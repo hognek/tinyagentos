@@ -380,7 +380,11 @@ class LLMProxy:
         """
         if self.inhouse_keys:
             try:
-                return self._keystore().mint(agent_name, models)
+                # Mirror the Postgres path's ``models or ["default"]`` so an
+                # agent deployed without an explicit model is scoped to the
+                # default chat alias (still usable), not minted with an empty
+                # allowlist that the auth hook would then deny-all.
+                return self._keystore().mint(agent_name, models or ["default"])
             except Exception as e:
                 logger.warning("inhouse key mint failed for %s: %s", agent_name, e)
                 return None

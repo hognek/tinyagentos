@@ -139,3 +139,16 @@ async def test_hook_out_of_scope_model_403(monkeypatch, tmp_path):
     with pytest.raises(HTTPException) as exc:
         await auth.user_api_key_auth(_FakeRequest({"model": "claude-3"}), token)
     assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_hook_empty_allowlist_is_deny_all(monkeypatch, tmp_path):
+    """An empty allowlist must 403 every model, not fall through to allow-all
+    (which is how LiteLLM reads UserAPIKeyAuth(models=[]))."""
+    from fastapi import HTTPException
+    path = tmp_path / "keys.db"
+    token = LiteLLMKeyStore(path).mint("agent-a", None)  # stored as []
+    auth = _reload_auth(monkeypatch, path)
+    with pytest.raises(HTTPException) as exc:
+        await auth.user_api_key_auth(_FakeRequest({"model": "anything"}), token)
+    assert exc.value.status_code == 403

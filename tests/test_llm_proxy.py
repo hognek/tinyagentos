@@ -519,6 +519,16 @@ class TestInhouseKeys:
         assert proxy._keystore().lookup(key)["agent"] == "agent-a"
 
     @pytest.mark.asyncio
+    async def test_create_key_no_models_scopes_to_default(self, tmp_path):
+        """Parity with the Postgres path's ``models or ["default"]``: an agent
+        deployed without an explicit model is scoped to the default alias, not
+        an empty allowlist (which the auth hook deny-alls)."""
+        proxy = LLMProxy(port=14006, config_dir=tmp_path, data_dir=tmp_path,
+                         inhouse_keys=True)
+        key = await proxy.create_agent_key("agent-a", None)
+        assert proxy._keystore().lookup(key)["allowed_models"] == ["default"]
+
+    @pytest.mark.asyncio
     async def test_update_and_delete_key_inhouse(self, tmp_path):
         proxy = LLMProxy(port=14005, config_dir=tmp_path, data_dir=tmp_path,
                          inhouse_keys=True)

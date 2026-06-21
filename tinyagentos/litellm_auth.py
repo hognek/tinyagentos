@@ -86,9 +86,18 @@ async def user_api_key_auth(request, api_key: str):
     allowed = rec["allowed_models"] or []
 
     # Defense in depth: enforce the per-agent model allowlist in-hook so
-    # correctness does not depend on LiteLLM's post-auth enforcement.
+    # correctness does not depend on LiteLLM's post-auth enforcement (which
+    # is disabled here via custom_auth_run_common_checks=False). An empty
+    # allowlist is deny-all per the keystore's mint() contract — do NOT
+    # short-circuit it, because returning UserAPIKeyAuth(models=[]) would be
+    # read by LiteLLM as "no restriction" (allow-all), the opposite intent.
     requested = await _requested_model(request)
-    if requested and allowed and requested not in allowed:
+    if not allowed:
+        raise HTTPException(
+            status_code=403,
+            detail="no models are permitted for this agent",
+        )
+    if requested and requested not in allowed:
         raise HTTPException(
             status_code=403,
             detail=f"model {requested!r} is not permitted for this agent",
