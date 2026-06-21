@@ -929,15 +929,15 @@ export function DeployWizard({
               >
                 {i < step ? <Check size={12} /> : i + 1}
               </div>
-              <span
-                className={`text-[11px] hidden sm:inline ${
-                  i === step ? "text-shell-text" : "text-shell-text-tertiary"
-                }`}
-              >
-                {label}
-              </span>
+              {/* Only the active step shows its label, so the rail never
+                  wraps. Completed/upcoming steps are compact numbered dots. */}
+              {i === step && (
+                <span className="text-[11px] font-medium text-shell-text whitespace-nowrap ml-0.5">
+                  {label}
+                </span>
+              )}
               {i < STEPS.length - 1 && (
-                <div className="w-4 h-px bg-white/10 mx-0.5" />
+                <div className={`w-4 h-px mx-1 ${i < step ? "bg-accent/30" : "bg-white/10"}`} />
               )}
             </div>
           ))}
