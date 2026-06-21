@@ -378,7 +378,7 @@ class LLMProxy:
         In-house mode mints a token in the local key store (no DB, works on
         ARM). Otherwise it calls LiteLLM's Postgres-backed /key/generate.
         """
-        if self.inhouse_keys:
+        if getattr(self, "inhouse_keys", False):
             try:
                 # Mirror the Postgres path's ``models or ["default"]`` so an
                 # agent deployed without an explicit model is scoped to the
@@ -428,7 +428,7 @@ class LLMProxy:
         use. Returns True on success. No-op (False) in routing-only mode (no DB)
         — there are no per-agent keys to scope there.
         """
-        if self.inhouse_keys:
+        if getattr(self, "inhouse_keys", False):
             if not key or not models:
                 logger.warning("update_agent_key (inhouse) needs key + models; refusing")
                 return False
@@ -464,7 +464,7 @@ class LLMProxy:
 
     async def delete_agent_key(self, key: str) -> bool:
         """Delete a per-agent virtual key."""
-        if self.inhouse_keys:
+        if getattr(self, "inhouse_keys", False):
             if not key:
                 return False
             try:
