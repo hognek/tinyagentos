@@ -40,24 +40,38 @@ async def _run(cmd: list[str], timeout: int = 120) -> tuple[int, str]:
 # ``patch("tinyagentos.containers._run")`` correctly intercepts them.
 # ---------------------------------------------------------------------------
 
+async def _resolve_container_project(name: str) -> str | None:
+    """Return the incus project a container lives in, or None if not found.
+
+    Searches ALL projects the client can see (``--all-projects``), not just the
+    ambient default. Multi-user installs place agent containers in a restricted
+    project (e.g. ``user-999``) while other agents sit in ``default``; a lookup
+    scoped to the ambient project alone misses the others, which is how undeploy
+    left orphaned containers behind. Errors return None (treated as "unknown").
+    """
+    code, output = await _run(["incus", "list", "--all-projects", "-f", "json"])
+    if code != 0:
+        return None
+    try:
+        instances = json.loads(output)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    for inst in instances:
+        if isinstance(inst, dict) and inst.get("name") == name:
+            return inst.get("project") or "default"
+    return None
+
+
 async def container_exists(name: str) -> bool:
     """Return True iff a container with the given name is known to the runtime.
 
-    Uses ``incus list --format=csv -c n --filter=name=<name>`` and checks
-    the output for an exact name match. Errors (incus not installed, daemon
-    down, malformed output) are treated as "unknown" and return False so
-    callers can take the safer no-container path rather than blocking on
-    cleanup of an orphan config row.
+    Searches across ALL projects (see ``_resolve_container_project``) so a
+    container in a restricted project (e.g. ``user-999``) is not mistaken for an
+    absent one. Errors (incus not installed, daemon down, malformed output) are
+    treated as "unknown" and return False so callers can take the safer
+    no-container path rather than blocking on cleanup of an orphan config row.
     """
-    code, output = await _run(
-        ["incus", "list", "--format=csv", "-c", "n", f"--filter=name={name}"]
-    )
-    if code != 0:
-        return False
-    for line in output.splitlines():
-        if line.strip() == name:
-            return True
-    return False
+    return (await _resolve_container_project(name)) is not None
 
 
 async def list_containers(prefix: str = "taos-agent-") -> list[ContainerInfo]:
@@ -224,9 +238,17 @@ async def restart_container(name: str) -> dict:
 
 
 async def destroy_container(name: str) -> dict:
-    """Stop and delete a container."""
-    await _run(["incus", "stop", name, "--force"])
-    code, output = await _run(["incus", "delete", name, "--force"])
+    """Stop and delete a container, in whatever project it lives in.
+
+    Resolves the container's actual project first so an agent in a restricted
+    project (e.g. ``user-999``) is destroyed rather than left orphaned when the
+    ambient project is ``default``. Falls back to the ambient project when the
+    lookup finds nothing (preserves the original behavior for fresh installs).
+    """
+    proj = await _resolve_container_project(name)
+    proj_args = ["--project", proj] if proj else []
+    await _run(["incus", "stop", *proj_args, name, "--force"])
+    code, output = await _run(["incus", "delete", *proj_args, name, "--force"])
     return {"success": code == 0, "output": output}
 
 
