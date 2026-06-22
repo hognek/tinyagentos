@@ -308,12 +308,14 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     # docs/design/framework-agnostic-runtime.md.
     db_url_path = data_dir / ".litellm_db_url"
     db_url = db_url_path.read_text().strip() if db_url_path.exists() else None
-    # Opt-in: authorize per-agent virtual keys against taOS's own SQLite key
-    # store via LiteLLM's custom_auth hook, instead of its Postgres/prisma
-    # virtual-key table. Lets per-agent keys work with NO DATABASE_URL and no
-    # prisma (the ARM / no-Postgres fix). Off by default; the released
-    # master-key fallback covers routing-only installs until this is enabled.
-    inhouse_keys = (data_dir / ".litellm_inhouse_keys").exists()
+    # Authorize per-agent virtual keys against taOS's own SQLite key store via
+    # LiteLLM's custom_auth hook, instead of its Postgres/prisma virtual-key
+    # table. Lets per-agent keys work with NO DATABASE_URL and no prisma (the
+    # ARM / no-Postgres fix) and gives every install real per-agent isolation
+    # uniformly. ON by default now; create a ``.litellm_disable_inhouse_keys``
+    # marker to fall back to the Postgres path + shared master key (e.g. to keep
+    # using LiteLLM's native virtual-key table on a Postgres-backed install).
+    inhouse_keys = not (data_dir / ".litellm_disable_inhouse_keys").exists()
     # Read the local auth token so LLMProxy can forward it to LiteLLM's
     # subprocess — otherwise the taOS callback can't POST llm_call events
     # back to /api/trace and the 401s fill the log instead of trace rows.
