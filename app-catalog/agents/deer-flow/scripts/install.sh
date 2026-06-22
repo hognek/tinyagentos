@@ -68,6 +68,13 @@ models:
 
 memory:
   token_counting: char
+
+# DeerFlow's AppConfig requires an explicit sandbox section (there is no
+# implicit default). LocalSandboxProvider is the host-filesystem provider that
+# needs no Docker — correct for a single-purpose agent container.
+sandbox:
+  use: deerflow.sandbox.local:LocalSandboxProvider
+  allow_host_bash: false
 CONFIG
 
 # ---------------------------------------------------------------------------
@@ -85,8 +92,15 @@ OPENAI_API_KEY=${OPENAI_API_KEY:-}
 OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
 DEER_FLOW_CONFIG_PATH=/opt/deer-flow/config.yaml
 PYTHONPATH=.
+DEER_FLOW_AUTH_DISABLED=1
 ENVFILE
 chmod 600 /opt/deer-flow/deer-flow.env
+# DEER_FLOW_AUTH_DISABLED=1 turns off the gateway's login auth AND its CSRF
+# double-submit guard (both are designed for browser clients). This is correct
+# and safe here: the gateway binds 127.0.0.1:8001 inside the agent container
+# and is reached only by the taOS adapter on localhost — never exposed. Without
+# it, POST /api/runs/wait returns 403 "CSRF token missing". The flag is ignored
+# if DEER_FLOW_ENV/ENVIRONMENT is prod, so do not set those in the container.
 
 # ---------------------------------------------------------------------------
 # 7. Systemd unit
@@ -117,8 +131,13 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable deer-flow.service
+# Start now: the EnvironmentFile + config.yaml are already written, so the
+# service is fully provisioned at this point. Type=simple returns immediately
+# (the LangGraph import takes ~30-60s on ARM before the API answers); the taOS
+# adapter retries on connection errors while it warms up.
+systemctl start deer-flow.service
 
-echo "[deer-flow] install complete (service enabled, start deferred to deployer)"
-echo "[deer-flow] backend serves the runs API on 127.0.0.1:8001"
-echo "[deer-flow] deployer injects OPENAI_BASE_URL, OPENAI_API_KEY, TAOS_MODEL"
-echo "             into the container env (inherited by the systemd service)"
+echo "[deer-flow] install complete — service enabled and started"
+echo "[deer-flow] backend serves the runs API on 127.0.0.1:8001 (auth disabled,"
+echo "            localhost-only); the taOS adapter bridges POST /api/runs/wait"
+echo "[deer-flow] model routes through OPENAI_BASE_URL (the taOS LiteLLM proxy)"
