@@ -54,9 +54,13 @@ class BrokerService:
         """Approve a grant for a bounded window.
 
         Sets status=active, granted_at=now, expires_at=now+window (capped at
-        MAX_WINDOW_SECONDS). Raises ValueError if window_seconds <= 0 or the
-        grant is unknown. For http-proxy providers, also mints and returns a
-        virtual cred token under the "token" key.
+        MAX_WINDOW_SECONDS). Raises ValueError if window_seconds <= 0, the grant
+        is unknown, or the grant is not currently ``pending``. For http-proxy
+        providers, also mints and returns a virtual cred token under "token".
+
+        Only a pending grant can be approved, so an approve call can never
+        resurrect a grant the user previously denied or revoked (nor re-activate
+        an expired one).
         """
         if window_seconds <= 0:
             raise ValueError("window_seconds must be > 0")
@@ -67,6 +71,10 @@ class BrokerService:
         grant = await self.store.get_grant(grant_id)
         if grant is None:
             raise ValueError(f"unknown grant_id: {grant_id!r}")
+        if grant["status"] != "pending":
+            raise ValueError(
+                f"grant {grant_id!r} is {grant['status']}, not pending; cannot approve"
+            )
 
         expires_at = now + window
         await self.store.set_grant_status(

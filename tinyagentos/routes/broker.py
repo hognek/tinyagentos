@@ -99,11 +99,17 @@ async def approve_grant(request: Request, grant_id: str, body: ApproveRequest):
 async def deny_grant(request: Request, grant_id: str):
     broker = request.app.state.broker
     ok = await broker.deny(grant_id)
-    return {"ok": ok}
+    # ok is False only when no grant matched the id; return 404 for consistency
+    # with approve (which 400s on an unknown id) instead of a 200 {"ok": false}.
+    if not ok:
+        return JSONResponse({"error": f"unknown grant_id: {grant_id!r}"}, status_code=404)
+    return {"ok": True}
 
 
 @router.post("/api/broker/grants/{grant_id}/revoke")
 async def revoke_grant(request: Request, grant_id: str):
     broker = request.app.state.broker
     ok = await broker.revoke(grant_id)
-    return {"ok": ok}
+    if not ok:
+        return JSONResponse({"error": f"unknown grant_id: {grant_id!r}"}, status_code=404)
+    return {"ok": True}

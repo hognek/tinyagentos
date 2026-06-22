@@ -124,3 +124,24 @@ class TestBrokerRoutes:
         async with AsyncClient(transport=transport, base_url="http://test") as c:
             resp = await c.get("/api/broker/providers")
         assert resp.status_code in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_deny_revoke_unknown_grant_404(client):
+    """deny/revoke on an unknown grant id return 404 (consistent with approve)."""
+    r1 = await client.post("/api/broker/grants/tsk-nope/deny")
+    assert r1.status_code == 404
+    r2 = await client.post("/api/broker/grants/tsk-nope/revoke")
+    assert r2.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_approve_denied_grant_400(client):
+    """A denied grant cannot be resurrected via the approve route."""
+    gid = (await _request_grant(client)).json()["grant_id"]
+    deny = await client.post(f"/api/broker/grants/{gid}/deny")
+    assert deny.status_code == 200
+    resp = await client.post(
+        f"/api/broker/grants/{gid}/approve", json={"window_seconds": 3600}
+    )
+    assert resp.status_code == 400
