@@ -919,6 +919,9 @@ export function DeployWizard({
           {STEPS.map((label, i) => (
             <div key={label} className="flex items-center gap-1">
               <div
+                title={label}
+                aria-label={label}
+                aria-current={i === step ? "step" : undefined}
                 className={`w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-medium transition-colors ${
                   i < step
                     ? "bg-accent/20 text-accent"
