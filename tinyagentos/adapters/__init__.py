@@ -56,6 +56,12 @@ _REGISTRY: list[dict] = [
         "verification_status": "alpha",
     },
     {
+        "id": "deer-flow",
+        "name": "DeerFlow",
+        "description": "DeerFlow LangGraph SuperAgent harness (runs API bridge)",
+        "verification_status": "alpha",
+    },
+    {
         "id": "ironclaw",
         "name": "IronClaw",
         "description": "IronClaw gateway proxy",
