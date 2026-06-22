@@ -38,6 +38,22 @@ def test_extract_text_empty_or_missing():
     assert _extract_text(None) == ""
 
 
+def test_extract_text_skips_trailing_non_assistant_message():
+    """The final channel-values message may be a tool/human turn; the adapter
+    must return the last ASSISTANT message, not blindly messages[-1]."""
+    messages = [
+        {"role": "user", "content": "search the web"},
+        {"role": "assistant", "content": "here is what I found"},
+        {"role": "tool", "content": "raw tool output blob"},
+    ]
+    assert _extract_text(messages) == "here is what I found"
+
+
+def test_extract_text_fallback_when_no_assistant_role():
+    """With no role/type markers, fall back to the last message's text."""
+    assert _extract_text([{"content": "only message"}]) == "only message"
+
+
 @pytest.mark.asyncio
 async def test_health():
     transport = ASGITransport(app=deer_flow_adapter.app)

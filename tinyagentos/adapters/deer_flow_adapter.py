@@ -7,7 +7,15 @@ from tinyagentos.clients.retry import with_retry
 
 app = FastAPI()
 
-_RETRY_KWARGS = dict(max_attempts=7, base_delay=0.5, multiplier=2.0, max_delay=60.0)
+# Retry ONLY on connection-level failures (the service is still starting, or a
+# transient transport blip) — NOT on ReadTimeout. /api/runs/wait drives a
+# long-horizon agent that legitimately takes minutes; a read timeout means the
+# run is in progress, so re-firing it would re-execute the whole job (and any
+# side effects). Keep the attempt count low for the same reason.
+_RETRY_ON = (httpx.ConnectError, httpx.RemoteProtocolError)
+_RETRY_KWARGS = dict(
+    max_attempts=3, base_delay=0.5, multiplier=2.0, max_delay=10.0, retry_on=_RETRY_ON
+)
 
 
 async def _controller_post(url: str, json: dict):
@@ -16,28 +24,45 @@ async def _controller_post(url: str, json: dict):
         return await client.post(url, json=json)
 
 
-def _extract_text(messages) -> str:
-    """Pull the assistant reply text from a list of LangGraph/LangChain messages.
+def _msg_content_text(msg) -> str:
+    """Render one message's content as plain text.
 
-    Handles both plain {"role": ..., "content": str} messages and LangChain
-    {"type": "ai", "content": [...]} messages where content is a string or a
-    list of {"type": "text", "text": "..."} blocks. Falls back to str() of the
-    last message.
+    Handles {"content": str} and LangChain {"content": [{"type":"text",...}]}.
     """
-    if not messages:
-        return ""
-    last = messages[-1]
-    content = last.get("content") if isinstance(last, dict) else None
+    content = msg.get("content") if isinstance(msg, dict) else None
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = [
+        return "".join(
             block.get("text", "")
             for block in content
             if isinstance(block, dict) and block.get("type") == "text"
-        ]
-        return "".join(parts)
-    return str(last)
+        )
+    return ""
+
+
+def _extract_text(messages) -> str:
+    """Pull the assistant reply from a list of LangGraph/LangChain messages.
+
+    The final channel-values message is not necessarily the assistant turn —
+    after a tool call it can be a tool/human message — so scan from the end for
+    the last assistant/AI message rather than blindly taking ``messages[-1]``.
+    Handles plain {"role": "assistant", "content": str} and LangChain
+    {"type": "ai", "content": [...]} shapes. Falls back to the last message's
+    text, then str() of it.
+    """
+    if not messages:
+        return ""
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role") or msg.get("type")
+        if role in ("assistant", "ai", "AIMessage"):
+            text = _msg_content_text(msg)
+            if text:
+                return text
+    # No assistant message found — fall back to the last message's text.
+    return _msg_content_text(messages[-1]) or str(messages[-1])
 
 
 @app.post("/message")
