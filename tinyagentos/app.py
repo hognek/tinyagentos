@@ -62,6 +62,8 @@ from tinyagentos.scheduler.discovery import build_scheduler as build_resource_sc
 from tinyagentos.torrent_settings import TorrentSettingsStore
 from tinyagentos.relationships import RelationshipManager
 from tinyagentos.github_identities import GitHubIdentitiesStore
+from tinyagentos.broker import BrokerService, BrokerStore
+from tinyagentos.broker.store import default_broker_path
 from tinyagentos.secrets import SecretsStore
 from tinyagentos.mail_store import MailAccountStore
 from tinyagentos.training import TrainingManager
@@ -269,6 +271,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     torrent_settings_store = TorrentSettingsStore(data_dir / "torrent_settings.json")
     download_manager = DownloadManager(torrent_settings_store=torrent_settings_store)
     secrets_store = SecretsStore(data_dir / "secrets.db")
+    broker_store = BrokerStore(default_broker_path(data_dir))
+    broker_service = BrokerService(broker_store)
     mail_store = MailAccountStore(data_dir / "mail.db")
     github_identities_store = GitHubIdentitiesStore(data_dir / "github_identities.db")
     relationship_mgr = RelationshipManager(data_dir / "relationships.db")
@@ -430,6 +434,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await notif_store.init()
         await qmd_client.init()
         await secrets_store.init()
+        await broker_store.init()
         await mail_store.init()
         app.state.mail_store = mail_store
         await github_identities_store.init()
@@ -661,6 +666,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         app.state.download_manager = download_manager
         app.state.torrent_settings_store = torrent_settings_store
         app.state.secrets = secrets_store
+        app.state.broker = broker_service
+        app.state.broker_store = broker_store
         app.state.github_identities = github_identities_store
         app.state.relationships = relationship_mgr
         app.state.channels = channel_store
@@ -1210,6 +1217,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await browser_cookie_store.close()
         await browser_store.close()
         await secrets_store.close()
+        await broker_store.close()
         await mail_store.close()
         await notif_store.close()
         await app.state.system_events.close()
@@ -1302,6 +1310,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.http_client = http_client
     app.state.download_manager = download_manager
     app.state.secrets = secrets_store
+    app.state.broker = broker_service
+    app.state.broker_store = broker_store
     app.state.github_identities = github_identities_store
     app.state.relationships = relationship_mgr
     app.state.channels = channel_store

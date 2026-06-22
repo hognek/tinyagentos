@@ -90,6 +90,9 @@ def register_all_routers(app):
     from tinyagentos.routes.secrets import router as secrets_router
     app.include_router(secrets_router)
 
+    from tinyagentos.routes.broker import router as broker_router
+    app.include_router(broker_router)
+
     from tinyagentos.routes.mail import router as mail_router
     app.include_router(mail_router)
 

@@ -253,6 +253,10 @@ async def client(app, tmp_data_dir):
     if secrets_store._db is not None:
         await secrets_store.close()
     await secrets_store.init()
+    broker_store = app.state.broker_store
+    if broker_store._db is not None:
+        await broker_store.close()
+    await broker_store.init()
     scheduler = app.state.scheduler
     if scheduler._db is not None:
         await scheduler.close()
@@ -375,6 +379,7 @@ async def client(app, tmp_data_dir):
     await channel_store.close()
     await scheduler.close()
     await secrets_store.close()
+    await broker_store.close()
     await notif_store.close()
     await store.close()
     await office_docs.close()
