@@ -71,7 +71,25 @@ memory:
 CONFIG
 
 # ---------------------------------------------------------------------------
-# 6. Systemd unit
+# 6. Capture the deployer-injected env into an EnvironmentFile
+# ---------------------------------------------------------------------------
+# install.sh runs via `incus exec`, which DOES inherit the container's
+# environment.* config, so OPENAI_BASE_URL / OPENAI_API_KEY / TAOS_MODEL are
+# visible here. A systemd service does NOT inherit those automatically (it
+# starts from a clean environment), so DeerFlow's config.yaml $VAR expansion
+# would otherwise see empty values. Snapshot them into an EnvironmentFile the
+# unit reads (the same pattern the Hermes framework uses).
+cat > /opt/deer-flow/deer-flow.env <<ENVFILE
+TAOS_MODEL=${TAOS_MODEL:-}
+OPENAI_API_KEY=${OPENAI_API_KEY:-}
+OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+DEER_FLOW_CONFIG_PATH=/opt/deer-flow/config.yaml
+PYTHONPATH=.
+ENVFILE
+chmod 600 /opt/deer-flow/deer-flow.env
+
+# ---------------------------------------------------------------------------
+# 7. Systemd unit
 # ---------------------------------------------------------------------------
 # Runs as root: the uv-managed venv lives under /opt and running as root avoids
 # venv-permission complexity. The container itself is the isolation boundary.
@@ -86,8 +104,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/deer-flow/backend
-Environment=DEER_FLOW_CONFIG_PATH=/opt/deer-flow/config.yaml
-Environment=PYTHONPATH=.
+EnvironmentFile=/opt/deer-flow/deer-flow.env
 ExecStart=${UV_BIN} run uvicorn app.gateway.app:app --host 127.0.0.1 --port 8001
 Restart=on-failure
 RestartSec=5
