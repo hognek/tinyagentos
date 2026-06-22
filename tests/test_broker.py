@@ -148,3 +148,22 @@ async def test_empty_scope_grant_still_authorizes(tmp_path):
     gid = await svc.request_access("agent-a", "exa", scopes=[])
     await svc.approve(gid, 3600, now=NOW)
     assert await svc.is_authorized("agent-a", "exa", now=NOW) is True
+
+
+@pytest.mark.asyncio
+async def test_approve_rejects_non_pending_grant(tmp_path):
+    """A denied or revoked grant can never be resurrected by approve."""
+    svc, _ = await _service(tmp_path)
+    # denied -> approve refused
+    gid = await svc.request_access("agent-x", "exa")
+    await svc.deny(gid)
+    with pytest.raises(ValueError):
+        await svc.approve(gid, 3600)
+    assert await svc.is_authorized("agent-x", "exa") is False
+    # revoked -> approve refused
+    gid2 = await svc.request_access("agent-y", "exa")
+    await svc.approve(gid2, 3600)
+    await svc.revoke(gid2)
+    with pytest.raises(ValueError):
+        await svc.approve(gid2, 3600)
+    assert await svc.is_authorized("agent-y", "exa") is False
