@@ -9,6 +9,7 @@ survives controller restarts and is not a local tmux concern.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
@@ -23,6 +24,12 @@ from tinyagentos.auth_context import CurrentUser, current_user
 router = APIRouter()
 
 _DEFAULT_STATE: dict = {"global": False, "lanes": {}}
+
+# Serialise read-modify-write of the pause/throttle state files so two
+# concurrent admin POSTs cannot lose an update (each reads the same prior
+# state and the second os.replace clobbers the first). The writes are
+# infrequent admin actions, so a single in-process lock is sufficient.
+_write_lock = asyncio.Lock()
 
 
 def _state_path(request: Request) -> Path:
@@ -44,13 +51,12 @@ def _read_state(request: Request) -> dict:
     }
 
 
-def _write_state(request: Request, state: dict) -> None:
-    p = _state_path(request)
+def _atomic_write(p: Path, state: dict) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     # Write to a temp file in the same dir then atomically rename, so a crash
     # mid-write or a concurrent writer can never leave a truncated/corrupt file
     # (a reader always sees either the old or the new complete state).
-    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix=".observatory_pause.", suffix=".tmp")
+    fd, tmp = tempfile.mkstemp(dir=str(p.parent), prefix="." + p.stem + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
             f.write(json.dumps(state))
@@ -61,6 +67,10 @@ def _write_state(request: Request, state: dict) -> None:
         except OSError:
             pass
         raise
+
+
+def _write_state(request: Request, state: dict) -> None:
+    _atomic_write(_state_path(request), state)
 
 
 class PauseBody(BaseModel):
@@ -84,14 +94,82 @@ async def set_pause(body: PauseBody, request: Request, user: CurrentUser = Depen
     scope = body.scope.strip()
     if not scope:
         return JSONResponse({"error": "scope required"}, status_code=400)
-    state = _read_state(request)
-    if scope == "global":
-        state["global"] = body.paused
-    elif body.paused:
-        state["lanes"][scope] = True
-    else:
-        state["lanes"].pop(scope, None)
-    _write_state(request, state)
+    async with _write_lock:
+        state = _read_state(request)
+        if scope == "global":
+            state["global"] = body.paused
+        elif body.paused:
+            state["lanes"][scope] = True
+        else:
+            state["lanes"].pop(scope, None)
+        _write_state(request, state)
+    return state
+
+
+# --- Throttle dials (decision 3: concurrency). A per-lane (and global) cap on
+# how many cards a lane may have in flight at once, which the dispatch loop
+# reads each iteration as its MAX_OPEN_PRS. null/absent = no override (the
+# loop's built-in default applies). Pause is the on/off switch; throttle is the
+# volume knob. ---
+
+
+def _throttle_path(request: Request) -> Path:
+    return Path(request.app.state.data_dir) / "observatory_throttle.json"
+
+
+def _coerce_limit(v) -> int | None:
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _read_throttle(request: Request) -> dict:
+    p = _throttle_path(request)
+    if not p.exists():
+        return {"global": None, "lanes": {}}
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {"global": None, "lanes": {}}
+    lanes = {}
+    for k, v in (data.get("lanes") or {}).items():
+        lim = _coerce_limit(v)
+        if lim is not None:
+            lanes[str(k)] = lim
+    return {"global": _coerce_limit(data.get("global")), "lanes": lanes}
+
+
+class ThrottleBody(BaseModel):
+    scope: str  # "global" or a lane handle
+    max_concurrent: int | None = None  # None or <= 0 clears the cap
+
+
+@router.get("/api/observatory/throttle")
+async def get_throttle(request: Request, user: CurrentUser = Depends(current_user)):
+    """Current concurrency caps. The dispatch loop polls this each iteration."""
+    return _read_throttle(request)
+
+
+@router.post("/api/observatory/throttle")
+async def set_throttle(body: ThrottleBody, request: Request, user: CurrentUser = Depends(current_user)):
+    """Set or clear a concurrency cap globally or for a single lane. Admin only."""
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="forbidden")
+    scope = body.scope.strip()
+    if not scope:
+        return JSONResponse({"error": "scope required"}, status_code=400)
+    limit = _coerce_limit(body.max_concurrent)
+    async with _write_lock:
+        state = _read_throttle(request)
+        if scope == "global":
+            state["global"] = limit
+        elif limit is not None:
+            state["lanes"][scope] = limit
+        else:
+            state["lanes"].pop(scope, None)
+        _atomic_write(_throttle_path(request), state)
     return state
 
 
