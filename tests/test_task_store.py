@@ -1,8 +1,8 @@
-import json
 from unittest.mock import AsyncMock
 
 import pytest
 
+from tinyagentos.projects import task_store as task_store_mod
 from tinyagentos.projects.task_store import ProjectTaskStore
 
 
@@ -10,6 +10,22 @@ async def _store(tmp_path):
     s = ProjectTaskStore(tmp_path / "tasks.db")
     await s.init()
     return s
+
+
+def _strictly_increasing_clock(monkeypatch, start=1_000_000.0, step=1.0):
+    """Patch the store's time.time so each created_at is strictly increasing.
+
+    The store orders by created_at with no secondary tiebreak, so two creates
+    in the same sub-microsecond tick would otherwise produce equal timestamps
+    and an undefined order, making ordering assertions flaky on fast machines.
+    """
+    counter = {"t": start}
+
+    def _now():
+        counter["t"] += step
+        return counter["t"]
+
+    monkeypatch.setattr(task_store_mod.time, "time", _now)
 
 
 @pytest.mark.asyncio
@@ -123,7 +139,8 @@ async def test_list_tasks_filter_by_parent(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_list_tasks_ordered_by_created_at_asc(tmp_path):
+async def test_list_tasks_ordered_by_created_at_asc(tmp_path, monkeypatch):
+    _strictly_increasing_clock(monkeypatch)
     s = await _store(tmp_path)
     t1 = await s.create_task("prj-1", "First", "alice")
     t2 = await s.create_task("prj-1", "Second", "alice")
@@ -487,7 +504,8 @@ async def test_list_ready_tasks_limit_clamped(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_add_and_list_comments(tmp_path):
+async def test_add_and_list_comments(tmp_path, monkeypatch):
+    _strictly_increasing_clock(monkeypatch)
     s = await _store(tmp_path)
     task = await s.create_task("prj-1", "Task", "alice")
     c1 = await s.add_comment(task["id"], "alice", "first comment")
