@@ -42,7 +42,11 @@ def _read_lock_version():
 def test_pyproject_and_lock_versions_match():
     pyproject_version = _read_pyproject_version()
     lock_version = _read_lock_version()
-    assert Version(pyproject_version).release == Version(lock_version).release, (
+    # Full PEP 440 equality, not just .release: comparing only the release
+    # segments would treat 1.0.0 and 1.0.0rc1 as matching and silently miss
+    # pre-release/dev drift. Version() equality still normalizes trailing zeros
+    # (1.0 == 1.0.0) but includes the pre/post/dev segments.
+    assert Version(pyproject_version) == Version(lock_version), (
         f"pyproject declares {pyproject_version!r} but uv.lock pins tinyagentos "
-        f"at {lock_version!r}; these release segments must match."
+        f"at {lock_version!r}; these versions must match."
     )
