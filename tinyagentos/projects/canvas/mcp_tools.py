@@ -83,6 +83,69 @@ async def canvas_add_image(
     return {"element": el}
 
 
+async def canvas_add_text(
+    ctx: CanvasToolContext, *, project_id: str, agent_id: str,
+    text: str, x: float, y: float, font_size: int = 16,
+) -> dict:
+    el = await ctx.canvas_store.add_element(
+        project_id=project_id,
+        author_kind="agent", author_id=agent_id,
+        element={
+            "kind": "text", "x": float(x), "y": float(y),
+            "w": 220.0, "h": 80.0,
+            "payload": {"text": text, "font_size": int(font_size)},
+        },
+    )
+    return {"element": el}
+
+
+async def canvas_add_mermaid(
+    ctx: CanvasToolContext, *, project_id: str, agent_id: str,
+    source: str, x: float, y: float,
+) -> dict:
+    el = await ctx.canvas_store.add_element(
+        project_id=project_id,
+        author_kind="agent", author_id=agent_id,
+        element={
+            "kind": "mermaid", "x": float(x), "y": float(y),
+            "w": 320.0, "h": 240.0, "payload": {"source": source},
+        },
+    )
+    return {"element": el}
+
+
+async def canvas_add_flowchart(
+    ctx: CanvasToolContext, *, project_id: str, agent_id: str,
+    source: str, x: float, y: float,
+) -> dict:
+    el = await ctx.canvas_store.add_element(
+        project_id=project_id,
+        author_kind="agent", author_id=agent_id,
+        element={
+            "kind": "flowchart", "x": float(x), "y": float(y),
+            "w": 320.0, "h": 240.0, "payload": {"source": source},
+        },
+    )
+    return {"element": el}
+
+
+async def canvas_add_mindmap_edge(
+    ctx: CanvasToolContext, *, project_id: str, agent_id: str,
+    from_id: str, to_id: str,
+) -> dict:
+    # An edge connects two existing elements by id. Its own geometry is
+    # nominal: the renderer derives the line from the endpoints' anchors.
+    el = await ctx.canvas_store.add_element(
+        project_id=project_id,
+        author_kind="agent", author_id=agent_id,
+        element={
+            "kind": "mindmap_edge", "x": 0.0, "y": 0.0,
+            "w": 1.0, "h": 1.0, "payload": {"from": from_id, "to": to_id},
+        },
+    )
+    return {"element": el}
+
+
 async def canvas_update_element(
     ctx: CanvasToolContext, *, project_id: str, agent_id: str,
     element_id: str, patch: dict,
