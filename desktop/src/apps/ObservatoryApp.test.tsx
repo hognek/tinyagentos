@@ -315,4 +315,100 @@ describe("ObservatoryApp polling", () => {
     expect(fetchMock.mock.calls.length).toBeGreaterThan(initial);
     vi.useRealTimers();
   });
+
+  it("skips the background poll while a steer write is in flight", async () => {
+    vi.useFakeTimers();
+    let resolvePost: (() => void) | null = null;
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method === "POST" && input === "/api/observatory/pause") {
+        return new Promise((res) => {
+          resolvePost = () =>
+            res({ ok: true, status: 200, json: () => Promise.resolve({}) });
+        });
+      }
+      if (input === "/api/observatory/throttle") {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ global: null, lanes: {} }),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(fleetBody),
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ObservatoryApp windowId="w1" />);
+    await act(async () => { await Promise.resolve(); });
+
+    // Start a pause write whose POST stays pending so inFlight stays non-zero.
+    fireEvent.click(screen.getByRole("button", { name: /pause queue/i }));
+    await act(async () => { await Promise.resolve(); });
+
+    const fleetCalls = () =>
+      fetchMock.mock.calls.filter((c) => c[0] === "/api/observatory/fleet").length;
+    const before = fleetCalls();
+
+    // The 5s tick must NOT background-fetch the fleet while the write is pending.
+    await act(async () => { vi.advanceTimersByTime(5000); await Promise.resolve(); });
+    expect(fleetCalls()).toBe(before);
+
+    // Once the write resolves, postSteer's reconcile fetches the fleet.
+    await act(async () => {
+      resolvePost?.();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(fleetCalls()).toBeGreaterThan(before);
+    vi.useRealTimers();
+  });
+
+  it("a finished write's reconcile does not revert another in-flight write", async () => {
+    let resolvePause: (() => void) | null = null;
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method === "POST" && input === "/api/observatory/pause") {
+        // The pause POST stays pending until we release it.
+        return new Promise((res) => {
+          resolvePause = () =>
+            res({ ok: true, status: 200, json: () => Promise.resolve({}) });
+        });
+      }
+      if (method === "POST" && input === "/api/observatory/throttle") {
+        // The cap POST resolves immediately, but the server read still reports
+        // no cap (as if the change has not propagated yet).
+        return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({}) });
+      }
+      if (input === "/api/observatory/throttle") {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () => Promise.resolve({ global: null, lanes: {} }),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(fleetBody),
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<ObservatoryApp windowId="w1" />);
+    await flush();
+
+    // Start a cap raise (optimistic cap -> 1) AND a pause whose POST stays
+    // pending, so a write is still in flight when the cap write reconciles.
+    fireEvent.click(screen.getByRole("button", { name: /pause queue/i }));
+    fireEvent.click(screen.getByRole("button", { name: /raise concurrency cap/i }));
+    await flush();
+
+    // The cap write's reconcile read says "no cap", but the pause write is still
+    // in flight, so the optimistic cap must be preserved (not reverted to 0).
+    expect(screen.getByLabelText(/concurrency cap value/i).textContent).toBe("1");
+
+    await act(async () => { resolvePause?.(); await Promise.resolve(); });
+  });
 });
