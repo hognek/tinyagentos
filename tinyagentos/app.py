@@ -591,6 +591,31 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
                 await save_config_locked(config, config.config_path)
         except Exception:
             logger.exception("persona_v2 startup migration failed")
+
+        # Archive any agent DM channels left live by a removal path that
+        # bypassed archive (a cleaned-up failed deploy, a hard-delete of a
+        # never-used config row).  Idempotent -- safe on every startup.
+        try:
+            from tinyagentos.chat.orphan_reconcile import (
+                reconcile_orphan_dm_channels,
+            )
+            try:
+                _reg_rows = await agent_registry_store.list_all()
+                _registry_ids = [
+                    r.get("canonical_id") for r in _reg_rows if r.get("canonical_id")
+                ]
+            except Exception:  # noqa: BLE001
+                _registry_ids = []
+            reconciled = await reconcile_orphan_dm_channels(
+                config, chat_channels, registry_ids=_registry_ids
+            )
+            if reconciled:
+                logger.info(
+                    "orphan reconcile: archived %d orphan DM channel(s) at startup",
+                    len(reconciled),
+                )
+        except Exception:
+            logger.exception("orphan DM channel reconcile failed")
         # Probe installed framework versions in the BACKGROUND so the UI can
         # show whether each agent is up-to-date before any manual check is
         # triggered. Each probe does an `incus exec` into the agent container,

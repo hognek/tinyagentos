@@ -881,6 +881,35 @@ async def purge_archived_agent(request: Request, archive_id: str):
     return await agent_archive.purge_archived(request, archive_id)
 
 
+@router.post("/api/agents/reconcile-orphan-channels")
+async def reconcile_orphan_channels(request: Request):
+    """Archive agent DM channels whose agent is in no list (active, failed,
+    or archived). Idempotent; never hard-deletes. Returns the channels
+    archived on this pass."""
+    from tinyagentos.chat.orphan_reconcile import reconcile_orphan_dm_channels
+
+    config = request.app.state.config
+    chat_channels = request.app.state.chat_channels
+    registry_ids = await _registry_canonical_ids(request.app.state)
+    archived = await reconcile_orphan_dm_channels(
+        config, chat_channels, registry_ids=registry_ids
+    )
+    return {"status": "ok", "archived": archived, "count": len(archived)}
+
+
+async def _registry_canonical_ids(state) -> list[str]:
+    """Best-effort list of canonical agent ids from the registry, so the
+    reconcile can recognise a former agent whose config row is gone."""
+    registry = getattr(state, "agent_registry", None)
+    if registry is None:
+        return []
+    try:
+        rows = await registry.list_all()
+    except Exception:  # noqa: BLE001
+        return []
+    return [r.get("canonical_id") for r in rows if r.get("canonical_id")]
+
+
 @router.post("/api/agents/{name}/resume")
 async def resume_agent(request: Request, name: str):
     """Clear the paused flag on an agent, allowing it to accept new calls."""
