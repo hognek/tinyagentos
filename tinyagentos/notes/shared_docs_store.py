@@ -145,7 +145,9 @@ class SharedDocsStore(BaseStore):
         await self._db.commit()
 
     # --------------------------------------------------------------- entries
-    async def add_entry(self, doc_id: str, text: str, author: str = "") -> dict:
+    async def add_entry(
+        self, doc_id: str, text: str, author: str = "", editor_type: str = "user"
+    ) -> dict:
         entry_id = new_id("ent")
         now = time.time()
         await self._db.execute(
@@ -160,8 +162,8 @@ class SharedDocsStore(BaseStore):
         await self._db.execute(
             "INSERT INTO shared_doc_entry_revisions "
             "(id, entry_id, rev_index, editor_id, editor_type, op, diff, snapshot, created_at) "
-            "VALUES (?, ?, 0, ?, 'user', 'create', NULL, ?, ?)",
-            (rev_id, entry_id, author, text, now),
+            "VALUES (?, ?, 0, ?, ?, 'create', NULL, ?, ?)",
+            (rev_id, entry_id, author, editor_type, text, now),
         )
         await self._db.commit()
         cur = await self._db.execute("SELECT * FROM shared_doc_entries WHERE id = ?", (entry_id,))
@@ -354,3 +356,16 @@ class SharedDocsStore(BaseStore):
         )
         rows = await cur.fetchall()
         return [{"agent": r[0], "standing_instruction": r[1]} for r in rows]
+
+    async def docs_for_agent(self, agent_name: str) -> list[dict]:
+        """Non-archived docs where the given agent is an agent-type member."""
+        cur = await self._db.execute(
+            "SELECT DISTINCT d.id, d.kind, d.title, d.updated_at FROM shared_docs d "
+            "JOIN shared_doc_members m ON m.doc_id = d.id "
+            "WHERE m.member_type = 'agent' AND m.member_id = ? "
+            "AND d.archived_at IS NULL "
+            "ORDER BY d.updated_at DESC",
+            (agent_name,),
+        )
+        rows = await cur.fetchall()
+        return [_row(cur.description, r) for r in rows]
