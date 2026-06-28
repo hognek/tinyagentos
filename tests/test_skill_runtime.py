@@ -132,6 +132,22 @@ async def test_list_files_lists_workspace(app_with_store):
 
 
 @pytest.mark.asyncio
+async def test_agent_name_traversal_rejected(app_with_store):
+    """A traversal agent_name must not escape the workspaces base via any file
+    skill (it feeds the workspace path before the per-call path check)."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app_with_store), base_url="http://test"
+    ) as client:
+        for skill in ("file_read", "file_write", "list_files"):
+            resp = await client.post(
+                f"/api/skill-exec/{skill}/call",
+                json={"args": {"agent_name": "../../../../etc", "path": ""}},
+            )
+            body = resp.json()
+            assert "error" in body and "agent_name" in body["error"], (skill, body)
+
+
+@pytest.mark.asyncio
 async def test_list_files_rejects_path_outside_workspace(app_with_store):
     async with AsyncClient(
         transport=ASGITransport(app=app_with_store), base_url="http://test"
@@ -140,6 +156,31 @@ async def test_list_files_rejects_path_outside_workspace(app_with_store):
             "/api/skill-exec/list_files/call", json={"args": {"path": "../.."}}
         )
         assert resp.json().get("error") == "Path outside workspace"
+
+
+@pytest.mark.asyncio
+async def test_symlink_escape_rejected(app_with_store):
+    """A symlink inside the workspace pointing outside must not let file_read or
+    list_files escape: resolve() canonicalises the symlink and the containment
+    check then rejects the escaped target."""
+    import os
+    ws = app_with_store.state.agent_workspaces_dir / "default"
+    ws.mkdir(parents=True, exist_ok=True)
+    outside = app_with_store.state.agent_workspaces_dir.parent / "outside-secret"
+    outside.mkdir(parents=True, exist_ok=True)
+    (outside / "secret.txt").write_text("top secret")
+    os.symlink(outside, ws / "escape")
+    async with AsyncClient(
+        transport=ASGITransport(app=app_with_store), base_url="http://test"
+    ) as client:
+        r = await client.post(
+            "/api/skill-exec/list_files/call", json={"args": {"path": "escape"}}
+        )
+        assert r.json().get("error") == "Path outside workspace"
+        r2 = await client.post(
+            "/api/skill-exec/file_read/call", json={"args": {"path": "escape/secret.txt"}}
+        )
+        assert r2.json().get("error") == "Path outside workspace"
 
 
 @pytest.mark.asyncio
