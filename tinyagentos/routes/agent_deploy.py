@@ -105,14 +105,19 @@ def resolve_deploy_routing(request: Request, body: "DeployAgentRequest") -> "JSO
                     status_code=409,
                 )
 
-            # Cases 3 + 4: route to the worker that holds the model.
-            # Phase 1.5 will actually instruct the worker to launch; for
-            # now we return a 202 naming the destination so the caller
-            # knows where the agent needs to land. Deliberately do NOT
-            # add a local agent entry — a ghost entry on the controller
-            # for an agent that lives on Fedora would confuse both the
-            # UI and the LXC bulk-ops endpoints.
-            chosen = body.target_worker or location.canonical_host
+            # Explicit, non-conflicting worker pin: fall through to the deploy
+            # path, which now actually creates the agent container ON that
+            # worker's nested incus (see configure_remote_deploy + the deployer
+            # remote= path). Returning None lets deploy_agent_endpoint handle it.
+            if body.target_worker:
+                return None
+
+            # No pin, worker-hosted model: auto-placement onto the worker that
+            # holds the model is not implemented yet, so return a 202 naming the
+            # destination. Deliberately do NOT add a local agent entry -- a ghost
+            # entry on the controller for an agent that lives on a worker would
+            # confuse both the UI and the LXC bulk-ops endpoints.
+            chosen = location.canonical_host
             return JSONResponse(
                 {
                     "status": "routed",
@@ -122,8 +127,8 @@ def resolve_deploy_routing(request: Request, body: "DeployAgentRequest") -> "JSO
                     "available_on": location.hosts,
                     "message": (
                         f"model '{body.model}' lives on worker '{chosen}'. "
-                        f"Routed deploy target only — remote launch lands "
-                        f"with Phase 1.5 network model placement."
+                        f"Pin a target_worker to deploy there now, or wait for "
+                        f"auto-placement."
                     ),
                 },
                 status_code=202,
@@ -131,6 +136,140 @@ def resolve_deploy_routing(request: Request, body: "DeployAgentRequest") -> "JSO
         # kind == "controller" or "cloud": fall through to the unchanged
         # controller-local deploy path below.
     return None
+
+
+async def controller_callback_host(request: Request) -> str | None:
+    """Return the address a remote worker should use to reach this controller.
+
+    Resolution order:
+      1. TAOS_CONTROLLER_CALLBACK_HOST -- explicit operator override. Set this
+         when the worker reaches the controller on a specific address, e.g. the
+         controller's LAN IP for a bridged worker on the same LAN.
+      2. The controller's Tailscale IP (the manual-Tailscale worker path).
+      3. The configured host LAN IP (request.app.state.controller_lan_ip).
+    Returns None when none is available -- a remote deploy must NOT silently
+    fall back to 127.0.0.1 (the worker's own loopback, where the controller is
+    not listening).
+    """
+    import asyncio
+    import os
+    import subprocess
+
+    override = os.environ.get("TAOS_CONTROLLER_CALLBACK_HOST", "").strip()
+    if override:
+        return override
+
+    try:
+        # Shell out off the event loop so a cold/hanging tailscale never stalls
+        # the FastAPI worker for other requests.
+        out = await asyncio.to_thread(
+            subprocess.run,
+            ["tailscale", "ip", "-4"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        ip = (out.stdout or "").strip().splitlines()
+        if out.returncode == 0 and ip and ip[0].strip():
+            return ip[0].strip()
+    except Exception:  # noqa: BLE001
+        logger.debug("tailscale ip lookup failed; falling back to controller_lan_ip", exc_info=True)
+    # Fall back to the LAN address the controller advertises, if known.
+    return getattr(request.app.state, "controller_lan_ip", None)
+
+
+def _worker_arch_suffix(worker) -> str:
+    """Map a worker's reported hardware arch to the base-image arch suffix."""
+    hw = getattr(worker, "hardware", None) or {}
+    arch = str(hw.get("arch") or hw.get("machine") or "").lower()
+    if arch in ("x86_64", "amd64", "x64"):
+        return "x64"
+    if arch in ("aarch64", "arm64"):
+        return "arm64"
+    # Unknown: default to x64 (the common worker case); a wrong guess just
+    # means the prefetch 404s and the deploy falls back to the apt path.
+    return "x64"
+
+
+async def configure_remote_deploy(request: Request, body: "DeployAgentRequest"):
+    """Resolve an explicit target_worker pin into a remote-deploy config.
+
+    Returns ``(remote, taos_host, error_response)``:
+      - remote: the worker name to create the container on, or None for a
+        normal controller-local deploy.
+      - taos_host: the address the agent uses to call back to the controller.
+      - error_response: a JSONResponse to short-circuit on (the pinned worker
+        is unknown/offline, or the controller has no address the worker could
+        reach it on), or None.
+
+    The base-image prefetch is NOT done here -- it would block the deploy
+    request on a ~300-500MB download. Call prefetch_base_onto_worker from the
+    background deploy task instead.
+    """
+    if not body.target_worker:
+        return None, "127.0.0.1", None
+
+    cm = getattr(request.app.state, "cluster_manager", None)
+    worker = cm.get_worker(body.target_worker) if cm is not None else None
+    if worker is None:
+        return None, "127.0.0.1", JSONResponse(
+            {"error": f"worker '{body.target_worker}' is not registered"},
+            status_code=409,
+        )
+    if getattr(worker, "status", "offline") != "online":
+        return None, "127.0.0.1", JSONResponse(
+            {"error": f"worker '{body.target_worker}' is not online"},
+            status_code=409,
+        )
+
+    taos_host = await controller_callback_host(request)
+    if not taos_host:
+        # A remote agent that can't reach the controller would install and then
+        # silently fail to phone home (bridge, skills, traces, memory). Refuse
+        # rather than start an unreachable agent.
+        return None, "127.0.0.1", JSONResponse(
+            {
+                "error": (
+                    "cannot derive a controller address the worker can reach "
+                    "(no Tailscale IP and no controller_lan_ip configured); "
+                    "remote deploy aborted"
+                )
+            },
+            status_code=500,
+        )
+
+    return body.target_worker, taos_host, None
+
+
+async def prefetch_base_onto_worker(request: Request, body: "DeployAgentRequest") -> None:
+    """Best-effort: import the framework's correct-arch base image onto the
+    pinned worker's nested incus so the deploy clones it instead of cold-installing.
+
+    Call this from the BACKGROUND deploy task -- it can download ~300-500MB and
+    must never block the deploy HTTP request. Any failure is non-fatal: the
+    deployer falls back to the cold apt path when the alias is absent.
+    """
+    if not body.target_worker or not body.framework or body.framework == "none":
+        return
+    cm = getattr(request.app.state, "cluster_manager", None)
+    worker = cm.get_worker(body.target_worker) if cm is not None else None
+    if worker is None:
+        return
+    try:
+        from tinyagentos.agent_image import (
+            base_image_alias,
+            base_image_url_for_alias,
+            ensure_image_present,
+        )
+
+        alias = base_image_alias(body.framework)
+        url = base_image_url_for_alias(alias, _worker_arch_suffix(worker))
+        await ensure_image_present(alias, url=url, remote=body.target_worker)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "remote prefetch of base image for %s onto %s failed (non-fatal)",
+            body.framework, body.target_worker,
+        )
 
 
 async def archive_smoke_check(request: Request, unique_slug: str, framework: str) -> bool:

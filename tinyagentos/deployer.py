@@ -150,6 +150,12 @@ class DeployRequest:
     # 127.0.0.1 on the host.
     taos_host: str = "127.0.0.1"
     taos_port: int = 6969
+    # When set (e.g. "fedora-worker"), the agent container is created on that
+    # enrolled incus remote's nested incus instead of locally. The caller must
+    # also set taos_host to an address the worker can reach the controller on
+    # (its Tailscale IP), since the localhost proxy devices are not used for a
+    # remote deploy.
+    remote: str | None = None
     # Per §10.10: default 40 GiB rootfs quota. Overridable per-agent at
     # deploy time. None disables quota (unlimited, e.g. for dev/test).
     root_size_gib: int = 40
@@ -270,10 +276,19 @@ async def deploy_agent(req: DeployRequest) -> dict:
             env["LITELLM_API_KEY"] = llm_key
             # Compat shim — smolagents and other frameworks still expect OPENAI_API_KEY.
             env["OPENAI_API_KEY"] = llm_key
-            env["OPENAI_BASE_URL"] = f"{proxy.url}/v1"
+            # A local deploy reaches LiteLLM via the proxy device on the
+            # container's own 127.0.0.1; a remote worker has no proxy device, so
+            # it reaches the controller's LiteLLM over the network at taos_host
+            # (the controller's Tailscale IP) on the host's LiteLLM port.
+            if req.remote:
+                _llm_port = getattr(proxy, "port", None) or 7834
+                _llm_base = f"http://{req.taos_host}:{_llm_port}"
+            else:
+                _llm_base = proxy.url
+            env["OPENAI_BASE_URL"] = f"{_llm_base}/v1"
             # Host-side embedding endpoint — same LiteLLM process,
             # OpenAI-compatible /v1/embeddings. Framework-agnostic.
-            env["TAOS_EMBEDDING_URL"] = f"{proxy.url}/v1/embeddings"
+            env["TAOS_EMBEDDING_URL"] = f"{_llm_base}/v1/embeddings"
             # Stable alias the host LiteLLM routes to whichever
             # concrete embedding model the backends actually have loaded.
             env["TAOS_EMBEDDING_MODEL"] = EMBEDDING_ALIAS
@@ -320,9 +335,14 @@ async def deploy_agent(req: DeployRequest) -> dict:
     # /root/.openclaw/openclaw.json and /root/.openclaw/env inside the container
     # from these env vars. Bridge URL is how the openclaw service phones home.
     env["TAOS_BRIDGE_URL"] = f"http://{req.taos_host}:{req.taos_port}"
-    # OPENAI_BASE_URL defaults to LiteLLM proxy if no llm_proxy in config.
+    # OPENAI_BASE_URL defaults to LiteLLM proxy if no llm_proxy in config. A
+    # remote deploy must target the controller over the network, not the
+    # container's own loopback (there is no proxy device on a worker).
     if "OPENAI_BASE_URL" not in env:
-        env["OPENAI_BASE_URL"] = "http://127.0.0.1:4000/v1"
+        if req.remote:
+            env["OPENAI_BASE_URL"] = f"http://{req.taos_host}:7834/v1"
+        else:
+            env["OPENAI_BASE_URL"] = "http://127.0.0.1:4000/v1"
     if "OPENAI_API_KEY" not in env:
         env["OPENAI_API_KEY"] = ""
     if "LITELLM_API_KEY" not in env:
@@ -391,7 +411,7 @@ async def deploy_agent(req: DeployRequest) -> dict:
             candidates.append(GENERIC_BASE_ALIAS)
         for alias in candidates:
             try:
-                present = await is_image_present(alias)
+                present = await is_image_present(alias, remote=req.remote)
             except Exception:
                 present = False
             if present:
@@ -419,10 +439,18 @@ async def deploy_agent(req: DeployRequest) -> dict:
         # this host UID so the trace bind-mount is writable by the container.
         host_uid=os.getuid(),
         root_size_gib=req.root_size_gib,
+        remote=req.remote,
     )
     if not result["success"]:
         return {"success": False, "error": _explain_container_failure(result.get("error")), "steps": steps}
     steps.append("container_created")
+
+    # Keep the bare name for the agent record, then qualify container_name with
+    # the remote so every downstream incus op (exec/push/destroy) targets the
+    # worker's nested incus. Local deploys leave it unchanged.
+    record_container = container_name
+    if req.remote:
+        container_name = f"{req.remote}:{container_name}"
 
     try:
         # Incus proxy devices: let the container reach host services via
@@ -435,25 +463,30 @@ async def deploy_agent(req: DeployRequest) -> dict:
         # The connect side tracks the live proxy port so the tunnel reaches the
         # right host process regardless of whether the operator kept the legacy
         # 4000 or migrated to 7834.
-        llm_proxy_ref = (req.extra_config or {}).get("llm_proxy")
-        litellm_host_port = getattr(llm_proxy_ref, "port", None) or 7834
-        proxy_devices = [
-            ("taos-proxy-litellm", 4000, litellm_host_port),
-            ("taos-proxy-taos", req.taos_port, req.taos_port),
-        ]
-        for dev_name, listen_port, connect_port in proxy_devices:
-            res = await add_proxy_device(
-                container_name,
-                dev_name,
-                listen=f"tcp:127.0.0.1:{listen_port}",
-                connect=f"tcp:127.0.0.1:{connect_port}",
-                bind_mode="instance",
-            )
-            if not res.get("success"):
-                raise RuntimeError(
-                    f"failed to attach proxy device {dev_name}: {res.get('output', '')}"
+        # Proxy devices map the container's 127.0.0.1 to host services. They
+        # only work for a LOCAL deploy; a remote worker reaches the controller
+        # directly over the network (taos_host is the controller's Tailscale IP
+        # for a remote deploy), so skip them.
+        if not req.remote:
+            llm_proxy_ref = (req.extra_config or {}).get("llm_proxy")
+            litellm_host_port = getattr(llm_proxy_ref, "port", None) or 7834
+            proxy_devices = [
+                ("taos-proxy-litellm", 4000, litellm_host_port),
+                ("taos-proxy-taos", req.taos_port, req.taos_port),
+            ]
+            for dev_name, listen_port, connect_port in proxy_devices:
+                res = await add_proxy_device(
+                    container_name,
+                    dev_name,
+                    listen=f"tcp:127.0.0.1:{listen_port}",
+                    connect=f"tcp:127.0.0.1:{connect_port}",
+                    bind_mode="instance",
                 )
-        steps.append("proxy_devices_attached")
+                if not res.get("success"):
+                    raise RuntimeError(
+                        f"failed to attach proxy device {dev_name}: {res.get('output', '')}"
+                    )
+            steps.append("proxy_devices_attached")
 
         # Step 2: Wait for network
         for _ in range(10):
@@ -604,7 +637,7 @@ async def deploy_agent(req: DeployRequest) -> dict:
         return {
             "success": True,
             "name": req.name,
-            "container": container_name,
+            "container": record_container,
             "ip": container_ip,
             "llm_key": llm_key,
             "steps": steps,
