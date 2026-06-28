@@ -274,13 +274,53 @@ async def _run_profile_import(request: Request, slug: str, agent: dict | None) -
         raise RuntimeError(f"failed to push bundle into container (rc={push_rc}): {push_out[-300:]}")
 
     hermes_bin = await _find_hermes_bin(container_name)
+    # Import under a unique per-agent profile name (the slug), never the bundle's
+    # own name. A profile exported from a user's main agent is named `default`,
+    # and `hermes profile import` REFUSES to import as `default` because that is
+    # the built-in root profile (~/.hermes): it errors with "Specify a different
+    # name". Passing --name <slug> both avoids that and prevents collisions with
+    # any existing profile in the fresh container.
     code, output = await exec_in_container(
         container_name,
-        [hermes_bin, "profile", "import", _CONTAINER_BUNDLE_PATH],
+        [hermes_bin, "profile", "import", _CONTAINER_BUNDLE_PATH, "--name", slug],
         timeout=300,
     )
     if code != 0:
         raise RuntimeError(f"hermes profile import failed ({code}): {output[-1000:]}")
+
+    # Make the imported profile the sticky default so the agent runs it rather
+    # than the empty built-in `default`. The import never overwrites `default`,
+    # so without this the agent would deploy with none of the restored persona.
+    use_code, use_out = await exec_in_container(
+        container_name,
+        [hermes_bin, "profile", "use", slug],
+        timeout=60,
+    )
+    if use_code != 0:
+        raise RuntimeError(f"hermes profile use failed ({use_code}): {use_out[-500:]}")
+
+    # Restart the gateway so the now-default imported profile is the one
+    # serving. `use` sets the sticky default but does not move the already-
+    # running gateway, and the agent is already started + marked running by
+    # this task, so without an explicit restart it keeps serving the empty
+    # built-in `default`. Best-effort: a restart failure must not undo an
+    # otherwise successful import, but a non-zero exit is logged loudly (not
+    # swallowed) since exec_in_container only RAISES on transport errors -- the
+    # agent would otherwise look healthy while serving the wrong profile. The
+    # slug is already a validated agent slug (alphanumeric + dashes), a valid
+    # hermes profile name, so `use <slug>` cannot be a bad-name case.
+    try:
+        restart_code, restart_out = await exec_in_container(
+            container_name, [hermes_bin, "gateway", "restart"], timeout=120
+        )
+        if restart_code != 0:
+            logger.warning(
+                "import %s: hermes gateway restart exited %s; the agent may serve "
+                "the empty default profile until its gateway is restarted: %s",
+                slug, restart_code, (restart_out or "")[-300:],
+            )
+    except Exception:
+        logger.exception("import %s: hermes gateway restart after profile use failed", slug)
 
     # Best-effort persona readback so the imported personality shows in taOS.
     if agent is not None:
