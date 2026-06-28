@@ -178,14 +178,14 @@ A typical flow: open Projects, create_project, add tasks, generate_image then
 canvas_add_image(project_id, image_ref) to place it; export_storybook(project_id,
 title, pages) writes the illustrated PDF to the project's Files.
 
-These drive the user's own desktop. Make your work visible: open the relevant app
-so the user can watch, then carry out the task with that app's tools. Open only
-what you need, leave their windows alone, say what you do.
+These drive the user's desktop. Open only the app you need so the user can watch
+you work, and leave their other windows alone.
 
 You can read and write shared notes and lists you belong to:
 
 - **notes_list_shared_docs** -- the docs you belong to (id, kind, title, updated_at).
 - **notes_add_entry** -- append to a doc you belong to. Args: `doc_id`, `text`.
+- **notes_set_done** -- mark a list task done or not. Args: `doc_id`, `entry_id`, `done`.
 ---
 
 # Generating good images
