@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tinyagentos"
-version = "1.0.0-beta.12"
+version = "1.0.0-beta.13"
 description = "Self-hosted AI agent memory system for low-power hardware"
 license = { file = "LICENSE" }
 # Upper-capped at <3.14 because litellm (the proxy extra, the agent/model proxy
@@ -42,6 +42,9 @@ dependencies = [
     # http://taos.local:<port>/ on the LAN without users knowing its IP
     # (tinyagentos/services/mdns_publisher.py).
     "zeroconf>=0.150.0",
+    # Diff/patch for the notes revision log: computes and applies text diffs
+    # for the Time Machine history layer (tinyagentos/notes/shared_docs_store.py).
+    "diff-match-patch>=20230430",
 ]
 
 [project.optional-dependencies]

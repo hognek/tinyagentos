@@ -220,6 +220,7 @@ async def get_fleet(request: Request, user: CurrentUser = Depends(current_user))
             agents.append({
                 "handle": handle,
                 "state": "working",
+                "framework": "",  # backfilled from the registry below, if known
                 "holds": {
                     "task_id": t.get("id"),
                     "project_id": pid,
@@ -233,6 +234,7 @@ async def get_fleet(request: Request, user: CurrentUser = Depends(current_user))
     # shows the full active roster, not just the busy lanes. Best-effort: a
     # missing or erroring registry must not break the working view.
     registry = getattr(request.app.state, "agent_registry", None)
+    registered: list[dict] = []
     if registry is not None:
         try:
             if user.is_admin:
@@ -248,9 +250,38 @@ async def get_fleet(request: Request, user: CurrentUser = Depends(current_user))
             working.add(handle)
             # Idle agents hold no card, so no claim age; keep the shape uniform.
             agents.append({
-                "handle": handle, "state": "idle", "holds": None,
-                "held_seconds": None, "stale": False,
+                "handle": handle, "state": "idle",
+                "framework": (rec.get("framework") or ""),
+                "holds": None, "held_seconds": None, "stale": False,
             })
 
+    # Lane badge: attach each agent's framework (kilo/opencode/hermes/...) from the
+    # registry. Working agents come from the board (claim handle), so backfill them
+    # from the registry by handle; unknown handles keep the empty default.
+    framework_by_handle = {
+        (rec.get("handle") or "").strip(): (rec.get("framework") or "")
+        for rec in registered
+        if (rec.get("handle") or "").strip()
+    }
+    for a in agents:
+        if not a.get("framework"):
+            a["framework"] = framework_by_handle.get(a["handle"], "")
+
     agents.sort(key=lambda a: a["handle"])
-    return {"agents": agents, "paused": _read_state(request)}
+
+    # Fleet health summary: a single-glance roll-up for the Observatory header so
+    # the UI does not have to recompute counts. `status` is degraded when any
+    # lane is stale (a wedged claim the pause switch would hide), else active if
+    # anything is working, else idle.
+    stale_handles = [a["handle"] for a in agents if a.get("stale")]
+    working_count = sum(1 for a in agents if a["state"] == "working")
+    idle_count = sum(1 for a in agents if a["state"] == "idle")
+    health = {
+        "total": len(agents),
+        "working": working_count,
+        "idle": idle_count,
+        "stale": len(stale_handles),
+        "stale_handles": stale_handles,
+        "status": "degraded" if stale_handles else ("active" if working_count else "idle"),
+    }
+    return {"agents": agents, "paused": _read_state(request), "health": health}
