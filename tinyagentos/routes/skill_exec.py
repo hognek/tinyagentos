@@ -9,12 +9,20 @@ to execute them.
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from pathlib import Path
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+# Hold references to in-flight fire-and-forget receipt tasks so they are not
+# garbage-collected before they run (asyncio keeps only a weak reference).
+_bg_receipt_tasks: set = set()
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +465,38 @@ async def list_tools(request: Request, agent_name: str):
     return JSONResponse({"tools": tools})
 
 
+def _capture_tool_receipt(request: Request, skill_id: str, args: dict, result) -> None:
+    """Schedule a fire-and-forget action receipt for this tool call (#155).
+
+    Fail-soft and off the response path: extracts the plain values it needs, then
+    schedules the write on the loop so the tool response returns first. Any error
+    here is swallowed; a receipt must never disrupt or slow a tool call.
+    """
+    try:
+        from tinyagentos.receipts import emit_tool_receipt
+
+        store = getattr(request.app.state, "receipt_store", None)
+        agent = (args.get("agent_name") or "").strip()
+        if store is None or not agent:
+            return
+        files_changed = None
+        if skill_id == "file_write" and isinstance(result, dict) and not result.get("error"):
+            files_changed = [{"path": args.get("path", ""), "bytes": result.get("bytes")}]
+        # agent_name is identity, not a tool argument; keep it out of tool_args.
+        tool_args = {k: v for k, v in args.items() if k != "agent_name"}
+        task = asyncio.create_task(emit_tool_receipt(
+            store, agent=agent, tool_name=skill_id, args=tool_args,
+            result=result, files_changed=files_changed,
+        ))
+        # Keep a strong reference until the task finishes, else it can be GC'd.
+        _bg_receipt_tasks.add(task)
+        task.add_done_callback(_bg_receipt_tasks.discard)
+    except Exception:  # noqa: BLE001 - never let receipt capture touch the tool path
+        # Log so a silent integration break (bad import, missing store) is visible;
+        # still swallowed so the tool path is never affected.
+        logger.warning("receipt capture dispatch failed for %s", skill_id, exc_info=True)
+
+
 @router.post("/api/skill-exec/{skill_id}/call")
 async def execute_skill(skill_id: str, request: Request):
     """Execute a skill with the given arguments."""
@@ -482,6 +522,7 @@ async def execute_skill(skill_id: str, request: Request):
 
     try:
         result = await impl(args, request)
+        _capture_tool_receipt(request, skill_id, args, result)
         return JSONResponse(result)
     except Exception as exc:
         return JSONResponse({"error": str(exc)}, status_code=500)
