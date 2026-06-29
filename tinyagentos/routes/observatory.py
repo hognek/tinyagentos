@@ -180,6 +180,96 @@ async def set_throttle(body: ThrottleBody, request: Request, user: CurrentUser =
     return state
 
 
+# --- Per-session approval-mode steer (#133). A controller-owned mode the
+# dispatch loop will read each iteration to decide how much an agent may do
+# without asking: ``default`` (ask before edits), ``accept_edits`` (auto-allow
+# workspace/tmp edits), ``dont_ask`` (no prompts). Approval mode is PER-SESSION
+# (the scope key is a session id), unlike pause/throttle which are per-lane: how
+# much an agent may do without asking is a property of the running session, not
+# the lane. Same storage shape as pause/throttle (global plus a per-session
+# override map, JSON in data_dir, admin-gated writes). This is
+# the storage+API layer only; wiring the dispatch loop to honour the mode and
+# the Observatory UI control are a deliberate follow-up (held for Jay). Until
+# then nothing reads this, so it changes no live agent behaviour. ---
+
+APPROVAL_MODES = ("default", "accept_edits", "dont_ask")
+
+
+def _approval_path(request: Request) -> Path:
+    return Path(request.app.state.data_dir) / "observatory_approval_mode.json"
+
+
+def _coerce_mode(v) -> str | None:
+    """Return *v* if it is a recognised mode, else None."""
+    return v if v in APPROVAL_MODES else None
+
+
+def _read_approval(request: Request) -> dict:
+    """Current approval modes. ``global`` falls back to the safe ``default``
+    (ask before edits); only valid non-default per-session overrides are kept so
+    a hand-edited or partial file cannot widen permissions unexpectedly."""
+    p = _approval_path(request)
+    if not p.exists():
+        return {"global": "default", "sessions": {}}
+    try:
+        data = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return {"global": "default", "sessions": {}}
+    # A hand-edited file could be valid JSON but not the expected shape (a scalar,
+    # a list, or a non-dict "sessions"). Guard both so a malformed file degrades
+    # to the safe default instead of 500ing the GET.
+    if not isinstance(data, dict):
+        return {"global": "default", "sessions": {}}
+    raw_sessions = data.get("sessions")
+    if not isinstance(raw_sessions, dict):
+        raw_sessions = {}
+    sessions = {}
+    for k, v in raw_sessions.items():
+        mode = _coerce_mode(v)
+        if mode is not None and mode != "default":
+            sessions[str(k)] = mode
+    return {"global": _coerce_mode(data.get("global")) or "default", "sessions": sessions}
+
+
+class ApprovalModeBody(BaseModel):
+    scope: str  # "global" or a session id
+    mode: str  # one of APPROVAL_MODES; "default" clears a per-session override
+
+
+@router.get("/api/observatory/approval-mode")
+async def get_approval_mode(request: Request, user: CurrentUser = Depends(current_user)):
+    """Current approval modes. The dispatch loop will poll this each iteration."""
+    return _read_approval(request)
+
+
+@router.post("/api/observatory/approval-mode")
+async def set_approval_mode(body: ApprovalModeBody, request: Request, user: CurrentUser = Depends(current_user)):
+    """Set the approval mode globally or for a single session. Admin only, since
+    it relaxes how much an agent may do without asking. ``mode='default'`` on a
+    session clears its override (it falls back to global)."""
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="forbidden")
+    scope = body.scope.strip()
+    if not scope:
+        return JSONResponse({"error": "scope required"}, status_code=400)
+    mode = _coerce_mode(body.mode)
+    if mode is None:
+        return JSONResponse(
+            {"error": f"invalid mode; expected one of {list(APPROVAL_MODES)}"},
+            status_code=400,
+        )
+    async with _write_lock:
+        state = _read_approval(request)
+        if scope == "global":
+            state["global"] = mode
+        elif mode != "default":
+            state["sessions"][scope] = mode
+        else:
+            state["sessions"].pop(scope, None)
+        _atomic_write(_approval_path(request), state)
+    return state
+
+
 @router.get("/api/observatory/fleet")
 async def get_fleet(request: Request, user: CurrentUser = Depends(current_user)):
     """The Observe half: which agents are working and what they hold right now.
