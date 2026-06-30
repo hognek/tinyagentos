@@ -300,9 +300,16 @@ async def _do_approve(request: Request, request_id: str, body: ApproveBody, user
     rel_mgr = _get_relationships(request)
 
     # Mint canonical identity in the registry.
+    # Strip whitespace first, then remove the leading "@" sigil (bus-addressing
+    # syntax only), then strip again.  If that leaves nothing (claim was "@" or
+    # whitespace-only) fall back to the framework name -- never the raw claim,
+    # which could still carry the "@", so display_name is always a clean,
+    # non-empty value.
+    _claim = record["identity_claim"].strip().removeprefix("@").strip()
+    display_name = _claim or record["framework"]
     reg_record = await registry.register(
         framework=record["framework"],
-        display_name=record["identity_claim"],
+        display_name=display_name,
         user_id=user.user_id,
         origin="external-selfjoin",
         handle="",
