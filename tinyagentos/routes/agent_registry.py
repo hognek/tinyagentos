@@ -88,6 +88,11 @@ class MintInternalRequest(BaseModel):
     slug: str
     scopes: list[str] = []
     project_id: Optional[str] = None
+    # When the handle is already owned by a non-internal agent (e.g. a driver
+    # agent that earlier self-joined via the consent flow), default-deny: the
+    # admin must set adopt=true to vouch for that existing identity and grant it
+    # driver scopes + a token. Guards against an impostor that grabbed a handle.
+    adopt: bool = False
 
     @field_validator("handle", "slug")
     @classmethod
@@ -246,10 +251,14 @@ async def _mint_internal_identity(
     slug: str,
     scopes: list[str],
     project_id: Optional[str] = None,
+    adopt: bool = False,
 ) -> dict:
-    """Register-or-reuse an internal agent by handle, ensure its grants, and mint
-    a registry JWT.  Idempotent: a second call with the same handle reuses the
-    existing active canonical_id and re-asserts the (idempotent) grants.
+    """Register-or-reuse a driver-agent identity by handle, ensure its grants,
+    and mint a registry JWT.  Idempotent: a second call with the same handle
+    reuses the existing active canonical_id and re-asserts the (idempotent)
+    grants.  When the handle is already owned by a NON-internal agent (e.g. a
+    driver that self-joined via the consent flow), default-deny with 409 unless
+    ``adopt`` is set -- then the admin is explicitly vouching for that identity.
     """
     store = _get_store(request)
     grants_store = _get_grants_store(request)
@@ -260,17 +269,21 @@ async def _mint_internal_identity(
     async with _mint_lock:
         existing = await store.get_by_handle(handle)
         if existing is not None:
-            # Never hand internal scopes + a fresh token to an agent that already
-            # owns this handle under a different origin (e.g. an external
-            # self-join that claimed "@Hermes"). Only a taos-internal row reuses.
-            if existing.get("origin") != _INTERNAL_ORIGIN:
+            # A non-internal owner is only reused when the admin adopts it: this
+            # blocks an impostor that grabbed "@Hermes" from silently receiving
+            # driver scopes + a token, while still letting the operator vouch for
+            # a legitimately pre-existing driver (its origin is left untouched).
+            adopted = existing.get("origin") != _INTERNAL_ORIGIN
+            if adopted and not adopt:
                 raise HTTPException(
                     status_code=409,
-                    detail="handle is already owned by a non-internal agent",
+                    detail=("handle is already owned by a non-internal agent; "
+                            "pass adopt=true to vouch for it and grant driver scopes"),
                 )
             record = existing
             created = False
         else:
+            adopted = False
             record = await store.register(
                 framework=_INTERNAL_ORIGIN,
                 display_name=slug,
@@ -292,10 +305,25 @@ async def _mint_internal_identity(
         framework=record.get("framework", ""),
         project_id=project_id,
     )
+
+    # Minting a driver token is a privileged, trust-changing action -- leave a
+    # forensic trail. Adopt is the most sensitive (it elevates a possibly
+    # untrusted-origin identity), so it gets its own action name; create/reuse
+    # are logged too so every token issuance is traceable to an actor.
+    status_now = record.get("status", "")
+    await _audit_governance(
+        request,
+        action="adopt" if adopted else ("mint-internal-create" if created else "mint-internal-reuse"),
+        canonical_id=canonical_id,
+        actor_user_id=user.user_id,
+        before_status=status_now,
+        after_status=status_now,
+    )
     return {
         "handle": handle,
         "canonical_id": canonical_id,
         "created": created,
+        "adopted": adopted,
         "scopes": scopes,
         "token": token,
     }
@@ -324,6 +352,7 @@ async def mint_internal_agent(
         slug=body.slug,
         scopes=body.scopes,
         project_id=body.project_id,
+        adopt=body.adopt,
     )
 
 
@@ -331,13 +360,16 @@ async def mint_internal_agent(
 async def seed_internal_agents(
     request: Request,
     user: CurrentUser = Depends(current_user),
+    adopt: bool = False,
 ):
     """Idempotently mint the four internal driver agents and return their tokens.
 
     Admin only.  Each of @taOS-dev, @taOS-website-dev, @taOSmd-dev, @Hermes is
     minted with the a2a_send + a2a_receive scopes.  Re-running creates no
-    duplicate rows.  Response: {"seeded": [{handle, canonical_id, created,
-    scopes, token}, ...]}.
+    duplicate rows.  ``adopt=true`` (query param) vouches for any of those
+    handles that already exist under a non-internal origin (e.g. a driver that
+    self-joined earlier) instead of 409ing.  Response: {"seeded": [{handle,
+    canonical_id, created, adopted, scopes, token}, ...]}.
     """
     if not user.is_admin:
         raise HTTPException(status_code=403, detail="forbidden")
@@ -350,6 +382,7 @@ async def seed_internal_agents(
                 handle=spec["handle"],
                 slug=spec["slug"],
                 scopes=list(_INTERNAL_AGENT_SCOPES),
+                adopt=adopt,
             )
         )
     return {"seeded": seeded}
