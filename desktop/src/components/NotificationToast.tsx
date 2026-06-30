@@ -3,6 +3,7 @@ import { X, Info, CheckCircle, AlertTriangle, AlertCircle, Server, Bot, BellOff 
 import { useNotificationStore, type Notification } from "@/stores/notification-store";
 import { useProcessStore } from "@/stores/process-store";
 import { getApp } from "@/registry/app-registry";
+import { ConsentActions, consentPayload } from "./ConsentActions";
 
 const LEVEL_ICONS = {
   info: Info,
@@ -266,18 +267,24 @@ function extractTagged(text: string, tag: string): string | undefined {
 
 function ToastItem({ notif, onExpire }: { notif: Notification; onExpire: () => void }) {
   const dismiss = useNotificationStore((s) => s.dismiss);
+  const archiveRead = useNotificationStore((s) => s.archiveRead);
   const Icon = LEVEL_ICONS[notif.level];
   const isAgentPaused = notif.source === "agent.paused";
+  const consent = notif.source === "auth_requests" ? consentPayload(notif.data) : null;
+  // Stable boolean for the effect dependency — using the `consent` object
+  // would recreate the timer on every render because consentPayload() returns
+  // a new object reference each time.
+  const isConsentToast = consent !== null;
 
   useEffect(() => {
-    // Agent-paused toasts stay until the user explicitly acts on them.
-    if (isAgentPaused) return;
+    // Agent-paused and consent toasts stay until the user explicitly acts.
+    if (isAgentPaused || isConsentToast) return;
     // Auto-expiry only hides the toast; it must NOT archive. Archiving is an
     // explicit user action (the X button / "Keep paused"). Otherwise every
     // toast that simply times out would silently fill the History view.
     const timer = setTimeout(onExpire, 5000);
     return () => clearTimeout(timer);
-  }, [notif.id, onExpire, isAgentPaused]);
+  }, [notif.id, onExpire, isAgentPaused, isConsentToast]);
 
   return (
     <div
@@ -294,6 +301,13 @@ function ToastItem({ notif, onExpire }: { notif: Notification; onExpire: () => v
         )}
         {isAgentPaused && (
           <AgentPausedActions notif={notif} onDismiss={() => dismiss(notif.id)} />
+        )}
+        {consent && (
+          <ConsentActions
+            requestId={consent.requestId}
+            scopes={consent.scopes}
+            onResolved={() => archiveRead(notif.id)}
+          />
         )}
       </div>
       {!isAgentPaused && (
