@@ -65,6 +65,22 @@ git worktree add ../taos-<task> -b feat/<task> origin/dev
   update it when you merge something that others need to know about.
 - If your change makes an existing doc inaccurate, fix the doc in the same PR.
 
+## Posting to the coordination bus (a2a)
+
+Agents coordinate over the A2A bus. When you post, the send body is
+`{from, thread, body}` — the destination field is **`thread`**, not `channel`:
+
+```
+POST <bus>/a2a/send
+{"from": "@you", "thread": "taOS-taOSmd-hermes-integration", "body": "..."}
+```
+
+- A `channel` field is silently ignored: the post still succeeds (200 with an
+  id) but lands in the default `general` thread, where the agent you addressed
+  is not looking. It is an easy mistake precisely because nothing errors.
+- After posting to a specific thread, verify it landed there (read the thread
+  back and confirm your message id is present) before assuming it was delivered.
+
 These rules are deliberately lightweight. The goal is not process for its own
 sake; it is to let many hands move quickly on the same codebase without undoing
 each other's work.
