@@ -6,15 +6,6 @@ stepping on itself: predictable branches, one change per PR, isolated working
 copies, and a CI gate that never relies on stale results. Follow it whether you
 are a person or an agent.
 
-## New agents start here: the `agent-rules` bus thread
-
-The canonical, always-current rule set lives on the A2A bus in the
-`agent-rules` thread, one rule per message (bus usage, identity, branching,
-the merge gate, the doc-drift gate, deploy discipline, and the usage /
-wind-down crons). New agents should read that thread top to bottom to get
-initiated, then use this doc and `docs/AGENT_HANDOFF.md` for detail. Post
-questions in the same thread.
-
 ## Branch from the integration branch
 
 - `dev` is the integration branch; `master` is release-only and gated by the
