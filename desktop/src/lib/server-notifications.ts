@@ -11,7 +11,7 @@ import { withCsrf } from "./csrf";
  * ids, and second-precision timestamps are converted to milliseconds.
  */
 
-interface ServerNotificationRow {
+export interface ServerNotificationRow {
   id: number;
   timestamp: number; // unix seconds
   level: string;
@@ -19,6 +19,7 @@ interface ServerNotificationRow {
   message: string;
   read: boolean;
   source: string;
+  data?: Record<string, unknown> | null;
 }
 
 const VALID_LEVELS: ReadonlySet<Notification["level"]> = new Set([
@@ -56,13 +57,14 @@ export function sourceToTarget(
     case "app.failed":
       return { action: "store" };
     case "decisions":
+    case "auth_requests":
       return { action: "decisions" };
     default:
       return {};
   }
 }
 
-function mapRow(row: ServerNotificationRow): Notification {
+export function mapRow(row: ServerNotificationRow): Notification {
   const level = VALID_LEVELS.has(row.level as Notification["level"])
     ? (row.level as Notification["level"])
     : "info";
@@ -77,6 +79,7 @@ function mapRow(row: ServerNotificationRow): Notification {
     timestamp: row.timestamp * 1000,
     ...(action ? { action } : {}),
     ...(meta ? { meta } : {}),
+    ...(row.data ? { data: row.data } : {}),
   };
 }
 

@@ -103,6 +103,22 @@ async def _migration_v1_add_status(conn) -> None:
     )
     await conn.commit()
 
+
+async def _migration_v2_strip_at_display_name(conn) -> None:
+    """Strip a leading '@' from display_name for all rows (idempotent).
+
+    The '@' sigil is bus-addressing syntax only; it must never be stored
+    in display_name.  Safe to run every startup — rows without a leading
+    '@' are untouched by the WHERE clause.
+    """
+    # '@_%' requires at least one character after '@', so bare '@'-only rows
+    # are intentionally left unchanged and cannot be produced as empty strings.
+    await conn.execute(
+        "UPDATE agent_registry SET display_name = substr(display_name, 2) "
+        "WHERE display_name LIKE '@_%'"
+    )
+    await conn.commit()
+
 # ---------------------------------------------------------------------------
 # Signing-key helpers (Ed25519, persisted to disk)
 # ---------------------------------------------------------------------------
@@ -300,6 +316,7 @@ class AgentRegistryStore(BaseStore):
     async def _post_init(self) -> None:
         """Idempotently ensure the status column exists and is backfilled."""
         await _migration_v1_add_status(self._db)
+        await _migration_v2_strip_at_display_name(self._db)
 
     # ------------------------------------------------------------------
     # Registration
@@ -381,6 +398,29 @@ class AgentRegistryStore(BaseStore):
                 (canonical_id,),
             )
         ).fetchone()
+        return _row_to_dict(row) if row else None
+
+    async def get_by_handle(self, handle: str, *, status: str = "active") -> Optional[dict]:
+        """Return the oldest entry with *handle* and *status*, or ``None``.
+
+        Used to make internal-identity minting idempotent by handle: when an
+        active agent already owns the handle its canonical_id is reused instead
+        of registering a duplicate row.  Pass ``status=None`` to match any
+        status.
+        """
+        if self._db is None:
+            raise RuntimeError("AgentRegistryStore not initialised")
+        if status is None:
+            cursor = await self._db.execute(
+                "SELECT * FROM agent_registry WHERE handle = ? ORDER BY id LIMIT 1",
+                (handle,),
+            )
+        else:
+            cursor = await self._db.execute(
+                "SELECT * FROM agent_registry WHERE handle = ? AND status = ? ORDER BY id LIMIT 1",
+                (handle, status),
+            )
+        row = await cursor.fetchone()
         return _row_to_dict(row) if row else None
 
     async def list_all(self, *, status: Optional[str] = None) -> list[dict]:

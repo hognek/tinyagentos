@@ -19,12 +19,10 @@ To keep this sustainable, **all contributors must agree to the Contributor Licen
 ```bash
 git clone https://github.com/jaylfc/tinyagentos.git
 cd tinyagentos
-python3 -m venv venv
-source venv/bin/activate
-pip install -e ".[dev]"
+uv sync --extra dev
 # Build the desktop SPA — static/desktop/ is gitignored (generated artifact)
 cd desktop && npm install && npm run build && cd ..
-pytest tests/ -v
+uv run pytest tests/ --ignore=tests/e2e -n auto
 ```
 
 Python 3.10 or later and Node.js 22 or later are required.
@@ -58,7 +56,7 @@ The app catalog is one of the easiest ways to contribute. See [Adding an App to 
 1. Fork the repository
 2. Create a branch: `git checkout -b feat/my-feature`
 3. Make your changes and add tests
-4. Run `pytest tests/ -v` — all tests must pass
+4. Run `uv run pytest tests/ --ignore=tests/e2e -n auto` - all tests must pass
 5. Open a pull request against **`dev`**, not `master`
 
 Keep pull requests focused. One feature or fix per PR is easier to review.
@@ -195,7 +193,7 @@ Do not include AI tool attribution in commit messages.
 Run the full test suite:
 
 ```bash
-pytest tests/ -v
+uv run pytest tests/ --ignore=tests/e2e -n auto
 ```
 
 Run a specific test file:
@@ -207,6 +205,31 @@ pytest tests/test_catalog_sync.py -v
 The project has ~3,590 tests. CI runs against Python 3.12 and 3.13 on every pull request (two matrix jobs). Python 3.11 is added on the nightly scheduled run. A PR cannot be merged until all matrix jobs pass.
 
 When adding a feature, add tests that cover the new behaviour. When fixing a bug, add a regression test.
+
+---
+
+## Documentation gate
+
+A gate blocks PRs that add or remove certain feature code without a matching doc update. It only fires on structural changes (a file added or deleted), never on a plain edit, and only for a small set of conservative rules configured in `docs/doc-gate.toml`:
+
+| Change | Requires editing one of |
+|--------|--------------------------|
+| A desktop app under `desktop/src/apps/` is added or removed | `README.md` |
+| A route module under `tinyagentos/routes/` is added or removed | `docs/agent-coordination.md` |
+| An installer under `tinyagentos/installers/` or `scripts/install*` is added or removed | `README.md` |
+| A manifest under `app-catalog/` is added or removed | `README.md` |
+
+If your PR trips a rule and there is genuinely nothing to document (or you already covered it elsewhere), add a trailer line to a commit message instead of editing a doc:
+
+```
+Docs-Reviewed: no user-facing change, internal refactor only
+```
+
+The trailer must have non-empty text after the colon; a bare `Docs-Reviewed:` does not count.
+
+Run `scripts/install-git-hooks.sh` once to enable local hooks (`.githooks/pre-commit` and `.githooks/commit-msg`) so the gate runs before you push instead of after you open the PR. Local hooks are a convenience only: `.github/workflows/doc-gate.yml` is the authoritative check and runs on every PR regardless of local setup or `--no-verify`.
+
+To add a new rule, edit `docs/doc-gate.toml` -- rules are data, no code changes needed.
 
 ---
 

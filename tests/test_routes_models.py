@@ -5,7 +5,28 @@ import httpx
 from httpx import AsyncClient, ASGITransport
 from unittest.mock import AsyncMock, patch, MagicMock
 from tinyagentos.app import create_app
-from tinyagentos.routes.models import get_downloaded_models
+from tinyagentos.installers.model_paths import models_root
+from tinyagentos.routes.models import DEFAULT_MODELS_DIR, get_downloaded_models
+
+
+class TestDefaultModelsDir:
+    """DEFAULT_MODELS_DIR must track the install dir (via models_root()),
+    not a hardcoded /opt/tinyagentos literal — so an existing install at
+    /opt/tinyagentos and a fresh one at /opt/taos both resolve correctly.
+    """
+
+    def test_tracks_models_root(self):
+        assert DEFAULT_MODELS_DIR == models_root()
+
+    def test_is_not_hardcoded_opt_tinyagentos(self):
+        assert str(DEFAULT_MODELS_DIR) != "/opt/tinyagentos/models"
+
+    def test_honours_env_override(self, monkeypatch, tmp_path):
+        # models_root() reads TAOS_MODELS_ROOT at call time, so no module reload
+        # is needed; DEFAULT_MODELS_DIR is bound to models_root() (see
+        # test_tracks_models_root). Avoids the global-state race of reload.
+        monkeypatch.setenv("TAOS_MODELS_ROOT", str(tmp_path / "alt-models"))
+        assert models_root() == tmp_path / "alt-models"
 
 
 @pytest.fixture

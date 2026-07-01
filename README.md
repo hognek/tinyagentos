@@ -26,7 +26,7 @@
 
 Self-hosted AI agent platform that runs on whatever hardware you have. An old laptop, a Raspberry Pi, a gaming PC, an SBC gathering dust, or all of them at once. taOS turns your spare hardware into a distributed AI compute cluster.
 
-A full web desktop environment with 36 bundled apps, 108 catalog apps, 47 MCP plugins, 16 agent frameworks, a curated local model catalog of 112 manifests covering LLMs, vision, embeddings, audio, and image generation (including RK3588 NPU variants via c01zaut/happyme531), plus 167k+ searchable models from HuggingFace, agent deployment, training, image/video/audio generation, and full system monitoring, all from a single web dashboard. Supports Apple Silicon (MLX), NVIDIA, AMD, Rockchip NPU, Raspberry Pi, Android phones, and more.
+A full web desktop environment with 40 bundled apps, 109 catalog apps, 47 MCP plugins, 17 agent frameworks, a curated local model catalog of 113 manifests covering LLMs, vision, embeddings, audio, and image generation (including RK3588 NPU variants via c01zaut/happyme531), plus 167k+ searchable models from HuggingFace, agent deployment, training, image/video/audio generation, and full system monitoring, all from a single web dashboard. Supports Apple Silicon (MLX), NVIDIA, AMD, Rockchip NPU, Raspberry Pi, Android phones, and more.
 
 **Framework-agnostic by design.** taOS owns everything that matters: your agent's memory, files, communication channels, model access, and configuration. The agent framework is just a replaceable execution engine. Switch from SmolAgents to LangChain to OpenClaw and your agent keeps its entire history, all its Telegram/Discord/Slack connections, its trained LoRA adapters, its files, and its API keys. No migration, no data loss, no reconfiguration. This is possible because taOS manages the full agent lifecycle outside the framework.
 
@@ -91,7 +91,7 @@ Open `http://your-host:6969` (or `http://taos.local:6969` with mDNS). The root U
 
 ## Web Desktop Experience
 
-taOS ships with a full browser-based desktop environment. Open it at `http://your-host:6969/` and you get a window manager, dock, launchpad, notifications, widgets, and 36 bundled apps, no native install required. On phones and tablets it automatically swaps to a widget-first home screen with swipeable pages, a persistent dock, and desktop-style app windows with close/minimise title bars, installable as a fullscreen PWA from the browser's "Add to Home Screen".
+taOS ships with a full browser-based desktop environment. Open it at `http://your-host:6969/` and you get a window manager, dock, launchpad, notifications, widgets, and 40 bundled apps, no native install required. On phones and tablets it automatically swaps to a widget-first home screen with swipeable pages, a persistent dock, and desktop-style app windows with close/minimise title bars, installable as a fullscreen PWA from the browser's "Add to Home Screen".
 
 - **Window manager.** Float, snap zones, drag, resize, minimise, maximise, close
 - **Top bar.** Global search (Ctrl+Space), clock, notifications, widget toggle
@@ -108,20 +108,20 @@ taOS ships with a full browser-based desktop environment. Open it at `http://you
 - **Standalone Chat PWA**. Messages available as a dedicated installable app at `/chat-pwa`
 - **shadcn/ui primitives**. Button, Card, Input, Tabs, Switch, Toolbar
 
-### 39 Bundled Desktop Apps
+### 40 Bundled Desktop Apps
 
-**Platform apps (22):** Messages (WebSocket chat), Mail (IMAP/SMTP accounts, read and send), Projects (Kanban + A2A), Agents (deploy wizard + logs + skills), Store (47+ apps), Settings (multi-section with Memory capture toggles), Models, Providers (cloud LLM provider management, add/test/remove OpenAI, Anthropic, DeepSeek, and compatible APIs), Memory (User + Agent sections), MCP (plugin manager), Channels, Secrets, Tasks, Import, Images (Image Studio: Create / Library / Edit with tier-aware inpaint + upscale backends), Dashboard (Activity), Cluster (worker management + health), Library (knowledge pipeline, document library with collections and search), Agent Browsers (manage agent browser sessions), Files (real VFS with workspace + shared folders), taOS Agent (Agent-as-a-Model endpoint), Guides.
+**Platform apps (27):** Messages (WebSocket chat), Mail (IMAP/SMTP accounts, read and send), Projects (Kanban + A2A), Agents (deploy wizard + logs + skills), Store (109+ apps), Settings (multi-section with Memory capture toggles), Models, Providers (cloud LLM provider management, add/test/remove OpenAI, Anthropic, DeepSeek, and compatible APIs), Memory (User + Agent sections), MCP (plugin manager), Channels, Secrets, Tasks, Import, Images (Image Studio: Create / Library / Edit with tier-aware inpaint + upscale backends), Dashboard (Activity), Cluster (worker management + health), Library (knowledge pipeline, document library with collections and search), Agent Browsers (manage agent browser sessions), Files (real VFS with workspace + shared folders), taOS Agent (Agent-as-a-Model endpoint), Guides, Feedback, Decisions, Observatory, Notes, Todo.
 
 **Optional taOS apps (4):** Reddit (subreddit browser with saved threads and memory ingest), YouTube (video library with transcript extraction), GitHub (repository browser with code search), and X (feed monitor with bookmarks and memory capture) ship in the build but are not installed by default; install or remove them from the Store's "taOS Apps" section.
 
-**OS apps (10):** Weather, Calculator (math.js), Calendar (month view), Contacts (CRUD), Browser (URL-rewriting proxy, agent-ready), Browser (Streamed) (real WebRTC Chromium streamed from the host), Media Player (Plyr), Text Editor (CodeMirror 6 with Obsidian-style theme), Image Viewer (zoom/rotate), Terminal (real PTY + SSH client).
+**OS apps (9):** Weather, Calculator (math.js), Calendar (month view), Contacts (CRUD), Browser (URL-rewriting proxy, agent-ready), Media Player (Plyr), Text Editor (CodeMirror 6 with Obsidian-style theme), Image Viewer (zoom/rotate), Terminal (real PTY + SSH client).
 
 **Games & studios (4):** Game Studio (offline-AI game maker, three.js + react-three-fiber, fullscreen play with mandatory exit-to-taOS, test then optionally share to the Store), Chess (plays against real agents via LLM), Wordle, Crosswords.
 
 The Activity app includes a Cluster overview panel showing live worker status and resource stats alongside the process monitor. The Model Browser surfaces cloud models (from configured providers) alongside local catalog models, with a provider badge per entry. The deploy wizard accepts cloud models as inference targets.
 
 <p align="center">
-  <img src="docs/images/desktop-store.jpg" alt="App store -- 108 catalog apps, 16 agent frameworks, hardware-filtered" width="100%">
+  <img src="docs/images/desktop-store.jpg" alt="App store -- 109 catalog apps, 17 agent frameworks, hardware-filtered" width="100%">
 </p>
 
 <p align="center"><sub>The Store -- agent frameworks, models, plugins, services. One-click install, hardware-filtered.</sub></p>
@@ -129,7 +129,7 @@ The Activity app includes a Cluster overview panel showing live worker status an
 ## Key Features
 
 ### Web Desktop Shell
-Full browser-based desktop OS with window manager (float + snap), dock, launchpad, right-click context menu, wallpaper picker, notifications, widgets, and persistent sessions that follow you across devices. 39 bundled apps, platform tools, OS utilities, and games, plus an optional password login gate. See [Web Desktop Experience](#web-desktop-experience) above.
+Full browser-based desktop OS with window manager (float + snap), dock, launchpad, right-click context menu, wallpaper picker, notifications, widgets, and persistent sessions that follow you across devices. 40 bundled apps, platform tools, OS utilities, and games, plus an optional password login gate. See [Web Desktop Experience](#web-desktop-experience) above.
 
 ### Mobile & Tablet Mode
 Auto-detects touch devices and swaps the desktop for a widget-first home screen with customisable multi-page layout (swipe or tap dots to navigate), a persistent dock with app launcher and app switcher, and desktop-style app windows with close/minimise title bars. The top bar features iOS 26-style frosted glass buttons for search and notifications, with a "taOS" home button. Installable as a fullscreen PWA on iOS and Android. A standalone Chat PWA is available at `/chat-pwa` and installs like a private Discord.
@@ -150,7 +150,7 @@ Personal memory powered by [taOSmd](https://github.com/jaylfc/taosmd), think Pie
 User memory is unified through taosmd (issue #25): `tinyagentos/routes/user_memory.py` proxies writes to taosmd `POST /ingest/batch` and reads to `GET /search?mode=bm25` (sub-300ms keyword search), with idempotent migration via `POST /api/user-memory/migrate`. A local SQLite FTS5 store is kept as a fallback for when taosmd is unreachable. taOS reaches taosmd at the URL configured in the `TAOS_USER_MEMORY_URL` environment variable.
 
 ### Skills & Plugins Registry
-Framework-agnostic skill system with 8 default skills, memory_search, file_read, file_write, web_search, code_exec, image_generation, list_image_models, http_request, categorised by search, files, code, media, browser, data, comms, system. Each skill declares compatibility per framework (native/adapter/unsupported) and works across all 16 supported frameworks via adapter translation. Assign or remove skills per agent from the Skills tab with compatibility badges.
+Framework-agnostic skill system with 8 core skills (plus 20 more platform skills), memory_search, file_read, file_write, web_search, code_exec, image_generation, list_image_models, http_request, categorised by search, files, code, media, system, desktop, projects, agent, notes. Each skill declares compatibility per framework (native/adapter/unsupported) and works across all 17 supported frameworks via adapter translation. Assign or remove skills per agent from the Skills tab with compatibility badges.
 
 ### Distributed Compute Cluster
 Combine ANY device into one AI compute mesh, desktops, laptops, SBCs, even phones and tablets. A gaming PC handles large models, a Mac runs MLX inference, a Pi handles embeddings, an old Android phone contributes from a drawer. Cross-platform worker apps connect from the system tray (Windows, macOS, Linux) or via Termux (Android).
@@ -184,8 +184,8 @@ iwr -useb https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-w
 
 **Sudo and freshness.** The Linux/macOS worker installer is designed to run on **either a fresh Debian install or your existing system.** No clean slate required. It installs cleanly on Debian, Ubuntu, Fedora, Arch, Alpine, and macOS.
 
-- **Run with `sudo`** (the recommended path) and the worker is installed as a **system-level systemd unit** at `/etc/systemd/system/tinyagentos-worker.service`. The service runs as your user (via `User=` in the unit), survives logout, auto-starts at boot, and survives container / SBC reboots without an active login session.
-- **Run without sudo** and the script falls back to a **user-mode systemd unit** under `~/.config/systemd/user/`. Linger is enabled automatically so the user manager keeps the worker running across logouts. This path is for environments where sudo is genuinely unavailable (corporate machines, shared hosts).
+- **Linux (recommended path):** the installer runs in two phases. Phase 1 runs on the bare host: it installs incus, nftables, and btrfs-progs, creates a privileged LXC named `taos-worker` backed by a btrfs storage pool (`taos-worker-pool`), adds an nftables DNAT rule that forwards bare-host port `:8443` to the LXC, then re-executes the script inside the container. Phase 2 runs inside the `taos-worker` LXC: it installs the Python runtime, clones the repo, builds the worker venv at `~/.local/share/tinyagentos-worker/`, and installs `/etc/systemd/system/tinyagentos-worker.service` as a root-run system unit inside the container. The worker daemon itself is outbound-only to the controller.
+- **macOS:** the two-phase LXC flow is skipped (incus is Linux-only). The script installs directly on the host and registers the worker as a launchd agent (`~/Library/LaunchAgents/com.tinyagentos.worker.plist`), auto-started at login.
 
 A truly clean Debian install is the smoothest experience because nothing else is competing for ports or sysfs paths, but the script is hardened against common existing-system gotchas: it detects headless environments and skips the desktop tray, it gracefully handles unreadable `/sys/kernel/debug` paths on hosts that mount debugfs but restrict it, and it scopes its writes to `~/.local/share/tinyagentos-worker/` plus the systemd unit.
 
@@ -204,12 +204,12 @@ lets the scheduler route work only to backends that are genuinely ready.
 See [docs/design/resource-scheduler.md](docs/design/resource-scheduler.md).
 
 ### Local Model Catalog + Live Model Browser
-A curated catalog of 112 vetted model manifests ships in-tree, every download URL is verified against HuggingFace, covering LLMs (Qwen3, Qwen2.5, Llama 3.1/3.3, Gemma 2/3, Phi-4, Mistral, Mixtral, DeepSeek, Granite, Command-R), vision models (Qwen2.5-VL, MiniCPM-V 2.6, Moondream2, Florence-2, LLaVA), embeddings (nomic, bge, mxbai, snowflake-arctic), rerankers (bge-reranker-v2, qwen3-reranker), speech (Whisper tiny→large-v3-turbo, Kokoro TTS, Piper, Parakeet), image generation (SD 1.5 LCM, Dreamshaper 8 LCM, SDXL Turbo/Lightning, Flux schnell/dev, SD3.5, PixArt-Σ, Playground v2.5, Kolors, AuraFlow), and image tools (RMBG-1.4, BiRefNet, Real-ESRGAN, 4x-UltraSharp, GFPGAN, CodeFormer, ControlNet canny/depth/pose). **RK3588 NPU variants** are included via c01zaut (Qwen2.5 1.5B→14B RKLLM) and happyme531 (LCM Dreamshaper SD as multi-file RKNN). The live Model Browser also searches 167k+ GGUF models from HuggingFace and the Ollama library. Hardware-filtered compatibility indicators show what runs on your device (green/yellow/red).
+A curated catalog of 113 vetted model manifests ships in-tree, every download URL is verified against HuggingFace, covering LLMs (Qwen3, Qwen2.5, Llama 3.1/3.3, Gemma 2/3, Phi-4, Mistral, Mixtral, DeepSeek, Granite, Command-R), vision models (Qwen2.5-VL, MiniCPM-V 2.6, Moondream2, Florence-2, LLaVA), embeddings (nomic, bge, mxbai, snowflake-arctic), rerankers (bge-reranker-v2, qwen3-reranker), speech (Whisper tiny→large-v3-turbo, Kokoro TTS, Piper, Parakeet), image generation (SD 1.5 LCM, Dreamshaper 8 LCM, SDXL Turbo/Lightning, Flux schnell/dev, SD3.5, PixArt-Σ, Playground v2.5, Kolors, AuraFlow), and image tools (RMBG-1.4, BiRefNet, Real-ESRGAN, 4x-UltraSharp, GFPGAN, CodeFormer, ControlNet canny/depth/pose). **RK3588 NPU variants** are included via c01zaut (Qwen2.5 1.5B→14B RKLLM) and happyme531 (LCM Dreamshaper SD as multi-file RKNN). The live Model Browser also searches 167k+ GGUF models from HuggingFace and the Ollama library. Hardware-filtered compatibility indicators show what runs on your device (green/yellow/red).
 
 ### Agent Templates (1,467 Templates)
-Pick from 1,467 agent templates, 12 built-in plus 196 from awesome-openclaw-agents and 1,259 from the System Prompt Library, and deploy in one click. Browse by category (27 categories), filter by source, or search. Each template includes a system prompt, recommended framework, model, and resource limits. All templates vendored locally so nothing depends on external services.
+Pick from 1,467 agent templates, 12 built-in plus 196 from awesome-openclaw-agents and 1,259 from the System Prompt Library, and deploy in one click. Browse by category (28 categories), filter by source, or search. Each template includes a system prompt, recommended framework, model, and resource limits. All templates vendored locally so nothing depends on external services.
 
-### App Store (108 Catalog Apps + 47 MCP Plugins, including 13 Streaming Apps)
+### App Store (109 Catalog Apps + 47 MCP Plugins, including 13 Streaming Apps)
 One-click install for agent frameworks, AI models, and services. Hardware-aware, only shows what works on your device.
 
 ### Agent Deployment
@@ -226,8 +226,8 @@ One-click install for agent frameworks, AI models, and services. Hardware-aware,
 ### Channel Hub (Framework-Agnostic Messaging)
 Most agent frameworks force you to wire up Telegram, Discord, or Slack directly into their code. If you switch frameworks, you rebuild all those integrations from scratch. taOS flips this: the platform owns the messaging connections and routes messages to whichever framework the agent currently uses. Switch an agent from SmolAgents to LangChain and it keeps every channel, every conversation, every connection. The framework never touches the bot tokens.
 
-- **6 connectors**. Telegram, Discord, Slack, Email (IMAP/SMTP), Web Chat (WebSocket), Webhooks
-- **15 framework adapters.** Thin HTTP bridges (~25 lines each) that translate the universal message format to framework-specific APIs
+- **7 connectors**. Telegram, Discord, Slack, Matrix (beta), Email (IMAP/SMTP), Web Chat (WebSocket), Webhooks
+- **20 framework adapters.** Thin HTTP bridges (~25 lines each) that translate the universal message format to framework-specific APIs
 - **Rich responses.** Buttons, images, cards via universal format with inline hint fallback for any framework
 - **Per-agent or shared bots.** Each agent gets its own bot, or share one across a group
 
@@ -238,7 +238,7 @@ Hidden internal gateway that unifies all inference providers behind a single Ope
 Features unlock automatically based on your hardware and cluster. Solo Pi sees core features. Add a GPU worker and image generation, video, and training appear. No configuration, the platform just knows what's possible.
 
 ### Creative Studios
-Dedicated studio apps for every kind of project, each a focused, native taOS workspace that runs entirely on your own cluster. Two are in beta, with Coding, App, Design, Music, and Office studios on the way (App Studio is taOS's own app builder, so agents and users can build and share new apps).
+Dedicated studio apps for every kind of project, each a focused, native taOS workspace that runs entirely on your own cluster. Two are bundled (Images, Game Studio); Coding, App, Design, Music, and Office studios are implemented but gated as optional apps (App Studio is taOS's own app builder, so agents and users can build and share new apps).
 
 <p align="center">
   <img src="docs/images/images-studio.jpg" alt="Images Studio -- generate from a prompt and edit on a local GPU" width="49%">
@@ -262,14 +262,14 @@ Dedicated studio apps for every kind of project, each a focused, native taOS wor
 - **Deployment.** Auto-converts and deploys to all backends in the cluster
 
 ### Agent Memory System ([taOSmd](https://github.com/jaylfc/taosmd))
-taOSmd is installed as a Python dependency from PyPI (`pip install taosmd`, pinned to 0.3.0 in `pyproject.toml`, published via Trusted Publishing): **97.0% end-to-end Judge accuracy** on LongMemEval-S (retrieve, generate, LLM-grade against the reference answer). The most-cited open comparators (MemPalace 96.6%, agentmemory 95.2%) publish **Recall@5** retrieval scores on the same dataset, which measures only "did the right session land in the top-5" with no generation and no judge, so the numbers are not apples-to-apples until one of us re-runs end-to-end; ours is the stricter measurement. The Librarian layer's LLM-assisted query expansion adds a measured **+15.4% on the vocabulary-gap axis** (45% recall@lag25 with full pipeline + Librarian, vs 30% without) on long-horizon sessions where the cross-encoder alone isn't enough.
+taOSmd is installed as a Python dependency from PyPI (`pip install taosmd`, pinned to 0.4.0 in `pyproject.toml`, published via Trusted Publishing): **97.0% end-to-end Judge accuracy** on LongMemEval-S (retrieve, generate, LLM-grade against the reference answer). The most-cited open comparators (MemPalace 96.6%, agentmemory 95.2%) publish **Recall@5** retrieval scores on the same dataset, which measures only "did the right session land in the top-5" with no generation and no judge, so the numbers are not apples-to-apples until one of us re-runs end-to-end; ours is the stricter measurement. The Librarian layer's LLM-assisted query expansion adds a measured **+15.4% on the vocabulary-gap axis** (45% recall@lag25 with full pipeline + Librarian, vs 30% without) on long-horizon sessions where the cross-encoder alone isn't enough.
 
 Two recent additions (separate measurements -- not part of the LongMemEval-S headline above):
 
 - **Upgraded low-tier embedding default.** Low-tier dense retrieval now defaults to `snowflake-arctic-embed-s`: **+0.057 judged retrieval quality** on the full 1540-QA LoCoMo set (0.730 vs 0.674 for MiniLM) at the same 384 dimensions and the same latency (about 13ms/embed on an Orange Pi). A free accuracy upgrade for low-end and SBC installs. MiniLM stays supported and is the model the 97.0% LongMemEval-S headline was measured on; existing installs are unchanged.
 - **Provable Memory (opt-in, off by default).** Because taOSmd keeps a zero-loss archive, it can verify every extracted fact against the source spans it came from, mark it supported or unsupported, and demote (never delete) the unsupported ones at recall. That makes the extraction-hallucination rate a standing, measurable number: **18.8% of extracted facts on LoCoMo were not fully supported by their source** (cross-family verified) -- something extraction-based systems that discard the source cannot measure.
 
-Memory layers: temporal knowledge graph with validity windows + contradiction detection, hybrid semantic+keyword vector search (ONNX arctic-embed-s low-tier default / MiniLM / Nomic), zero-loss append-only archive with FTS5, session catalog over the archive, and a crystal store of compressed session digests with extracted lessons. Processing: regex + LLM fact extraction (qwen3:4b), 30-min-gap session splitter, tiered enricher (heuristic / 4B / 9B+), session crystallizer, **secret filtering with 17 regex patterns auto-redacting on every ingest**, and Ebbinghaus retention scoring with hot/warm/cold tiers. Retrieval: parallel fan-out across all layers, query expansion, intent classifier that weights an RRF merge, ms-marco-MiniLM cross-encoder reranking, BFS graph expansion, and a token-budgeted L0-L3 context assembler.
+Memory layers: temporal knowledge graph with validity windows + contradiction detection, hybrid semantic+keyword vector search (ONNX arctic-embed-s low-tier default / MiniLM / Nomic), zero-loss append-only archive with FTS5, session catalog over the archive, and a crystal store of compressed session digests with extracted lessons. Processing: regex + LLM fact extraction (qwen3:4b), 30-min-gap session splitter, tiered enricher (heuristic / 4B / 9B+), session crystallizer, **secret filtering with 23 regex patterns auto-redacting on every ingest**, and Ebbinghaus retention scoring with hot/warm/cold tiers. Retrieval: parallel fan-out across all layers, query expansion, intent classifier that weights an RRF merge, ms-marco-MiniLM cross-encoder reranking, BFS graph expansion, and a token-budgeted L0-L3 context assembler.
 
 taOS wraps taOSmd with platform-specific scheduling (job queue, resource manager, worker heartbeat, gaming detection) for multi-agent coordination on resource-constrained devices. QMD (`qmd.service`, port 7832) remains as the NPU-accelerated embedding / rerank / query-expansion backend. Per-tenant isolation is handled by `dbPath` routing: each agent's index lives at `data/agent-memory/{name}/index.sqlite`.
 
@@ -294,7 +294,7 @@ Click on any agent to enter their "virtual computer", a tablet-like interface wi
 Create shared file spaces for agents, groups, and departments. The design team shares mockups, the research team shares documents. Per-agent access control.
 
 ### Agent Management
-- **Communication Channels**. Telegram, Discord, Slack, web chat, email, webhooks (Easy/Advanced setup)
+- **Communication Channels**. Telegram, Discord, Slack, Matrix, web chat, email, webhooks (Easy/Advanced setup)
 - **Secrets Manager.** Encrypted storage with per-agent access control
 - **Inter-Agent Relationships.** Groups, departments, lead agents, permissions matrix
 - **Scheduled Tasks.** Cron jobs with presets, per-agent or group assignment
@@ -304,6 +304,10 @@ Create shared file spaces for agents, groups, and departments. The design team s
 
 ### Authentication
 Password-protected dashboard with persistent sessions. Per-agent API keys. Exempt paths for cluster workers and health checks.
+
+**Agents authenticate with their own identity, not the owner password.** Each registered agent has an Ed25519 registry identity (canonical id + signed JWT). The owner password is human-only and is never handed to an agent. An agent calls scoped endpoints by presenting `Authorization: Bearer <registry-jwt>`; the route verifies the signature against the registry public key and checks the agent is active and holds the required scope grant. Today this covers the registry feed endpoints (scope `registry_feeds_read`) and the read-only A2A bus proxy `/api/a2a/bus/channels` + `/api/a2a/bus/messages` (scope `a2a_receive`). The Bearer allowlist is exact: a registry JWT authenticates only those agent paths, never an arbitrary route.
+
+Onboarding an internal driver agent: an admin mints its identity once with `taosctl agents mint --handle @taOS-dev --slug taos-dev --scopes a2a_send,a2a_receive` (or `taosctl agents seed-internal` to mint the four built-in driver agents idempotently). Minting prints the registry JWT; store it on the agent host in a gitignored per-host file (for example `~/.config/taos/agent-token`) and have the agent send it as `Authorization: Bearer <jwt>`. Re-running mint/seed for an existing handle reuses the same canonical id and re-asserts the grants, so it is safe to run again.
 
 ### Model Conversion
 Convert models between formats (GGUF→RKLLM, HF→GGUF, GGUF→MLX). Capability-gated, "Convert for NPU" button appears when an x86 worker joins the cluster.
@@ -328,7 +332,7 @@ Built-in browser with two engines. A lightweight server-side rewriting proxy ren
 `app-catalog/plugins/` ships 47 MCP servers including the official set (filesystem, git, fetch, memory, sequential-thinking, time), GitHub, Playwright, Docker, Kubernetes, databases (Postgres/MySQL/SQLite dbhub, MongoDB, Redis, Chroma, Supabase), documents (pandoc, office docs, spreadsheet, markdownify, excel), comms (Slack, WhatsApp, email, Notion, Obsidian, Atlassian, Google Workspace), infra (AWS, Cloudflare, Grafana, arXiv, YouTube transcript, Firecrawl), agent-specific (browser-use, Camoufox, context7, supergateway, engram, Exa), Home Assistant, Todoist, and more.
 
 ### Global Search
-Search across agents, apps, messages, and files from a single endpoint. Finds anything on the platform instantly.
+Search across agents, apps, messages, and shared folders from a single endpoint. Finds anything on the platform instantly.
 
 ### Monitoring & Management
 
@@ -347,16 +351,16 @@ Search across agents, apps, messages, and files from a single endpoint. Finds an
 - **Notifications.** Health alerts, backend up/down, worker join/leave, webhook forwarding (Slack/Discord/Telegram). Toast notifications appear top-right. The welcome notification is gated on a `localStorage` flag so it fires once per install, not on every page load.
 - **Agent Logs.** Real-time log viewer with auto-refresh
 - **Backup & Restore.** Downloadable config backup, one-click restore, scheduled auto-backup (daily/weekly)
-- **System Updates.** Pull latest from GitHub via Settings page. taOS periodically checks for updates and reports an anonymous install count (a daily aggregate estimate, no identifiers); disable with `TAOS_NO_UPDATE_PING=1` or in Settings.
+- **System Updates.** Pull latest from GitHub via Settings page. taOS periodically checks for updates and sends an install ping carrying the version, platform, and a stable random per-install id (a UUID stored in the data dir, no personal data) so the project keeps an exact install count; disable with `TAOS_NO_UPDATE_PING=1` or in Settings.
 - **Provider Management.** Add/test/remove inference providers with live connectivity checks. The Providers desktop app manages cloud LLM credentials; the model browser reflects configured providers automatically.
 
-## App Catalog (108 Catalog Apps + 39 Desktop Apps + 47 MCP Plugins)
+## App Catalog (109 Catalog Apps + 49 Desktop Apps + 47 MCP Plugins)
 
 | Category | Apps |
 |----------|------|
-| **Agent Frameworks (15)** | SmolAgents, PocketFlow, OpenClaw, nanoclaw, PicoClaw, ZeroClaw, MicroClaw, IronClaw, NullClaw, Moltis, Hermes, Agent Zero, OpenAI Agents SDK, Langroid, ShibaClaw |
+| **Agent Frameworks (17)** | SmolAgents, PocketFlow, OpenClaw, nanoclaw, PicoClaw, ZeroClaw, MicroClaw, IronClaw, NullClaw, Moltis, Hermes, Agent Zero, OpenAI Agents SDK, Langroid, ShibaClaw, DeerFlow, OpenCrabs (beta) |
 | **Streaming Apps (13)** | Blender, LibreOffice, Code Server, GIMP, Krita, FreeCAD, Obsidian, Excalidraw, JupyterLab, Grafana, n8n, Terminal, Neko Browser |
-| **LLM Models** | 112-manifest local catalog: Qwen3 0.6B-32B, Qwen2.5 0.5B-72B (+ RKLLM 1.5B-14B for RK3588), Llama 3.1/3.2/3.3, Gemma 2/3, Phi-3.5/4/4-mini, Mistral/Nemo/Mixtral, DeepSeek, Granite, Command-R, SmolLM2, TinyLlama, plus 167k+ searchable from HuggingFace |
+| **LLM Models** | 113-manifest local catalog: Qwen3 0.6B-32B, Qwen2.5 0.5B-72B (+ RKLLM 1.5B-14B for RK3588), Llama 3.1/3.2/3.3, Gemma 2/3, Phi-3.5/4/4-mini, Mistral/Nemo/Mixtral, DeepSeek, Granite, Command-R, SmolLM2, TinyLlama, plus 167k+ searchable from HuggingFace |
 | **Vision Models** | Qwen2-VL, Qwen2.5-VL, MiniCPM-V 2.6, Moondream2, Florence-2, LLaVA 1.6 / LLaVA-Phi-3 |
 | **Embeddings / Rerankers** | nomic-embed-text-v1.5, bge-large/small/m3, mxbai-embed-large, snowflake-arctic-embed, qwen3-embedding/reranker, bge-reranker-v2-m3 |
 | **Audio Models** | Whisper tiny→large-v3-turbo, Kokoro TTS, Piper voices, Parakeet TDT |
@@ -377,8 +381,8 @@ Search across agents, apps, messages, and files from a single endpoint. Finds an
 | **ARM + Rockchip NPU** | Orange Pi 5/5 Plus, Rock 5B | 6 TOPS NPU, primary SBC target |
 | **Raspberry Pi** | Pi 4 (8GB), Pi 5 (8/16GB) | CPU-only or with accelerator HATs |
 | **Pi Accelerators** | Hailo-10H (40T), M5Stack LLM-8850 (24T) | LLM-capable accelerators |
-| **NVIDIA** | GTX 1050 Ti through RTX 4090/5090 | CUDA 4-24GB or Vulkan legacy |
-| **AMD** | RX 6600 through RX 7900 XTX | ROCm 8-24GB |
+| **NVIDIA** | GTX 1050 Ti through RTX 4090/5090 | CUDA 4-32GB or Vulkan legacy |
+| **AMD** | RX 6600 through RX 7900 XTX | ROCm 4-24GB |
 | **Android** | Flagship phones/tablets (12-16GB) | 7-8B models at 15-30 tok/s via Termux + llama.cpp |
 | **iOS/iPadOS** | iPad Pro M4, iPhones (6-8GB+) | Dashboard via PWA, future native worker app |
 | **CPU Only** | Any device | Smallest quantized models |
@@ -388,13 +392,13 @@ Search across agents, apps, messages, and files from a single endpoint. Finds an
 
 ```
 taOS Controller (FastAPI + htmx + React Desktop Shell)
-├── Web Desktop Shell (window manager, dock, launchpad, widgets, 36 bundled apps)
+├── Web Desktop Shell (window manager, dock, launchpad, widgets, 40 bundled apps)
 ├── Mobile/Tablet Shell (widget home, dock, app title bars, swipeable pages, iOS PWA)
-├── Skills & Plugins Registry (8 default skills, 15 framework adapters)
+├── Skills & Plugins Registry (8 core skills + 20 platform skills, 20 framework adapters)
 ├── User Memory (taosmd proxy: /ingest/batch + /search?mode=bm25, SQLite FTS5 fallback, auto-capture, global search)
 ├── Web Dashboard (77 route modules, React SPA frontend)
-├── Channel Hub (6 connectors, 15 framework adapters)
-│   ├── Telegram, Discord, Slack, Email, Web Chat, Webhooks
+├── Channel Hub (7 connectors, 20 framework adapters)
+│   ├── Telegram, Discord, Slack, Matrix, Email, Web Chat, Webhooks
 │   └── Universal message format → framework-specific translation
 ├── LLM Proxy (LiteLLM, per-agent virtual keys)
 ├── Cluster Manager (worker registration, task routing)
@@ -403,7 +407,7 @@ taOS Controller (FastAPI + htmx + React Desktop Shell)
 ├── User Workspace (NAS-like file browser, shared with apps + agents)
 ├── Computer Use (vision + keyboard/mouse, agent escalation)
 ├── Message Hub (chat, channels, threads, canvas, dual PWA)
-├── App Store + Registry (108 apps + 47 MCP plugins, manifest-based)
+├── App Store + Registry (109 apps + 47 MCP plugins, manifest-based)
 ├── Live Model Browser (HuggingFace + Ollama search)
 ├── Container Manager (LXC or Docker, auto-detected)
 ├── Agent Memory (taOSmd -- temporal KG, hybrid vector search, zero-loss archive, session catalog, crystal store, librarian)
@@ -413,7 +417,7 @@ taOS Controller (FastAPI + htmx + React Desktop Shell)
 ├── Training Manager (LoRA, per-agent adapters)
 ├── Agent Export/Import (portable JSON config)
 ├── Agent Templates (1,467 vendored from 3 sources)
-├── Global Search (agents, apps, messages, folders)
+├── Global Search (agents, apps, messages, shared folders)
 ├── Backup Scheduler (daily/weekly automated backups)
 └── Backend Fallback (priority-based, auto-recovery)
 
@@ -453,15 +457,19 @@ Run `curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/ins
 
 ### Worker install (`scripts/install-worker.sh`)
 
+Linux uses a two-phase install. Phase 1 runs on the bare host; phase 2 runs inside the `taos-worker` LXC.
+
 | Where | What |
 |---|---|
-| `/etc/systemd/system/tinyagentos-worker.service` | Worker systemd unit (when run with sudo). Connects to the controller URL you passed and registers this machine as a cluster node. Runs as your user via `User=`, not root. |
-| `~/.config/systemd/user/tinyagentos-worker.service` | Same unit as above, but in user-mode (when run without sudo). Linger is enabled automatically. |
-| `~/.local/share/tinyagentos-worker/` | Worker repo checkout. ~150 MB on disk after install. Self-contained venv inside. |
+| `taos-worker` LXC | Privileged incus container created on the bare host during phase 1. All worker software lives inside it. |
+| `taos-worker-pool` | btrfs incus storage pool (loopback image, sized to 90% of free space on `/var/lib`) created on the bare host during phase 1. Backs the `taos-worker` container. |
+| `/etc/systemd/system/tinyagentos-worker.service` | Worker systemd unit installed inside the `taos-worker` LXC (phase 2). Runs as root inside the container. Connects to the controller URL and registers this machine as a cluster node. |
+| `~/.local/share/tinyagentos-worker/` | Repo checkout and venv, cloned inside the `taos-worker` LXC during phase 2. ~150 MB on disk after install. |
 | `~/.local/share/tinyagentos-worker/.venv/` | Python venv with worker-only deps: httpx, pydantic, psutil, fastapi, uvicorn, pyyaml, pillow, libtorrent. **Does NOT install controller-side deps** (no aiosqlite, no LiteLLM, no scheduler engine). |
-| Ports listened on | None. Workers are pure outbound, they connect TO the controller. |
-| OS packages added | python3, venv, pip, git, curl, ca-certificates, libtorrent (Debian/Ubuntu only, Arch/Fedora/Alpine equivalents on those distros). |
-| User accounts created | None. The worker runs as the user who ran the installer. |
+| Ports | `:8443` (incus HTTPS listener inside the LXC, DNAT'd from the bare-host port `:8443` via nftables -- used by the controller for LXC-based service deployment); `:21434` (TAOS-namespaced Ollama, localhost-only inside the LXC by default). The worker daemon itself is outbound-only to the controller. |
+| OS packages added (bare host, phase 1) | incus, nftables, btrfs-progs, curl |
+| OS packages added (inside LXC, phase 2) | incus, curl, python3, python3-venv, python3-pip, git, bees (if available in apt) |
+| User accounts created | None. All processes inside the LXC run as root (the container is privileged). macOS installs run as the invoking user via launchd. |
 
 ### Verify what's installed
 
@@ -472,8 +480,9 @@ ls /etc/systemd/system/tinyagentos*.service /etc/systemd/system/qmd.service
 ls ~/tinyagentos/data/
 
 # Worker side (after running install-worker.sh)
-systemctl status tinyagentos-worker
-ls ~/.local/share/tinyagentos-worker/
+sudo incus list                                                        # shows taos-worker container
+sudo incus exec taos-worker -- systemctl status tinyagentos-worker    # service status inside LXC
+sudo incus exec taos-worker -- ls ~/.local/share/tinyagentos-worker/  # repo + venv inside LXC
 ```
 
 ### Uninstall
@@ -487,13 +496,18 @@ sudo rm /etc/systemd/system/tinyagentos*.service /etc/systemd/system/qmd.service
 sudo systemctl daemon-reload
 # Repo + data are still at ~/tinyagentos, delete with: rm -rf ~/tinyagentos
 
-# Worker
+# Worker (two-phase LXC teardown -- bare host)
 scripts/uninstall-worker.sh
 # Or manually:
-sudo systemctl disable --now tinyagentos-worker
-sudo rm /etc/systemd/system/tinyagentos-worker.service
-sudo systemctl daemon-reload
-rm -rf ~/.local/share/tinyagentos-worker
+sudo incus stop taos-worker
+sudo incus delete taos-worker
+# Optional, DESTROYS worker data (the script keeps this unless you pass --purge); skip to keep it:
+sudo incus storage delete taos-worker-pool
+# Remove the nftables DNAT rule (port :8443 forward):
+sudo nft delete table ip taos
+# Persist (optional). This snapshots the FULL live ruleset over /etc/nftables.conf,
+# so if you hand-maintain that file, edit it by hand instead of running this:
+sudo bash -c 'nft list ruleset > /etc/nftables.conf.tmp && mv /etc/nftables.conf.tmp /etc/nftables.conf'
 ```
 
 ### Upgrading a long-running install
@@ -523,13 +537,10 @@ You do not build the UI on every machine. `install-server.sh` and the in-app upd
 **Worker:**
 
 ```bash
-cd ~/.local/share/tinyagentos-worker
-git pull
-find . -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
-sudo systemctl restart tinyagentos-worker
+sudo incus exec taos-worker -- bash -c "cd ~/.local/share/tinyagentos-worker && git pull && find . -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true && systemctl restart tinyagentos-worker"
 ```
 
-The bytecode cleanup line is belt-and-braces; Python's mtime-based invalidation usually works, but on long-running boxes that have survived many upgrades it occasionally doesn't, and a stale `.pyc` is easy to mistake for a code bug.
+The bytecode cleanup step is belt-and-braces; Python's mtime-based invalidation usually works, but on long-running boxes that have survived many upgrades it occasionally doesn't, and a stale `.pyc` is easy to mistake for a code bug.
 
 ## Service Management
 
@@ -589,7 +600,7 @@ taOS integrates [exo](https://github.com/exo-explore/exo) for running models tha
 
 **What exo enables:** Run 70B+ parameter models by pooling VRAM across multiple machines. A 70B model that needs ~40 GB can be split across a 12 GB desktop GPU + a 16 GB laptop + a 24 GB Mac, with exo handling the shard placement and inter-device communication automatically.
 
-**How it works with TAOS:** exo runs as a backend on participating workers, discovered automatically on port 52415. The TAOS worker probe detects it and advertises `llm-chat` capability. The deploy wizard can offer "Distributed (exo)" as a deployment option when a model exceeds any single worker's VRAM. Peer discovery is automatic via mDNS on the local network.
+**How it works with TAOS:** exo runs as a backend on participating workers, discovered automatically on port 52415. The TAOS worker probe detects it and advertises `llm-chat` capability. When an exo backend is running, its models appear in the deploy wizard alongside the other backends; an explicit "Distributed (exo)" mode for models that exceed a single worker's VRAM is in progress. exo handles its own peer discovery via mDNS on the local network.
 
 **Supported hardware:**
 
@@ -637,8 +648,9 @@ uv run exo
 ## Development
 
 ```bash
-pip install -e ".[dev]"
-pytest tests/ -v          # ~3,590 tests
+uv sync --extra dev
+uv run pytest tests/ --ignore=tests/e2e -n auto   # ~7,400 tests
+cd desktop && npx vitest run                       # ~1,900 desktop tests
 ```
 
 CI runs automatically on every push (Python 3.12 and 3.13 on every PR; Python 3.11 on the nightly scheduled run).
@@ -646,8 +658,8 @@ CI runs automatically on every push (Python 3.12 and 3.13 on every PR; Python 3.
 ## Roadmap
 
 ### Done ✅
-- [x] Web desktop GUI with 36 bundled apps
-- [x] App Store (108 apps, 16 agent frameworks)
+- [x] Web desktop GUI with 40 bundled apps
+- [x] App Store (109 apps, 17 agent frameworks)
 - [x] Live model browser (HuggingFace + Ollama, 167k+ models)
 - [x] Agent deployment wizard (LXC containers)
 - [x] Image + video generation (multi-backend)
@@ -667,7 +679,7 @@ CI runs automatically on every push (Python 3.12 and 3.13 on every PR; Python 3.
 - [x] LLM Proxy (LiteLLM) with per-agent keys
 - [x] Webhook notifications (Slack/Discord/Telegram)
 - [x] Health debug page
-- [x] Channel Hub, framework-agnostic messaging (6 connectors, 18 adapters)
+- [x] Channel Hub, framework-agnostic messaging (6 connectors, 20 adapters)
 - [x] Agent config export/import
 - [x] Agent template library (1,467 templates from 3 sources)
 - [x] Global search across all platform data
@@ -680,18 +692,18 @@ CI runs automatically on every push (Python 3.12 and 3.13 on every PR; Python 3.
 - [x] Playwright E2E test scaffolding
 - [x] Message Hub, built-in chat with channels, threads, canvas, dual PWA
 - [x] Dual container runtime (LXC + Docker, auto-detected)
-- [x] Web desktop shell (window manager, dock, launchpad, widgets, 36 bundled apps)
+- [x] Web desktop shell (window manager, dock, launchpad, widgets, 40 bundled apps)
 - [x] Mobile/tablet responsive mode with iOS PWA support
 - [x] Persistent desktop sessions across devices (windows, dock, wallpaper)
 - [x] User memory system (taOSmd with temporal KG + FTS5 + auto-capture)
-- [x] Skills & plugins registry (8 default skills, per-framework compatibility)
+- [x] Skills & plugins registry (28 default skills, per-framework compatibility)
 - [x] Terminal app with real PTY + SSH client
 - [x] Standalone Chat PWA at /chat-pwa
-- [x] Browser app with URL-rewriting proxy
+- [x] Browser app with URL-rewriting proxy and Neko streamed Chromium toggle
 - [x] 47 MCP server plugins in app catalog
 - [x] Desktop notifications (toast stack + notification centre)
 - [x] Widget system (Clock, Agent Status, Notes, System Stats, Weather)
-- [x] Curated local model catalog, 112 manifests, all download URLs verified against HuggingFace
+- [x] Curated local model catalog, 113 manifests, all download URLs verified against HuggingFace
 - [x] Activity monitor app, rktop-inspired per-core CPU/NPU/thermal/GPU/process stats
 - [x] Loaded Models panel in Model Browser, shows running models, purpose, and VRAM/RAM usage
 - [x] iOS PWA pill bar, safe-area-aware bottom nav with back / home / card-switcher / notifications
@@ -703,17 +715,24 @@ CI runs automatically on every push (Python 3.12 and 3.13 on every PR; Python 3.
 - [x] Worker hardware detection without nvidia-smi, `/proc/driver/nvidia` probe + VRAM lookup table; installer offers nvidia-utils on native hosts
 - [x] install-server.sh, controller installer companion to install-worker.sh; supports Debian/Ubuntu/Fedora/Arch/Alpine + macOS; system or user-mode systemd unit
 - [x] install-rknpu.sh, opt-in Rockchip NPU setup; pins librknnrt 2.3.0, installs rkllama fork, preloads three chat models; all binaries from TAOS mirror with SHA256 verification
+- [x] Mail app (IMAP/SMTP send and receive, multi-account, threaded view)
+- [x] Coding Studio (offline-AI coding environment with file tree, editor, terminal, and tool-calling loop)
+- [x] Observatory app (fleet view with per-agent pause, resume, and steer controls)
+- [x] Decisions app (human-in-the-loop inbox: multiple-choice, approve/reject, and free-text request types)
+- [x] Notes app (tracked-edit history, markdown rendering, agent-writable)
+- [x] Todo app (agent-callable checklist with completion tracking and priority)
+- [x] Exo backend detection and task-parallel routing (worker probe on :52415, llm-chat capability, install-exo deploy command)
 
 ### In Progress
 - [ ] Unified streamed browser (#603), one WebRTC-streamed Chromium app that runs locally on the host including the Pi, replaces the URL-rewriting proxy, presents a native touch-friendly mobile layout on phones, surfaces agents' browser sessions, and migrates sessions between host and worker
 - [ ] Fresh install test on clean hardware (#2)
 - [ ] Containerised app streaming (#22), all 5 plans complete: session store, streaming pages, user workspace, agent-bridge, expert agents, 13 app manifests (Blender/LibreOffice/GIMP/Code Server/Neko Browser + 8 Phase 2), app orchestrator, computer-use with escalation, companion launcher API
+- [ ] Exo deploy-wizard option, an explicit Distributed (exo) mode for models that exceed a single worker's VRAM
 
 ### Planned
 - [ ] Local assistant LLM / Setup Agent (#4)
 - [ ] Pre-built Armbian images (#7)
 - [ ] Automated Playwright tests (#8)
-- [ ] Exo integration for pipeline-parallel inference
 
 ### Future Vision
 - [ ] Cloud services, tinyagentos.com (#5)

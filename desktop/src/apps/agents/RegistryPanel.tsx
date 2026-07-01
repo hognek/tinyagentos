@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import {
   ChevronRight,
   ShieldCheck,
@@ -42,6 +42,11 @@ export interface RegistryEntry {
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                             */
 /* ------------------------------------------------------------------ */
+
+/** Strip a leading "@" for display only — "@" is bus-addressing syntax, not a name. */
+export function stripAt(s: string): string {
+  return s.startsWith("@") ? s.slice(1) : s;
+}
 
 function relativeTime(ts: string | null): string {
   if (!ts) return "—";
@@ -121,7 +126,7 @@ function RegistryEntryRow({
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
             <span className="font-medium text-sm truncate">
-              {entry.display_name || entry.handle || entry.framework}
+              {stripAt(entry.display_name || entry.handle || entry.framework)}
             </span>
             <span
               className={`inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium border ${STATUS_STYLES[entry.status] ?? STATUS_STYLES.revoked}`}
@@ -158,7 +163,7 @@ function RegistryEntryRow({
                 className="h-7 w-7 hover:bg-emerald-500/15 hover:text-emerald-400"
                 onClick={() => act("approve")}
                 disabled={busy}
-                aria-label={`Approve ${entry.display_name || entry.canonical_id}`}
+                aria-label={`Approve ${stripAt(entry.display_name) || entry.canonical_id}`}
                 title="Approve"
               >
                 <CheckCircle size={14} />
@@ -169,7 +174,7 @@ function RegistryEntryRow({
                 className="h-7 w-7 hover:bg-red-500/15 hover:text-red-400"
                 onClick={() => act("reject")}
                 disabled={busy}
-                aria-label={`Reject ${entry.display_name || entry.canonical_id}`}
+                aria-label={`Reject ${stripAt(entry.display_name) || entry.canonical_id}`}
                 title="Reject"
               >
                 <XCircle size={14} />
@@ -183,7 +188,7 @@ function RegistryEntryRow({
               className="h-7 w-7 hover:bg-orange-500/15 hover:text-orange-400"
               onClick={() => act("suspend")}
               disabled={busy}
-              aria-label={`Suspend ${entry.display_name || entry.canonical_id}`}
+              aria-label={`Suspend ${stripAt(entry.display_name) || entry.canonical_id}`}
               title="Suspend"
             >
               <PauseCircle size={14} />
@@ -196,7 +201,7 @@ function RegistryEntryRow({
               className="h-7 w-7 hover:bg-emerald-500/15 hover:text-emerald-400"
               onClick={() => act("reactivate")}
               disabled={busy}
-              aria-label={`Reactivate ${entry.display_name || entry.canonical_id}`}
+              aria-label={`Reactivate ${stripAt(entry.display_name) || entry.canonical_id}`}
               title="Reactivate"
             >
               <PlayCircle size={14} />
@@ -209,7 +214,7 @@ function RegistryEntryRow({
               className="h-7 w-7 hover:bg-red-500/15 hover:text-red-400"
               onClick={() => act("revoke")}
               disabled={busy}
-              aria-label={`Revoke ${entry.display_name || entry.canonical_id}`}
+              aria-label={`Revoke ${stripAt(entry.display_name) || entry.canonical_id}`}
               title="Revoke"
             >
               <ShieldOff size={14} />
@@ -365,8 +370,11 @@ export function RegistryPanel() {
   const [currentUserId, setCurrentUserId] = useState("");
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // Monotonic counter — only the latest in-flight response is applied.
+  const loadSeq = useRef(0);
 
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current;
     setLoading(true);
     setErr(null);
     try {
@@ -374,6 +382,7 @@ export function RegistryPanel() {
         fetch("/auth/status", { credentials: "include" }),
         fetch("/api/agents/registry", { credentials: "include" }),
       ]);
+      if (seq !== loadSeq.current) return; // stale — a newer load fired; discard
       if (statusResp.ok) {
         const s = await statusResp.json();
         setIsAdmin(!!s.user?.is_admin);
@@ -386,14 +395,55 @@ export function RegistryPanel() {
         setErr(`Failed to load registry (${registryResp.status})`);
       }
     } catch (e: unknown) {
+      if (seq !== loadSeq.current) return;
       setErr(e instanceof Error ? e.message : "Network error");
     } finally {
-      setLoading(false);
+      if (seq === loadSeq.current) setLoading(false);
     }
   }, []);
 
+  // Initial load when panel opens; polling while expanded + visible.
   useEffect(() => {
-    if (expanded) load();
+    if (!expanded) return;
+
+    void load();
+
+    let timer: ReturnType<typeof setInterval> | null = null;
+
+    const startPolling = () => {
+      if (timer === null) timer = setInterval(() => void load(), 5_000);
+    };
+    const stopPolling = () => {
+      if (timer !== null) {
+        clearInterval(timer);
+        timer = null;
+      }
+    };
+    const onVisibility = () => {
+      if (document.hidden) {
+        stopPolling();
+      } else {
+        void load();
+        startPolling();
+      }
+    };
+    // Also refetch when the window regains focus while already visible
+    // (covers alt-tab / dock-click without a tab switch).
+    const onFocus = () => {
+      if (!document.hidden) {
+        void load();
+        startPolling();
+      }
+    };
+
+    if (!document.hidden) startPolling();
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("focus", onFocus);
+    return () => {
+      stopPolling();
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("focus", onFocus);
+    };
   }, [expanded, load]);
 
   async function handleAction(
