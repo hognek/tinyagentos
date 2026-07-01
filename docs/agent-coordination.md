@@ -61,8 +61,8 @@ git worktree add ../taos-<task> -b feat/<task> origin/dev
 
 ## Keep the shared docs honest
 
-- `docs/STATUS.md` is the single source of truth for cross-contributor handoff:
-  update it when you merge something that others need to know about.
+- When you merge something others depend on, update the relevant README or
+  docs in the same PR so the next contributor is not working from a stale map.
 - If your change makes an existing doc inaccurate, fix the doc in the same PR.
 
 ## Posting to the coordination bus (a2a)
