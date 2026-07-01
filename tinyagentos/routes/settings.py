@@ -664,6 +664,14 @@ def _find_uv(project_dir: Path) -> str | None:
     return None
 
 
+# Optional-dependency extras the updater must install so a `uv sync --frozen`
+# does not prune them out of the venv. Single source of truth for the Python
+# side; `scripts/install-server.sh` installs the same set via
+# `pip install -e ".[proxy]"`, and `test_updater_dep_install.py` asserts the two
+# stay in parity so they cannot silently drift (the bug that stripped litellm).
+UPDATE_EXTRAS: tuple[str, ...] = ("proxy",)
+
+
 async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
     """Install/sync the update's Python deps, preferring a pinned uv sync.
 
@@ -671,6 +679,12 @@ async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
     (uv.lock) instead of a fresh pip resolve that can pull newer transitive
     deps onto a user's box. When uv is not present we fall back to the legacy
     ``pip install -e .`` so installs without uv still update.
+
+    Both paths carry the ``proxy`` extra (litellm + prisma) to match
+    ``install-server.sh``'s ``pip install -e ".[proxy]"``. The LLM proxy is a
+    core dependency, not optional: a bare ``uv sync --frozen`` prunes the venv
+    to the locked default set and silently uninstalls litellm, disabling the
+    proxy on every update and breaking basic agent functionality.
 
     Capture output and surface failures -- silently swallowing a failed install
     lands users on a grey-screen the next time they restart, because the new
@@ -682,24 +696,23 @@ async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
     """
     uv_cmd = _find_uv(project_dir)
     if uv_cmd is not None:
-        logger.info("Updater dependency install: uv sync --frozen (%s)", uv_cmd)
         # HOME=project_dir so uv resolves its data/cache dir correctly under the
         # service user whose HOME is the install dir (the Pi layout).
         env = {**os.environ, "HOME": str(project_dir)}
-        return await _run_capture(
-            [uv_cmd, "sync", "--frozen"],
-            cwd=str(project_dir),
-            env=env,
-        )
+        extra_args = [arg for extra in UPDATE_EXTRAS for arg in ("--extra", extra)]
+        cmd = [uv_cmd, "sync", "--frozen", *extra_args]
+        logger.info("Updater dependency install: %s", " ".join(cmd))
+        return await _run_capture(cmd, cwd=str(project_dir), env=env)
 
     pip_cmd = "pip"
     for candidate in (project_dir / ".venv" / "bin" / "pip", project_dir / "venv" / "bin" / "pip"):
         if candidate.exists():
             pip_cmd = str(candidate)
             break
-    logger.info("Updater dependency install: uv not found, using %s install -e .", pip_cmd)
+    pip_target = f".[{','.join(UPDATE_EXTRAS)}]"
+    logger.info("Updater dependency install: uv not found, using %s install -e %s", pip_cmd, pip_target)
     return await _run_capture(
-        [pip_cmd, "install", "-e", "."],
+        [pip_cmd, "install", "-e", pip_target],
         cwd=str(project_dir),
     )
 
