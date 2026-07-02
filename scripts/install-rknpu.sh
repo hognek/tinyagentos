@@ -403,8 +403,11 @@ install_rkllama() {
         # GLib was renamed libglib2.0-0t64 in Ubuntu 24.04 / Debian Trixie;
         # probe both installed names and add whichever the repos carry.
         # The madison probes below read the local package lists; refresh them
-        # first (best-effort) so a stale image cannot steer the name choice.
-        sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>/dev/null || true
+        # first so a stale image cannot steer the name choice. Best-effort,
+        # but say so when it fails: with stale lists the probes may pick the
+        # wrong package name, and the operator needs that context.
+        sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+            || warn "apt-get update failed — package lists may be stale and the library package-name detection below may be wrong"
         if ! dpkg-query -W libglib2.0-0 >/dev/null 2>&1 && ! dpkg-query -W libglib2.0-0t64 >/dev/null 2>&1; then
             if [[ -n "$(apt-cache madison libglib2.0-0 2>/dev/null)" ]]; then
                 _need+=("libglib2.0-0")
