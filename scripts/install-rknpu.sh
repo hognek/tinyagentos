@@ -94,6 +94,20 @@ log()  { printf '\033[1;34m[rknpu]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[rknpu]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[rknpu]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# Environment banner: every user-posted install log should self-describe the
+# machine it ran on (distro, kernel, board, current NPU runtime) so a failure
+# report is diagnosable without a round-trip asking for these.
+if [[ -r /etc/os-release ]]; then
+    log "distro=$( . /etc/os-release; echo "${PRETTY_NAME:-$ID}" )"
+fi
+log "kernel=$(uname -r) arch=$(uname -m)"
+if [[ -r /proc/device-tree/model ]]; then
+    log "board=$(tr -d '\0' < /proc/device-tree/model)"
+fi
+if [[ -f "$LIBRKNNRT_DEST" ]] && command -v strings >/dev/null 2>&1; then
+    log "current librknnrt=$(strings "$LIBRKNNRT_DEST" 2>/dev/null | grep -m1 -oE 'librknnrt version: [0-9]+\.[0-9]+\.[0-9]+' || echo 'version string not found')"
+fi
+
 # verify_sha256 <file> <expected_hex> <label>
 # Hard-fails on mismatch: a corrupted download or a tampered mirror must
 # never be silently accepted.
@@ -336,6 +350,22 @@ install_rkllama() {
         log "cloning $RKLLAMA_REPO -> $RKLLAMA_DIR"
         run_as_user mkdir -p "$(dirname "$RKLLAMA_DIR")"
         run_as_user git clone --quiet "$RKLLAMA_REPO" "$RKLLAMA_DIR"
+        # A clone brings down all branches and tags, but an overridden
+        # TAOS_RKLLAMA_REF can be a SHA reachable from none of them. Try to
+        # fetch the configured ref explicitly (best-effort: some servers
+        # refuse unadvertised objects) so the verification below sees the
+        # same coverage as the re-install path; on failure fall through to
+        # the curated error instead of dying on git's raw message.
+        run_as_user git -C "$RKLLAMA_DIR" fetch --quiet origin "$RKLLAMA_REF" 2>/dev/null || true
+    fi
+    # Verify the pinned ref is actually fetchable before checking it out. A
+    # fresh clone only has branch/tag refs, so a pin orphaned by a history
+    # rewrite of the rkllama fork fails with git's opaque "reference is not a
+    # tree" (#1527). Fail with a message that says what happened and how to
+    # override, rather than silently falling back to a moving branch (which
+    # would break install reproducibility).
+    if ! run_as_user git -C "$RKLLAMA_DIR" cat-file -e "${RKLLAMA_REF}^{commit}" 2>/dev/null; then
+        die "pinned rkllama ref ${RKLLAMA_REF:0:12} is not reachable from any branch or tag of $RKLLAMA_REPO (the fork's history may have been rewritten). Update taOS for a current pin, or override with TAOS_RKLLAMA_REF=<ref>."
     fi
     run_as_user git -C "$RKLLAMA_DIR" checkout --quiet "$RKLLAMA_REF"
     log "rkllama pinned to $(run_as_user git -C "$RKLLAMA_DIR" rev-parse --short HEAD)"
