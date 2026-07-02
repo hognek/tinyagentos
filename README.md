@@ -78,7 +78,15 @@ curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-
 
 Run without `sudo` to install as a user-mode systemd unit instead. The script is idempotent, safe to re-run on an existing install. Supports env-var overrides for install path, branch, and port.
 
-Tested on WSL2 (Windows 11) with the default Ubuntu image, including the current Python 3.14 default: the installer provisions a compatible Python automatically, so a clean box needs nothing more than the one line above.
+### Verified installs
+
+Platforms where a clean controller install has been verified end to end. Ran it somewhere else? Open an issue with your install log (the installer prints an environment banner for exactly this) and it gets added here.
+
+| Hardware | OS | Verified |
+| --- | --- | --- |
+| Orange Pi 5 Plus 16GB (RK3588) | Armbian (Debian trixie base) | Runs the maintainer's stack daily, including the RK3588 NPU memory/embedding path |
+| Orange Pi 5 Pro (RK3588S) | Official Orange Pi Debian 12 (Bookworm) vendor image | Clean-install community report (#1540); fixes shipped in v1.0.0-beta.17, including the RK3588 NPU backend with preloaded models |
+| WSL2 on Windows 11 | Default Ubuntu image (incl. Python 3.14) | Clean install; the installer provisions a compatible Python automatically |
 
 **Manual / development:**
 
