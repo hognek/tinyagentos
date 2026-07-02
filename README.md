@@ -86,7 +86,10 @@ Platforms where a clean controller install has been verified end to end. Ran it 
 | --- | --- | --- |
 | Orange Pi 5 Plus 16GB (RK3588) | Armbian (Debian trixie base) | Runs the maintainer's stack daily, including the RK3588 NPU memory/embedding path |
 | Orange Pi 5 Pro (RK3588S) | Official Orange Pi Debian 12 (Bookworm) vendor image | Clean-install community report (#1540); fixes shipped in v1.0.0-beta.17, including the RK3588 NPU backend with preloaded models |
+| x86_64 PC | Fedora | Maintainer-verified install (also serves as a GPU cluster worker with an RTX 3060) |
+| x86_64 PC | Debian | Maintainer-verified install |
 | WSL2 on Windows 11 | Default Ubuntu image (incl. Python 3.14) | Clean install; the installer provisions a compatible Python automatically |
+| Mac | macOS | Installer verified in early betas; the dedicated macOS app (Apple Containerization) is a separate track |
 
 **Manual / development:**
 
