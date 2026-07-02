@@ -25,12 +25,12 @@ errors; the Logs app links to it as one source among several.
 
 New route module `tinyagentos/routes/system_logs.py`:
 
-- `GET /api/system-logs/sources` — the sources available on THIS install
+- `GET /api/system-logs/sources`: the sources available on THIS install
   (journald probed once; absent units simply not listed).
-- `GET /api/system-logs/{source}?lines=N&before=cursor` — paged read,
+- `GET /api/system-logs/{source}?lines=N&before=cursor`: paged read,
   newest-first, cursor = journald cursor or byte offset.
-- `GET /api/system-logs/{source}/stream` — SSE live tail.
-- `GET /api/system-logs/bundle` — the copy-for-bug-report payload: the
+- `GET /api/system-logs/{source}/stream`: SSE live tail.
+- `GET /api/system-logs/bundle`: the copy-for-bug-report payload: the
   installer-style environment banner + last N lines of every source, as one
   redacted text blob.
 
@@ -59,13 +59,13 @@ every row red).
 
 Replace the boolean-ish status with an explicit state enum carried per entry:
 
-- `ok` — probe answered.
-- `starting` — the backend's lifecycle state says installed/managed but the
+- `ok`: probe answered.
+- `starting`: the backend's lifecycle state says installed/managed but the
   socket is not answering yet (connection refused within the grace window,
   default 120s after controller boot or lifecycle start).
-- `unreachable` — probe failed after the grace window; carry `detail` with
+- `unreachable`: probe failed after the grace window; carry `detail` with
   the exception class + target so the UI can show WHY.
-- `unconfigured` — cloud type present but no key resolvable.
+- `unconfigured`: cloud type present but no key resolvable.
 
 Frontend: empty list renders a first-run card ("No providers yet") with an
 Add Provider CTA instead of an error wall; `starting` renders an amber badge
