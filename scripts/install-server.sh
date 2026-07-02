@@ -909,18 +909,17 @@ PY
 # docker-compose-v2. Trying only the Ubuntu name broke Debian Bookworm
 # (vendor Pi images included) with "Unable to locate package" (#1541).
 _apt_install_compose() {
-    local _err
-    if _err=$(sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose-plugin 2>&1); then
-        return 0
+    # Probe availability with apt-cache madison instead of grepping apt's
+    # stderr: the error text is locale-dependent (so string matching broke
+    # the fallback on any non-English system) and "no installation candidate"
+    # was a second phrasing the match missed; an empty madison covers both.
+    # Any real apt failure (locks, held packages, resolver) then surfaces
+    # from the single install attempt itself.
+    if [[ -n "$(apt-cache madison docker-compose-plugin 2>/dev/null)" ]]; then
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose-plugin
+    else
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose-v2
     fi
-    # Only fall through to the Ubuntu name when the Debian name simply is not
-    # in the repos; any other apt failure (locks, held packages, resolver)
-    # is real and must reach the operator, not be masked by a second attempt.
-    if ! grep -qi "unable to locate package" <<<"$_err"; then
-        printf '%s\n' "$_err" >&2
-        return 1
-    fi
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker-compose-v2
 }
 
 ensure_docker_for_apps() {
