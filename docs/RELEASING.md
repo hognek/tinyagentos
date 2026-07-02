@@ -38,14 +38,14 @@ After that PR merges, the install-count telemetry at taos.my starts recording th
 
 On `master`, after the merge commit:
 
-```
+```bash
 git tag v1.0.0-beta.N
 git push origin v1.0.0-beta.N
 ```
 
 Create a GitHub Release for that tag. Paste the matching CHANGELOG section as the release body:
 
-```
+```bash
 gh release create v1.0.0-beta.N --title "v1.0.0-beta.N" --notes-file <notes> --latest
 ```
 

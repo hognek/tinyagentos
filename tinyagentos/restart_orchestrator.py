@@ -260,7 +260,13 @@ _RESUME_RETRY_WINDOW_S = 600
 def _load_or_synthesize_note(note_path: Path) -> dict:
     if note_path.exists():
         try:
-            return json.loads(note_path.read_text())
+            note = json.loads(note_path.read_text())
+            # Valid JSON is not necessarily a valid note (null, [], "x");
+            # posting one of those to /resume would fail until the retry
+            # window expires, so synthesize instead.
+            if isinstance(note, dict):
+                return note
+            logger.warning("resume note at %s is not an object; synthesizing", note_path)
         except Exception:
             logger.warning("unreadable resume note at %s; synthesizing", note_path)
     # No controller-side note: the framework handled /prepare-for-shutdown
@@ -281,17 +287,33 @@ async def _post_resume(host: str, port: int, note: dict) -> bool:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(f"http://{host}:{port}/resume", json=note)
+            if resp.status_code != 200:
+                logger.warning("resume POST to %s:%s returned HTTP %s", host, port, resp.status_code)
             return resp.status_code == 200
-    except Exception:
+    except Exception as exc:
+        # The cause matters for a post-mortem (DNS vs refused vs TLS vs
+        # timeout); without this line a failed fleet resume is invisible
+        # until the final still-paused warning, which carries no cause.
+        logger.warning("resume POST to %s:%s failed: %r", host, port, exc)
         return False
 
 
 async def _unpause(app_state, agent: dict, note_path: Path | None) -> None:
+    # Same contract as the boot-time batch pass: the agent was genuinely
+    # resumed over /resume, so the in-memory flag flips even if persistence
+    # fails; the failure is surfaced and the recovery note is kept.
     agent["paused"] = False
     from tinyagentos.config import save_config_locked
 
     config = app_state.config
-    await save_config_locked(config, config.config_path)
+    try:
+        await save_config_locked(config, config.config_path)
+    except Exception:
+        logger.exception(
+            "persisting unpause of agent %s failed; keeping its resume note",
+            agent.get("name"),
+        )
+        return
     # Delete the note only AFTER the unpause is persisted: a failed config
     # write must never leave paused=True with the recovery note already gone.
     if note_path is not None:
@@ -334,6 +356,18 @@ async def resume_agents_from_notes(app_state) -> None:
         else:
             pending.append(name)
 
+    if pending:
+        # Agent containers can boot slower than the controller; keep retrying
+        # in the background instead of stranding them paused, and say so loudly
+        # if they never come back. Scheduled FIRST: the persistence and
+        # notification steps below are best-effort, and a raise there must not
+        # cost the pending agents their retry window.
+        task = asyncio.create_task(_resume_retry_loop(app_state, pending))
+        bg = getattr(app_state, "_background_tasks", None)
+        if bg is not None:
+            bg.add(task)
+            task.add_done_callback(bg.discard)
+
     if finalize:
         # In-memory flags flip regardless of persistence: the agents were
         # genuinely resumed over /resume, so blocking them in memory because a
@@ -365,7 +399,10 @@ async def resume_agents_from_notes(app_state) -> None:
             # Notes go only after the unpauses are persisted (see _unpause).
             for _, np_ in finalize:
                 if np_ is not None:
-                    np_.unlink(missing_ok=True)
+                    try:
+                        np_.unlink(missing_ok=True)
+                    except OSError:
+                        logger.warning("could not delete resume note %s", np_)
 
     if resumed:
         await notif.add(
@@ -374,16 +411,6 @@ async def resume_agents_from_notes(app_state) -> None:
             level="info",
             source="system.lifecycle",
         )
-
-    if pending:
-        # Agent containers can boot slower than the controller; keep retrying
-        # in the background instead of stranding them paused, and say so loudly
-        # if they never come back.
-        task = asyncio.create_task(_resume_retry_loop(app_state, pending))
-        bg = getattr(app_state, "_background_tasks", None)
-        if bg is not None:
-            bg.add(task)
-            task.add_done_callback(bg.discard)
 
 
 async def _resume_retry_loop(app_state, names: list[str]) -> None:

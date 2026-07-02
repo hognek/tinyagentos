@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { SetupChecklist } from "./SetupChecklist";
 
 vi.mock("@/stores/process-store", () => ({
@@ -72,15 +72,22 @@ describe("SetupChecklist", () => {
     expect(container.innerHTML).toBe("");
   });
 
-  it("renders nothing when status.dismissed is true", () => {
+  it("renders nothing when status.dismissed is true", async () => {
     mockFetchStatus({ ...baseStatus, dismissed: true });
     const { container } = render(<SetupChecklist />);
+    // Wait for the status fetch to land, then assert against the settled
+    // render; asserting synchronously would pass trivially on the initial
+    // (status === null) render even if the hiding logic were broken.
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledWith("/api/setup/status"));
+    await act(async () => {});
     expect(container.innerHTML).toBe("");
   });
 
-  it("renders nothing when status.complete is true", () => {
+  it("renders nothing when status.complete is true", async () => {
     mockFetchStatus({ ...baseStatus, complete: true });
     const { container } = render(<SetupChecklist />);
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledWith("/api/setup/status"));
+    await act(async () => {});
     expect(container.innerHTML).toBe("");
   });
 
@@ -207,7 +214,7 @@ describe("SetupChecklist", () => {
     expect(await screen.findByText("Install the NPU backend")).toBeInTheDocument();
   });
 
-  it("hides once complete and the NPU backend is running", () => {
+  it("hides once complete and the NPU backend is running", async () => {
     mockFetchStatus({
       ...baseStatus,
       complete: true,
@@ -215,6 +222,8 @@ describe("SetupChecklist", () => {
       npu_backend_running: true,
     });
     const { container } = render(<SetupChecklist />);
+    await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledWith("/api/setup/status"));
+    await act(async () => {});
     expect(container.innerHTML).toBe("");
   });
 

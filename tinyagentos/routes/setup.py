@@ -5,6 +5,8 @@ POST /api/setup/dismiss → persist user's dismissal of the checklist
 """
 from __future__ import annotations
 
+import asyncio
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, Request
@@ -13,6 +15,34 @@ from fastapi.responses import JSONResponse
 router = APIRouter()
 
 _PREF_NAMESPACE = "setup"
+
+# The rkllama probe holds a worker thread while its socket connects, and
+# /api/setup/status is polled by the frontend; without a cache and a hard
+# timeout, concurrent polls could pin the default-thread executor.
+_NPU_PROBE_TTL_S = 5.0
+_NPU_PROBE_TIMEOUT_S = 5.0
+_npu_probe_cache: tuple[float, bool] = (0.0, False)
+
+
+async def _npu_backend_running() -> bool:
+    global _npu_probe_cache
+    now = time.monotonic()
+    cached_at, cached = _npu_probe_cache
+    if cached_at and now - cached_at < _NPU_PROBE_TTL_S:
+        return cached
+
+    from tinyagentos.installers.rkllama_installer import rkllama_is_running
+
+    try:
+        # rkllama_is_running never raises, but its socket probes block;
+        # keep them off the event loop and cap how long one can hang.
+        running = await asyncio.wait_for(
+            asyncio.to_thread(rkllama_is_running), _NPU_PROBE_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        running = False
+    _npu_probe_cache = (now, running)
+    return running
 
 
 @router.get("/api/setup/status")
@@ -59,13 +89,7 @@ async def setup_status(request: Request):
     npu_present = bool(npu is not None and getattr(npu, "type", "none") == "rknpu")
     npu_backend_running = False
     if npu_present:
-        import asyncio
-
-        from tinyagentos.installers.rkllama_installer import rkllama_is_running
-
-        # rkllama_is_running never raises, but its socket probes block;
-        # keep them off the event loop.
-        npu_backend_running = await asyncio.to_thread(rkllama_is_running)
+        npu_backend_running = await _npu_backend_running()
 
     # complete: the two core steps done
     complete = has_provider and taos_model_set

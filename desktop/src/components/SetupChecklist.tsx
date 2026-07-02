@@ -98,7 +98,7 @@ export function SetupChecklist({ onDismissed }: { onDismissed?: () => void }) {
   // complete covers the two core steps only; on an NPU board the backend
   // install still deserves a surface until it is running (or the user
   // dismisses the checklist), otherwise it would never be seen (#1535).
-  const npuOutstanding = Boolean(status.npu_present) && !status.npu_backend_running;
+  const npuOutstanding = status.npu_present === true && !status.npu_backend_running;
   if (status.complete && !npuOutstanding) return null;
 
   const steps = status.npu_present ? [...STEPS, NPU_STEP] : STEPS;

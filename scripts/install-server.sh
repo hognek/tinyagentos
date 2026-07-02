@@ -73,7 +73,12 @@ command -v python3 >/dev/null 2>&1 && log "python3=$(python3 --version 2>&1)"
 # Report free space on the filesystem the install actually targets;
 # INSTALL_DIR may not exist yet on a fresh box, so walk up to its nearest
 # existing ancestor (falling back to / masks a full /opt-style volume).
+# An empty or relative INSTALL_DIR would walk to "." and report the cwd's
+# filesystem instead of the install target; fall back to / for the banner.
 _df_target="$INSTALL_DIR"
+if [[ -z "$_df_target" || "$_df_target" != /* ]]; then
+    _df_target="/"
+fi
 while [[ ! -d "$_df_target" && "$_df_target" != "/" ]]; do
     _df_target="$(dirname "$_df_target")"
 done

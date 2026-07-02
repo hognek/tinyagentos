@@ -242,8 +242,11 @@ class TestSetupStatus:
             npu=SimpleNamespace(type="rknpu", tops=6)
         )
         import tinyagentos.installers.rkllama_installer as rk
+        import tinyagentos.routes.setup as setup_routes
 
         monkeypatch.setattr(rk, "rkllama_is_running", lambda: True)
+        # The probe result is TTL-cached; reset so this test sees a fresh probe.
+        monkeypatch.setattr(setup_routes, "_npu_probe_cache", (0.0, False))
         resp = await client.get("/api/setup/status")
         data = resp.json()
         assert data["npu_present"] is True
@@ -256,8 +259,10 @@ class TestSetupStatus:
             npu=SimpleNamespace(type="rknpu", tops=6)
         )
         import tinyagentos.installers.rkllama_installer as rk
+        import tinyagentos.routes.setup as setup_routes
 
         monkeypatch.setattr(rk, "rkllama_is_running", lambda: False)
+        monkeypatch.setattr(setup_routes, "_npu_probe_cache", (0.0, False))
         resp = await client.get("/api/setup/status")
         data = resp.json()
         assert data["npu_present"] is True
