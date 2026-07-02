@@ -97,6 +97,38 @@ class DownloadManager:
     def list_all(self) -> list[DownloadTask]:
         return list(self._tasks.values())
 
+    async def _validate_download(
+        self,
+        task: DownloadTask,
+        expected_sha256: str | None = None,
+        computed_sha256: str | None = None,
+    ) -> str | None:
+        """Check a finished download before it is marked complete.
+
+        Returns None if the download is valid, or an error message
+        describing why it isn't. Applies to both the torrent and HTTP
+        paths so neither can mark a task complete when nothing (or the
+        wrong thing) was actually written to disk.
+        """
+        if not task.dest.exists() or task.dest.stat().st_size == 0:
+            return "download produced no data"
+        if task.total_bytes and task.dest.stat().st_size != task.total_bytes:
+            return "size mismatch"
+        if expected_sha256:
+            digest = computed_sha256
+            if digest is None:
+                # Fallback for a caller that did not stream the hash. Reading a
+                # potentially multi-GB model is offloaded to a thread so it
+                # never blocks the event loop.
+                digest = await asyncio.to_thread(
+                    lambda: hashlib.sha256(task.dest.read_bytes()).hexdigest()
+                )
+            # Hex digests are case-insensitive; a caller passing an uppercase
+            # expected value must not be treated as a mismatch.
+            if digest.lower() != expected_sha256.lower():
+                return "SHA256 mismatch"
+        return None
+
     async def _download_with_fallback(
         self,
         task: DownloadTask,
@@ -133,6 +165,21 @@ class DownloadManager:
                     expected_sha256=expected_sha256,
                     progress_cb=_progress,
                 )
+                # torrent.download() already SHA-verified the file internally
+                # (and raised on mismatch), so re-hashing here would just re-read
+                # a multi-GB file to no benefit. Only the cheap non-empty / size
+                # floor is needed on this path.
+                error = await self._validate_download(task)
+                if error:
+                    task.dest.unlink(missing_ok=True)
+                    task.status = "error"
+                    task.error = error
+                    logger.error(
+                        "Torrent download for %s produced an invalid result (%s)",
+                        task.id,
+                        error,
+                    )
+                    return
                 task.status = "complete"
                 task.completed_at = time.time()
                 logger.info("Downloaded %s via torrent swarm", task.id)
@@ -160,17 +207,29 @@ class DownloadManager:
             async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
                 async with client.stream("GET", task.url) as resp:
                     resp.raise_for_status()
+                    # Content-Length is the size of the ON-THE-WIRE body. When
+                    # the response is content-encoded (gzip/br/deflate/zstd),
+                    # httpx's aiter_bytes() transparently decompresses, so the
+                    # bytes we write to disk are LARGER than Content-Length.
+                    # Treating that as the expected on-disk size would make
+                    # _validate_download flag a perfectly good download as a
+                    # "size mismatch" and delete it, so leave total_bytes at 0
+                    # (unknown) for encoded responses and rely on the SHA check.
                     total = resp.headers.get("content-length")
-                    task.total_bytes = int(total) if total else 0
+                    if total and not resp.headers.get("content-encoding"):
+                        task.total_bytes = int(total)
+                    else:
+                        task.total_bytes = 0
                     with open(task.dest, "wb") as f:
                         async for chunk in resp.aiter_bytes(chunk_size=65536):
                             f.write(chunk)
                             sha.update(chunk)
                             task.downloaded_bytes += len(chunk)
-            if expected_sha256 and sha.hexdigest() != expected_sha256:
+            error = await self._validate_download(task, expected_sha256, computed_sha256=sha.hexdigest())
+            if error:
                 task.dest.unlink(missing_ok=True)
                 task.status = "error"
-                task.error = "SHA256 mismatch"
+                task.error = error
             else:
                 task.status = "complete"
                 task.completed_at = time.time()
