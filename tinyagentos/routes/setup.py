@@ -5,6 +5,8 @@ POST /api/setup/dismiss → persist user's dismissal of the checklist
 """
 from __future__ import annotations
 
+import asyncio
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, Request
@@ -13,6 +15,34 @@ from fastapi.responses import JSONResponse
 router = APIRouter()
 
 _PREF_NAMESPACE = "setup"
+
+# The rkllama probe holds a worker thread while its socket connects, and
+# /api/setup/status is polled by the frontend; without a cache and a hard
+# timeout, concurrent polls could pin the default-thread executor.
+_NPU_PROBE_TTL_S = 5.0
+_NPU_PROBE_TIMEOUT_S = 5.0
+_npu_probe_cache: tuple[float, bool] = (0.0, False)
+
+
+async def _npu_backend_running() -> bool:
+    global _npu_probe_cache
+    now = time.monotonic()
+    cached_at, cached = _npu_probe_cache
+    if cached_at and now - cached_at < _NPU_PROBE_TTL_S:
+        return cached
+
+    from tinyagentos.installers.rkllama_installer import rkllama_is_running
+
+    try:
+        # rkllama_is_running never raises, but its socket probes block;
+        # keep them off the event loop and cap how long one can hang.
+        running = await asyncio.wait_for(
+            asyncio.to_thread(rkllama_is_running), _NPU_PROBE_TIMEOUT_S
+        )
+    except asyncio.TimeoutError:
+        running = False
+    _npu_probe_cache = (now, running)
+    return running
 
 
 @router.get("/api/setup/status")
@@ -25,6 +55,8 @@ async def setup_status(request: Request):
       taos_model_set  — the taOS agent has a model configured
       has_agent       — at least one deployed agent exists
       memory_enabled  — user completed the taOSmd memory setup wizard
+      npu_present     — a Rockchip NPU was detected on this board (#1535)
+      npu_backend_running — a live rkllama answers on the taOS or legacy port
       dismissed       — user dismissed the checklist
       complete        — has_provider AND taos_model_set (the core two steps)
     """
@@ -49,6 +81,16 @@ async def setup_status(request: Request):
     setup_prefs = await store.get_preference("user", _PREF_NAMESPACE)
     dismissed = bool(setup_prefs.get("dismissed", False))
 
+    # NPU-conditional step (#1535): on a Rockchip board the checklist offers
+    # the rkllama backend install (via the Store), complete once a live
+    # rkllama answers. Boards without an NPU never see the step.
+    profile = getattr(request.app.state, "hardware_profile", None)
+    npu = getattr(profile, "npu", None)
+    npu_present = bool(npu is not None and getattr(npu, "type", "none") == "rknpu")
+    npu_backend_running = False
+    if npu_present:
+        npu_backend_running = await _npu_backend_running()
+
     # complete: the two core steps done
     complete = has_provider and taos_model_set
 
@@ -58,6 +100,8 @@ async def setup_status(request: Request):
         "taos_model_set": taos_model_set,
         "has_agent": has_agent,
         "memory_enabled": memory_enabled,
+        "npu_present": npu_present,
+        "npu_backend_running": npu_backend_running,
         "dismissed": dismissed,
         "complete": complete,
     })

@@ -243,49 +243,231 @@ async def apply_pending_restart_check(app_state) -> None:
         )
 
 
+# The graceful-shutdown pause (prepare()) marks EVERY agent paused=True, so the
+# boot-time resume must cover every paused agent or a routine update/restart
+# strands agents paused with no indication (#97):
+#   - a framework that answered /prepare-for-shutdown itself leaves NO
+#     controller-side note, so a note-gated resume skipped exactly the agents
+#     that implemented the protocol correctly;
+#   - hostless agents have no /resume to call and were never unpaused;
+#   - agents whose containers boot slower than the controller failed the single
+#     resume attempt and stayed paused silently.
+
+_RESUME_RETRY_INTERVAL_S = 30
+_RESUME_RETRY_WINDOW_S = 600
+
+
+def _load_or_synthesize_note(note_path: Path) -> dict:
+    if note_path.exists():
+        try:
+            note = json.loads(note_path.read_text())
+            # Valid JSON is not necessarily a valid note (null, [], "x");
+            # posting one of those to /resume would fail until the retry
+            # window expires, so synthesize instead.
+            if isinstance(note, dict):
+                return note
+            logger.warning("resume note at %s is not an object; synthesizing", note_path)
+        except Exception:
+            logger.warning("unreadable resume note at %s; synthesizing", note_path)
+    # No controller-side note: the framework handled /prepare-for-shutdown
+    # itself and keeps its own state, so a minimal note is enough. Field
+    # shapes mirror _write_controller_note (paused_at is an int there) so a
+    # framework parsing either source sees a single contract.
+    return {
+        "reason": "restart",
+        "paused_at": int(time.time()),
+        "last_user_msg": None,
+        "in_progress_task": None,
+        "next_step_hint": "controller restarted; resume normal operation",
+        "context_snapshot": {},
+    }
+
+
+async def _post_resume(host: str, port: int, note: dict) -> bool:
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(f"http://{host}:{port}/resume", json=note)
+            if resp.status_code != 200:
+                logger.warning("resume POST to %s:%s returned HTTP %s", host, port, resp.status_code)
+            return resp.status_code == 200
+    except Exception as exc:
+        # The cause matters for a post-mortem (DNS vs refused vs TLS vs
+        # timeout); without this line a failed fleet resume is invisible
+        # until the final still-paused warning, which carries no cause.
+        logger.warning("resume POST to %s:%s failed: %r", host, port, exc)
+        return False
+
+
+async def _unpause(app_state, agent: dict, note_path: Path | None) -> None:
+    # Same contract as the boot-time batch pass: the agent was genuinely
+    # resumed over /resume, so the in-memory flag flips even if persistence
+    # fails; the failure is surfaced and the recovery note is kept.
+    agent["paused"] = False
+    from tinyagentos.config import save_config_locked
+
+    config = app_state.config
+    try:
+        await save_config_locked(config, config.config_path)
+    except Exception:
+        logger.exception(
+            "persisting unpause of agent %s failed; keeping its resume note",
+            agent.get("name"),
+        )
+        return
+    # Delete the note only AFTER the unpause is persisted: a failed config
+    # write must never leave paused=True with the recovery note already gone.
+    if note_path is not None:
+        note_path.unlink(missing_ok=True)
+
+
 async def resume_agents_from_notes(app_state) -> None:
     config = app_state.config
     data_dir: Path = app_state.data_dir
     notif = app_state.notifications
 
-    resumed = []
-    for agent in config.agents:
-        if not agent.get("paused", False):
-            continue
+    paused = [a for a in config.agents if a.get("paused", False)]
+    if not paused:
+        return
+
+    resumed: list[str] = []
+    pending: list[str] = []
+    # (agent, note_path-to-delete) pairs; flags flip and persist in ONE locked
+    # config write below instead of one write per agent.
+    finalize: list[tuple[dict, Path | None]] = []
+
+    for agent in paused:
         name = agent["name"]
         note_path = data_dir / "agent-memory" / name / "resume_note.json"
-        if not note_path.exists():
-            continue
-
-        try:
-            note = json.loads(note_path.read_text())
-        except Exception:
-            continue
-
         host = agent.get("host", "")
         port = agent.get("port", 8080)
+
         if not host:
+            # Nothing to call: the pause flag is the only thing holding the
+            # agent back, so clear it. Keep any note on disk: nothing consumed
+            # it, and it may carry state worth inspecting.
+            finalize.append((agent, None))
+            resumed.append(name)
             continue
 
+        note = _load_or_synthesize_note(note_path)
+        if await _post_resume(host, port, note):
+            finalize.append((agent, note_path))
+            resumed.append(name)
+        else:
+            pending.append(name)
+
+    if pending:
+        # Agent containers can boot slower than the controller; keep retrying
+        # in the background instead of stranding them paused, and say so loudly
+        # if they never come back. Scheduled FIRST: the persistence and
+        # notification steps below are best-effort, and a raise there must not
+        # cost the pending agents their retry window.
+        task = asyncio.create_task(_resume_retry_loop(app_state, pending))
+        bg = getattr(app_state, "_background_tasks", None)
+        if bg is not None:
+            bg.add(task)
+            task.add_done_callback(bg.discard)
+
+    if finalize:
+        # In-memory flags flip regardless of persistence: the agents were
+        # genuinely resumed over /resume, so blocking them in memory because a
+        # disk write failed would be worse than the divergence. A failed write
+        # is surfaced loudly and the recovery notes are kept.
+        for agent, _ in finalize:
+            agent["paused"] = False
+        from tinyagentos.config import save_config_locked
+
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(
-                    f"http://{host}:{port}/resume",
-                    json=note,
-                )
-                if resp.status_code == 200:
-                    agent["paused"] = False
-                    note_path.unlink(missing_ok=True)
-                    resumed.append(name)
+            await save_config_locked(config, config.config_path)
         except Exception:
-            pass  # leave paused=True and note in place
+            logger.exception("persisting agent unpauses failed")
+            try:
+                await notif.add(
+                    title="Agent resume not persisted",
+                    message=(
+                        "Agents were resumed but the config write failed; they may "
+                        "show as paused again after the next restart."
+                    ),
+                    level="warning",
+                    source="system.lifecycle",
+                )
+            except Exception:
+                # The log line above already carries the failure; a broken
+                # notification store must not abort the rest of the resume.
+                logger.exception("could not post the persist-failure warning")
+        else:
+            # Notes go only after the unpauses are persisted (see _unpause).
+            for _, np_ in finalize:
+                if np_ is not None:
+                    try:
+                        np_.unlink(missing_ok=True)
+                    except OSError:
+                        logger.warning("could not delete resume note %s", np_)
 
     if resumed:
-        from tinyagentos.config import save_config_locked
-        await save_config_locked(config, config.config_path)
         await notif.add(
-            title="All agents resumed",
-            message=f"Resumed {len(resumed)} agent(s) from resume notes: {', '.join(resumed)}",
+            title="Agents resumed",
+            message=f"Resumed {len(resumed)} agent(s) after restart: {', '.join(resumed)}",
             level="info",
             source="system.lifecycle",
         )
+
+
+async def _resume_retry_loop(app_state, names: list[str]) -> None:
+    config = app_state.config
+    data_dir: Path = app_state.data_dir
+    notif = app_state.notifications
+
+    remaining = set(names)
+    deadline = time.monotonic() + _RESUME_RETRY_WINDOW_S
+
+    while remaining and time.monotonic() < deadline:
+        await asyncio.sleep(_RESUME_RETRY_INTERVAL_S)
+        # Rebuilt each tick on purpose: agents can be added or removed while
+        # the 10-minute window runs, and a stale index would resume a deleted
+        # agent or miss a re-added one.
+        by_name = {a["name"]: a for a in config.agents}
+        for name in list(remaining):
+            # Any raise past this point (config write, notification store)
+            # would kill the loop and re-create the silent pause this fix
+            # exists to remove; log and keep going instead.
+            try:
+                agent = by_name.get(name)
+                if agent is None or not agent.get("paused", False):
+                    remaining.discard(name)
+                    continue
+                note_path = data_dir / "agent-memory" / name / "resume_note.json"
+                note = _load_or_synthesize_note(note_path)
+                if await _post_resume(agent.get("host", ""), agent.get("port", 8080), note):
+                    # Per-agent config write is fine here: retry successes are
+                    # rare, isolated events (one agent per 30s tick at worst),
+                    # unlike the boot pass which batches.
+                    await _unpause(app_state, agent, note_path)
+                    remaining.discard(name)
+                    await notif.add(
+                        title=f"Agent {name} resumed",
+                        message="Resumed after the controller restart (agent took a while to come back up).",
+                        level="info",
+                        source="system.lifecycle",
+                    )
+            except Exception:
+                logger.exception("resume retry for agent %s failed; will retry", name)
+
+    if remaining:
+        # The whole point of this warning is to make the failure visible; a
+        # notification-store error must not silently swallow it.
+        try:
+            await notif.add(
+                title="Some agents are still paused",
+                message=(
+                    f"Could not resume after the restart: {', '.join(sorted(remaining))}. "
+                    "They stay paused; check the agent containers, then unpause from the Agents app."
+                ),
+                level="warning",
+                source="system.lifecycle",
+            )
+        except Exception:
+            logger.exception(
+                "could not post the still-paused warning; agents still paused: %s",
+                ", ".join(sorted(remaining)),
+            )
