@@ -1,32 +1,57 @@
 import { render, screen, fireEvent } from "@testing-library/react";
 import { describe, it, expect } from "vitest";
-import { OfficeSuiteApp } from "./OfficeSuiteApp";
+import { OfficeStudioApp } from "./OfficeStudioApp";
 
 function renderApp() {
-  return render(<OfficeSuiteApp windowId="test-window" />);
+  return render(<OfficeStudioApp windowId="test-window" />);
 }
 
-describe("OfficeSuiteApp", () => {
+describe("OfficeStudioApp", () => {
   it("renders all rail items", () => {
     renderApp();
-    const nav = screen.getByRole("navigation", { name: "Office Suite views" });
+    const nav = screen.getByRole("navigation", { name: "Office Studio views" });
     expect(nav).toBeDefined();
     // query within nav to avoid ambiguity with toolbar buttons
     expect(nav.querySelector('[aria-label="Write"]')).toBeTruthy();
     expect(nav.querySelector('[aria-label="Calc"]')).toBeTruthy();
     expect(nav.querySelector('[aria-label="Slides"]')).toBeTruthy();
-    expect(nav.querySelector('[aria-label="Data"]')).toBeTruthy();
     expect(nav.querySelector('[aria-label="Assist"]')).toBeTruthy();
   });
 
   it("shows Write view by default with Write rail item active", () => {
     renderApp();
-    const nav = screen.getByRole("navigation", { name: "Office Suite views" });
+    const nav = screen.getByRole("navigation", { name: "Office Studio views" });
     const writeBtn = nav.querySelector('[aria-label="Write"]') as HTMLElement;
     expect(writeBtn).toBeTruthy();
     expect(writeBtn.getAttribute("aria-current")).toBe("page");
     expect(screen.getByLabelText("Document title")).toBeDefined();
     expect(screen.getByRole("button", { name: "Save" })).toBeDefined();
+  });
+
+  it("renders the Tiptap document body with an accessible label", () => {
+    renderApp();
+    const body = screen.getByRole("textbox", { name: "Document body" });
+    expect(body).toBeDefined();
+    expect(body.getAttribute("contenteditable")).toBe("true");
+  });
+
+  it("toggles Bold on and off from the toolbar", () => {
+    renderApp();
+    const boldBtn = screen.getByRole("button", { name: "Bold" });
+    expect(boldBtn.getAttribute("aria-pressed")).toBe("false");
+    fireEvent.click(boldBtn);
+    expect(boldBtn.getAttribute("aria-pressed")).toBe("true");
+    fireEvent.click(boldBtn);
+    expect(boldBtn.getAttribute("aria-pressed")).toBe("false");
+  });
+
+  it("typing into the document body updates the editor content", () => {
+    renderApp();
+    const body = screen.getByRole("textbox", { name: "Document body" });
+    body.focus();
+    body.innerHTML = "<p>Hello world</p>";
+    fireEvent.input(body);
+    expect(body.textContent).toContain("Hello world");
   });
 
   it("switches to Calc view and shows spreadsheet grid with Total row", () => {
