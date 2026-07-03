@@ -34,7 +34,7 @@ OPTIONAL_FRONTEND_APPS = {
     # Creative Studios: a frontend-only optional app whose install row just
     # flips the launcher visibility, no service spawned.
     "coding-studio", "design-studio", "music-studio", "app-studio", "office-studio",
-    "web-studio",
+    "web-studio", "video-studio",
 }
 _FRONTEND_APP_KIND = "frontend-app"
 
@@ -47,10 +47,27 @@ APP_VERSIONS: dict[str, str] = {
     "app-studio": "1.0.0",
     "office-studio": "1.0.0",
     "web-studio": "1.0.0",
+    "video-studio": "1.0.0",
 }
 
 # Trust level for each optional app (all current optional apps are first-party).
 APP_TRUST: dict[str, str] = {
+    "coding-studio": "first-party",
+    "design-studio": "first-party",
+    "music-studio": "first-party",
+    "app-studio": "first-party",
+    "office-studio": "first-party",
+    "web-studio": "first-party",
+    "video-studio": "first-party",
+}
+
+# Provenance tier for each optional app (see tinyagentos/userspace/capabilities.py
+# for the full tier -> capability model). Every app bundled here ships in the
+# core repo and is built by taOS itself, so they are all "first-party" today;
+# this is a separate dict from APP_TRUST because provenance is the broader,
+# 4-tier classification (first-party/ai-generated/user-uploaded/unknown) while
+# trust remains the older first-party/community binary used elsewhere.
+APP_PROVENANCE: dict[str, str] = {
     "coding-studio": "first-party",
     "design-studio": "first-party",
     "music-studio": "first-party",
@@ -213,6 +230,7 @@ async def optional_app_catalog(request: Request):
                     "id": "reddit",
                     "version": "1.0.0",
                     "trust": "first-party",
+                    "provenance": "first-party",
                     "source": "core",
                     "installed": true,
                     "update_available": false
@@ -253,10 +271,18 @@ async def optional_app_catalog(request: Request):
             if recorded:
                 update_available = _semver_tuple(recorded) < _semver_tuple(current_version)
 
+        # Legacy install rows (from before provenance was recorded) fall back to
+        # the APP_PROVENANCE allowlist -- every optional app shipped in-core is
+        # first-party, so this is always a safe, non-elevating default.
+        provenance = (
+            (row.get("metadata") or {}).get("provenance") if row is not None else None
+        ) or APP_PROVENANCE.get(app_id, "first-party")
+
         result.append({
             "id": app_id,
             "version": current_version,
             "trust": APP_TRUST.get(app_id, "first-party"),
+            "provenance": provenance,
             "source": "core",
             "installed": is_installed,
             "update_available": update_available,
@@ -280,7 +306,10 @@ async def install_optional_app(app_id: str, request: Request):
     await store.install(
         app_id,
         version=APP_VERSIONS.get(app_id, "1.0.0"),
-        metadata={"kind": _FRONTEND_APP_KIND},
+        metadata={
+            "kind": _FRONTEND_APP_KIND,
+            "provenance": APP_PROVENANCE.get(app_id, "first-party"),
+        },
     )
     return {"status": "installed", "app_id": app_id}
 
