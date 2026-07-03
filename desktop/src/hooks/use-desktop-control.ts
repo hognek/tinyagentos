@@ -14,6 +14,12 @@ import { resolveApp } from "@/registry/app-registry";
  * Actions: open, close, focus, minimize, restore, maximize, move, resize, snap,
  * arrange (preset: tile-2 | tile-3 | center | cascade). Targeting precedence:
  * explicit windowId, else first window for appId, else the focused/topmost one.
+ * `close` is the one exception: given an appId with no windowId, it closes
+ * every open window for that app (an app can have more than one via forceNew).
+ * The CustomEvent also accepts `op`/`app` as aliases for `action`/`appId` (the
+ * sibling `taos:open-app` event uses `app`, so callers reasonably guess it here
+ * too); an event with neither `action` nor `op` is rejected with a console.warn
+ * so contract drift is visible instead of silently doing nothing.
  * This is the agent-tool side of the deep-navigation API (#836) and complements
  * `taos:open-app`.
  */
@@ -57,6 +63,13 @@ export interface WindowOp {
   snap?: SnapPosition;
   preset?: "tile-2" | "tile-3" | "center" | "cascade";
 }
+
+// The valid WindowOp actions, as a runtime allowlist for the event receiver
+// (the type union alone cannot guard an untrusted CustomEvent payload).
+const WINDOW_ACTIONS = new Set<WindowOp["action"]>([
+  "open", "close", "focus", "minimize", "restore",
+  "maximize", "move", "resize", "snap", "arrange",
+]);
 
 const TOP = 36; // below the 32px top bar
 const DOCK = 88; // above the dock
@@ -187,6 +200,12 @@ function run(op: WindowOp): string | void {
       return;
     }
     case "close": {
+      // appId with no explicit windowId closes every window for that app,
+      // not just the first match -- an app can have several (forceNew).
+      if (!op.windowId && op.appId) {
+        s.windows.filter((w) => w.appId === op.appId).forEach((w) => s.closeWindow(w.id));
+        return;
+      }
       const id = resolveId(op);
       if (id) s.closeWindow(id);
       return;
@@ -211,8 +230,22 @@ declare global {
 export function useDesktopControl(): void {
   useEffect(() => {
     const onWindow = (e: Event) => {
-      const detail = (e as CustomEvent).detail as WindowOp | undefined;
-      if (detail?.action) run(detail);
+      // `op`/`app` are accepted as aliases for `action`/`appId` (see module
+      // docstring) since they mirror the sibling taos:open-app payload shape.
+      const raw = (e as CustomEvent).detail as Record<string, unknown> | undefined;
+      const candidate = raw?.action ?? raw?.op;
+      // Allowlist the action so an unknown string (e.g. op: "shutdown") is
+      // rejected loudly here rather than falling through run()'s switch as a
+      // silent no-op, which is the very behaviour this receiver fixes.
+      if (typeof candidate !== "string" || !WINDOW_ACTIONS.has(candidate as WindowOp["action"])) {
+        console.warn("taos:window ignored: missing or unknown action/op", raw);
+        return;
+      }
+      const action = candidate as WindowOp["action"];
+      // appId must be a string; a non-string app silently fails the lookup.
+      const rawAppId = raw?.appId ?? raw?.app;
+      const appId = typeof rawAppId === "string" ? rawAppId : undefined;
+      run({ ...(raw as Partial<WindowOp>), action, appId });
     };
     window.addEventListener("taos:window", onWindow);
     window.taosDesktop = { getLayout, run };
