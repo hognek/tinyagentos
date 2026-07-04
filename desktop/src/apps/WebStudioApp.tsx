@@ -1,26 +1,30 @@
 import { useCallback, useEffect, useState } from "react";
-import { Wand2, LayoutGrid, Pencil, Eye, Download } from "lucide-react";
+import { Wand2, LayoutGrid, Pencil, Eye, Download, Share2 } from "lucide-react";
 import { GenerateView } from "./webstudio/GenerateView";
 import { TemplatesView } from "./webstudio/TemplatesView";
 import { EditView, type SavedSite } from "./webstudio/EditView";
 import { PreviewView } from "./webstudio/PreviewView";
 import { ExportView } from "./webstudio/ExportView";
+import { ShareView } from "./webstudio/ShareView";
+import { exportSiteHtml } from "./webstudio/export";
 import { emptySite } from "./webstudio/templates";
 import { isValidSite, MAX_CONTENT_BYTES, type Site, type StudioView } from "./webstudio/types";
 
 /* ------------------------------------------------------------------ */
-/*  Web Studio - shell (phase 1)                                       */
+/*  Web Studio - shell                                                  */
 /*                                                                     */
 /*  A Wix-style, section-based website builder. Left icon rail         */
-/*  (Generate / Templates / Edit / Preview / Export) + the active      */
-/*  surface, the same shape as the other taOS studios.                 */
+/*  (Generate / Templates / Edit / Preview / Export / Share) + the      */
+/*  active surface, the same shape as the other taOS studios.           */
 /*                                                                     */
-/*  Phase 1 ships a genuinely usable editor: template-matched          */
-/*  scaffolding, a visual sections editor with inline text + image     */
-/*  swap, live device preview, a self-contained static-HTML export     */
-/*  and backend persistence (/api/web/sites). Full offline-LLM         */
-/*  generation and publish-to-host are later phases, surfaced as       */
-/*  honest "coming" affordances, never faked.                          */
+/*  Generate streams the taos-agent for a real, bespoke Site (with an   */
+/*  honest template-match fallback if that fails); Edit is a visual     */
+/*  sections editor; Preview is a sandboxed iframe (either the saved,    */
+/*  backend-rendered page or a srcDoc of the live in-memory edits);      */
+/*  Export downloads the self-contained static HTML; Share installs the  */
+/*  site as a real taOS app (or exports the same .taosapp package).      */
+/*  Saving also persists the rendered index.html alongside the editable  */
+/*  Site JSON, so Preview/Share have something servable.                 */
 /* ------------------------------------------------------------------ */
 
 const RAIL: { id: StudioView; label: string; icon: typeof Wand2 }[] = [
@@ -29,6 +33,7 @@ const RAIL: { id: StudioView; label: string; icon: typeof Wand2 }[] = [
   { id: "edit", label: "Edit", icon: Pencil },
   { id: "preview", label: "Preview", icon: Eye },
   { id: "export", label: "Export", icon: Download },
+  { id: "share", label: "Share", icon: Share2 },
 ];
 
 export function WebStudioApp(_props: { windowId: string }) {
@@ -40,6 +45,17 @@ export function WebStudioApp(_props: { windowId: string }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
+  // True when the active saved site has a stored rendered index.html the
+  // /preview route can serve. Legacy rows (saved before this feature) have an
+  // empty index_html, so Preview must fall back to a client-side srcDoc render
+  // rather than point the iframe at a 404. Any save with the current code
+  // populates it, so it's true after a successful save.
+  const [activeHasRender, setActiveHasRender] = useState(false);
+  // Honest provenance for the current editing session: only a site the agent
+  // actually generated is "ai-generated"; templates, manual edits, a matched
+  // fallback, or a reopened saved site are "user-uploaded" (the safe default;
+  // both tiers carry the same capability ceiling, so this is a labeling fix).
+  const [provenance, setProvenance] = useState<"ai-generated" | "user-uploaded">("user-uploaded");
 
   const loadList = useCallback(async () => {
     const res = await fetch("/api/web/sites", { credentials: "include" });
@@ -68,12 +84,14 @@ export function WebStudioApp(_props: { windowId: string }) {
   const confirmDiscard = () =>
     !dirty || window.confirm("Discard unsaved changes to the current site?");
 
-  const seedInEditor = (next: Site) => {
+  const seedInEditor = (next: Site, wasAiGenerated = false) => {
     if (!confirmDiscard()) return;
     setSite(next);
     setActiveId(null);
     setView("edit");
     setDirty(false);
+    setActiveHasRender(false);
+    setProvenance(wasAiGenerated ? "ai-generated" : "user-uploaded");
   };
 
   const newSite = () => {
@@ -82,6 +100,8 @@ export function WebStudioApp(_props: { windowId: string }) {
     setActiveId(null);
     setError(null);
     setDirty(false);
+    setActiveHasRender(false);
+    setProvenance("user-uploaded");
   };
 
   const updateSite = (next: Site) => {
@@ -95,7 +115,7 @@ export function WebStudioApp(_props: { windowId: string }) {
     try {
       const res = await fetch(`/api/web/sites/${encodeURIComponent(id)}`, { credentials: "include" });
       if (!res.ok) throw new Error("Could not open site");
-      const row = (await res.json()) as { id: string; title: string; content: string };
+      const row = (await res.json()) as { id: string; title: string; content: string; index_html?: string };
       let model: Site;
       try {
         const parsed: unknown = JSON.parse(row.content);
@@ -108,6 +128,11 @@ export function WebStudioApp(_props: { windowId: string }) {
       setSite(model);
       setActiveId(row.id);
       setDirty(false);
+      // Legacy rows have no stored render; Preview will use a srcDoc fallback.
+      setActiveHasRender(Boolean(row.index_html));
+      // A reopened saved site's origin isn't tracked across sessions; fall
+      // back to the safe, non-agent tier rather than assume ai-generated.
+      setProvenance("user-uploaded");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Open failed");
     }
@@ -118,15 +143,23 @@ export function WebStudioApp(_props: { windowId: string }) {
     setError(null);
     try {
       const content = JSON.stringify(site);
+      // The rendered static HTML persisted alongside the editable Site JSON --
+      // the derived artifact the preview/package routes serve, so Preview and
+      // Share never have to re-render the site server-side.
+      const indexHtml = exportSiteHtml(site);
       // Catch an over-cap site (usually too many/too-large inlined images)
-      // here with a clear message rather than letting it fail only at PUT
-      // time with a raw 413. The cap mirrors the backend's MAX_CONTENT_BYTES.
-      if (new Blob([content]).size > MAX_CONTENT_BYTES) {
+      // here with a clear message rather than letting it fail only at PUT time
+      // with a raw 413. Both the JSON content and the rendered HTML are capped
+      // at the backend's MAX_CONTENT_BYTES, so check both before the request.
+      if (
+        new Blob([content]).size > MAX_CONTENT_BYTES ||
+        new Blob([indexHtml]).size > MAX_CONTENT_BYTES
+      ) {
         throw new Error(
           "This site is too large to save (over 5 MB). Remove or shrink some images and try again.",
         );
       }
-      const payload = { title: site.title.trim() || "Untitled site", content };
+      const payload = { title: site.title.trim() || "Untitled site", content, index_html: indexHtml };
       const url = activeId ? `/api/web/sites/${encodeURIComponent(activeId)}` : "/api/web/sites";
       const res = await fetch(url, {
         method: activeId ? "PUT" : "POST",
@@ -141,6 +174,8 @@ export function WebStudioApp(_props: { windowId: string }) {
       const savedRow = (await res.json()) as { id: string };
       setActiveId(savedRow.id);
       setDirty(false);
+      // We just persisted index_html, so the /preview route can serve it.
+      setActiveHasRender(true);
       await loadList();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Save failed");
@@ -212,8 +247,11 @@ export function WebStudioApp(_props: { windowId: string }) {
               onDelete={deleteSite}
             />
           )}
-          {view === "preview" && <PreviewView site={site} />}
+          {view === "preview" && (
+            <PreviewView site={site} siteId={activeId} dirty={dirty} hasRender={activeHasRender} />
+          )}
           {view === "export" && <ExportView site={site} />}
+          {view === "share" && <ShareView siteId={activeId} provenance={provenance} />}
         </div>
       </div>
     </div>

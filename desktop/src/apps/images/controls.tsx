@@ -14,7 +14,14 @@ export function Segmented<T extends string>({
   onChange,
   ariaLabel,
 }: {
-  options: readonly { value: T; label: string }[];
+  options: readonly {
+    value: T;
+    label: string;
+    /** Disable this option (e.g. a tier whose backend isn't installed). */
+    disabled?: boolean;
+    /** Tooltip shown on the disabled option. */
+    title?: string;
+  }[];
   value: T;
   onChange: (v: T) => void;
   ariaLabel: string;
@@ -27,17 +34,29 @@ export function Segmented<T extends string>({
     >
       {options.map((opt) => {
         const on = opt.value === value;
+        const disabled = opt.disabled ?? false;
         return (
           <button
             key={opt.value}
             type="button"
             role="radio"
             aria-checked={on}
-            onClick={() => onChange(opt.value)}
+            // aria-disabled (not the native `disabled` attribute) so the
+            // element still receives pointer/focus events and its `title`
+            // tooltip actually surfaces — a truly disabled/pointer-events-none
+            // control never shows its native tooltip. The click is guarded
+            // below instead.
+            aria-disabled={disabled || undefined}
+            title={opt.title}
+            onClick={() => {
+              if (!disabled) onChange(opt.value);
+            }}
             className={`rounded-full px-3 py-[5px] text-[11px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40 ${
-              on
-                ? "bg-shell-surface-active text-shell-text"
-                : "text-shell-text-secondary hover:text-shell-text"
+              disabled
+                ? "cursor-not-allowed text-shell-text-secondary opacity-40"
+                : on
+                  ? "bg-shell-surface-active text-shell-text"
+                  : "text-shell-text-secondary hover:text-shell-text"
             }`}
           >
             {opt.label}
