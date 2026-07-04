@@ -317,6 +317,10 @@ async def client(app, tmp_data_dir):
     if project_task_store._db is not None:
         await project_task_store.close()
     await project_task_store.init()
+    routine_store = app.state.routine_store
+    if routine_store._db is not None:
+        await routine_store.close()
+    await routine_store.init()
     decision_store = app.state.decision_store
     if decision_store._db is not None:
         await decision_store.close()
@@ -392,6 +396,7 @@ async def client(app, tmp_data_dir):
         yield c
     await canvas_store.close()
     await project_task_store.close()
+    await routine_store.close()
     await board_audit.close()
     await project_store.close()
     await chat_channels.close()
@@ -549,6 +554,10 @@ async def client_with_qmd(app_with_qmd):
     if project_task_store._db is not None:
         await project_task_store.close()
     await project_task_store.init()
+    routine_store = app_with_qmd.state.routine_store
+    if routine_store._db is not None:
+        await routine_store.close()
+    await routine_store.init()
     app_with_qmd.state.projects_root.mkdir(parents=True, exist_ok=True)
     canvas_store = app_with_qmd.state.canvas_store
     if canvas_store._db is not None:
@@ -568,6 +577,7 @@ async def client_with_qmd(app_with_qmd):
         yield c
     await canvas_store.close()
     await project_task_store.close()
+    await routine_store.close()
     await board_audit.close()
     await project_store.close()
     await chat_channels.close()
