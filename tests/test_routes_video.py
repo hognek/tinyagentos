@@ -1,3 +1,4 @@
+import asyncio
 import json
 from unittest.mock import AsyncMock, patch
 
@@ -6,6 +7,15 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient, Request as HttpxRequest, Response
 
 from tinyagentos.app import create_app
+
+
+async def _drain_background_tasks(app) -> None:
+    """Wait for the video generation background task(s) spawned by the last
+    request to finish, so a job status poll immediately after sees the
+    terminal state instead of racing the still-running task."""
+    pending = [t for t in app.state._background_tasks if not t.done()]
+    if pending:
+        await asyncio.gather(*pending)
 
 
 @pytest.fixture
@@ -63,8 +73,9 @@ class TestVideoGenerate:
         await app.state.qmd_client.close()
         await app.state.http_client.aclose()
 
-    async def test_generate_with_mocked_backend_b64(self, video_app, video_client):
-        """Generate a video using a mocked backend returning base64 data."""
+    async def test_generate_returns_job_id_then_completes(self, video_app, video_client):
+        """Generate enqueues a job (202 + job_id) and, once the background
+        task finishes, the job's status flips to done with the saved video."""
         import base64
 
         # Set video_backend_url in config
@@ -89,13 +100,22 @@ class TestVideoGenerate:
                 "prompt": "a test video",
                 "seed": 99,
             })
+            assert resp.status_code == 202
+            data = resp.json()
+            assert data["status"] == "queued"
+            job_id = data["job_id"]
+            assert job_id
 
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["status"] == "generated"
-        assert data["prompt"] == "a test video"
-        assert data["seed"] == 99
-        assert data["filename"].endswith("_99.mp4")
+            await _drain_background_tasks(video_app)
+
+        status_resp = await video_client.get(f"/api/video/jobs/{job_id}")
+        assert status_resp.status_code == 200
+        status = status_resp.json()
+        assert status["status"] == "done"
+        result = status["result"]
+        assert result["prompt"] == "a test video"
+        assert result["seed"] == 99
+        assert result["filename"].endswith("_99.mp4")
 
         # Verify file was saved
         videos_dir = video_app.state.config.config_path.parent / "videos"
@@ -124,9 +144,15 @@ class TestVideoGenerate:
             MockClient.return_value = mock_instance
 
             resp = await video_client.post("/api/video/generate", json={"prompt": "test"})
+            assert resp.status_code == 202
+            job_id = resp.json()["job_id"]
 
-        assert resp.status_code == 503
-        assert "Cannot connect" in resp.json()["error"]
+            await _drain_background_tasks(video_app)
+
+        status_resp = await video_client.get(f"/api/video/jobs/{job_id}")
+        status = status_resp.json()
+        assert status["status"] == "error"
+        assert "Cannot connect" in status["error"]
 
         del video_app.state.config.server["video_backend_url"]
 
@@ -142,9 +168,15 @@ class TestVideoGenerate:
             MockClient.return_value = mock_instance
 
             resp = await video_client.post("/api/video/generate", json={"prompt": "test"})
+            assert resp.status_code == 202
+            job_id = resp.json()["job_id"]
 
-        assert resp.status_code == 504
-        assert "timed out" in resp.json()["error"]
+            await _drain_background_tasks(video_app)
+
+        status_resp = await video_client.get(f"/api/video/jobs/{job_id}")
+        status = status_resp.json()
+        assert status["status"] == "error"
+        assert "timed out" in status["error"]
 
         del video_app.state.config.server["video_backend_url"]
 
@@ -166,11 +198,64 @@ class TestVideoGenerate:
             MockClient.return_value = mock_instance
 
             resp = await video_client.post("/api/video/generate", json={"prompt": "test"})
+            assert resp.status_code == 202
+            job_id = resp.json()["job_id"]
 
-        assert resp.status_code == 502
-        assert "Unexpected response format" in resp.json()["error"]
+            await _drain_background_tasks(video_app)
+
+        status_resp = await video_client.get(f"/api/video/jobs/{job_id}")
+        status = status_resp.json()
+        assert status["status"] == "error"
+        assert "Unexpected response format" in status["error"]
 
         del video_app.state.config.server["video_backend_url"]
+
+
+    async def test_generate_unexpected_exception_marks_job_error(self, video_app, video_client):
+        """An unexpected (non-httpx) backend exception still ends the job in a
+        terminal 'error' state -- never stuck in 'running'."""
+        video_app.state.config.server["video_backend_url"] = "http://localhost:9000"
+
+        with patch("tinyagentos.routes.video.httpx.AsyncClient") as MockClient:
+            mock_instance = AsyncMock()
+            mock_instance.post.side_effect = RuntimeError("boom")
+            mock_instance.__aenter__ = AsyncMock(return_value=mock_instance)
+            mock_instance.__aexit__ = AsyncMock(return_value=False)
+            MockClient.return_value = mock_instance
+
+            resp = await video_client.post("/api/video/generate", json={"prompt": "test"})
+            assert resp.status_code == 202
+            job_id = resp.json()["job_id"]
+
+            await _drain_background_tasks(video_app)
+
+        status_resp = await video_client.get(f"/api/video/jobs/{job_id}")
+        status = status_resp.json()
+        assert status["status"] == "error"
+        assert "boom" in status["error"]
+
+        del video_app.state.config.server["video_backend_url"]
+
+
+@pytest.mark.asyncio
+class TestVideoJobStatus:
+    async def test_job_not_found_returns_404(self, video_client):
+        resp = await video_client.get("/api/video/jobs/does-not-exist")
+        assert resp.status_code == 404
+        assert "error" in resp.json()
+
+    async def test_rapid_jobs_get_distinct_ids(self, video_app, video_client):
+        """Two jobs created back-to-back must get distinct (full-length) ids --
+        a truncated id would risk a PRIMARY KEY collision."""
+        from tinyagentos.routes.video import _get_video_job_store
+
+        job_store = await _get_video_job_store(video_app)
+        id1 = await job_store.create_job()
+        id2 = await job_store.create_job()
+        assert id1 != id2
+        # Full uuid4 hex is 32 chars -- not truncated.
+        assert len(id1) == 32
+        assert len(id2) == 32
 
 
 @pytest.mark.asyncio
