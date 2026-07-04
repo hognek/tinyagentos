@@ -34,6 +34,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel
 
 from tinyagentos.adapters.opencode_adapter import OpenCodeAdapter, OpenCodeConfig
+from tinyagentos.opencode_runtime import OpenCodeBinaryNotFoundError
 from tinyagentos.taos_agent_runtime import ensure_taos_opencode_server
 
 logger = logging.getLogger(__name__)
@@ -300,9 +301,21 @@ async def put_permitted_models(request: Request, body: PermittedModelsUpdate):
         permitted = [current_model, *permitted]
 
     # Validate every model is reachable.
-    from tinyagentos.cluster.model_resolver import resolve_model_location
+    from tinyagentos.cluster.model_resolver import (
+        describe_downloaded_backend_down,
+        resolve_model_location,
+    )
     for model_id in permitted:
         location = resolve_model_location(request, model_id)
+        if location.kind == "downloaded_backend_down":
+            return JSONResponse(
+                {
+                    "error": describe_downloaded_backend_down(location, model_id),
+                    "model": model_id,
+                    "backend": location.backend_id,
+                },
+                status_code=409,
+            )
         if location.kind == "not_found":
             return JSONResponse(
                 {
@@ -372,10 +385,28 @@ async def chat(request: Request, body: ChatRequest):
     # Ensure the host opencode server is running.
     try:
         server = await ensure_taos_opencode_server(request.app.state, model)
-    except Exception:
-        logger.exception("taos-agent: failed to start opencode server")
+    except OpenCodeBinaryNotFoundError as exc:
+        # The binary genuinely isn't reachable (not on PATH, not at the
+        # installer's default location) — a clear install instruction, not a
+        # generic "unavailable" message.
+        logger.error("taos-agent: opencode binary not found: %s", exc)
         return JSONResponse(
-            {"error": "taOS agent runtime unavailable. Check that opencode is installed."},
+            {
+                "error": (
+                    "opencode is not installed. Install it with: "
+                    "curl -fsSL https://opencode.ai/install | bash — then restart taOS."
+                )
+            },
+            status_code=503,
+        )
+    except Exception as exc:
+        # opencode was found but failed to start (or some other runtime
+        # error) — surface the real cause instead of masking it behind a
+        # generic message that sends users chasing an install that's already
+        # correct.
+        logger.exception("taos-agent: opencode server failed to start")
+        return JSONResponse(
+            {"error": f"taOS agent runtime failed to start: {exc}"},
             status_code=503,
         )
 
