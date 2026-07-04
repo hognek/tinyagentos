@@ -83,7 +83,11 @@ class TestSkillExecAuthz:
         mock_run.assert_not_called()
 
     async def test_admin_session_allowed(self, client, app):
-        """(b) An admin session may execute code_exec."""
+        """(b) An admin session may execute code_exec.
+
+        Agent governance (#160 slice 1) never gates an admin HUMAN session --
+        the human is the approval authority and bypasses the policy layer -- so
+        this auth-gate test needs no governance setup to reach the impl."""
         await _ensure_skills_seeded(app)
         with patch("subprocess.run", return_value=_fake_subprocess_result()) as mock_run:
             resp = await client.post(
@@ -100,6 +104,11 @@ class TestSkillExecAuthz:
         """(c) A request presenting the valid local token is allowed, with no
         session cookie at all."""
         await _ensure_skills_seeded(app)
+        # A local-token caller (a deployed agent) IS governed, unlike an admin
+        # session -- so neutralize the conservative code-exec gate here to keep
+        # this test focused on the auth gate. Governance itself is covered in
+        # test_skill_exec_governance.py.
+        await app.state.execution_policies.set_policy("code-exec", "allow")
         local_token = app.state.auth.get_local_token()
         bare_client = AsyncClient(
             transport=ASGITransport(app=app), base_url="http://test"
