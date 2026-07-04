@@ -522,7 +522,24 @@ async def upscale_image(request: Request, body: UpscaleRequest):
 @router.get("/api/images/edit/capabilities")
 async def edit_capabilities(request: Request):
     """Report which editing capabilities currently have a healthy backend,
-    so the frontend can gate ops."""
+    so the frontend can gate ops.
+
+    ``image_editing_tiers`` additionally reports per-tier health for
+    image-editing so the UI can disable a tier the router can't honestly
+    serve, rather than offering one that silently downgrades. Health mirrors
+    what ``_get_edit_backend`` + ``edit_image`` actually do:
+
+    - ``quality`` is healthy only when the router resolves its primary
+      backend (flux-fill). If it would fall back to iopaint, that's the
+      silent, prompt-ignoring downgrade we're preventing, so Quality reports
+      unhealthy (matching ``edit_image``'s ``degraded`` flag).
+    - ``fast`` is healthy whenever the router resolves *any* backend for the
+      tier. Fast's preference falls through to flux-fill when iopaint is
+      absent, and serving a fast request on flux-fill still honours the
+      prompt (never flagged ``degraded``) — so Fast must NOT be disabled just
+      because iopaint is missing, or the UI would gate a tier the router
+      would happily serve.
+    """
     catalog = getattr(request.app.state, "backend_catalog", None)
 
     def has(capability: str) -> bool:
@@ -530,8 +547,32 @@ async def edit_capabilities(request: Request):
             return False
         return bool(catalog.backends_with_capability(capability))
 
+    def tier_healthy(capability: str, tier: str) -> bool:
+        """True if the router can serve *tier* without a silent downgrade.
+
+        Resolves the backend the same way ``edit_image`` does (via
+        ``_get_edit_backend``) so the probe and the router never diverge.
+        """
+        resolved = _get_edit_backend(request, capability, tier)
+        if resolved is None:
+            return False
+        _url, backend_type, _name = resolved
+        # Only "quality" carries a downgrade risk: served by anything other
+        # than its primary (flux-fill) means the prompt is ignored. This is
+        # exactly ``edit_image``'s degraded condition, inverted.
+        quality_primary = (
+            _TIER_PREFERENCE.get(capability, {}).get("quality") or [None]
+        )[0]
+        if tier == "quality":
+            return backend_type == quality_primary
+        return True
+
     return {
         "image_editing": has("image-editing"),
         "background_removal": has("background-removal"),
         "upscale": has("upscale"),
+        "image_editing_tiers": {
+            "quality": tier_healthy("image-editing", "quality"),
+            "fast": tier_healthy("image-editing", "fast"),
+        },
     }
