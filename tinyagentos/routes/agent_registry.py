@@ -2,19 +2,19 @@ from __future__ import annotations
 
 """Routes for the Agent Registry (SP-A, taOS side).
 
-POST   /api/agents/registry/register         — register an agent, mint canonical_id, issue token
-GET    /api/agents/registry/pubkey           — public key for token verification (exempt, no auth)
-GET    /api/agents/registry/revoked          — global revocation feed (admin/local-token only)
-GET    /api/agents/registry/inactive         — all non-active entries for the bus (admin only)
-GET    /api/agents/registry/grants           — active grant feed for @taOSmd enforcement (admin only)
-GET    /api/agents/registry                  — list registry entries (admin: all; member: own)
-GET    /api/agents/registry/{id}             — read a single entry (owner or admin; else 404)
-PATCH  /api/agents/registry/{id}             — update mutable fields (owner or admin)
-DELETE /api/agents/registry/{id}             — revoke an entry (owner or admin)
-POST   /api/agents/registry/{id}/approve     — lifecycle: pending → active (admin only)
-POST   /api/agents/registry/{id}/reject      — lifecycle: pending → rejected (admin only)
-POST   /api/agents/registry/{id}/suspend     — lifecycle: active → suspended (admin only)
-POST   /api/agents/registry/{id}/reactivate  — lifecycle: suspended → active (admin only)
+POST   /api/agents/registry/register         - register an agent, mint canonical_id, issue token
+GET    /api/agents/registry/pubkey           - public key for token verification (exempt, no auth)
+GET    /api/agents/registry/revoked          - global revocation feed (admin/local-token only)
+GET    /api/agents/registry/inactive         - all non-active entries for the bus (admin only)
+GET    /api/agents/registry/grants           - active grant feed for @taOSmd enforcement (admin only)
+GET    /api/agents/registry                  - list registry entries (admin: all; member: own)
+GET    /api/agents/registry/{id}             - read a single entry (owner or admin; else 404)
+PATCH  /api/agents/registry/{id}             - update mutable fields (owner or admin)
+DELETE /api/agents/registry/{id}             - revoke an entry (owner or admin)
+POST   /api/agents/registry/{id}/approve     - lifecycle: pending → active (admin only)
+POST   /api/agents/registry/{id}/reject      - lifecycle: pending → rejected (admin only)
+POST   /api/agents/registry/{id}/suspend     - lifecycle: active → suspended (admin only)
+POST   /api/agents/registry/{id}/reactivate  - lifecycle: suspended → active (admin only)
 
 Route ordering matters: /pubkey, /revoked, and /inactive are declared before
 /{canonical_id} so the literal strings are not captured as a path parameter.
@@ -68,6 +68,19 @@ class PatchRegistryRequest(BaseModel):
     handle: Optional[str] = None
     role: Optional[str] = None
     capabilities: Optional[list[str]] = None
+
+
+class OrgUpdateRequest(BaseModel):
+    """Body for PUT /api/agents/{canonical_id}/org.
+
+    ``reports_to`` follows the same clear-with-empty-string convention as
+    ``emoji`` elsewhere in the agent routes: omit the field (None) to leave
+    the manager untouched, pass "" to clear it (make the agent an org-tree
+    root), or pass a canonical_id to set/change it.
+    """
+    role: Optional[str] = None
+    title: Optional[str] = None
+    reports_to: Optional[str] = None
 
 
 # Scopes an operator may grant when minting an internal agent. Mirrors the
@@ -214,7 +227,7 @@ async def register_agent(
 ):
     """Register an agent and issue a signed identity token.
 
-    The minted token's user_id is the authenticated caller's id — not
+    The minted token's user_id is the authenticated caller's id - not
     a value from the request body, so identity cannot be spoofed.
     """
     store = _get_store(request)
@@ -451,7 +464,7 @@ async def list_inactive_entries(
 
     Response: {"inactive": [{canonical_id, status}, ...]}
 
-    Admin only — covers pending/suspended/rejected/revoked.
+    Admin only - covers pending/suspended/rejected/revoked.
     The bus polls this to reject any canonical_id present.
     """
     if not user.is_admin:
@@ -529,7 +542,7 @@ async def get_registry_entry(
     """Fetch a single registry entry by canonical_id.
 
     Returns 404 for unknown entries and for entries the caller does not own
-    (existence-hiding — avoids disclosing whether an id exists to non-owners).
+    (existence-hiding - avoids disclosing whether an id exists to non-owners).
     """
     store = _get_store(request)
     record = await store.get(canonical_id)
@@ -691,3 +704,60 @@ async def reactivate_agent(
 ):
     """Reactivate a suspended agent (suspended → active). Admin only."""
     return await _transition(request, canonical_id, "reactivate", "active", user)
+
+
+# ---------------------------------------------------------------------------
+# Org model (#161): reporting lines, roles/titles, org tree
+#
+# Registered here (not routes/agents.py) so this file remains the single
+# owner of the registry's read/write surface. Both routes live under
+# /api/agents/... but this router is included before the generic
+# /api/agents/{name} route in routes/__init__.py, so /api/agents/org is not
+# shadowed (same reasoning as /api/agents/registry/*).
+# ---------------------------------------------------------------------------
+
+@router.get("/api/agents/org")
+async def get_org_chart(
+    request: Request,
+    user: CurrentUser = Depends(current_user),
+):
+    """Return the full reporting forest (org chart). Admin only - the tree
+    spans every agent's manager regardless of owner, which is an operator/
+    admin concern (mirrors the admin-only registry feeds above)."""
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="forbidden")
+    store = _get_store(request)
+    return {"tree": await store.get_org_tree()}
+
+
+@router.put("/api/agents/{canonical_id}/org")
+async def update_org_fields(
+    request: Request,
+    canonical_id: str,
+    body: OrgUpdateRequest,
+    user: CurrentUser = Depends(current_user),
+):
+    """Set role/title and/or reporting line on a registry entry.
+
+    Only the owning user or an admin may update an entry (mirrors PATCH
+    /api/agents/registry/{canonical_id}). ``reports_to`` is validated via
+    ``set_reporting`` - 400 on a nonexistent manager, self-report, or a
+    reporting cycle.
+    """
+    store = _get_store(request)
+    record = await store.get(canonical_id)
+    if record is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    require_owner_or_admin(user, record["user_id"])
+
+    if body.role is not None or body.title is not None:
+        await store.set_role_title(canonical_id, role=body.role, title=body.title)
+
+    if body.reports_to is not None:
+        manager_id = body.reports_to or None  # "" clears the manager
+        try:
+            await store.set_reporting(canonical_id, manager_id)
+        except (ValueError, KeyError) as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+
+    return await store.get(canonical_id)
