@@ -314,6 +314,9 @@ class TestDelegationApprovalFlow:
         # The task must NOT have been assigned.
         still_open = await app.state.project_task_store.get_task(task["id"])
         assert still_open["assignee_id"] is None
+        # And the delegate grant must NOT leak: a failed completion cannot leave
+        # behind a grant that would let a later delegation skip approval.
+        assert not await app.state.execution_policies.has_live_grant("from-agent", "delegate")
 
 
 @pytest.mark.asyncio
