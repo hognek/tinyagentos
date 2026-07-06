@@ -104,6 +104,25 @@ class TaskScheduler(BaseStore):
         await self._db.commit()
         return cursor.rowcount > 0
 
+    async def list_enabled(self) -> list[dict]:
+        sql = "SELECT id, name, schedule, command, last_run, created_at FROM scheduled_tasks WHERE enabled = 1"
+        async with self._db.execute(sql) as cursor:
+            return [{"id": r[0], "name": r[1], "schedule": r[2], "command": r[3],
+                     "last_run": r[4], "created_at": r[5]} for r in await cursor.fetchall()]
+
+    async def claim_run(self, task_id: int, prev_last_run, run_ts: int, next_run: int) -> bool:
+        """Atomically advance last_run/next_run, guarded on the previous
+        last_run still matching, so two concurrent ticks racing on the same
+        due instant cannot both fire it (the loser's UPDATE matches zero rows)."""
+        cursor = await self._db.execute(
+            "UPDATE scheduled_tasks SET last_run = ?, next_run = ? "
+            "WHERE id = ? AND enabled = 1 "
+            "AND ((last_run IS NULL AND ? IS NULL) OR last_run = ?)",
+            (run_ts, next_run, task_id, prev_last_run, prev_last_run),
+        )
+        await self._db.commit()
+        return cursor.rowcount > 0
+
     async def get_presets(self) -> list[dict]:
         async with self._db.execute("SELECT id, name, description, tasks FROM task_presets ORDER BY name") as cursor:
             return [{"id": r[0], "name": r[1], "description": r[2], "tasks": json.loads(r[3])} for r in await cursor.fetchall()]

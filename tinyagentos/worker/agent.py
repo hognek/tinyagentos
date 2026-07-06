@@ -477,7 +477,7 @@ class WorkerAgent:
         matches (migration case); the run loop enters the needs-re-pair
         state on this code.
         """
-        from tinyagentos.cluster.worker_capacity import capacity_snapshot
+        from tinyagentos.cluster.worker_capacity import capacity_snapshot, gpu_vram_snapshot
         import json as _json
 
         # Re-read the key from disk on every attempt so that running the pair
@@ -502,6 +502,7 @@ class WorkerAgent:
             caps = sorted(set(self.detect_capabilities(backends)) | set(self.extra_capabilities))
             kv_quant = self.detect_kv_quant_support(backends)
             snap = capacity_snapshot()
+            vram = gpu_vram_snapshot()
             path = "/api/cluster/heartbeat"
             payload = {
                 "name": self.name,
@@ -515,6 +516,10 @@ class WorkerAgent:
                 "storage_cap_bytes": snap["storage_cap_bytes"],
                 "storage_used_bytes": snap["storage_used_bytes"],
                 "bytes_deduped_total": snap["bytes_deduped_total"],
+                # None (not 0) when no VRAM probe is available so the
+                # controller can tell "unknown" apart from "no VRAM free".
+                "free_vram_mb": vram["free_vram_mb"] if vram else None,
+                "used_vram_mb": vram["used_vram_mb"] if vram else None,
             }
             body = _json.dumps(payload).encode()
             auth_headers = sign_request_headers(self._signing_key, self.name, "POST", path, body)

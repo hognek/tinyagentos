@@ -260,6 +260,12 @@ class HeartbeatBody(BaseModel):
     storage_cap_bytes: int | None = None
     storage_used_bytes: int | None = None
     bytes_deduped_total: int | None = None
+    # Real-time GPU VRAM reported by the worker on every heartbeat.
+    # Optional so legacy workers that don't send them leave stored values
+    # unchanged. Consumers (e.g. Skald's TaosDispatcher) use these to
+    # rank candidates by actual free memory, not total capacity.
+    free_vram_mb: int | None = None
+    used_vram_mb: int | None = None
 
 
 class RouteRequest(BaseModel):
@@ -498,6 +504,8 @@ async def worker_heartbeat(request: Request, body: HeartbeatBody):
         kv_cache_quant_k_support=body.kv_cache_quant_k_support,
         kv_cache_quant_v_support=body.kv_cache_quant_v_support,
         kv_cache_quant_boundary_layer_protect=body.kv_cache_quant_boundary_layer_protect,
+        free_vram_mb=body.free_vram_mb,
+        used_vram_mb=body.used_vram_mb,
     )
     if not ok:
         return JSONResponse({"error": "Worker not registered"}, status_code=404)
@@ -990,4 +998,106 @@ async def promote_archived_models(request: Request):
         "promoted": total,
         "by_worker": promoted_by_worker,
         "workers_scanned": len(online),
+    }
+
+
+# ── GPU lease coordination (taOS #893) ───────────────────────────────────
+
+
+class LeaseClaimRequest(BaseModel):
+    resource_id: str
+    ttl_seconds: float = 30
+    caller: str = ""
+    required_vram_mb: int = 0
+
+
+class LeaseReleaseRequest(BaseModel):
+    lease_id: str
+
+
+class LeaseRenewRequest(BaseModel):
+    lease_id: str
+    ttl_seconds: float = 30
+
+
+@router.post("/api/cluster/leases/claim")
+async def claim_lease(request: Request, body: LeaseClaimRequest):
+    """Claim a GPU lease on a cluster resource.
+
+    Returns 200 with lease details on success, 409 if the resource is
+    already leased or the worker has insufficient free VRAM.
+    """
+    cluster = request.app.state.cluster_manager
+    lease = await cluster.claim_lease(
+        resource_id=body.resource_id,
+        caller=body.caller,
+        ttl_seconds=body.ttl_seconds,
+        required_vram_mb=body.required_vram_mb,
+    )
+    if lease is None:
+        # Check why it failed — already leased or insufficient VRAM?
+        existing = cluster.find_existing_lease(body.resource_id)
+        if existing is not None:
+            return JSONResponse({
+                "error": "resource already leased",
+                "lease_id": existing.lease_id,
+                "caller": existing.caller,
+                "expires_at": existing.expires_at,
+            }, status_code=409)
+        return JSONResponse({
+            "error": "resource unavailable — check worker status and VRAM",
+        }, status_code=409)
+
+    return {
+        "status": "claimed",
+        "lease_id": lease.lease_id,
+        "resource_id": lease.resource_id,
+        "expires_at": lease.expires_at,
+        "ttl_seconds": int(body.ttl_seconds),
+        "required_vram_mb": lease.required_vram_mb,
+    }
+
+
+@router.post("/api/cluster/leases/release")
+async def release_lease(request: Request, body: LeaseReleaseRequest):
+    """Release a GPU lease by id.  Idempotent."""
+    cluster = request.app.state.cluster_manager
+    await cluster.release_lease(body.lease_id)
+    return {"status": "released", "lease_id": body.lease_id}
+
+
+@router.post("/api/cluster/leases/renew")
+async def renew_lease(request: Request, body: LeaseRenewRequest):
+    """Extend a lease's TTL.  Returns 409 if the lease is expired."""
+    cluster = request.app.state.cluster_manager
+    lease = await cluster.renew_lease(body.lease_id, ttl_seconds=body.ttl_seconds)
+    if lease is None:
+        return JSONResponse({
+            "error": "lease not found or expired",
+            "lease_id": body.lease_id,
+        }, status_code=409)
+    return {
+        "status": "renewed",
+        "lease_id": lease.lease_id,
+        "expires_at": lease.expires_at,
+    }
+
+
+@router.get("/api/cluster/leases")
+async def list_leases(request: Request):
+    """Return active (non-expired) GPU leases."""
+    cluster = request.app.state.cluster_manager
+    leases = cluster.get_leases()
+    return {
+        "leases": [
+            {
+                "lease_id": lease.lease_id,
+                "resource_id": lease.resource_id,
+                "caller": lease.caller,
+                "expires_at": lease.expires_at,
+                "required_vram_mb": lease.required_vram_mb,
+            }
+            for lease in leases
+        ],
+        "count": len(leases),
     }

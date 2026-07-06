@@ -216,9 +216,45 @@ TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 [[ -d "$TARGET_HOME" ]] || die "cannot resolve home directory for user $TARGET_USER"
 TARGET_GROUP="$(id -gn "$TARGET_USER")"
 
+# The unit runs rkllama as $TARGET_USER (see install_systemd_unit), not root.
+# On RK3588 the NPU/GPU is reached through the render/video group-owned DRI
+# nodes (/dev/dri/renderD12x, /dev/mpp_service, mode 660), so the service user
+# must be in those groups or model load fails with a device-permission error.
+# Best-effort (like install-server.sh's incus/docker group setup): warn, don't
+# die, if a group is absent on this board.
+for _grp in render video; do
+    if getent group "$_grp" >/dev/null 2>&1; then
+        if ! id -nG "$TARGET_USER" | tr ' ' '\n' | grep -qx "$_grp"; then
+            sudo usermod -aG "$_grp" "$TARGET_USER" \
+                && log "added '$TARGET_USER' to the '$_grp' group (NPU/GPU device access)" \
+                || warn "could not add '$TARGET_USER' to '$_grp' — rkllama may fail to reach the NPU"
+        fi
+    else
+        warn "group '$_grp' not found — if rkllama can't reach the NPU, create it and re-run"
+    fi
+done
+
 RKLLAMA_DIR="${TAOS_RKLLAMA_DIR:-$TARGET_HOME/rkllama}"
 RKLLAMA_VENV="$RKLLAMA_DIR/rkllama-env"
-RKLLAMA_MODELS="$RKLLAMA_DIR/models"
+
+# Models land in the unified taOS model tree so every backend shares one
+# location and the Models UI — which scans <data_dir>/models recursively and
+# recognises .rkllm — sees rkllama pulls. Previously rkllama wrote to its own
+# ~/rkllama/models, which taOS never scanned, so a downloaded model never
+# appeared in the UI (#1548). Resolution order:
+#   1. TAOS_MODELS_ROOT env (taOS may export it),
+#   2. <project_dir>/data/models derived from arg 1 (taOS's script installer
+#      passes the project root; data_dir defaults to <project>/data),
+#   3. legacy $RKLLAMA_DIR/models for standalone runs with neither available.
+LEGACY_RKLLAMA_MODELS="$RKLLAMA_DIR/models"
+TAOS_PROJECT_DIR="${1:-}"
+if [[ -n "${TAOS_MODELS_ROOT:-}" ]]; then
+    RKLLAMA_MODELS="${TAOS_MODELS_ROOT%/}/rkllama"
+elif [[ -n "$TAOS_PROJECT_DIR" && -d "$TAOS_PROJECT_DIR/data" ]]; then
+    RKLLAMA_MODELS="${TAOS_PROJECT_DIR%/}/data/models/rkllama"
+else
+    RKLLAMA_MODELS="$LEGACY_RKLLAMA_MODELS"
+fi
 
 # run_as_user <cmd...> — run a command as the unprivileged target user
 run_as_user() {
@@ -526,8 +562,41 @@ TEMPERATURE=$temperature
 EOF
 }
 
+# One-time move of models from the legacy per-install ~/rkllama/models tree
+# into the unified taOS tree, so an upgrade doesn't strand already-downloaded
+# weights (and force a re-download). Idempotent: only moves model dirs that
+# aren't already present at the destination, and is a no-op when the legacy
+# and unified paths are the same or the legacy tree is absent/empty.
+migrate_legacy_models() {
+    [[ "$LEGACY_RKLLAMA_MODELS" == "$RKLLAMA_MODELS" ]] && return 0
+    [[ -d "$LEGACY_RKLLAMA_MODELS" ]] || return 0
+    local moved=0 entry name
+    for entry in "$LEGACY_RKLLAMA_MODELS"/*/; do
+        [[ -d "$entry" ]] || continue
+        name="$(basename "$entry")"
+        if [[ -e "$RKLLAMA_MODELS/$name" ]]; then
+            continue  # already migrated / present — leave the legacy copy for the user to clean up
+        fi
+        run_as_user mv "$entry" "$RKLLAMA_MODELS/$name"
+        moved=$((moved + 1))
+    done
+    [[ "$moved" -gt 0 ]] && log "migrated $moved model(s) from $LEGACY_RKLLAMA_MODELS -> $RKLLAMA_MODELS"
+    return 0
+}
+
 pull_models() {
-    run_as_user mkdir -p "$RKLLAMA_MODELS"
+    # The unified root (TAOS_MODELS_ROOT / <project>/data/models) may live under
+    # a tree the service user can't write (e.g. a project dir owned by someone
+    # else -> EACCES). If creating it as $TARGET_USER fails, fall back to the
+    # always-safe per-install path under $TARGET_HOME so the install still
+    # succeeds. RKLLAMA_MODELS is global, so install_systemd_unit (called after
+    # pull_models) picks up the fallback too.
+    if ! run_as_user mkdir -p "$RKLLAMA_MODELS" 2>/dev/null; then
+        warn "cannot create $RKLLAMA_MODELS as $TARGET_USER; falling back to $LEGACY_RKLLAMA_MODELS"
+        RKLLAMA_MODELS="$LEGACY_RKLLAMA_MODELS"
+        run_as_user mkdir -p "$RKLLAMA_MODELS"
+    fi
+    migrate_legacy_models
 
     fetch_model "qwen3-embedding-0.6b" "$EMBEDDING_LOCAL_NAME" "$EMBEDDING_URL" \
         "$EMBEDDING_HF_TOKENIZER" \

@@ -7,6 +7,22 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
 
 ## [Unreleased]
 
+## [1.0.0-beta.33] - 2026-07-06
+
+### Fixed
+- Downloaded RK3588 (rkllama) models now appear in the Models list. rkllama downloaded and registered models correctly, but wrote them to its own directory that taOS never scanned, so a model that finished downloading never showed up. taOS now points rkllama at the unified model directory it already scans, and migrates any models you have already downloaded into it on upgrade, so nothing needs re-downloading. Reported by @mandresve (#1548).
+- rkllama install failures now surface the real cause (e.g. HuggingFace unreachable) instead of a generic "model not registered", so a failed download is self-diagnosing (#1548).
+- Scheduled backups (and any other scheduled task) actually run now. The scheduler stored the cron expression but had no execution engine, so due tasks never fired (#165).
+
+### Added
+- Cluster GPU-lease coordination: agents claim and release a worker's GPU atomically over the A2A bus, and `/api/cluster/workers` now reports real-time free/used VRAM, so shared-hardware model loads on one node no longer collide. Archived models are promoted automatically when compatible hardware joins the cluster (#893, #333).
+
+### Changed
+- Backends (rkllama and other GPU/NPU model servers) run as the unprivileged `taos` service user with the device-group access they need, rather than root.
+- Non-admin users no longer see system-settings panels, a UX follow-up to the settings-router access gate (#163).
+- The documentation gate no longer trips on test-only files (#171).
+- Cleared seven Dependabot alerts by pinning `lodash-es`, `uuid`, and `nanoid` (#173), and added a safe cleanup policy for stale agent worktrees (#172).
+
 ## [1.0.0-beta.32] - 2026-07-06
 
 ### Fixed

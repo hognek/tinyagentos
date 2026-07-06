@@ -42,6 +42,28 @@ class TestRkllamaIsRunning:
         assert rkllama_is_running() is False
 
 
+class TestParsePullError:
+    """The plain-text fallback must recognise real 'Error: ...' lines but not
+    lines that merely begin with those letters (folds Kilo review on #1681)."""
+
+    def test_ndjson_error_shape(self):
+        assert (
+            rkllama_installer._parse_pull_error('{"status":"error","error":"repo not found"}')
+            == "repo not found"
+        )
+
+    def test_plaintext_error_variants_match(self):
+        for line in ("Error: boom", "error something went wrong", "error"):
+            assert rkllama_installer._parse_pull_error(line) is not None
+
+    def test_lines_that_only_start_with_error_letters_do_not_match(self):
+        for line in ("errored gracefully", "error-free run", "Downloading 45%", "45%", ""):
+            assert rkllama_installer._parse_pull_error(line) is None
+
+    def test_success_ndjson_is_not_an_error(self):
+        assert rkllama_installer._parse_pull_error('{"status":"success"}') is None
+
+
 class TestParseHfResolveUrl:
     def test_standard_main_branch(self):
         url = (
@@ -169,6 +191,39 @@ class TestInstallVerification:
         res = await self._installer().install("rkllama-x", {}, variant=_VARIANT)
         assert res["success"] is False
         assert "could not confirm" in res["error"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_surfaces_pull_error_from_ndjson(self, monkeypatch):
+        # When the download errors AND the model never registers, the failure
+        # must surface the real cause, not the generic "could not confirm" (#1548).
+        monkeypatch.setattr(rkllama_installer.asyncio, "sleep", _no_sleep)
+        respx.post("http://localhost:7833/api/pull").mock(
+            return_value=httpx.Response(
+                200, text='{"status":"error","error":"repository not found"}\n'
+            )
+        )
+        respx.get("http://localhost:7833/api/tags").mock(
+            return_value=httpx.Response(200, json={"models": []})
+        )
+        res = await self._installer().install("rkllama-x", {}, variant=_VARIANT)
+        assert res["success"] is False
+        assert "repository not found" in res["error"]
+        assert "download failed" in res["error"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_surfaces_pull_error_from_plaintext(self, monkeypatch):
+        monkeypatch.setattr(rkllama_installer.asyncio, "sleep", _no_sleep)
+        respx.post("http://localhost:7833/api/pull").mock(
+            return_value=httpx.Response(200, text="Downloading foo...\nError: Invalid path\n")
+        )
+        respx.get("http://localhost:7833/api/tags").mock(
+            return_value=httpx.Response(200, json={"models": []})
+        )
+        res = await self._installer().install("rkllama-x", {}, variant=_VARIANT)
+        assert res["success"] is False
+        assert "Invalid path" in res["error"]
 
     @respx.mock
     @pytest.mark.asyncio
