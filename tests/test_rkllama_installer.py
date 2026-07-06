@@ -172,6 +172,39 @@ class TestInstallVerification:
 
     @respx.mock
     @pytest.mark.asyncio
+    async def test_surfaces_pull_error_from_ndjson(self, monkeypatch):
+        # When the download errors AND the model never registers, the failure
+        # must surface the real cause, not the generic "could not confirm" (#1548).
+        monkeypatch.setattr(rkllama_installer.asyncio, "sleep", _no_sleep)
+        respx.post("http://localhost:7833/api/pull").mock(
+            return_value=httpx.Response(
+                200, text='{"status":"error","error":"repository not found"}\n'
+            )
+        )
+        respx.get("http://localhost:7833/api/tags").mock(
+            return_value=httpx.Response(200, json={"models": []})
+        )
+        res = await self._installer().install("rkllama-x", {}, variant=_VARIANT)
+        assert res["success"] is False
+        assert "repository not found" in res["error"]
+        assert "download failed" in res["error"]
+
+    @respx.mock
+    @pytest.mark.asyncio
+    async def test_surfaces_pull_error_from_plaintext(self, monkeypatch):
+        monkeypatch.setattr(rkllama_installer.asyncio, "sleep", _no_sleep)
+        respx.post("http://localhost:7833/api/pull").mock(
+            return_value=httpx.Response(200, text="Downloading foo...\nError: Invalid path\n")
+        )
+        respx.get("http://localhost:7833/api/tags").mock(
+            return_value=httpx.Response(200, json={"models": []})
+        )
+        res = await self._installer().install("rkllama-x", {}, variant=_VARIANT)
+        assert res["success"] is False
+        assert "Invalid path" in res["error"]
+
+    @respx.mock
+    @pytest.mark.asyncio
     async def test_failure_when_tags_unreachable(self, monkeypatch):
         # Previously this path returned a false success. Now an unreachable
         # /api/tags (after retries) is a clean failure.

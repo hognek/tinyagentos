@@ -134,6 +134,25 @@ def _report_pull_progress(line: str, on_progress: Callable[[int, int], None]) ->
     on_progress(percent, 100)
 
 
+def _parse_pull_error(line: str) -> str | None:
+    """Return a human error string if a pull-stream line reports a failure, else
+    None. Handles both the ndjson shape (``{"status":"error","error":...}``) and
+    the plain-text ``"Error: ..."`` lines rkllama emits, so a failed download
+    surfaces its real cause instead of a generic "not registered" (#1548)."""
+    try:
+        data = json.loads(line)
+    except (TypeError, ValueError):
+        data = None
+    if isinstance(data, dict):
+        if str(data.get("status", "")).lower() == "error":
+            return str(data.get("error") or "unknown error")
+        return None
+    stripped = line.strip()
+    if stripped.lower().startswith("error"):
+        return stripped
+    return None
+
+
 def parse_hf_resolve_url(url: str) -> tuple[str, str, str]:
     """Return (user, repo, filename) for an HF resolve URL.
 
@@ -199,6 +218,10 @@ class RkllamaInstaller(AppInstaller):
         endpoint = f"{self.rkllama_url}/api/pull"
         logger.info("rkllama install: POST %s body=%r", endpoint, body)
 
+        # Capture any error the download stream reports so a failure surfaces the
+        # real cause (e.g. HuggingFace unreachable, repo not found) rather than a
+        # generic "not registered" (#1548).
+        pull_error: str | None = None
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 # /api/pull streams plain-text progress lines (see
@@ -215,6 +238,9 @@ class RkllamaInstaller(AppInstaller):
                     async for line in resp.aiter_lines():
                         if line:
                             last_line = line
+                            err = _parse_pull_error(line)
+                            if err:
+                                pull_error = err
                             if on_progress is not None:
                                 _report_pull_progress(line, on_progress)
                     logger.info(
@@ -267,6 +293,15 @@ class RkllamaInstaller(AppInstaller):
                 await asyncio.sleep(1.0 * (attempt + 1))
 
         if not verified:
+            # If the download itself reported an error, that is the real cause;
+            # surface it instead of the generic "could not confirm" (#1548). A
+            # stray error line that still ended in a registered model does not
+            # reach here (verified is True), so this never masks a real success.
+            if pull_error:
+                return {
+                    "success": False,
+                    "error": f"model download failed on the rkllama backend: {pull_error}",
+                }
             return {
                 "success": False,
                 "error": (
