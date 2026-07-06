@@ -37,6 +37,22 @@ describe("process-store openWindow", () => {
     expect(win.launchNonce).toBe(1);
   });
 
+  it("marks a window as closing instead of removing it on closeWindow", () => {
+    const id = useProcessStore.getState().openWindow("browser", { w: 800, h: 600 });
+    useProcessStore.getState().closeWindow(id);
+    const win = useProcessStore.getState().windows.find((w) => w.id === id);
+    // Still mounted in the array so the Window can run its close animation.
+    expect(win).toBeDefined();
+    expect(win!.closing).toBe(true);
+  });
+
+  it("removes a window from the array on removeWindow", () => {
+    const id = useProcessStore.getState().openWindow("browser", { w: 800, h: 600 });
+    useProcessStore.getState().closeWindow(id);
+    useProcessStore.getState().removeWindow(id);
+    expect(useProcessStore.getState().windows.find((w) => w.id === id)).toBeUndefined();
+  });
+
   it("restores a minimized window when re-opened", () => {
     const id = useProcessStore.getState().openWindow("browser", { w: 800, h: 600 });
     useProcessStore.getState().minimizeWindow(id);
@@ -47,5 +63,29 @@ describe("process-store openWindow", () => {
     const win = useProcessStore.getState().windows.find((w) => w.id === id)!;
     expect(win.minimized).toBe(false);
     expect(win.focused).toBe(true);
+  });
+
+  it("opens a second window for the same app when forceNew is set", () => {
+    const a = useProcessStore
+      .getState()
+      .openWindow("projects", { w: 900, h: 600 }, { projectId: "p1" });
+    const b = useProcessStore
+      .getState()
+      .openWindow("projects", { w: 900, h: 600 }, { projectId: "p2" }, { forceNew: true });
+    expect(b).not.toBe(a);
+    const wins = useProcessStore.getState().windows.filter((w) => w.appId === "projects");
+    expect(wins).toHaveLength(2);
+    // Each window keeps its own props, so two projects can show side by side.
+    expect(wins.find((w) => w.id === a)!.props).toEqual({ projectId: "p1" });
+    expect(wins.find((w) => w.id === b)!.props).toEqual({ projectId: "p2" });
+  });
+
+  it("still refocuses the existing window when forceNew is not set", () => {
+    const a = useProcessStore.getState().openWindow("projects", { w: 900, h: 600 });
+    const b = useProcessStore.getState().openWindow("projects", { w: 900, h: 600 });
+    expect(b).toBe(a);
+    expect(
+      useProcessStore.getState().windows.filter((w) => w.appId === "projects"),
+    ).toHaveLength(1);
   });
 });

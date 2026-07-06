@@ -1,82 +1,69 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
-import { Image, Wand2, Trash2, Download, Package } from "lucide-react";
-import {
-  Button,
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-  Input,
-  Label,
-  Textarea,
-} from "@/components/ui";
+import { Sparkles, LayoutGrid, Pencil, Settings2 } from "lucide-react";
 import { ModelBrowser } from "@/components/ModelBrowser";
+import { CreateView } from "./images/CreateView";
+import { LibraryView } from "./images/LibraryView";
+import { EditView } from "./images/EditView";
+import {
+  type GeneratedImage,
+  type ImageModel,
+  type GenerateParams,
+  type StudioView,
+  type GenerateMode,
+  type LibraryFilter,
+} from "./images/types";
 
 /* ------------------------------------------------------------------ */
-/*  Types                                                              */
+/*  Images Studio — shell                                              */
+/*                                                                     */
+/*  Left icon rail (Create / Library / Edit / Models) + the active     */
+/*  surface. Shared backend wiring (list / generate / delete /          */
+/*  download / models) lives here; the views are presentational.       */
 /* ------------------------------------------------------------------ */
 
-interface GeneratedImage {
-  id: string;
-  url: string;
-  prompt: string;
-  model: string;
-  size: number | string;
-  steps: number;
-  seed: number;
-  guidance: number;
-  createdAt: string;
+const RAIL: { id: StudioView; label: string; icon: typeof Sparkles }[] = [
+  { id: "create", label: "Create", icon: Sparkles },
+  { id: "library", label: "Library", icon: LayoutGrid },
+  { id: "edit", label: "Edit", icon: Pencil },
+];
+
+function randomSeed(): number {
+  return Math.floor(Math.random() * 1_000_000);
 }
-
-interface ModelVariant {
-  id: string;
-  name: string;
-  format?: string;
-  size_mb: number;
-  min_ram_mb?: number;
-  backend?: string[];
-  downloaded?: boolean;
-  compatibility: "green" | "yellow" | "red";
-  download_url?: string;
-}
-
-interface ImageModel {
-  id: string;
-  name: string;
-  description?: string;
-  capabilities: string[];
-  variants: ModelVariant[];
-  has_downloaded_variant?: boolean;
-}
-
-/* ------------------------------------------------------------------ */
-/*  Helpers                                                            */
-/* ------------------------------------------------------------------ */
-
-/* ------------------------------------------------------------------ */
-/*  ImagesApp                                                          */
-/* ------------------------------------------------------------------ */
 
 export function ImagesApp({ windowId: _windowId }: { windowId: string }) {
+  const [view, setView] = useState<StudioView>("create");
+
+  // gallery / results
   const [images, setImages] = useState<GeneratedImage[]>([]);
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [activeResultId, setActiveResultId] = useState<string | null>(null);
+  const [librarySelectedId, setLibrarySelectedId] = useState<string | null>(
+    null,
+  );
+  const [editImage, setEditImage] = useState<GeneratedImage | null>(null);
 
-  // Model catalog state
+  // model catalog
   const [models, setModels] = useState<ImageModel[]>([]);
   const [selectedModelId, setSelectedModelId] = useState<string>("");
   const [selectedVariantId, setSelectedVariantId] = useState<string>("");
   const [browserOpen, setBrowserOpen] = useState(false);
 
-  // Form state (non-model)
+  // create form
+  const [mode, setMode] = useState<GenerateMode>("single");
   const [prompt, setPrompt] = useState("");
   const [size, setSize] = useState(512);
   const [steps, setSteps] = useState(4);
+  const [guidance, setGuidance] = useState(7.5);
+  const [style, setStyle] = useState<string | null>(null);
   const [seed, setSeed] = useState("");
-  const [guidance, setGuidance] = useState("7.5");
 
-  /* -------------------------- Images gallery --------------------- */
+  // library
+  const [libFilter, setLibFilter] = useState<LibraryFilter>("all");
+
+  /* ----------------------------- images -------------------------- */
 
   const fetchImages = useCallback(async () => {
     try {
@@ -102,6 +89,7 @@ export function ImagesApp({ windowId: _windowId }: { windowId: string }) {
               steps: (raw.steps as number) ?? 0,
               seed: (raw.seed as number) ?? 0,
               guidance: (raw.guidance_scale as number) ?? 0,
+              backend: (raw.backend as string) ?? undefined,
               createdAt:
                 (raw.created_at as string) ?? new Date().toISOString(),
             }),
@@ -122,7 +110,7 @@ export function ImagesApp({ windowId: _windowId }: { windowId: string }) {
     fetchImages();
   }, [fetchImages]);
 
-  /* -------------------------- Model catalog ---------------------- */
+  /* --------------------------- model catalog --------------------- */
 
   const refreshModels = useCallback(async () => {
     try {
@@ -147,7 +135,6 @@ export function ImagesApp({ windowId: _windowId }: { windowId: string }) {
   useEffect(() => {
     (async () => {
       const imageModels = await refreshModels();
-      // Auto-select first downloaded variant
       for (const m of imageModels) {
         const dl = m.variants?.find((v) => v.downloaded);
         if (dl) {
@@ -168,369 +155,286 @@ export function ImagesApp({ windowId: _windowId }: { windowId: string }) {
     [selectedModel, selectedVariantId],
   );
 
-  // Flat list of usable (downloaded) variants for the dropdown
-  const availableOptions = useMemo(() => {
-    const options: Array<{
-      modelId: string;
-      variantId: string;
-      label: string;
-    }> = [];
-    for (const m of models) {
-      for (const v of m.variants ?? []) {
-        if (v.downloaded) {
-          options.push({
-            modelId: m.id,
-            variantId: v.id,
-            label: `${m.name} — ${v.name}`,
-          });
-        }
+  const modelName = selectedModel?.name ?? "No model";
+  const modelMeta = selectedVariant
+    ? `${selectedVariant.name}${
+        selectedVariant.backend?.length
+          ? ` · ${selectedVariant.backend.join("/")}`
+          : ""
+      }`
+    : "Pick a model";
+
+  const canGenerate =
+    !!prompt.trim() &&
+    !generating &&
+    !!selectedVariant &&
+    !!selectedVariant.downloaded;
+
+  /* ----------------------------- generate ------------------------ */
+
+  const runGenerate = useCallback(
+    async (
+      overrideSeed?: number,
+      overridePrompt?: string,
+      overrides?: { size?: number; steps?: number; guidance?: number },
+    ) => {
+      const usePrompt = (overridePrompt ?? prompt).trim();
+      if (!usePrompt) return;
+      if (!selectedVariant || !selectedVariant.downloaded) {
+        setError("Select a downloaded model first.");
+        return;
       }
-    }
-    return options;
-  }, [models]);
+      setGenerating(true);
+      setError(null);
 
-  const handleSelectChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-    const value = e.target.value;
-    if (value === "__browse__") {
-      setBrowserOpen(true);
-      return;
-    }
-    if (!value) return;
-    const [modelId, variantId] = value.split("::");
-    if (modelId === undefined || variantId === undefined) return;
-    setSelectedModelId(modelId);
-    setSelectedVariantId(variantId);
-  };
+      const effectiveSeed =
+        overrideSeed ?? (seed ? parseInt(seed, 10) : randomSeed());
+      const styledPrompt = style
+        ? `${usePrompt}, ${style.toLowerCase()} style`
+        : usePrompt;
 
-  /* -------------------------- Generate --------------------------- */
+      const params: GenerateParams = {
+        prompt: styledPrompt,
+        model: selectedModelId,
+        variant: selectedVariantId,
+        size: `${overrides?.size ?? size}x${overrides?.size ?? size}`,
+        steps: overrides?.steps ?? steps,
+        seed: effectiveSeed,
+        guidance_scale: (overrides?.guidance ?? guidance) || 7.5,
+      };
 
-  async function handleGenerate() {
-    if (!prompt.trim()) return;
-    if (!selectedVariant || !selectedVariant.downloaded) {
-      setError("Select a downloaded model first.");
-      return;
-    }
-    setGenerating(true);
-    setError(null);
-
-    const params = {
-      prompt: prompt.trim(),
-      model: selectedModelId,
-      variant: selectedVariantId,
-      size: `${size}x${size}`,
-      steps,
-      seed: seed ? parseInt(seed) : Math.floor(Math.random() * 999999),
-      guidance_scale: parseFloat(guidance) || 7.5,
-    };
-
-    try {
-      const res = await fetch("/api/images/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(params),
-      });
-      if (res.ok) {
-        const ct = res.headers.get("content-type") ?? "";
-        if (ct.includes("application/json")) {
-          const data = await res.json();
-          if (data.filename || data.id) {
-            await fetchImages();
-          } else if (data.error) {
-            setError(data.error);
+      try {
+        const res = await fetch("/api/images/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(params),
+        });
+        if (res.ok) {
+          const ct = res.headers.get("content-type") ?? "";
+          if (ct.includes("application/json")) {
+            const data = await res.json();
+            if (data.filename || data.id) {
+              const newId = (data.filename as string) ?? (data.id as string);
+              await fetchImages();
+              setActiveResultId(newId);
+            } else if (data.error) {
+              setError(String(data.error));
+            }
           }
+        } else {
+          const data = await res.json().catch(() => ({}));
+          setError(
+            (data as { error?: string }).error ??
+              `Generation failed (${res.status})`,
+          );
         }
-      } else {
-        const data = await res.json().catch(() => ({}));
-        setError(
-          (data as { error?: string }).error ??
-            `Generation failed (${res.status})`,
-        );
+      } catch (e) {
+        setError(`Generation error: ${(e as Error).message}`);
       }
-    } catch (e) {
-      setError(`Generation error: ${(e as Error).message}`);
-    }
+      setGenerating(false);
+    },
+    [
+      prompt,
+      seed,
+      style,
+      selectedVariant,
+      selectedModelId,
+      selectedVariantId,
+      size,
+      steps,
+      guidance,
+      fetchImages,
+    ],
+  );
 
-    setGenerating(false);
-  }
+  const handleReroll = useCallback(() => {
+    setSeed(String(randomSeed()));
+  }, []);
 
-  function handleDelete(id: string) {
+  /* ----------------------------- delete -------------------------- */
+
+  const handleDelete = useCallback((id: string) => {
     setImages((prev) => prev.filter((img) => img.id !== id));
+    setLibrarySelectedId((cur) => (cur === id ? null : cur));
+    setActiveResultId((cur) => (cur === id ? null : cur));
     fetch(`/api/images/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(
       () => {},
     );
-  }
+  }, []);
 
-  function handleDownload(img: GeneratedImage) {
+  const handleDownload = useCallback((img: GeneratedImage) => {
     if (!img.url) return;
     const a = document.createElement("a");
     a.href = img.url;
-    a.download = `${img.prompt.slice(0, 30).replace(/\s+/g, "-")}-${img.seed}.png`;
+    a.download = `${img.prompt.slice(0, 30).replace(/\s+/g, "-") || "image"}-${
+      img.seed
+    }.png`;
     a.click();
-  }
+  }, []);
 
-  /* -------------------------- Render ----------------------------- */
+  /* --------- re-roll from library/create: reuse params + new seed --- */
+
+  const rerollFrom = useCallback(
+    (img: GeneratedImage) => {
+      if (typeof img.size === "number") setSize(img.size);
+      if (img.steps) setSteps(img.steps);
+      if (img.guidance) setGuidance(img.guidance);
+      setPrompt(img.prompt);
+      setView("create");
+      // Pass params explicitly: the setState calls above update the controls
+      // for next time, but won't be visible to runGenerate this tick.
+      void runGenerate(randomSeed(), img.prompt, {
+        size: typeof img.size === "number" ? img.size : undefined,
+        steps: img.steps || undefined,
+        guidance: img.guidance || undefined,
+      });
+    },
+    [runGenerate],
+  );
+
+  const openInEdit = useCallback((img: GeneratedImage) => {
+    setEditImage(img);
+    setView("edit");
+  }, []);
+
+  /* --------- Apply adjust (real client-side op via canvas) -------- */
+
+  const applyAdjust = useCallback(
+    (filterCss: string) => {
+      if (!editImage?.url) return;
+      const img = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload = () => {
+        const canvas = document.createElement("canvas");
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext("2d");
+        if (!ctx) return;
+        ctx.filter = filterCss;
+        ctx.drawImage(img, 0, 0);
+        canvas.toBlob((blob) => {
+          if (!blob) return;
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `${
+            editImage.prompt.slice(0, 30).replace(/\s+/g, "-") || "image"
+          }-adjusted.png`;
+          a.click();
+          URL.revokeObjectURL(url);
+        }, "image/png");
+      };
+      img.src = editImage.url;
+    },
+    [editImage],
+  );
+
+  /* ------------------------------ render ------------------------- */
 
   return (
-    <div className="flex flex-col h-full bg-shell-bg text-shell-text select-none">
-      {/* Toolbar */}
-      <div className="flex items-center gap-2 px-4 py-3 border-b border-white/5">
-        <Image size={18} className="text-accent" />
-        <h1 className="text-sm font-semibold">Images</h1>
-        <span className="text-xs text-shell-text-tertiary">
-          {images.length} generated
-        </span>
-      </div>
+    <div className="flex h-full min-h-0 flex-col overflow-hidden bg-shell-bg text-shell-text select-none">
+      <div className="flex min-h-0 flex-1">
+        {/* left rail */}
+        <div className="flex w-[68px] flex-none flex-col items-center gap-1.5 border-r border-shell-border bg-shell-bg-deep py-3.5">
+          {RAIL.map((r) => {
+            const Icon = r.icon;
+            const on = view === r.id;
+            return (
+              <button
+                key={r.id}
+                type="button"
+                aria-label={r.label}
+                aria-current={on ? "page" : undefined}
+                onClick={() => setView(r.id)}
+                className={`flex h-[46px] w-[46px] flex-col items-center justify-center gap-0.5 rounded-xl text-[9px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40 ${
+                  on
+                    ? "bg-gradient-to-b from-accent/25 to-transparent text-accent"
+                    : "text-shell-text-tertiary hover:bg-white/10 hover:text-shell-text-secondary"
+                }`}
+              >
+                <Icon size={21} />
+                {r.label}
+              </button>
+            );
+          })}
+          <div className="flex-1" />
+          <button
+            type="button"
+            aria-label="Models"
+            onClick={() => setBrowserOpen(true)}
+            className="flex h-[46px] w-[46px] flex-col items-center justify-center gap-0.5 rounded-xl text-[9px] font-semibold text-shell-text-tertiary transition-colors hover:bg-white/10 hover:text-shell-text-secondary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+          >
+            <Settings2 size={21} />
+            Models
+          </button>
+        </div>
 
-      <div className="flex-1 overflow-auto p-4 space-y-5">
-        {/* Generate form */}
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm font-semibold flex items-center gap-2">
-              <Wand2 size={14} className="text-accent" />
-              Generate Image
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3">
-            {/* Prompt */}
-            <div className="space-y-1.5">
-              <Label htmlFor="img-prompt">Prompt</Label>
-              <Textarea
-                id="img-prompt"
-                value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
-                placeholder="A serene mountain landscape at sunset..."
-                rows={3}
-                className="resize-none"
-              />
-            </div>
+        {/* active surface */}
+        <div className="flex min-w-0 flex-1 flex-col">
+          {view === "create" && (
+            <CreateView
+              mode={mode}
+              onModeChange={setMode}
+              modelName={modelName}
+              modelMeta={modelMeta}
+              onPickModel={() => setBrowserOpen(true)}
+              prompt={prompt}
+              onPromptChange={setPrompt}
+              size={size}
+              onSizeChange={setSize}
+              steps={steps}
+              onStepsChange={setSteps}
+              guidance={guidance}
+              onGuidanceChange={setGuidance}
+              style={style}
+              onStyleChange={setStyle}
+              seed={seed}
+              onReroll={handleReroll}
+              results={images}
+              activeResultId={activeResultId}
+              onSelectResult={setActiveResultId}
+              generating={generating}
+              canGenerate={canGenerate}
+              onGenerate={() => void runGenerate()}
+              error={error}
+              onEditResult={openInEdit}
+              onDownloadResult={handleDownload}
+            />
+          )}
 
-            {/* Model dropdown */}
-            <div className="space-y-1.5">
-              <Label htmlFor="img-model">Model</Label>
-              <div className="flex items-center gap-2">
-                <select
-                  id="img-model"
-                  value={
-                    selectedModelId && selectedVariantId
-                      ? `${selectedModelId}::${selectedVariantId}`
-                      : ""
-                  }
-                  onChange={handleSelectChange}
-                  className="flex-1 h-9 rounded-lg border border-white/10 bg-shell-bg-deep px-3 py-1 text-sm text-shell-text focus-visible:outline-none focus-visible:border-accent/40 focus-visible:ring-2 focus-visible:ring-accent/20"
-                >
-                  {availableOptions.length === 0 && (
-                    <option value="">
-                      No models available — click Browse…
-                    </option>
-                  )}
-                  {availableOptions.map((opt) => (
-                    <option
-                      key={`${opt.modelId}::${opt.variantId}`}
-                      value={`${opt.modelId}::${opt.variantId}`}
-                    >
-                      {"\u2713 "}
-                      {opt.label}
-                    </option>
-                  ))}
-                  <option disabled>────────</option>
-                  <option value="__browse__">Get more models…</option>
-                </select>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={() => setBrowserOpen(true)}
-                  type="button"
-                >
-                  <Package size={12} />
-                  Browse
-                </Button>
-              </div>
-              {!selectedVariant && availableOptions.length === 0 && (
-                <div className="text-xs text-shell-text-tertiary mt-1">
-                  Open the browser to download an image generation model.
-                </div>
-              )}
-            </div>
+          {view === "library" && (
+            <LibraryView
+              images={images}
+              loading={loading}
+              filter={libFilter}
+              onFilterChange={setLibFilter}
+              selectedId={librarySelectedId}
+              onSelect={setLibrarySelectedId}
+              onReroll={rerollFrom}
+              onDownload={handleDownload}
+              onDelete={handleDelete}
+              onEdit={openInEdit}
+            />
+          )}
 
-            {/* Row of controls */}
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-              {/* Size */}
-              <div className="space-y-1.5">
-                <Label htmlFor="img-size">Size</Label>
-                <select
-                  id="img-size"
-                  value={size}
-                  onChange={(e) => setSize(parseInt(e.target.value))}
-                  className="flex h-9 w-full rounded-lg border border-white/10 bg-shell-bg-deep px-3 py-1 text-sm text-shell-text focus-visible:outline-none focus-visible:border-accent/40 focus-visible:ring-2 focus-visible:ring-accent/20"
-                >
-                  <option value={256}>256x256</option>
-                  <option value={384}>384x384</option>
-                  <option value={512}>512x512</option>
-                </select>
-              </div>
-
-              {/* Seed */}
-              <div className="space-y-1.5">
-                <Label htmlFor="img-seed">Seed</Label>
-                <Input
-                  id="img-seed"
-                  type="number"
-                  value={seed}
-                  onChange={(e) => setSeed(e.target.value)}
-                  placeholder="Random"
-                />
-              </div>
-
-              {/* Guidance */}
-              <div className="space-y-1.5">
-                <Label htmlFor="img-guidance">Guidance</Label>
-                <Input
-                  id="img-guidance"
-                  type="number"
-                  step="0.5"
-                  min="1"
-                  max="20"
-                  value={guidance}
-                  onChange={(e) => setGuidance(e.target.value)}
-                />
-              </div>
-            </div>
-
-            {/* Steps slider */}
-            <div>
-              <div className="flex items-center justify-between mb-1.5">
-                <Label htmlFor="img-steps">Steps</Label>
-                <span className="text-xs text-shell-text-tertiary tabular-nums">
-                  {steps}
-                </span>
-              </div>
-              <input
-                id="img-steps"
-                type="range"
-                min={1}
-                max={8}
-                value={steps}
-                onChange={(e) => setSteps(parseInt(e.target.value))}
-                className="w-full accent-accent"
-              />
-            </div>
-
-            {/* Error */}
-            {error && (
-              <div className="text-xs text-red-400 bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2">
-                {error}
-              </div>
-            )}
-
-            {/* Generate button */}
-            <Button
-              size="lg"
-              onClick={handleGenerate}
-              disabled={
-                !prompt.trim() ||
-                generating ||
-                !selectedVariant ||
-                !selectedVariant.downloaded
-              }
-            >
-              <Wand2 size={14} />
-              {generating ? "Generating..." : "Generate"}
-            </Button>
-
-            {/* Loading spinner */}
-            {generating && (
-              <div className="flex items-center gap-2 text-xs text-shell-text-tertiary">
-                <div className="w-4 h-4 border-2 border-accent border-t-transparent rounded-full animate-spin" />
-                Generating image...
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        {/* Gallery */}
-        {loading ? (
-          <div className="text-center text-shell-text-tertiary text-sm py-8">
-            Loading gallery...
-          </div>
-        ) : images.length === 0 ? (
-          <div className="flex flex-col items-center justify-center py-12 gap-3 text-shell-text-tertiary">
-            <Image size={40} className="opacity-30" />
-            <p className="text-sm">No images generated yet</p>
-            <p className="text-xs">
-              Use the form above to create your first image
-            </p>
-          </div>
-        ) : (
-          <div>
-            <h2 className="text-sm font-medium text-shell-text-secondary mb-3">
-              Gallery
-            </h2>
-            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-              {images.map((img) => (
-                <Card key={img.id} className="overflow-hidden group">
-                  <div className="aspect-square bg-shell-bg-deep flex items-center justify-center">
-                    {img.url ? (
-                      <img
-                        src={img.url}
-                        alt={img.prompt}
-                        className="w-full h-full object-cover"
-                      />
-                    ) : (
-                      <div className="text-center px-3">
-                        <Image
-                          size={24}
-                          className="mx-auto text-shell-text-tertiary mb-1"
-                        />
-                        <p className="text-[10px] text-shell-text-tertiary line-clamp-2">
-                          {img.prompt}
-                        </p>
-                      </div>
-                    )}
-                  </div>
-
-                  <CardContent className="p-2.5 space-y-1">
-                    <p className="text-xs line-clamp-2 leading-relaxed">
-                      {img.prompt}
-                    </p>
-                    <div className="flex items-center gap-2 text-[10px] text-shell-text-tertiary">
-                      <span>{img.model}</span>
-                      <span>
-                        {typeof img.size === "number"
-                          ? `${img.size}px`
-                          : img.size}
-                      </span>
-                      <span>{img.steps}st</span>
-                    </div>
-                    <div className="flex items-center gap-1 pt-1">
-                      {img.url && (
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => handleDownload(img)}
-                          className="h-7 w-7"
-                          aria-label={`Download image: ${img.prompt.slice(0, 30)}`}
-                          title="Download"
-                        >
-                          <Download size={13} />
-                        </Button>
-                      )}
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        onClick={() => handleDelete(img.id)}
-                        className="h-7 w-7 hover:text-red-400 hover:bg-red-500/15"
-                        aria-label={`Delete image: ${img.prompt.slice(0, 30)}`}
-                        title="Delete"
-                      >
-                        <Trash2 size={13} />
-                      </Button>
-                    </div>
-                  </CardContent>
-                </Card>
-              ))}
-            </div>
-          </div>
-        )}
+          {view === "edit" && (
+            <EditView
+              image={editImage}
+              onApplyAdjust={applyAdjust}
+              onEdited={async ({ url, image_ref, backend }) => {
+                // Refresh the library and re-select the new result for
+                // further editing. `backend` is the tier that actually ran
+                // (may differ from what was requested — see EditView's
+                // downgrade notice), so it replaces the stale value here too.
+                await fetchImages();
+                setEditImage((cur) =>
+                  cur ? { ...cur, id: image_ref, url, backend } : cur,
+                );
+                setLibrarySelectedId(image_ref);
+              }}
+            />
+          )}
+        </div>
       </div>
 
       <ModelBrowser

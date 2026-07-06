@@ -105,7 +105,7 @@ async def serve_chat_pwa():
     """Serve the standalone chat PWA."""
     chat_html = SPA_DIR / "chat.html"
     if chat_html.exists():
-        return FileResponse(chat_html, media_type="text/html")
+        return FileResponse(chat_html, media_type="text/html", headers=_HTML_NO_CACHE)
     return JSONResponse({"error": "Chat PWA not built"}, status_code=404)
 
 
@@ -115,8 +115,19 @@ async def serve_chat_pwa_assets(rest: str = ""):
     # Assets are at /desktop/assets/... due to base path — this route just serves index
     chat_html = SPA_DIR / "chat.html"
     if chat_html.exists():
-        return FileResponse(chat_html, media_type="text/html")
+        return FileResponse(chat_html, media_type="text/html", headers=_HTML_NO_CACHE)
     return JSONResponse({"error": "Chat PWA not built"}, status_code=404)
+
+
+@router.get("/app.html")
+async def serve_app_pwa():
+    """Serve the generic standalone app PWA shell. It reads ?app=<id> at runtime
+    and mounts that app full-screen (assets load from the /desktop/assets base,
+    same as the chat PWA)."""
+    app_html = SPA_DIR / "app.html"
+    if app_html.exists():
+        return FileResponse(app_html, media_type="text/html", headers=_HTML_NO_CACHE)
+    return JSONResponse({"error": "App PWA shell not built"}, status_code=404)
 
 
 @router.post("/api/desktop/browser/agent-command")

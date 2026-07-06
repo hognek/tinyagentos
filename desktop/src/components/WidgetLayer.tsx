@@ -37,22 +37,26 @@ function renderWidget(type: string) {
 }
 
 export function WidgetLayer() {
-  const { widgets, showWidgets, addWidget, removeWidget, updateLayout } = useWidgetStore();
+  const { widgets, showWidgets, hydrated, addWidget, removeWidget, updateLayout } = useWidgetStore();
   const [pickerOpen, setPickerOpen] = useState(false);
   const [containerWidth, setContainerWidth] = useState(1200);
   const containerRef = useRef<HTMLDivElement>(null);
   const pickerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (!containerRef.current) return;
+    // Gate on hydration: the container only renders once hydrated + showWidgets
+    // are true (see the early return below), so this must re-run then to attach.
+    if (!hydrated || !showWidgets || !containerRef.current) return;
+    const node = containerRef.current;
+    setContainerWidth(node.clientWidth);
     const observer = new ResizeObserver((entries) => {
       for (const entry of entries) {
         setContainerWidth(entry.contentRect.width);
       }
     });
-    observer.observe(containerRef.current);
+    observer.observe(node);
     return () => observer.disconnect();
-  }, []);
+  }, [hydrated, showWidgets]);
 
   useEffect(() => {
     if (!pickerOpen) return;
@@ -74,7 +78,10 @@ export function WidgetLayer() {
     [updateLayout],
   );
 
-  if (!showWidgets) return null;
+  // Hide until the store has loaded from localStorage + resolved the server
+  // fetch. Rendering before hydration shows DEFAULT_WIDGETS and then replaces
+  // them, causing a visible flash + grid re-layout on mobile cold start.
+  if (!hydrated || !showWidgets) return null;
 
   const gridLayout: Layout[] = widgets.map((w) => ({
     i: w.id,
@@ -117,7 +124,7 @@ export function WidgetLayer() {
               <div
                 style={{
                   height: "100%",
-                  background: "rgba(20, 20, 35, 0.65)",
+                  background: "rgba(22, 22, 24, 0.65)",
                   backdropFilter: "blur(12px)",
                   WebkitBackdropFilter: "blur(12px)",
                   borderRadius: 12,
@@ -197,7 +204,7 @@ export function WidgetLayer() {
             width: 40,
             height: 40,
             borderRadius: "50%",
-            background: "rgba(20, 20, 35, 0.7)",
+            background: "rgba(22, 22, 24, 0.7)",
             backdropFilter: "blur(12px)",
             WebkitBackdropFilter: "blur(12px)",
             border: "1px solid rgba(255,255,255,0.15)",
@@ -209,11 +216,11 @@ export function WidgetLayer() {
             transition: "transform 0.15s, background 0.15s",
           }}
           onMouseEnter={(e) => {
-            e.currentTarget.style.background = "rgba(40, 40, 60, 0.85)";
+            e.currentTarget.style.background = "rgba(44, 44, 48, 0.85)";
             e.currentTarget.style.transform = "scale(1.1)";
           }}
           onMouseLeave={(e) => {
-            e.currentTarget.style.background = "rgba(20, 20, 35, 0.7)";
+            e.currentTarget.style.background = "rgba(22, 22, 24, 0.7)";
             e.currentTarget.style.transform = "scale(1)";
           }}
         >
@@ -228,7 +235,7 @@ export function WidgetLayer() {
               position: "absolute",
               bottom: 50,
               right: 0,
-              background: "rgba(20, 20, 35, 0.9)",
+              background: "rgba(22, 22, 24, 0.9)",
               backdropFilter: "blur(16px)",
               WebkitBackdropFilter: "blur(16px)",
               border: "1px solid rgba(255,255,255,0.15)",

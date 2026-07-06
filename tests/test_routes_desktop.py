@@ -48,6 +48,20 @@ def test_sw_js_returns_404_when_not_built(client, monkeypatch, tmp_path):
     assert r.status_code == 404
 
 
+def test_app_html_served_without_auth(client, monkeypatch, tmp_path):
+    """The generic standalone PWA shell /app.html is served (with the ?app=
+    query) and is auth-exempt -- the mobile Install button opens it."""
+    fake_dir = tmp_path / "fake-spa"
+    fake_dir.mkdir()
+    (fake_dir / "app.html").write_text("<!doctype html><title>app</title>")
+    monkeypatch.setattr("tinyagentos.routes.desktop.SPA_DIR", fake_dir)
+    r = client.get("/app.html?app=messages")
+    assert r.status_code == 200
+    # The shell HTML must revalidate so an updated bundle is not served stale.
+    assert "no-cache" in r.headers.get("Cache-Control", "")
+    assert "text/html" in r.headers.get("content-type", "")
+
+
 # ---------------------------------------------------------------------------
 # PWA shell pre-login accessibility
 # The service worker must be able to precache the shell HTML without a

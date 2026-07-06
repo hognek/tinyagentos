@@ -8,6 +8,8 @@ interface Props {
   onToggleSwitcher: () => void;
   onOpenLaunchpad: () => void;
   activeAppId: string | null;
+  /** True when running in mobile Safari/Chrome (not installed as a PWA). */
+  isBrowserMobile?: boolean;
 }
 
 function resolveIcon(iconName: string): icons.LucideIcon {
@@ -18,9 +20,18 @@ function resolveIcon(iconName: string): icons.LucideIcon {
   return (icons[key] as icons.LucideIcon) ?? icons.HelpCircle;
 }
 
-export function MobileDock({ onOpenApp, onToggleSwitcher, onOpenLaunchpad, activeAppId }: Props) {
+export function MobileDock({ onOpenApp, onToggleSwitcher, onOpenLaunchpad, activeAppId, isBrowserMobile = false }: Props) {
   const dockApps = useMobileHomeStore((s) => s.dockApps);
   const windows = useProcessStore((s) => s.windows);
+
+  // The dock is the bottom-most element in the mobile column, so it owns the
+  // home-indicator / browser-chrome clearance for everything above it. We add
+  // env(safe-area-inset-bottom) on TOP of a base gap so the dock (and the app
+  // content that ends just above it) always clears the home indicator. In PWA
+  // mode the inset is non-zero (notch devices); in browser mode it is 0, so we
+  // add extra room to keep the dock above Safari's ~50 px URL/tab bar.
+  const dockBaseGap = isBrowserMobile ? 54 : 12;
+  const dockPaddingBottom = `calc(env(safe-area-inset-bottom, 0px) + ${dockBaseGap}px)`;
 
   return (
     <div
@@ -33,7 +44,7 @@ export function MobileDock({ onOpenApp, onToggleSwitcher, onOpenLaunchpad, activ
         justifyContent: "center",
         gap: 8,
         paddingTop: 6,
-        paddingBottom: 24,
+        paddingBottom: dockPaddingBottom,
       }}
     >
       {/* Launchpad / All Apps button */}

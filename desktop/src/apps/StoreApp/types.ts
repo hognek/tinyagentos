@@ -15,6 +15,34 @@ export interface CatalogApp {
     backend?: string[];
     [key: string]: unknown;
   }>;
+  /** GitHub owner/repo slug for star count display (e.g. "home-assistant/core"). */
+  repo?: string;
+  /** dashboard-icons CDN slug for the official logo image. */
+  iconSlug?: string;
+  /** Real GitHub star count (e.g. 72400). */
+  stars?: number;
+  /** Short tagline used in hero and rich-card previews. */
+  tagline?: string;
+  /** Cover art URL or gradient CSS value for rich cards. */
+  cover?: string;
+  /**
+   * Real cover photo (official screenshot / hero) shown behind a featured
+   * or carousel card. A bottom-up dark scrim keeps overlaid text legible.
+   * Falls back to `cover` (gradient) when absent or if the image fails to load.
+   */
+  coverImage?: string;
+  /** True when an installed app has a newer version available (drives Updates). */
+  update_available?: boolean;
+  /** Studios-specific lifecycle state. "soon" hides install and shows a badge. */
+  studioState?: "installed" | "available" | "soon";
+  /** Code license (e.g. "MIT"). Distinct from weights_license/license_class below. */
+  license?: string;
+  /** Model weights license label (e.g. "CC-BY-NC 4.0"), when the backend pins weights
+   * under a different license than the runtime code. */
+  weights_license?: string;
+  /** "permissive" | "non-commercial" | "" (unknown/code-only). Drives the
+   * "Non-commercial weights" badge and the install-time license gate. */
+  license_class?: string;
 }
 
 export interface InstallTarget {

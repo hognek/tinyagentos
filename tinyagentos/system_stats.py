@@ -16,6 +16,8 @@ import time
 from functools import lru_cache
 from pathlib import Path
 
+import psutil
+
 _RKNPU_LOAD_PATHS = (
     "/sys/kernel/debug/rknpu/load",
     "/sys/class/devfreq/fdab0000.npu/load",
@@ -169,7 +171,6 @@ def get_cpu_per_core() -> list[dict]:
 
     Uses psutil for load, sysfs for freq/governor (Linux only).
     """
-    import psutil
 
     loads = psutil.cpu_percent(percpu=True)
     cores: list[dict] = []
@@ -304,7 +305,6 @@ _DISK_IO_LAST: dict = {"ts": 0.0, "read": 0, "write": 0}
 
 def get_disk_io_rate() -> dict:
     """Overall disk read/write bytes per second (across all disks)."""
-    import psutil
 
     io = psutil.disk_io_counters()
     if io is None:
@@ -331,7 +331,6 @@ _NET_IO_LAST: dict[str, dict] = {}
 
 def get_network_rates() -> list[dict]:
     """Per-interface network rx/tx bytes per second."""
-    import psutil
 
     now = time.time()
     stats = psutil.net_io_counters(pernic=True)
@@ -365,7 +364,6 @@ def get_network_rates() -> list[dict]:
 
 def get_top_processes(limit: int = 10) -> list[dict]:
     """Top processes by memory usage."""
-    import psutil
 
     procs: list[dict] = []
     for p in psutil.process_iter(['pid', 'name', 'memory_info', 'cpu_percent', 'username']):

@@ -1,8 +1,8 @@
-# TinyAgentOS Mirror Policy
+# taOS Mirror Policy
 
-TinyAgentOS's verified install paths depend on binaries — runtime libraries, NPU-converted model weights, firmware — that are not part of any official OS package index. Most of these live in ad-hoc community HuggingFace repos maintained by a single contributor, or on vendor FTPs, or on forums. Any of those sources can disappear, be renamed, or be re-uploaded with different contents at any time, without warning.
+taOS's verified install paths depend on binaries — runtime libraries, NPU-converted model weights, firmware — that are not part of any official OS package index. Most of these live in ad-hoc community HuggingFace repos maintained by a single contributor, or on vendor FTPs, or on forums. Any of those sources can disappear, be renamed, or be re-uploaded with different contents at any time, without warning.
 
-To protect the install path from that class of failure, TinyAgentOS maintains its own binary mirrors. This document describes what we mirror, when we update, how a user can verify integrity, and how the policy applies across every accelerator class we support.
+To protect the install path from that class of failure, taOS maintains its own binary mirrors. This document describes what we mirror, when we update, how a user can verify integrity, and how the policy applies across every accelerator class we support.
 
 ## What we mirror
 
@@ -24,7 +24,7 @@ The same policy applies to every class. There is no "trust the upstream" tier.
 
 ## When we update the mirror
 
-The mirror is updated **only after re-verifying the new version end-to-end against a clean install** of TinyAgentOS on the target hardware. Specifically:
+The mirror is updated **only after re-verifying the new version end-to-end against a clean install** of taOS on the target hardware. Specifically:
 
 1. A new upstream version is identified (new `librknnrt` build, new `dulimov/*` conversion, new in-house rkllm export, etc.).
 2. The candidate file is installed on a clean TAOS image on the target SBC.
@@ -48,7 +48,7 @@ Two layers of verification, both covered by the same SHA256 hashes:
 
 ## How to self-host the same mirror
 
-TinyAgentOS does not want to be a single point of failure. If the upstream HuggingFace repo at `jaysom/tinyagentos-rockchip-mirror` ever becomes unreachable, or an air-gapped deployment needs a local mirror, the process is:
+taOS does not want to be a single point of failure. If the upstream HuggingFace repo at `jaysom/tinyagentos-rockchip-mirror` ever becomes unreachable, or an air-gapped deployment needs a local mirror, the process is:
 
 1. Clone the HF mirror repo (`git clone https://huggingface.co/jaysom/tinyagentos-rockchip-mirror`) or use `huggingface-cli download` to pull every file.
 2. Host the files on your own HTTP server / S3 bucket / LAN NAS / internal HF instance. Preserve the same relative paths (`librknnrt-...so`, `models/*.rkllm`).
@@ -99,6 +99,6 @@ The mirror as it stands is static: files are uploaded, SHA256s are recorded, and
 - Fetches every file listed in its README.
 - Verifies each file's SHA256 against the expected value.
 - Checks that the URL returns a 200 and not a 404 / 403 / gateway error.
-- Surfaces pass/fail status on the public TinyAgentOS dashboard so anyone can see at a glance whether every verified install path's binary supply chain is currently healthy.
+- Surfaces pass/fail status on the public taOS dashboard so anyone can see at a glance whether every verified install path's binary supply chain is currently healthy.
 
 This closes the loop: today the installer hard-fails if a mirror file has drifted, but only at install time. With nightly health checks, we find out before a user ever tries to install.

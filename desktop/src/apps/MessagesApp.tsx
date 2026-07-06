@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
+import { createPortal } from "react-dom";
 import {
   MessageCircle,
   Hash,
@@ -12,10 +13,15 @@ import {
   Wifi,
   WifiOff,
   ChevronRight,
+  ChevronDown,
   PanelRight,
   Archive,
+  CircleDot,
+  PauseCircle,
   Trash2,
   RotateCcw,
+  MessagesSquare,
+  Search,
 } from "lucide-react";
 import {
   Button,
@@ -33,6 +39,7 @@ import { useVisualViewport } from "@/hooks/use-visual-viewport";
 import { useDropTarget } from "@/shell/dnd/use-drop-target";
 import { startDrag, endDrag } from "@/shell/dnd/dnd-bus";
 import { resolveAgentEmoji } from "@/lib/agent-emoji";
+import { MessageAvatar } from "./chat/MessageAvatar";
 import { ChannelSettingsPanel } from "./chat/ChannelSettingsPanel";
 import { AgentContextMenu } from "./chat/AgentContextMenu";
 import { SlashMenu, type SlashCommandsBySlug } from "./chat/SlashMenu";
@@ -52,6 +59,9 @@ import { MessageEditor } from "./chat/MessageEditor";
 import { MessageTombstone } from "./chat/MessageTombstone";
 import { PinBadge } from "./chat/PinBadge";
 import { PinnedMessagesPopover, type PinnedMessage } from "./chat/PinnedMessagesPopover";
+import { AllThreadsList } from "./chat/AllThreadsList";
+import { ChannelSwitcher } from "./chat/ChannelSwitcher";
+import { useChatNotifications } from "./chat/useChatNotifications";
 import { PinRequestAffordance } from "./chat/PinRequestAffordance";
 import {
   pinMessage, unpinMessage, listPins,
@@ -64,7 +74,20 @@ import {
   readLastChannel,
   writeLastChannel,
 } from "./MessagesApp.a2aSelection";
+import { bucketAgentChannels } from "./MessagesApp.agentSections";
 import { displayAuthor } from "./chat/format-author";
+import { useProcessStore } from "@/stores/process-store";
+import { getApp } from "@/registry/app-registry";
+import { CodeBlock } from "@/components/CodeBlock";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import Picker, { Theme } from "emoji-picker-react";
+import { SearchPanel } from "./chat/SearchPanel";
+import {
+  A2aBusSection,
+  A2aBusMessageView,
+  useBusChannels,
+} from "./chat/A2aBusPanel";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -155,6 +178,8 @@ interface Message {
   author_id: string;
   author_type: "user" | "agent";
   content: string;
+  /** Parent message id when this message is a thread reply. */
+  thread_id?: string;
   content_type?: "text" | "canvas" | string;
   metadata?: {
     canvas_id?: string;
@@ -196,38 +221,127 @@ function toMs(ts: number | string): number {
   return new Date(ts).getTime();
 }
 
-function relativeTime(ts: number | string): string {
+function relativeTime(ts: number | string, nowMs: number = Date.now()): string {
   const ms = toMs(ts);
-  const diff = Date.now() - ms;
-  const mins = Math.floor(diff / 60000);
+  const mins = Math.floor((nowMs - ms) / 60000);
   if (mins < 1) return "now";
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  const days = Math.floor(hrs / 24);
-  if (days < 7) return `${days}d ago`;
-  return new Date(ms).toLocaleDateString();
+  if (mins < 60) return `${mins}m`;
+  // Older than an hour: show the clock time. The day context comes from the
+  // date separators rendered between message groups.
+  return new Date(ms).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
 
-function renderContent(text: string) {
-  // basic markdown: bold, italic, inline code
-  const parts: (string | React.ReactElement)[] = [];
-  const regex = /(\*\*(.+?)\*\*|\*(.+?)\*|`(.+?)`)/g;
-  let last = 0;
-  let match: RegExpExecArray | null;
-  let key = 0;
-  while ((match = regex.exec(text)) !== null) {
-    if (match.index > last) parts.push(text.slice(last, match.index));
-    if (match[2]) parts.push(<strong key={key++} className="font-semibold">{match[2]}</strong>);
-    else if (match[3]) parts.push(<em key={key++} className="italic">{match[3]}</em>);
-    else if (match[4]) parts.push(<code key={key++} className="bg-white/10 px-1.5 py-0.5 rounded text-[13px] font-mono">{match[4]}</code>);
-    last = match.index + match[0].length;
+export function renderContent(text: string) {
+  // Split on fenced code blocks first, then apply inline markdown to non-code segments.
+  const result: (string | React.ReactElement)[] = [];
+  const fenceRegex = /```(?:[^\n]*)?\n([\s\S]*?)```/g;
+  let lastFence = 0;
+  let fenceMatch: RegExpExecArray | null;
+  let seg = 0;
+
+  // Each segment gets a distinct key prefix so keys can never collide no
+  // matter how many inline elements one segment produces.
+  while ((fenceMatch = fenceRegex.exec(text)) !== null) {
+    if (fenceMatch.index > lastFence) {
+      result.push(...renderInline(text.slice(lastFence, fenceMatch.index), `s${seg++}`));
+    }
+    result.push(<CodeBlock key={`cb-${seg++}`} code={fenceMatch[1] ?? ""} />);
+    lastFence = fenceMatch.index + fenceMatch[0].length;
   }
-  if (last < text.length) parts.push(text.slice(last));
-  return parts;
+  if (lastFence < text.length) {
+    result.push(...renderInline(text.slice(lastFence), `s${seg}`));
+  }
+  return result;
+}
+
+export function renderInline(text: string, keyPrefix: string) {
+  return [
+    <div key={keyPrefix}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        disallowedElements={["img"]}
+        components={{
+          p: ({ node, ...props }) => <p className="mb-1 last:mb-0" {...props} />,
+          a: ({ node, ...props }) => (
+            <a className="text-blue-400 underline" target="_blank" rel="noopener noreferrer" {...props} />
+          ),
+          code: ({ node, className, children, ...props }) => {
+            const isBlock = typeof className === "string" && /language-/.test(className);
+            if (isBlock) {
+              return <code className={className} {...props}>{children}</code>;
+            }
+            return (
+              <code className="bg-white/10 px-1.5 py-0.5 rounded text-[13px] font-mono" {...props}>
+                {children}
+              </code>
+            );
+          },
+          ul: ({ node, ...props }) => <ul className="list-disc pl-5 mb-1" {...props} />,
+          ol: ({ node, ...props }) => <ol className="list-decimal pl-5 mb-1" {...props} />,
+          blockquote: ({ node, ...props }) => (
+            <blockquote className="border-l-2 border-white/20 pl-3 text-white/70" {...props} />
+          ),
+          pre: ({ node, ...props }) => (
+            <pre className="my-2 overflow-x-auto max-w-full bg-black/30 border border-white/10 rounded p-2 text-[13px]" {...props} />
+          ),
+          table: ({ node, ...props }) => (
+            <div className="my-2 overflow-x-auto">
+              <table className="min-w-full text-left text-[13px]" {...props} />
+            </div>
+          ),
+          th: ({ node, ...props }) => (
+            <th className="border-b border-white/10 px-2 py-1 font-semibold" {...props} />
+          ),
+          td: ({ node, ...props }) => (
+            <td className="border-b border-white/5 px-2 py-1 align-top" {...props} />
+          ),
+          h1: ({ node, ...props }) => <p className="font-semibold mb-1" {...props} />,
+          h2: ({ node, ...props }) => <p className="font-semibold mb-1" {...props} />,
+          h3: ({ node, ...props }) => <p className="font-semibold mb-1" {...props} />,
+          h4: ({ node, ...props }) => <p className="font-semibold mb-1" {...props} />,
+          h5: ({ node, ...props }) => <p className="font-semibold mb-1" {...props} />,
+          h6: ({ node, ...props }) => <p className="font-semibold mb-1" {...props} />,
+        }}
+      >
+        {text}
+      </ReactMarkdown>
+    </div>,
+  ];
 }
 
 const EMOJI_PICKER = ["👍", "❤️", "😂", "🎉", "🤔", "👀", "🚀", "✅"];
+
+// Best-effort per-channel draft storage. Drafts are user input that may
+// contain sensitive material; they are kept in localStorage (the same
+// mechanism Slack's web client uses) and not synced to the server. Stored
+// unencrypted at rest in the browser profile. Users on shared machines
+// should clear site data to remove drafts.
+const draftKey = (channelId: string) => `taos-chat-draft:${channelId}`;
+function loadDraft(channelId: string): string {
+  try { return localStorage.getItem(draftKey(channelId)) || ""; } catch { return ""; }
+}
+function saveDraft(channelId: string, text: string) {
+  try {
+    if (text) localStorage.setItem(draftKey(channelId), text);
+    else localStorage.removeItem(draftKey(channelId));
+  } catch { /* storage full or unavailable: drafts are best-effort */ }
+}
+
+export function dayLabel(ts: string | number): string {
+  const d = new Date(toMs(ts));
+  const now = new Date();
+  // Compare local calendar days, not UTC. Build local-midnight Dates for
+  // both, then divide by 86400000ms. A local day is 23-25 hours across
+  // DST, so the division can still produce fractional values; use
+  // Math.round so a one-calendar-day difference is reported as exactly
+  // 1 day. (A diff of 0.96 days is still a single calendar-day gap
+  // before noon, and a diff of 1.04 days is one calendar day after.)
+  const localMidnight = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate());
+  const diffDays = Math.round((localMidnight(now).getTime() - localMidnight(d).getTime()) / 86400000);
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  return d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
+}
 
 /* ------------------------------------------------------------------ */
 /*  MessagesApp                                                        */
@@ -244,8 +358,14 @@ export function MessagesApp({
 }) {
   const isMobile = useIsMobile();
   const { keyboardInset } = useVisualViewport();
+  const openWindow = useProcessStore((s) => s.openWindow);
+  const openAgentsApp = () => {
+    const app = getApp("agents");
+    if (app) openWindow("agents", app.defaultSize);
+  };
 
   const [channels, setChannels] = useState<Channel[]>([]);
+  const [channelsLoaded, setChannelsLoaded] = useState(false);
   const shellFileDropTarget = useDropTarget({
     accept: ["file"],
     onDrop: async (payload) => {
@@ -273,17 +393,29 @@ export function MessagesApp({
   });
   const [archivedChannels, setArchivedChannels] = useState<Channel[]>([]);
   const [archivedExpanded, setArchivedExpanded] = useState(false);
+  // Collapsible sidebar sections, keyed by section label / project id, persisted.
+  const [collapsedSections, setCollapsedSections] = useState<Record<string, boolean>>(() => {
+    try { return JSON.parse(localStorage.getItem("taos-chat-collapsed") || "{}"); } catch { return {}; }
+  });
   const [projectsExpanded, setProjectsExpanded] = useState(true);
   const [projectChannelExpanded, setProjectChannelExpanded] = useState<Record<string, boolean>>({});
   const [liveAgents, setLiveAgents] = useState<LiveAgent[]>([]);
   const [archivedAgents, setArchivedAgents] = useState<ArchivedAgentEntry[]>([]);
   const [selectedChannel, setSelectedChannel] = useState<string | null>(null);
+  // External taOSmd coordination bus (read-only). Selecting a bus channel is a
+  // separate mode from the internal project channels: when busSelected is set,
+  // the detail pane shows the read-only bus viewer instead of the chat panel.
+  const [busSelected, setBusSelected] = useState<string | null>(null);
+  const bus = useBusChannels();
   const [messages, setMessages] = useState<Message[]>([]);
   const [unread, setUnread] = useState<Record<string, number>>({});
+  const unreadRef = useRef<Record<string, number>>({});
+  const pendingNewCountRef = useRef(0);
+  const [newDividerAtId, setNewDividerAtId] = useState<string | null>(null);
   const [input, setInput] = useState("");
   const [wsStatus, setWsStatus] = useState<WsStatus>("disconnected");
   const [showCreate, setShowCreate] = useState(false);
-  const [showEmoji, setShowEmoji] = useState<string | null>(null); // message id
+  const [showEmoji, setShowEmoji] = useState<{ messageId: string; rect: DOMRect } | null>(null); // message id + anchor
   const [viewingCanvas, setViewingCanvas] = useState<{ url: string; title?: string } | null>(null);
   const [newChannel, setNewChannel] = useState({ name: "", type: "topic" as "topic" | "group", description: "" });
   const [prefillBanner, setPrefillBanner] = useState<{ promptName: string; agentName?: string } | null>(null);
@@ -302,10 +434,45 @@ export function MessagesApp({
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
   const [pinnedPopoverOpen, setPinnedPopoverOpen] = useState(false);
   const [pinnedMessages, setPinnedMessages] = useState<PinnedMessage[]>([]);
+  const [showAllThreads, setShowAllThreads] = useState(false);
+  const [showSearch, setShowSearch] = useState(false);
+  const [showSwitcher, setShowSwitcher] = useState(false);
+  // Which channel's message fetch has completed, so the "empty channel"
+  // placeholder only shows after a real fetch (never mid-load or mid-switch).
+  const [fetchedChannel, setFetchedChannel] = useState<string | null>(null);
+  // Scroll-to-bottom affordance: whether the list is near the bottom, and how
+  // many messages have arrived while scrolled away (shown as a badge).
+  const [atBottom, setAtBottom] = useState(true);
+  const [newCount, setNewCount] = useState(0);
+  const prevMsgCountRef = useRef(0);
+  // One 60s tick for the whole list so relative timestamps ("3m") stay fresh
+  // without a reload. Only sub-hour labels depend on it; cheap re-render.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  // @mention autocomplete: the partial after "@" at the cursor + the @ index,
+  // or null when not in mention mode. mentionSel is the highlighted candidate.
+  const [mention, setMention] = useState<{ partial: string; atIndex: number } | null>(null);
+  const [mentionSel, setMentionSel] = useState(0);
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
   const [currentUserDisplayName, setCurrentUserDisplayName] = useState<string | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const { openThread, openThreadFor, closeThread } = useThreadPanel();
+  // Live thread replies: messages whose thread_id matches the open thread,
+  // captured from the main WS so the panel updates without a reopen. The ref
+  // lets the (long-lived) WS closure read the current open thread id.
+  const [threadLiveReplies, setThreadLiveReplies] = useState<Message[]>([]);
+  const openThreadIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    openThreadIdRef.current = openThread?.parentId ?? null;
+    setThreadLiveReplies([]); // reset when the open thread changes or closes
+  }, [openThread?.parentId]);
+
+  // Browser notifications for messages in background channels. Refs so the
+  // long-lived WS closure reads the current user id + channel list.
+  const { notify } = useChatNotifications();
+  const currentUserIdRef = useRef<string | null>(null);
+  const channelsRef = useRef<Channel[]>([]);
+  useEffect(() => { currentUserIdRef.current = currentUserId; }, [currentUserId]);
+  useEffect(() => { channelsRef.current = channels; }, [channels]);
 
   const wsRef = useRef<WebSocket | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -335,6 +502,8 @@ export function MessagesApp({
       }
     } catch {
       /* offline */
+    } finally {
+      setChannelsLoaded(true);
     }
   }, [scope?.projectId]);
 
@@ -386,8 +555,19 @@ export function MessagesApp({
       const res = await fetch(`/api/chat/channels/${channelId}/messages?limit=50`);
       if (res.ok) {
         const data = await res.json();
-        setMessages(data.messages ?? []);
+        const list: Message[] = data.messages ?? [];
+        setMessages(list);
+        setFetchedChannel(channelId);
         autoScrollRef.current = true;
+        const pending = pendingNewCountRef.current;
+        pendingNewCountRef.current = 0;
+        if (pending > 0 && list.length > 0) {
+          const idx = list.length - pending;
+          const atIdx = idx < 0 ? 0 : idx;
+          setNewDividerAtId(list[atIdx]?.id ?? null);
+        } else {
+          setNewDividerAtId(null);
+        }
       }
     } catch {
       /* offline */
@@ -447,9 +627,21 @@ export function MessagesApp({
               if (prev.some((m) => m.id === data.id)) return prev;
               return [...prev, data as Message];
             });
-            // bump unread if not the selected channel
+            // Live thread updates: if this is a reply in the open thread, feed
+            // it to the panel (de-duped by id).
+            if (data.thread_id && data.thread_id === openThreadIdRef.current) {
+              setThreadLiveReplies((prev) =>
+                prev.some((m) => m.id === data.id) ? prev : [...prev, data as Message],
+              );
+            }
+            // bump unread + browser-notify if not the selected channel and not
+            // the user's own message.
             if (data.channel_id !== prevChannelRef.current) {
               setUnread((u) => ({ ...u, [data.channel_id]: (u[data.channel_id] ?? 0) + 1 }));
+              if (data.author_id && data.author_id !== currentUserIdRef.current) {
+                const chName = channelsRef.current.find((c) => c.id === data.channel_id)?.name ?? "a channel";
+                notify(`${data.author_id} in #${chName}`, data.content ?? "", () => setSelectedChannel(data.channel_id));
+              }
             }
             break;
 
@@ -539,6 +731,27 @@ export function MessagesApp({
     wsRef.current = ws;
   }, []);
 
+  /* ---- emoji popover: escape and outside click ---- */
+  useEffect(() => {
+    if (!showEmoji) return;
+    function onKey(e: KeyboardEvent) {
+      if (e.key === "Escape") setShowEmoji(null);
+    }
+    function onPointer(e: MouseEvent) {
+      const t = e.target as HTMLElement | null;
+      if (!t) return;
+      if (t.closest("[data-emoji-popover='1']")) return;
+      if (t.closest(`[data-message-id="${showEmoji!.messageId}"]`)) return;
+      setShowEmoji(null);
+    }
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onPointer);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onPointer);
+    };
+  }, [showEmoji]);
+
   /* ---- init ---- */
   useEffect(() => {
     fetchChannels();
@@ -552,6 +765,12 @@ export function MessagesApp({
       }
     };
   }, [fetchChannels, fetchArchivedChannels, fetchAgentLists, connectWs]);
+
+  /* ---- keep unreadRef in sync with the unread state without re-running
+   * the channel-selection effect (which would re-capture the pending count). ---- */
+  useEffect(() => {
+    unreadRef.current = unread;
+  }, [unread]);
 
   /* ---- default-select A2A channel on first project visit ----
    * Also runs when the project switches: if the previously selected channel
@@ -584,6 +803,20 @@ export function MessagesApp({
     if (!channels.some((c) => c.id === selectedChannel)) return;
     writeLastChannel(scope.projectId, selectedChannel);
   }, [scope?.projectId, selectedChannel, channels]);
+
+  /* ---- bus / project-channel selection are mutually exclusive ----
+   * Modeled as render precedence: while busSelected is set the bus viewer
+   * wins, otherwise the project channel shows. Picking a project channel
+   * clears busSelected (project view takes over); picking a bus channel keeps
+   * selectedChannel intact so returning from the bus restores it.
+   */
+  useEffect(() => {
+    if (selectedChannel) setBusSelected(null);
+  }, [selectedChannel]);
+
+  const selectBusChannel = useCallback((channel: string) => {
+    setBusSelected(channel);
+  }, []);
 
   /* ---- fetch project list for sidebar grouping (standalone mode only) ---- */
   useEffect(() => {
@@ -659,21 +892,39 @@ export function MessagesApp({
 
   /* ---- channel selection ---- */
   useEffect(() => {
-    if (!selectedChannel) return;
-    // leave previous channel
-    if (prevChannelRef.current && prevChannelRef.current !== selectedChannel && wsRef.current?.readyState === 1) {
+    // Persist the draft for the channel we are leaving, regardless of socket
+    // state, so a switch while offline still saves the composer's contents.
+    if (prevChannelRef.current && prevChannelRef.current !== selectedChannel) {
+      saveDraft(prevChannelRef.current, input);
+    }
+    if (!selectedChannel) {
+      // No new channel: clear refs and stop here.
+      prevChannelRef.current = null;
+      return;
+    }
+    // leave previous channel (websocket signaling only)
+    if (prevChannelRef.current && wsRef.current?.readyState === 1) {
       wsRef.current.send(JSON.stringify({ type: "leave", channel_id: prevChannelRef.current }));
     }
+    // load draft for the new channel
+    if (prevChannelRef.current !== selectedChannel) {
+      setInput(loadDraft(selectedChannel));
+      if (inputRef.current) inputRef.current.style.height = "auto";
+    }
     prevChannelRef.current = selectedChannel;
+    setNewDividerAtId(null);
     // join new
     if (wsRef.current?.readyState === 1) {
       wsRef.current.send(JSON.stringify({ type: "join", channel_id: selectedChannel }));
     }
+    // capture unread count before markRead clears it (read via ref so this
+    // effect does not re-run when markRead mutates the unread map).
+    pendingNewCountRef.current = unreadRef.current[selectedChannel] ?? 0;
     fetchMessages(selectedChannel);
     markRead(selectedChannel);
     setTypingHumans([]);
     setTypingAgents([]);
-  }, [selectedChannel, fetchMessages, markRead]);
+  }, [selectedChannel, fetchMessages, markRead]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* ---- deep-link scroll on ?msg=<id> — latch so it fires once per URL ---- */
   const deepLinkSeenRef = useRef<string | null>(null);
@@ -713,19 +964,60 @@ export function MessagesApp({
     return () => { alive = false; };
   }, [selectedChannel]);
 
-  /* ---- auto-scroll ---- */
+  /* ---- auto-scroll + new-message counter while scrolled away ---- */
   useEffect(() => {
+    const delta = messages.length - prevMsgCountRef.current;
+    prevMsgCountRef.current = messages.length;
     if (autoScrollRef.current) {
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    } else if (delta > 0) {
+      setNewCount((c) => c + delta);
     }
   }, [messages]);
+
+  /* ---- reset scroll affordance on channel switch ---- */
+  useEffect(() => {
+    setAtBottom(true);
+    setNewCount(0);
+    prevMsgCountRef.current = 0;
+  }, [selectedChannel]);
+
+  /* ---- 60s tick to keep relative timestamps fresh ---- */
+  useEffect(() => {
+    const id = setInterval(() => setNowMs(Date.now()), 60000);
+    return () => clearInterval(id);
+  }, []);
 
   const handleScroll = () => {
     const el = messageListRef.current;
     if (!el) return;
-    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-    autoScrollRef.current = atBottom;
+    const nowAtBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    autoScrollRef.current = nowAtBottom;
+    // Only flip state (avoids re-render storms on every scroll tick).
+    setAtBottom((prev) => (prev === nowAtBottom ? prev : nowAtBottom));
+    if (nowAtBottom) setNewCount(0);
   };
+
+  const scrollToLatest = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    autoScrollRef.current = true;
+    setAtBottom(true);
+    setNewCount(0);
+  };
+
+  const toggleSection = (key: string) => {
+    setCollapsedSections((s) => {
+      const next = { ...s, [key]: !s[key] };
+      try { localStorage.setItem("taos-chat-collapsed", JSON.stringify(next)); } catch { /* best-effort */ }
+      return next;
+    });
+  };
+  // When a section is collapsed, still surface channels that are unread or
+  // currently selected (Slack behavior), so nothing important is hidden.
+  const visibleInSection = (items: Channel[], key: string) =>
+    collapsedSections[key]
+      ? items.filter((ch) => (unread[ch.id] ?? 0) > 0 || ch.id === selectedChannel)
+      : items;
 
   /* ---- typing emitter + slash menu derived state ---- */
   const emitTyping = useTypingEmitter(selectedChannel, "user");
@@ -735,12 +1027,29 @@ export function MessagesApp({
   /* ---- mutex: settings vs thread panel ---- */
   const handleOpenSettings = () => {
     closeThread();
+    setShowAllThreads(false);
+    setShowSearch(false);
     setShowSettings(true);
   };
   const handleOpenThreadFor = (channelId: string, parentId: string) => {
     setShowSettings(false);
+    setShowAllThreads(false);
+    setShowSearch(false);
     openThreadFor(channelId, parentId);
   };
+
+  // Cmd/Ctrl+K opens the quick channel switcher (suppressing the browser
+  // default). Idempotent: re-pressing while open does not reset it.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && (e.key === "k" || e.key === "K")) {
+        e.preventDefault();
+        setShowSwitcher(true);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   /* ---- send message ---- */
   const sendMessage = async () => {
@@ -779,6 +1088,8 @@ export function MessagesApp({
           return;
         }
         setInput("");
+        if (selectedChannel) saveDraft(selectedChannel, "");
+        setNewDividerAtId(null);
         setPendingAttachments([]);
         if (inputRef.current) inputRef.current.style.height = "auto";
         autoScrollRef.current = true;
@@ -810,6 +1121,8 @@ export function MessagesApp({
           if ((body as { handled?: string }).handled) {
             setSendError(null);
             setInput("");
+            if (selectedChannel) saveDraft(selectedChannel, "");
+            setNewDividerAtId(null);
             autoScrollRef.current = true;
             if (inputRef.current) inputRef.current.style.height = "auto";
             return;
@@ -846,6 +1159,8 @@ export function MessagesApp({
       }
     }
     setInput("");
+    if (selectedChannel) saveDraft(selectedChannel, "");
+    setNewDividerAtId(null);
     autoScrollRef.current = true;
     if (inputRef.current) inputRef.current.style.height = "auto";
   };
@@ -853,6 +1168,13 @@ export function MessagesApp({
   /* ---- typing indicator ---- */
   const handleInputChange = (val: string) => {
     setInput(val);
+    if (selectedChannel) saveDraft(selectedChannel, val);
+    // @mention detection: is the cursor inside an @token (no whitespace, the
+    // @ at the start or after whitespace)? If so, enter mention mode.
+    const pos = inputRef.current?.selectionStart ?? val.length;
+    const m = val.slice(0, pos).match(/(?:^|\s)@([^\s@]*)$/);
+    const part = m ? (m[1] ?? "") : "";
+    setMention(m ? { partial: part, atIndex: pos - part.length - 1 } : null);
     // auto-resize textarea
     if (inputRef.current) {
       inputRef.current.style.height = "auto";
@@ -872,6 +1194,8 @@ export function MessagesApp({
 
   /* ---- key handler ---- */
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    // The mention popover (when open) owns Enter/Tab via a capture listener
+    // that stops propagation, so this send handler never sees those keys.
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       sendMessage();
@@ -879,6 +1203,15 @@ export function MessagesApp({
   };
 
   /* ---- file upload ---- */
+  // Re-upload a File-based attachment (used by the retry affordance). Keeps the
+  // success/failure state updates identical to a first attempt.
+  const uploadFileAttachment = (id: string, file: File) => {
+    setPendingAttachments((p) => p.map((x) => (x.id === id ? { ...x, uploading: true, error: undefined } : x)));
+    uploadDiskFile(file, selectedChannel ?? undefined)
+      .then((rec) => setPendingAttachments((p) => p.map((x) => (x.id === id ? { ...x, record: rec, uploading: false, error: undefined } : x))))
+      .catch((err) => setPendingAttachments((p) => p.map((x) => (x.id === id ? { ...x, uploading: false, error: (err as Error).message } : x))));
+  };
+
   const handleFileUpload = async () => {
     const selections = await openFilePicker({
       sources: ["disk", "workspace", "agent-workspace"],
@@ -888,7 +1221,7 @@ export function MessagesApp({
       const id = Math.random().toString(36).slice(2);
       const filename = sel.source === "disk" ? sel.file.name : sel.path.split("/").pop() || "";
       const size = sel.source === "disk" ? sel.file.size : 0;
-      setPendingAttachments((p) => [...p, { id, filename, size, uploading: true }]);
+      setPendingAttachments((p) => [...p, { id, filename, size, uploading: true, file: sel.source === "disk" ? sel.file : undefined }]);
       try {
         const rec = sel.source === "disk"
           ? await uploadDiskFile(sel.file, selectedChannel ?? undefined)
@@ -932,7 +1265,7 @@ export function MessagesApp({
       });
       if (res.ok) {
         const ch = await res.json();
-        setChannels((prev) => [...prev, ch]);
+        await fetchChannels();
         setSelectedChannel(ch.id);
         setShowCreate(false);
         setNewChannel({ name: "", type: "topic", description: "" });
@@ -1022,6 +1355,15 @@ export function MessagesApp({
     } catch { /* ignore */ }
   };
 
+  const handleCopyText = async (msgId: string) => {
+    setOverflowMenu(null);
+    const msg = messages.find((m) => m.id === msgId);
+    if (!msg) return;
+    try {
+      await navigator.clipboard.writeText(msg.content);
+    } catch { /* ignore */ }
+  };
+
   const handlePin = async (msg: Message) => {
     setOverflowMenu(null);
     const isPinned = pinnedMessages.some((p) => p.id === msg.id);
@@ -1060,16 +1402,68 @@ export function MessagesApp({
   };
 
   /* ---- group channels by type ---- */
-  const isRoot = (c: Channel) => !c.project_id;
+  // Standalone Messages: root channels (no project_id) go in the DM/Topics/Groups
+  // sections; project channels nest under Projects. Project-scoped Messages shows
+  // only that project's channels in the type sections (Projects nest is hidden).
+  const inSidebarSection = (c: Channel) =>
+    scope?.projectId ? c.project_id === scope.projectId : !c.project_id;
   const grouped = {
-    dm: channels.filter((c) => c.type === "dm" && isRoot(c)),
-    topic: channels.filter((c) => c.type === "topic" && isRoot(c)),
-    group: channels.filter((c) => c.type === "group" && isRoot(c)),
+    dm: channels.filter((c) => c.type === "dm" && inSidebarSection(c)),
+    topic: channels.filter((c) => c.type === "topic" && inSidebarSection(c)),
+    group: channels.filter((c) => c.type === "group" && inSidebarSection(c)),
   };
+
+  // Split DM channels into agent lifecycle buckets (Live / Suspended /
+  // Archived) so deleted-agent DMs no longer mix in with live ones. Plain
+  // user DMs and a2a channels stay under nonAgent (their original placement).
+  const dmSections = bucketAgentChannels(grouped.dm, liveAgents, archivedAgents);
 
   const allChannels = [...channels, ...archivedChannels];
   const currentChannel = allChannels.find((c) => c.id === selectedChannel);
   const isCurrentArchived = currentChannel?.settings?.archived === true;
+
+  /* ---- @mention autocomplete: candidates = channel members + "all" ---- */
+  const mentionCandidates: string[] = (() => {
+    if (!mention) return [];
+    const q = mention.partial.toLowerCase();
+    const pool = [...(currentChannel?.members ?? []).filter((m) => m !== "user"), "all"];
+    const pref = pool.filter((m) => m.toLowerCase().startsWith(q));
+    const sub = pool.filter((m) => !m.toLowerCase().startsWith(q) && m.toLowerCase().includes(q));
+    return [...pref, ...sub].slice(0, 6);
+  })();
+
+  const insertMention = (slug: string | undefined) => {
+    if (!mention || !slug) return;
+    const el = inputRef.current;
+    const pos = el?.selectionStart ?? input.length;
+    const next = input.slice(0, mention.atIndex) + "@" + slug + " " + input.slice(pos);
+    setInput(next);
+    setMention(null);
+    requestAnimationFrame(() => {
+      if (el) {
+        const caret = mention.atIndex + slug.length + 2; // past "@slug "
+        el.focus();
+        el.setSelectionRange(caret, caret);
+      }
+    });
+  };
+
+  useEffect(() => { setMentionSel(0); }, [mention?.partial]);
+
+  // Capture Arrow/Enter/Tab/Escape while the mention popover is open. Capture
+  // phase + stopPropagation so the composer's send handler never sees them.
+  useEffect(() => {
+    if (!mention || mentionCandidates.length === 0) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); setMention(null); return; }
+      if (e.key === "ArrowDown") { e.preventDefault(); e.stopPropagation(); setMentionSel((s) => Math.min(mentionCandidates.length - 1, s + 1)); return; }
+      if (e.key === "ArrowUp") { e.preventDefault(); e.stopPropagation(); setMentionSel((s) => Math.max(0, s - 1)); return; }
+      if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); e.stopPropagation(); insertMention(mentionCandidates[mentionSel]); }
+    };
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mention, mentionCandidates.join(","), mentionSel]);
 
   /* ---- project-grouped channels for sidebar (standalone mode) ---- */
   const projectGroups = (() => {
@@ -1091,11 +1485,24 @@ export function MessagesApp({
   /*  Sections definition (shared between mobile + desktop lists)     */
   /* ---------------------------------------------------------------- */
 
+  // Agent DMs are grouped by lifecycle so live, suspended, and
+  // archived/deleted agents are visually separated. Empty buckets are
+  // omitted so the list stays compact. Plain user DMs and a2a channels
+  // (nonAgent) keep their original "Direct Messages" placement.
   const SECTIONS = [
-    { label: "Direct Messages", icon: <AtSign size={13} />, items: grouped.dm },
+    { label: "Live", icon: <CircleDot size={13} />, items: dmSections.live },
+    { label: "Suspended", icon: <PauseCircle size={13} />, items: dmSections.suspended },
+    { label: "Archived Agents", icon: <Archive size={13} />, items: dmSections.archived },
+    { label: "Direct Messages", icon: <AtSign size={13} />, items: dmSections.nonAgent },
     { label: "Topics", icon: <Hash size={13} />, items: grouped.topic },
     { label: "Groups", icon: <Users size={13} />, items: grouped.group },
-  ];
+  ].filter((s) => s.items.length > 0 || s.label === "Topics" || s.label === "Groups");
+
+  const allEmpty =
+    channelsLoaded &&
+    SECTIONS.every((s) => s.items.length === 0) &&
+    archivedChannels.length === 0 &&
+    projectGroups.length === 0;
 
   /* ---------------------------------------------------------------- */
   /*  Channel list — iOS 26 grouped on mobile, flat sidebar on desktop */
@@ -1115,62 +1522,107 @@ export function MessagesApp({
         )}
       </div>
 
-      {SECTIONS.map((section) => (
+      {allEmpty ? (
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "48px 24px", textAlign: "center", gap: 12 }}>
+          <MessageCircle size={36} style={{ color: "var(--color-shell-text-tertiary)" }} aria-hidden="true" />
+          <p style={{ fontSize: 15, fontWeight: 600, color: "var(--color-shell-text)", margin: 0 }}>No conversations yet</p>
+          <p style={{ fontSize: 13, color: "var(--color-shell-text-secondary)", margin: 0 }}>Deploy an agent to start chatting</p>
+          <button
+            type="button"
+            onClick={openAgentsApp}
+            style={{ marginTop: 4, fontSize: 13, padding: "8px 16px", borderRadius: 10, background: "var(--color-accent-soft)", border: "1px solid var(--color-accent-line)", color: "var(--color-accent-strong)", cursor: "pointer" }}
+          >
+            Open Agents
+          </button>
+        </div>
+      ) : SECTIONS.map((section) => (
         <div key={section.label} style={{ marginBottom: 20 }}>
-          <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 0.5, color: "rgba(255,255,255,0.45)", padding: "0 20px 6px", fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
+          <button
+            type="button"
+            onClick={() => toggleSection(section.label)}
+            aria-expanded={!collapsedSections[section.label]}
+            style={{ fontSize: 12, textTransform: "uppercase" as const, letterSpacing: 0.5, color: "var(--color-shell-text-secondary)", padding: "0 20px 6px", fontWeight: 600, display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", cursor: "pointer", width: "100%" }}
+          >
+            <ChevronRight size={13} aria-hidden="true" style={{ transition: "transform 0.15s", transform: collapsedSections[section.label] ? "none" : "rotate(90deg)" }} />
             {section.icon} {section.label}
-          </div>
-          {section.items.length === 0 ? (
-            <div style={{ padding: "0 20px", fontSize: 12, color: "rgba(255,255,255,0.2)", fontStyle: "italic" }}>None yet</div>
+          </button>
+          {visibleInSection(section.items, section.label).length === 0 ? (
+            collapsedSections[section.label] ? null : (
+              <div style={{ padding: "0 20px", fontSize: 12, color: "var(--color-shell-text-tertiary)", fontStyle: "italic" }}>None yet</div>
+            )
           ) : (
             <div
               style={{
                 margin: "0 12px",
                 borderRadius: 16,
-                background: "rgba(255,255,255,0.05)",
-                border: "1px solid rgba(255,255,255,0.08)",
+                background: "var(--color-shell-surface)",
+                border: "1px solid var(--color-shell-border)",
                 overflow: "hidden",
               }}
             >
-              {section.items.map((ch, idx, arr) => (
+              {visibleInSection(section.items, section.label).map((ch, idx, arr) => {
+                const isA2A = ch.settings?.kind === "a2a";
+                // Only direct messages get an agent avatar; topics/groups/a2a get
+                // a glyph tile (a topic/group can include agent members too).
+                const agentMember = ch.type === "dm" ? (ch.members ?? []).find((m) => m !== "user") : undefined;
+                const count = unread[ch.id] ?? 0;
+                return (
                 <button
                   key={ch.id}
                   type="button"
                   onClick={() => setSelectedChannel(ch.id)}
                   aria-label={`Channel ${ch.name}`}
-                  title={ch.settings?.kind === "a2a" ? "Agent coordination — mention @<slug> to hand off." : undefined}
+                  title={isA2A ? "Agent coordination — mention @<slug> to hand off." : undefined}
                   style={{
                     display: "flex",
                     alignItems: "center",
-                    gap: 10,
+                    gap: 12,
                     width: "100%",
-                    padding: "14px 16px",
-                    background: selectedChannel === ch.id ? "rgba(59,130,246,0.15)" : "none",
+                    padding: "11px 14px",
+                    background: selectedChannel === ch.id ? "var(--color-shell-surface-active)" : "none",
                     border: "none",
-                    borderBottom: idx === arr.length - 1 ? "none" : "1px solid rgba(255,255,255,0.06)",
+                    borderBottom: idx === arr.length - 1 ? "none" : "1px solid var(--color-shell-border)",
                     cursor: "pointer",
                     color: "inherit",
                     textAlign: "left",
                   }}
                 >
-                  {ch.settings?.kind === "a2a" && (
-                    <Bot
-                      size={14}
-                      aria-hidden
-                      style={{ color: "rgba(255,255,255,0.6)", flexShrink: 0 }}
-                    />
+                  {agentMember ? (
+                    <MessageAvatar size={38} authorId={agentMember} displayName={agentMember} kind="agent" />
+                  ) : isA2A ? (
+                    <div style={{ width: 38, height: 38, borderRadius: 11, display: "flex", alignItems: "center", justifyContent: "center", background: "var(--color-accent-soft)", border: "1px solid var(--color-accent-line)", color: "var(--color-accent-strong)", flexShrink: 0 }}>
+                      <Bot size={18} aria-hidden />
+                    </div>
+                  ) : (
+                    <div style={{ width: 38, height: 38, borderRadius: 11, display: "flex", alignItems: "center", justifyContent: "center", background: "var(--color-shell-surface-active)", color: "var(--color-shell-text-secondary)", flexShrink: 0 }}>
+                      {ch.type === "group" ? <Users size={18} aria-hidden /> : <Hash size={18} aria-hidden />}
+                    </div>
                   )}
-                  <span style={{ flex: 1, fontSize: 15, fontWeight: 400, color: "rgba(255,255,255,0.9)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {ch.name}
-                  </span>
-                  {(unread[ch.id] ?? 0) > 0 && (
-                    <span style={{ background: "#3b82f6", color: "#fff", fontSize: 10, fontWeight: 700, borderRadius: 9999, minWidth: 18, height: 18, display: "flex", alignItems: "center", justifyContent: "center", padding: "0 4px" }}>
-                      {unread[ch.id]}
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+                      <span style={{ flex: 1, fontSize: 15, fontWeight: count > 0 ? 700 : 600, color: "var(--color-shell-text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                        {ch.name}
+                      </span>
+                      {ch.last_message_at && (
+                        <span style={{ fontSize: 11, color: "var(--color-shell-text-tertiary)", flexShrink: 0 }}>
+                          {relativeTime(ch.last_message_at, nowMs)}
+                        </span>
+                      )}
+                    </div>
+                    {ch.lastPreview && (
+                      <div style={{ fontSize: 13, color: "var(--color-shell-text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 1 }}>
+                        {ch.lastPreview}
+                      </div>
+                    )}
+                  </div>
+                  {count > 0 && (
+                    <span style={{ background: "var(--color-unread)", color: "#fff", fontSize: 10, fontWeight: 700, borderRadius: 9999, minWidth: 18, height: 18, display: "flex", alignItems: "center", justifyContent: "center", padding: "0 5px", flexShrink: 0 }}>
+                      {count}
                     </span>
                   )}
-                  <ChevronRight size={16} style={{ color: "rgba(255,255,255,0.25)", flexShrink: 0 }} />
                 </button>
-              ))}
+                );
+              })}
             </div>
           )}
         </div>
@@ -1184,9 +1636,9 @@ export function MessagesApp({
             onClick={() => setProjectsExpanded((v) => !v)}
             aria-expanded={projectsExpanded}
             aria-controls="projects-section-mobile"
-            style={{ fontSize: 12, textTransform: "uppercase" as const, letterSpacing: 0.5, color: "rgba(255,255,255,0.45)", padding: "0 20px 6px", fontWeight: 600, display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", cursor: "pointer", width: "100%" }}
+            style={{ fontSize: 12, textTransform: "uppercase" as const, letterSpacing: 0.5, color: "var(--color-shell-text-secondary)", padding: "0 20px 6px", fontWeight: 600, display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", cursor: "pointer", width: "100%" }}
           >
-            <ChevronRight size={12} style={{ transition: "transform 0.15s", transform: projectsExpanded ? "rotate(90deg)" : "none", color: "rgba(255,255,255,0.3)" }} aria-hidden="true" />
+            <ChevronRight size={12} style={{ transition: "transform 0.15s", transform: projectsExpanded ? "rotate(90deg)" : "none", color: "var(--color-shell-text-tertiary)" }} aria-hidden="true" />
             Projects ({projectGroups.length})
           </button>
           <div id="projects-section-mobile" style={{ display: projectsExpanded ? "block" : "none" }}>
@@ -1199,9 +1651,9 @@ export function MessagesApp({
                     onClick={() => setProjectChannelExpanded((prev) => ({ ...prev, [g.id]: !isOpen }))}
                     aria-expanded={isOpen}
                     aria-controls={`project-section-mobile-${g.id}`}
-                    style={{ fontSize: 11, color: "rgba(255,255,255,0.5)", padding: "0 20px 4px", fontWeight: 600, display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", cursor: "pointer", width: "100%" }}
+                    style={{ fontSize: 11, color: "var(--color-shell-text-secondary)", padding: "0 20px 4px", fontWeight: 600, display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", cursor: "pointer", width: "100%" }}
                   >
-                    <ChevronRight size={10} style={{ transition: "transform 0.15s", transform: isOpen ? "rotate(90deg)" : "none", color: "rgba(255,255,255,0.3)" }} aria-hidden="true" />
+                    <ChevronRight size={10} style={{ transition: "transform 0.15s", transform: isOpen ? "rotate(90deg)" : "none", color: "var(--color-shell-text-tertiary)" }} aria-hidden="true" />
                     {g.name}
                   </button>
                   <div id={`project-section-mobile-${g.id}`} style={{ display: isOpen ? "block" : "none" }}>
@@ -1219,9 +1671,9 @@ export function MessagesApp({
                             gap: 10,
                             width: "100%",
                             padding: "14px 16px",
-                            background: selectedChannel === ch.id ? "rgba(59,130,246,0.15)" : "none",
+                            background: selectedChannel === ch.id ? "var(--color-shell-surface-active)" : "none",
                             border: "none",
-                            borderBottom: idx === arr.length - 1 ? "none" : "1px solid rgba(255,255,255,0.06)",
+                            borderBottom: idx === arr.length - 1 ? "none" : "1px solid var(--color-shell-border)",
                             cursor: "pointer",
                             color: "inherit",
                             textAlign: "left",
@@ -1231,18 +1683,18 @@ export function MessagesApp({
                             <Bot
                               size={14}
                               aria-hidden
-                              style={{ color: "rgba(255,255,255,0.6)", flexShrink: 0 }}
+                              style={{ color: "var(--color-shell-text-secondary)", flexShrink: 0 }}
                             />
                           )}
-                          <span style={{ flex: 1, fontSize: 15, fontWeight: 400, color: "rgba(255,255,255,0.9)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                          <span style={{ flex: 1, fontSize: 15, fontWeight: 400, color: "var(--color-shell-text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                             {ch.name}
                           </span>
                           {(unread[ch.id] ?? 0) > 0 && (
-                            <span style={{ background: "#3b82f6", color: "#fff", fontSize: 10, fontWeight: 700, borderRadius: 9999, minWidth: 18, height: 18, display: "flex", alignItems: "center", justifyContent: "center", padding: "0 4px" }}>
+                            <span style={{ background: "var(--color-unread)", color: "#fff", fontSize: 10, fontWeight: 700, borderRadius: 9999, minWidth: 18, height: 18, display: "flex", alignItems: "center", justifyContent: "center", padding: "0 4px" }}>
                               {unread[ch.id]}
                             </span>
                           )}
-                          <ChevronRight size={16} style={{ color: "rgba(255,255,255,0.25)", flexShrink: 0 }} />
+                          <ChevronRight size={16} style={{ color: "var(--color-shell-text-tertiary)", flexShrink: 0 }} />
                         </button>
                       ))}
                     </div>
@@ -1262,9 +1714,9 @@ export function MessagesApp({
             onClick={() => setArchivedExpanded((v) => !v)}
             aria-expanded={archivedExpanded}
             aria-controls="archived-channels-mobile"
-            style={{ fontSize: 12, textTransform: "uppercase" as const, letterSpacing: 0.5, color: "rgba(255,255,255,0.35)", padding: "0 20px 6px", fontWeight: 600, display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", cursor: "pointer", width: "100%" }}
+            style={{ fontSize: 12, textTransform: "uppercase" as const, letterSpacing: 0.5, color: "var(--color-shell-text-tertiary)", padding: "0 20px 6px", fontWeight: 600, display: "flex", alignItems: "center", gap: 6, background: "none", border: "none", cursor: "pointer", width: "100%" }}
           >
-            <ChevronRight size={12} style={{ transition: "transform 0.15s", transform: archivedExpanded ? "rotate(90deg)" : "none", color: "rgba(255,255,255,0.3)" }} aria-hidden="true" />
+            <ChevronRight size={12} style={{ transition: "transform 0.15s", transform: archivedExpanded ? "rotate(90deg)" : "none", color: "var(--color-shell-text-tertiary)" }} aria-hidden="true" />
             <Archive size={12} aria-hidden="true" />
             Archived ({archivedChannels.length})
           </button>
@@ -1288,10 +1740,10 @@ export function MessagesApp({
                       type="button"
                       onClick={() => setSelectedChannel(ch.id)}
                       aria-label={`Archived channel ${ch.name}`}
-                      style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, padding: "12px 8px 12px 16px", background: selectedChannel === ch.id ? "rgba(59,130,246,0.12)" : "none", border: "none", cursor: "pointer", color: "inherit", textAlign: "left" as const, minWidth: 0 }}
+                      style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, padding: "12px 8px 12px 16px", background: selectedChannel === ch.id ? "var(--color-shell-surface-active)" : "none", border: "none", cursor: "pointer", color: "inherit", textAlign: "left" as const, minWidth: 0 }}
                     >
-                      <Archive size={11} aria-hidden="true" style={{ color: "rgba(255,255,255,0.4)", flexShrink: 0 }} />
-                      <span style={{ flex: 1, fontSize: 14, color: "rgba(255,255,255,0.7)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{ch.name}</span>
+                      <Archive size={11} aria-hidden="true" style={{ color: "var(--color-shell-text-tertiary)", flexShrink: 0 }} />
+                      <span style={{ flex: 1, fontSize: 14, color: "var(--color-shell-text-secondary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{ch.name}</span>
                     </button>
                     <div style={{ display: "flex", gap: 2, paddingRight: 8 }}>
                       <button
@@ -1321,6 +1773,15 @@ export function MessagesApp({
           </div>
         </div>
       )}
+
+      {/* External taOSmd coordination bus (read-only) */}
+      <A2aBusSection
+        channels={bus.channels}
+        available={bus.available}
+        loaded={bus.loaded}
+        selected={busSelected}
+        onSelect={selectBusChannel}
+      />
     </div>
   ) : (
     /* Desktop: compact sidebar */
@@ -1338,38 +1799,78 @@ export function MessagesApp({
 
       {/* channel list */}
       <div className="flex-1 overflow-y-auto py-1">
-        {SECTIONS.map((section) => (
+        {allEmpty ? (
+          <div className="flex flex-col items-center justify-center h-full px-4 py-10 text-center gap-2.5">
+            <MessageCircle size={28} className="text-white/15" aria-hidden="true" />
+            <p className="text-[13px] font-medium text-white/60">No conversations yet</p>
+            <p className="text-[11px] text-white/30">Deploy an agent to start chatting</p>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={openAgentsApp}
+              className="mt-1 text-xs"
+            >
+              Open Agents
+            </Button>
+          </div>
+        ) : SECTIONS.map((section) => (
           <div key={section.label}>
-            <div className="px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-white/30 flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => toggleSection(section.label)}
+              aria-expanded={!collapsedSections[section.label]}
+              className="w-full px-3 pt-3 pb-1 text-[10px] font-semibold uppercase tracking-wider text-white/30 hover:text-white/50 flex items-center gap-1.5 transition-colors"
+            >
+              <ChevronRight
+                size={11}
+                aria-hidden="true"
+                className={`transition-transform ${collapsedSections[section.label] ? "" : "rotate-90"}`}
+              />
               {section.icon} {section.label}
-            </div>
-            {section.items.length === 0 && (
+            </button>
+            {!collapsedSections[section.label] && section.items.length === 0 && (
               <div className="px-3 py-1 text-[11px] text-white/20 italic">None yet</div>
             )}
-            {section.items.map((ch) => (
-              <Button
-                key={ch.id}
-                variant={selectedChannel === ch.id ? "secondary" : "ghost"}
-                onClick={() => setSelectedChannel(ch.id)}
-                className="w-full justify-start h-auto py-1.5 px-3 text-[13px] rounded-none font-normal"
-                aria-label={`Channel ${ch.name}`}
-                title={ch.settings?.kind === "a2a" ? "Agent coordination — mention @<slug> to hand off." : undefined}
-              >
-                {ch.settings?.kind === "a2a" && (
-                  <Bot
-                    size={14}
-                    aria-hidden
-                    style={{ color: "rgba(255,255,255,0.6)", flexShrink: 0 }}
-                  />
-                )}
-                <span className="truncate flex-1 text-left">{ch.name}</span>
-                {(unread[ch.id] ?? 0) > 0 && (
-                  <span className="shrink-0 bg-blue-500 text-white text-[10px] font-bold rounded-full min-w-[18px] h-[18px] flex items-center justify-center px-1">
-                    {unread[ch.id]}
-                  </span>
-                )}
-              </Button>
-            ))}
+            <div className="px-2 flex flex-col gap-px">
+              {visibleInSection(section.items, section.label).map((ch) => {
+                const isA2A = ch.settings?.kind === "a2a";
+                const agentMember = ch.type === "dm" ? (ch.members ?? []).find((m) => m !== "user") : undefined;
+                const count = unread[ch.id] ?? 0;
+                return (
+                  <button
+                    key={ch.id}
+                    type="button"
+                    onClick={() => setSelectedChannel(ch.id)}
+                    aria-pressed={selectedChannel === ch.id}
+                    className={`w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[10px] text-left transition-colors ${
+                      selectedChannel === ch.id ? "bg-shell-surface-active" : "hover:bg-shell-surface-hover"
+                    }`}
+                    aria-label={`Channel ${ch.name}`}
+                    title={isA2A ? "Agent coordination — mention @<slug> to hand off." : undefined}
+                  >
+                    {agentMember ? (
+                      <MessageAvatar size={30} authorId={agentMember} displayName={agentMember} kind="agent" />
+                    ) : isA2A ? (
+                      <span className="shrink-0 grid place-items-center w-[30px] h-[30px] rounded-[9px] bg-accent-soft border border-accent-line text-accent-strong">
+                        <Bot size={15} aria-hidden />
+                      </span>
+                    ) : (
+                      <span className="shrink-0 grid place-items-center w-[30px] h-[30px] rounded-[9px] bg-shell-surface-active text-shell-text-secondary">
+                        {ch.type === "group" ? <Users size={15} aria-hidden /> : <Hash size={15} aria-hidden />}
+                      </span>
+                    )}
+                    <span className={`truncate flex-1 text-[14px] tracking-tight ${count > 0 ? "font-bold text-shell-text" : "font-semibold text-shell-text"}`}>
+                      {ch.name}
+                    </span>
+                    {count > 0 && (
+                      <span className="shrink-0 bg-unread text-white text-[10px] font-bold rounded-full min-w-[18px] h-[18px] flex items-center justify-center px-1 tabular-nums">
+                        {count}
+                      </span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
           </div>
         ))}
 
@@ -1471,6 +1972,15 @@ export function MessagesApp({
             </div>
           </div>
         )}
+
+        {/* External taOSmd coordination bus (read-only) */}
+        <A2aBusSection
+          channels={bus.channels}
+          available={bus.available}
+          loaded={bus.loaded}
+          selected={busSelected}
+          onSelect={selectBusChannel}
+        />
       </div>
     </div>
   );
@@ -1479,14 +1989,30 @@ export function MessagesApp({
   /*  Message area                                                     */
   /* ---------------------------------------------------------------- */
 
-  const messageAreaUI = (
-    <div className="flex-1 flex flex-col min-w-0 h-full">
+  const messageAreaUI = busSelected ? (
+    <A2aBusMessageView channel={busSelected} />
+  ) : (
+    <div className="relative flex-1 flex flex-col min-w-0 h-full">
+      {selectedChannel && !atBottom && (
+        <button
+          type="button"
+          onClick={scrollToLatest}
+          aria-label="Jump to latest"
+          className="absolute right-4 bottom-24 z-20 flex items-center gap-1.5 px-3 h-9 rounded-full bg-shell-surface-active border border-shell-border-strong text-shell-text/80 hover:text-shell-text shadow-lg hover:bg-shell-surface-hover backdrop-blur-xl transition-colors"
+        >
+          <ChevronDown size={16} aria-hidden="true" />
+          {newCount > 0 && <span className="text-[11px] font-semibold">{newCount} new</span>}
+        </button>
+      )}
       {!selectedChannel ? (
-        /* empty state */
+        /* empty state: nothing selected yet */
         <div className="flex-1 flex items-center justify-center text-white/20">
-          <div className="text-center">
+          <div className="text-center px-6">
             <MessageCircle size={48} className="mx-auto mb-3 opacity-30" />
-            <p className="text-sm">Select a channel to start chatting</p>
+            <p className="text-sm mb-3">Pick a channel or start a DM</p>
+            <Button variant="outline" size="sm" onClick={() => setShowCreate(true)}>
+              New channel
+            </Button>
           </div>
         </div>
       ) : (
@@ -1547,12 +2073,55 @@ export function MessagesApp({
                           el.scrollIntoView({ behavior: "smooth", block: "center" });
                           el.classList.add("data-highlight");
                           setTimeout(() => el.classList.remove("data-highlight"), 2000);
+                        } else {
+                          // Only ~50 messages load; a pin older than that is not in the DOM.
+                          setSendError("Message is older than the loaded history");
                         }
                       }}
                       onClose={() => setPinnedPopoverOpen(false)}
                     />
                   )}
                 </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (showAllThreads) {
+                      setShowAllThreads(false);
+                    } else {
+                      closeThread();
+                      setShowSettings(false);
+                      setShowSearch(false);
+                      setShowAllThreads(true);
+                    }
+                  }}
+                  className="ml-2 p-1 rounded hover:bg-white/10 text-white/60 hover:text-white"
+                  aria-label={showAllThreads ? "Hide all threads" : "Show all threads"}
+                  aria-expanded={showAllThreads}
+                  aria-controls="all-threads-panel"
+                  title="All threads"
+                >
+                  <MessagesSquare size={14} aria-hidden="true" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (showSearch) {
+                      setShowSearch(false);
+                    } else {
+                      closeThread();
+                      setShowSettings(false);
+                      setShowAllThreads(false);
+                      setShowSearch(true);
+                    }
+                  }}
+                  className="ml-2 p-1 rounded hover:bg-white/10 text-white/60 hover:text-white"
+                  aria-label={showSearch ? "Hide search" : "Search messages"}
+                  aria-expanded={showSearch}
+                  aria-controls="search-panel"
+                  title="Search"
+                >
+                  <Search size={14} aria-hidden="true" />
+                </button>
               </div>
               {currentChannel?.description && (
                 <div className="text-[11px] text-white/35 truncate">{currentChannel.description}</div>
@@ -1591,7 +2160,7 @@ export function MessagesApp({
                 e.preventDefault();
                 for (const f of Array.from(e.dataTransfer.files)) {
                   const id = Math.random().toString(36).slice(2);
-                  setPendingAttachments((p) => [...p, { id, filename: f.name, size: f.size, uploading: true }]);
+                  setPendingAttachments((p) => [...p, { id, filename: f.name, size: f.size, uploading: true, file: f }]);
                   uploadDiskFile(f, selectedChannel ?? undefined)
                     .then((rec) => setPendingAttachments((p) => p.map((x) => x.id === id ? { ...x, record: rec, uploading: false } : x)))
                     .catch((err) => setPendingAttachments((p) => p.map((x) => x.id === id ? { ...x, uploading: false, error: (err as Error).message } : x)));
@@ -1601,15 +2170,27 @@ export function MessagesApp({
               shellFileDropTarget.dropHandlers.onDrop(e);
             }}
           >
-            {messages.length === 0 && (
-              <div className="flex items-center justify-center h-full text-white/20 text-sm">
-                No messages yet. Say something!
+            {messages.length === 0 && fetchedChannel === selectedChannel && (
+              <div className="flex flex-col items-center justify-center h-full text-white/25 text-center px-6">
+                <MessageCircle size={40} className="mb-3 opacity-30" />
+                <p className="text-sm">
+                  No messages yet. Say hello to{" "}
+                  {currentChannel?.type === "dm"
+                    ? `@${(currentChannel.members ?? []).find((m) => m !== "user") ?? "them"}`
+                    : currentChannel?.name
+                      ? `#${currentChannel.name}`
+                      : "this channel"}
+                  .
+                </p>
               </div>
             )}
             {messages.map((msg, i) => {
               const isAgent = msg.author_type === "agent";
               const prev = i > 0 ? messages[i - 1] : undefined;
               const showAuthor = !prev || prev.author_id !== msg.author_id;
+              const prevDay = prev ? new Date(toMs(prev.created_at)).toDateString() : null;
+              const currDay = new Date(toMs(msg.created_at)).toDateString();
+              const showDaySeparator = !prev || prevDay !== currDay;
               const authorState = resolveAuthorDisplayState(
                 msg.author_id,
                 msg.author_type,
@@ -1624,15 +2205,67 @@ export function MessagesApp({
                     ? "Agent removed"
                     : undefined;
               return (
+                <React.Fragment key={msg.id}>
+                {showDaySeparator && (
+                  <div className="flex items-center gap-3 my-4 select-none">
+                    <div className="flex-1 h-px bg-white/10" />
+                    <span className="text-[11px] text-white/40 font-medium">{dayLabel(msg.created_at)}</span>
+                    <div className="flex-1 h-px bg-white/10" />
+                  </div>
+                )}
+                {newDividerAtId === msg.id && (
+                  <div
+                    role="separator"
+                    aria-label="New messages"
+                    className="flex items-center gap-3 my-3 select-none"
+                  >
+                    <div className="flex-1 h-px bg-red-400/40" />
+                    <span className="text-[11px] text-red-400 font-semibold">New</span>
+                    <div className="flex-1 h-px bg-red-400/40" />
+                  </div>
+                )}
                 <div
-                  key={msg.id}
                   data-message-id={msg.id}
-                  className={`group relative px-3 py-1 rounded-md transition-colors hover:bg-white/[0.03] ${
-                    isAgent && !isDeadAgent ? "bg-blue-500/[0.04]" : ""
-                  } ${showAuthor ? "mt-3" : ""}`}
+                  className={`group relative flex gap-2.5 px-3 py-0.5 rounded-md transition-colors hover:bg-shell-surface ${showAuthor ? (isMobile ? "mt-2" : "mt-3") : ""}`}
                   onMouseEnter={() => setHoveredMessageId(msg.id)}
                   onMouseLeave={() => setHoveredMessageId((id) => id === msg.id ? null : id)}
                 >
+                  {/* avatar gutter */}
+                  <div
+                    className="flex-shrink-0 flex justify-end pt-0.5"
+                    style={{ width: isMobile ? 34 : 38 }}
+                    onContextMenu={(e) => {
+                      if (msg.author_type !== "agent") return;
+                      e.preventDefault();
+                      setContextMenu({ slug: msg.author_id, x: e.clientX, y: e.clientY });
+                    }}
+                  >
+                    {showAuthor ? (
+                      (() => {
+                        const agent = isAgent ? liveAgents.find((a) => a.name === msg.author_id) : undefined;
+                        return (
+                          <MessageAvatar
+                            size={isMobile ? 34 : 38}
+                            authorId={msg.author_id}
+                            displayName={displayAuthor(msg, { currentUserId, currentUserDisplayName })}
+                            kind={isAgent ? "agent" : "user"}
+                            dead={isDeadAgent}
+                            emoji={agent ? resolveAgentEmoji(agent.emoji, agent.framework) : isAgent ? resolveAgentEmoji(undefined, undefined) : undefined}
+                          />
+                        );
+                      })()
+                    ) : (
+                      <span
+                        className="text-[10px] leading-none text-shell-text-tertiary opacity-0 group-hover:opacity-100 transition-opacity self-center select-none"
+                        aria-hidden="true"
+                        title={new Date(toMs(msg.created_at)).toLocaleString()}
+                      >
+                        {new Date(toMs(msg.created_at)).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}
+                      </span>
+                    )}
+                  </div>
+                  {/* content column */}
+                  <div className="flex-1 min-w-0">
                   {showAuthor && (
                     <div
                       className="flex items-center gap-2 mb-0.5"
@@ -1642,25 +2275,11 @@ export function MessagesApp({
                         setContextMenu({ slug: msg.author_id, x: e.clientX, y: e.clientY });
                       }}
                     >
-                      {isAgent && !isDeadAgent && (() => {
-                        const agent = liveAgents.find((a) => a.name === msg.author_id);
-                        if (!agent) return null;
-                        return (
-                          <span
-                            className="text-[14px] leading-none"
-                            aria-hidden="true"
-                          >
-                            {resolveAgentEmoji(agent.emoji, agent.framework)}
-                          </span>
-                        );
-                      })()}
                       <span
-                        className={`text-[13px] font-semibold ${
+                        className={`${isMobile ? "text-[14px]" : "text-[15px]"} font-bold tracking-tight ${
                           isDeadAgent
-                            ? "line-through text-white/35"
-                            : isAgent
-                              ? "text-blue-400"
-                              : "text-white/90"
+                            ? "line-through text-shell-text-tertiary"
+                            : "text-shell-text"
                         }`}
                         style={isDeadAgent ? { opacity: 0.55 } : undefined}
                         title={authorTooltip}
@@ -1668,18 +2287,21 @@ export function MessagesApp({
                         {displayAuthor(msg, { currentUserId, currentUserDisplayName })}
                       </span>
                       {isAgent && !isDeadAgent && (
-                        <span className="text-[10px] bg-blue-500/20 text-blue-300 px-1.5 py-0.5 rounded font-medium flex items-center gap-0.5">
+                        <span className="text-[10px] uppercase tracking-wide bg-accent-soft text-accent-strong border border-accent-line px-1.5 py-0.5 rounded font-semibold flex items-center gap-0.5">
                           <Bot size={10} aria-hidden="true" /> Agent
                         </span>
                       )}
                       {isDeadAgent && (
-                        <span className="text-[10px] bg-zinc-500/20 text-zinc-500 px-1.5 py-0.5 rounded font-medium flex items-center gap-0.5">
+                        <span className="text-[10px] uppercase tracking-wide bg-shell-surface-active text-shell-text-tertiary px-1.5 py-0.5 rounded font-semibold flex items-center gap-0.5">
                           <Bot size={10} aria-hidden="true" />
                           {authorState === "archived" ? "inactive" : "removed"}
                         </span>
                       )}
-                      <span className={`text-[11px] ${isDeadAgent ? "text-white/15" : "text-white/25"}`}>{relativeTime(msg.created_at)}</span>
-                      {msg.edited_at && <span className="text-[10px] text-white/20">(edited)</span>}
+                      <span
+                        className="text-[11px] text-shell-text-tertiary"
+                        title={new Date(toMs(msg.created_at)).toLocaleString()}
+                      >{relativeTime(msg.created_at, nowMs)}</span>
+                      {msg.edited_at && <span className="text-[10px] text-shell-text-tertiary">(edited)</span>}
                     </div>
                   )}
                   {msg.deleted_at ? (
@@ -1691,16 +2313,16 @@ export function MessagesApp({
                       onCancel={() => setEditingMessageId(null)}
                     />
                   ) : (
-                    <div className={`text-[13px] leading-relaxed whitespace-pre-wrap break-words ${isDeadAgent ? "text-white/45" : "text-white/80"}`}>
+                    <div className={`${isMobile ? "text-[14px]" : "text-[15px]"} leading-[1.46] whitespace-pre-wrap break-words ${isDeadAgent ? "text-shell-text-secondary" : "text-shell-text"}`}>
                       {renderContent(msg.content)}
                       {msg.state === "pending" && (
-                        <span className="ml-1 text-white/30">...</span>
+                        <span className="ml-1 text-shell-text-tertiary">...</span>
                       )}
                       {msg.state === "streaming" && (
                         <span className="ml-1 inline-flex gap-0.5">
-                          <span className="w-1 h-1 bg-blue-400 rounded-full animate-bounce [animation-delay:0ms]" />
-                          <span className="w-1 h-1 bg-blue-400 rounded-full animate-bounce [animation-delay:150ms]" />
-                          <span className="w-1 h-1 bg-blue-400 rounded-full animate-bounce [animation-delay:300ms]" />
+                          <span className="w-1 h-1 bg-accent rounded-full animate-bounce [animation-delay:0ms]" />
+                          <span className="w-1 h-1 bg-accent rounded-full animate-bounce [animation-delay:150ms]" />
+                          <span className="w-1 h-1 bg-accent rounded-full animate-bounce [animation-delay:300ms]" />
                         </span>
                       )}
                       {msg.state === "error" && (
@@ -1725,7 +2347,7 @@ export function MessagesApp({
                           const url = msg.metadata?.canvas_url ?? `/canvas/${msg.metadata?.canvas_id}`;
                           setViewingCanvas({ url, title: msg.metadata?.canvas_title as string | undefined });
                         }}
-                        className="h-7 px-2.5 text-[12px] gap-1.5 bg-white/[0.04] border-white/10 hover:bg-white/[0.08]"
+                        className="h-7 px-2.5 text-[12px] gap-1.5 bg-shell-surface border-shell-border-strong hover:bg-shell-surface-hover"
                         aria-label="View canvas"
                       >
                         <PanelRight size={13} />
@@ -1736,17 +2358,25 @@ export function MessagesApp({
 
                   {/* reactions */}
                   {msg.reactions && Object.keys(msg.reactions).length > 0 && (
-                    <div className="flex flex-wrap gap-1 mt-1">
-                      {Object.entries(msg.reactions).map(([emoji, users]) => (
-                        <button
-                          key={emoji}
-                          onClick={() => toggleReaction(msg.id, emoji)}
-                          className="text-[12px] bg-white/[0.06] hover:bg-white/10 border border-white/[0.06] rounded-full px-2 py-0.5 flex items-center gap-1 transition-colors"
-                        >
-                          <span>{emoji}</span>
-                          <span className="text-white/40">{users.length}</span>
-                        </button>
-                      ))}
+                    <div className="flex flex-wrap gap-1 mt-1.5">
+                      {Object.entries(msg.reactions).map(([emoji, users]) => {
+                        const mine = currentUserId != null && users.includes(currentUserId);
+                        return (
+                          <button
+                            key={emoji}
+                            onClick={() => toggleReaction(msg.id, emoji)}
+                            aria-pressed={mine}
+                            className={`text-[12px] rounded-full px-2 py-0.5 flex items-center gap-1 border transition-colors ${
+                              mine
+                                ? "bg-accent-soft border-accent-line text-accent-strong"
+                                : "bg-shell-surface border-shell-border hover:bg-shell-surface-hover text-shell-text-secondary"
+                            }`}
+                          >
+                            <span>{emoji}</span>
+                            <span className={mine ? "text-accent-strong font-medium" : "text-shell-text-tertiary"}>{users.length}</span>
+                          </button>
+                        );
+                      })}
                     </div>
                   )}
 
@@ -1755,9 +2385,18 @@ export function MessagesApp({
                     const excerpt = (msg.content || "").slice(0, 80);
                     const msgChannelId = msg.channel_id ?? selectedChannel ?? "";
                     return (
-                      <div className="absolute top-0 right-2 -translate-y-1/2 z-10">
+                      <div className="absolute -top-3 right-2 z-10">
                         <MessageHoverActions
-                          onReact={() => setShowEmoji(showEmoji === msg.id ? null : msg.id)}
+                          onReact={() => {
+                            if (showEmoji && showEmoji.messageId === msg.id) {
+                              setShowEmoji(null);
+                              return;
+                            }
+                            const row = document.querySelector(`[data-message-id="${msg.id}"]`) as HTMLElement | null;
+                            const rect = row?.getBoundingClientRect();
+                            if (!rect) return;
+                            setShowEmoji({ messageId: msg.id, rect });
+                          }}
                           onReplyInThread={() => handleOpenThreadFor(msg.channel_id ?? selectedChannel ?? "", msg.id)}
                           onOverflow={(e) => {
                             e.preventDefault();
@@ -1800,21 +2439,56 @@ export function MessagesApp({
                     />
                   )}
 
-                  {/* emoji picker */}
-                  {showEmoji === msg.id && (
-                    <div className="absolute right-2 top-5 bg-zinc-800 border border-white/10 rounded-lg shadow-xl p-2 flex gap-1 z-10">
-                      {EMOJI_PICKER.map((em) => (
-                        <button
-                          key={em}
-                          onClick={() => toggleReaction(msg.id, em)}
-                          className="text-lg hover:bg-white/10 rounded p-0.5 transition-colors"
-                        >
-                          {em}
-                        </button>
-                      ))}
+                  {/* emoji picker — rendered in a portal to avoid clipping by the scrollable list */}
+                  {showEmoji && showEmoji.messageId === msg.id && createPortal(
+                    (() => {
+                      const POPOVER_W = 300;
+                      const POPOVER_H = 360;
+                      const vw = window.innerWidth;
+                      const vh = window.innerHeight;
+                      const r = showEmoji.rect;
+                      // Upper bounds are clamped to >=8 so a viewport smaller
+                      // than the popover (with margins) cannot produce a
+                      // negative limit and let Math.min return a value < 8.
+                      const top = Math.max(8, Math.min(r.top, Math.max(8, vh - POPOVER_H - 8)));
+                      const left = Math.max(8, Math.min(r.right - POPOVER_W, Math.max(8, vw - POPOVER_W - 8)));
+                      return (
+                    <div
+                      data-emoji-popover="1"
+                      role="dialog"
+                      aria-label="Emoji reactions"
+                      className="fixed z-50 bg-shell-bg border border-shell-border-strong rounded-lg shadow-xl p-2 w-[300px] h-[360px] flex flex-col gap-2 backdrop-blur-xl"
+                      style={{ top, left }}
+                    >
+                      <div className="flex gap-1 shrink-0">
+                        {EMOJI_PICKER.map((em) => (
+                          <button
+                            key={em}
+                            onClick={() => toggleReaction(msg.id, em)}
+                            className="text-lg hover:bg-white/10 rounded p-0.5 transition-colors"
+                          >
+                            {em}
+                          </button>
+                        ))}
+                      </div>
+                      <div className="flex-1 min-h-0">
+                        <Picker
+                          theme={Theme.DARK}
+                          width="100%"
+                          height="100%"
+                          onEmojiClick={(d) => {
+                            toggleReaction(msg.id, d.emoji);
+                          }}
+                        />
+                      </div>
                     </div>
+                      );
+                    })(),
+                    document.body,
                   )}
+                  </div>
                 </div>
+                </React.Fragment>
               );
             })}
             <div ref={messagesEndRef} />
@@ -1834,7 +2508,7 @@ export function MessagesApp({
           {/* prefill banner */}
           {prefillBanner && (
             <div
-              className="mx-4 mb-1 px-3 py-2 rounded-lg bg-blue-500/10 border border-blue-500/20 text-[12px] text-blue-300/90 flex items-center gap-2 shrink-0"
+              className="mx-4 mb-1 px-3 py-2 rounded-lg bg-accent-soft border border-accent-line text-[12px] text-accent-strong flex items-center gap-2 shrink-0"
               role="status"
               aria-label={`Composer prefilled from prompt: ${prefillBanner.promptName}`}
             >
@@ -1867,7 +2541,16 @@ export function MessagesApp({
             items={pendingAttachments}
             onRemove={(id) => setPendingAttachments((p) => p.filter((x) => x.id !== id))}
             onRetry={(id) => {
-              setPendingAttachments((p) => p.map((x) => x.id === id ? { ...x, uploading: false, error: "retry not yet supported — remove and re-add" } : x));
+              const entry = pendingAttachments.find((x) => x.id === id);
+              if (!entry) return;
+              if (!entry.file) {
+                // Path-based attachment (no File kept): can only re-add.
+                setPendingAttachments((p) => p.map((x) => x.id === id ? { ...x, error: "Can't retry, remove and re-add" } : x));
+                return;
+              }
+              if ((entry.retries ?? 0) >= 3) return;
+              setPendingAttachments((p) => p.map((x) => x.id === id ? { ...x, retries: (x.retries ?? 0) + 1 } : x));
+              uploadFileAttachment(id, entry.file);
             }}
           />
 
@@ -1877,9 +2560,9 @@ export function MessagesApp({
               style={{
                 padding: "10px 14px",
                 fontSize: 12,
-                color: "rgba(255,255,255,0.55)",
-                background: "rgba(255,255,255,0.03)",
-                border: "1px solid rgba(255,255,255,0.06)",
+                color: "var(--color-shell-text-secondary)",
+                background: "var(--color-accent-soft)",
+                border: "1px solid var(--color-accent-line)",
                 borderRadius: 12,
                 margin: "8px 12px",
               }}
@@ -1909,7 +2592,28 @@ export function MessagesApp({
                   onClose={() => { /* leave input as-is; user can Esc or delete */ }}
                 />
               )}
-              <div className={`flex items-end gap-2 rounded-xl border px-2 py-1.5 ${isCurrentArchived ? "bg-white/[0.02] border-white/[0.04] opacity-50" : "bg-white/[0.06] border-white/[0.08]"}`}>
+              {mention && mentionCandidates.length > 0 && !showSlash && (
+                <div
+                  role="listbox"
+                  aria-label="Mention a member"
+                  className="absolute bottom-full left-0 mb-2 w-full max-w-md bg-shell-surface border border-white/10 rounded-lg shadow-xl max-h-60 overflow-y-auto text-sm"
+                >
+                  {mentionCandidates.map((slug, i) => (
+                    <button
+                      key={slug}
+                      role="option"
+                      aria-selected={i === mentionSel}
+                      onMouseEnter={() => setMentionSel(i)}
+                      onMouseDown={(e) => { e.preventDefault(); insertMention(slug); }}
+                      className={`w-full text-left px-3 py-1.5 flex items-center gap-2 ${i === mentionSel ? "bg-white/10" : "hover:bg-white/5"}`}
+                    >
+                      <AtSign size={13} className="text-white/40" aria-hidden="true" />
+                      <span className="font-mono text-[13px]">@{slug}</span>
+                    </button>
+                  ))}
+                </div>
+              )}
+              <div className={`flex items-end gap-2 rounded-2xl border px-2 py-1.5 ${isCurrentArchived ? "bg-white/[0.02] border-white/[0.04] opacity-50" : "bg-shell-surface border-shell-border-strong"}`}>
                 <Button
                   variant="ghost"
                   size="icon"
@@ -1925,6 +2629,7 @@ export function MessagesApp({
                   value={input}
                   onChange={(e) => !isCurrentArchived && handleInputChange(e.target.value)}
                   onKeyDown={(e) => !isCurrentArchived && handleKeyDown(e)}
+                  onBlur={() => setMention(null)}
                   onPaste={(e) => {
                     if (!e.clipboardData) return;
                     const files = Array.from(e.clipboardData.files).filter((f) => f.type.startsWith("image/"));
@@ -1932,7 +2637,7 @@ export function MessagesApp({
                     e.preventDefault();
                     for (const f of files) {
                       const id = Math.random().toString(36).slice(2);
-                      setPendingAttachments((p) => [...p, { id, filename: f.name || "pasted.png", size: f.size, uploading: true }]);
+                      setPendingAttachments((p) => [...p, { id, filename: f.name || "pasted.png", size: f.size, uploading: true, file: f }]);
                       uploadDiskFile(f, selectedChannel ?? undefined)
                         .then((rec) => setPendingAttachments((p) => p.map((x) => x.id === id ? { ...x, record: rec, uploading: false } : x)))
                         .catch((err) => setPendingAttachments((p) => p.map((x) => x.id === id ? { ...x, uploading: false, error: (err as Error).message } : x)));
@@ -1972,7 +2677,7 @@ export function MessagesApp({
   /* ---------------------------------------------------------------- */
 
   return (
-    <div className="flex flex-col h-full bg-shell-base text-white overflow-hidden">
+    <div className="relative flex flex-col h-full bg-shell-base text-white overflow-hidden">
       {/* Toolbar — hidden on mobile when a channel is selected */}
       {showToolbar && (
         <div className="relative flex items-center px-3 py-2.5 border-b border-white/[0.06] shrink-0">
@@ -2016,10 +2721,13 @@ export function MessagesApp({
       {/* Master-detail — MobileSplitView handles mobile single-pane + desktop split */}
       <div className="flex-1 min-h-0 overflow-hidden">
         <MobileSplitView
-          selectedId={selectedChannel}
-          onBack={() => setSelectedChannel(null)}
+          selectedId={selectedChannel ?? busSelected}
+          onBack={() => { setSelectedChannel(null); setBusSelected(null); }}
           listTitle="Messages"
-          detailTitle={currentChannel?.name}
+          // On mobile the in-pane channel header already shows the channel name
+          // (and its toolbar), so suppressing the nav title removes the doubled
+          // name and the dead space it took up. Desktop keeps it.
+          detailTitle={isMobile ? undefined : (busSelected ?? currentChannel?.name)}
           listWidth={240}
           list={channelListUI}
           detail={messageAreaUI}
@@ -2038,6 +2746,7 @@ export function MessagesApp({
             onEdit={() => handleEdit(msg.id)}
             onDelete={() => handleDelete(msg.id)}
             onCopyLink={() => handleCopyLink(msg.id)}
+            onCopyText={() => handleCopyText(msg.id)}
             onPin={() => handlePin(msg)}
             onMarkUnread={() => handleMarkUnread(msg.id)}
             onClose={() => setOverflowMenu(null)}
@@ -2067,7 +2776,7 @@ export function MessagesApp({
             id: currentChannel.id,
             name: currentChannel.name,
             type: currentChannel.type,
-            topic: currentChannel.topic ?? "",
+            topic: currentChannel.topic ?? currentChannel.description ?? "",
             members: currentChannel.members ?? [],
             settings: currentChannel.settings ?? {},
           }}
@@ -2084,6 +2793,7 @@ export function MessagesApp({
           parentId={openThread.parentId}
           onClose={closeThread}
           isFullscreen={isMobile}
+          liveReplies={threadLiveReplies}
           authorCtx={{ currentUserId, currentUserDisplayName }}
           onSend={async (content, attachments) => {
             const r = await fetch("/api/chat/messages", {
@@ -2104,6 +2814,61 @@ export function MessagesApp({
               throw new Error((body as { error?: string }).error || `HTTP ${r.status}`);
             }
           }}
+        />
+      )}
+
+      {/* ---- All Threads Panel ---- */}
+      {showAllThreads && selectedChannel && !openThread && !showSettings && !showSearch && (
+        <AllThreadsList
+          channelId={selectedChannel}
+          onClose={() => setShowAllThreads(false)}
+          onJumpToThread={(parentId) => {
+            setShowAllThreads(false);
+            openThreadFor(selectedChannel, parentId);
+          }}
+          authorCtx={{ currentUserId, currentUserDisplayName }}
+        />
+      )}
+
+      {/* ---- Search Panel ---- */}
+      {showSearch && !openThread && !showSettings && !showAllThreads && (
+        <SearchPanel
+          onJump={(channelId, messageId) => {
+            setShowSearch(false);
+            if (channelId !== selectedChannel) {
+              // Switching channel triggers fetchMessages; the scroll happens
+              // once the new messages render (the rAF retry below waits for it).
+              setSelectedChannel(channelId);
+            }
+            // Poll across a few frames so a slow channel switch/render still
+            // lands instead of relying on a single fixed delay. If the target
+            // is not in the first 50 loaded messages it never appears, so the
+            // jump silently no-ops (search hits are not paginated here).
+            let attempts = 0;
+            const tryScroll = () => {
+              const el = document.querySelector(`[data-message-id="${messageId}"]`) as HTMLElement | null;
+              if (el) {
+                el.scrollIntoView({ behavior: "smooth", block: "center" });
+                el.classList.add("data-highlight");
+                setTimeout(() => el.classList.remove("data-highlight"), 2000);
+                return;
+              }
+              if (attempts++ < 40) requestAnimationFrame(tryScroll);
+            };
+            requestAnimationFrame(tryScroll);
+          }}
+          onClose={() => setShowSearch(false)}
+          channels={allChannels.map((c) => ({ id: c.id, name: c.name }))}
+          authorCtx={{ currentUserId, currentUserDisplayName }}
+        />
+      )}
+
+      {/* ---- Quick channel switcher (Cmd/Ctrl+K) ---- */}
+      {showSwitcher && (
+        <ChannelSwitcher
+          channels={channels.map((c) => ({ id: c.id, name: c.name }))}
+          onSelect={(id) => setSelectedChannel(id)}
+          onClose={() => setShowSwitcher(false)}
         />
       )}
 
@@ -2191,7 +2956,7 @@ export function MessagesApp({
           aria-label="Canvas viewer"
         >
           <div
-            className="w-[90vw] h-[85vh] max-w-5xl rounded-xl border border-white/10 overflow-hidden bg-zinc-900 flex flex-col"
+            className="w-[90vw] h-[85vh] max-w-5xl rounded-xl border border-white/10 overflow-hidden bg-shell-bg flex flex-col"
             onClick={(e) => e.stopPropagation()}
           >
             <div className="flex items-center justify-between px-4 py-2 border-b border-white/10 shrink-0">
@@ -2229,7 +2994,7 @@ export function MessagesApp({
             aria-label="New channel"
           >
             <div
-              className="absolute bottom-0 left-0 right-0 bg-zinc-900 border-t border-white/[0.08] rounded-t-2xl p-4 space-y-3"
+              className="absolute bottom-0 left-0 right-0 bg-shell-bg border-t border-white/[0.08] rounded-t-2xl p-4 space-y-3"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="flex items-center justify-between mb-1">
@@ -2254,7 +3019,7 @@ export function MessagesApp({
                   id="new-channel-type-mobile"
                   value={newChannel.type}
                   onChange={(e) => setNewChannel((s) => ({ ...s, type: e.target.value as "topic" | "group" }))}
-                  className="w-full bg-white/[0.06] border border-white/10 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-blue-500/50"
+                  className="w-full bg-white/[0.06] border border-white/10 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-accent-line"
                   aria-label="Channel type"
                 >
                   <option value="topic">Topic</option>
@@ -2278,7 +3043,7 @@ export function MessagesApp({
           </div>
         ) : (
           <div className="absolute inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
-            <Card className="w-full max-w-[380px] max-h-full flex flex-col shadow-2xl bg-zinc-900">
+            <Card className="w-full max-w-[380px] max-h-full flex flex-col shadow-2xl bg-shell-bg">
               <CardHeader className="flex flex-row items-center justify-between gap-2 p-0 px-4 py-3 border-b border-white/[0.06]">
                 <CardTitle className="text-sm font-medium">New Channel</CardTitle>
                 <Button
@@ -2308,7 +3073,7 @@ export function MessagesApp({
                     id="new-channel-type"
                     value={newChannel.type}
                     onChange={(e) => setNewChannel((s) => ({ ...s, type: e.target.value as "topic" | "group" }))}
-                    className="w-full bg-white/[0.06] border border-white/10 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-blue-500/50"
+                    className="w-full bg-white/[0.06] border border-white/10 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-accent-line"
                     aria-label="Channel type"
                   >
                     <option value="topic">Topic</option>

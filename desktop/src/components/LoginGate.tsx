@@ -1,7 +1,9 @@
 import { useState, useEffect, useCallback } from "react";
 import { Lock } from "lucide-react";
 import { OnboardingScreen } from "./OnboardingScreen";
+import { OffNetworkScreen } from "./OffNetworkScreen";
 import { SESSION_EXPIRED_EVENT } from "@/lib/auth-guard";
+import { useAuthReadyStore } from "@/stores/auth-ready-store";
 
 interface Props {
   children: React.ReactNode;
@@ -12,6 +14,7 @@ type AuthStatus =
   | { phase: "onboarding" }
   | { phase: "invite"; username: string; inviteCode: string; multiUser: boolean }
   | { phase: "login"; legacy: boolean; multiUser: boolean }
+  | { phase: "unreachable" }
   | { phase: "ready" };
 
 export function LoginGate({ children }: Props) {
@@ -48,13 +51,24 @@ export function LoginGate({ children }: Props) {
         setStatus({ phase: "login", legacy: !data.user, multiUser: !!data.multi_user });
       }
     } catch {
-      setStatus({ phase: "ready" });
+      // A thrown fetch (network failure, not an HTTP error) means the host is
+      // unreachable -- e.g. the PWA was opened off the host's network. Offer
+      // taOSgo rather than load the shell into a broken, data-less state.
+      setStatus({ phase: "unreachable" });
     }
   }, []);
 
   useEffect(() => {
     refreshStatus();
   }, [refreshStatus]);
+
+  // Publish auth-readiness for session-scoped restore effects that live
+  // outside LoginGate's children (e.g. useSessionPersistence, active-theme
+  // restore) — they must not fetch per-user data until this flips true, and
+  // must re-fetch the next time it does (see auth-ready-store.ts).
+  useEffect(() => {
+    useAuthReadyStore.getState().setReady(status.phase === "ready");
+  }, [status.phase]);
 
   // Listen for session-expired events from the global auth guard. Any
   // /api/* call returning 401 fires this; we re-run /auth/status which
@@ -119,6 +133,10 @@ export function LoginGate({ children }: Props) {
     );
   }
 
+  if (status.phase === "unreachable") {
+    return <OffNetworkScreen onRetry={refreshStatus} />;
+  }
+
   if (status.phase === "onboarding") {
     return <OnboardingScreen onDone={refreshStatus} defaultAutoLogin={true} />;
   }
@@ -142,7 +160,7 @@ export function LoginGate({ children }: Props) {
     return (
       <div
         className="h-screen w-screen flex items-center justify-center p-4"
-        style={{ background: "linear-gradient(160deg, #1a1b2e 0%, #1e2140 40%, #252848 100%)" }}
+        style={{ background: "var(--color-shell-bg)" }}
       >
         <form
           onSubmit={handleSubmit}
@@ -165,7 +183,7 @@ export function LoginGate({ children }: Props) {
 
           {showUsername && (
             <>
-              <label htmlFor="login-username" className="sr-only">Username</label>
+              <label htmlFor="login-username" className="sr-only">Username or email</label>
               <input
                 id="login-username"
                 type="text"
@@ -173,7 +191,7 @@ export function LoginGate({ children }: Props) {
                 onChange={(e) => setUsername(e.target.value)}
                 autoComplete="username"
                 autoFocus
-                placeholder="Username"
+                placeholder="Username or email"
                 className="w-full px-4 py-2.5 mb-2 rounded-lg bg-shell-bg-deep border border-white/10 text-sm text-shell-text outline-none focus:border-accent/40 transition-colors"
               />
             </>

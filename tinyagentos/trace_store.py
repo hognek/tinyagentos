@@ -35,6 +35,8 @@ from typing import Any
 
 import aiosqlite
 
+from tinyagentos.db_migrations import apply_wal_pragmas_async
+
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
@@ -68,6 +70,12 @@ CREATE INDEX IF NOT EXISTS idx_trace_created ON trace_events(created_at);
 VALID_KINDS = frozenset({
     "message_in", "message_out", "llm_call", "tool_call",
     "tool_result", "reasoning", "error", "lifecycle",
+    # Phase 1 observability: post-hoc reasoning judge result (§4.7 / §7).
+    # Never emitted as an OTel span — it is an internal eval artifact.
+    "reasoning_audit",
+    # Registry governance audit events (PR1 — lifecycle state machine).
+    # Payload shape: {action, canonical_id, actor_user_id, before_status, after_status}
+    "governance",
 })
 
 # Documented envelope schema — the librarian parses against this.
@@ -89,6 +97,17 @@ ENVELOPE_V1_SCHEMA = {
         "reasoning": {"text": "str", "block_type": "str?"},
         "error": {"stage": "str", "message": "str", "traceback": "str?"},
         "lifecycle": {"event": "str", "reason": "str?"},
+        # Phase 1 observability — judge result written by tinyagentos/otel/judge.py (Phase 4).
+        # Payload shape: {verdict: "pass"|"warn"|"fail", flags: list[str], model: str, latency_ms: int}
+        "reasoning_audit": {"verdict": "pass|warn|fail", "flags": "list[str]", "model": "str", "latency_ms": "int"},
+        # Registry governance audit (PR1 — lifecycle state machine).
+        "governance": {
+            "action": "str",
+            "canonical_id": "str",
+            "actor_user_id": "str",
+            "before_status": "str",
+            "after_status": "str",
+        },
     },
 }
 
@@ -121,9 +140,20 @@ def _new_id() -> str:
 
 
 def _build_envelope(agent_name: str, kind: str, fields: dict) -> dict:
-    """Produce a v1 envelope from loose input, filling ids + created_at."""
+    """Produce a v1 envelope from loose input, filling ids + created_at.
+
+    Timing convenience: callers may pass ``ts_start`` (float Unix epoch) instead
+    of a pre-computed ``duration_ms``. When ``ts_start`` is present and
+    ``duration_ms`` is absent, ``duration_ms`` is computed as
+    ``int((time.time() - ts_start) * 1000)``. Callers that already supply
+    ``duration_ms`` directly are unaffected. ``ts_start`` itself is NOT
+    persisted as a column or stored in the payload.
+    """
     if kind not in VALID_KINDS:
         raise ValueError(f"unknown kind: {kind!r}; valid: {sorted(VALID_KINDS)}")
+    duration_ms = fields.get("duration_ms")
+    if duration_ms is None and fields.get("ts_start") is not None:
+        duration_ms = max(0, int((time.time() - fields["ts_start"]) * 1000))
     return {
         "v": SCHEMA_VERSION,
         "id": fields.get("id") or _new_id(),
@@ -136,7 +166,7 @@ def _build_envelope(agent_name: str, kind: str, fields: dict) -> dict:
         "thread_id": fields.get("thread_id"),
         "backend_name": fields.get("backend_name"),
         "model": fields.get("model"),
-        "duration_ms": fields.get("duration_ms"),
+        "duration_ms": duration_ms,
         "tokens_in": fields.get("tokens_in"),
         "tokens_out": fields.get("tokens_out"),
         "cost_usd": fields.get("cost_usd"),
@@ -154,10 +184,24 @@ class AgentTraceStore:
         # bucket_key -> aiosqlite.Connection
         self._connections: dict[str, aiosqlite.Connection] = {}
         self._lock = asyncio.Lock()
+        # Optional OTel emitter injected by the app lifespan.
+        # None = no-op (tests, early startup, or no receiver configured).
+        self._emitter: object | None = None  # type: tinyagentos.otel.emitter.OTelEmitter
+        # Optional reasoning judge (Phase 4). Fired on lifecycle session_end.
+        # None = no-op (tests, or judge not configured).
+        self._judge: object | None = None  # type: tinyagentos.otel.judge.ReasoningJudge
 
     @property
     def slug(self) -> str:
         return self._slug
+
+    def set_emitter(self, emitter: object | None) -> None:
+        """Inject the OTel emitter.  None disables emission."""
+        self._emitter = emitter
+
+    def set_judge(self, judge: object | None) -> None:
+        """Inject the reasoning judge.  None disables judging."""
+        self._judge = judge
 
     async def _open_bucket(self, bucket: str) -> aiosqlite.Connection:
         conn = self._connections.get(bucket)
@@ -171,6 +215,7 @@ class AgentTraceStore:
             pass
         db_path = _bucket_db_path(self._data_dir, self._slug, bucket)
         conn = await aiosqlite.connect(str(db_path))
+        await apply_wal_pragmas_async(conn)
         await conn.executescript(TRACE_SCHEMA)
         await conn.commit()
         self._connections[bucket] = conn
@@ -259,6 +304,25 @@ class AgentTraceStore:
             # Opportunistic eviction — cheap, runs under our lock.
             now_bucket = _bucket_key(time.time())
             await self._evict_old_buckets(now_bucket)
+        # OTel emission is a side-effect of record() — D5: NOT routed via bus.py.
+        # Fire-and-forget; any emission error is silently dropped.
+        if self._emitter is not None:
+            try:
+                self._emitter.emit(envelope)
+            except Exception:
+                pass
+        # Phase 4: reasoning judge fires on session_end (non-trivial runs only).
+        if (
+            self._judge is not None
+            and kind == "lifecycle"
+            and envelope.get("trace_id")
+            and isinstance(envelope.get("payload"), dict)
+            and envelope["payload"].get("event") == "session_end"
+        ):
+            try:
+                self._judge.schedule(self, envelope["trace_id"])
+            except Exception:
+                pass
         return envelope
 
     def _seal_bucket(self, bucket: str) -> None:
@@ -469,12 +533,28 @@ class TraceStoreRegistry:
         self._data_dir = data_dir
         self._stores: dict[str, AgentTraceStore] = {}
         self._lock = asyncio.Lock()
+        self._emitter: object | None = None
+        self._judge: object | None = None
+
+    def set_emitter(self, emitter: object | None) -> None:
+        """Inject the OTel emitter into all current and future stores."""
+        self._emitter = emitter
+        for store in self._stores.values():
+            store.set_emitter(emitter)
+
+    def set_judge(self, judge: object | None) -> None:
+        """Inject the reasoning judge into all current and future stores."""
+        self._judge = judge
+        for store in self._stores.values():
+            store.set_judge(judge)
 
     async def get(self, slug: str) -> AgentTraceStore:
         async with self._lock:
             store = self._stores.get(slug)
             if store is None:
                 store = AgentTraceStore(self._data_dir, slug)
+                store.set_emitter(self._emitter)
+                store.set_judge(self._judge)
                 self._stores[slug] = store
             return store
 

@@ -49,7 +49,12 @@ describe("projectsApi.tasks (extended)", () => {
 describe("projectsApi.subscribeEvents", () => {
   it("opens an EventSource for the project events endpoint", () => {
     const closeSpy = vi.fn();
-    const eventSourceMock = vi.fn(() => ({ close: closeSpy, onmessage: null as ((e: MessageEvent) => void) | null }));
+    // subscribeEvents calls `new EventSource(...)`, so the mock must be
+    // constructable. An arrow function is not (`new (() => {})` throws), so use
+    // a regular function whose returned object becomes the instance.
+    const eventSourceMock = vi.fn(function () {
+      return { close: closeSpy, onmessage: null as ((e: MessageEvent) => void) | null };
+    });
     vi.stubGlobal("EventSource", eventSourceMock);
     const off = projectsApi.subscribeEvents("p1", () => {});
     expect(eventSourceMock).toHaveBeenCalledWith(expect.stringMatching("/api/projects/p1/events"));

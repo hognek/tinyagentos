@@ -34,8 +34,19 @@ CREATE INDEX IF NOT EXISTS idx_canvas_updated ON project_canvas_elements(project
 """
 
 _CANVAS_JSON_FIELDS = ("payload",)
-_VALID_KINDS = {"note", "link", "image", "user_shape"}
-_AGENT_ALLOWED_KINDS = {"note", "link", "image"}
+# Ideas-board kinds (text, mermaid, flowchart, mindmap_edge) carry their
+# content in the free-form payload, so they need no schema change beyond being
+# accepted here. Agents may emit them via the canvas tools (#68 agent + user
+# read/write); only user_shape stays user-only (freeform shapes are drawn by
+# hand in the UI, not painted by an agent).
+_VALID_KINDS = {
+    "note", "link", "image", "user_shape",
+    "text", "mermaid", "flowchart", "mindmap_edge",
+}
+_AGENT_ALLOWED_KINDS = {
+    "note", "link", "image",
+    "text", "mermaid", "flowchart", "mindmap_edge",
+}
 
 
 class CanvasPermissionError(PermissionError):
@@ -98,11 +109,20 @@ class ProjectCanvasStore(BaseStore):
             raise ValueError(f"invalid author_kind: {author_kind}")
         eid = element.get("id") or new_id("cve")
         now = time.time()
+        # Upsert: the client may re-send an element it already created (e.g. a
+        # shape hydrated then nudged), which a plain INSERT rejected with a
+        # UNIQUE constraint 500. On conflict, update in place (keep created_at).
         await self._db.execute(
             """INSERT INTO project_canvas_elements
                (id, project_id, kind, author_kind, author_id,
                 x, y, w, h, rotation, z_index, payload, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(id) DO UPDATE SET
+                 kind=excluded.kind, author_kind=excluded.author_kind,
+                 author_id=excluded.author_id, x=excluded.x, y=excluded.y,
+                 w=excluded.w, h=excluded.h, rotation=excluded.rotation,
+                 z_index=excluded.z_index, payload=excluded.payload,
+                 updated_at=excluded.updated_at""",
             (
                 eid, project_id, kind, author_kind, author_id,
                 float(element["x"]), float(element["y"]),

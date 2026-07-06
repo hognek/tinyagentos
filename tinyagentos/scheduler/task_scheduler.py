@@ -41,7 +41,7 @@ DEFAULT_PRESETS = [
         "name": "Health Checks",
         "description": "Regular health monitoring tasks",
         "tasks": [
-            {"name": "Backend Ping", "schedule": "*/5 * * * *", "command": "curl -sf http://localhost:8080/health", "description": "Check rkllama every 5 min"},
+            {"name": "Backend Ping", "schedule": "*/5 * * * *", "command": "curl -sf http://localhost:7833/health", "description": "Check rkllama every 5 min"},
         ],
     },
 ]
@@ -80,6 +80,17 @@ class TaskScheduler(BaseStore):
                      "command": r[4], "description": r[5], "enabled": bool(r[6]),
                      "last_run": r[7], "next_run": r[8]} for r in await cursor.fetchall()]
 
+    async def get_task(self, task_id: int) -> dict | None:
+        sql = ("SELECT id, name, agent_name, schedule, command, description, enabled, last_run, next_run "
+               "FROM scheduled_tasks WHERE id = ?")
+        async with self._db.execute(sql, (task_id,)) as cursor:
+            r = await cursor.fetchone()
+        if r is None:
+            return None
+        return {"id": r[0], "name": r[1], "agent_name": r[2], "schedule": r[3],
+                "command": r[4], "description": r[5], "enabled": bool(r[6]),
+                "last_run": r[7], "next_run": r[8]}
+
     async def update_task(self, task_id: int, **kwargs):
         for field in ["name", "schedule", "command", "description"]:
             if field in kwargs:
@@ -90,6 +101,25 @@ class TaskScheduler(BaseStore):
 
     async def delete_task(self, task_id: int) -> bool:
         cursor = await self._db.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
+        await self._db.commit()
+        return cursor.rowcount > 0
+
+    async def list_enabled(self) -> list[dict]:
+        sql = "SELECT id, name, schedule, command, last_run, created_at FROM scheduled_tasks WHERE enabled = 1"
+        async with self._db.execute(sql) as cursor:
+            return [{"id": r[0], "name": r[1], "schedule": r[2], "command": r[3],
+                     "last_run": r[4], "created_at": r[5]} for r in await cursor.fetchall()]
+
+    async def claim_run(self, task_id: int, prev_last_run, run_ts: int, next_run: int) -> bool:
+        """Atomically advance last_run/next_run, guarded on the previous
+        last_run still matching, so two concurrent ticks racing on the same
+        due instant cannot both fire it (the loser's UPDATE matches zero rows)."""
+        cursor = await self._db.execute(
+            "UPDATE scheduled_tasks SET last_run = ?, next_run = ? "
+            "WHERE id = ? AND enabled = 1 "
+            "AND ((last_run IS NULL AND ? IS NULL) OR last_run = ?)",
+            (run_ts, next_run, task_id, prev_last_run, prev_last_run),
+        )
         await self._db.commit()
         return cursor.rowcount > 0
 

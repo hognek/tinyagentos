@@ -46,8 +46,8 @@ async def test_list_image_models_filters_to_image_gen():
                 "id": "lcm-dreamshaper-v7",
                 "name": "LCM Dreamshaper v7",
                 "capabilities": ["image-generation"],
-                "variants": [{"id": "rknn", "backend": ["rknn-sd"]}],
-                "description": "LCM model for RKNN",
+                "variants": [{"id": "safetensors", "backend": ["sd-cpp"]}],
+                "description": "LCM model",
                 "has_downloaded_variant": True,
             },
             {
@@ -65,7 +65,7 @@ async def test_list_image_models_filters_to_image_gen():
             {
                 "name": "LCM Dreamshaper v7",
                 "purpose": "image-generation",
-                "backend_type": "rknn-sd",
+                "backend_type": "sd-cpp",
             }
         ]
     }
@@ -91,7 +91,7 @@ async def test_list_image_models_filters_to_image_gen():
 
 @pytest.mark.asyncio
 async def test_list_image_models_backend_type_filter():
-    """Models with no image-generation capability but an rknn-sd/sd-cpp variant are included."""
+    """Models with no image-generation capability but an sd-cpp variant are included."""
     from tinyagentos.tools.image_tool import execute_list_image_models
 
     installed_body = {
@@ -161,6 +161,9 @@ async def test_image_generation_forwards_new_params():
     mock_resp.status_code = 200
     mock_resp.content = fake_png
     mock_resp.raise_for_status = MagicMock()
+    # Scheduler route returns JSON metadata (filename + path), which the tool
+    # now requires to honour the image_ref contract.
+    mock_resp.json = MagicMock(return_value={"filename": "gen.png", "path": "/api/images/files/gen.png"})
 
     captured_payload: dict = {}
     captured_url: dict = {}
@@ -205,6 +208,9 @@ async def test_image_generation_default_routes_via_scheduler():
     mock_resp.status_code = 200
     mock_resp.content = fake_png
     mock_resp.raise_for_status = MagicMock()
+    # Scheduler route returns JSON metadata (filename + path), which the tool
+    # now requires to honour the image_ref contract.
+    mock_resp.json = MagicMock(return_value={"filename": "gen.png", "path": "/api/images/files/gen.png"})
 
     captured: dict = {}
 
@@ -245,6 +251,9 @@ async def test_image_generation_blank_model_treated_as_omitted():
     mock_resp.status_code = 200
     mock_resp.content = fake_png
     mock_resp.raise_for_status = MagicMock()
+    # Scheduler route returns JSON metadata (filename + path), which the tool
+    # now requires to honour the image_ref contract.
+    mock_resp.json = MagicMock(return_value={"filename": "gen.png", "path": "/api/images/files/gen.png"})
 
     captured: dict = {}
 

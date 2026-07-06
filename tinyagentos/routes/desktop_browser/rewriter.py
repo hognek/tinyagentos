@@ -48,13 +48,32 @@ _CSS_URL_RE = re.compile(
 )
 
 
+# Kept in sync with the proxy route path in proxy.py. GET forms submit to this
+# bare path (their query string is replaced by the form's own fields on
+# submit), carrying the taOS routing params as hidden inputs instead.
+_PROXY_PATH = "/api/desktop/browser/proxy"
+# Reserved hidden-input names for GET-form routing — prefixed so they can't
+# collide with a site's own form field named e.g. "url" or "profile_id".
+_FORM_PID_FIELD = "__taos_pid"
+_FORM_URL_FIELD = "__taos_url"
+
+
 def rewrite_html(
     html_bytes: bytes,
     *,
     base_url: str,
     proxy: Callable[[str], str],
+    charset: str = "utf-8",
+    profile_id: str | None = None,
 ) -> bytes:
     """Rewrite all URL-bearing references in `html_bytes` to proxied form.
+
+    `charset` is the encoding the upstream bytes are actually in (resolved
+    by the proxy from the Content-Type header / <meta charset>). We feed it
+    to the lxml parser so non-UTF-8 pages (Latin-1, windows-1252, …) decode
+    correctly. The output is always re-serialized as UTF-8 bytes, and any
+    stale `<meta charset>` is normalized to utf-8 so the iframe never
+    re-guesses the encoding.
 
     Returns the rewritten HTML as bytes. Empty input returns empty.
     """
@@ -63,8 +82,9 @@ def rewrite_html(
 
     # lxml is forgiving — even malformed HTML produces a tree. We use
     # `fromstring` rather than `parse` because we're working with bytes
-    # in memory, and we explicitly handle the encoding via the parser.
-    parser = lxml_html.HTMLParser(encoding="utf-8")
+    # in memory. The parser's `encoding` overrides any <meta charset> in
+    # the document, so we pass the charset the proxy already resolved.
+    parser = lxml_html.HTMLParser(encoding=charset or "utf-8")
     try:
         tree = lxml_html.fromstring(html_bytes, parser=parser)
     except Exception:
@@ -75,12 +95,32 @@ def rewrite_html(
         return html_bytes
 
     _rewrite_attributes(tree, base_url=base_url, proxy=proxy)
+    _rewrite_forms(tree, base_url=base_url, proxy=proxy, profile_id=profile_id)
     _rewrite_srcset(tree, base_url=base_url, proxy=proxy)
     _rewrite_inline_styles(tree, base_url=base_url, proxy=proxy)
     _rewrite_style_tags(tree, base_url=base_url, proxy=proxy)
     _rewrite_meta_refresh(tree, base_url=base_url, proxy=proxy)
+    _normalize_meta_charset(tree)
 
     return lxml_html.tostring(tree, encoding="utf-8")
+
+
+def _normalize_meta_charset(tree) -> None:
+    """Rewrite any <meta charset> / <meta http-equiv content-type> to utf-8.
+
+    The body is re-serialized as UTF-8, so a leftover declaration of the
+    original charset would tell the iframe to decode UTF-8 bytes as, say,
+    Latin-1 — reintroducing mojibake even with a correct response header.
+    """
+    for meta in tree.iter("meta"):
+        if meta.get("charset") is not None:
+            meta.set("charset", "utf-8")
+            continue
+        http_equiv = (meta.get("http-equiv") or "").lower()
+        if http_equiv == "content-type":
+            content = meta.get("content") or ""
+            if "charset" in content.lower():
+                meta.set("content", "text/html; charset=utf-8")
 
 
 def _should_rewrite(url: str) -> bool:
@@ -101,7 +141,9 @@ def _rewrite_one(url: str, *, base_url: str, proxy: Callable[[str], str]) -> str
 def _rewrite_attributes(
     tree, *, base_url: str, proxy: Callable[[str], str],
 ) -> None:
-    for attr in ("href", "src", "action"):
+    # NOTE: `action` is intentionally NOT here — form actions are handled by
+    # _rewrite_forms, which has to special-case GET vs POST submission.
+    for attr in ("href", "src"):
         for el in tree.iter():
             val = el.get(attr)
             if val is None:
@@ -109,6 +151,47 @@ def _rewrite_attributes(
             new = _rewrite_one(val, base_url=base_url, proxy=proxy)
             if new != val:
                 el.set(attr, new)
+
+
+def _rewrite_forms(
+    tree, *, base_url: str, proxy: Callable[[str], str], profile_id: str | None,
+) -> None:
+    """Rewrite <form> actions so submissions route through the proxy.
+
+    POST and GET need different treatment:
+
+    - **POST** keeps the action URL's query string on submit, so the regular
+      proxied action (``?profile_id=…&url=…``) works; the form fields ride in
+      the request body (forwarded by the proxy).
+    - **GET** *replaces* the action's query string with the form's own fields
+      on submit, which would wipe out query-encoded routing params. So we point
+      the action at the bare proxy path and carry the routing params as hidden
+      inputs (reserved names), which survive in the submitted query. The proxy
+      merges the remaining fields into the target URL.
+    """
+    for form in tree.iter("form"):
+        raw_action = form.get("action")
+        action_target = urljoin(base_url, raw_action) if raw_action else base_url
+        if not action_target.startswith(("http://", "https://")):
+            continue  # javascript:/data: etc — leave alone
+        method = (form.get("method") or "get").strip().lower()
+        if method == "post":
+            form.set("action", proxy(action_target))
+            continue
+        # GET form
+        form.set("action", _PROXY_PATH)
+        if profile_id:
+            _prepend_hidden(form, _FORM_PID_FIELD, profile_id)
+        _prepend_hidden(form, _FORM_URL_FIELD, action_target)
+
+
+def _prepend_hidden(form, name: str, value: str) -> None:
+    """Insert a hidden <input name=value> as the form's first child."""
+    inp = lxml_html.Element("input")
+    inp.set("type", "hidden")
+    inp.set("name", name)
+    inp.set("value", value)
+    form.insert(0, inp)
 
 
 def _rewrite_srcset(

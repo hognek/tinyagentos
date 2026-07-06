@@ -1,9 +1,97 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Request
+import threading
+import time
+from collections import OrderedDict
+
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from tinyagentos.middleware.csrf import verify_csrf
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+# ---------------------------------------------------------------------------
+# Brute-force rate limiter (in-memory, per-IP, fixed window)
+# ---------------------------------------------------------------------------
+
+_FAIL_COUNTER_MAX_KEYS = 10_000  # cap total tracked IPs to prevent unbounded growth
+
+
+class _FailCounter:
+    """Count failed attempts per key in a rolling window.
+
+    Bounded to avoid memory leaks:
+    - Expired entries (all timestamps outside the window) are dropped on access.
+    - Total key count is capped at ``_FAIL_COUNTER_MAX_KEYS``; oldest-accessed
+      entries are evicted first (LRU via OrderedDict).
+
+    Thread-safe: all mutating operations are protected by a Lock.
+    """
+
+    def __init__(self, max_attempts: int = 5, window_seconds: int = 600):
+        self._max = max_attempts
+        self._window = window_seconds
+        # key → list of failure timestamps; OrderedDict for LRU eviction
+        self._log: OrderedDict[str, list[float]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def _prune(self, key: str) -> None:
+        """Must be called with self._lock held."""
+        cutoff = time.monotonic() - self._window
+        if key not in self._log:
+            return
+        self._log[key] = [t for t in self._log[key] if t > cutoff]
+        if not self._log[key]:
+            # All timestamps expired — drop the entry entirely
+            del self._log[key]
+        else:
+            # Keep active entry fresh in LRU order
+            self._log.move_to_end(key)
+
+    def _ensure_capacity(self) -> None:
+        """Must be called with self._lock held."""
+        while len(self._log) >= _FAIL_COUNTER_MAX_KEYS:
+            self._log.popitem(last=False)  # evict oldest-accessed
+
+    def is_limited(self, key: str) -> bool:
+        with self._lock:
+            self._prune(key)
+            return len(self._log.get(key, [])) >= self._max
+
+    def record_failure(self, key: str) -> None:
+        with self._lock:
+            self._prune(key)
+            if key not in self._log:
+                self._ensure_capacity()
+                self._log[key] = []
+            self._log[key].append(time.monotonic())
+            self._log.move_to_end(key)
+
+    def reset(self, key: str) -> None:
+        with self._lock:
+            self._log.pop(key, None)
+
+    def count(self, key: str) -> int:
+        """Current failure count for the key within the window."""
+        with self._lock:
+            self._prune(key)
+            return len(self._log.get(key, []))
+
+
+_login_limiter = _FailCounter(max_attempts=5, window_seconds=600)
+_complete_limiter = _FailCounter(max_attempts=5, window_seconds=600)
+
+# Hard ceiling: at/above this we reject BEFORE verifying the password, which
+# bounds BOTH brute-force guesses and the bcrypt cost per window+IP. Kept just
+# above the soft limit (5): a user who fat-fingers a few times then types the
+# right password still gets in (within the first ~10 attempts), while an attacker
+# is throttled to at most this many guesses+hashes per 10-minute window per IP.
+# Letting a correct password through inherently requires checking it, so a small
+# increase over the soft limit is the necessary cost of not locking out real
+# users -- keep this tight, not large.
+_LOGIN_HARD_MAX = 10
+_LOCKOUT_MSG = "Too many failed attempts. Wait a few minutes, then sign in with your correct password."
 
 # Self-contained HTML pages for the auth flow.
 #
@@ -20,7 +108,7 @@ body {
   align-items: center;
   justify-content: center;
   padding: env(safe-area-inset-top, 16px) env(safe-area-inset-right, 16px) env(safe-area-inset-bottom, 16px) env(safe-area-inset-left, 16px);
-  background: linear-gradient(160deg, #1a1b2e 0%, #1e2140 40%, #252848 100%);
+  background: linear-gradient(160deg, #141415 0%, #1a1a1d 45%, #202024 100%);
   color: rgba(255, 255, 255, 0.85);
   font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
@@ -30,7 +118,7 @@ body {
   padding: 28px 24px;
   border: 1px solid rgba(255,255,255,0.10);
   border-radius: 18px;
-  background: rgba(28, 26, 44, 0.72);
+  background: rgba(255, 255, 255, 0.04);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
 }
@@ -67,7 +155,7 @@ input[type="text"], input[type="password"], input[type="email"] {
   padding: 10px 14px;
   border-radius: 10px;
   border: 1px solid rgba(255,255,255,0.10);
-  background: #151625;
+  background: #171717;
   color: rgba(255,255,255,0.85);
   font: inherit;
   outline: none;
@@ -121,7 +209,7 @@ def _login_page(error: str = "", multi_user: bool = False, next_url: str = "") -
     autologin_default = "" if multi_user else "checked"
     username_field = '''
         <label class="field">
-          <span>Username</span>
+          <span>Username or email</span>
           <input type="text" name="username" autocomplete="username" autofocus required>
         </label>
         ''' if multi_user else ""
@@ -192,8 +280,8 @@ def _setup_page(error: str = "") -> str:
     </label>
     <label class="field">
       <span>Password</span>
-      <input type="password" name="password" autocomplete="new-password" minlength="4" required>
-      <span class="hint">At least 4 characters.</span>
+      <input type="password" name="password" autocomplete="new-password" minlength="8" required>
+      <span class="hint">At least 8 characters.</span>
     </label>
     <label class="checkbox">
       <input type="checkbox" name="auto_login" value="1" checked>
@@ -239,7 +327,12 @@ async def login_page(request: Request, error: str = "", next: str = ""):
     # showing a useless login form.
     if not auth_mgr.is_configured():
         return RedirectResponse("/auth/setup", status_code=303)
-    err_text = "Incorrect username or password." if error else ""
+    if error == "rate_limit":
+        err_text = _LOCKOUT_MSG
+    elif error:
+        err_text = "Incorrect username or password."
+    else:
+        err_text = ""
     # Only allow relative paths starting with / to prevent open redirect
     safe_next = next if (next.startswith("/") and not next.startswith("//")) else ""
     return HTMLResponse(_login_page(err_text, multi_user=auth_mgr.is_multi_user(), next_url=safe_next))
@@ -256,7 +349,7 @@ async def setup_page(request: Request, error: str = ""):
     if error:
         err_text = {
             "username": "Username is required.",
-            "password": "Password must be at least 4 characters.",
+            "password": "Password must be at least 8 characters.",
         }.get(error, "Setup failed. Please try again.")
     return HTMLResponse(_setup_page(err_text))
 
@@ -275,8 +368,19 @@ async def login(request: Request):
     Form body: legacy password-only login (kept for backward compat).
     """
     auth_mgr = request.app.state.auth
+    client_ip = request.client.host if request.client else "unknown"
 
     content_type = request.headers.get("content-type", "")
+
+    # Only the HARD ceiling rejects before we verify the password. Below it we
+    # always check, so a correct password succeeds even after earlier typos --
+    # the soft lockout (applied on failure below) gates further WRONG attempts,
+    # not the legitimate user. This is the footgun that funneled a locked-out
+    # user into creating a duplicate account.
+    if _login_limiter.count(client_ip) >= _LOGIN_HARD_MAX:
+        if "application/json" in content_type:
+            return JSONResponse({"error": _LOCKOUT_MSG}, status_code=429)
+        return RedirectResponse("/auth/login?error=rate_limit", status_code=303)
     if "application/json" in content_type:
         try:
             body = await request.json()
@@ -287,7 +391,12 @@ async def login(request: Request):
 
         ok, user_record = auth_mgr.check_password(password, username=username)
         if not ok:
+            _login_limiter.record_failure(client_ip)
+            if _login_limiter.is_limited(client_ip):
+                return JSONResponse({"error": _LOCKOUT_MSG}, status_code=429)
             return JSONResponse({"error": "invalid credentials"}, status_code=401)
+
+        _login_limiter.reset(client_ip)
 
         # Determine long_lived. In multi-user mode default to False when
         # auto_login is not explicitly set.
@@ -306,11 +415,11 @@ async def login(request: Request):
             })
             if long_lived:
                 resp.set_cookie(
-                    "taos_session", token, httponly=True, samesite="lax",
+                    "taos_session", token, httponly=True, samesite="strict",
                     max_age=auth_mgr.session_ttl_for(True),
                 )
             else:
-                resp.set_cookie("taos_session", token, httponly=True, samesite="lax")
+                resp.set_cookie("taos_session", token, httponly=True, samesite="strict")
             return resp
 
         user_id = user_record["id"] if user_record else ""
@@ -321,11 +430,11 @@ async def login(request: Request):
         resp = JSONResponse({"ok": True, "user": pub})
         if long_lived:
             resp.set_cookie(
-                "taos_session", token, httponly=True, samesite="lax",
+                "taos_session", token, httponly=True, samesite="strict",
                 max_age=auth_mgr.session_ttl_for(True),
             )
         else:
-            resp.set_cookie("taos_session", token, httponly=True, samesite="lax")
+            resp.set_cookie("taos_session", token, httponly=True, samesite="strict")
         return resp
 
     # Form-encoded path — used by the no-JS HTML login page.
@@ -340,8 +449,12 @@ async def login(request: Request):
 
     ok, user_record = auth_mgr.check_password(password, username=username)
     if not ok:
+        _login_limiter.record_failure(client_ip)
         next_qs = f"&next={next_url}" if next_url else ""
-        return RedirectResponse(f"/auth/login?error=1{next_qs}", status_code=303)
+        err = "rate_limit" if _login_limiter.is_limited(client_ip) else "1"
+        return RedirectResponse(f"/auth/login?error={err}{next_qs}", status_code=303)
+
+    _login_limiter.reset(client_ip)
 
     if user_record and user_record.get("pending_invite"):
         # Pending user — create their session, then send to /desktop. The
@@ -358,15 +471,15 @@ async def login(request: Request):
     response = RedirectResponse(destination, status_code=303)
     if long_lived:
         response.set_cookie(
-            "taos_session", token, httponly=True, samesite="lax",
+            "taos_session", token, httponly=True, samesite="strict",
             max_age=auth_mgr.session_ttl_for(True),
         )
     else:
-        response.set_cookie("taos_session", token, httponly=True, samesite="lax")
+        response.set_cookie("taos_session", token, httponly=True, samesite="strict")
     return response
 
 
-@router.post("/logout")
+@router.post("/logout", dependencies=[Depends(verify_csrf)])
 async def logout(request: Request):
     auth_mgr = request.app.state.auth
     token = request.cookies.get("taos_session")
@@ -377,7 +490,7 @@ async def logout(request: Request):
     return response
 
 
-@router.post("/lock")
+@router.post("/lock", dependencies=[Depends(verify_csrf)])
 async def lock(request: Request):
     """Revoke the current session and clear the cookie."""
     auth_mgr = request.app.state.auth
@@ -416,8 +529,8 @@ async def auth_setup(request: Request):
         password = body.get("password") or ""
         if not username:
             return JSONResponse({"error": "username is required"}, status_code=400)
-        if not password or len(password) < 4:
-            return JSONResponse({"error": "password must be at least 4 characters"}, status_code=400)
+        if not password or len(password) < 8:
+            return JSONResponse({"error": "password must be at least 8 characters"}, status_code=400)
         try:
             user = auth_mgr.setup_user(username, full_name, email, password)
         except ValueError as exc:
@@ -431,11 +544,11 @@ async def auth_setup(request: Request):
         resp = JSONResponse({"ok": True, "user": user})
         if long_lived:
             resp.set_cookie(
-                "taos_session", token, httponly=True, samesite="lax",
+                "taos_session", token, httponly=True, samesite="strict",
                 max_age=auth_mgr.session_ttl_for(True),
             )
         else:
-            resp.set_cookie("taos_session", token, httponly=True, samesite="lax")
+            resp.set_cookie("taos_session", token, httponly=True, samesite="strict")
         return resp
 
     # Form-encoded path — used by the no-JS HTML setup page.
@@ -450,7 +563,7 @@ async def auth_setup(request: Request):
 
     if not username:
         return RedirectResponse("/auth/setup?error=username", status_code=303)
-    if not password or len(password) < 4:
+    if not password or len(password) < 8:
         return RedirectResponse("/auth/setup?error=password", status_code=303)
     try:
         auth_mgr.setup_user(username, full_name, email, password)
@@ -464,11 +577,11 @@ async def auth_setup(request: Request):
     response = RedirectResponse("/desktop", status_code=303)
     if long_lived:
         response.set_cookie(
-            "taos_session", token, httponly=True, samesite="lax",
+            "taos_session", token, httponly=True, samesite="strict",
             max_age=auth_mgr.session_ttl_for(True),
         )
     else:
-        response.set_cookie("taos_session", token, httponly=True, samesite="lax")
+        response.set_cookie("taos_session", token, httponly=True, samesite="strict")
     return response
 
 
@@ -479,6 +592,14 @@ async def complete_invite(request: Request):
     Body: ``{username, invite_code, full_name, email, password, auto_login?}``
     """
     auth_mgr = request.app.state.auth
+    client_ip = request.client.host if request.client else "unknown"
+
+    if _complete_limiter.is_limited(client_ip):
+        return JSONResponse(
+            {"error": "too many attempts, try again later"},
+            status_code=429,
+        )
+
     try:
         body = await request.json()
     except Exception:
@@ -492,14 +613,16 @@ async def complete_invite(request: Request):
 
     if not username or not invite_code:
         return JSONResponse({"error": "username and invite_code are required"}, status_code=400)
-    if not password or len(password) < 4:
-        return JSONResponse({"error": "password must be at least 4 characters"}, status_code=400)
+    if not password or len(password) < 8:
+        return JSONResponse({"error": "password must be at least 8 characters"}, status_code=400)
 
     try:
         user = auth_mgr.complete_invite(username, invite_code, full_name, email, password)
     except ValueError as exc:
+        _complete_limiter.record_failure(client_ip)
         return JSONResponse({"error": str(exc)}, status_code=400)
 
+    _complete_limiter.reset(client_ip)
     long_lived = bool(body.get("auto_login", False))
     record = auth_mgr.find_user(username)
     user_id = record["id"] if record else ""
@@ -510,11 +633,11 @@ async def complete_invite(request: Request):
     resp = JSONResponse({"ok": True, "user": user})
     if long_lived:
         resp.set_cookie(
-            "taos_session", token, httponly=True, samesite="lax",
+            "taos_session", token, httponly=True, samesite="strict",
             max_age=auth_mgr.session_ttl_for(True),
         )
     else:
-        resp.set_cookie("taos_session", token, httponly=True, samesite="lax")
+        resp.set_cookie("taos_session", token, httponly=True, samesite="strict")
     return resp
 
 
@@ -667,8 +790,8 @@ async def change_password(username: str, request: Request):
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
     current = body.get("current") or ""
     new_pw = body.get("new") or ""
-    if not new_pw or len(new_pw) < 4:
-        return JSONResponse({"error": "new password must be at least 4 characters"}, status_code=400)
+    if not new_pw or len(new_pw) < 8:
+        return JSONResponse({"error": "new password must be at least 8 characters"}, status_code=400)
     auth_mgr = request.app.state.auth
     changed = auth_mgr.change_password(username, current, new_pw)
     if not changed:

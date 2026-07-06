@@ -9,6 +9,7 @@ import {
   Input,
   Label,
 } from "@/components/ui";
+import { GitHubConnect } from "./secrets/GitHubConnect";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -31,7 +32,7 @@ type CategoryFilter = "all" | "api-key" | "credential" | "token" | "config";
 
 const CATEGORY_STYLES: Record<string, string> = {
   "api-key": "bg-sky-500/20 text-sky-400",
-  credential: "bg-violet-500/20 text-violet-400",
+  credential: "bg-cyan-500/20 text-cyan-400",
   token: "bg-amber-500/20 text-amber-400",
   config: "bg-emerald-500/20 text-emerald-400",
 };
@@ -120,15 +121,28 @@ function AddEditDialog({
 
             <div className="space-y-1.5">
               <Label htmlFor="secret-value">Value</Label>
-              <Input
-                id="secret-value"
-                type="password"
-                value={value}
-                onChange={(e) => setValue(e.target.value)}
-                placeholder={isEdit ? "Leave blank to keep existing" : "sk-..."}
-                className="font-mono"
-                autoFocus={isEdit}
-              />
+              {category === "ssh-keys" ? (
+                <textarea
+                  id="secret-value"
+                  value={value}
+                  onChange={(e) => setValue(e.target.value)}
+                  placeholder={isEdit ? "Leave blank to keep existing" : "-----BEGIN OPENSSH PRIVATE KEY-----\n..."}
+                  className="flex w-full rounded-lg border border-white/10 bg-shell-bg-deep px-3 py-2 text-sm text-shell-text font-mono focus-visible:outline-none focus-visible:border-accent/40 focus-visible:ring-2 focus-visible:ring-accent/20 resize-y min-h-[120px]"
+                  autoFocus={isEdit}
+                  aria-label="SSH private key value"
+                  spellCheck={false}
+                />
+              ) : (
+                <Input
+                  id="secret-value"
+                  type="password"
+                  value={value}
+                  onChange={(e) => setValue(e.target.value)}
+                  placeholder={isEdit ? "Leave blank to keep existing" : "sk-..."}
+                  className="font-mono"
+                  autoFocus={isEdit}
+                />
+              )}
             </div>
 
             <div className="space-y-1.5">
@@ -143,6 +157,7 @@ function AddEditDialog({
                 <option value="credential">Credential</option>
                 <option value="token">Token</option>
                 <option value="config">Config</option>
+                <option value="ssh-keys">SSH Key</option>
               </select>
             </div>
 
@@ -345,6 +360,9 @@ export function SecretsApp({ windowId: _windowId }: { windowId: string }) {
 
       {/* Content */}
       <div className="flex-1 overflow-auto">
+        <div className="p-4">
+          <GitHubConnect />
+        </div>
         {loading ? (
           <div className="flex items-center justify-center h-full text-shell-text-tertiary text-sm">
             Loading secrets...

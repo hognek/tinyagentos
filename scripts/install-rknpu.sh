@@ -18,7 +18,7 @@
 #     sudo bash scripts/install-rknpu.sh --yes
 #
 #     # one-liner
-#     curl -sSL https://raw.githubusercontent.com/jaylfc/tinyagentos/master/scripts/install-rknpu.sh \
+#     curl -sSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-rknpu.sh \
 #       | TAOS_RKNPU_SETUP=1 sudo bash
 #
 # Environment overrides:
@@ -26,7 +26,7 @@
 #     TAOS_RKLLAMA_DIR        install dir (default: ~<user>/rkllama)
 #     TAOS_RKLLAMA_REPO       git remote (default: https://github.com/jaylfc/rkllama.git)
 #     TAOS_RKLLAMA_REF        git ref  (default: 06cf874d8b29767729ec06547cf02fc92acd875c)
-#     TAOS_RKLLAMA_PORT       HTTP port (default: 8080)
+#     TAOS_RKLLAMA_PORT       HTTP port (default: 7833)
 #     TAOS_QMD_EXPANSION_URL  override URL for qmd-query-expansion-1.7B-rk3588.rkllm
 #                             (default is the TAOS HF mirror at
 #                             jaysom/tinyagentos-rockchip-mirror; only set
@@ -64,7 +64,7 @@ LIBRKNNRT_EXPECTED_VERSION="2.3.0"
 
 RKLLAMA_REPO="${TAOS_RKLLAMA_REPO:-https://github.com/jaylfc/rkllama.git}"
 RKLLAMA_REF="${TAOS_RKLLAMA_REF:-06cf874d8b29767729ec06547cf02fc92acd875c}"
-RKLLAMA_PORT="${TAOS_RKLLAMA_PORT:-8080}"
+RKLLAMA_PORT="${TAOS_RKLLAMA_PORT:-7833}"
 
 # Qwen3-Embedding-0.6B rk3588 rkllm weights.
 # Upstream fallback: https://huggingface.co/dulimov/Qwen3-Embedding-0.6B-rk3588-1.2.1/resolve/main/Qwen3-Embedding-0.6B-rk3588-w8a8-opt-1-hybrid-ratio-0.5.rkllm
@@ -93,6 +93,41 @@ QMD_EXPANSION_HF_TOKENIZER="Qwen/Qwen3-1.7B"
 log()  { printf '\033[1;34m[rknpu]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[rknpu]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[rknpu]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# Single source of truth for reading the installed librknnrt version; used by
+# both the environment banner below and the pin logic later so the two can
+# never drift if upstream rewords the version string.
+librknnrt_current_version() {
+    if [[ -f "$LIBRKNNRT_DEST" ]] && command -v strings >/dev/null 2>&1; then
+        # No early awk exit: it SIGPIPEs strings and trips pipefail (see the
+        # note at the version-verify site). Read to EOF and print the first
+        # match only. Do not swallow strings' stderr: if it fails on the
+        # installed library (vendor perms, corrupted ELF) the real error should
+        # surface in the log rather than the banner silently dropping the
+        # runtime line. Both callers guard the call with `|| true`, so a probe
+        # failure cannot abort the install.
+        strings "$LIBRKNNRT_DEST" | awk '/librknnrt version: / && !seen { print $3; seen=1 }'
+    fi
+}
+
+# Environment banner: every user-posted install log should self-describe the
+# machine it ran on (distro, kernel, board, current NPU runtime) so a failure
+# report is diagnosable without a round-trip asking for these.
+if [[ -r /etc/os-release ]]; then
+    log "distro=$( . /etc/os-release; echo "${PRETTY_NAME:-$ID}" )"
+fi
+log "kernel=$(uname -r) arch=$(uname -m)"
+if [[ -r /proc/device-tree/model ]]; then
+    log "board=$(tr -d '\0' < /proc/device-tree/model)"
+fi
+if [[ ! -f "$LIBRKNNRT_DEST" ]]; then
+    log "current librknnrt=not installed"
+elif ! command -v strings >/dev/null 2>&1; then
+    log "current librknnrt=unknown (strings/binutils not installed yet)"
+else
+    _rt_v="$(librknnrt_current_version || true)"
+    log "current librknnrt=${_rt_v:-version string not found}"
+fi
 
 # verify_sha256 <file> <expected_hex> <label>
 # Hard-fails on mismatch: a corrupted download or a tampered mirror must
@@ -246,12 +281,6 @@ detect_rknpu_driver() {
 
 # -------- (3) librknnrt 2.3.0 pin ----------------------------------------
 
-librknnrt_current_version() {
-    if [[ -f "$LIBRKNNRT_DEST" ]] && command -v strings >/dev/null 2>&1; then
-        strings "$LIBRKNNRT_DEST" | awk '/librknnrt version: / { print $3; exit }'
-    fi
-}
-
 pin_librknnrt() {
     local current
     current="$(librknnrt_current_version || true)"
@@ -297,24 +326,59 @@ pin_librknnrt() {
     # Install the new one.
     sudo install -m 0644 "$tmp" "$LIBRKNNRT_DEST"
     LIBRKNNRT_REPLACED=1
-    sudo ldconfig
+    # ldconfig can exit non-zero on vendor images (e.g. "/lib/librknnrt.so is
+    # not a symbolic link" on merged-/lib layouts), which under set -e killed
+    # the whole install right after the library was correctly replaced and
+    # rkllama never got installed (#1543). The cache refresh is best-effort:
+    # the library is already at its canonical path.
+    sudo ldconfig || warn "ldconfig exited $? after installing librknnrt (its stderr above has the cause; harmless on merged /lib layouts where the runtime resolves by absolute path; continuing)"
 
-    # Verify version string against the temp source file before deleting
-    # it — the filesystem-cache / symlink-resolution race after
-    # `sudo install` + `sudo ldconfig` was making librknnrt_current_version
-    # return empty on first run even though the file content was correct
-    # (#406). SHA256 matched up front so $tmp is provably the right file.
-    local verified
-    verified="$(strings "$tmp" | awk '/librknnrt version: / { print $3; exit }')"
+    # Verify the version string as a belt-and-braces check. The SHA256 above
+    # already proved $tmp is byte-for-byte the pinned runtime, so this is
+    # secondary. It depends on `strings` (binutils), which minimal Pi images
+    # often lack and which install_rkllama only installs LATER (step 4). A
+    # missing `strings` here must therefore NOT fail the install (#783): on a
+    # box without binutils the re-check returned empty and the script died
+    # with "version after install is ''" even though librknnrt installed
+    # correctly, which stopped rkllama from ever installing. Skip gracefully
+    # when the tool is unavailable; only die on a genuine version mismatch.
+    local verified=""
+    if command -v strings >/dev/null 2>&1; then
+        # awk must NOT exit early here: an early `exit` closes the pipe and
+        # SIGPIPEs `strings`, which under `set -o pipefail` fails the whole
+        # command substitution, and with `set -e` that aborted the ENTIRE
+        # install on the first clean run wherever binutils was present (#1560,
+        # #1543). The second run only worked because librknnrt was already at
+        # 2.3.0 and this whole pin block was skipped. Read to EOF (no early
+        # exit) and guard the assignment so a strings/awk hiccup is never fatal.
+        # Capture the substitution status so a genuine strings/awk failure is
+        # not silently indistinguishable from "no version string" (which used
+        # to mean only "binutils missing"); warn so a future first-run failure
+        # stays diagnosable.
+        # Do NOT swallow strings' stderr: if the probe fails (truncated
+        # download, bad perms, corrupted ELF) its real error is the diagnostic,
+        # so let it through to the log alongside the warn below. On a valid
+        # runtime strings is quiet on stderr, so this adds no normal-path noise.
+        if verified="$(strings "$tmp" | awk '/librknnrt version: / && !seen { print $3; seen=1 }')"; then
+            :
+        else
+            # A failed substitution already leaves $verified empty, so no reset
+            # is needed; the fallback below re-reads the installed path.
+            warn "strings/awk version probe failed on the downloaded runtime; falling back to the installed path"
+        fi
+        if [[ -z "$verified" ]]; then
+            # Fall back to re-reading the installed path (legacy behaviour).
+            verified="$(librknnrt_current_version || true)"
+        fi
+    fi
     rm -f "$tmp"
     if [[ -z "$verified" ]]; then
-        # Fall back to re-reading the installed path (legacy behaviour).
-        verified="$(librknnrt_current_version || true)"
-    fi
-    if [[ "$verified" != "$LIBRKNNRT_EXPECTED_VERSION" ]]; then
+        log "librknnrt installed and SHA256-verified; skipping version-string re-check ('strings' not available yet)"
+    elif [[ "$verified" != "$LIBRKNNRT_EXPECTED_VERSION" ]]; then
         die "librknnrt version after install is '$verified', expected $LIBRKNNRT_EXPECTED_VERSION"
+    else
+        log "librknnrt pinned to $verified (backup: ${LIBRKNNRT_BACKUP:-none})"
     fi
-    log "librknnrt pinned to $verified (backup: ${LIBRKNNRT_BACKUP:-none})"
 }
 
 # -------- (4) rkllama clone + venv ---------------------------------------
@@ -327,6 +391,23 @@ install_rkllama() {
         log "cloning $RKLLAMA_REPO -> $RKLLAMA_DIR"
         run_as_user mkdir -p "$(dirname "$RKLLAMA_DIR")"
         run_as_user git clone --quiet "$RKLLAMA_REPO" "$RKLLAMA_DIR"
+        # A clone brings down all branches and tags, but an overridden
+        # TAOS_RKLLAMA_REF can be a SHA reachable from none of them. Try to
+        # fetch the configured ref explicitly (best-effort: some servers
+        # refuse unadvertised objects) so the verification below sees the
+        # same coverage as the re-install path; on failure fall through to
+        # the curated error instead of dying on git's raw message.
+        _fetch_err="$(run_as_user git -C "$RKLLAMA_DIR" fetch --quiet origin "$RKLLAMA_REF" 2>&1)" \
+            || log "note: direct fetch of the pinned ref failed (${_fetch_err:-no detail}); relying on the refs the clone brought down"
+    fi
+    # Verify the pinned ref is actually fetchable before checking it out. A
+    # fresh clone only has branch/tag refs, so a pin orphaned by a history
+    # rewrite of the rkllama fork fails with git's opaque "reference is not a
+    # tree" (#1527). Fail with a message that says what happened and how to
+    # override, rather than silently falling back to a moving branch (which
+    # would break install reproducibility).
+    if ! run_as_user git -C "$RKLLAMA_DIR" cat-file -e "${RKLLAMA_REF}^{commit}" 2>/dev/null; then
+        die "pinned rkllama ref ${RKLLAMA_REF:0:12} is not reachable from any branch or tag of $RKLLAMA_REPO (the fork's history may have been rewritten). Update taOS for a current pin, or override with TAOS_RKLLAMA_REF=<ref>."
     fi
     run_as_user git -C "$RKLLAMA_DIR" checkout --quiet "$RKLLAMA_REF"
     log "rkllama pinned to $(run_as_user git -C "$RKLLAMA_DIR" rev-parse --short HEAD)"
@@ -340,6 +421,37 @@ install_rkllama() {
         command -v gcc >/dev/null 2>&1 || _need+=("build-essential")
         dpkg-query -W python3-dev >/dev/null 2>&1 || _need+=("python3-dev")
         dpkg-query -W libffi-dev  >/dev/null 2>&1 || _need+=("libffi-dev")
+        # `strings` (binutils) is used by the librknnrt version checks; minimal
+        # Pi images can lack it (#783). Ensure it is present.
+        command -v strings >/dev/null 2>&1 || _need+=("binutils")
+        # rkllama imports OpenCV (cv2), which needs the OpenGL/GLib/X runtime
+        # libs; vendor Debian images ship without them and the service then
+        # crashloops on "ImportError: libGL.so.1" (#1545). Bookworm+ names the
+        # GL runtime libgl1; older releases only have libgl1-mesa-glx.
+        # GLib was renamed libglib2.0-0t64 in Ubuntu 24.04 / Debian Trixie;
+        # probe both installed names and add whichever the repos carry.
+        # The madison probes below read the local package lists; refresh them
+        # first so a stale image cannot steer the name choice. Best-effort,
+        # but say so when it fails: with stale lists the probes may pick the
+        # wrong package name, and the operator needs that context.
+        sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq \
+            || warn "apt-get update failed — package lists may be stale and the library package-name detection below may be wrong"
+        if ! dpkg-query -W libglib2.0-0 >/dev/null 2>&1 && ! dpkg-query -W libglib2.0-0t64 >/dev/null 2>&1; then
+            if [[ -n "$(apt-cache madison libglib2.0-0 2>/dev/null)" ]]; then
+                _need+=("libglib2.0-0")
+            else
+                _need+=("libglib2.0-0t64")
+            fi
+        fi
+        dpkg-query -W libsm6 >/dev/null 2>&1 || _need+=("libsm6")
+        dpkg-query -W libxext6 >/dev/null 2>&1 || _need+=("libxext6")
+        if ! dpkg-query -W libgl1 >/dev/null 2>&1 && ! dpkg-query -W libgl1-mesa-glx >/dev/null 2>&1; then
+            if [[ -n "$(apt-cache madison libgl1 2>/dev/null)" ]]; then
+                _need+=("libgl1")
+            else
+                _need+=("libgl1-mesa-glx")
+            fi
+        fi
         if (( ${#_need[@]} )); then
             log "installing build deps for rkllama wheel compilation: ${_need[*]}"
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${_need[@]}" \
@@ -474,14 +586,14 @@ EOF
 
 wait_for_rkllama() {
     local i
-    for (( i = 0; i < 30; i++ )); do
+    for (( i = 0; i < 60; i++ )); do
         if curl -fs "http://localhost:$RKLLAMA_PORT/api/tags" >/dev/null 2>&1; then
             log "rkllama HTTP API is up on :$RKLLAMA_PORT"
             return 0
         fi
         sleep 1
     done
-    die "rkllama HTTP API did not come up within 30s — check: sudo journalctl -u rkllama -n 100"
+    die "rkllama HTTP API did not come up within 60s — check: sudo journalctl -u rkllama -n 100"
 }
 
 # -------- (7) end-to-end verify ------------------------------------------

@@ -100,6 +100,136 @@ class TestUserWorkspaceRoutes:
         resp = await client.get("/api/workspace/files?path=../../etc")
         assert resp.status_code == 400
 
+    @pytest.mark.asyncio
+    async def test_rename_file(self, client):
+        """POST /api/workspace/rename moves a file to its new name."""
+        await client.post(
+            "/api/workspace/files/upload",
+            files={"file": ("old.txt", io.BytesIO(b"x"), "text/plain")},
+        )
+        resp = await client.post("/api/workspace/rename", json={"src": "old.txt", "dst": "new.txt"})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "renamed"
+        names = [e["name"] for e in (await client.get("/api/workspace/files")).json()]
+        assert "new.txt" in names and "old.txt" not in names
+
+    @pytest.mark.asyncio
+    async def test_rename_nonexistent_returns_404(self, client):
+        """Renaming a missing source returns 404."""
+        resp = await client.post("/api/workspace/rename", json={"src": "ghost", "dst": "x"})
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_rename_onto_existing_returns_409(self, client):
+        """Renaming onto an existing target returns 409."""
+        for n in ("a.txt", "b.txt"):
+            await client.post(
+                "/api/workspace/files/upload",
+                files={"file": (n, io.BytesIO(b"x"), "text/plain")},
+            )
+        resp = await client.post("/api/workspace/rename", json={"src": "a.txt", "dst": "b.txt"})
+        assert resp.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_rename_traversal_blocked(self, client):
+        """Rename targets outside the workspace are blocked with 400."""
+        await client.post(
+            "/api/workspace/files/upload",
+            files={"file": ("safe.txt", io.BytesIO(b"x"), "text/plain")},
+        )
+        resp = await client.post("/api/workspace/rename", json={"src": "safe.txt", "dst": "../escape.txt"})
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_copy_file(self, client):
+        """POST /api/workspace/copy duplicates a file, leaving the source intact."""
+        await client.post(
+            "/api/workspace/files/upload",
+            files={"file": ("orig.txt", io.BytesIO(b"copy me"), "text/plain")},
+        )
+        resp = await client.post("/api/workspace/copy", json={"src": "orig.txt", "dst": "dup.txt"})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "copied"
+        names = [e["name"] for e in (await client.get("/api/workspace/files")).json()]
+        assert "dup.txt" in names and "orig.txt" in names
+
+    @pytest.mark.asyncio
+    async def test_copy_in_place_with_copy_suffix(self, client):
+        """Duplicating a file in the same directory under a "copy" name works.
+
+        The Files app picks a non-colliding "<base> copy<ext>" destination when
+        pasting into the source directory; the backend must accept that dst.
+        """
+        await client.post(
+            "/api/workspace/files/upload",
+            files={"file": ("note.txt", io.BytesIO(b"dup in place"), "text/plain")},
+        )
+        resp = await client.post(
+            "/api/workspace/copy", json={"src": "note.txt", "dst": "note copy.txt"}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "copied"
+        names = [e["name"] for e in (await client.get("/api/workspace/files")).json()]
+        assert "note.txt" in names and "note copy.txt" in names
+
+    @pytest.mark.asyncio
+    async def test_copy_directory_tree(self, client):
+        """Copying a directory copies its contents recursively."""
+        await client.post("/api/workspace/mkdir", json={"path": "srcdir"})
+        await client.post(
+            "/api/workspace/files/upload?path=srcdir",
+            files={"file": ("inner.txt", io.BytesIO(b"nested"), "text/plain")},
+        )
+        resp = await client.post("/api/workspace/copy", json={"src": "srcdir", "dst": "dstdir"})
+        assert resp.status_code == 200
+        names = [e["name"] for e in (await client.get("/api/workspace/files?path=dstdir")).json()]
+        assert "inner.txt" in names
+
+    @pytest.mark.asyncio
+    async def test_copy_onto_existing_returns_409(self, client):
+        """Copying onto an existing target returns 409."""
+        for n in ("c.txt", "d.txt"):
+            await client.post(
+                "/api/workspace/files/upload",
+                files={"file": (n, io.BytesIO(b"x"), "text/plain")},
+            )
+        resp = await client.post("/api/workspace/copy", json={"src": "c.txt", "dst": "d.txt"})
+        assert resp.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_copy_nonexistent_returns_404(self, client):
+        """Copying a missing source returns 404."""
+        resp = await client.post("/api/workspace/copy", json={"src": "ghost", "dst": "x"})
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_copy_traversal_blocked(self, client):
+        """Copy sources/targets outside the workspace are blocked with 400."""
+        resp = await client.post("/api/workspace/copy", json={"src": "../../etc", "dst": "stolen.txt"})
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_copy_directory_into_itself_returns_400(self, client):
+        """Copying a directory into a path nested inside itself returns a clean
+        400, not a 500 from shutil.copytree."""
+        await client.post("/api/workspace/mkdir", json={"path": "selfdir"})
+        resp = await client.post(
+            "/api/workspace/copy", json={"src": "selfdir", "dst": "selfdir/nested"}
+        )
+        assert resp.status_code == 400
+        assert "itself" in resp.json()["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_move_directory_into_itself_returns_400(self, client):
+        """Renaming/moving a directory into a path nested inside itself returns a
+        clean 400, not a 500."""
+        await client.post("/api/workspace/mkdir", json={"path": "movedir"})
+        resp = await client.post(
+            "/api/workspace/rename", json={"src": "movedir", "dst": "movedir/inner"}
+        )
+        assert resp.status_code == 400
+        assert "itself" in resp.json()["error"].lower()
+
     def test_dir_signature_changes_on_modification(self):
         """Signature helper drives the SSE watch change-detection loop.
         Unit-tested directly — the full SSE stream endpoint is tested

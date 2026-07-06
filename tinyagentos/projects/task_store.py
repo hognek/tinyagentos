@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 
 from typing import TYPE_CHECKING
@@ -9,7 +10,15 @@ from tinyagentos.base_store import BaseStore
 from tinyagentos.projects.ids import new_id
 
 if TYPE_CHECKING:
+    from tinyagentos.board_audit import BoardAuditLog
     from tinyagentos.projects.events import ProjectEventBroker
+    from tinyagentos.projects.project_store import ProjectStore
+
+logger = logging.getLogger(__name__)
+
+# Ancestor-walk depth cap for get_task_context — mirrors the cycle guard in
+# routes/projects.py's parent-chain check.
+_MAX_ANCESTRY_DEPTH = 50
 
 TASK_SCHEMA = """
 CREATE TABLE IF NOT EXISTS project_tasks (
@@ -86,14 +95,52 @@ def _row_to_task(row, description) -> dict:
 class ProjectTaskStore(BaseStore):
     SCHEMA = TASK_SCHEMA
 
-    def __init__(self, db_path, *, broker: "ProjectEventBroker | None" = None) -> None:
+    def __init__(
+        self,
+        db_path,
+        *,
+        broker: "ProjectEventBroker | None" = None,
+        audit: "BoardAuditLog | None" = None,
+        project_store: "ProjectStore | None" = None,
+    ) -> None:
         super().__init__(db_path)
         self._broker = broker
+        self._audit = audit
+        self._project_store = project_store
 
     async def _publish(self, project_id: str, kind: str, payload: dict) -> None:
         if self._broker is not None:
             from tinyagentos.projects.events import ProjectEvent
             await self._broker.publish(project_id, ProjectEvent(kind=kind, payload=payload))
+
+    async def _record_audit(
+        self,
+        task_id: str,
+        event: str,
+        actor: str,
+        from_status: str | None,
+        to_status: str | None,
+        project_id: str = "",
+    ) -> None:
+        """Append a status transition to the board audit log (best effort).
+
+        The audit log lives in its own store; a failure to record must never
+        roll back or break the task mutation that already committed. project_id
+        is recorded so the project-scoped activity feed never crosses projects.
+        """
+        if self._audit is None:
+            return
+        try:
+            await self._audit.record(
+                task_id=task_id,
+                event=event,
+                actor=actor,
+                from_status=from_status,
+                to_status=to_status,
+                project_id=project_id,
+            )
+        except Exception:
+            logger.warning("board audit record failed for task %s", task_id, exc_info=True)
 
     async def create_task(
         self,
@@ -121,6 +168,7 @@ class ProjectTaskStore(BaseStore):
         await self._db.commit()
         new_task = await self.get_task(tid)
         await self._publish(project_id, "task.created", {"id": new_task["id"], "task": new_task})
+        await self._record_audit(tid, "task.created", created_by, None, "open", project_id=project_id)
         return new_task
 
     async def get_task(self, task_id: str) -> dict | None:
@@ -190,13 +238,31 @@ class ProjectTaskStore(BaseStore):
         if existing is not None:
             await self._publish(existing["project_id"], "task.updated", {"id": task_id, "patch": patch})
 
+    async def held_task(self, claimer_id: str) -> str | None:
+        """Return the id of the active ('claimed') task this agent currently
+        holds, or None. Used to enforce one active claim per agent."""
+        async with self._db.execute(
+            "SELECT id FROM project_tasks WHERE claimed_by = ? AND status = 'claimed' LIMIT 1",
+            (claimer_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else None
+
     async def claim_task(self, task_id: str, claimer_id: str) -> bool:
         now = time.time()
+        # Flow protection: an agent must complete (close) or release a task
+        # before claiming another. The NOT EXISTS guard makes the one-active-
+        # claim rule atomic, so concurrent claims by the same agent can't race
+        # past it.
         cursor = await self._db.execute(
             """UPDATE project_tasks
                SET claimed_by = ?, claimed_at = ?, status = 'claimed', updated_at = ?
-               WHERE id = ? AND claimed_by IS NULL AND status = 'open'""",
-            (claimer_id, now, now, task_id),
+               WHERE id = ? AND claimed_by IS NULL AND status = 'open'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM project_tasks held
+                     WHERE held.claimed_by = ? AND held.status = 'claimed'
+                 )""",
+            (claimer_id, now, now, task_id, claimer_id),
         )
         await self._db.commit()
         changed = cursor.rowcount == 1
@@ -204,6 +270,10 @@ class ProjectTaskStore(BaseStore):
             existing = await self.get_task(task_id)
             if existing is not None:
                 await self._publish(existing["project_id"], "task.claimed", {"id": task_id, "claimed_by": claimer_id})
+            await self._record_audit(
+                task_id, "task.claimed", claimer_id, "open", "claimed",
+                project_id=existing["project_id"] if existing else "",
+            )
         return changed
 
     async def release_task(self, task_id: str, releaser_id: str) -> bool:
@@ -224,6 +294,10 @@ class ProjectTaskStore(BaseStore):
                     "task.released",
                     {"id": task_id, "releaser_id": releaser_id},
                 )
+            await self._record_audit(
+                task_id, "task.released", releaser_id, "claimed", "open",
+                project_id=existing["project_id"] if existing else "",
+            )
         return changed
 
     async def close_task(
@@ -245,6 +319,38 @@ class ProjectTaskStore(BaseStore):
             existing = await self.get_task(task_id)
             if existing is not None:
                 await self._publish(existing["project_id"], "task.closed", {"id": task_id, "closed_by": closed_by})
+            # Derive the pre-close status race-free from the committed row rather
+            # than a separate pre-read (which would have a TOCTOU gap). close does
+            # not clear claimed_by, so a set claimer means it was 'claimed'.
+            from_status = "claimed" if existing and existing.get("claimed_by") else "open"
+            await self._record_audit(
+                task_id, "task.closed", closed_by, from_status, "closed",
+                project_id=existing["project_id"] if existing else "",
+            )
+        return changed
+
+    async def reopen_task(self, task_id: str, reopened_by: str) -> bool:
+        """Undo a close: a closed task returns to the open pool (claimer stays
+        cleared, so a free agent can pick it up again). Only acts on a closed
+        task; returns False otherwise."""
+        now = time.time()
+        cursor = await self._db.execute(
+            """UPDATE project_tasks
+               SET status = 'open', closed_by = NULL, closed_at = NULL, close_reason = NULL,
+                   claimed_by = NULL, claimed_at = NULL, updated_at = ?
+               WHERE id = ? AND status = 'closed'""",
+            (now, task_id),
+        )
+        await self._db.commit()
+        changed = cursor.rowcount == 1
+        if changed:
+            existing = await self.get_task(task_id)
+            if existing is not None:
+                await self._publish(existing["project_id"], "task.reopened", {"id": task_id, "reopened_by": reopened_by})
+            await self._record_audit(
+                task_id, "task.reopened", reopened_by, "closed", "open",
+                project_id=existing["project_id"] if existing else "",
+            )
         return changed
 
     async def add_relationship(
@@ -310,6 +416,87 @@ class ProjectTaskStore(BaseStore):
             rows = await cur.fetchall()
             desc = cur.description
         return [_row_to_task(r, desc) for r in rows]
+
+    async def list_ready_tasks_for_assignee(self, assignee_id: str, limit: int = 5) -> list[dict]:
+        """Ready tasks (open, unclaimed, unblocked) assigned to *assignee_id*,
+        across all projects. Mirrors list_ready_tasks's ordering but scopes by
+        assignee instead of project - used by the agent heartbeat loop to find
+        an idle agent's next task without a per-project scan."""
+        limit = max(1, min(limit, 200))
+        async with self._db.execute(
+            """SELECT * FROM ready_tasks
+               WHERE assignee_id = ?
+               ORDER BY priority DESC, created_at ASC
+               LIMIT ?""",
+            (assignee_id, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+            desc = cur.description
+        return [_row_to_task(r, desc) for r in rows]
+
+    async def get_task_context(self, task_id: str) -> dict:
+        """Relational context for a task: its goal (project + parent-task
+        ancestry) and what's blocking it.
+
+        Ancestry is ordered root -> leaf (the task's immediate parent last),
+        excluding the task itself. The walk is capped at
+        _MAX_ANCESTRY_DEPTH and guards against cycles via a visited set.
+
+        Blockers are read via `direction="from"` on this task: a `blocks`
+        relationship is stored as (from=dependent, to=blocker) — see
+        ready_tasks / test_closing_blocker_unblocks_ready_view, where a task
+        with an outbound `blocks` edge to an open task is excluded from the
+        ready set until that target closes.
+        """
+        task = await self.get_task(task_id)
+        if task is None:
+            raise ValueError(f"task not found: {task_id}")
+
+        ancestry: list[dict] = []
+        seen = {task_id}
+        parent_id = task.get("parent_task_id")
+        depth = 0
+        while parent_id and depth < _MAX_ANCESTRY_DEPTH:
+            if parent_id in seen:
+                break
+            seen.add(parent_id)
+            parent = await self.get_task(parent_id)
+            if parent is None:
+                break
+            ancestry.append({
+                "id": parent["id"], "title": parent["title"], "status": parent["status"],
+            })
+            parent_id = parent.get("parent_task_id")
+            depth += 1
+        ancestry.reverse()
+
+        project_id = task["project_id"]
+        project: dict = {"id": project_id, "name": None, "description": None}
+        if self._project_store is not None:
+            proj = await self._project_store.get_project(project_id)
+            if proj is not None:
+                project = {
+                    "id": proj["id"],
+                    "name": proj.get("name"),
+                    "description": proj.get("description", ""),
+                }
+
+        outbound = await self.list_relationships(task_id, direction="from")
+        blockers: list[dict] = []
+        for rel in outbound:
+            if rel.get("kind") != "blocks":
+                continue
+            blocker = await self.get_task(rel["to_task_id"])
+            if blocker is not None:
+                blockers.append({"id": blocker["id"], "title": blocker["title"], "status": blocker["status"]})
+        is_blocked = any(b["status"] not in ("closed", "cancelled") for b in blockers)
+
+        return {
+            "project": project,
+            "ancestry": ancestry,
+            "blockers": blockers,
+            "is_blocked": is_blocked,
+        }
 
     async def add_comment(
         self,

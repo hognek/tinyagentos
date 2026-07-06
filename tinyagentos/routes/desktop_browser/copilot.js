@@ -9,16 +9,98 @@
 (function () {
   'use strict';
 
+  // ─── prefers-color-scheme emulation (taOS theme → proxied site) ─────────────
+  // copilot.js is injected as the FIRST head element, so this runs before the
+  // page's own scripts. When the taOS theme is dark/light, sites that read the
+  // colour-scheme preference in JS (matchMedia) see the taOS scheme, so sites
+  // that support dark/light render to match the shell. Pure CSS
+  // @media(prefers-color-scheme) still follows the host browser (an iframe's UA
+  // preference cannot be overridden from the parent); the injected
+  // <meta name="color-scheme"> covers UA default surfaces. Runs before the
+  // idempotency guard so it always applies, even on PJAX re-injection.
+  (function applyColorScheme() {
+    try {
+      var meta = document.querySelector('meta[name="taos-color-scheme"]');
+      var cs = meta ? (meta.getAttribute('content') || '') : '';
+      if (cs !== 'dark' && cs !== 'light') return;
+      try { document.documentElement.style.colorScheme = cs; } catch (e) {}
+      if (window.__taosColorScheme === cs) return;
+      window.__taosColorScheme = cs;
+      var isDark = cs === 'dark';
+      var orig = window.matchMedia ? window.matchMedia.bind(window) : null;
+      if (!orig) return;
+      window.matchMedia = function (q) {
+        var qs = String(q);
+        // Only override a query that is EXACTLY a prefers-color-scheme test with
+        // a dark/light value. Compound queries (e.g. "(min-width: 600px) and
+        // (prefers-color-scheme: dark)") or valueless ones fall through to the
+        // real matchMedia so their other conditions evaluate correctly --
+        // keying off just the colour-scheme term there returns wrong matches.
+        var m = /^\s*\(\s*prefers-color-scheme\s*:\s*(dark|light)\s*\)\s*$/i.exec(qs);
+        if (m) {
+          var wantDark = m[1].toLowerCase() === 'dark';
+          var matches = wantDark ? isDark : !isDark;
+          return {
+            media: qs, matches: matches, onchange: null,
+            addListener: function () {}, removeListener: function () {},
+            addEventListener: function () {}, removeEventListener: function () {},
+            dispatchEvent: function () { return false; },
+          };
+        }
+        return orig(q);
+      };
+    } catch (e) { /* never break the page over theming */ }
+  })();
+
   // Idempotent guard — re-injection (e.g. turbo / PJAX frame swap) is a no-op.
   if (window.__taosCopilot) return;
   window.__taosCopilot = true;
 
-  // ─── Service Worker note ────────────────────────────────────────────────────
-  // SW registration moved to the parent shell (BrowserApp.tsx). This iframe
-  // runs with sandbox="allow-scripts allow-forms allow-popups allow-downloads"
-  // (no allow-same-origin), so navigator.serviceWorker is unavailable here.
-  // The parent registers /__taos/sw.js and primes it via postMessage after
-  // each tab navigation (TabRenderer.tsx).
+  // ─── Service Worker registration + priming ──────────────────────────────────
+  // The proxied iframe now has a REAL, separate origin (the proxy-origin port)
+  // and runs with allow-same-origin, so navigator.serviceWorker IS available
+  // here. We register /__taos/sw.js (scope "/") from inside the iframe — the SW
+  // belongs to the proxy origin, NOT the shell — and prime it with the page's
+  // real base URL + profile id so it can rewrite relative SPA fetches back
+  // through the proxy. Priming context comes from meta tags the backend
+  // injector templates into this page (the sandbox blocks reaching the parent
+  // for it).
+  (function registerProxyServiceWorker() {
+    if (!('serviceWorker' in navigator)) return;
+
+    function readMeta(name) {
+      var el = document.querySelector('meta[name="' + name + '"]');
+      return el ? (el.getAttribute('content') || '') : '';
+    }
+    var pageBaseUrl = readMeta('taos-page-base') || location.href;
+    var profileId = readMeta('taos-profile-id') || 'personal';
+
+    function prime(sw) {
+      if (!sw) return;
+      try {
+        sw.postMessage({
+          type: 'taos-sw:prime',
+          pageBaseUrl: pageBaseUrl,
+          profileId: profileId,
+        });
+      } catch (_e) { /* SW gone — ignore */ }
+    }
+
+    navigator.serviceWorker.register('/__taos/sw.js', { scope: '/' }).then(
+      function () {
+        // Prime via .ready so the message is delivered whether or not the SW
+        // has claimed this client yet. The active worker (or, on first install,
+        // the one that just took control on next load) gets the page base.
+        navigator.serviceWorker.ready.then(function (reg) {
+          prime(reg.active);
+        });
+        if (navigator.serviceWorker.controller) {
+          prime(navigator.serviceWorker.controller);
+        }
+      },
+      function () { /* registration failed (e.g. http) — SPA fetch falls back */ }
+    );
+  })();
 
   // ─── WebSocket constructor patch ─────────────────────────────────────────────
   // PR 8 ships a no-op patch that logs cross-origin WS attempts. PR 9 (or

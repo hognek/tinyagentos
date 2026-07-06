@@ -8,6 +8,7 @@ import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { syntaxHighlighting, defaultHighlightStyle } from "@codemirror/language";
 import { FilePlus, Trash2, ChevronLeft, Menu, FileText } from "lucide-react";
 import { useDropTarget } from "@/shell/dnd/use-drop-target";
+import { randomId } from "@/lib/uid";
 
 /* ── Note storage ────────────────────────────────────────── */
 
@@ -169,7 +170,14 @@ const MarkdownEditor = React.forwardRef<
       view.destroy();
       viewRef.current = null;
     };
-  }, [content]); // re-create when content identity changes (note switch)
+    // Mount once per note, not on every keystroke. The parent already remounts
+    // this component (via `key={activeNote.id}`) when the user switches notes,
+    // which re-runs this effect with the new note's `content` as the initial
+    // doc. Depending on `content` here instead destroyed and recreated the
+    // CodeMirror view on every `onChange` (i.e. every character typed), which
+    // dropped focus after exactly one keystroke (#1596).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return <div ref={containerRef} className="h-full w-full" />;
 });
@@ -199,7 +207,7 @@ export function TextEditorApp({ windowId: _windowId }: { windowId: string }) {
 
   const createNote = useCallback(() => {
     const note: Note = {
-      id: crypto.randomUUID(),
+      id: randomId("note-"),
       content: "# New Note\n\nStart writing...",
       updatedAt: Date.now(),
     };

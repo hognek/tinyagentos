@@ -11,11 +11,205 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
+import re
+
 from tinyagentos.cluster.capabilities import hardware_to_targets, potential_capabilities as _potential_capabilities
 from tinyagentos.cluster.optimiser import ClusterOptimiser
+from tinyagentos.cluster.worker_auth import _HMACError, require_worker_hmac
 from tinyagentos.cluster.worker_protocol import WorkerInfo
+from tinyagentos.routes.auth import _require_admin
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# Manual-claim throttle
+# ---------------------------------------------------------------------------
+#
+# /api/cluster/pairing/manual-claim is unauthenticated and matches a worker
+# purely by sha256(code), so a wrong code is indistinguishable from a worker
+# polling before the admin has authorised (both return "awaiting"). That means
+# a failure-counting cap would throttle legitimate polling. Instead we cap the
+# raw request rate per client IP. A real worker polls every few seconds (well
+# under the limit); an attacker trying to brute-force the code is held to a few
+# attempts per window, which on top of the high-entropy PIN makes guessing the
+# code within its 15-minute TTL infeasible.
+import time as _time
+
+_MANUAL_CLAIM_WINDOW_SECS = 10.0
+_MANUAL_CLAIM_MAX_PER_WINDOW = 20
+# ip -> (window_start_ts, count). In-memory is sufficient: the controller is a
+# single process and the cap only needs to bound a brute-force burst.
+_manual_claim_hits: dict[str, tuple[float, int]] = {}
+
+
+def _manual_claim_rate_ok(ip: str) -> bool:
+    """Fixed-window per-IP limiter. Returns False when the IP has exceeded
+    _MANUAL_CLAIM_MAX_PER_WINDOW requests in the current window."""
+    now = _time.time()
+    window_start, count = _manual_claim_hits.get(ip, (now, 0))
+    if now - window_start >= _MANUAL_CLAIM_WINDOW_SECS:
+        window_start, count = now, 0
+    count += 1
+    _manual_claim_hits[ip] = (window_start, count)
+    return count <= _MANUAL_CLAIM_MAX_PER_WINDOW
+
+
+# ---------------------------------------------------------------------------
+# Pairing models
+# ---------------------------------------------------------------------------
+
+class PairingAnnounce(BaseModel):
+    name: str
+    url: str
+    platform: str = ""
+    code_hash: str
+
+
+class PairingConfirm(BaseModel):
+    name: str
+    code: str
+
+
+class PairingClaim(BaseModel):
+    name: str
+    code: str
+
+
+# ---------------------------------------------------------------------------
+# Pairing endpoints
+# ---------------------------------------------------------------------------
+
+_CODE_HASH_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+@router.post("/api/cluster/pairing/announce")
+async def pairing_announce(request: Request, body: PairingAnnounce):
+    """Unauthenticated — worker announces itself with a code hash."""
+    if not body.name or not body.url:
+        return JSONResponse({"error": "name and url are required"}, status_code=400)
+    if not _CODE_HASH_RE.match(body.code_hash):
+        return JSONResponse(
+            {"error": "code_hash must be 64 lowercase hex characters"},
+            status_code=400,
+        )
+    store = request.app.state.cluster_pairing
+    await store.announce(body.name, body.url, body.platform, body.code_hash)
+    return {"status": "pending"}
+
+
+@router.get("/api/cluster/pairing/pending")
+async def pairing_pending(request: Request):
+    """Admin session required -- list pending pairing announcements."""
+    ok, err = _require_admin(request)
+    if not ok:
+        return err
+    store = request.app.state.cluster_pairing
+    items = await store.list_pending()
+    return items
+
+
+@router.post("/api/cluster/pairing/confirm")
+async def pairing_confirm(request: Request, body: PairingConfirm):
+    """Admin session required -- confirm a pending pairing."""
+    ok, err = _require_admin(request)
+    if not ok:
+        return err
+    store = request.app.state.cluster_pairing
+    state = await store.pairing_state(body.name)
+    if state is None or not state["has_pending"]:
+        return JSONResponse({"error": "No pending pairing for this worker"}, status_code=404)
+    if state["attempts_capped"]:
+        return JSONResponse({"error": "No pending pairing for this worker"}, status_code=404)
+    if state["expired"]:
+        return JSONResponse({"error": "Pairing request has expired"}, status_code=410)
+    confirmed = await store.confirm(body.name, body.code)
+    if not confirmed:
+        return JSONResponse({"error": "Incorrect pairing code"}, status_code=403)
+    return {"status": "confirmed"}
+
+
+@router.post("/api/cluster/pairing/claim")
+async def pairing_claim(request: Request, body: PairingClaim):
+    """Unauthenticated -- worker claims its signing key after admin confirmation."""
+    store = request.app.state.cluster_pairing
+    state = await store.pairing_state(body.name)
+    if state is None or not state["has_pending"]:
+        return JSONResponse({"error": "Unknown or invalidated worker"}, status_code=404)
+    # Check invalidation before the confirmed check so workers get actionable
+    # errors instead of polling 202 indefinitely on a dead entry.
+    if state["attempts_capped"]:
+        return JSONResponse({"error": "Unknown or invalidated worker"}, status_code=404)
+    if state["expired"]:
+        return JSONResponse(
+            {"error": "Pairing request expired; please re-announce"},
+            status_code=410,
+        )
+    if not state["confirmed"]:
+        return JSONResponse({"status": "awaiting_confirm"}, status_code=202)
+    key = await store.claim(body.name, body.code)
+    if key is None:
+        # Re-check state: if the entry was cleared by a concurrent winner or
+        # became invalidated, return 404; otherwise it is a wrong code.
+        state2 = await store.pairing_state(body.name)
+        if state2 is None or not state2["has_pending"]:
+            return JSONResponse({"error": "Unknown or invalidated worker"}, status_code=404)
+        return JSONResponse({"error": "Incorrect pairing code"}, status_code=403)
+    return {"signing_key": key.hex()}
+
+
+class ManualPairAuthorize(BaseModel):
+    url: str
+    code: str
+
+
+class ManualPairClaim(BaseModel):
+    name: str
+    code: str
+    platform: str = ""
+
+
+@router.post("/api/cluster/pairing/manual")
+async def pairing_manual(request: Request, body: ManualPairAuthorize):
+    """Admin session required -- the free-tier 'Add worker' path. The admin types
+    the worker's LAN address and the pairing code the worker displayed; this
+    authorises that code so the worker's poll can claim its signing key. No
+    announce or network discovery: the admin supplies the address by hand."""
+    ok, err = _require_admin(request)
+    if not ok:
+        return err
+    url = body.url.strip()
+    code = body.code.strip()
+    if not url or not code:
+        return JSONResponse({"error": "url and code are required"}, status_code=400)
+    if "://" not in url:
+        url = "http://" + url
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return JSONResponse({"error": "invalid worker address"}, status_code=400)
+    store = request.app.state.cluster_pairing
+    await store.manual_authorize(url, code)
+    return {"status": "authorized"}
+
+
+@router.post("/api/cluster/pairing/manual-claim")
+async def pairing_manual_claim(request: Request, body: ManualPairClaim):
+    """Unauthenticated -- a manually-paired worker polls with its name + the code
+    it displayed. Returns the signing key + the admin-supplied url once the admin
+    has authorised the matching code; 202 awaiting otherwise."""
+    client_ip = request.client.host if request.client else "unknown"
+    if not _manual_claim_rate_ok(client_ip):
+        return JSONResponse(
+            {"error": "too many pairing attempts; slow down and retry"},
+            status_code=429,
+        )
+    store = request.app.state.cluster_pairing
+    result = await store.manual_claim(body.name, body.code)
+    if result is None:
+        return JSONResponse({"status": "awaiting"}, status_code=202)
+    key, url = result
+    return {"signing_key": key.hex(), "url": url}
 
 
 class WorkerRegister(BaseModel):
@@ -116,6 +310,19 @@ async def list_workers(request: Request):
 
 @router.post("/api/cluster/workers")
 async def register_worker(request: Request, body: WorkerRegister):
+    # HMAC gate — workers must be paired before registering.
+    # The 'local' worker registers in-process (manager.register_worker),
+    # never over HTTP, so it is unaffected by this check.
+    try:
+        await require_worker_hmac(request)
+    except _HMACError as exc:
+        return exc.response
+    # The authenticated worker name must match the body name.
+    if getattr(request.state, "hmac_worker_name", None) != body.name:
+        return JSONResponse(
+            {"error": "Worker name in header does not match body"},
+            status_code=403,
+        )
     cluster = request.app.state.cluster_manager
     if not body.name or not body.url:
         return JSONResponse({"error": "name and url are required"}, status_code=400)
@@ -126,6 +333,13 @@ async def register_worker(request: Request, body: WorkerRegister):
                 {"error": f"Worker '{existing.name}' already registered for host {body.host_lan_ip}; only one worker LXC per host is supported"},
                 status_code=409,
             )
+    # Populate signing_key from pairing store so ticket-signing consumers work.
+    pairing_store = getattr(request.app.state, "cluster_pairing", None)
+    signing_key = b""
+    if pairing_store is not None:
+        key = await pairing_store.get_signing_key(body.name)
+        if key is not None:
+            signing_key = key
     info = WorkerInfo(
         name=body.name,
         url=body.url,
@@ -143,11 +357,52 @@ async def register_worker(request: Request, body: WorkerRegister):
         storage_used_bytes=body.storage_used_bytes,
         bytes_deduped_total=body.bytes_deduped_total,
         worker_lxc_image_version=body.worker_lxc_image_version,
+        signing_key=signing_key,
     )
     await cluster.register_worker(info)
+    await _record_worker_capability(request.app, body.name, body.host_lan_ip, body.hardware)
     if body.pending_storage_backup:
         await _surface_storage_backup(request.app, body.name, body.pending_storage_backup)
     return {"status": "registered", "name": body.name}
+
+
+async def _record_worker_capability(app, name: str, host_lan_ip: str, hardware: dict) -> None:
+    """Populate the capability map from a registering worker (best effort).
+
+    The worker's detected hardware dict already carries cpu/ram_mb/gpu/npu, the
+    same shape the capability map stores, so registration doubles as a heartbeat
+    that marks the node online. A failure here must never fail registration; an
+    explicit admin set-status still owns 'draining'.
+    """
+    store = getattr(app.state, "capability_map", None)
+    if store is None:
+        return
+    hw = hardware or {}
+    try:
+        current = await store.get(name)
+        status = "draining" if current is not None and current["status"] == "draining" else "online"
+        # The store does a full-row overwrite, so a legacy/flat-mode worker that
+        # re-registers without hardware would wipe previously-detected fields.
+        # Carry forward each field the incoming hardware omits.
+        prev = current or {}
+
+        def _keep(key, default):
+            val = hw.get(key)
+            return val if val else prev.get(key, default)
+
+        await store.upsert(
+            {
+                "node_id": name,
+                "hostname": host_lan_ip or prev.get("hostname") or name,
+                "cpu": _keep("cpu", {}),
+                "ram_mb": _keep("ram_mb", 0),
+                "gpu": _keep("gpu", {}),
+                "npu": _keep("npu", {}),
+                "status": status,
+            }
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("capability-map upsert on worker registration failed for %s", name)
 
 
 async def _surface_storage_backup(app, worker_name: str, marker: dict) -> None:
@@ -227,6 +482,17 @@ async def _surface_storage_backup(app, worker_name: str, marker: dict) -> None:
 
 @router.post("/api/cluster/heartbeat")
 async def worker_heartbeat(request: Request, body: HeartbeatBody):
+    # HMAC gate — only paired, registered workers may heartbeat.
+    try:
+        await require_worker_hmac(request)
+    except _HMACError as exc:
+        return exc.response
+    # The authenticated worker name must match the body name.
+    if getattr(request.state, "hmac_worker_name", None) != body.name:
+        return JSONResponse(
+            {"error": "Worker name in header does not match body"},
+            status_code=403,
+        )
     cluster = request.app.state.cluster_manager
     ok = cluster.heartbeat(
         body.name,
@@ -491,7 +757,22 @@ async def incus_enroll(request: Request, name: str, body: IncusEnrollRequest):
 
     Returns ``{"ok": true}`` on success or ``{"ok": false, "error": "..."}`` on
     failure. 404 when the worker is not yet registered.
+
+    HMAC-gated like register/heartbeat: the worker signs the request with its
+    pairing key (see tinyagentos.worker.enroll), so an unauthenticated caller
+    cannot enrol an arbitrary incus remote.
     """
+    # HMAC gate — only the paired worker may enrol its own incus daemon.
+    try:
+        await require_worker_hmac(request)
+    except _HMACError as exc:
+        return exc.response
+    if getattr(request.state, "hmac_worker_name", None) != name:
+        return JSONResponse(
+            {"error": "Worker name in header does not match path"},
+            status_code=403,
+        )
+
     from urllib.parse import urlparse
     import tinyagentos.containers as containers
 
@@ -519,7 +800,7 @@ async def incus_enroll(request: Request, name: str, body: IncusEnrollRequest):
         return JSONResponse({"error": f"invalid incus_url: {exc}"}, status_code=400)
 
     try:
-        result = await containers.remote_add(name, body.incus_url, body.token)
+        result = await containers.remote_add(name, body.incus_url, token=body.token)
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=500)
 
@@ -635,7 +916,7 @@ async def deploy_backend(request: Request, name: str, body: DeployRequest):
 async def worker_remote_command(request: Request, name: str, body: WorkerRemoteRequest):
     """Run an allowlisted command on a remote worker for debugging.
 
-    Used by the TAOS assistant/expert agent and the admin UI to
+    Used by the taOS agent/expert agent and the admin UI to
     diagnose worker issues without SSH access. Commands must match
     a prefix in the allowlist. The worker-side endpoint uses
     create_subprocess_exec (no shell) with the command split into
@@ -666,7 +947,7 @@ async def worker_remote_command(request: Request, name: str, body: WorkerRemoteR
         return JSONResponse({"error": str(exc)}, status_code=502)
 
 
-@router.get("/api/cluster/promote-archived")
+@router.post("/api/cluster/promote-archived")
 async def promote_archived_models(request: Request):
     """Manual trigger: scan all online workers and promote any archived
     models that are now compatible with cluster hardware.
@@ -747,7 +1028,7 @@ async def claim_lease(request: Request, body: LeaseClaimRequest):
     already leased or the worker has insufficient free VRAM.
     """
     cluster = request.app.state.cluster_manager
-    lease = cluster.claim_lease(
+    lease = await cluster.claim_lease(
         resource_id=body.resource_id,
         caller=body.caller,
         ttl_seconds=body.ttl_seconds,
@@ -755,12 +1036,12 @@ async def claim_lease(request: Request, body: LeaseClaimRequest):
     )
     if lease is None:
         # Check why it failed — already leased or insufficient VRAM?
-        existing = cluster._find_existing_lease(body.resource_id)
+        existing = cluster.find_existing_lease(body.resource_id)
         if existing is not None:
             return JSONResponse({
                 "error": "resource already leased",
                 "lease_id": existing.lease_id,
-                "holder": existing.caller,
+                "caller": existing.caller,
                 "expires_at": existing.expires_at,
             }, status_code=409)
         return JSONResponse({
@@ -781,7 +1062,7 @@ async def claim_lease(request: Request, body: LeaseClaimRequest):
 async def release_lease(request: Request, body: LeaseReleaseRequest):
     """Release a GPU lease by id.  Idempotent."""
     cluster = request.app.state.cluster_manager
-    cluster.release_lease(body.lease_id)
+    await cluster.release_lease(body.lease_id)
     return {"status": "released", "lease_id": body.lease_id}
 
 
@@ -789,7 +1070,7 @@ async def release_lease(request: Request, body: LeaseReleaseRequest):
 async def renew_lease(request: Request, body: LeaseRenewRequest):
     """Extend a lease's TTL.  Returns 409 if the lease is expired."""
     cluster = request.app.state.cluster_manager
-    lease = cluster.renew_lease(body.lease_id, ttl_seconds=body.ttl_seconds)
+    lease = await cluster.renew_lease(body.lease_id, ttl_seconds=body.ttl_seconds)
     if lease is None:
         return JSONResponse({
             "error": "lease not found or expired",

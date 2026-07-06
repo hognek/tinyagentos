@@ -23,7 +23,6 @@ class TestAttributeRewriting:
         ("src", "img"),
         ("src", "script"),
         ("src", "iframe"),
-        ("action", "form"),
     ])
     def test_rewrites_relative_url(self, attr, tag):
         from tinyagentos.routes.desktop_browser.rewriter import rewrite_html
@@ -128,3 +127,107 @@ class TestNonHtmlInput:
         # but our rewriter should be defensive about empty/binary input
         out = rewrite_html(b"", base_url="https://example.com/", proxy=_proxy)
         assert out == b""
+
+
+class TestCharsetHandling:
+    def test_utf8_copyright_and_nbsp_survive_roundtrip(self):
+        from tinyagentos.routes.desktop_browser.rewriter import rewrite_html
+
+        html = (
+            "<html><head><meta charset=\"utf-8\"></head>"
+            "<body><p>© 2026 Example Co</p></body></html>"
+        ).encode("utf-8")
+        out = rewrite_html(
+            html, base_url="https://example.com/", proxy=_proxy, charset="utf-8"
+        )
+        # Real UTF-8 bytes for © and nbsp present; no Latin-1 mojibake.
+        assert "©".encode("utf-8") in out
+        assert " ".encode("utf-8") in out
+        # The mojibake signature (Â©) would be the bytes for U+00C2 U+00A9.
+        assert "Â©".encode("utf-8") not in out
+        # Output is valid UTF-8.
+        out.decode("utf-8")
+
+    def test_latin1_page_decoded_with_declared_charset(self):
+        from tinyagentos.routes.desktop_browser.rewriter import rewrite_html
+
+        # Raw 0xa9 is © in ISO-8859-1.
+        html = (
+            b"<html><head><meta charset=\"iso-8859-1\"></head>"
+            b"<body><p>\xa9 2026</p></body></html>"
+        )
+        out = rewrite_html(
+            html, base_url="https://example.com/", proxy=_proxy, charset="ISO-8859-1"
+        )
+        text = out.decode("utf-8")
+        assert "© 2026" in text
+
+    def test_meta_charset_normalized_to_utf8(self):
+        from tinyagentos.routes.desktop_browser.rewriter import rewrite_html
+
+        html = (
+            b"<html><head><meta charset=\"iso-8859-1\"></head>"
+            b"<body><p>x</p></body></html>"
+        )
+        out = rewrite_html(
+            html, base_url="https://example.com/", proxy=_proxy, charset="ISO-8859-1"
+        )
+        lower = out.lower()
+        assert b"charset=\"utf-8\"" in lower
+        assert b"iso-8859-1" not in lower
+
+
+class TestFormRewriting:
+    """Forms route through the proxy; GET and POST need different handling."""
+
+    def test_get_form_uses_bare_path_and_hidden_inputs(self):
+        from tinyagentos.routes.desktop_browser.rewriter import rewrite_html
+
+        html = (
+            b'<html><body><form action="/search" method="get">'
+            b'<input name="q"></form></body></html>'
+        )
+        out = rewrite_html(
+            html, base_url="https://www.google.com/", proxy=_proxy, profile_id="p",
+        ).decode()
+
+        # Bare proxy path (no query — a GET submit would clobber it anyway).
+        assert 'action="/api/desktop/browser/proxy"' in out
+        # Routing carried as reserved hidden inputs that survive the submit.
+        assert 'name="__taos_url"' in out
+        assert 'value="https://www.google.com/search"' in out
+        assert 'name="__taos_pid"' in out
+        assert 'value="p"' in out
+
+    def test_get_form_defaults_when_no_method(self):
+        from tinyagentos.routes.desktop_browser.rewriter import rewrite_html
+
+        html = b'<html><body><form action="/s"><input name="q"></form></body></html>'
+        out = rewrite_html(
+            html, base_url="https://ex.com/", proxy=_proxy, profile_id="p",
+        ).decode()
+        assert 'action="/api/desktop/browser/proxy"' in out
+        assert 'value="https://ex.com/s"' in out
+
+    def test_post_form_keeps_query_encoded_action(self):
+        from tinyagentos.routes.desktop_browser.rewriter import rewrite_html
+
+        html = (
+            b'<html><body><form action="/login" method="POST">'
+            b'<input name="u"></form></body></html>'
+        )
+        out = rewrite_html(
+            html, base_url="https://ex.com/", proxy=_proxy, profile_id="p",
+        ).decode()
+        # POST keeps the query-encoded proxied action; no hidden routing inputs.
+        assert "url=https%3A%2F%2Fex.com%2Flogin" in out
+        assert "__taos_url" not in out
+
+    def test_form_without_action_targets_current_page(self):
+        from tinyagentos.routes.desktop_browser.rewriter import rewrite_html
+
+        html = b'<html><body><form><input name="q"></form></body></html>'
+        out = rewrite_html(
+            html, base_url="https://ex.com/page", proxy=_proxy, profile_id="p",
+        ).decode()
+        assert 'value="https://ex.com/page"' in out

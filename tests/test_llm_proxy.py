@@ -3,11 +3,11 @@ from unittest.mock import patch
 import pytest
 from tinyagentos.llm_proxy import (
     EMBEDDING_ALIAS,
-    TAOS_LITELLM_MASTER_KEY,
     _is_embedding_model,
     generate_litellm_config,
     LLMProxy,
 )
+from tinyagentos.litellm_config import get_litellm_master_key
 
 
 class TestConfigGeneration:
@@ -26,13 +26,14 @@ class TestConfigGeneration:
         config = generate_litellm_config([])
         assert config["model_list"] == []
 
-    def test_config_emits_master_key(self):
-        """general_settings.master_key must carry the shared taOS master
-        key so LiteLLM rejects unauthenticated requests and accepts the
-        value the deployer injects into every agent container."""
-        config = generate_litellm_config([])
-        assert config["general_settings"]["master_key"] == "sk-taos-master"
-        assert config["general_settings"]["master_key"] == TAOS_LITELLM_MASTER_KEY
+    def test_config_emits_master_key(self, tmp_path):
+        """general_settings.master_key must carry the per-install taOS master
+        key (generated and persisted on first use) so LiteLLM rejects
+        unauthenticated requests and every internal admin call uses the same value."""
+        key = get_litellm_master_key(tmp_path)
+        config = generate_litellm_config([], master_key=key)
+        assert config["general_settings"]["master_key"] == key
+        assert config["general_settings"]["master_key"].startswith("sk-taos-")
 
     def test_ollama_backend_uses_ollama_prefix(self):
         backends = [{"name": "local", "type": "ollama", "url": "http://localhost:11434", "priority": 1}]
@@ -75,7 +76,7 @@ class TestEmbeddingDiscovery:
             {"name": "npu", "type": "rkllama", "url": "http://localhost:8080", "priority": 1},
         ]
         with patch(
-            "tinyagentos.llm_proxy._discover_ollama_models",
+            "tinyagentos.litellm_config._discover_ollama_models",
             return_value=["qwen3-4b-chat", "qwen3-embedding-0.6b", "qwen3-reranker-0.6b"],
         ):
             config = generate_litellm_config(backends)
@@ -101,7 +102,7 @@ class TestEmbeddingDiscovery:
         backends = [
             {"name": "npu", "type": "rkllama", "url": "http://localhost:8080", "priority": 1},
         ]
-        with patch("tinyagentos.llm_proxy._discover_ollama_models", return_value=[]):
+        with patch("tinyagentos.litellm_config._discover_ollama_models", return_value=[]):
             config = generate_litellm_config(backends)
         names = [e["model_name"] for e in config["model_list"]]
         assert names == ["default"]
@@ -117,7 +118,7 @@ class TestEmbeddingDiscovery:
         def _fake_probe(url, timeout=2.0):
             return ["bge-small-en-v1.5"] if "a" in url else ["nomic-embed-text-v1.5"]
 
-        with patch("tinyagentos.llm_proxy._discover_ollama_models", side_effect=_fake_probe):
+        with patch("tinyagentos.litellm_config._discover_ollama_models", side_effect=_fake_probe):
             config = generate_litellm_config(backends)
 
         alias_entries = [e for e in config["model_list"] if e["model_name"] == EMBEDDING_ALIAS]
@@ -185,7 +186,7 @@ class TestCloudBackends:
             {"name": "blank-openrouter", "type": "openrouter",
              "url": "https://openrouter.ai/api/v1", "priority": 6},
         ]
-        with caplog.at_level(logging.WARNING, logger="tinyagentos.llm_proxy"):
+        with caplog.at_level(logging.WARNING, logger="tinyagentos.litellm_config"):
             generate_litellm_config(backends)
 
         msgs = [r.getMessage() for r in caplog.records]
@@ -208,7 +209,7 @@ class TestCloudBackends:
             "models": [{"id": "kilo-auto/free"}],
             "api_key_secret": "KILO_KEY",
         }]
-        with caplog.at_level(logging.WARNING, logger="tinyagentos.llm_proxy"):
+        with caplog.at_level(logging.WARNING, logger="tinyagentos.litellm_config"):
             generate_litellm_config(backends)
         assert not any(
             "missing url or models" in r.getMessage() for r in caplog.records
@@ -241,13 +242,14 @@ class TestCallbackWiring:
         )
         assert "custom_callbacks" not in result["general_settings"]
 
-    def test_write_config_creates_callback_shim(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_write_config_creates_callback_shim(self, tmp_path):
         """``write_config`` writes a sibling ``taos_callback.py`` next to
         the generated yaml, re-exporting the installed callback instance as
         ``proxy_handler_instance`` — so LiteLLM's config-dir-relative import
         succeeds without duplicating the callback source."""
         proxy = LLMProxy(port=14000, config_dir=tmp_path)
-        proxy.write_config([])
+        await proxy.write_config([])
         shim = tmp_path / "taos_callback.py"
         assert shim.exists()
         contents = shim.read_text()
@@ -258,6 +260,14 @@ class TestCallbackWiring:
 
 
 class TestLLMProxy:
+    def test_default_port_is_7834(self):
+        proxy = LLMProxy()
+        assert proxy.port == 7834
+
+    def test_config_provided_port_overrides_default(self):
+        proxy = LLMProxy(port=4000)
+        assert proxy.port == 4000
+
     def test_proxy_not_running_initially(self):
         proxy = LLMProxy(port=14000)
         assert not proxy.is_running()
@@ -308,7 +318,7 @@ class TestDatabaseUrlPropagation:
         await p.start(backends=[])
 
         assert captured["env"]["DATABASE_URL"] == "postgresql://fake:pw@host/db"
-        assert captured["env"]["LITELLM_MASTER_KEY"] == "sk-taos-master"
+        assert captured["env"]["LITELLM_MASTER_KEY"].startswith("sk-taos-")
 
     @pytest.mark.asyncio
     async def test_start_omits_database_url_when_unset(self, monkeypatch):
@@ -389,7 +399,8 @@ class TestLLMProxyOwnership:
 
         monkeypatch.setattr(mod.subprocess, "Popen", _FakePopen)
         # Avoid resolving a real litellm binary on the test host.
-        monkeypatch.setattr(mod, "_discover_ollama_models", lambda *a, **kw: [])
+        import tinyagentos.litellm_config as litellm_cfg_mod
+        monkeypatch.setattr(litellm_cfg_mod, "_discover_ollama_models", lambda *a, **kw: [])
 
         p = mod.LLMProxy(port=4000)
         await p.start(backends=[])
@@ -466,3 +477,311 @@ class TestLLMProxyOwnership:
         key = await p.create_agent_key("routing-only")
         assert key is None
         assert called is False
+
+
+class TestInhouseKeys:
+    """In-house key mode: per-agent keys minted in a local SQLite store via
+    the custom_auth hook, so virtual keys work with no DATABASE_URL (the ARM /
+    no-Postgres fix). Opt-in; default behavior is unchanged."""
+
+    def test_config_emits_custom_auth_when_inhouse(self):
+        result = generate_litellm_config([], inhouse_keys=True)
+        gs = result["general_settings"]
+        assert gs["custom_auth"] == "taos_auth.user_api_key_auth"
+        assert gs["custom_auth_run_common_checks"] is False
+
+    def test_config_no_custom_auth_by_default(self):
+        result = generate_litellm_config([])
+        assert "custom_auth" not in result["general_settings"]
+
+    @pytest.mark.asyncio
+    async def test_write_config_writes_auth_shim_when_inhouse(self, tmp_path):
+        proxy = LLMProxy(port=14002, config_dir=tmp_path, inhouse_keys=True)
+        await proxy.write_config([])
+        shim = tmp_path / "taos_auth.py"
+        assert shim.exists()
+        assert "from tinyagentos.litellm_auth import user_api_key_auth" in shim.read_text()
+
+    @pytest.mark.asyncio
+    async def test_write_config_no_auth_shim_by_default(self, tmp_path):
+        proxy = LLMProxy(port=14003, config_dir=tmp_path)
+        await proxy.write_config([])
+        assert not (tmp_path / "taos_auth.py").exists()
+
+    @pytest.mark.asyncio
+    async def test_create_key_mints_locally_without_db(self, tmp_path):
+        """Minting works with no DB and no running proxy in in-house mode."""
+        proxy = LLMProxy(port=14004, config_dir=tmp_path, data_dir=tmp_path,
+                         inhouse_keys=True)
+        key = await proxy.create_agent_key("agent-a", ["gpt-4o"])
+        assert key and key.startswith("sk-taos-")
+        # the same key authorizes via the shared store
+        assert proxy._keystore().lookup(key)["agent"] == "agent-a"
+
+    @pytest.mark.asyncio
+    async def test_create_key_no_models_scopes_to_default(self, tmp_path):
+        """Parity with the Postgres path's ``models or ["default"]``: an agent
+        deployed without an explicit model is scoped to the default alias, not
+        an empty allowlist (which the auth hook deny-alls)."""
+        proxy = LLMProxy(port=14006, config_dir=tmp_path, data_dir=tmp_path,
+                         inhouse_keys=True)
+        key = await proxy.create_agent_key("agent-a", None)
+        assert proxy._keystore().lookup(key)["allowed_models"] == ["default"]
+
+    @pytest.mark.asyncio
+    async def test_update_and_delete_key_inhouse(self, tmp_path):
+        proxy = LLMProxy(port=14005, config_dir=tmp_path, data_dir=tmp_path,
+                         inhouse_keys=True)
+        key = await proxy.create_agent_key("agent-a", ["a"])
+        assert await proxy.update_agent_key(key, ["b", "c"]) is True
+        assert proxy._keystore().lookup(key)["allowed_models"] == ["b", "c"]
+        assert await proxy.delete_agent_key(key) is True
+        assert proxy._keystore().lookup(key) is None
+
+
+class TestProxySelfHeal:
+    """The proxy self-installs the litellm extra once if a pre-fix update
+    stripped it (bounded + non-fatal), so agents are not left without a route."""
+
+    @pytest.mark.asyncio
+    async def test_selfheal_uses_uv_sync_extra_proxy(self, tmp_path, monkeypatch):
+        import sys
+        import tinyagentos.llm_proxy as mod
+
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "tinyagentos"\n')
+        binp = tmp_path / ".local" / "bin"
+        binp.mkdir(parents=True)
+        (binp / "uv").write_text("x")
+        monkeypatch.setattr(sys, "executable", str(tmp_path / ".venv" / "bin" / "python"))
+
+        captured = {}
+
+        class FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return (b"ok", None)
+
+        async def fake_exec(*cmd, **kw):
+            captured["cmd"] = list(cmd)
+            captured["cwd"] = kw.get("cwd")
+            captured["home"] = (kw.get("env") or {}).get("HOME")
+            return FakeProc()
+
+        monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
+
+        ok = await LLMProxy()._selfheal_proxy_extra()
+        assert ok is True
+        assert captured["cmd"][:4] == [str(binp / "uv"), "sync", "--frozen", "--extra"]
+        assert "proxy" in captured["cmd"]
+        assert captured["cwd"] == str(tmp_path)
+        assert captured["home"] == str(tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_selfheal_nonzero_returns_false(self, tmp_path, monkeypatch):
+        import sys
+        import tinyagentos.llm_proxy as mod
+
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "tinyagentos"\n')
+        (tmp_path / ".local" / "bin").mkdir(parents=True)
+        (tmp_path / ".local" / "bin" / "uv").write_text("x")
+        monkeypatch.setattr(sys, "executable", str(tmp_path / ".venv" / "bin" / "python"))
+
+        class FakeProc:
+            returncode = 1
+
+            async def communicate(self):
+                return (b"boom", None)
+
+        async def fake_exec(*cmd, **kw):
+            return FakeProc()
+
+        monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
+        assert await LLMProxy()._selfheal_proxy_extra() is False
+
+    @pytest.mark.asyncio
+    async def test_selfheal_skips_when_no_install_root(self, tmp_path, monkeypatch):
+        import sys
+        monkeypatch.setattr(sys, "executable", str(tmp_path / ".venv" / "bin" / "python"))
+        # No pyproject.toml under tmp_path -> cannot locate install root.
+        assert await LLMProxy()._selfheal_proxy_extra() is False
+
+    @pytest.mark.asyncio
+    async def test_selfheal_kills_subprocess_on_timeout(self, tmp_path, monkeypatch):
+        import asyncio as aio
+        import sys
+        import tinyagentos.llm_proxy as mod
+
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "tinyagentos"\n')
+        (tmp_path / ".local" / "bin").mkdir(parents=True)
+        (tmp_path / ".local" / "bin" / "uv").write_text("x")
+        monkeypatch.setattr(sys, "executable", str(tmp_path / ".venv" / "bin" / "python"))
+
+        killed = {"called": False}
+
+        class FakeProc:
+            returncode = None
+
+            async def communicate(self):
+                return (b"", None)
+
+            def kill(self):
+                killed["called"] = True
+
+            async def wait(self):
+                return 0
+
+        async def fake_exec(*a, **k):
+            return FakeProc()
+
+        calls = {"n": 0}
+
+        async def fake_wait_for(aw, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                if hasattr(aw, "close"):
+                    aw.close()
+                raise aio.TimeoutError()
+            return await aw
+
+        monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
+        monkeypatch.setattr(mod.asyncio, "wait_for", fake_wait_for)
+
+        assert await LLMProxy()._selfheal_proxy_extra() is False
+        assert killed["called"] is True
+
+    @pytest.mark.asyncio
+    async def test_selfheal_locates_root_through_venv_symlink(self, tmp_path, monkeypatch):
+        """sys.executable is a venv symlink to the base interpreter; the install
+        root must be the venv's grandparent, NOT the symlink target's (regression:
+        an earlier .resolve() walked out of the install tree onto /usr)."""
+        import sys
+        import tinyagentos.llm_proxy as mod
+
+        root = tmp_path / "install"
+        (root / ".venv" / "bin").mkdir(parents=True)
+        (root / "pyproject.toml").write_text('[project]\nname = "tinyagentos"\n')
+        (root / ".local" / "bin").mkdir(parents=True)
+        (root / ".local" / "bin" / "uv").write_text("x")
+        base = tmp_path / "usr" / "local" / "bin"
+        base.mkdir(parents=True)
+        real_py = base / "python3"
+        real_py.write_text("#!/bin/sh\n")
+        venv_py = root / ".venv" / "bin" / "python"
+        venv_py.symlink_to(real_py)
+        monkeypatch.setattr(sys, "executable", str(venv_py))
+
+        captured = {}
+
+        class FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return (b"", None)
+
+        async def fake_exec(*cmd, **kw):
+            captured["cwd"] = kw.get("cwd")
+            captured["cmd"] = list(cmd)
+            return FakeProc()
+
+        monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
+
+        ok = await LLMProxy()._selfheal_proxy_extra()
+        assert ok is True
+        # cwd must be the install root (venv grandparent), not tmp_path/usr.
+        assert captured["cwd"] == str(root)
+
+    @pytest.mark.asyncio
+    async def test_selfheal_locates_root_at_other_venv_depths(self, tmp_path, monkeypatch):
+        """The root walk must not assume <root>/.venv/bin/python exactly: a
+        python3.x-named binary or nested layout still finds the first ancestor
+        holding pyproject.toml instead of silently no-opping."""
+        import sys
+        import tinyagentos.llm_proxy as mod
+
+        root = tmp_path / "install"
+        deep = root / "envs" / ".venv" / "bin"
+        deep.mkdir(parents=True)
+        (root / "pyproject.toml").write_text('[project]\nname = "tinyagentos"\n')
+        (root / ".local" / "bin").mkdir(parents=True)
+        (root / ".local" / "bin" / "uv").write_text("x")
+        monkeypatch.setattr(sys, "executable", str(deep / "python3.12"))
+
+        captured = {}
+
+        class FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return (b"", None)
+
+        async def fake_exec(*cmd, **kw):
+            captured["cwd"] = kw.get("cwd")
+            return FakeProc()
+
+        monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
+
+        assert await LLMProxy()._selfheal_proxy_extra() is True
+        assert captured["cwd"] == str(root)
+
+    @pytest.mark.asyncio
+    async def test_selfheal_pip_fallback_installs_only_extra_requirements(
+        self, tmp_path, monkeypatch
+    ):
+        """Without uv, the fallback installs the extras' pinned requirements
+        from pyproject, never an editable reinstall of the project: pip
+        install -e .[proxy] re-resolves every dependency, the exact churn the
+        self-heal exists to undo."""
+        import shutil
+        import sys
+        import tinyagentos.llm_proxy as mod
+
+        (tmp_path / "pyproject.toml").write_text(
+            "[project]\nname = \"tinyagentos\"\nversion = \"0\"\n"
+            "[project.optional-dependencies]\n"
+            # trailing whitespace/newline in an entry must be stripped, not
+            # reach pip verbatim
+            "proxy = [\"litellm[proxy]>=1.90.0\", \"prisma>=0.11.0\\n\"]\n"
+        )
+        (tmp_path / ".venv" / "bin").mkdir(parents=True)
+        monkeypatch.setattr(sys, "executable", str(tmp_path / ".venv" / "bin" / "python"))
+        monkeypatch.setattr(shutil, "which", lambda _name: None)
+
+        captured = {}
+
+        class FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return (b"", None)
+
+        async def fake_exec(*cmd, **kw):
+            captured["cmd"] = list(cmd)
+            return FakeProc()
+
+        monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
+
+        assert await LLMProxy()._selfheal_proxy_extra() is True
+        assert captured["cmd"] == [
+            str(tmp_path / ".venv" / "bin" / "pip"),
+            "install",
+            "--no-input",
+            "--disable-pip-version-check",
+            "litellm[proxy]>=1.90.0",
+            "prisma>=0.11.0",
+        ]
+        assert "-e" not in captured["cmd"]
+
+    @pytest.mark.asyncio
+    async def test_selfheal_ignores_foreign_pyproject(self, tmp_path, monkeypatch):
+        """The root walk must not trust just any pyproject.toml above the
+        interpreter: a foreign project's file (e.g. one in $HOME) would make
+        the self-heal pip-install THAT project's pins into our venv. Only a
+        pyproject whose project.name is tinyagentos counts."""
+        import sys
+
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "someone-else"\n')
+        (tmp_path / ".venv" / "bin").mkdir(parents=True)
+        monkeypatch.setattr(sys, "executable", str(tmp_path / ".venv" / "bin" / "python"))
+
+        assert await LLMProxy()._selfheal_proxy_extra() is False

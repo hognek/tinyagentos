@@ -6,13 +6,19 @@ from tinyagentos.base_store import BaseStore
 DEFAULT_SETTINGS = {
     "mode": "dark",
     "accentColor": "#667eea",
-    "wallpaper": "default",
+    # Must match the frontend's own boot-time default (theme-store's
+    # DEFAULT_WP, "graphite"). "default" is a real, selectable wallpaper
+    # ("Classic") elsewhere in the catalog, so it cannot double as the
+    # "nothing saved yet" sentinel without colliding with that choice.
+    "wallpaper": "graphite",
     "dockMagnification": False,
     "topBarOpacity": 0.95,
 }
 
 DEFAULT_DOCK = {
     "pinned": ["messages", "agents", "files", "store", "settings"],
+    "iconSize": "medium",
+    "position": "bottom",
 }
 
 
@@ -55,6 +61,10 @@ class DesktopSettingsStore(BaseStore):
         return settings
 
     async def update_settings(self, user_id: str, updates: dict) -> None:
+        # Read-merge-write, not replace: a partial payload (e.g. only
+        # {"wallpaper": ...}) must never wipe other saved settings fields.
+        # Dock lives in its own separate row (see update_dock below), so a
+        # Dock-only save can never reach this row at all (#1603, #1601).
         current = await self._get(user_id, "settings", DEFAULT_SETTINGS)
         current.update(updates)
         await self._set(user_id, "settings", current)
@@ -63,6 +73,9 @@ class DesktopSettingsStore(BaseStore):
         return await self._get(user_id, "dock", DEFAULT_DOCK)
 
     async def update_dock(self, user_id: str, updates: dict) -> None:
+        # Read-merge-write, not replace, and its own row separate from
+        # "settings" — a partial Dock save can never clear the wallpaper (or
+        # any other settings field) and vice versa (#1603, #1601).
         current = await self.get_dock(user_id)
         current.update(updates)
         await self._set(user_id, "dock", current)

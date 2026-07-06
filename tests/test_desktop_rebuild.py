@@ -153,25 +153,23 @@ async def test_rebuild_returns_true_on_npm_build_failure(tmp_path, monkeypatch):
     (src_dir / "App.tsx").write_text("// stale")
     (tmp_path / "desktop" / "package.json").write_text('{"name":"x"}')
 
-    call_count = [0]
-
-    class InstallProc:
-        returncode = 0
-
-        async def communicate(self):
-            return b"", b""
-
-    class BuildProc:
-        returncode = 1
+    class Proc:
+        def __init__(self, rc, err=b""):
+            self.returncode = rc
+            self._err = err
 
         async def communicate(self):
-            return b"", b"build error"
+            return b"", self._err
 
     async def fake_exec(*args, **kwargs):
-        call_count[0] += 1
-        if call_count[0] == 1:
-            return InstallProc()
-        return BuildProc()
+        # The prebuilt-bundle check probes `git rev-parse HEAD:desktop` first;
+        # return an empty SHA so it skips straight to the local npm build.
+        if args[0] == "git":
+            return Proc(0, b"")
+        # npm ci / npm install succeed; npm run build fails.
+        if args[0] == "npm" and args[1] == "run":
+            return Proc(1, b"build error")
+        return Proc(0)
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
 
@@ -204,3 +202,202 @@ async def test_rebuild_success(tmp_path, monkeypatch):
     assert result.rebuilt is True
     assert result.success is True
     assert "successfully" in result.message.lower()
+
+
+@pytest.mark.asyncio
+async def test_rebuild_falls_back_to_npm_install_when_ci_fails(tmp_path, monkeypatch):
+    """npm ci failure falls back to npm install, restores the lockfile, then builds."""
+    src_dir = tmp_path / "desktop" / "src"
+    src_dir.mkdir(parents=True)
+    (src_dir / "App.tsx").write_text("// stale")
+    (tmp_path / "desktop" / "package.json").write_text('{"name":"x"}')
+
+    calls = []
+
+    class Proc:
+        def __init__(self, rc):
+            self.returncode = rc
+
+        async def communicate(self):
+            return b"", b""
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        if args[0] == "npm" and args[1] == "ci":
+            return Proc(1)  # ci fails -> fallback path
+        return Proc(0)  # npm install, git checkout, npm run build all succeed
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+
+    result = await rebuild_desktop_bundle_if_stale(tmp_path)
+    assert result.rebuilt is True
+    assert result.success is True
+    cmds = [(a[0], a[1]) for a in calls]
+    assert ("npm", "ci") in cmds
+    assert ("npm", "install") in cmds  # fallback ran
+    assert ("git", "checkout") in cmds  # lockfile restored after install
+
+
+# ---------------------------------------------------------------------------
+# npm-install gate: only reinstall when package-lock.json changes
+# ---------------------------------------------------------------------------
+
+from tinyagentos.desktop_rebuild import (
+    _deps_install_needed,
+    _record_deps_install,
+    _lockfile_hash,
+)
+
+
+def _mk_desktop(tmp_path, *, lock="{}", node_modules=True):
+    d = tmp_path / "desktop"
+    d.mkdir(parents=True, exist_ok=True)
+    if lock is not None:
+        (d / "package-lock.json").write_text(lock)
+    if node_modules:
+        (d / "node_modules").mkdir(exist_ok=True)
+    return d
+
+
+def test_deps_needed_when_node_modules_missing(tmp_path):
+    d = _mk_desktop(tmp_path, node_modules=False)
+    assert _deps_install_needed(d) is True
+
+
+def test_deps_needed_when_no_lockfile(tmp_path):
+    d = _mk_desktop(tmp_path, lock=None)
+    assert _deps_install_needed(d) is True
+
+
+def test_deps_needed_when_no_marker(tmp_path):
+    """node_modules + lockfile but never recorded → must install."""
+    d = _mk_desktop(tmp_path)
+    assert _deps_install_needed(d) is True
+
+
+def test_deps_skipped_after_record(tmp_path):
+    d = _mk_desktop(tmp_path, lock='{"v":1}')
+    _record_deps_install(d)
+    assert _deps_install_needed(d) is False
+
+
+def test_deps_needed_again_when_lockfile_changes(tmp_path):
+    d = _mk_desktop(tmp_path, lock='{"v":1}')
+    _record_deps_install(d)
+    assert _deps_install_needed(d) is False
+    # A dependency bump rewrites package-lock.json → hash changes → reinstall.
+    (d / "package-lock.json").write_text('{"v":2}')
+    assert _deps_install_needed(d) is True
+
+
+def test_lockfile_hash_none_without_file(tmp_path):
+    d = tmp_path / "desktop"
+    d.mkdir()
+    assert _lockfile_hash(d) is None
+
+
+# ---------------------------------------------------------------------------
+# prebuilt bundle: download instead of building locally when the source matches
+# ---------------------------------------------------------------------------
+
+from tinyagentos.desktop_rebuild import _try_prebuilt_desktop_bundle
+
+
+def _git_proc(sha: str):
+    class GitProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (sha + "\n").encode(), b""
+
+    async def fake_exec(*args, **kwargs):
+        return GitProc()
+
+    return fake_exec
+
+
+@pytest.mark.asyncio
+async def test_prebuilt_bundle_installed_on_tree_match(tmp_path, monkeypatch):
+    """Matching tree SHA -> bundle is downloaded + swapped into static/desktop/."""
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _git_proc("SHA123"))
+
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        payload = b"<html>ok</html>"
+        info = tarfile.TarInfo("desktop/index.html")
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    tarball = buf.getvalue()
+
+    import hashlib
+
+    async def fake_to_thread(_fn, url, **_kwargs):
+        if url.endswith("desktop-tree.txt"):
+            return "SHA123"
+        if url.endswith("desktop-bundle.sha256"):
+            return hashlib.sha256(tarball).hexdigest()
+        return tarball
+
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+
+    assert await _try_prebuilt_desktop_bundle(tmp_path) is True
+    assert (tmp_path / "static" / "desktop" / "index.html").read_text() == "<html>ok</html>"
+
+
+@pytest.mark.asyncio
+async def test_prebuilt_bundle_skipped_on_tree_mismatch(tmp_path, monkeypatch):
+    """Mismatched tree SHA -> returns False and never downloads the bundle."""
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _git_proc("LOCAL"))
+
+    calls = []
+
+    async def fake_to_thread(_fn, url, **_kwargs):
+        calls.append(url)
+        return "REMOTE_DIFFERENT"
+
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+
+    assert await _try_prebuilt_desktop_bundle(tmp_path) is False
+    assert calls and all(c.endswith("desktop-tree.txt") for c in calls)
+
+
+@pytest.mark.asyncio
+async def test_prebuilt_bundle_skipped_when_git_missing(tmp_path, monkeypatch):
+    """No git on PATH -> returns False (falls back to a local build)."""
+    async def fake_exec(*args, **kwargs):
+        raise FileNotFoundError("git not found")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    assert await _try_prebuilt_desktop_bundle(tmp_path) is False
+
+
+@pytest.mark.asyncio
+async def test_prebuilt_bundle_rejected_on_checksum_mismatch(tmp_path, monkeypatch):
+    """Tree matches but the published SHA256 does not -> build locally, no install."""
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _git_proc("SHA123"))
+
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        data = b"x"
+        info = tarfile.TarInfo("desktop/index.html")
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    tarball = buf.getvalue()
+
+    async def fake_to_thread(_fn, url, **_kwargs):
+        if url.endswith("desktop-tree.txt"):
+            return "SHA123"
+        if url.endswith("desktop-bundle.sha256"):
+            return "deadbeef" * 8  # wrong digest
+        return tarball
+
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
+
+    assert await _try_prebuilt_desktop_bundle(tmp_path) is False
+    assert not (tmp_path / "static" / "desktop").exists()

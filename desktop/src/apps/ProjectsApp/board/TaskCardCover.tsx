@@ -52,6 +52,5 @@ export function inferCoverKind(task: { labels: string[]; priority: number }): Co
     const k = lbl.slice("cover:".length) as CoverKind;
     if (["gradient", "code", "terminal", "screenshot", "none"].includes(k)) return k;
   }
-  if (task.priority <= 1) return "gradient";
   return "none";
 }

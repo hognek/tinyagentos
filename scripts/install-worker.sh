@@ -5,10 +5,10 @@
 # scheduler.
 #
 # Usage:
-#     curl -sL https://raw.githubusercontent.com/jaylfc/tinyagentos/master/scripts/install-worker.sh | bash -s -- http://controller:6969
+#     curl -sL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-worker.sh | bash -s -- http://controller:6969
 #
 # or download + inspect + run:
-#     curl -O https://raw.githubusercontent.com/jaylfc/tinyagentos/master/scripts/install-worker.sh
+#     curl -O https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-worker.sh
 #     chmod +x install-worker.sh
 #     ./install-worker.sh http://controller:6969
 #
@@ -17,9 +17,13 @@
 #     TAOS_WORKER_NAME        worker display name (default: hostname)
 #     TAOS_INSTALL_DIR        where to install (default: ~/.local/share/tinyagentos-worker)
 #     TAOS_BRANCH             git branch or tag (default: master)
-#     TAOS_REPO               git remote (default: https://github.com/jaylfc/tinyagentos)
+#     TAOS_REPO               git remote (default: https://github.com/jaylfc/taOS)
 #     TAOS_SKIP_BENCHMARK     if set, skip the on-join benchmark run
 #     TAOS_SERVICE            install as system service: auto (default), user, skip
+#     TAOS_PAIR_MANUAL        if set, use free-tier manual pairing: the worker
+#                             prints its address + PIN and waits for the admin to
+#                             enter both in taOS > Cluster > Add worker (no
+#                             network announce/discovery)
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
@@ -64,7 +68,7 @@ _default_worker_name() {
 WORKER_NAME="${TAOS_WORKER_NAME:-$(_default_worker_name)}"
 INSTALL_DIR="${TAOS_INSTALL_DIR:-$HOME/.local/share/tinyagentos-worker}"
 BRANCH="${TAOS_BRANCH:-master}"
-REPO="${TAOS_REPO:-https://github.com/jaylfc/tinyagentos}"
+REPO="${TAOS_REPO:-https://github.com/jaylfc/taOS}"
 SERVICE_MODE="${TAOS_SERVICE:-auto}"
 
 os_name="$(uname -s)"
@@ -320,6 +324,22 @@ setup_port_forward() {
 
 reexec_into_worker_lxc() {
     log "re-execing install-worker.sh inside taos-worker for phase 2"
+
+    # The advertised incus URL the controller enrols MUST be an address the
+    # controller can reach. Inside the LXC the only detectable source address
+    # toward the controller is the NAT'd incusbr0 IP (e.g. 10.x), which is
+    # private to this host. The reachable address is the bare host's own LAN
+    # IP — the nftables rule in setup_port_forward DNATs <host>:8443 to the
+    # LXC. That IP is only knowable here on the host, so detect it and pass it
+    # into phase 2 as TAOS_ADVERTISE_IP.
+    local advertise_ip _ctrl_host
+    _ctrl_host="$(printf '%s' "$CONTROLLER_URL" | sed 's|^[^/]*/*/||; s|[:/].*||')"
+    if [[ -n "$_ctrl_host" ]] && command -v ip >/dev/null 2>&1; then
+        advertise_ip="$(ip -4 route get "$_ctrl_host" 2>/dev/null \
+            | awk '/src/{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')"
+    fi
+    [[ -z "$advertise_ip" ]] && advertise_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+
     # </dev/null on `incus exec` so the inner bash doesn't pull from
     # the outer curl pipe — same root cause as the storage/launch fixes
     # in this file.
@@ -328,6 +348,8 @@ reexec_into_worker_lxc() {
         export TAOS_INSIDE_WORKER=1
         export TAOS_CONTROLLER_URL='${CONTROLLER_URL}'
         export TAOS_WORKER_NAME='${WORKER_NAME}'
+        export TAOS_BRANCH='${BRANCH}'
+        export TAOS_ADVERTISE_IP='${advertise_ip}'
         curl -sL '${REPO}/raw/${BRANCH}/scripts/install-worker.sh' | bash -s -- '${CONTROLLER_URL}'
     " </dev/null
 }
@@ -367,8 +389,31 @@ install_and_enroll_incus() {
                 else
                     log "incus not in default apt — adding zabbly repo"
                     sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl gpg
-                    curl -fsSL https://pkgs.zabbly.com/key.asc \
-                        | sudo gpg --dearmor -o /usr/share/keyrings/zabbly.gpg
+
+                    # Fetch and verify Zabbly GPG key fingerprint before importing.
+                    # Expected fingerprint (verified 2026-06-08 from https://pkgs.zabbly.com/key.asc
+                    # and confirmed on keyserver.ubuntu.com):
+                    #   4EFC 5906 96CB 15B8 7C73  A3AD 82CC 8797 C838 DCFD
+                    # Update if Zabbly rotates their signing key.
+                    local _zabbly_key_tmp
+                    _zabbly_key_tmp="$(mktemp /tmp/zabbly-key.XXXXXX.asc)"
+                    # shellcheck disable=SC2064
+                    trap "rm -f '$_zabbly_key_tmp'" RETURN
+                    curl -fsSL https://pkgs.zabbly.com/key.asc -o "$_zabbly_key_tmp" \
+                        || { warn "failed to fetch Zabbly key — skipping Incus install"; return 0; }
+                    local _zabbly_expected_fp="4EFC590696CB15B87C73A3AD82CC8797C838DCFD"
+                    local _zabbly_actual_fp
+                    _zabbly_actual_fp="$(gpg --with-colons --import-options show-only \
+                        --import "$_zabbly_key_tmp" 2>/dev/null \
+                        | awk -F: '/^fpr:/{gsub(/ /,"",$10); print $10}' | head -1)"
+                    _zabbly_actual_fp="${_zabbly_actual_fp//[[:space:]]/}"
+                    if [[ "$_zabbly_actual_fp" != "$_zabbly_expected_fp" ]]; then
+                        warn "Zabbly key fingerprint mismatch: expected $_zabbly_expected_fp, got '$_zabbly_actual_fp'"
+                        warn "  Refusing to import — skipping Incus install via Zabbly"
+                        return 0
+                    fi
+                    log "Zabbly key fingerprint ok (${_zabbly_actual_fp:0:16}…)"
+                    sudo gpg --dearmor -o /usr/share/keyrings/zabbly.gpg < "$_zabbly_key_tmp"
                     # Resolve the release codename for the apt sources line
                     local codename
                     codename="$(. /etc/os-release && echo "${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}")"
@@ -440,10 +485,10 @@ install_and_enroll_incus() {
     TOKEN="$(echo "$token_output" | awk 'NF{last=$0} END{print last}')"
     if [[ -z "$TOKEN" ]]; then
         warn "failed to generate incus trust token — LXC enrollment skipped"
-        warn "  to enroll manually: incus config trust add controller-enroll"
-        warn "  then: curl -X POST $CONTROLLER_URL/api/cluster/workers/$WORKER_NAME/incus-enroll \\"
-        warn "      -H 'Content-Type: application/json' \\"
-        warn "      -d '{\"incus_url\": \"https://<LAN_IP>:8443\", \"token\": \"<TOKEN>\"}'"
+        warn "  to enroll manually: TOKEN=\$(incus config trust add controller-enroll 2>&1 | tail -1)"
+        warn "  then: $INSTALL_DIR/.venv/bin/python -m tinyagentos.worker.enroll $CONTROLLER_URL \\"
+        warn "      --name $WORKER_NAME --incus-url https://<LAN_IP>:8443 --token \"\$TOKEN\" \\"
+        warn "      --state-dir $INSTALL_DIR/.taos-worker-state"
         return 0
     fi
 
@@ -452,9 +497,16 @@ install_and_enroll_incus() {
     # controller, so we don't accidentally pick up docker0 / incusbr0 /
     # Tailscale addresses that the controller can't reach back on.
     local LAN_IP=""
+    # Inside the worker LXC, the kernel's source address toward the controller
+    # is the NAT'd incusbr0 IP, which the controller cannot reach. Phase 1
+    # passes the bare host's reachable LAN IP as TAOS_ADVERTISE_IP (DNAT'd to
+    # this LXC by setup_port_forward), so prefer it when present.
+    if [[ -n "${TAOS_ADVERTISE_IP:-}" ]]; then
+        LAN_IP="$TAOS_ADVERTISE_IP"
+    fi
     local _ctrl_host
     _ctrl_host="$(printf '%s' "$CONTROLLER_URL" | sed 's|^[^/]*/*/||; s|[:/].*||')"
-    if [[ -n "$_ctrl_host" ]] && command -v ip >/dev/null 2>&1; then
+    if [[ -z "$LAN_IP" && -n "$_ctrl_host" ]] && command -v ip >/dev/null 2>&1; then
         LAN_IP="$(ip -4 route get "$_ctrl_host" 2>/dev/null \
             | awk '/src/{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')"
     fi
@@ -469,67 +521,163 @@ install_and_enroll_incus() {
     fi
     if [[ -z "$LAN_IP" ]]; then
         warn "could not detect LAN IP — LXC enrollment skipped"
-        warn "  to enroll manually: curl -X POST $CONTROLLER_URL/api/cluster/workers/$WORKER_NAME/incus-enroll \\"
-        warn "      -H 'Content-Type: application/json' \\"
-        warn "      -d '{\"incus_url\": \"https://<LAN_IP>:8443\", \"token\": \"$TOKEN\"}'"
+        warn "  to enroll manually: $INSTALL_DIR/.venv/bin/python -m tinyagentos.worker.enroll $CONTROLLER_URL \\"
+        warn "      --name $WORKER_NAME --incus-url https://<LAN_IP>:8443 --token \"$TOKEN\" \\"
+        warn "      --state-dir $INSTALL_DIR/.taos-worker-state"
         return 0
     fi
 
     log "LAN IP: $LAN_IP"
 
-    # ── 7. Register worker with controller ─────────────────────────────
-    # POST /api/cluster/workers so the controller knows this worker exists
-    # before we try to /incus-enroll (that endpoint 404s for unknown workers).
-    # Includes the new LXC-mode fields: host_lan_ip and worker_lxc_image_version.
-    log "registering worker '${WORKER_NAME}' with controller at $CONTROLLER_URL"
-    local reg_code
-    reg_code="$(curl -sS -o /tmp/taos-worker-register.out -w "%{http_code}" \
-        -X POST "$CONTROLLER_URL/api/cluster/workers" \
-        -H "Content-Type: application/json" \
-        -d "{
-            \"name\": \"${WORKER_NAME}\",
-            \"url\": \"https://${LAN_IP}:8443\",
-            \"hardware\": {},
-            \"backends\": [],
-            \"capabilities\": [],
-            \"platform\": \"linux\",
-            \"models\": [],
-            \"host_lan_ip\": \"${TAOS_HOST_LAN_IP:-${LAN_IP}}\",
-            \"worker_lxc_image_version\": \"ubuntu/24.04/amd64\"
-        }" \
-        2>/tmp/taos-worker-register.err || true)"
-
-    if [[ "$reg_code" == 2* ]]; then
-        log "worker registered successfully (HTTP $reg_code)"
-    elif [[ "$reg_code" == "409" ]]; then
-        log "worker already registered (HTTP 409) — continuing to incus-enroll"
-    else
-        warn "worker registration returned HTTP $reg_code"
-        warn "  response: $(cat /tmp/taos-worker-register.out 2>/dev/null)"
-        warn "  continuing to incus-enroll anyway"
+    # ── 7. Pair + register worker with controller ───────────────────────
+    # Pairing acquires the HMAC signing key; --register-after does the
+    # first signed POST /api/cluster/workers so the controller knows this
+    # worker before the incus-enroll step below (that endpoint 404s for
+    # unknown workers). Crypto lives in Python, not shell.
+    log "pairing worker '${WORKER_NAME}' with controller at $CONTROLLER_URL"
+    log "  (the pairing code will be printed below — enter it in taOS > Cluster)"
+    local _pair_manual_flag=()
+    if [[ -n "${TAOS_PAIR_MANUAL:-}" ]]; then
+        _pair_manual_flag=(--manual)
+        log "  TAOS_PAIR_MANUAL set — using free-tier manual pairing (enter IP + PIN in Add worker)"
+    fi
+    # Save the signing key where the worker daemon reads it. The systemd unit
+    # sets TAOS_WORKER_STATE_DIR=$INSTALL_DIR/.taos-worker-state; pair.py's
+    # default state-dir differs, so pass it explicitly or the daemon starts up
+    # "not paired" despite a successful pairing.
+    if ! "$INSTALL_DIR/.venv/bin/python" -m tinyagentos.worker.pair \
+            "$CONTROLLER_URL" \
+            --name "$WORKER_NAME" \
+            --url "https://${LAN_IP}:8443" \
+            --state-dir "$INSTALL_DIR/.taos-worker-state" \
+            "${_pair_manual_flag[@]}" \
+            --register-after; then
+        warn "pairing requires admin approval in taOS > Cluster."
+        warn "  The code was printed above. Once approved, re-run this installer to resume."
+        warn "  To resume later: run this installer again (it will skip already-done steps)."
+        return 1
     fi
 
-    # ── 8. POST to controller ───────────────────────────────────────────
+    # ── 8. Enrol the worker's incus with the controller ─────────────────
+    # The endpoint is HMAC-gated like register/heartbeat, so the request is
+    # signed with the pairing key. Crypto lives in Python (tinyagentos.worker.enroll),
+    # not shell. --state-dir matches the pairing step above so the key is found.
     log "enrolling incus remote with controller at $CONTROLLER_URL"
-    local http_code
-    http_code="$(curl -sS -o /tmp/taos-incus-enroll.out -w "%{http_code}" \
-        -X POST "$CONTROLLER_URL/api/cluster/workers/$WORKER_NAME/incus-enroll" \
-        -H "Content-Type: application/json" \
-        -d "{\"incus_url\": \"https://${LAN_IP}:8443\", \"token\": \"${TOKEN}\"}" \
-        2>/tmp/taos-incus-enroll.err || true)"
-
-    if [[ "$http_code" == 2* ]]; then
-        log "incus remote enrolled successfully (HTTP $http_code)"
+    if "$INSTALL_DIR/.venv/bin/python" -m tinyagentos.worker.enroll \
+            "$CONTROLLER_URL" \
+            --name "$WORKER_NAME" \
+            --incus-url "https://${LAN_IP}:8443" \
+            --token "$TOKEN" \
+            --state-dir "$INSTALL_DIR/.taos-worker-state"; then
+        log "incus remote enrolled successfully"
     else
-        warn "incus enrollment returned HTTP $http_code"
-        warn "  response: $(cat /tmp/taos-incus-enroll.out 2>/dev/null)"
-        warn "  to retry manually:"
+        warn "incus enrollment failed (see message above)"
+        warn "  to retry manually from inside the worker LXC:"
         warn "    TOKEN=\$(incus config trust add controller-enroll 2>&1 | tail -1)"
-        warn "    curl -X POST $CONTROLLER_URL/api/cluster/workers/$WORKER_NAME/incus-enroll \\"
-        warn "        -H 'Content-Type: application/json' \\"
-        warn "        -d \"{\\\"incus_url\\\": \\\"https://$LAN_IP:8443\\\", \\\"token\\\": \\\"\$TOKEN\\\"}\" "
+        warn "    $INSTALL_DIR/.venv/bin/python -m tinyagentos.worker.enroll $CONTROLLER_URL \\"
+        warn "        --name $WORKER_NAME --incus-url https://$LAN_IP:8443 --token \"\$TOKEN\" \\"
+        warn "        --state-dir $INSTALL_DIR/.taos-worker-state"
         warn "  set TAOS_SKIP_INCUS=1 to skip this block entirely on re-runs"
     fi
+}
+
+# --- repo clone + python runtime (shared: macOS legacy body + phase 2) -----
+#
+# Defined here, above the phase entry-points, so phase2_inside_lxc() (which
+# runs inside the worker LXC and exits before the fall-through body) can reuse
+# the exact same clone + venv logic the macOS / non-phased path uses.
+
+clone_or_update_repo() {
+    if [[ ! -d "$INSTALL_DIR/.git" ]]; then
+        log "cloning $REPO into $INSTALL_DIR"
+        mkdir -p "$(dirname "$INSTALL_DIR")"
+        # If INSTALL_DIR already exists but isn't a git repo (e.g. a previous
+        # partial install), move it aside so the clone can proceed.
+        if [[ -d "$INSTALL_DIR" ]]; then
+            mv "$INSTALL_DIR" "${INSTALL_DIR}.old.$(date +%s)"
+        fi
+        git clone --depth 1 --branch "$BRANCH" "$REPO" "$INSTALL_DIR"
+    else
+        log "updating existing checkout"
+        # A shallow single-branch fetch only moves FETCH_HEAD; it does not
+        # create/update an origin/<branch> ref, so reset to FETCH_HEAD (the
+        # just-fetched tip) rather than a remote-tracking name that may not
+        # exist. This is what makes a re-run ("re-run to resume") idempotent.
+        (cd "$INSTALL_DIR" && git fetch --depth 1 origin "$BRANCH" && git reset --hard FETCH_HEAD)
+    fi
+    cd "$INSTALL_DIR"
+}
+
+setup_python_venv() {
+    cd "$INSTALL_DIR"
+    if [[ ! -d .venv ]]; then
+        log "creating venv"
+        python3 -m venv .venv
+    fi
+
+    log "installing worker python deps into .venv"
+    ./.venv/bin/pip install --quiet --upgrade pip
+    ./.venv/bin/pip install --quiet \
+        httpx \
+        pydantic \
+        psutil \
+        fastapi \
+        uvicorn \
+        pyyaml \
+        pillow
+
+    # libtorrent is optional (only used for model torrent mesh). It isn't on
+    # PyPI as a wheel for most platforms — it ships as the distro's
+    # libtorrent-rasterbar package. Try pip in case a wheel is available;
+    # silently skip if not. Worker still functions without it.
+    ./.venv/bin/pip install --quiet libtorrent 2>/dev/null || \
+        warn "libtorrent python bindings not available — torrent model mesh disabled (worker still functional)"
+}
+
+# Install the worker daemon as a system service INSIDE the worker LXC, where
+# we always run as root (so no sudo / no $USER gymnastics — unlike
+# install_linux_systemd_system which targets the bare-host legacy path).
+install_worker_service_root() {
+    local unit="/etc/systemd/system/tinyagentos-worker.service"
+
+    # Deploy helper so the controller can manage backends in the nested incus.
+    local helper_src="$INSTALL_DIR/scripts/taos-deploy-helper.sh"
+    if [[ -f "$helper_src" ]]; then
+        cp "$helper_src" /usr/local/bin/taos-deploy-helper
+        chmod 755 /usr/local/bin/taos-deploy-helper
+        log "installed /usr/local/bin/taos-deploy-helper"
+    else
+        warn "deploy helper not found at $helper_src — remote backend deployment will not work"
+    fi
+
+    cat > "$unit" <<EOF
+[Unit]
+Description=TinyAgentOS Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$INSTALL_DIR/.venv/bin/python -m tinyagentos.worker $CONTROLLER_URL --name $WORKER_NAME
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=TAOS_WORKER_STATE_DIR=$INSTALL_DIR/.taos-worker-state
+Environment=TAOS_ADVERTISE_IP=${TAOS_ADVERTISE_IP:-}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    log "installed $unit (worker LXC system unit, runs as root)"
+    systemctl daemon-reload
+    systemctl enable tinyagentos-worker
+    # restart (not just enable --now): on a re-run the service is already
+    # active, and enable --now will not reload a rewritten unit — so a changed
+    # ExecStart/Environment (e.g. TAOS_ADVERTISE_IP) would never take effect.
+    systemctl restart tinyagentos-worker
+    log "worker daemon running inside LXC as system service"
+    log "logs: incus exec taos-worker -- journalctl -u tinyagentos-worker -f"
 }
 
 # --- phase 2: nested incus + bees + register (runs inside worker LXC) -----
@@ -537,9 +685,10 @@ install_and_enroll_incus() {
 phase2_inside_lxc() {
     log "phase 2: nested incus + bees + register"
 
-    # 1. Nested incus + bees
+    # 1. Nested incus + bees + worker runtime deps (the LXC is a fresh,
+    #    minimal Ubuntu image, so python3/venv/git are not present yet).
     apt update -y
-    apt install -y incus curl
+    apt install -y incus curl python3 python3-venv python3-pip git
     # bees is not packaged in Ubuntu 24.04; install if available, otherwise
     # the bees service setup below is skipped (TAOS_NO_DEDUP behaviour).
     local bees_installed=0
@@ -550,7 +699,15 @@ phase2_inside_lxc() {
         warn "  to enable later: apt install bees && systemctl enable --now bees.service"
     fi
 
-    if incus list >/dev/null 2>&1; then
+    # Gate init on the default storage pool existing, NOT on `incus list`
+    # succeeding: `incus list` returns 0 even on a fresh daemon with no storage
+    # pool and an empty default profile, which would skip init and leave the
+    # nested incus unable to create agent containers ("No root device could be
+    # found"). Match the pool name exactly, as create_btrfs_loopback does at the
+    # host level: `--format=csv` still emits a header row on some incus builds,
+    # so a bare `grep -q .` matches the header and wrongly skips init on a fresh
+    # daemon. `incus admin init --minimal` creates a pool named `default`.
+    if incus storage list --format=csv 2>/dev/null | awk -F',' '{print $1}' | grep -q '^default$'; then
         log "nested incus already initialised"
     else
         incus admin init --minimal < /dev/null
@@ -600,9 +757,20 @@ BEESEOF
     fi
     export TAOS_HOST_LAN_IP="$host_lan_ip"
 
-    # 4. Register with controller (reuse existing function from the rest of
+    # 4. Clone the repo + build the python venv INSIDE the LXC. The shared
+    #    clone/venv block at the foot of this script only runs on the macOS /
+    #    non-phased path, so the worker-LXC phase needs its own runtime: both
+    #    pairing (install_and_enroll_incus, below) and the worker daemon
+    #    invoke $INSTALL_DIR/.venv/bin/python.
+    clone_or_update_repo
+    setup_python_venv
+
+    # 5. Register with controller (reuse existing function from the rest of
     #    install-worker.sh; it does POST /api/cluster/workers + /incus-enroll).
     install_and_enroll_incus
+
+    # 6. Install + start the worker daemon as a system service inside the LXC.
+    install_worker_service_root
 }
 
 # --- phase 1 entry-point --------------------------------------------------
@@ -927,6 +1095,12 @@ install_taos_ollama() {
         # install.sh which auto-installs cuda-drivers system-wide and
         # creates /usr/local/bin/ollama + /etc/systemd/system/ollama.service —
         # both things we never want.
+        #
+        # Pinned to a specific Ollama release rather than /releases/latest to
+        # avoid pulling an untested version on fresh installs.
+        # Update TAOS_OLLAMA_VERSION when a new Ollama release is validated.
+        # Pinned: 2026-06-07
+        local ollama_version="${TAOS_OLLAMA_VERSION:-0.9.0}"
         local arch_suffix
         case "$arch" in
             x86_64)  arch_suffix="amd64" ;;
@@ -934,7 +1108,7 @@ install_taos_ollama() {
             *) warn "unsupported arch '$arch' for bundled Ollama — skipping"; return 0 ;;
         esac
 
-        local ollama_url="https://github.com/ollama/ollama/releases/latest/download/ollama-linux-${arch_suffix}.tar.zst"
+        local ollama_url="https://github.com/ollama/ollama/releases/download/v${ollama_version}/ollama-linux-${arch_suffix}.tar.zst"
         local tmp_dir="$ollama_dir/.download"
         mkdir -p "$tmp_dir"
 
@@ -955,6 +1129,32 @@ install_taos_ollama() {
             warn "failed to download bundled Ollama from $ollama_url"
             warn "  worker will start with no LLM backend; install one manually"
             return 0
+        fi
+
+        # Verify SHA256 of the downloaded tarball against the pinned checksum.
+        # Ollama publishes per-release SHA256 sums at:
+        #   https://github.com/ollama/ollama/releases/download/v<ver>/sha256sums.txt
+        # TAOS_OLLAMA_SHA256_AMD64 / TAOS_OLLAMA_SHA256_ARM64 can be set in the
+        # environment to supply the expected digest. If not set, verification is
+        # skipped with a warning — set these in production to close this gap.
+        # Pinned: 2026-06-07 for v0.9.0
+        local ollama_sha256_var="TAOS_OLLAMA_SHA256_${arch_suffix^^}"
+        local ollama_expected_sha256="${!ollama_sha256_var:-}"
+        if [[ -n "$ollama_expected_sha256" ]]; then
+            local ollama_actual_sha256
+            ollama_actual_sha256="$(sha256sum "$tmp_dir/ollama.tar.zst" | awk '{print $1}')"
+            if [[ "$ollama_actual_sha256" != "$ollama_expected_sha256" ]]; then
+                warn "SHA256 mismatch for ollama-linux-${arch_suffix}.tar.zst"
+                warn "  expected: $ollama_expected_sha256"
+                warn "  got:      $ollama_actual_sha256"
+                warn "  worker will start with no LLM backend"
+                rm -rf "$tmp_dir"
+                return 0
+            fi
+            log "Ollama tarball sha256 ok (${ollama_actual_sha256:0:16}…)"
+        else
+            warn "TAOS_OLLAMA_SHA256_${arch_suffix^^} not set — skipping tarball SHA256 check"
+            warn "  Set this env var to the sha256 from https://github.com/ollama/ollama/releases/download/v${ollama_version}/sha256sums.txt"
         fi
 
         # Extract — Ollama tar.zst contains bin/ + lib/ at the root
@@ -1024,48 +1224,13 @@ EOF
 # directory to work with. install_taos_ollama then drops its bundled
 # Ollama into $INSTALL_DIR/backends/ollama inside the cloned repo.
 
-if [[ ! -d "$INSTALL_DIR/.git" ]]; then
-    log "cloning $REPO into $INSTALL_DIR"
-    mkdir -p "$(dirname "$INSTALL_DIR")"
-    # If INSTALL_DIR already exists but isn't a git repo (e.g. a previous
-    # partial install), move it aside so the clone can proceed.
-    if [[ -d "$INSTALL_DIR" ]]; then
-        mv "$INSTALL_DIR" "${INSTALL_DIR}.old.$(date +%s)"
-    fi
-    git clone --depth 1 --branch "$BRANCH" "$REPO" "$INSTALL_DIR"
-else
-    log "updating existing checkout"
-    (cd "$INSTALL_DIR" && git fetch --depth 1 origin "$BRANCH" && git reset --hard "origin/$BRANCH")
-fi
-
-cd "$INSTALL_DIR"
+clone_or_update_repo
 
 install_taos_ollama
 
 # --- python venv + worker-only deps --------------------------------------
 
-if [[ ! -d .venv ]]; then
-    log "creating venv"
-    python3 -m venv .venv
-fi
-
-log "installing worker python deps into .venv"
-./.venv/bin/pip install --quiet --upgrade pip
-./.venv/bin/pip install --quiet \
-    httpx \
-    pydantic \
-    psutil \
-    fastapi \
-    uvicorn \
-    pyyaml \
-    pillow
-
-# libtorrent is optional (only used for model torrent mesh). It isn't on
-# PyPI as a wheel for most platforms — it ships as the distro's
-# libtorrent-rasterbar package. Try pip in case a wheel is available;
-# silently skip if not. Worker still functions without it.
-./.venv/bin/pip install --quiet libtorrent 2>/dev/null || \
-    warn "libtorrent python bindings not available — torrent model mesh disabled (worker still functional)"
+setup_python_venv
 
 # --- first-boot benchmark -----------------------------------------------
 
@@ -1119,7 +1284,7 @@ install_deploy_helper() {
     local sudo_cmd=""
     if [[ "$(id -u)" != "0" ]]; then sudo_cmd="sudo"; fi
 
-    local helper_src="$INSTALL_DIR/tinyagentos/scripts/taos-deploy-helper.sh"
+    local helper_src="$INSTALL_DIR/scripts/taos-deploy-helper.sh"
     local helper_dst="/usr/local/bin/taos-deploy-helper"
 
     if [[ -f "$helper_src" ]]; then
@@ -1170,6 +1335,7 @@ ExecStart=$INSTALL_DIR/.venv/bin/python -m tinyagentos.worker $CONTROLLER_URL --
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+Environment=TAOS_WORKER_STATE_DIR=$INSTALL_DIR/.taos-worker-state
 
 [Install]
 WantedBy=multi-user.target
@@ -1198,6 +1364,7 @@ ExecStart=$INSTALL_DIR/.venv/bin/python -m tinyagentos.worker $CONTROLLER_URL --
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+Environment=TAOS_WORKER_STATE_DIR=$INSTALL_DIR/.taos-worker-state
 
 [Install]
 WantedBy=default.target

@@ -12,9 +12,10 @@
  * (We don't pretend to handle arbitrary failures; that's the job of
  * the surrounding observability stack and per-app error states.)
  */
-import { Component, type ReactNode } from "react";
+import { Component, type ErrorInfo, type ReactNode } from "react";
 import { Loader2, RefreshCw, AlertCircle } from "lucide-react";
 import { BackendUnavailableError } from "@/lib/taos-fetch";
+import { reportClientLog } from "@/lib/client-log";
 
 type Mode = "ok" | "waiting" | "chunk" | "generic";
 
@@ -27,7 +28,18 @@ interface State {
 }
 
 const CHUNK_NAMES = new Set(["ChunkLoadError"]);
-const CHUNK_MESSAGES = [/Loading chunk \d+ failed/i, /Failed to fetch dynamically imported module/i];
+// A stale cached shell points at chunk URLs deleted by a newer deploy; the
+// dynamic import then fails. Each JS engine words that failure differently, so
+// match all three or the WebKit/Firefox variants fall through to the dead
+// "generic" screen instead of auto-reloading (Chrome: "Failed to fetch
+// dynamically imported module"; Firefox: "error loading dynamically imported
+// module"; Safari/WebKit: "Importing a module script failed").
+const CHUNK_MESSAGES = [
+  /Loading chunk \d+ failed/i,
+  /Failed to fetch dynamically imported module/i,
+  /error loading dynamically imported module/i,
+  /importing a module script failed/i,
+];
 
 function classify(err: Error): Mode {
   if (err instanceof BackendUnavailableError) return "waiting";
@@ -44,7 +56,22 @@ export class AppErrorBoundary extends Component<Props, State> {
     return { mode: classify(err) };
   }
 
-  componentDidCatch() {
+  componentDidCatch(error: Error, info: ErrorInfo) {
+    // The generic fallback intentionally hides the error from the user, but it
+    // must not be swallowed: log the error and the component stack so a crash
+    // is diagnosable from the console and reachable by the observability stack.
+    // Skip the "waiting"/"chunk" modes -- those are expected, handled states.
+    if (this.state.mode === "generic") {
+      console.error("[AppErrorBoundary]", error, info?.componentStack ?? "");
+      // Also ship it server-side: a PWA user has no console, so this is the only
+      // way the crash becomes visible to us (#106).
+      reportClientLog("fatal", error.message || error.name, {
+        source: "AppErrorBoundary",
+        stack: [error.stack, info?.componentStack]
+          .filter(Boolean)
+          .join("\n--- componentStack ---\n"),
+      });
+    }
     if (this.state.mode === "chunk" && !this.reloadTimer) {
       this.reloadTimer = setTimeout(() => window.location.reload(), 5_000);
     }

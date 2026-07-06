@@ -7,8 +7,12 @@
  * (e.g. mid-restart after Install Update). Scope: '/' — covers both
  * /desktop and /chat-pwa. Strategy:
  *  - cache-first for /desktop/assets/* (immutable hashed URLs)
- *  - stale-while-revalidate for /desktop/index.html, /chat-pwa,
- *    static manifests and icons
+ *  - network-first for the SPA shell HTML (/desktop/index.html, /chat-pwa):
+ *    a stale cached index references old hashed chunk URLs that 404 after a
+ *    redeploy, which crashes lazy imports (ChunkLoadError) and forces a reload
+ *    loop. Always fetch the current index when online; fall back to cache only
+ *    when the network fails (offline / mid-restart).
+ *  - stale-while-revalidate for static manifests and icons
  *  - passes everything else through (/api/*, /ws/*, ...)
  *
  * No app logic, no postMessage, no polling. The reconnect / version
@@ -103,33 +107,115 @@ self.addEventListener("fetch", (event: FetchEvent) => {
     return;
   }
 
-  if (isShellHTML(url) || isPrecachedStatic(url)) {
-    // Stale-while-revalidate: serve cache instantly, refresh in background.
-    // For chat-pwa subpaths (e.g. /chat-pwa/foo), serve cached /chat-pwa.
-    const cacheKey = isShellHTML(url) && url.pathname.startsWith("/chat-pwa")
+  // isShellHTML is checked BEFORE isPrecachedStatic on purpose: /desktop/,
+  // /desktop/index.html and /chat-pwa are in PRECACHE_URLS but must use
+  // network-first, not the SWR branch below -- a stale cached index
+  // reintroduces the ChunkLoadError loop. Keep this branch first.
+  if (isShellHTML(url)) {
+    // Network-first (bounded) for the SPA shell: fetch the current index when
+    // the backend is healthy so its chunk refs match the deployed assets. Fall
+    // back to the cached shell on a non-OK response (503 mid-restart), a
+    // network failure (offline), or a stall (aborted after the timeout),
+    // preserving the Install-Update reconnect UX. cache:"no-store" bypasses the
+    // browser HTTP cache so a 304-with-empty-body cannot slip through.
+    const cacheKey = url.pathname.startsWith("/chat-pwa")
       ? new Request("/chat-pwa")
-      : (isShellHTML(url) && url.pathname !== "/desktop/index.html"
-          ? new Request("/desktop/")
-          : req);
+      : (url.pathname !== "/desktop/index.html" ? new Request("/desktop/") : req);
     event.respondWith(
       caches.open(STATIC_CACHE).then(async (cache) => {
-        const hit = await cache.match(cacheKey);
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 4000);
+        try {
+          const fresh = await fetch(req, { cache: "no-store", signal: controller.signal });
+          if (fresh.ok) {
+            cache.put(cacheKey, fresh.clone());
+            return fresh;
+          }
+          // Non-OK (e.g. 503 mid-restart after Install Update): prefer the
+          // cached shell so the UI still loads and the reconnect banner shows.
+          const hit = await cache.match(cacheKey);
+          return hit || fresh;
+        } catch (err) {
+          // Offline / stall (aborted) / network failure: fall back to cache.
+          const hit = await cache.match(cacheKey);
+          if (hit) return hit;
+          throw err;
+        } finally {
+          clearTimeout(timer);
+        }
+      })
+    );
+    return;
+  }
+
+  if (isPrecachedStatic(url)) {
+    // Stale-while-revalidate for icons/manifests (no hashed-chunk coupling):
+    // serve cache instantly, refresh in background.
+    event.respondWith(
+      caches.open(STATIC_CACHE).then(async (cache) => {
+        const hit = await cache.match(req);
         const network = fetch(req).then((r) => {
-          if (r.ok) cache.put(cacheKey, r.clone());
+          if (r.ok) cache.put(req, r.clone());
           return r;
         }).catch((err) => {
-          // If we have a cached copy, fall back to it. Otherwise propagate
-          // the network error so the browser shows a normal failure rather
-          // than crashing the SW handler with an undefined Response.
           if (hit) return hit;
           throw err;
         });
-        if (hit) return hit;
-        return network;
+        return hit || network;
       })
     );
     return;
   }
 
   // Everything else: pass through.
+});
+
+// ---------------------------------------------------------------------------
+// Web push
+// ---------------------------------------------------------------------------
+
+self.addEventListener("push", (event: PushEvent) => {
+  // Server pushes a JSON payload {title, body, tag?, icon?, data?}.
+  // Fallback to a generic message if parsing fails or the push has no payload.
+  let payload: Record<string, unknown> | null = null;
+  try {
+    payload = event.data ? (event.data.json() as Record<string, unknown>) : null;
+  } catch {
+    payload = null;
+  }
+  if (!payload || typeof payload !== "object") {
+    payload = { title: "taOS", body: "New activity" };
+  }
+  const title = typeof payload["title"] === "string" ? payload["title"] : "taOS";
+  const options: NotificationOptions = {
+    body: typeof payload["body"] === "string" ? payload["body"] : "",
+    tag: typeof payload["tag"] === "string" ? payload["tag"] : undefined,
+    icon: typeof payload["icon"] === "string" ? payload["icon"] : undefined,
+    data: payload["data"] && typeof payload["data"] === "object" ? payload["data"] : {},
+  };
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
+self.addEventListener("notificationclick", (event: NotificationEvent) => {
+  // Close the notification, then focus an existing same-origin window
+  // (posting the click data so the shell can route to the right tab)
+  // or open a new one at root.
+  event.notification.close();
+  const data = (event.notification.data as Record<string, unknown>) || {};
+  event.waitUntil(
+    self.clients
+      .matchAll({ type: "window", includeUncontrolled: true })
+      .then((clientsList) => {
+        for (const client of clientsList) {
+          if (client.url && new URL(client.url).origin === self.location.origin) {
+            (client as WindowClient).postMessage({ type: "taos-push:click", data });
+            return (client as WindowClient).focus();
+          }
+        }
+        if (self.clients.openWindow) {
+          return self.clients.openWindow("/");
+        }
+        return null;
+      })
+  );
 });

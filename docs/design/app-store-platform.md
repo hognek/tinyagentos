@@ -25,9 +25,8 @@ TinyAgentOS evolves from an agent monitoring dashboard into a full AI-focused ho
 
 ## Non-Goals (This Spec)
 
-- Cloud services (tinyagentos.com, email relay, subscriptions) — future spec
+- Cloud services (tinyagentos.com, email relay) — future spec
 - Built-in services (Gitea, mail, web IDE) — these are apps in the catalog, not platform features
-- Billing/payments — future spec
 - Custom domain management — future spec
 
 ## Architecture
@@ -53,7 +52,8 @@ TinyAgentOS evolves from an agent monitoring dashboard into a full AI-focused ho
 │  Existing services:                                         │
 │  ├── Metrics Store (SQLite)                                 │
 │  ├── Backend Adapters (rkllama, ollama, llama.cpp, vllm)    │
-│  ├── QMD Client (per-agent HTTP)                            │
+│  ├── QMD Client (per-agent memory, HTTP :7832)              │
+│  ├── taosmd Client (user memory + librarian, HTTP :7900)    │
 │  └── Health Monitor (background poller)                     │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -674,7 +674,7 @@ rkllama currently loads model weights into system RAM (5.8GB RSS for 3 preloaded
 
 ## Future Work (Separate Specs)
 
-1. **Cloud services** — tinyagentos.com, email relay, hosted backup, subscriptions
+1. **Cloud services** — tinyagentos.com, email relay, hosted backup
 2. **Setup Agent** — chat-based configuration via local LLM
 3. **Authentication** — user accounts, API keys
 4. **Remote management** — manage multiple TinyAgentOS instances

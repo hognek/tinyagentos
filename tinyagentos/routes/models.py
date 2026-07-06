@@ -10,6 +10,7 @@ from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from tinyagentos.installers.model_paths import models_root
 from tinyagentos.model_sources import (
     estimate_ram_mb,
     get_compatibility,
@@ -36,7 +37,7 @@ class PullRequest(BaseModel):
 
 router = APIRouter()
 
-DEFAULT_MODELS_DIR = Path("/opt/tinyagentos/models")
+DEFAULT_MODELS_DIR = models_root()
 
 
 _MODEL_FILE_SUFFIXES = (".gguf", ".rkllm", ".bin", ".safetensors", ".onnx")
@@ -108,20 +109,33 @@ def _scan_all_roots(roots: list[Path]) -> list[dict]:
     return merged
 
 
+def _attach_model_ids(downloaded_files: list[dict], models) -> None:
+    """Attach the catalog manifest id to each downloaded file entry.
+
+    Matches on the ``{manifest.id}-{variant.id}.{format}`` naming convention
+    that POST /api/models/download uses when writing a variant to disk (see
+    ``_model_to_dict``'s own ``expected_filename`` check below, which this
+    mirrors). Lets the frontend wire a per-file Delete button to
+    DELETE /api/models/{model_id} without having to reverse-engineer that
+    naming convention itself.
+    """
+    by_filename: dict[str, str] = {}
+    for m in models:
+        for v in m.variants:
+            expected = f"{m.id}-{v['id']}.{v.get('format', 'bin')}"
+            by_filename.setdefault(expected, m.id)
+    for entry in downloaded_files:
+        model_id = by_filename.get(entry["filename"])
+        if model_id:
+            entry["model_id"] = model_id
+
+
 def _is_service_installed(variant: dict) -> bool:
-    """Detect whether a multi-file service-backed variant (e.g. RKNN SD) is
-    installed on disk outside the ``data/models`` tree. Looks for an
-    ``install_script`` marker and a representative file at the install path.
+    """Detect whether a multi-file service-backed variant is installed on disk
+    outside the ``data/models`` tree.
     """
     if not variant.get("multi_file"):
         return False
-    # darkbit1001 / happyme531 layout — models live under
-    # ~/.local/share/tinyagentos/rknn-sd/model/{text_encoder,unet,vae_decoder}
-    # and the install marker is the unet rknn weights.
-    if variant.get("backend") and "rknn-stable-diffusion" in variant.get("backend", []):
-        install_root = Path.home() / ".local" / "share" / "tinyagentos" / "rknn-sd"
-        unet = install_root / "model" / "unet" / "model.rknn"
-        return unet.exists() and unet.stat().st_size > 1_000_000_000
     return False
 
 
@@ -291,6 +305,7 @@ async def list_models(request: Request):
 
     models = registry.list_available(type_filter="model")
     downloaded = _scan_all_roots(_scan_roots(request))
+    _attach_model_ids(downloaded, models)
     live_models = catalog.all_models() if catalog is not None else []
     # Build {app_id: True} from the install registry so backend-installed
     # models (e.g. rk-llama.cpp GGUFs at ~/rk-llama.cpp/models/) still show
@@ -332,13 +347,69 @@ async def download_model(request: Request, body: DownloadRequest):
     if not url:
         return JSONResponse({"error": "No download URL for variant"}, status_code=400)
 
+    download_id = f"{body.app_id}-{body.variant_id}"
+    dm = request.app.state.download_manager
+
+    # Variants that declare requires.backends: [{id: rkllama, ...}] must be
+    # installed through rkllama's own /api/pull so the weight is registered
+    # with the running rkllama server (and shows up in its /api/tags). A raw
+    # HTTP download to disk here would leave the file invisible to rkllama —
+    # it never loads, so it can neither be selected as an agent model nor
+    # deployed (see #1599 / #1600).
+    backend_deps = (variant.get("requires") or {}).get("backends") or []
+    backend_ids = {b.get("id") for b in backend_deps if isinstance(b, dict)}
+    if "rkllama" in backend_ids:
+        from tinyagentos.installers.rkllama_installer import (
+            RkllamaInstaller,
+            resolve_rkllama_url,
+        )
+
+        installer = RkllamaInstaller(rkllama_url=resolve_rkllama_url(None))
+        catalog = getattr(request.app.state, "backend_catalog", None)
+
+        async def _install_and_record(on_progress):
+            result = await installer.install(
+                body.app_id, {}, variant=variant, on_progress=on_progress
+            )
+            if result.get("success"):
+                # rkllama pulls the weight into its own model store, not
+                # models_dir, so the disk scan in list_models() never sees it.
+                # Record the install as a registry breadcrumb (corroborated by
+                # live-backend evidence, see _model_to_dict) and force an
+                # immediate catalog refresh so the newly pulled model shows up
+                # in all_models() right away instead of waiting for the next
+                # poll tick.
+                try:
+                    registry.mark_installed(
+                        body.app_id, variant.get("id") or "latest", state="installed"
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to record rkllama install for %s in registry",
+                        body.app_id, exc_info=True,
+                    )
+                if catalog is not None:
+                    try:
+                        await catalog.refresh()
+                    except Exception:
+                        logger.warning(
+                            "Backend catalog refresh after rkllama install failed for %s",
+                            body.app_id, exc_info=True,
+                        )
+            return result
+
+        dm.start_installer_task(download_id, _install_and_record)
+        return {
+            "status": "started",
+            "download_id": download_id,
+            "app_id": body.app_id,
+            "variant_id": body.variant_id,
+        }
+
     models_dir = _models_dir(request)
     fmt = variant.get("format", "bin")
     filename = f"{body.app_id}-{body.variant_id}.{fmt}"
     dest = models_dir / filename
-
-    download_id = f"{body.app_id}-{body.variant_id}"
-    dm = request.app.state.download_manager
     # Hybrid download: DownloadManager tries the torrent swarm first if
     # the variant declares a magnet URI and the catalog publisher has
     # marked its licence as allowing redistribution. Failures fall back
@@ -670,27 +741,6 @@ async def loaded_models(request: Request):
                                 "expires_at": None,
                                 "details": {},
                             })
-                elif backend_type == "rknn-sd":
-                    # Use /health to determine actual pipeline load state.
-                    # /v1/models lists what the server *can* serve (always
-                    # populated) and does not reflect whether weights are
-                    # actually in NPU memory.
-                    resp = await client.get(f"{base}/health", timeout=5)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        if data.get("pipeline_loaded") is True:
-                            loaded.append({
-                                "name": data.get("model", "rknn-sd"),
-                                "backend": backend_name,
-                                "backend_type": backend_type,
-                                "backend_url": backend_url,
-                                "purpose": "image-generation",
-                                "size_mb": None,
-                                "vram_mb": None,
-                                "ram_mb": None,
-                                "expires_at": None,
-                                "details": {},
-                            })
                 elif backend_type == "sd-cpp":
                     # sd-cpp's /sdapi/v1/options reports the configured
                     # checkpoint but does not expose whether weights are
@@ -740,7 +790,10 @@ async def delete_model(request: Request, model_id: str):
 
     deleted = []
     for f in models_dir.glob(f"{model_id}*"):
-        if f.is_file() and f.suffix in (".gguf", ".rkllm", ".bin"):
+        # Use the same canonical suffix set (case-insensitive) the scan uses,
+        # so .safetensors/.onnx models aren't left orphaned on disk after a
+        # "delete" — the narrower hardcoded list missed them.
+        if f.is_file() and f.suffix.lower() in _MODEL_FILE_SUFFIXES:
             f.unlink()
             deleted.append(f.name)
 

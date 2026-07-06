@@ -15,6 +15,25 @@ from tinyagentos.catalog.resolver import (
 )
 from tinyagentos.installers.base import get_installer
 from tinyagentos.routes.store_install import get_device_capability
+from tinyagentos.store_popularity import (
+    parse_repo,
+    popularity_for_homepage_cached,
+)
+
+
+def _popularity_by_app_id(apps) -> dict[str, dict]:
+    """Resolve the telemetry-ready popularity shape for each manifest.
+
+    Reads ONLY the in-memory star cache; it never calls GitHub, so the Store
+    list endpoint returns immediately and is never stalled by a slow or
+    rate-limited GitHub. Not-yet-warmed (or non-GitHub) entries get a
+    popularity shape with github_stars=None. A background warmer populates the
+    cache over time, respecting GitHub's unauthenticated rate limit.
+    """
+    return {
+        app.id: popularity_for_homepage_cached(getattr(app, "homepage", "") or "")
+        for app in apps
+    }
 
 
 class InstallRequest(BaseModel):
@@ -125,19 +144,43 @@ async def list_catalog(request: Request, type: str | None = None):
             return registry.is_installed(app_id)
         return installation.state(app_id) in ("running", "installed")
 
+    popularity = _popularity_by_app_id(apps)
+
     return [
         {
             "id": a.id, "name": a.name, "type": a.type, "category": a.category,
             "version": a.version,
             "description": a.description, "icon": a.icon,
+            "license": a.license, "weights_license": a.weights_license,
+            "license_class": a.license_class,
             "requires": a.requires, "hardware_tiers": a.hardware_tiers,
             "install_method": (a.install.get("method") or a.install.get("backend") or "") if isinstance(a.install, dict) else "",
             "installed": _installed_flag(a.id),
             "state": (installation.state(a.id) if installation else ("installed" if registry.is_installed(a.id) else "not_installed")),
             "variants": _slim_variants(a),
+            # Popularity (telemetry-ready). repo + stars are flattened for the
+            # existing Store frontend; popularity carries the full shape so #15
+            # can fill installs without a breaking change.
+            "repo": parse_repo(getattr(a, "homepage", "") or ""),
+            "stars": popularity[a.id]["github_stars"],
+            "popularity": popularity[a.id],
         }
         for a in apps
     ]
+
+
+@router.get("/api/store/popularity")
+async def list_popularity(request: Request, type: str | None = None):
+    """Return the telemetry-ready popularity shape per app id.
+
+    {app_id: {"github_stars": int|null, "installs": int|null, "score": float}}
+
+    github_stars come from GitHub today; installs is null until #15 wires real
+    install telemetry. GitHub failures degrade to github_stars=null.
+    """
+    registry = request.app.state.registry
+    apps = registry.list_available(type_filter=type)
+    return _popularity_by_app_id(apps)
 
 
 @router.get("/api/store/installed")
@@ -330,3 +373,40 @@ async def uninstall_app(request: Request, body: UninstallRequest):
                     await mcp_supervisor.uninstall(body.app_id)
     registry.mark_uninstalled(body.app_id)
     return {"status": "uninstalled", "app_id": body.app_id}
+
+
+# ── Store templates ────────────────────────────────────────────────────
+
+import yaml
+from pathlib import Path
+
+_STORE_TEMPLATE_DIR = Path(__file__).parent.parent.parent / "app-catalog" / "templates"
+
+
+@router.get("/api/store/templates")
+async def list_store_templates():
+    """Return curated hardware-tier install template bundles.
+
+    Each template is a static YAML file in app-catalog/templates/ describing
+    a curated set of apps for a specific hardware tier. The response includes
+    the template metadata plus resolved app info from the catalog so the
+    frontend can show download sizes, descriptions, and install buttons
+    without additional API calls.
+    """
+    if not _STORE_TEMPLATE_DIR.is_dir():
+        return {"templates": []}
+
+    templates = []
+    for tmpl_path in sorted(_STORE_TEMPLATE_DIR.glob("*.yaml")):
+        try:
+            with open(tmpl_path) as f:
+                data = yaml.safe_load(f)
+        except Exception:
+            continue
+        # yaml.safe_load can return a scalar/list for valid-but-wrong YAML;
+        # guard so a malformed template file is skipped, not a 500.
+        if not isinstance(data, dict) or data.get("type") != "template":
+            continue
+        templates.append(data)
+
+    return {"templates": templates}

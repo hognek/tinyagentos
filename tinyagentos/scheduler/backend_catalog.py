@@ -40,7 +40,10 @@ BACKEND_CAPABILITIES: dict[str, set[str]] = {
     "openai": {"llm-chat", "embedding"},
     "anthropic": {"llm-chat"},
     "sd-cpp": {"image-generation"},
-    "rknn-sd": {"image-generation"},
+    # IOPaint (lama-cleaner successor): LaMa erase/inpaint + rembg + RealESRGAN.
+    "iopaint": {"image-editing", "background-removal", "upscale"},
+    # FLUX.1-Fill served via an inpaint/outpaint endpoint — the quality tier.
+    "flux-fill": {"image-editing"},
 }
 
 

@@ -6,8 +6,8 @@ Each agent runs its own `qmd serve` instance inside its LXC container. This keep
 
 ```
 Host (Orange Pi / x86)
-├── rkllama (port 8080) — shared NPU/GPU inference
-├── TinyAgentOS (port 6969) — web GUI, talks to each agent's qmd serve
+├── rkllama (port 7833) — shared NPU/GPU inference
+├── taOS (port 6969) — web GUI, talks to each agent's qmd serve
 │
 ├── LXC: agent-alpha
 │   ├── agent framework gateway
@@ -25,13 +25,16 @@ Host (Orange Pi / x86)
         └── ~/.cache/qmd/index.sqlite
 ```
 
-**Key point:** Each agent's `qmd serve` uses the shared rkllama/ollama backend for inference but stores its own index database locally. TinyAgentOS accesses each agent's memory via the agent's `qmd_url`.
+**Key point:** Each agent's `qmd serve` uses the shared rkllama/ollama backend for inference but stores its own index database locally. taOS accesses each agent's memory via the agent's `qmd_url`.
 
 ## Install QMD in Agent LXC
 
 ```bash
 # Inside the agent's LXC container
-npm install -g github:jaylfc/qmd#feat/remote-llm-provider
+# Always install the latest published qmd so deployments match the
+# maintainer's setup.  The npm package is pre-built; installing from the
+# git source requires a TypeScript build step.
+npm install -g @jaylfc/qmd@latest
 ```
 
 ## Configure QMD to Use Remote Backend
@@ -51,7 +54,7 @@ Each agent runs its own `qmd serve` that:
 2. Routes inference requests (embed, rerank, expand) to the shared rkllama backend on the host
 
 ```bash
-qmd serve --port 7832 --bind 0.0.0.0 --backend rkllama --rkllama-url http://<host-ip>:8080
+qmd serve --port 7832 --bind 0.0.0.0 --backend rkllama --rkllama-url http://<host-ip>:7833
 ```
 
 Replace `<host-ip>` with the host's IP address. If using Tailscale, the Tailscale IP avoids macvlan routing issues where LXC containers can't reach the host's LAN IP.
@@ -67,7 +70,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/qmd serve --port 7832 --bind 0.0.0.0 --backend rkllama --rkllama-url http://<host-ip>:8080
+ExecStart=/usr/local/bin/qmd serve --port 7832 --bind 0.0.0.0 --backend rkllama --rkllama-url http://<host-ip>:7833
 Restart=on-failure
 RestartSec=5
 Environment=NODE_ENV=production
@@ -81,9 +84,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now qmd-serve
 ```
 
-## TinyAgentOS Config
+## taOS Config
 
-In TinyAgentOS's `data/config.yaml`, point each agent to its QMD serve instance:
+In taOS's `data/config.yaml`, point each agent to its QMD serve instance:
 
 ```yaml
 agents:
@@ -101,12 +104,26 @@ agents:
     color: "#ff7eb3"
 ```
 
-TinyAgentOS then queries each agent's endpoints:
+taOS then queries each agent's endpoints:
 - `GET /status` — index health
 - `GET /collections` — list memory collections
 - `GET /search?q=X` — keyword search
 - `GET /browse?limit=20` — paginated browsing
 - `GET /health` — backend status
+
+## Firewall (shared A2A bus hosts)
+
+When a host runs `taosmd serve` as the shared A2A bus (default port 7900),
+remote agents and workers need inbound TCP access to that port. If ufw is
+active the port is blocked by default; the install script opens it
+automatically, but you can also do it by hand:
+
+```bash
+sudo ufw allow 7900/tcp comment 'taOS A2A bus'
+sudo ufw status | grep 7900
+```
+
+If the bus port was changed via `TAOS_BUS_PORT`, substitute that value.
 
 ## Verify
 

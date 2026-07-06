@@ -47,6 +47,44 @@ class TestDeployAgent:
             assert env["TAOS_SKILLS_URL"].endswith("/api/skill-exec")
 
     @pytest.mark.asyncio
+    async def test_remote_deploy_targets_worker_and_skips_proxy(self, tmp_path):
+        """remote= creates on the worker, qualifies downstream incus ops with
+        <remote>:, skips the localhost proxy devices, and keeps the record name
+        unqualified."""
+        req = _req(data_dir=tmp_path, remote="fedora-worker", taos_host="100.78.225.80")
+        exec_names = []
+
+        async def mock_exec(name, cmd, **kwargs):
+            exec_names.append(name)
+            if "hostname -I" in " ".join(cmd):
+                return (0, "10.228.0.9")
+            return (0, "ok")
+
+        with patch("tinyagentos.deployer.create_container", new_callable=AsyncMock) as mock_create, \
+             patch("tinyagentos.deployer.exec_in_container", side_effect=mock_exec), \
+             patch("tinyagentos.deployer.push_file", new_callable=AsyncMock, return_value=(0, "")), \
+             patch("tinyagentos.deployer.add_proxy_device", new_callable=AsyncMock) as mock_proxy:
+            mock_create.return_value = {"success": True, "name": "taos-agent-test"}
+
+            result = await deploy_agent(req)
+            assert result["success"] is True
+            # Record name stays unqualified.
+            assert result["container"] == "taos-agent-test"
+            # create_container was told to target the remote.
+            assert mock_create.call_args.kwargs["remote"] == "fedora-worker"
+            # Proxy devices are localhost-only; never attached for a remote deploy.
+            mock_proxy.assert_not_awaited()
+            # Downstream incus ops are qualified with the remote.
+            assert exec_names and all(n.startswith("fedora-worker:") for n in exec_names)
+            # The agent's callback host is the controller's Tailscale IP.
+            env = mock_create.call_args.kwargs["env"]
+            assert "100.78.225.80" in env["TAOS_BRIDGE_URL"]
+            # The LiteLLM base must target the controller over the network for a
+            # remote deploy, never the container's own loopback (no proxy device).
+            assert "100.78.225.80" in env["OPENAI_BASE_URL"]
+            assert "127.0.0.1" not in env["OPENAI_BASE_URL"]
+
+    @pytest.mark.asyncio
     async def test_one_trace_bind_mount(self, tmp_path):
         """After deploy, create_container receives exactly one mount: the trace dir."""
         req = _req(data_dir=tmp_path)
@@ -198,11 +236,12 @@ class TestDeployAgent:
             )
 
     @pytest.mark.asyncio
-    async def test_fallback_to_master_key_when_create_returns_none(self, tmp_path):
-        """When LiteLLM runs without a Postgres DB, create_agent_key
-        returns None. The deployer must fall back to the shared master
-        key so the container still gets a non-empty LITELLM_API_KEY —
-        otherwise openclaw's gateway crashes on boot."""
+    async def test_deploy_fails_when_key_mint_returns_none_no_db(self, tmp_path, monkeypatch):
+        """When LiteLLM runs without a Postgres DB, create_agent_key returns None.
+        With the master-key fallback DISABLED (the hardened/multi-tenant opt-out),
+        the deployer must refuse rather than inject the shared master key, with a
+        clear error directing operators to configure Postgres."""
+        monkeypatch.setenv("TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK", "1")
         mock_proxy = MagicMock()
         mock_proxy.is_running.return_value = True
         mock_proxy.url = "http://localhost:4000"
@@ -215,26 +254,57 @@ class TestDeployAgent:
             extra_config={"llm_proxy": mock_proxy},
         )
 
+        with patch("tinyagentos.deployer.create_container", new_callable=AsyncMock) as mock_create, \
+             patch("tinyagentos.deployer.exec_in_container", new_callable=AsyncMock, return_value=(0, "")), \
+             patch("tinyagentos.deployer.push_file", new_callable=AsyncMock, return_value=(0, "")), \
+             patch("tinyagentos.deployer.add_proxy_device", new_callable=AsyncMock, return_value={"success": True, "output": ""}):
+            mock_create.return_value = {"success": True, "name": "taos-agent-routing-only"}
+            result = await deploy_agent(req)
+            assert result["success"] is False
+            assert "routing-only" in result["error"] or "DATABASE_URL" in result["error"]
+            assert "fallback is disabled" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_master_key_never_injected_into_container_env(self, tmp_path):
+        """The per-install master key must never appear in the container env —
+        not as OPENAI_API_KEY, LITELLM_API_KEY, or any other variable.
+        Only scoped per-agent virtual keys are permitted."""
+        from tinyagentos.litellm_config import get_litellm_master_key
+        master_key = get_litellm_master_key(tmp_path)
+        mock_proxy = MagicMock()
+        mock_proxy.is_running.return_value = True
+        mock_proxy.url = "http://localhost:4000"
+        mock_proxy.database_url = "postgresql://u:p@h/db"
+        mock_proxy._data_dir = tmp_path
+        mock_proxy.create_agent_key = AsyncMock(return_value="sk-scoped-agent-key")
+
+        req = _req(
+            name="master-key-test",
+            data_dir=tmp_path,
+            extra_config={"llm_proxy": mock_proxy},
+        )
+
         async def mock_exec_fn(name, cmd, **kwargs):
             if "hostname -I" in " ".join(cmd):
-                return (0, "10.0.0.14")
+                return (0, "10.0.0.42")
             return (0, "ok")
 
         with patch("tinyagentos.deployer.create_container", new_callable=AsyncMock) as mock_create, \
              patch("tinyagentos.deployer.exec_in_container", side_effect=mock_exec_fn), \
              patch("tinyagentos.deployer.push_file", new_callable=AsyncMock, return_value=(0, "")), \
              patch("tinyagentos.deployer.add_proxy_device", new_callable=AsyncMock, return_value={"success": True, "output": ""}):
-            mock_create.return_value = {"success": True, "name": "taos-agent-routing-only"}
+            mock_create.return_value = {"success": True, "name": "taos-agent-master-key-test"}
             result = await deploy_agent(req)
             assert result["success"] is True
             env = mock_create.call_args.kwargs["env"]
-            assert env["LITELLM_API_KEY"] == "sk-taos-master"
-            assert env["OPENAI_API_KEY"] == "sk-taos-master"
-            assert env["OPENAI_BASE_URL"] == "http://localhost:4000/v1"
-            # Embedding env must still fire under the fallback path — the
-            # LiteLLM routing-only mode serves /v1/embeddings identically.
-            assert env["TAOS_EMBEDDING_URL"] == "http://localhost:4000/v1/embeddings"
-            assert env["TAOS_EMBEDDING_MODEL"] == "taos-embedding-default"
+            # The scoped virtual key must be injected
+            assert env["OPENAI_API_KEY"] == "sk-scoped-agent-key"
+            assert env["LITELLM_API_KEY"] == "sk-scoped-agent-key"
+            # The master key must never appear anywhere in the container env
+            for var, val in env.items():
+                assert val != master_key, (
+                    f"master key leaked into container env var {var!r}"
+                )
 
     @pytest.mark.asyncio
     async def test_create_agent_key_called_with_agent_models(self, tmp_path):
@@ -274,11 +344,13 @@ class TestDeployAgent:
             )
 
     @pytest.mark.asyncio
-    async def test_deploy_fails_loudly_when_db_configured_but_key_mint_fails(self, tmp_path):
-        """DB configured + /key/generate returns None → deploy fails with a
-        clear error. Falling back to the master key here would hide real
-        LiteLLM bugs (migration pending, DB unreachable, master key drift)
-        and ship broken agents."""
+    async def test_deploy_fails_loudly_when_db_configured_but_key_mint_fails(self, tmp_path, monkeypatch):
+        """DB configured + /key/generate returns None → deploy ALWAYS fails with
+        a clear error naming the DB host (no credentials leaked), regardless of
+        the fallback opt-out. A configured-but-broken DB is a real fault that
+        must surface, not be masked by the shared master key."""
+        # Explicitly leave the opt-out UNSET to prove the refusal is unconditional.
+        monkeypatch.delenv("TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK", raising=False)
         mock_proxy = MagicMock()
         mock_proxy.is_running.return_value = True
         mock_proxy.url = "http://localhost:4000"
@@ -550,6 +622,70 @@ class TestDeployAgent:
             assert "tcp:127.0.0.1:6969" in listens
 
     @pytest.mark.asyncio
+    async def test_litellm_proxy_device_container_listen_stays_4000(self, tmp_path):
+        """Container-side listen for LiteLLM is always 4000 (baked into agent
+        configs); the host-side connect follows the live proxy port.  With no
+        proxy supplied the deployer falls back to 7834."""
+        req = _req(name="port-check", data_dir=tmp_path)
+
+        async def mock_exec_fn(name, cmd, **kwargs):
+            if "hostname -I" in " ".join(cmd):
+                return (0, "10.0.0.92")
+            return (0, "ok")
+
+        with patch("tinyagentos.deployer.create_container", new_callable=AsyncMock) as mock_create, \
+             patch("tinyagentos.deployer.exec_in_container", side_effect=mock_exec_fn), \
+             patch("tinyagentos.deployer.push_file", new_callable=AsyncMock, return_value=(0, "")), \
+             patch("tinyagentos.deployer.add_proxy_device", new_callable=AsyncMock) as mock_proxy:
+            mock_create.return_value = {"success": True, "name": "taos-agent-port-check"}
+            mock_proxy.return_value = {"success": True, "output": ""}
+            result = await deploy_agent(req)
+            assert result["success"] is True
+
+            litellm_call = next(
+                c for c in mock_proxy.call_args_list if c.args[1] == "taos-proxy-litellm"
+            )
+            assert litellm_call.kwargs["listen"] == "tcp:127.0.0.1:4000"
+            assert litellm_call.kwargs["connect"] == "tcp:127.0.0.1:7834"
+
+    @pytest.mark.asyncio
+    async def test_litellm_proxy_device_connect_follows_live_proxy_port(self, tmp_path):
+        """When extra_config supplies an llm_proxy object with a custom port,
+        the host-side connect address of the incus proxy device uses that port."""
+        mock_proxy = MagicMock()
+        mock_proxy.is_running.return_value = False
+        mock_proxy.port = 4000  # legacy install kept old port
+        mock_proxy.database_url = None
+
+        req = _req(
+            name="legacy-port",
+            data_dir=tmp_path,
+            extra_config={"llm_proxy": mock_proxy},
+        )
+
+        async def mock_exec_fn(name, cmd, **kwargs):
+            if "hostname -I" in " ".join(cmd):
+                return (0, "10.0.0.93")
+            return (0, "ok")
+
+        with patch("tinyagentos.deployer.create_container", new_callable=AsyncMock) as mock_create, \
+             patch("tinyagentos.deployer.exec_in_container", side_effect=mock_exec_fn), \
+             patch("tinyagentos.deployer.push_file", new_callable=AsyncMock, return_value=(0, "")), \
+             patch("tinyagentos.deployer.add_proxy_device", new_callable=AsyncMock) as mock_proxy_dev:
+            mock_create.return_value = {"success": True, "name": "taos-agent-legacy-port"}
+            mock_proxy_dev.return_value = {"success": True, "output": ""}
+            result = await deploy_agent(req)
+            assert result["success"] is True
+
+            litellm_call = next(
+                c for c in mock_proxy_dev.call_args_list if c.args[1] == "taos-proxy-litellm"
+            )
+            # Container listen stays 4000 regardless of host port
+            assert litellm_call.kwargs["listen"] == "tcp:127.0.0.1:4000"
+            # Host connect follows the live proxy's recorded port
+            assert litellm_call.kwargs["connect"] == "tcp:127.0.0.1:4000"
+
+    @pytest.mark.asyncio
     async def test_proxy_device_failure_rolls_back(self, tmp_path):
         req = _req(name="noproxy", data_dir=tmp_path)
 
@@ -769,6 +905,32 @@ class TestDeployAgent:
             env = mock_create.call_args.kwargs["env"]
             assert env["TAOS_BRIDGE_URL"] == "http://127.0.0.1:6969"
 
+    @pytest.mark.asyncio
+    async def test_bridge_token_injected_per_deployment(self, tmp_path):
+        """TAOS_BRIDGE_TOKEN is a 64-char hex secret generated uniquely per deployment."""
+        req = _req(name="token-test", data_dir=tmp_path)
+
+        async def mock_exec_fn(name, cmd, **kwargs):
+            if "hostname -I" in " ".join(cmd):
+                return (0, "10.0.0.5")
+            return (0, "ok")
+
+        tokens = []
+        for _ in range(2):
+            with patch("tinyagentos.deployer.create_container", new_callable=AsyncMock) as mock_create, \
+                 patch("tinyagentos.deployer.exec_in_container", side_effect=mock_exec_fn), \
+                 patch("tinyagentos.deployer.push_file", new_callable=AsyncMock, return_value=(0, "")), \
+                 patch("tinyagentos.deployer.add_proxy_device", new_callable=AsyncMock, return_value={"success": True, "output": ""}):
+                mock_create.return_value = {"success": True, "name": "taos-agent-token-test"}
+                await deploy_agent(req)
+                env = mock_create.call_args.kwargs["env"]
+                token = env["TAOS_BRIDGE_TOKEN"]
+                assert len(token) == 64, f"expected 64 hex chars, got {len(token)}"
+                assert all(c in "0123456789abcdef" for c in token)
+                tokens.append(token)
+        # Two deployments must produce different tokens.
+        assert tokens[0] != tokens[1], "bridge tokens must be unique per deployment"
+
 
 class TestSpliceTaosmdBlock:
     """Unit tests for the _splice_taosmd_block helper — no I/O involved."""
@@ -953,6 +1115,30 @@ class TestBackgroundDeploy:
         resp = await client.get("/api/agents/nonexistent/deploy-status")
         assert resp.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_deploy_failure_emits_notification(self, client, app):
+        """When background deploy fails, a notification must be pushed so the
+        tray surfaces the error rather than leaving the user stuck on 'deploying'."""
+        import asyncio
+
+        with patch(
+            "tinyagentos.deployer.deploy_agent",
+            new_callable=AsyncMock,
+            return_value={"success": False, "error": "container create failed"},
+        ):
+            await client.post("/api/agents/deploy", json={
+                "name": "notif-fail-test",
+                "framework": "none",
+            })
+            # Yield to the event loop so the background task runs to completion.
+            await asyncio.sleep(0.1)
+
+        notifs = await app.state.notifications.list(limit=20)
+        error_notifs = [n for n in notifs if "notif-fail-test" in n.get("message", "")]
+        assert error_notifs, "Expected a notification for the failed deploy"
+        assert error_notifs[0].get("level") == "error"
+        assert "container create failed" in error_notifs[0].get("message", "")
+
 
 class TestUndeployAgent:
     @pytest.mark.asyncio
@@ -1028,3 +1214,146 @@ class TestContainerFailureExplanation:
         assert deployer._is_unprivileged_userns(str(f2)) is True
         # missing file (e.g. macOS): not an unprivileged Linux userns
         assert deployer._is_unprivileged_userns(str(tmp_path / "nope")) is False
+
+
+class TestMasterKeyFallback:
+    """Per-agent virtual key mint failure: gated master-key fallback (#668 regression).
+
+    When LiteLLM can't mint a per-agent scoped key (routing-only / ARM where
+    prisma can't start), deploy falls back to the shared master key on a
+    single-user instance (default) instead of refusing, unless the operator
+    sets TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK.
+    """
+
+    def _proxy(self):
+        proxy = MagicMock()
+        proxy.is_running.return_value = True
+        proxy.create_agent_key = AsyncMock(return_value=None)  # mint fails
+        proxy.database_url = None  # routing-only
+        proxy.url = "http://127.0.0.1:7834"
+        return proxy
+
+    async def _run(self, tmp_path):
+        async def mock_exec(name, cmd, **kwargs):
+            return (0, "10.0.0.5") if "hostname -I" in " ".join(cmd) else (0, "ok")
+        req = _req(data_dir=tmp_path, framework="hermes", model="kilo-auto/free",
+                   extra_config={"llm_proxy": self._proxy()})
+        with patch("tinyagentos.deployer.create_container", new_callable=AsyncMock) as mock_create, \
+             patch("tinyagentos.deployer.exec_in_container", side_effect=mock_exec), \
+             patch("tinyagentos.deployer.push_file", new_callable=AsyncMock, return_value=(0, "")), \
+             patch("tinyagentos.deployer.add_proxy_device", new_callable=AsyncMock, return_value={"success": True, "output": ""}), \
+             patch("tinyagentos.llm_proxy.get_litellm_master_key", return_value="sk-master-xyz"):
+            mock_create.return_value = {"success": True, "name": "taos-agent-test"}
+            result = await deploy_agent(req)
+            env = mock_create.call_args.kwargs["env"]
+            return result, env
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_master_key_by_default(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK", raising=False)
+        result, env = await self._run(tmp_path)
+        assert result["success"] is True
+        assert env["LITELLM_API_KEY"] == "sk-master-xyz"
+        assert env["OPENAI_API_KEY"] == "sk-master-xyz"
+        assert any("master key" in s for s in result["steps"])
+
+    @pytest.mark.asyncio
+    async def test_refuses_when_fallback_disabled(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK", "1")
+        async def mock_exec(name, cmd, **kwargs):
+            return (0, "ok")
+        req = _req(data_dir=tmp_path, framework="hermes", model="kilo-auto/free",
+                   extra_config={"llm_proxy": self._proxy()})
+        with patch("tinyagentos.deployer.create_container", new_callable=AsyncMock), \
+             patch("tinyagentos.deployer.exec_in_container", side_effect=mock_exec), \
+             patch("tinyagentos.deployer.push_file", new_callable=AsyncMock, return_value=(0, "")), \
+             patch("tinyagentos.deployer.add_proxy_device", new_callable=AsyncMock, return_value={"success": True, "output": ""}):
+            result = await deploy_agent(req)
+        assert result["success"] is False
+        assert "fallback is disabled" in result["error"]
+
+
+class TestFrameworkAwareBaseImage:
+    """Framework-aware prebuilt base image selection (Hermes fast-path)."""
+
+    @staticmethod
+    async def _run(framework, present_aliases, tmp_path):
+        """Deploy *framework* with is_image_present True only for the aliases
+        in *present_aliases*. Return (launch_image, env, recorded_exec_cmds)."""
+        req = _req(name="fwbase", framework=framework, data_dir=tmp_path)
+        recorded = []
+
+        async def mock_exec(name, cmd, **kwargs):
+            cmd_str = " ".join(cmd)
+            recorded.append(cmd_str)
+            if "hostname -I" in cmd_str:
+                return (0, "10.0.0.7")
+            return (0, "ok")
+
+        async def fake_present(alias, remote=None):
+            return alias in present_aliases
+
+        with patch("tinyagentos.deployer.create_container", new_callable=AsyncMock) as mock_create, \
+             patch("tinyagentos.deployer.is_image_present", side_effect=fake_present), \
+             patch("tinyagentos.deployer.exec_in_container", side_effect=mock_exec), \
+             patch("tinyagentos.deployer.push_file", new_callable=AsyncMock, return_value=(0, "")), \
+             patch("tinyagentos.deployer.add_proxy_device", new_callable=AsyncMock, return_value={"success": True, "output": ""}):
+            mock_create.return_value = {"success": True, "name": "taos-agent-fwbase"}
+            await deploy_agent(req)
+            launch_image = mock_create.call_args.kwargs["image"]
+            env = mock_create.call_args.kwargs["env"]
+        return launch_image, env, recorded
+
+    @pytest.mark.asyncio
+    async def test_openclaw_uses_its_dedicated_base(self, tmp_path):
+        launch, env, recorded = await self._run(
+            "openclaw", {"taos-openclaw-base"}, tmp_path
+        )
+        assert launch == "taos-openclaw-base"
+        assert env.get("TAOS_BASE_IMAGE_PRESENT") == "1"
+        assert not any("apt-get install" in c for c in recorded)
+
+    @pytest.mark.asyncio
+    async def test_hermes_uses_its_dedicated_base(self, tmp_path):
+        launch, env, recorded = await self._run(
+            "hermes", {"taos-hermes-base"}, tmp_path
+        )
+        assert launch == "taos-hermes-base"
+        assert env.get("TAOS_BASE_IMAGE_PRESENT") == "1"
+        assert not any("apt-get install" in c for c in recorded)
+
+    @pytest.mark.asyncio
+    async def test_hermes_falls_back_to_generic_base(self, tmp_path):
+        # No dedicated hermes base on this host, but the generic one is present.
+        launch, env, recorded = await self._run(
+            "hermes", {"taos-base"}, tmp_path
+        )
+        assert launch == "taos-base"
+        assert env.get("TAOS_BASE_IMAGE_PRESENT") == "1"
+        # Generic base already has the common deps -- apt is skipped.
+        assert not any("apt-get install" in c for c in recorded)
+
+    @pytest.mark.asyncio
+    async def test_unknown_framework_uses_generic_base(self, tmp_path):
+        launch, env, recorded = await self._run(
+            "smolagents", {"taos-base"}, tmp_path
+        )
+        assert launch == "taos-base"
+        assert env.get("TAOS_BASE_IMAGE_PRESENT") == "1"
+        assert not any("apt-get install" in c for c in recorded)
+
+    @pytest.mark.asyncio
+    async def test_cold_fallback_when_no_base_present(self, tmp_path):
+        launch, env, recorded = await self._run("hermes", set(), tmp_path)
+        assert launch == "images:debian/bookworm"
+        assert "TAOS_BASE_IMAGE_PRESENT" not in env
+        # Cold host still runs the full apt install.
+        assert any("apt-get install" in c for c in recorded)
+
+    @pytest.mark.asyncio
+    async def test_dedicated_base_preferred_over_generic(self, tmp_path):
+        # Both present -- the framework-specific alias must win.
+        launch, _env, _recorded = await self._run(
+            "hermes", {"taos-hermes-base", "taos-base"}, tmp_path
+        )
+        assert launch == "taos-hermes-base"

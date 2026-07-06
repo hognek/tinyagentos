@@ -8,11 +8,17 @@ regardless of platform (systemd/Pi, Docker, Mac .app, dev host).
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# Marker recording the package-lock.json hash of the last successful
+# `npm install`. Lives inside node_modules so it is naturally per-install
+# (wiped whenever node_modules is) and never tracked by git.
+_DEPS_MARKER = "node_modules/.taos-deps-lock"
 
 
 @dataclass(frozen=True)
@@ -48,6 +54,143 @@ def _is_bundle_stale(project_root: Path) -> bool:
         if path.is_file() and path.stat().st_mtime > bundle_mtime:
             return True
     return False
+
+
+def _lockfile_hash(desktop_dir: Path) -> str | None:
+    """SHA-256 of desktop/package-lock.json, or None if it doesn't exist."""
+    lock = desktop_dir / "package-lock.json"
+    if not lock.is_file():
+        return None
+    return hashlib.sha256(lock.read_bytes()).hexdigest()
+
+
+def _deps_install_needed(desktop_dir: Path) -> bool:
+    """True if ``npm install`` must run before a build.
+
+    Skips the install only when node_modules already exists and the
+    package-lock.json hash matches the last successful install. Any of
+    {no node_modules, no lockfile to compare, lockfile changed, marker
+    unreadable} forces the install — so the gate never trades correctness
+    for speed.
+    """
+    if not (desktop_dir / "node_modules").is_dir():
+        return True
+    current = _lockfile_hash(desktop_dir)
+    if current is None:
+        return True  # no lockfile to trust — always install
+    try:
+        return (desktop_dir / _DEPS_MARKER).read_text().strip() != current
+    except OSError:
+        return True
+
+
+def _record_deps_install(desktop_dir: Path) -> None:
+    """Record the current package-lock hash after a successful npm install."""
+    current = _lockfile_hash(desktop_dir)
+    if current is None:
+        return
+    try:
+        (desktop_dir / _DEPS_MARKER).write_text(current)
+    except OSError as exc:  # node_modules vanished mid-build, read-only fs, etc.
+        logger.warning("Could not write deps marker (%s) — next update reinstalls.", exc)
+
+
+_BUNDLE_BASE = "https://github.com/jaylfc/taOS/releases/download/bundle-latest"
+
+
+async def _try_prebuilt_desktop_bundle(project_root: Path) -> bool:
+    """Install the CI-published prebuilt SPA bundle when it matches this source.
+
+    The bundle is keyed by ``git rev-parse HEAD:desktop`` (the content hash of
+    the frontend tree), so it is valid for every commit that does not touch
+    desktop/. On a match we download + stage + swap it into static/desktop/ and
+    return True, letting the caller skip the memory-heavy vite build that OOMs
+    on small machines. Returns False -- fall back to a local build -- on any
+    mismatch, missing git, or network/extract failure. The artifact is our own
+    CI output, extracted with the path-safe ``data`` tar filter.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git", "-C", str(project_root), "rev-parse", "HEAD:desktop",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+    except FileNotFoundError:
+        return False  # git not on PATH
+    local_tree = out.decode(errors="replace").strip()
+    if proc.returncode != 0 or not local_tree:
+        return False
+
+    def _get(url: str, *, binary: bool):
+        import urllib.request
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            data = resp.read()
+        return data if binary else data.decode(errors="replace").strip()
+
+    # Only download the (larger) bundle if the published tree matches ours.
+    try:
+        remote_tree = await asyncio.to_thread(_get, f"{_BUNDLE_BASE}/desktop-tree.txt", binary=False)
+    except Exception:
+        return False
+    if remote_tree != local_tree:
+        return False
+
+    logger.info("Downloading prebuilt desktop bundle (matches source; skipping local build).")
+    try:
+        blob = await asyncio.to_thread(_get, f"{_BUNDLE_BASE}/desktop-bundle.tar.gz", binary=True)
+    except Exception as exc:
+        logger.warning("Prebuilt bundle download failed (%s); building locally.", exc)
+        return False
+
+    # Verify against the CI-published SHA256 before extracting; reject a corrupted
+    # or tampered tarball and fall back to a local build.
+    try:
+        expected_sha = await asyncio.to_thread(_get, f"{_BUNDLE_BASE}/desktop-bundle.sha256", binary=False)
+    except Exception:
+        expected_sha = ""
+    if not expected_sha or hashlib.sha256(blob).hexdigest() != expected_sha.split()[0]:
+        logger.warning("Prebuilt bundle checksum missing or mismatched; building locally.")
+        return False
+
+    import io
+    import shutil
+    import tarfile
+    import tempfile
+
+    # Stage INSIDE static/ (same filesystem as the target) so the final swap is
+    # an atomic rename, never a cross-device copy that could fail half-done and
+    # leave static/desktop missing.
+    static_dir = project_root / "static"
+    static_dir.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=".taos-bundle-", dir=str(static_dir)))
+    try:
+        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tar:
+            try:
+                tar.extractall(stage, filter="data")  # py>=3.12 path-safe filter
+            except TypeError:
+                # Pythons without the path-safe tar filter: do not risk an unsafe
+                # extract; fall back to the local build instead.
+                logger.warning("This Python lacks the path-safe tar filter; building locally.")
+                return False
+        staged = stage / "desktop"
+        if not (staged / "index.html").is_file():
+            logger.warning("Prebuilt bundle missing index.html; building locally.")
+            return False
+        target = static_dir / "desktop"
+        if target.exists():
+            shutil.rmtree(target)
+        staged.rename(target)  # atomic rename (same filesystem)
+        # The tarball preserves the CI build mtime, which can predate the local
+        # source and make _is_bundle_stale treat the bundle as perpetually stale
+        # (re-downloading on every check). Stamp index.html fresh.
+        (target / "index.html").touch()
+        logger.info("Prebuilt desktop bundle installed into static/desktop/.")
+        return True
+    except Exception as exc:
+        logger.warning("Prebuilt bundle install failed (%s); building locally.", exc)
+        return False
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
 
 
 async def rebuild_desktop_bundle_if_stale(
@@ -87,18 +230,74 @@ async def rebuild_desktop_bundle_if_stale(
 
     logger.info("Desktop source is ahead of bundle — rebuilding...")
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "npm", "install", "--silent",
-            cwd=str(desktop_dir),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+    # Prefer the CI-published prebuilt bundle (keyed to this desktop/ source by
+    # its git tree SHA) so low-RAM hosts skip the memory-heavy vite build. Falls
+    # through to the local build below on any miss.
+    if await _try_prebuilt_desktop_bundle(project_root):
+        return RebuildResult(
+            rebuilt=True,
+            success=True,
+            message="Installed prebuilt desktop bundle (no local build needed).",
         )
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
-        if proc.returncode != 0:
-            msg = f"npm install failed (rc={proc.returncode}): {stderr.decode(errors='replace')[-500:]}"
-            logger.error(msg)
-            return RebuildResult(rebuilt=True, success=False, message=msg)
+
+    try:
+        if _deps_install_needed(desktop_dir):
+            # Use `npm ci`, not `npm install`: ci installs exactly from the
+            # committed package-lock.json and NEVER rewrites it. `npm install`
+            # rewrites the lockfile, which leaves the tracked desktop/package-
+            # lock.json dirty and makes the next in-app `git pull` update abort
+            # with "local changes would be overwritten by merge" (the deadlock a
+            # user hit when their installed version predated the #852 restore).
+            logger.info("Dependencies changed or missing — running npm ci...")
+            proc = await asyncio.create_subprocess_exec(
+                "npm", "ci", "--silent",
+                cwd=str(desktop_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+            if proc.returncode != 0:
+                # `npm ci` fails if package.json and the lockfile are out of sync
+                # (rare). Fall back to `npm install`, then restore the lockfile so
+                # the tree stays clean for the next update.
+                logger.warning(
+                    "npm ci failed (rc=%s), falling back to npm install: %s",
+                    proc.returncode, stderr.decode(errors="replace")[-300:],
+                )
+                proc = await asyncio.create_subprocess_exec(
+                    "npm", "install", "--silent",
+                    cwd=str(desktop_dir),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+                if proc.returncode != 0:
+                    msg = f"npm install failed (rc={proc.returncode}): {stderr.decode(errors='replace')[-500:]}"
+                    logger.error(msg)
+                    return RebuildResult(rebuilt=True, success=False, message=msg)
+                # Discard the lockfile rewrite npm install just made so the tree
+                # is clean for the next git-pull update. If this restore fails we
+                # only warn: apply_update() also restores the lockfile before
+                # every pull, so a dirty lockfile is double-covered there.
+                try:
+                    restore = await asyncio.create_subprocess_exec(
+                        "git", "checkout", "--", "package-lock.json",
+                        cwd=str(desktop_dir),
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    _, rerr = await restore.communicate()
+                    if restore.returncode != 0:
+                        logger.warning(
+                            "could not restore package-lock.json after npm install "
+                            "(rc=%s): %s",
+                            restore.returncode, rerr.decode(errors="replace")[-200:],
+                        )
+                except FileNotFoundError:
+                    logger.warning("git not found; could not restore package-lock.json")
+            _record_deps_install(desktop_dir)
+        else:
+            logger.info("Dependencies unchanged — skipping npm install.")
 
         proc = await asyncio.create_subprocess_exec(
             "npm", "run", "build",

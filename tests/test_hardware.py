@@ -5,8 +5,28 @@ import pytest
 from unittest.mock import patch
 from tinyagentos.hardware import detect_hardware, get_hardware_profile, HardwareProfile
 from tinyagentos import hardware as hardware_mod
+from tinyagentos.hardware import _nvidia_vram_for_model, _amd_vram_for_model
+from tinyagentos.hardware import _soc_from_devicetree
 
 import pytest_asyncio
+
+
+class TestSocFromDeviceTree:
+    def test_rk3588_from_compatible_when_model_omits_it(self):
+        # The board name ("Orange Pi 5 Plus") does not contain the SoC; the
+        # compatible string does. Both files are concatenated before matching.
+        text = " orange pi 5 plus rockchip,rk3588-orangepi-5-plus rockchip,rk3588"
+        assert _soc_from_devicetree(text) == "rk3588"
+
+    def test_board_name_alone_does_not_match(self):
+        assert _soc_from_devicetree(" orange pi 5 plus") == ""
+
+    def test_raspberry_pi(self):
+        assert _soc_from_devicetree(" raspberry pi 5 brcm,bcm2712") == "bcm2712"
+        assert _soc_from_devicetree(" raspberry pi 4 model b") == "bcm2711"
+
+    def test_unknown_returns_empty(self):
+        assert _soc_from_devicetree(" generic x86 box") == ""
 
 
 class TestDetectHardware:
@@ -168,6 +188,44 @@ class TestGetHardwareProfile:
         assert path.exists()  # auto-saved
 
 
+class TestNvidiaVramTable:
+    def test_gtx_1050_ti_resolves_to_4096(self):
+        assert _nvidia_vram_for_model("NVIDIA GeForce GTX 1050 Ti") == 4096
+
+    def test_gtx_1050_ti_case_insensitive(self):
+        assert _nvidia_vram_for_model("gtx 1050 ti") == 4096
+
+    def test_rtx_3090_resolves_correctly(self):
+        assert _nvidia_vram_for_model("NVIDIA GeForce RTX 3090") == 24576
+
+    def test_unknown_model_returns_zero(self):
+        assert _nvidia_vram_for_model("NVIDIA GeForce GTX 580") == 0
+
+    def test_empty_model_returns_zero(self):
+        assert _nvidia_vram_for_model("") == 0
+
+
+class TestAmdVramTable:
+    def test_rx_7900_xtx_resolves_to_24576(self):
+        assert _amd_vram_for_model("AMD Radeon RX 7900 XTX") == 24576
+
+    def test_rx_7900_xtx_case_insensitive(self):
+        assert _amd_vram_for_model("rx 7900 xtx") == 24576
+
+    def test_rx_6600_resolves_to_8192(self):
+        assert _amd_vram_for_model("AMD Radeon RX 6600") == 8192
+
+    def test_rx_7900_xt_does_not_match_xtx(self):
+        # RX 7900 XT is 20480, not 24576 — ensure longer key matches first
+        assert _amd_vram_for_model("AMD Radeon RX 7900 XT") == 20480
+
+    def test_unknown_amd_card_returns_zero(self):
+        assert _amd_vram_for_model("AMD Radeon HD 7970") == 0
+
+    def test_empty_model_returns_zero(self):
+        assert _amd_vram_for_model("") == 0
+
+
 @pytest.mark.asyncio
 class TestHardwareRefreshEndpoint:
     async def test_refresh_returns_fresh_profile(self, client):
@@ -203,3 +261,25 @@ class TestHardwareRefreshEndpoint:
         assert cache_path.exists()
         saved = json.loads(cache_path.read_text())
         assert saved["ram_mb"] == fresh["ram_mb"]
+
+
+class TestWslDetection:
+    def test_detect_wsl_via_env(self, monkeypatch):
+        monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+        assert hardware_mod._detect_wsl() is True
+
+    def test_no_wsl_on_clean_host(self, monkeypatch):
+        monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
+        monkeypatch.delenv("WSL_INTEROP", raising=False)
+        # A normal Linux/mac host has no microsoft marker (or no /proc/version).
+        assert hardware_mod._detect_wsl() is False
+
+    def test_detect_hardware_explains_wsl_cap(self, monkeypatch):
+        monkeypatch.setenv("WSL_DISTRO_NAME", "Ubuntu")
+        monkeypatch.setattr(hardware_mod, "_detect_ram", lambda: 8192)
+        prof = detect_hardware()
+        assert prof.wsl is True
+        assert ".wslconfig" in prof.mem_note
+        assert "8GB" in prof.mem_note
+        # ram_mb itself is left untouched (8GB really is what the VM has)
+        assert prof.ram_mb == 8192

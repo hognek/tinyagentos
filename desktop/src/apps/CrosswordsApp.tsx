@@ -297,9 +297,9 @@ export function CrosswordsApp({ windowId: _windowId }: { windowId: string }) {
         display: "flex",
         flexDirection: "column",
         height: "100%",
-        background: "#0f0f1a",
-        color: "#e5e7eb",
-        fontFamily: "system-ui, sans-serif",
+        background: "var(--color-shell-bg)",
+        color: "var(--color-shell-text)",
+        fontFamily: "system-ui, -apple-system, sans-serif",
         padding: 16,
         gap: 12,
         overflow: "auto",
@@ -428,7 +428,7 @@ export function CrosswordsApp({ windowId: _windowId }: { windowId: string }) {
                 textTransform: "uppercase",
                 letterSpacing: 1,
                 marginBottom: 8,
-                color: "#9ca3af",
+                color: "var(--color-shell-text-secondary)",
               }}
             >
               Across
@@ -469,7 +469,7 @@ export function CrosswordsApp({ windowId: _windowId }: { windowId: string }) {
                 textTransform: "uppercase",
                 letterSpacing: 1,
                 marginBottom: 8,
-                color: "#9ca3af",
+                color: "var(--color-shell-text-secondary)",
               }}
             >
               Down
@@ -509,8 +509,8 @@ export function CrosswordsApp({ windowId: _windowId }: { windowId: string }) {
         <div
           style={{
             fontSize: 13,
-            color: "#9ca3af",
-            borderTop: "1px solid #1f2937",
+            color: "var(--color-shell-text-secondary)",
+            borderTop: "1px solid var(--color-shell-border)",
             paddingTop: 8,
           }}
         >
@@ -531,9 +531,9 @@ export function CrosswordsApp({ windowId: _windowId }: { windowId: string }) {
 const btnStyle: React.CSSProperties = {
   padding: "6px 14px",
   borderRadius: 6,
-  border: "1px solid #374151",
-  background: "#1f2937",
-  color: "#e5e7eb",
+  border: "1px solid var(--color-shell-border-strong)",
+  background: "var(--color-shell-surface)",
+  color: "var(--color-shell-text)",
   fontSize: 13,
   fontWeight: 600,
   cursor: "pointer",

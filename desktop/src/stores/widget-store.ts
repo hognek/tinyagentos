@@ -95,7 +95,9 @@ const initial = readCache();
 
 export const useWidgetStore = create<WidgetStore>((set, get) => ({
   widgets: initial?.widgets ?? DEFAULT_WIDGETS,
-  showWidgets: initial?.showWidgets ?? true,
+  // Off by default until the widgets are overhauled/redesigned. A user who has
+  // already enabled them keeps their choice (persisted showWidgets is restored).
+  showWidgets: initial?.showWidgets ?? false,
   hydrated: false,
 
   addWidget(type) {

@@ -71,7 +71,11 @@ class UserMemoryStore(BaseStore):
         limit: int = 20,
     ) -> list[dict]:
         assert self._db is not None
-        fts_query = query.replace('"', '""')
+        # Wrap as a quoted phrase: double internal quotes first, then wrap the
+        # whole string in double-quotes.  This prevents FTS5 special characters
+        # (AND, OR, NOT, ^, *, NEAR, column filters, etc.) from being
+        # interpreted as query operators.
+        fts_query = '"' + query.replace('"', '""') + '"'
         sql = """
             SELECT c.hash, c.collection, c.title, c.content, c.metadata, c.created_at
             FROM user_memory_fts f
@@ -120,6 +124,7 @@ class UserMemoryStore(BaseStore):
         user_id: str,
         collection: str | None = None,
         limit: int = 50,
+        offset: int = 0,
     ) -> list[dict]:
         assert self._db is not None
         sql = "SELECT hash, collection, title, content, metadata, created_at FROM user_memory_chunks WHERE user_id = ?"
@@ -127,8 +132,8 @@ class UserMemoryStore(BaseStore):
         if collection:
             sql += " AND collection = ?"
             params.append(collection)
-        sql += " ORDER BY created_at DESC LIMIT ?"
-        params.append(limit)
+        sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
         cursor = await self._db.execute(sql, params)
         rows = await cursor.fetchall()
         return [

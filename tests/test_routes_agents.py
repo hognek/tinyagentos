@@ -134,7 +134,12 @@ class TestDeployRouting:
         config = app.state.config
         assert not any(a["name"] == "routed-agent" for a in config.agents)
 
-    async def test_worker_hosted_model_pinned_to_holder_routes(self, client, app):
+    async def test_worker_hosted_model_pinned_to_holder_deploys_remote(self, client, app):
+        # Pin-wins: a pin to the worker that holds the model now falls through
+        # routing and schedules a remote deploy on that worker, rather than
+        # returning a 202 routing stub. With a reachable controller callback
+        # host configured, configure_remote_deploy accepts the request.
+        app.state.controller_lan_ip = "10.0.0.5"
         _seed_worker(app, "fedora", ["qwen2.5-7b"])
         _seed_worker(app, "arch-box", ["phi3"])
         resp = await client.post("/api/agents/deploy", json={
@@ -143,9 +148,10 @@ class TestDeployRouting:
             "model": "qwen2.5-7b",
             "target_worker": "fedora",
         })
-        assert resp.status_code == 202
+        assert resp.status_code == 200
         data = resp.json()
-        assert data["worker"] == "fedora"
+        assert data["status"] == "deploying"
+        assert data["name"] == "pinned-ok"
 
     async def test_worker_hosted_model_pinned_to_wrong_worker_rejects_409(self, client, app):
         _seed_worker(app, "fedora", ["qwen2.5-7b"])
@@ -1155,6 +1161,90 @@ class TestOrphanAgentDeletion:
 
 
 @pytest.mark.asyncio
+class TestDeleteResolvesOrphanedContainer:
+    """DELETE must not orphan a real container when the record lost its link.
+
+    Reproduces Jay's live bug: a 'test' agent whose container_name was null but
+    whose legacy ``taos-test`` container was still running. Delete must resolve
+    and archive that container instead of hard-deleting the bare row.
+    """
+
+    async def test_null_link_resolves_and_archives_legacy_container(
+        self, client, tmp_data_dir, monkeypatch
+    ):
+        # The derived ``taos-agent-test-agent`` does not exist...
+        async def _no_container(name):
+            return False
+        monkeypatch.setattr("tinyagentos.containers.container_exists", _no_container)
+
+        # ...but a legacy ``taos-test-agent`` container is live in some project.
+        async def fake_list_all(*_a, **_k):
+            return [{"name": "taos-test-agent", "project": "user-999"}]
+        monkeypatch.setattr(
+            "tinyagentos.containers.list_all_taos_containers", fake_list_all
+        )
+
+        stop_calls = []
+        snap_calls = []
+
+        async def fake_stop(name, force=False):
+            stop_calls.append(name)
+            return {"success": True, "output": ""}
+
+        async def fake_snapshot_create(name, snapshot_name):
+            snap_calls.append((name, snapshot_name))
+            return {"success": True, "output": ""}
+
+        monkeypatch.setattr("tinyagentos.containers.stop_container", fake_stop)
+        monkeypatch.setattr("tinyagentos.containers.snapshot_create", fake_snapshot_create)
+
+        resp = await client.delete("/api/agents/test-agent")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "archived"
+        # The resolved legacy container is the one snapshotted, not the derived name.
+        assert stop_calls == ["taos-test-agent"]
+        assert snap_calls and snap_calls[0][0] == "taos-test-agent"
+
+        config = load_config(tmp_data_dir / "config.yaml")
+        assert not any(a["name"] == "test-agent" for a in config.agents)
+        entry = next(
+            a for a in config.archived_agents if a.get("archived_slug") == "test-agent"
+        )
+        # container_name records the REAL (legacy) container so restore/purge act on it.
+        assert entry["container_name"] == "taos-test-agent"
+        assert entry["snapshot_name"] is not None
+
+    async def test_truly_container_less_row_still_hard_deletes(
+        self, client, tmp_data_dir, monkeypatch
+    ):
+        """When NO container exists anywhere, the bare row is hard-deleted."""
+        async def _no_container(name):
+            return False
+        monkeypatch.setattr("tinyagentos.containers.container_exists", _no_container)
+
+        async def fake_list_all(*_a, **_k):
+            return []  # nothing on the host
+        monkeypatch.setattr(
+            "tinyagentos.containers.list_all_taos_containers", fake_list_all
+        )
+
+        async def fake_snapshot_create(name, snapshot_name):
+            raise AssertionError("no container -> snapshot must not run")
+        monkeypatch.setattr("tinyagentos.containers.snapshot_create", fake_snapshot_create)
+
+        resp = await client.delete("/api/agents/test-agent")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "deleted"
+
+        config = load_config(tmp_data_dir / "config.yaml")
+        assert not any(a["name"] == "test-agent" for a in config.agents)
+        assert not any(
+            a.get("archived_slug") == "test-agent" for a in config.archived_agents
+        )
+
+
+@pytest.mark.asyncio
 class TestDeployMemoryConfig:
     """Deploy endpoint should accept and persist memory_plugin + memory_config."""
 
@@ -1216,3 +1306,156 @@ class TestDeployMemoryConfig:
         assert resp.status_code == 200
         agent = next(a for a in app.state.config.agents if a["name"] == "default-memory-agent")
         assert agent.get("memory_config") is None
+
+
+@pytest.mark.asyncio
+class TestDeployRamPreflight:
+    """Pre-flight RAM check — low-RAM hosts reject deploy before mutating state (#384)."""
+
+    async def _mock_deploy_passthrough(self, monkeypatch):
+        """Allow deploy to run (patched out so no real container work)."""
+        async def fake_deploy(req):
+            return {"success": True, "name": req.name, "ip": "10.0.0.1",
+                    "llm_key": None, "steps": ["deployment_complete"],
+                    "container": f"taos-agent-{req.name}"}
+        monkeypatch.setattr("tinyagentos.deployer.deploy_agent", fake_deploy)
+
+    async def test_low_ram_rejects_deploy(self, client, app, monkeypatch):
+        """Host with 2GB RAM should be rejected for all frameworks."""
+        class _FakeHW:
+            ram_mb = 2048  # 2GB — below every framework's minimum
+        app.state.hardware_profile = _FakeHW()
+
+        resp = await client.post("/api/agents/deploy", json={
+            "name": "low-ram-agent",
+            "framework": "openclaw",
+            "model": "phi3",
+        })
+        assert resp.status_code == 400
+        body = resp.json()
+        assert "2.0 GB RAM" in body["error"]
+        assert "openclaw" in body["error"]
+        assert "needs at least" in body["error"]
+        assert body["ram_mb"] == 2048
+        assert body["framework"] == "openclaw"
+
+    async def test_adequate_ram_passes(self, client, app, monkeypatch):
+        """Host with 8GB RAM should pass the pre-flight check."""
+        await self._mock_deploy_passthrough(monkeypatch)
+
+        class _FakeCatalog:
+            def all_models(self, capability=None):
+                return [{"name": "phi3", "id": "phi3"}]
+        app.state.backend_catalog = _FakeCatalog()
+        app.state.cluster_manager._workers.clear()
+
+        class _FakeHW:
+            ram_mb = 8192  # 8GB — well above any framework minimum
+        app.state.hardware_profile = _FakeHW()
+
+        resp = await client.post("/api/agents/deploy", json={
+            "name": "adequate-ram-agent",
+            "framework": "openclaw",
+            "model": "phi3",
+        })
+        assert resp.status_code == 200
+
+    async def test_no_framework_skips_ram_check(self, client, app, monkeypatch):
+        """framework='none' should skip the RAM check entirely."""
+        await self._mock_deploy_passthrough(monkeypatch)
+
+        class _FakeCatalog:
+            def all_models(self, capability=None):
+                return [{"name": "phi3", "id": "phi3"}]
+        app.state.backend_catalog = _FakeCatalog()
+        app.state.cluster_manager._workers.clear()
+
+        class _FakeHW:
+            ram_mb = 1024  # 1GB — would fail check if it ran
+        app.state.hardware_profile = _FakeHW()
+
+        resp = await client.post("/api/agents/deploy", json={
+            "name": "no-framework-agent",
+            "framework": "none",
+            "model": "phi3",
+        })
+        assert resp.status_code == 200
+
+    async def test_unknown_framework_still_checked_before_ram(self, client, app, monkeypatch):
+        """Unknown framework should fail at framework validation, not RAM check."""
+        resp = await client.post("/api/agents/deploy", json={
+            "name": "bad-fw-agent",
+            "framework": "nonexistent-framework",
+            "model": "phi3",
+        })
+        assert resp.status_code == 400
+        body = resp.json()
+        assert "Unknown framework" in body["error"]
+
+
+@pytest.mark.asyncio
+class TestAgentBudgetRoutes:
+    """Agent governance Slice 2 — per-agent LLM budget admin API."""
+
+    async def test_get_budget_defaults_when_unset(self, client):
+        resp = await client.get("/api/agents/test-agent/budget")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["max_budget_usd"] is None
+        assert data["spend_usd"] == 0
+
+    async def test_get_budget_not_found_agent(self, client):
+        resp = await client.get("/api/agents/no-such-agent/budget")
+        assert resp.status_code == 404
+
+    async def test_put_budget_sets_cap(self, client):
+        resp = await client.put("/api/agents/test-agent/budget", json={"max_budget_usd": 25.0})
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["max_budget_usd"] == 25.0
+        assert data["spend_usd"] == 0
+
+        resp2 = await client.get("/api/agents/test-agent/budget")
+        assert resp2.json()["max_budget_usd"] == 25.0
+
+    async def test_put_budget_null_clears_cap(self, client):
+        await client.put("/api/agents/test-agent/budget", json={"max_budget_usd": 25.0})
+        resp = await client.put("/api/agents/test-agent/budget", json={"max_budget_usd": None})
+        assert resp.status_code == 200
+        assert resp.json()["max_budget_usd"] is None
+
+    async def test_put_budget_rejects_negative(self, client):
+        resp = await client.put("/api/agents/test-agent/budget", json={"max_budget_usd": -5.0})
+        assert resp.status_code == 400
+
+    async def test_put_budget_rejects_non_finite(self, client):
+        # NaN/Infinity would slip past a bare "< 0" check and disable the cap
+        # (spend >= NaN is always False), so they must be rejected with 400.
+        for bad in ("NaN", "Infinity", "-Infinity"):
+            resp = await client.put(
+                "/api/agents/test-agent/budget",
+                content=f'{{"max_budget_usd": {bad}}}',
+                headers={"content-type": "application/json"},
+            )
+            assert resp.status_code == 400, f"{bad} was not rejected"
+
+    async def test_put_budget_not_found_agent(self, client):
+        resp = await client.put("/api/agents/no-such-agent/budget", json={"max_budget_usd": 10.0})
+        assert resp.status_code == 404
+
+    async def test_reset_zeroes_spend_keeps_cap(self, client, app, tmp_data_dir):
+        await client.put("/api/agents/test-agent/budget", json={"max_budget_usd": 10.0})
+
+        from tinyagentos.agent_budget_store import AgentBudgetStore, default_budget_path
+        store = AgentBudgetStore(default_budget_path(tmp_data_dir))
+        store.add_spend("test-agent", 7.5)
+
+        resp = await client.post("/api/agents/test-agent/budget/reset")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["spend_usd"] == 0
+        assert data["max_budget_usd"] == 10.0
+
+    async def test_reset_not_found_agent(self, client):
+        resp = await client.post("/api/agents/no-such-agent/budget/reset")
+        assert resp.status_code == 404

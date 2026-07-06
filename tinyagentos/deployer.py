@@ -16,10 +16,20 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from tinyagentos.agent_image import BASE_IMAGE_ALIAS, is_image_present
+if TYPE_CHECKING:
+    from tinyagentos.secrets import SecretsStore
+
+from tinyagentos.agent_image import (
+    GENERIC_BASE_ALIAS,
+    base_image_alias,
+    is_image_present,
+)
 from tinyagentos.containers import (
     create_container, exec_in_container, push_file,
     start_container, stop_container, destroy_container,
@@ -69,8 +79,28 @@ def _explain_container_failure(raw_error: object) -> str:
         )
     return f"Container creation failed: {text}"
 
+def _secret_env_name(name: str) -> str:
+    """Sanitize a secret name into a valid POSIX env identifier.
+
+    Uppercase, replace any char outside [A-Z0-9_] with ``_``, and prefix an
+    underscore when the result starts with a digit (env names can't start
+    with one). A secret literally named ``OPENROUTER_API_KEY`` therefore maps
+    to env ``OPENROUTER_API_KEY`` exactly, which is what external frameworks
+    (e.g. Hermes) expect.
+    """
+    sanitized = re.sub(r"[^A-Z0-9_]", "_", name.upper())
+    if sanitized and sanitized[0].isdigit():
+        sanitized = "_" + sanitized
+    return sanitized
+
+
 _TAOSMD_BEGIN = "<!-- taosmd:rules-begin -->"
 _TAOSMD_END = "<!-- taosmd:rules-end -->"
+
+# An SSH-key secret name becomes a filename under ~/.ssh on deploy, so it must
+# be a plain safe filename: no path separators, no "..", no traversal. Names
+# that do not match are skipped rather than written outside ~/.ssh.
+_SAFE_SSH_KEY_NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # Per-framework AGENTS.md path inside the agent's container.
 # Frameworks read this file on every turn to pick up agent rules
@@ -125,9 +155,20 @@ class DeployRequest:
     # 127.0.0.1 on the host.
     taos_host: str = "127.0.0.1"
     taos_port: int = 6969
+    # When set (e.g. "fedora-worker"), the agent container is created on that
+    # enrolled incus remote's nested incus instead of locally. The caller must
+    # also set taos_host to an address the worker can reach the controller on
+    # (its Tailscale IP), since the localhost proxy devices are not used for a
+    # remote deploy.
+    remote: str | None = None
     # Per §10.10: default 40 GiB rootfs quota. Overridable per-agent at
     # deploy time. None disables quota (unlimited, e.g. for dev/test).
     root_size_gib: int = 40
+    # Optional resolver for agent-granted secrets. When set, deploy_agent
+    # calls ``get_agent_secrets(name)`` and injects each granted secret into
+    # the container environment. Optional (None) so existing callers/tests
+    # are unaffected. Typed loosely to avoid a runtime import cycle.
+    secrets_store: "SecretsStore | None" = None
 
 
 async def deploy_agent(req: DeployRequest) -> dict:
@@ -172,37 +213,87 @@ async def deploy_agent(req: DeployRequest) -> dict:
             key_models = [m for m in [req.model, *(req.fallback_models or [])] if m]
             llm_key = await proxy.create_agent_key(req.name, models=key_models or None)
             if llm_key is None:
+                # Key mint failed. Two distinct cases, handled differently:
+                #
+                # 1. Routing-only (db_url is None): LiteLLM has no Postgres, so
+                #    virtual keys are simply unavailable (e.g. an ARM box where
+                #    prisma can't start). This is an expected capability gap,
+                #    not a bug. taOS is single-user per instance, so we fall
+                #    back to the shared master key by default and warn loudly;
+                #    a hardened / multi-tenant operator sets
+                #    TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK=1 to refuse instead.
+                #
+                # 2. DB configured but mint failed (db_url is set): the proxy
+                #    HAS a key store but /key/generate broke (migration pending,
+                #    DB unreachable, master-key drift). That is a real bug. The
+                #    master key would mask it AND ship an unscoped agent, so we
+                #    always refuse here regardless of the env var, directing the
+                #    operator at the misbehaving DB.
                 db_url = getattr(proxy, "database_url", None)
-                if db_url is None:
-                    # Routing-only mode — LiteLLM can't mint virtual keys
-                    # without a Postgres DB. Fall back to the shared master
-                    # key so the container can still authenticate.
-                    from tinyagentos.llm_proxy import TAOS_LITELLM_MASTER_KEY
-                    llm_key = TAOS_LITELLM_MASTER_KEY
-                    logger.info(
-                        "deploy %s: LiteLLM routing-only mode — using shared master key (no DB configured for virtual keys)",
-                        req.name,
-                    )
-                else:
-                    # DB configured but key mint failed — something else
-                    # is wrong (migration pending, DB unreachable, master
-                    # key mismatch). Don't silently fall back; that hides
-                    # the bug and ships broken agents.
+                if db_url is not None:
                     db_host = db_url.split("@")[-1] if "@" in db_url else db_url
                     msg = (
-                        f"virtual key mint failed despite DB configured at {db_host}"
+                        "per-agent LiteLLM virtual key mint failed despite DB "
+                        f"configured at {db_host}. This is a LiteLLM/DB fault "
+                        "(migration pending, DB unreachable, or master-key "
+                        "drift), not a missing-DB capability gap, so the deploy "
+                        "is refused rather than silently using the shared "
+                        "master key. Fix the LiteLLM Postgres connection."
                     )
                     logger.error("deploy %s: %s", req.name, msg)
                     return {"success": False, "error": msg, "steps": steps}
+
+                why = (
+                    "LiteLLM is running in routing-only mode (no Postgres "
+                    "DATABASE_URL configured)"
+                )
+                fallback_disabled = os.environ.get(
+                    "TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK", ""
+                ).strip().lower() in ("1", "true", "yes")
+                if fallback_disabled:
+                    msg = (
+                        f"per-agent LiteLLM virtual key could not be minted: {why}. "
+                        "The master-key fallback is disabled "
+                        "(TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK is set), so the "
+                        "deploy is refused. Configure a Postgres database for "
+                        "LiteLLM to issue per-agent scoped keys, or unset that "
+                        "variable on a single-user instance."
+                    )
+                    logger.error("deploy %s: %s", req.name, msg)
+                    return {"success": False, "error": msg, "steps": steps}
+
+                from tinyagentos.llm_proxy import get_litellm_master_key
+                llm_key = get_litellm_master_key(req.data_dir)
+                logger.warning(
+                    "deploy %s: %s; falling back to the shared LiteLLM master "
+                    "key. This agent has full LiteLLM admin access. Configure "
+                    "Postgres-backed virtual keys for per-agent isolation, or "
+                    "set TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK=1 to refuse "
+                    "instead.",
+                    req.name, why,
+                )
+                steps.append(
+                    "llm-key: per-agent virtual key unavailable, using shared "
+                    "master key (no per-agent isolation)"
+                )
             from tinyagentos.llm_proxy import EMBEDDING_ALIAS
             # Primary key for openclaw's litellm provider.
             env["LITELLM_API_KEY"] = llm_key
             # Compat shim — smolagents and other frameworks still expect OPENAI_API_KEY.
             env["OPENAI_API_KEY"] = llm_key
-            env["OPENAI_BASE_URL"] = f"{proxy.url}/v1"
+            # A local deploy reaches LiteLLM via the proxy device on the
+            # container's own 127.0.0.1; a remote worker has no proxy device, so
+            # it reaches the controller's LiteLLM over the network at taos_host
+            # (the controller's Tailscale IP) on the host's LiteLLM port.
+            if req.remote:
+                _llm_port = getattr(proxy, "port", None) or 7834
+                _llm_base = f"http://{req.taos_host}:{_llm_port}"
+            else:
+                _llm_base = proxy.url
+            env["OPENAI_BASE_URL"] = f"{_llm_base}/v1"
             # Host-side embedding endpoint — same LiteLLM process,
             # OpenAI-compatible /v1/embeddings. Framework-agnostic.
-            env["TAOS_EMBEDDING_URL"] = f"{proxy.url}/v1/embeddings"
+            env["TAOS_EMBEDDING_URL"] = f"{_llm_base}/v1/embeddings"
             # Stable alias the host LiteLLM routes to whichever
             # concrete embedding model the backends actually have loaded.
             env["TAOS_EMBEDDING_MODEL"] = EMBEDDING_ALIAS
@@ -240,32 +331,111 @@ async def deploy_agent(req: DeployRequest) -> dict:
         pass
     env["TAOS_TRACE_URL"] = f"http://{req.taos_host}:{req.taos_port}/api/trace"
 
+    # Agent-bridge shared token (issue #672 — defense-in-depth auth guard).
+    # Generate a per-deployment secret so only the controller (which knows
+    # the token) can call the command-executing bridge endpoints.
+    env["TAOS_BRIDGE_TOKEN"] = secrets.token_hex(32)
+
     # openclaw bridge connection info — injected so install.sh can write
     # /root/.openclaw/openclaw.json and /root/.openclaw/env inside the container
     # from these env vars. Bridge URL is how the openclaw service phones home.
     env["TAOS_BRIDGE_URL"] = f"http://{req.taos_host}:{req.taos_port}"
-    # OPENAI_BASE_URL defaults to LiteLLM proxy if no llm_proxy in config.
+    # OPENAI_BASE_URL defaults to LiteLLM proxy if no llm_proxy in config. A
+    # remote deploy must target the controller over the network, not the
+    # container's own loopback (there is no proxy device on a worker).
     if "OPENAI_BASE_URL" not in env:
-        env["OPENAI_BASE_URL"] = "http://127.0.0.1:4000/v1"
+        if req.remote:
+            env["OPENAI_BASE_URL"] = f"http://{req.taos_host}:7834/v1"
+        else:
+            env["OPENAI_BASE_URL"] = "http://127.0.0.1:4000/v1"
     if "OPENAI_API_KEY" not in env:
         env["OPENAI_API_KEY"] = ""
     if "LITELLM_API_KEY" not in env:
         env["LITELLM_API_KEY"] = ""
 
+    # Agent-granted secrets — injected as env vars so frameworks pick them up
+    # at startup (e.g. OPENROUTER_API_KEY for Hermes). Each secret name is
+    # sanitized to a POSIX env identifier and injected with NO extra prefix.
+    # Collision safety: never overwrite a platform var the deployer already
+    # set (TAOS_*/LITELLM_*/OPENAI_*/bridge) — a user secret must not be able
+    # to clobber those. Secret VALUES are never logged.
+    if req.secrets_store is not None:
+        agent_secrets = await req.secrets_store.get_agent_secrets(req.name)
+        injected: list[str] = []
+        # Snapshot the platform var names set above so injecting a secret does
+        # not make a later secret look like it collides with a platform var.
+        platform_vars = set(env)
+        # Track which env name each granted secret claimed so two distinct
+        # secret names that sanitize to the same identifier (e.g. "api-key"
+        # and "api_key" both map to API_KEY) do not silently overwrite each
+        # other. Sort by secret name for a deterministic winner: the first
+        # name keeps the env var, the colliding one is skipped with a warning.
+        claimed_by: dict[str, str] = {}
+        for secret in sorted(agent_secrets, key=lambda s: s["name"]):
+            env_name = _secret_env_name(secret["name"])
+            if env_name in platform_vars:
+                logger.warning(
+                    "Deploy %s: secret %r maps to env %s which is already a "
+                    "platform variable — skipping to avoid clobbering it",
+                    req.name, secret["name"], env_name,
+                )
+                continue
+            if env_name in claimed_by:
+                logger.warning(
+                    "Deploy %s: secrets %r and %r both map to env %s; "
+                    "keeping %r and skipping %r (rename one to resolve the "
+                    "collision)",
+                    req.name, claimed_by[env_name], secret["name"], env_name,
+                    claimed_by[env_name], secret["name"],
+                )
+                continue
+            env[env_name] = secret["value"]
+            claimed_by[env_name] = secret["name"]
+            injected.append(env_name)
+        if injected:
+            logger.info(
+                "Deploy %s: injected %d agent secret(s): %s",
+                req.name, len(injected), ", ".join(injected),
+            )
+
+    # SSH key secrets to materialize as files after container start.
+    # Collected here (before container creation) so the post-start loop has
+    # them. Secrets with category "ssh-keys" land at ~/.ssh/<name> with 0600.
+    _ssh_key_secrets: list[dict] = []
+    if req.secrets_store is not None:
+        _ssh_key_secrets = [
+            s for s in agent_secrets  # type: ignore[possibly-undefined]
+            if s.get("category") == "ssh-keys"
+        ]
+
     # Pre-built base image fast-path — see tinyagentos/agent_image.py.
-    # When the cached image is imported locally we launch from it and
-    # install.sh skips the openclaw/apt steps; on a cold host we fall
-    # back to images:debian/bookworm and install.sh does the full run.
+    # Framework-aware selection: prefer the framework's dedicated base
+    # (taos-<framework>-base), then the generic taos-base, then a cold
+    # images:debian/bookworm. Any base (specific or generic) already has
+    # the common deps baked in, so we skip the slow apt run below. This is
+    # what lets non-openclaw agents (especially Hermes on ARM/Pi) avoid the
+    # ~900s cold install. openclaw still resolves to taos-openclaw-base.
     base_image_ready = False
-    if req.framework == "openclaw":
-        try:
-            base_image_ready = await is_image_present(BASE_IMAGE_ALIAS)
-        except Exception:
-            base_image_ready = False
-    launch_image = BASE_IMAGE_ALIAS if base_image_ready else "images:debian/bookworm"
+    launch_image = "images:debian/bookworm"
+    if req.framework and req.framework != "none":
+        # Build the candidate list, de-duplicating when the framework has no
+        # dedicated base (base_image_alias already returns GENERIC_BASE_ALIAS).
+        specific_alias = base_image_alias(req.framework)
+        candidates = [specific_alias]
+        if specific_alias != GENERIC_BASE_ALIAS:
+            candidates.append(GENERIC_BASE_ALIAS)
+        for alias in candidates:
+            try:
+                present = await is_image_present(alias, remote=req.remote)
+            except Exception:
+                present = False
+            if present:
+                base_image_ready = True
+                launch_image = alias
+                break
     if base_image_ready:
         env["TAOS_BASE_IMAGE_PRESENT"] = "1"
-        logger.info(f"Deploy {req.name}: using cached base image {BASE_IMAGE_ALIAS}")
+        logger.info(f"Deploy {req.name}: using cached base image {launch_image}")
     else:
         logger.info(f"Deploy {req.name}: cached base image not present, using {launch_image}")
 
@@ -279,33 +449,59 @@ async def deploy_agent(req: DeployRequest) -> dict:
         cpu_limit=req.cpu_limit,
         mounts=mounts,
         env=env,
+        # os.getuid() is the UID of the controller process (the 'taos' system
+        # user when running under systemd).  raw.idmap maps container-root to
+        # this host UID so the trace bind-mount is writable by the container.
         host_uid=os.getuid(),
         root_size_gib=req.root_size_gib,
+        remote=req.remote,
     )
     if not result["success"]:
         return {"success": False, "error": _explain_container_failure(result.get("error")), "steps": steps}
     steps.append("container_created")
 
+    # Keep the bare name for the agent record, then qualify container_name with
+    # the remote so every downstream incus op (exec/push/destroy) targets the
+    # worker's nested incus. Local deploys leave it unchanged.
+    record_container = container_name
+    if req.remote:
+        container_name = f"{req.remote}:{container_name}"
+
     try:
         # Incus proxy devices: let the container reach host services via
         # its own 127.0.0.1.
-        proxy_ports = [
-            ("taos-proxy-litellm", 4000),
-            ("taos-proxy-taos", req.taos_port),
-        ]
-        for dev_name, port in proxy_ports:
-            res = await add_proxy_device(
-                container_name,
-                dev_name,
-                listen=f"tcp:127.0.0.1:{port}",
-                connect=f"tcp:127.0.0.1:{port}",
-                bind_mode="instance",
-            )
-            if not res.get("success"):
-                raise RuntimeError(
-                    f"failed to attach proxy device {dev_name}:{port}: {res.get('output', '')}"
+        #
+        # Each tuple: (device_name, container_listen_port, host_connect_port).
+        # LiteLLM: the container-side URL is always tcp:127.0.0.1:4000 (baked
+        # into OPENAI_BASE_URL and openclaw.json via the proxy device above),
+        # but the host may run LiteLLM on any configured port (default 7834).
+        # The connect side tracks the live proxy port so the tunnel reaches the
+        # right host process regardless of whether the operator kept the legacy
+        # 4000 or migrated to 7834.
+        # Proxy devices map the container's 127.0.0.1 to host services. They
+        # only work for a LOCAL deploy; a remote worker reaches the controller
+        # directly over the network (taos_host is the controller's Tailscale IP
+        # for a remote deploy), so skip them.
+        if not req.remote:
+            llm_proxy_ref = (req.extra_config or {}).get("llm_proxy")
+            litellm_host_port = getattr(llm_proxy_ref, "port", None) or 7834
+            proxy_devices = [
+                ("taos-proxy-litellm", 4000, litellm_host_port),
+                ("taos-proxy-taos", req.taos_port, req.taos_port),
+            ]
+            for dev_name, listen_port, connect_port in proxy_devices:
+                res = await add_proxy_device(
+                    container_name,
+                    dev_name,
+                    listen=f"tcp:127.0.0.1:{listen_port}",
+                    connect=f"tcp:127.0.0.1:{connect_port}",
+                    bind_mode="instance",
                 )
-        steps.append("proxy_devices_attached")
+                if not res.get("success"):
+                    raise RuntimeError(
+                        f"failed to attach proxy device {dev_name}: {res.get('output', '')}"
+                    )
+            steps.append("proxy_devices_attached")
 
         # Step 2: Wait for network
         for _ in range(10):
@@ -314,6 +510,66 @@ async def deploy_agent(req: DeployRequest) -> dict:
                 break
             await asyncio.sleep(2)
         steps.append("network_ready")
+
+        # Step 2b: Materialize SSH key secrets as ~/.ssh/<name> inside the container.
+        # Secrets with category "ssh-keys" are written verbatim to files so tools
+        # like git/ssh can use them directly. The value is written via push_file
+        # (same path used for AGENTS.md and install scripts above); perms are set
+        # with chmod/chown via exec_in_container. An SSH key stored as an env var
+        # alone would not be usable by the ssh binary.
+        if _ssh_key_secrets:
+            import tempfile
+            import os as _os
+            # Ensure ~/.ssh exists and has the right permissions.
+            code, output = await exec_in_container(
+                container_name,
+                ["bash", "-c", "mkdir -p /root/.ssh && chmod 700 /root/.ssh"],
+            )
+            if code != 0:
+                logger.warning("Deploy %s: failed to create ~/.ssh: %s", req.name, output)
+            for _sk in _ssh_key_secrets:
+                _sk_name = _sk["name"]
+                _sk_value = _sk["value"]
+                # Guard against path traversal: the secret name becomes a file
+                # name under ~/.ssh, so reject anything that is not a plain safe
+                # filename (no slashes, no "..", no leading-dot escapes). A name
+                # like "../authorized_keys" must never write outside ~/.ssh.
+                if not _SAFE_SSH_KEY_NAME.match(_sk_name) or _sk_name in (".", ".."):
+                    logger.warning(
+                        "Deploy %s: skipping SSH key with unsafe name %r",
+                        req.name, _sk_name,
+                    )
+                    continue
+                # Ensure the value ends with a newline — SSH clients require it.
+                if not _sk_value.endswith("\n"):
+                    _sk_value += "\n"
+                _dest = f"/root/.ssh/{_sk_name}"
+                # NamedTemporaryFile creates the host-side temp file with 0600
+                # (via mkstemp), so the plaintext key is never world-readable.
+                with tempfile.NamedTemporaryFile("w", suffix=".key", delete=False) as _tf:
+                    _tf.write(_sk_value)
+                    _tmp_key_path = _tf.name
+                try:
+                    _push_rc, _push_out = await push_file(container_name, _tmp_key_path, _dest)
+                finally:
+                    _os.unlink(_tmp_key_path)
+                if _push_rc != 0:
+                    logger.warning(
+                        "Deploy %s: failed to push SSH key %r (rc=%s): %s",
+                        req.name, _sk_name, _push_rc, _push_out[-200:],
+                    )
+                    continue
+                code, output = await exec_in_container(
+                    container_name, ["chmod", "600", _dest]
+                )
+                if code != 0:
+                    logger.warning(
+                        "Deploy %s: failed to chmod 600 on %s: %s",
+                        req.name, _dest, output,
+                    )
+                else:
+                    logger.info("Deploy %s: materialized SSH key %r at %s", req.name, _sk_name, _dest)
+            steps.append("ssh_keys_materialized")
 
         # Step 3: Install base dependencies (framework needs these).
         # Skipped entirely when the pre-built openclaw base image is in
@@ -456,7 +712,7 @@ async def deploy_agent(req: DeployRequest) -> dict:
         return {
             "success": True,
             "name": req.name,
-            "container": container_name,
+            "container": record_container,
             "ip": container_ip,
             "llm_key": llm_key,
             "steps": steps,

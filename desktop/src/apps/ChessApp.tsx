@@ -236,9 +236,9 @@ export function ChessApp({ windowId: _windowId }: { windowId: string }) {
       style={{
         display: "flex",
         height: "100%",
-        background: "#1a1a2e",
-        color: "#e0e0e0",
-        fontFamily: "'Segoe UI', system-ui, sans-serif",
+        background: "var(--color-shell-bg)",
+        color: "var(--color-shell-text)",
+        fontFamily: "system-ui, -apple-system, 'Segoe UI', sans-serif",
         overflow: "hidden",
       }}
     >
@@ -260,7 +260,11 @@ export function ChessApp({ windowId: _windowId }: { windowId: string }) {
             fontSize: 16,
             fontWeight: 600,
             marginBottom: 10,
-            color: isCheckmate ? "#ff6b6b" : isCheck ? "#ffa726" : "#e0e0e0",
+            color: isCheckmate
+              ? "var(--color-traffic-close)"
+              : isCheck
+                ? "var(--color-traffic-minimize)"
+                : "var(--color-shell-text)",
           }}
           role="status"
           aria-live="polite"
@@ -362,10 +366,10 @@ export function ChessApp({ windowId: _windowId }: { windowId: string }) {
             aria-label="Game mode"
             style={{
               padding: "6px 10px",
-              borderRadius: 4,
-              border: "1px solid #444",
-              background: "#2a2a3e",
-              color: "#e0e0e0",
+              borderRadius: 6,
+              border: "1px solid var(--color-shell-border-strong)",
+              background: "var(--color-shell-surface)",
+              color: "var(--color-shell-text)",
               fontSize: 13,
               cursor: "pointer",
             }}
@@ -384,10 +388,10 @@ export function ChessApp({ windowId: _windowId }: { windowId: string }) {
                 aria-label="Select agent opponent"
                 style={{
                   padding: "6px 10px",
-                  borderRadius: 4,
-                  border: "1px solid #444",
-                  background: "#2a2a3e",
-                  color: "#e0e0e0",
+                  borderRadius: 6,
+                  border: "1px solid var(--color-shell-border-strong)",
+                  background: "var(--color-shell-surface)",
+                  color: "var(--color-shell-text)",
                   fontSize: 13,
                   cursor: "pointer",
                   maxWidth: 160,
@@ -403,10 +407,10 @@ export function ChessApp({ windowId: _windowId }: { windowId: string }) {
               <span
                 style={{
                   padding: "6px 10px",
-                  borderRadius: 4,
-                  border: "1px dashed #444",
-                  background: "#201a1a",
-                  color: "#999",
+                  borderRadius: 6,
+                  border: "1px dashed var(--color-shell-border-strong)",
+                  background: "var(--color-shell-surface)",
+                  color: "var(--color-shell-text-secondary)",
                   fontSize: 12,
                   fontStyle: "italic",
                 }}
@@ -421,10 +425,10 @@ export function ChessApp({ windowId: _windowId }: { windowId: string }) {
             aria-label="New game"
             style={{
               padding: "6px 14px",
-              borderRadius: 4,
-              border: "1px solid #444",
-              background: "#2a2a3e",
-              color: "#e0e0e0",
+              borderRadius: 6,
+              border: "1px solid var(--color-shell-border-strong)",
+              background: "var(--color-shell-surface)",
+              color: "var(--color-shell-text)",
               fontSize: 13,
               cursor: "pointer",
             }}
@@ -437,10 +441,13 @@ export function ChessApp({ windowId: _windowId }: { windowId: string }) {
             aria-label="Undo move"
             style={{
               padding: "6px 14px",
-              borderRadius: 4,
-              border: "1px solid #444",
-              background: "#2a2a3e",
-              color: history.length === 0 || agentThinking ? "#666" : "#e0e0e0",
+              borderRadius: 6,
+              border: "1px solid var(--color-shell-border-strong)",
+              background: "var(--color-shell-surface)",
+              color:
+                history.length === 0 || agentThinking
+                  ? "var(--color-shell-text-tertiary)"
+                  : "var(--color-shell-text)",
               fontSize: 13,
               cursor: history.length === 0 || agentThinking ? "default" : "pointer",
             }}
@@ -454,10 +461,10 @@ export function ChessApp({ windowId: _windowId }: { windowId: string }) {
       <div
         style={{
           width: 180,
-          borderLeft: "1px solid #333",
+          borderLeft: "1px solid var(--color-shell-border)",
           display: "flex",
           flexDirection: "column",
-          background: "#16162a",
+          background: "var(--color-shell-bg-deep)",
         }}
       >
         <div
@@ -465,8 +472,8 @@ export function ChessApp({ windowId: _windowId }: { windowId: string }) {
             padding: "10px 12px",
             fontSize: 13,
             fontWeight: 600,
-            borderBottom: "1px solid #333",
-            color: "#aaa",
+            borderBottom: "1px solid var(--color-shell-border)",
+            color: "var(--color-shell-text-secondary)",
           }}
         >
           Moves
@@ -483,31 +490,45 @@ export function ChessApp({ windowId: _windowId }: { windowId: string }) {
           aria-label="Move history"
         >
           {history.length === 0 && (
-            <span style={{ color: "#555", fontStyle: "italic" }}>No moves yet</span>
+            <span style={{ color: "var(--color-shell-text-tertiary)", fontStyle: "italic" }}>
+              No moves yet
+            </span>
           )}
           {Array.from({ length: Math.ceil(history.length / 2) }).map((_, i) => (
             <div key={i} style={{ display: "flex", gap: 6 }}>
-              <span style={{ color: "#666", minWidth: 24 }}>{i + 1}.</span>
-              <span style={{ color: "#ddd", minWidth: 40 }}>{history[i * 2]}</span>
-              <span style={{ color: "#aaa" }}>{history[i * 2 + 1] ?? ""}</span>
+              <span style={{ color: "var(--color-shell-text-tertiary)", minWidth: 24 }}>
+                {i + 1}.
+              </span>
+              <span style={{ color: "var(--color-shell-text)", minWidth: 40 }}>
+                {history[i * 2]}
+              </span>
+              <span style={{ color: "var(--color-shell-text-secondary)" }}>
+                {history[i * 2 + 1] ?? ""}
+              </span>
             </div>
           ))}
         </div>
         {mode === "vs-agent" && agentCommentary && (
           <div
             style={{
-              borderTop: "1px solid #333",
+              borderTop: "1px solid var(--color-shell-border)",
               padding: "10px 12px",
               fontSize: 12,
-              color: "#bbb",
-              background: "#11111f",
+              color: "var(--color-shell-text)",
+              background: "var(--color-shell-surface)",
               maxHeight: 140,
               overflowY: "auto",
             }}
             role="note"
             aria-label="Agent commentary"
           >
-            <div style={{ color: "#888", fontWeight: 600, marginBottom: 4 }}>
+            <div
+              style={{
+                color: "var(--color-shell-text-secondary)",
+                fontWeight: 600,
+                marginBottom: 4,
+              }}
+            >
               {selectedAgent || "Agent"}
             </div>
             <div style={{ whiteSpace: "pre-wrap", lineHeight: 1.4 }}>

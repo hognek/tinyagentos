@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import {
   Github,
   Star,
@@ -18,18 +18,7 @@ import {
   CircleDot,
   Package,
 } from "lucide-react";
-import {
-  Button,
-  Card,
-  CardHeader,
-  CardContent,
-  Input,
-  Switch,
-  Tabs,
-  TabsList,
-  TabsTrigger,
-  TabsContent,
-} from "@/components/ui";
+import { Switch, Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui";
 import {
   fetchStarred,
   fetchNotifications,
@@ -48,6 +37,7 @@ import type {
 } from "@/lib/github";
 import { MobileSplitView } from "@/components/mobile/MobileSplitView";
 import { useIsMobile } from "@/hooks/use-is-mobile";
+import styles from "./GitHubApp.module.css";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -85,11 +75,24 @@ const formatBytes = (bytes: number): string => {
   return `${(bytes / 1048576).toFixed(1)} MB`;
 };
 
-const stateColor = (state: string): string => {
-  if (state === "open") return "bg-green-500/15 text-green-400 border-green-500/30";
-  if (state === "closed") return "bg-red-500/15 text-red-400 border-red-500/30";
-  if (state === "merged") return "bg-slate-500/15 text-slate-400 border-slate-500/30";
-  return "bg-white/10 text-shell-text-tertiary border-white/10";
+const stateClass = (state: string) => {
+  if (state === "open") return styles.stateOpen;
+  if (state === "merged") return styles.stateMerged;
+  if (state === "closed") return styles.stateClosed;
+  return styles.stateMerged;
+};
+
+/* Deterministic, low-saturation cover tint derived from the repo's
+   language string. Content colouring (like the Projects card covers),
+   not theme chrome — keeps the language-tinted DNA from the mock while
+   working for any language without a hardcoded per-language palette. */
+const coverBackground = (seed: string): string => {
+  let h = 0;
+  for (let i = 0; i < seed.length; i += 1) {
+    h = (h * 31 + seed.charCodeAt(i)) % 360;
+  }
+  const hue = ((h % 360) + 360) % 360;
+  return `radial-gradient(120% 120% at 30% 20%, hsl(${hue} 34% 26%), transparent 60%), linear-gradient(140deg, hsl(${hue} 28% 16%), hsl(${(hue + 24) % 360} 26% 11%))`;
 };
 
 /* ------------------------------------------------------------------ */
@@ -101,15 +104,15 @@ function CommentNode({ comment, depth = 0 }: { comment: GitHubComment; depth?: n
 
   return (
     <div
-      className={`border-l-2 ${depth === 0 ? "border-white/10" : "border-white/5"} pl-3 py-1`}
+      className={`${styles.comment} ${depth > 0 ? styles.commentNested : ""}`}
       style={{ marginLeft: depth > 0 ? `${depth * 12}px` : 0 }}
     >
-      <div className="flex items-center gap-2 mb-1">
-        <span className="text-xs font-medium text-shell-text-secondary">{comment.author}</span>
-        <span className="text-[10px] text-shell-text-tertiary">{formatDate(comment.created_at)}</span>
+      <div className={styles.commentHead}>
+        <span className={styles.commentAuthor}>{comment.author}</span>
+        <span className={styles.commentTime}>{formatDate(comment.created_at)}</span>
         {depth >= 3 && (
           <button
-            className="text-[10px] text-accent hover:underline ml-1"
+            className={styles.commentToggle}
             onClick={() => setCollapsed((v) => !v)}
             aria-expanded={!collapsed}
             aria-label={collapsed ? "Expand comment" : "Collapse comment"}
@@ -120,18 +123,12 @@ function CommentNode({ comment, depth = 0 }: { comment: GitHubComment; depth?: n
       </div>
       {!collapsed && (
         <>
-          <p className="text-xs text-shell-text-secondary whitespace-pre-wrap leading-relaxed mb-1">
-            {comment.body}
-          </p>
+          <p className={styles.commentBody}>{comment.body}</p>
           {Object.keys(comment.reactions ?? {}).length > 0 && (
-            <div className="flex gap-1.5 flex-wrap mb-1">
+            <div className={styles.reacts}>
               {Object.entries(comment.reactions).map(([emoji, count]) =>
                 count > 0 ? (
-                  <span
-                    key={emoji}
-                    className="px-1.5 py-0.5 rounded bg-white/5 border border-white/10 text-[10px] text-shell-text-secondary"
-                    aria-label={`${emoji}: ${count}`}
-                  >
+                  <span key={emoji} className={styles.react} aria-label={`${emoji}: ${count}`}>
                     {emoji} {count}
                   </span>
                 ) : null,
@@ -153,6 +150,10 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
   // view is kept for legacy section-switch effect below; navigation is now driven by selectedId/MobileSplitView
   const [, setView] = useState<View>("list");
   const [detail, setDetail] = useState<DetailTarget | null>(null);
+
+  /* root container ref — scopes the Escape-to-back handler to this app's
+     own subtree so it never fires while another window/app is focused */
+  const rootRef = useRef<HTMLDivElement>(null);
 
   /* ---------- sidebar state ---------- */
   const [activeSection, setActiveSection] = useState<SidebarSection>("starred");
@@ -271,6 +272,32 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
     setDetailReleases([]);
   }, []);
 
+  /* Escape returns to the list from anywhere in an open detail view.
+     Skips list view (no detail open) and editable targets (inputs,
+     textareas, contentEditable) so it never hijacks closing a field.
+     Scoped to this app's own DOM subtree: taOS is a multi-window desktop,
+     so the handler must bail when focus is in another window/app. */
+  useEffect(() => {
+    if (!detail) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      const root = rootRef.current;
+      if (!root) return;
+      const target = e.target as HTMLElement | null;
+      // Only act when focus / the event originates within the GitHub app.
+      const insideApp =
+        (target ? root.contains(target) : false) || root.contains(document.activeElement);
+      if (!insideApp) return;
+      if (target) {
+        const tag = target.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA" || target.isContentEditable) return;
+      }
+      goBack();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [detail, goBack]);
+
   /* ---------- selectedId for MobileSplitView ---------- */
   const selectedId = useMemo((): string | null => {
     if (!detail) return null;
@@ -318,74 +345,64 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
     return [];
   }, [activeSection, starredRepos, watched, notifications, search]);
 
+  const listHeading =
+    activeSection === "notifications" ? "Notifications" : activeSection === "watched" ? "Watched" : "Starred";
+
   /* ---------------------------------------------------------------- */
   /*  Sidebar UI                                                       */
   /* ---------------------------------------------------------------- */
 
   const sidebarUI = (
-    <nav
-      className="w-52 shrink-0 border-r border-white/5 bg-shell-surface/30 flex flex-col overflow-hidden"
-      aria-label="GitHub Browser navigation"
-    >
-      {/* Header */}
-      <div className="flex items-center gap-2 px-3 py-3 border-b border-white/5 shrink-0">
-        <Github size={15} className="text-accent" aria-hidden="true" />
-        <h1 className="text-sm font-semibold">GitHub</h1>
-      </div>
+    <nav className={styles.rail} aria-label="GitHub Browser navigation">
+      <div className={styles.railScroll}>
+        <div className={styles.brand}>
+          <Github size={18} aria-hidden="true" />
+          <b>GitHub</b>
+        </div>
 
-      <div className="flex-1 overflow-y-auto p-2 space-y-4">
-        {/* --- Sections --- */}
-        <section aria-label="Sections">
-          <div className="space-y-0.5">
-            <Button
-              variant={activeSection === "starred" ? "secondary" : "ghost"}
-              size="sm"
+        {/* --- Sources --- */}
+        <section aria-label="Sources">
+          <p className={styles.cap}>Sources</p>
+          <div className={styles.navGroup}>
+            <button
+              type="button"
               aria-pressed={activeSection === "starred"}
               onClick={() => setActiveSection("starred")}
-              className="w-full justify-start text-xs h-7 px-2 gap-1.5"
+              className={`${styles.navItem} ${activeSection === "starred" ? styles.active : ""}`}
             >
-              <Star size={11} aria-hidden="true" />
-              Starred Repos
-            </Button>
-            <Button
-              variant={activeSection === "notifications" ? "secondary" : "ghost"}
-              size="sm"
+              <Star size={14} aria-hidden="true" />
+              Starred
+            </button>
+            <button
+              type="button"
               aria-pressed={activeSection === "notifications"}
               onClick={() => setActiveSection("notifications")}
-              className="w-full justify-between text-xs h-7 px-2"
+              className={`${styles.navItem} ${activeSection === "notifications" ? styles.active : ""}`}
             >
-              <span className="flex items-center gap-1.5">
-                <Bell size={11} aria-hidden="true" />
-                Notifications
-              </span>
+              <Bell size={14} aria-hidden="true" />
+              Notifications
               {unreadCount > 0 && (
-                <span
-                  className="px-1.5 py-0.5 rounded-full bg-accent text-white text-[10px] tabular-nums"
-                  aria-label={`${unreadCount} unread`}
-                >
+                <span className={styles.count} aria-label={`${unreadCount} unread`}>
                   {unreadCount}
                 </span>
               )}
-            </Button>
-            <Button
-              variant={activeSection === "watched" ? "secondary" : "ghost"}
-              size="sm"
+            </button>
+            <button
+              type="button"
               aria-pressed={activeSection === "watched"}
               onClick={() => setActiveSection("watched")}
-              className="w-full justify-start text-xs h-7 px-2 gap-1.5"
+              className={`${styles.navItem} ${activeSection === "watched" ? styles.active : ""}`}
             >
-              <Eye size={11} aria-hidden="true" />
+              <Eye size={14} aria-hidden="true" />
               Watched
-            </Button>
+            </button>
           </div>
         </section>
 
         {/* --- Content Type --- */}
         <section aria-label="Content type">
-          <p className="text-[10px] uppercase tracking-wider text-shell-text-tertiary px-2 mb-1.5">
-            Content
-          </p>
-          <div className="space-y-0.5">
+          <p className={styles.cap}>Content</p>
+          <div className={styles.navGroup}>
             {(
               [
                 { id: "repos" as ContentType, label: "Repos", icon: Github },
@@ -394,40 +411,36 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
                 { id: "releases" as ContentType, label: "Releases", icon: Package },
               ] as const
             ).map(({ id, label, icon: Icon }) => (
-              <Button
+              <button
                 key={id}
-                variant={contentType === id ? "secondary" : "ghost"}
-                size="sm"
+                type="button"
                 aria-pressed={contentType === id}
                 onClick={() => setContentType(id)}
-                className="w-full justify-start text-xs h-7 px-2 gap-1.5"
+                className={`${styles.navItem} ${contentType === id ? styles.active : ""}`}
               >
-                <Icon size={11} aria-hidden="true" />
+                <Icon size={14} aria-hidden="true" />
                 {label}
-              </Button>
+              </button>
             ))}
           </div>
         </section>
 
         {/* --- Status --- */}
         <section aria-label="Status filter">
-          <p className="text-[10px] uppercase tracking-wider text-shell-text-tertiary px-2 mb-1.5">
-            Status
-          </p>
-          <div className="space-y-0.5">
+          <p className={styles.cap}>Status</p>
+          <div className={styles.pillrow}>
             {(["open", "closed", "merged"] as const).map((s) => {
               const active = filterStatus === s;
               return (
-                <Button
+                <button
                   key={s}
-                  variant={active ? "secondary" : "ghost"}
-                  size="sm"
+                  type="button"
                   aria-pressed={active}
                   onClick={() => setFilterStatus((prev) => (prev === s ? null : s))}
-                  className="w-full justify-start text-xs h-7 px-2 capitalize"
+                  className={`${styles.filterpill} ${active ? styles.on : ""}`}
                 >
                   {s}
-                </Button>
+                </button>
               );
             })}
           </div>
@@ -435,19 +448,16 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
       </div>
 
       {/* Auth status at bottom */}
-      <div className="shrink-0 border-t border-white/5 px-3 py-2">
+      <div className={styles.acct}>
         {authStatus.authenticated ? (
-          <div className="space-y-0.5">
-            <p className="text-[10px] text-shell-text-tertiary capitalize">
-              {authStatus.method ?? "connected"}
-            </p>
-            <p className="text-xs text-shell-text-secondary truncate">
-              @{authStatus.username}
-            </p>
-          </div>
+          <>
+            <p className={styles.acctWho}>@{authStatus.username}</p>
+            <p className={styles.acctMeth}>{authStatus.method ?? "connected"}</p>
+          </>
         ) : (
           <button
-            className="text-xs text-accent hover:underline"
+            type="button"
+            className={styles.connect}
             onClick={() => {
               /* links to Secrets app — no-op in UI, user can navigate manually */
             }}
@@ -465,17 +475,10 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
   /* ---------------------------------------------------------------- */
 
   const authBanner = !authStatus.authenticated ? (
-    <div
-      className="flex items-center gap-3 px-4 py-2 bg-amber-500/10 border-b border-amber-500/20 text-xs text-amber-300 shrink-0"
-      role="banner"
-      aria-label="GitHub authentication notice"
-    >
-      <AlertCircle size={13} aria-hidden="true" />
+    <div className={styles.authbanner} role="banner" aria-label="GitHub authentication notice">
+      <AlertCircle size={14} aria-hidden="true" />
       <span>Connect GitHub for starred repos and notifications.</span>
-      <button
-        className="ml-auto underline hover:text-amber-200"
-        aria-label="Open Secrets app to connect GitHub"
-      >
+      <button type="button" className={styles.authbannerLink} aria-label="Open Secrets app to connect GitHub">
         Connect
       </button>
     </div>
@@ -485,116 +488,94 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
   /*  Repo card                                                        */
   /* ---------------------------------------------------------------- */
 
-  const repoCard = (repo: GitHubRepo) => (
-    <Card
-      key={`${repo.owner}/${repo.name}`}
-      className="cursor-pointer hover:border-white/15 transition-colors"
-      onClick={() => openRepoDetail(repo)}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          openRepoDetail(repo);
-        }
-      }}
-      tabIndex={0}
-      role="button"
-      aria-label={`Open ${repo.owner}/${repo.name}`}
-    >
-      <CardHeader className="pb-1 p-3">
-        <div className="flex items-start justify-between gap-2">
-          <h3 className="text-sm font-medium leading-snug">
-            <span className="text-shell-text-tertiary">{repo.owner}/</span>
+  const repoCard = (repo: GitHubRepo) => {
+    const isSel = selectedId === `repo:${repo.owner}/${repo.name}`;
+    return (
+      <button
+        type="button"
+        key={`${repo.owner}/${repo.name}`}
+        className={`${styles.repocard} ${isSel ? styles.sel : ""}`}
+        onClick={() => openRepoDetail(repo)}
+        aria-label={`Open ${repo.owner}/${repo.name}`}
+      >
+        <div className={styles.cover} style={{ background: coverBackground(repo.language || repo.name) }}>
+          {repo.language && <span className={styles.coverLang}>{repo.language}</span>}
+        </div>
+        <div className={styles.cardBody}>
+          <div className={styles.repoTitle}>
+            <span className={styles.own}>{repo.owner}/</span>
             {repo.name}
-          </h3>
-          {repo.language && (
-            <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-accent/10 text-accent border border-accent/20">
-              {repo.language}
+          </div>
+          {repo.description && <p className={styles.repoDesc}>{repo.description}</p>}
+          <div className={styles.meta}>
+            <span className={styles.metaItem} aria-label={`${repo.stars} stars`}>
+              <Star size={11} aria-hidden="true" />
+              {repo.stars.toLocaleString()}
             </span>
+            <span className={styles.metaItem} aria-label={`${repo.forks} forks`}>
+              <GitFork size={11} aria-hidden="true" />
+              {repo.forks.toLocaleString()}
+            </span>
+            <span className={styles.metaAgo}>{formatDate(repo.updated_at)}</span>
+          </div>
+          {repo.topics.length > 0 && (
+            <div className={styles.topics} aria-label="Topics">
+              {repo.topics.slice(0, 4).map((t) => (
+                <span key={t} className={styles.topic}>
+                  {t}
+                </span>
+              ))}
+            </div>
           )}
         </div>
-        {repo.description && (
-          <p className="text-[11px] text-shell-text-secondary line-clamp-1 leading-relaxed mt-0.5">
-            {repo.description}
-          </p>
-        )}
-      </CardHeader>
-      <CardContent className="pt-0 px-3 pb-3">
-        <div className="flex items-center gap-3 text-[10px] text-shell-text-tertiary">
-          <span className="flex items-center gap-1" aria-label={`${repo.stars} stars`}>
-            <Star size={10} aria-hidden="true" />
-            {repo.stars.toLocaleString()}
-          </span>
-          <span className="flex items-center gap-1" aria-label={`${repo.forks} forks`}>
-            <GitFork size={10} aria-hidden="true" />
-            {repo.forks.toLocaleString()}
-          </span>
-          <span className="ml-auto">{formatDate(repo.updated_at)}</span>
-        </div>
-      </CardContent>
-    </Card>
-  );
+      </button>
+    );
+  };
 
   /* ---------------------------------------------------------------- */
   /*  Issue card                                                       */
   /* ---------------------------------------------------------------- */
 
   const issueCard = (issue: GitHubIssue) => (
-    <Card
+    <button
+      type="button"
       key={`${issue.repo}#${issue.number}`}
-      className="cursor-pointer hover:border-white/15 transition-colors"
+      className={styles.issuecard}
       onClick={() => openIssueDetail(issue)}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          openIssueDetail(issue);
-        }
-      }}
-      tabIndex={0}
-      role="button"
       aria-label={`Open ${issue.is_pull_request ? "PR" : "issue"}: ${issue.title}`}
     >
-      <CardHeader className="pb-1 p-3">
-        <div className="flex items-start gap-2">
-          {issue.is_pull_request ? (
-            <GitPullRequest size={13} className="mt-0.5 shrink-0 text-accent" aria-hidden="true" />
-          ) : (
-            <CircleDot size={13} className="mt-0.5 shrink-0 text-green-400" aria-hidden="true" />
-          )}
-          <div className="flex-1 min-w-0">
-            <h3 className="text-sm font-medium leading-snug line-clamp-1">{issue.title}</h3>
-            <p className="text-[11px] text-shell-text-tertiary mt-0.5">{issue.repo}</p>
-          </div>
-          <span
-            className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded border ${stateColor(issue.state)}`}
-            aria-label={`Status: ${issue.state}`}
-          >
-            {issue.state}
-          </span>
-        </div>
-      </CardHeader>
-      <CardContent className="pt-0 px-3 pb-3 space-y-1.5">
-        {issue.labels.length > 0 && (
-          <div className="flex flex-wrap gap-1" aria-label="Labels">
-            {issue.labels.map((label) => (
-              <span
-                key={label}
-                className="px-1.5 py-0.5 rounded bg-white/5 border border-white/10 text-[10px] text-shell-text-secondary"
-              >
-                {label}
-              </span>
-            ))}
-          </div>
+      <div className={styles.issueTop}>
+        {issue.is_pull_request ? (
+          <GitPullRequest size={14} className={`${styles.gi} ${styles.giPr}`} aria-hidden="true" />
+        ) : (
+          <CircleDot size={14} className={`${styles.gi} ${styles.giOpen}`} aria-hidden="true" />
         )}
-        <div className="flex items-center gap-3 text-[10px] text-shell-text-tertiary">
-          <span className="flex items-center gap-1">
-            <MessageSquare size={10} aria-hidden="true" />
-            {issue.comments.length}
-          </span>
-          <span>{issue.author}</span>
-          <span className="ml-auto">{formatDate(issue.created_at)}</span>
+        <div className={styles.issueTitle}>{issue.title}</div>
+        <span className={`${styles.state} ${stateClass(issue.state)}`} aria-label={`Status: ${issue.state}`}>
+          {issue.state}
+        </span>
+      </div>
+      <div className={styles.issueRepo}>
+        {issue.repo} · #{issue.number}
+      </div>
+      {issue.labels.length > 0 && (
+        <div className={styles.labels} aria-label="Labels">
+          {issue.labels.map((label) => (
+            <span key={label} className={styles.lbl}>
+              {label}
+            </span>
+          ))}
         </div>
-      </CardContent>
-    </Card>
+      )}
+      <div className={styles.issueFoot}>
+        <span className={styles.issueFootItem}>
+          <MessageSquare size={11} aria-hidden="true" />
+          {issue.comments.length}
+        </span>
+        <span>{issue.author}</span>
+        <span className={styles.issueFootAgo}>{formatDate(issue.created_at)}</span>
+      </div>
+    </button>
   );
 
   /* ---------------------------------------------------------------- */
@@ -602,42 +583,29 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
   /* ---------------------------------------------------------------- */
 
   const releaseCard = (release: GitHubRelease, repoFullName = "") => (
-    <Card
+    <button
+      type="button"
       key={release.tag}
-      className="cursor-pointer hover:border-white/15 transition-colors"
+      className={styles.releasecard}
       onClick={() => openReleaseDetail(release, repoFullName)}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          openReleaseDetail(release, repoFullName);
-        }
-      }}
-      tabIndex={0}
-      role="button"
       aria-label={`Open release ${release.tag}`}
     >
-      <CardHeader className="pb-1 p-3">
-        <div className="flex items-start justify-between gap-2">
-          <div>
-            <h3 className="text-sm font-medium leading-snug flex items-center gap-1.5">
-              <Tag size={11} aria-hidden="true" className="text-accent" />
-              {release.tag}
-            </h3>
-            {repoFullName && (
-              <p className="text-[11px] text-shell-text-tertiary mt-0.5">{repoFullName}</p>
-            )}
+      <div className={styles.releaseTop}>
+        <div>
+          <div className={styles.releaseTag}>
+            <Tag size={13} aria-hidden="true" />
+            {release.tag}
           </div>
-          {release.prerelease && (
-            <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 border border-amber-500/30">
-              pre-release
-            </span>
-          )}
+          {repoFullName && <div className={styles.releaseRepo}>{repoFullName}</div>}
         </div>
-      </CardHeader>
-      <CardContent className="pt-0 px-3 pb-3">
-        <p className="text-[10px] text-shell-text-tertiary">{formatDate(release.published_at)}</p>
-      </CardContent>
-    </Card>
+        {release.prerelease && <span className={styles.pre}>pre-release</span>}
+      </div>
+      <div className={styles.releaseMeta}>
+        {release.assets.length > 0
+          ? `${formatDate(release.published_at)} · ${release.assets.length} assets`
+          : formatDate(release.published_at)}
+      </div>
+    </button>
   );
 
   /* ---------------------------------------------------------------- */
@@ -645,42 +613,38 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
   /* ---------------------------------------------------------------- */
 
   const listViewUI = (
-    <main className="flex-1 flex flex-col overflow-hidden" aria-label="GitHub content list">
-      {/* Search bar */}
-      <div className="flex items-center gap-2 px-4 py-3 border-b border-white/5 shrink-0">
-        <div className="relative flex-1">
-          <Search
-            size={14}
-            className="absolute left-3 top-1/2 -translate-y-1/2 text-shell-text-tertiary pointer-events-none z-10"
-            aria-hidden="true"
-          />
-          <Input
+    <main className={styles.listcol} aria-label="GitHub content list">
+      <div className={styles.listhead}>
+        <h2>{listHeading}</h2>
+        <span className={styles.listN}>
+          {activeSection === "notifications" && unreadCount > 0 ? `${unreadCount} unread` : activeItems.length}
+        </span>
+        <div className={styles.search}>
+          <Search size={13} aria-hidden="true" />
+          <input
             type="search"
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             placeholder="Search…"
-            className="pl-8 h-8"
             aria-label="Search GitHub content"
           />
         </div>
       </div>
 
-      {/* Items */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-2" role="list" aria-label="GitHub items">
+      <div className={styles.list} role="list" aria-label="GitHub items">
         {loading ? (
-          <div
-            className="flex items-center justify-center h-full text-shell-text-tertiary text-sm"
-            role="status"
-            aria-live="polite"
-          >
-            Loading…
-          </div>
+          <>
+            <div className={`${styles.skel} taos-shimmer`} aria-hidden="true" />
+            <div className={`${styles.skel} taos-shimmer`} aria-hidden="true" />
+            <div className={`${styles.skel} taos-shimmer`} aria-hidden="true" />
+            <span className="sr-only" role="status" aria-live="polite">
+              Loading…
+            </span>
+          </>
         ) : activeItems.length === 0 ? (
-          <div className="flex flex-col items-center justify-center h-full gap-3 text-shell-text-tertiary">
-            <Github size={36} className="opacity-20" aria-hidden="true" />
-            <p className="text-sm">
-              {search ? "No results for your search" : "Nothing here yet"}
-            </p>
+          <div className={styles.empty}>
+            <Github size={36} aria-hidden="true" />
+            <p>{search ? "No results for your search" : "Nothing here yet"}</p>
           </div>
         ) : activeSection === "notifications" ? (
           (activeItems as GitHubIssue[]).map((item) => (
@@ -708,69 +672,45 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
     const latestRelease = detailReleases[0] ?? null;
 
     return (
-      <main className="flex-1 flex flex-col overflow-hidden" aria-label={`${repo.owner}/${repo.name} detail`}>
-        <div className="flex-1 overflow-y-auto">
-          {/* Back + header */}
-          <div className="px-5 pt-4 pb-3 border-b border-white/5">
+      <main className={styles.detail} aria-label={`${repo.owner}/${repo.name} detail`}>
+        <div className={styles.detailScroll}>
+          <div className={styles.dhead}>
             {/* Hide back button on mobile — MobileSplitView nav bar handles back */}
             {!isMobile && (
-              <Button
-                variant="ghost"
-                size="sm"
+              <button
+                type="button"
+                className={styles.back}
                 onClick={goBack}
-                className="text-xs mb-3 -ml-1 text-shell-text-secondary"
                 aria-label="Back to list"
-                onKeyDown={(e) => e.key === "Escape" && goBack()}
               >
                 <ChevronLeft size={14} aria-hidden="true" />
                 Back
-              </Button>
+              </button>
             )}
 
-            <h2 className="text-lg font-semibold leading-snug mb-1">
-              <span className="text-shell-text-tertiary">{repo.owner}/</span>
+            <h2 className={styles.dtitle}>
+              <span className={styles.own}>{repo.owner}/</span>
               {repo.name}
             </h2>
-            {repo.description && (
-              <p className="text-sm text-shell-text-secondary mb-3">{repo.description}</p>
-            )}
+            {repo.description && <p className={styles.ddesc}>{repo.description}</p>}
 
-            {/* Badges */}
-            <div className="flex flex-wrap gap-2 mb-3">
-              <span
-                className="flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-white/5 border border-white/10 text-shell-text-secondary"
-                aria-label={`${repo.stars} stars`}
-              >
-                <Star size={10} aria-hidden="true" />
+            <div className={styles.badges}>
+              <span className={styles.badge} aria-label={`${repo.stars} stars`}>
+                <Star size={11} aria-hidden="true" />
                 {repo.stars.toLocaleString()} stars
               </span>
-              <span
-                className="flex items-center gap-1 text-[11px] px-2 py-0.5 rounded bg-white/5 border border-white/10 text-shell-text-secondary"
-                aria-label={`${repo.forks} forks`}
-              >
-                <GitFork size={10} aria-hidden="true" />
+              <span className={styles.badge} aria-label={`${repo.forks} forks`}>
+                <GitFork size={11} aria-hidden="true" />
                 {repo.forks.toLocaleString()} forks
               </span>
-              {repo.language && (
-                <span className="text-[11px] px-2 py-0.5 rounded bg-accent/10 text-accent border border-accent/20">
-                  {repo.language}
-                </span>
-              )}
-              {repo.license && (
-                <span className="text-[11px] px-2 py-0.5 rounded bg-white/5 border border-white/10 text-shell-text-secondary">
-                  {repo.license}
-                </span>
-              )}
+              {repo.language && <span className={`${styles.badge} ${styles.badgeLang}`}>{repo.language}</span>}
+              {repo.license && <span className={styles.badge}>{repo.license}</span>}
             </div>
 
-            {/* Topics */}
             {repo.topics.length > 0 && (
-              <div className="flex flex-wrap gap-1 mb-2" aria-label="Topics">
+              <div className={styles.topics} aria-label="Topics">
                 {repo.topics.map((t) => (
-                  <span
-                    key={t}
-                    className="px-1.5 py-0.5 rounded-full bg-blue-500/10 text-blue-400 text-[10px] border border-blue-500/20"
-                  >
+                  <span key={t} className={styles.topic}>
                     {t}
                   </span>
                 ))}
@@ -780,36 +720,25 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
 
           {/* README */}
           {repo.readme_content && (
-            <div className="px-5 py-4 border-b border-white/5">
-              <h3 className="text-xs font-semibold text-shell-text-tertiary uppercase tracking-wider mb-2">
-                README
-              </h3>
-              <div className="rounded-lg bg-white/[0.02] border border-white/5 p-3 max-h-64 overflow-y-auto">
-                <pre className="text-xs text-shell-text-secondary whitespace-pre-wrap leading-relaxed font-sans">
-                  {detailLoading ? "Loading…" : repo.readme_content}
-                </pre>
+            <div className={styles.section}>
+              <p className={styles.sectionCap}>Readme</p>
+              <div className={styles.readme}>
+                <pre>{detailLoading ? "Loading…" : repo.readme_content}</pre>
               </div>
             </div>
           )}
 
           {/* Latest release */}
           {latestRelease && (
-            <div className="px-5 py-4 border-b border-white/5">
-              <h3 className="text-xs font-semibold text-shell-text-tertiary uppercase tracking-wider mb-2">
-                Latest Release
-              </h3>
+            <div className={styles.section}>
+              <p className={styles.sectionCap}>Latest Release</p>
               {releaseCard(latestRelease, `${repo.owner}/${repo.name}`)}
             </div>
           )}
 
           {/* Monitor toggle */}
-          <div className="px-5 py-3 border-b border-white/5 flex items-center justify-between">
-            <label
-              htmlFor={`monitor-${repo.name}`}
-              className="text-xs text-shell-text-secondary cursor-pointer"
-            >
-              Monitor releases
-            </label>
+          <div className={styles.toggleRow}>
+            <label htmlFor={`monitor-${repo.name}`}>Monitor releases</label>
             <Switch
               id={`monitor-${repo.name}`}
               checked={monitorEnabled}
@@ -819,28 +748,26 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
           </div>
 
           {/* Action bar */}
-          <div className="px-5 py-3 flex flex-wrap gap-2">
-            <Button
-              size="sm"
-              variant="ghost"
-              className="text-xs gap-1.5"
+          <div className={styles.actions}>
+            <button
+              type="button"
+              className={`${styles.btn} ${styles.btnGhost}`}
               onClick={() => window.open(repoUrl, "_blank", "noopener,noreferrer")}
               aria-label="Open on GitHub"
             >
               <ExternalLink size={13} aria-hidden="true" />
               Open on GitHub
-            </Button>
-            <Button
-              size="sm"
-              variant={savedToLib ? "secondary" : "outline"}
-              className="text-xs gap-1.5"
+            </button>
+            <button
+              type="button"
+              className={`${styles.btn} ${savedToLib ? "" : styles.btnPrimary}`}
               onClick={() => handleSaveToLibrary(repoUrl)}
               disabled={savingToLib || savedToLib}
               aria-label={savedToLib ? "Saved to library" : "Save to Library"}
             >
               <BookMarked size={13} aria-hidden="true" />
               {savedToLib ? "Saved" : savingToLib ? "Saving…" : "Save to Library"}
-            </Button>
+            </button>
           </div>
         </div>
       </main>
@@ -855,51 +782,42 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
     const issueUrl = `https://github.com/${issue.repo}/${issue.is_pull_request ? "pull" : "issues"}/${issue.number}`;
 
     return (
-      <main className="flex-1 flex flex-col overflow-hidden" aria-label={`Issue ${issue.number} detail`}>
-        <div className="flex-1 overflow-y-auto">
-          {/* Back + header */}
-          <div className="px-5 pt-4 pb-3 border-b border-white/5">
+      <main className={styles.detail} aria-label={`Issue ${issue.number} detail`}>
+        <div className={styles.detailScroll}>
+          <div className={styles.dhead}>
             {/* Hide back button on mobile — MobileSplitView nav bar handles back */}
             {!isMobile && (
-              <Button
-                variant="ghost"
-                size="sm"
+              <button
+                type="button"
+                className={styles.back}
                 onClick={goBack}
-                className="text-xs mb-3 -ml-1 text-shell-text-secondary"
                 aria-label="Back to list"
-                onKeyDown={(e) => e.key === "Escape" && goBack()}
               >
                 <ChevronLeft size={14} aria-hidden="true" />
                 Back
-              </Button>
+              </button>
             )}
 
-            <div className="flex items-start gap-2 mb-2">
+            <div className={styles.dtitleRow}>
               {issue.is_pull_request ? (
-                <GitPullRequest size={16} className="mt-0.5 shrink-0 text-accent" aria-hidden="true" />
+                <GitPullRequest size={16} className={`${styles.gi} ${styles.giPr}`} aria-hidden="true" />
               ) : (
-                <CircleDot size={16} className="mt-0.5 shrink-0 text-green-400" aria-hidden="true" />
+                <CircleDot size={16} className={`${styles.gi} ${styles.giOpen}`} aria-hidden="true" />
               )}
-              <h2 className="text-base font-semibold leading-snug flex-1">{issue.title}</h2>
-              <span
-                className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded border ${stateColor(issue.state)}`}
-                aria-label={`Status: ${issue.state}`}
-              >
+              <h2 className={styles.dtitle}>{issue.title}</h2>
+              <span className={`${styles.state} ${stateClass(issue.state)}`} aria-label={`Status: ${issue.state}`}>
                 {issue.state}
               </span>
             </div>
 
-            <p className="text-xs text-shell-text-tertiary mb-2">
-              {issue.repo} · {issue.author} · {formatDate(issue.created_at)}
+            <p className={styles.dmeta}>
+              {issue.repo} · {issue.author} · #{issue.number} · {formatDate(issue.created_at)}
             </p>
 
             {issue.labels.length > 0 && (
-              <div className="flex flex-wrap gap-1 mb-2" aria-label="Labels">
+              <div className={styles.labels} aria-label="Labels">
                 {issue.labels.map((label) => (
-                  <span
-                    key={label}
-                    className="px-1.5 py-0.5 rounded bg-white/5 border border-white/10 text-[10px] text-shell-text-secondary"
-                  >
+                  <span key={label} className={styles.lbl}>
                     {label}
                   </span>
                 ))}
@@ -908,29 +826,30 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
           </div>
 
           {/* Tabs */}
-          <div className="px-5 py-3 flex-1">
+          <div className={styles.section}>
             <Tabs defaultValue="discussion">
-              <TabsList>
-                <TabsTrigger value="discussion">Discussion</TabsTrigger>
-                <TabsTrigger value="history">History</TabsTrigger>
-                <TabsTrigger value="metadata">Metadata</TabsTrigger>
+              <TabsList className={styles.tabsList}>
+                <TabsTrigger value="discussion" className={styles.tabsTrigger}>
+                  Discussion
+                </TabsTrigger>
+                <TabsTrigger value="history" className={styles.tabsTrigger}>
+                  History
+                </TabsTrigger>
+                <TabsTrigger value="metadata" className={styles.tabsTrigger}>
+                  Metadata
+                </TabsTrigger>
               </TabsList>
 
               {/* Discussion tab */}
               <TabsContent value="discussion">
-                {/* Body */}
                 {issue.body && (
-                  <div className="rounded-lg bg-white/[0.02] border border-white/5 p-3 mb-3 mt-3">
-                    <p className="text-xs text-shell-text-secondary whitespace-pre-wrap leading-relaxed">
-                      {detailLoading ? "Loading…" : issue.body}
-                    </p>
+                  <div className={styles.readme} style={{ maxHeight: "none", marginBottom: issue.comments.length > 0 ? 14 : 0 }}>
+                    <pre className={styles.issueBody}>{detailLoading ? "Loading…" : issue.body}</pre>
                   </div>
                 )}
-
-                {/* Comments */}
                 {issue.comments.length > 0 && (
-                  <div className="space-y-2 mt-2" aria-label="Comments">
-                    <p className="text-[10px] uppercase tracking-wider text-shell-text-tertiary mb-1">
+                  <div aria-label="Comments">
+                    <p className={styles.sectionCap}>
                       {issue.comments.length} comment{issue.comments.length !== 1 ? "s" : ""}
                     </p>
                     {issue.comments.map((comment, idx) => (
@@ -938,29 +857,30 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
                     ))}
                   </div>
                 )}
+                {!issue.body && issue.comments.length === 0 && (
+                  <p className={styles.tabsEmpty}>No description or comments.</p>
+                )}
               </TabsContent>
 
               {/* History tab */}
               <TabsContent value="history">
-                <div className="mt-3 text-xs text-shell-text-tertiary italic">
-                  Issue history not available in this view.
-                </div>
+                <p className={styles.tabsEmpty}>Issue history not available in this view.</p>
               </TabsContent>
 
               {/* Metadata tab */}
               <TabsContent value="metadata">
-                <div className="mt-3 space-y-2">
+                <div className={styles.metaList}>
                   {[
                     { label: "Number", value: `#${issue.number}` },
                     { label: "State", value: issue.state },
                     { label: "Author", value: issue.author },
                     { label: "Repo", value: issue.repo },
                     { label: "Type", value: issue.is_pull_request ? "Pull Request" : "Issue" },
-                    { label: "Created", value: issue.created_at },
+                    { label: "Created", value: formatDate(issue.created_at) },
                   ].map(({ label, value }) => (
-                    <div key={label} className="flex justify-between text-xs">
-                      <span className="text-shell-text-tertiary">{label}</span>
-                      <span className="text-shell-text-secondary">{value}</span>
+                    <div key={label} className={styles.metaRow}>
+                      <span className={styles.metaKey}>{label}</span>
+                      <span className={styles.metaVal}>{value}</span>
                     </div>
                   ))}
                 </div>
@@ -969,28 +889,26 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
           </div>
 
           {/* Action bar */}
-          <div className="px-5 py-3 flex flex-wrap gap-2 border-t border-white/5">
-            <Button
-              size="sm"
-              variant="ghost"
-              className="text-xs gap-1.5"
+          <div className={`${styles.actions} ${styles.actionsTop}`}>
+            <button
+              type="button"
+              className={`${styles.btn} ${styles.btnGhost}`}
               onClick={() => window.open(issueUrl, "_blank", "noopener,noreferrer")}
               aria-label="Open on GitHub"
             >
               <ExternalLink size={13} aria-hidden="true" />
               Open on GitHub
-            </Button>
-            <Button
-              size="sm"
-              variant={savedToLib ? "secondary" : "outline"}
-              className="text-xs gap-1.5"
+            </button>
+            <button
+              type="button"
+              className={`${styles.btn} ${savedToLib ? "" : styles.btnPrimary}`}
               onClick={() => handleSaveToLibrary(issueUrl)}
               disabled={savingToLib || savedToLib}
               aria-label={savedToLib ? "Saved to library" : "Save to Library"}
             >
               <BookMarked size={13} aria-hidden="true" />
               {savedToLib ? "Saved" : savingToLib ? "Saving…" : "Save to Library"}
-            </Button>
+            </button>
           </div>
         </div>
       </main>
@@ -1008,78 +926,54 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
       : "#";
 
     return (
-      <main className="flex-1 flex flex-col overflow-hidden" aria-label={`Release ${release.tag} detail`}>
-        <div className="flex-1 overflow-y-auto">
-          {/* Back + header */}
-          <div className="px-5 pt-4 pb-3 border-b border-white/5">
+      <main className={styles.detail} aria-label={`Release ${release.tag} detail`}>
+        <div className={styles.detailScroll}>
+          <div className={styles.dhead}>
             {/* Hide back button on mobile — MobileSplitView nav bar handles back */}
             {!isMobile && (
-              <Button
-                variant="ghost"
-                size="sm"
+              <button
+                type="button"
+                className={styles.back}
                 onClick={goBack}
-                className="text-xs mb-3 -ml-1 text-shell-text-secondary"
                 aria-label="Back to list"
-                onKeyDown={(e) => e.key === "Escape" && goBack()}
               >
                 <ChevronLeft size={14} aria-hidden="true" />
                 Back
-              </Button>
+              </button>
             )}
 
-            <div className="flex items-start gap-2 mb-1">
-              <Tag size={16} className="mt-0.5 shrink-0 text-accent" aria-hidden="true" />
-              <h2 className="text-lg font-semibold leading-snug">{release.tag}</h2>
-              {release.prerelease && (
-                <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-400 border border-amber-500/30">
-                  pre-release
-                </span>
-              )}
+            <div className={styles.dtitleRow}>
+              <Tag size={16} className={`${styles.gi} ${styles.giPr}`} aria-hidden="true" />
+              <h2 className={styles.dtitle}>{release.tag}</h2>
+              {release.prerelease && <span className={styles.pre}>pre-release</span>}
             </div>
-            {repoFullName && (
-              <p className="text-xs text-shell-text-tertiary mb-1">{repoFullName}</p>
-            )}
-            <p className="text-xs text-shell-text-tertiary">
+            {repoFullName && <p className={styles.dmeta}>{repoFullName}</p>}
+            <p className={styles.dmeta}>
               {release.author} · {formatDate(release.published_at)}
             </p>
           </div>
 
           {/* Release notes */}
           {release.body && (
-            <div className="px-5 py-4 border-b border-white/5">
-              <h3 className="text-xs font-semibold text-shell-text-tertiary uppercase tracking-wider mb-2">
-                Release Notes
-              </h3>
-              <pre className="text-xs text-shell-text-secondary whitespace-pre-wrap leading-relaxed font-sans">
-                {release.body}
-              </pre>
+            <div className={styles.section}>
+              <p className={styles.sectionCap}>Release Notes</p>
+              <div className={styles.readme} style={{ maxHeight: "none" }}>
+                <pre>{release.body}</pre>
+              </div>
             </div>
           )}
 
           {/* Assets */}
           {release.assets.length > 0 && (
-            <div className="px-5 py-4 border-b border-white/5">
-              <h3 className="text-xs font-semibold text-shell-text-tertiary uppercase tracking-wider mb-2">
-                Assets ({release.assets.length})
-              </h3>
-              <div className="space-y-1.5" role="list" aria-label="Release assets">
+            <div className={styles.section}>
+              <p className={styles.sectionCap}>Assets ({release.assets.length})</p>
+              <div role="list" aria-label="Release assets">
                 {release.assets.map((asset) => (
-                  <div
-                    key={asset.name}
-                    className="flex items-center gap-3 px-3 py-2 rounded-lg bg-white/[0.02] border border-white/5 text-xs"
-                    role="listitem"
-                  >
-                    <Download size={11} aria-hidden="true" className="text-shell-text-tertiary shrink-0" />
-                    <span className="flex-1 truncate text-shell-text-secondary font-mono">
-                      {asset.name}
-                    </span>
-                    <span className="text-shell-text-tertiary shrink-0">
-                      {formatBytes(asset.size)}
-                    </span>
-                    <span
-                      className="text-shell-text-tertiary shrink-0"
-                      aria-label={`${asset.download_count} downloads`}
-                    >
+                  <div key={asset.name} className={styles.asset} role="listitem">
+                    <Download size={11} aria-hidden="true" />
+                    <span className={styles.assetName}>{asset.name}</span>
+                    <span className={styles.assetMeta}>{formatBytes(asset.size)}</span>
+                    <span className={styles.assetMeta} aria-label={`${asset.download_count} downloads`}>
                       {asset.download_count.toLocaleString()} dl
                     </span>
                   </div>
@@ -1089,28 +983,26 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
           )}
 
           {/* Action bar */}
-          <div className="px-5 py-3 flex flex-wrap gap-2">
-            <Button
-              size="sm"
-              variant="ghost"
-              className="text-xs gap-1.5"
+          <div className={styles.actions}>
+            <button
+              type="button"
+              className={`${styles.btn} ${styles.btnGhost}`}
               onClick={() => window.open(releaseUrl, "_blank", "noopener,noreferrer")}
               aria-label="Open on GitHub"
             >
               <ExternalLink size={13} aria-hidden="true" />
               Open on GitHub
-            </Button>
-            <Button
-              size="sm"
-              variant={savedToLib ? "secondary" : "outline"}
-              className="text-xs gap-1.5"
+            </button>
+            <button
+              type="button"
+              className={`${styles.btn} ${savedToLib ? "" : styles.btnPrimary}`}
               onClick={() => handleSaveToLibrary(releaseUrl)}
               disabled={savingToLib || savedToLib || releaseUrl === "#"}
               aria-label={savedToLib ? "Saved to library" : "Save to Library"}
             >
               <BookMarked size={13} aria-hidden="true" />
               {savedToLib ? "Saved" : savingToLib ? "Saving…" : "Save to Library"}
-            </Button>
+            </button>
           </div>
         </div>
       </main>
@@ -1141,224 +1033,146 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
     return "";
   }, [detail]);
 
-  // Hide toolbar on mobile when detail is open — MobileSplitView nav bar is shown instead
-  const showToolbar = !isMobile || selectedId === null;
-
   /* ---------------------------------------------------------------- */
   /*  Mobile iOS-style list pane (sidebar sections + item list)        */
   /* ---------------------------------------------------------------- */
 
   const mobileListPane = (
-    <div style={{ display: "flex", flexDirection: "column", height: "100%" }}>
+    <div className={styles.mobileRoot}>
       {authBanner}
-      {/* Sections */}
-      <div style={{ padding: "8px 0 4px", borderBottom: "1px solid rgba(255,255,255,0.05)", flexShrink: 0 }}>
-        <div style={{ margin: "0 12px", borderRadius: 16, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)", overflow: "hidden" }}>
+      <div className={styles.mscroll}>
+        {/* Sources */}
+        <p className={styles.mgroupCap}>Sources</p>
+        <div className={styles.minset}>
           {(
             [
-              { id: "starred" as SidebarSection, label: "Starred Repos", icon: Star, badge: null as number | null },
-              { id: "notifications" as SidebarSection, label: "Notifications", icon: Bell, badge: unreadCount as number | null },
+              { id: "starred" as SidebarSection, label: "Starred", icon: Star, badge: null as number | null },
+              {
+                id: "notifications" as SidebarSection,
+                label: "Notifications",
+                icon: Bell,
+                badge: unreadCount as number | null,
+              },
               { id: "watched" as SidebarSection, label: "Watched", icon: Eye, badge: null as number | null },
             ]
-          ).map(({ id, label, icon: Icon, badge }, idx, arr) => (
+          ).map(({ id, label, icon: Icon, badge }) => (
             <button
               key={id}
               type="button"
               onClick={() => setActiveSection(id)}
               aria-pressed={activeSection === id}
               aria-label={label}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 10,
-                width: "100%",
-                padding: "14px 16px",
-                background: activeSection === id ? "rgba(255,255,255,0.08)" : "none",
-                border: "none",
-                borderBottom: idx === arr.length - 1 ? "none" : "1px solid rgba(255,255,255,0.06)",
-                cursor: "pointer",
-                color: "inherit",
-                textAlign: "left",
-              }}
+              className={`${styles.mrow} ${activeSection === id ? styles.on : ""}`}
             >
-              <Icon size={15} style={{ color: "rgba(255,255,255,0.6)", flexShrink: 0 }} aria-hidden="true" />
-              <span style={{ flex: 1, fontSize: 15, fontWeight: 500, color: "rgba(255,255,255,0.9)" }}>{label}</span>
+              <Icon size={15} className={styles.lead} aria-hidden="true" />
+              <span className={styles.mrowLabel}>{label}</span>
               {badge != null && badge > 0 && (
-                <span style={{ fontSize: 11, padding: "1px 7px", borderRadius: 20, background: "var(--accent, #7c6be8)", color: "#fff", fontWeight: 600 }} aria-label={`${badge} unread`}>
+                <span className={styles.mrowCount} aria-label={`${badge} unread`}>
                   {badge}
                 </span>
               )}
-              <ChevronRight size={14} style={{ color: "rgba(255,255,255,0.3)", flexShrink: 0 }} aria-hidden="true" />
+              <ChevronRight size={14} className={styles.chev} aria-hidden="true" />
             </button>
           ))}
         </div>
-      </div>
 
-      {/* Content type filter */}
-      <div style={{ padding: "8px 0 4px", borderBottom: "1px solid rgba(255,255,255,0.05)", flexShrink: 0 }}>
-        <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 0.5, color: "rgba(255,255,255,0.45)", padding: "0 20px 6px", fontWeight: 600 }}>
-          Content
-        </div>
-        <div style={{ margin: "0 12px", borderRadius: 16, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)", overflow: "hidden" }}>
+        {/* Content type segmented control */}
+        <p className={styles.mgroupCap}>Content</p>
+        <div className={styles.mseg}>
           {(
             [
               { id: "repos" as ContentType, label: "Repos", icon: Github },
               { id: "issues" as ContentType, label: "Issues", icon: CircleDot },
-              { id: "prs" as ContentType, label: "Pull Requests", icon: GitPullRequest },
+              { id: "prs" as ContentType, label: "PRs", icon: GitPullRequest },
               { id: "releases" as ContentType, label: "Releases", icon: Package },
             ] as const
-          ).map(({ id, label, icon: Icon }, idx, arr) => (
+          ).map(({ id, label, icon: Icon }) => (
             <button
               key={id}
               type="button"
               onClick={() => setContentType(id)}
               aria-pressed={contentType === id}
               aria-label={label}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 10,
-                width: "100%",
-                padding: "12px 16px",
-                background: contentType === id ? "rgba(255,255,255,0.08)" : "none",
-                border: "none",
-                borderBottom: idx === arr.length - 1 ? "none" : "1px solid rgba(255,255,255,0.06)",
-                cursor: "pointer",
-                color: "inherit",
-                textAlign: "left",
-              }}
+              className={contentType === id ? styles.on : ""}
             >
-              <Icon size={14} style={{ color: "rgba(255,255,255,0.6)", flexShrink: 0 }} aria-hidden="true" />
-              <span style={{ flex: 1, fontSize: 14, color: "rgba(255,255,255,0.85)" }}>{label}</span>
+              <Icon size={13} aria-hidden="true" />
+              {label}
             </button>
           ))}
         </div>
-      </div>
 
-      {/* Items list */}
-      <div style={{ flex: 1, overflowY: "auto", padding: "8px 0 16px" }}>
-        <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 0.5, color: "rgba(255,255,255,0.45)", padding: "4px 20px 8px", fontWeight: 600 }}>
-          {activeSection === "notifications" ? "Notifications" : activeSection === "watched" ? "Watched" : "Starred"}
-        </div>
+        {/* Items list */}
+        <p className={styles.mgroupCap}>{listHeading}</p>
 
-        {/* Search */}
-        <div style={{ padding: "0 12px 8px" }}>
-          <div style={{ position: "relative" }}>
-            <Search size={13} style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", color: "rgba(255,255,255,0.4)", pointerEvents: "none" }} aria-hidden="true" />
-            <input
-              type="search"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search…"
-              aria-label="Search GitHub content"
-              style={{
-                width: "100%",
-                padding: "8px 12px 8px 30px",
-                borderRadius: 10,
-                background: "rgba(255,255,255,0.06)",
-                border: "1px solid rgba(255,255,255,0.1)",
-                color: "inherit",
-                fontSize: 13,
-                outline: "none",
-                boxSizing: "border-box",
-              }}
-            />
-          </div>
+        <div className={styles.msearch}>
+          <Search size={14} aria-hidden="true" />
+          <input
+            type="search"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search…"
+            aria-label="Search GitHub content"
+          />
         </div>
 
         {loading ? (
-          <div style={{ padding: "24px 20px", textAlign: "center", fontSize: 13, color: "rgba(255,255,255,0.4)" }} role="status" aria-live="polite">
+          <div className={styles.statusline} role="status" aria-live="polite">
             Loading…
           </div>
         ) : activeItems.length === 0 ? (
-          <div style={{ padding: "32px 20px", textAlign: "center", fontSize: 13, color: "rgba(255,255,255,0.4)" }}>
-            {search ? "No results for your search" : "Nothing here yet"}
-          </div>
+          <div className={styles.statusline}>{search ? "No results for your search" : "Nothing here yet"}</div>
         ) : (
-          <div
-            style={{ margin: "0 12px", borderRadius: 16, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)", overflow: "hidden" }}
-            role="list"
-            aria-label="GitHub items"
-          >
+          <div className={styles.minset} role="list" aria-label="GitHub items">
             {activeSection === "notifications"
-              ? (activeItems as GitHubIssue[]).map((item, idx, arr) => (
+              ? (activeItems as GitHubIssue[]).map((item) => (
                   <button
                     key={`${item.repo}#${item.number}`}
                     type="button"
                     role="listitem"
                     onClick={() => openIssueDetail(item)}
                     aria-label={`Open ${item.is_pull_request ? "PR" : "issue"}: ${item.title}`}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 10,
-                      width: "100%",
-                      padding: "14px 16px",
-                      background: "none",
-                      border: "none",
-                      borderBottom: idx === arr.length - 1 ? "none" : "1px solid rgba(255,255,255,0.06)",
-                      cursor: "pointer",
-                      color: "inherit",
-                      textAlign: "left",
-                    }}
+                    className={styles.mrow}
                   >
-                    {item.is_pull_request
-                      ? <GitPullRequest size={13} style={{ flexShrink: 0, color: "rgba(130,140,255,0.9)" }} aria-hidden="true" />
-                      : <CircleDot size={13} style={{ flexShrink: 0, color: "rgba(80,200,120,0.9)" }} aria-hidden="true" />
-                    }
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 14, fontWeight: 500, color: "rgba(255,255,255,0.9)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 2 }}>
-                        {item.title}
-                      </div>
-                      <div style={{ fontSize: 12, color: "rgba(255,255,255,0.45)" }}>{item.repo}</div>
+                    {item.is_pull_request ? (
+                      <GitPullRequest size={13} className={`${styles.gi} ${styles.giPr}`} aria-hidden="true" />
+                    ) : (
+                      <CircleDot size={13} className={`${styles.gi} ${styles.giOpen}`} aria-hidden="true" />
+                    )}
+                    <div className={styles.missueMain}>
+                      <div className={styles.missueTitle}>{item.title}</div>
+                      <div className={styles.missueRepo}>{item.repo}</div>
                     </div>
-                    <ChevronRight size={14} style={{ color: "rgba(255,255,255,0.3)", flexShrink: 0 }} aria-hidden="true" />
+                    <ChevronRight size={14} className={styles.chev} aria-hidden="true" />
                   </button>
                 ))
-              : (activeItems as GitHubRepo[]).map((item, idx, arr) => (
+              : (activeItems as GitHubRepo[]).map((item) => (
                   <button
                     key={`${item.owner}/${item.name}`}
                     type="button"
                     role="listitem"
                     onClick={() => openRepoDetail(item)}
                     aria-label={`Open ${item.owner}/${item.name}`}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      gap: 10,
-                      width: "100%",
-                      padding: "14px 16px",
-                      background: "none",
-                      border: "none",
-                      borderBottom: idx === arr.length - 1 ? "none" : "1px solid rgba(255,255,255,0.06)",
-                      cursor: "pointer",
-                      color: "inherit",
-                      textAlign: "left",
-                    }}
+                    className={styles.mrow}
                   >
-                    <div style={{ flex: 1, minWidth: 0 }}>
-                      <div style={{ fontSize: 14, fontWeight: 600, color: "rgba(255,255,255,0.95)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginBottom: 2 }}>
-                        <span style={{ color: "rgba(255,255,255,0.5)" }}>{item.owner}/</span>{item.name}
+                    <div className={styles.mrepoMain}>
+                      <div className={styles.mrepoTitle}>
+                        <span className={styles.own}>{item.owner}/</span>
+                        {item.name}
                       </div>
-                      {item.description && (
-                        <div style={{ fontSize: 12, color: "rgba(255,255,255,0.45)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          {item.description}
-                        </div>
-                      )}
-                      <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 4, fontSize: 11, color: "rgba(255,255,255,0.35)" }}>
-                        <span style={{ display: "flex", alignItems: "center", gap: 3 }} aria-label={`${item.stars} stars`}>
-                          <Star size={9} aria-hidden="true" /> {item.stars.toLocaleString()}
+                      {item.description && <div className={styles.mrepoDesc}>{item.description}</div>}
+                      <div className={styles.mrepoMeta}>
+                        <span aria-label={`${item.stars} stars`}>
+                          <Star size={10} aria-hidden="true" /> {item.stars.toLocaleString()}
                         </span>
-                        <span style={{ display: "flex", alignItems: "center", gap: 3 }} aria-label={`${item.forks} forks`}>
-                          <GitFork size={9} aria-hidden="true" /> {item.forks.toLocaleString()}
+                        <span aria-label={`${item.forks} forks`}>
+                          <GitFork size={10} aria-hidden="true" /> {item.forks.toLocaleString()}
                         </span>
                         {item.language && <span>{item.language}</span>}
                       </div>
                     </div>
-                    <ChevronRight size={14} style={{ color: "rgba(255,255,255,0.3)", flexShrink: 0 }} aria-hidden="true" />
+                    <ChevronRight size={14} className={styles.chev} aria-hidden="true" />
                   </button>
-                ))
-            }
+                ))}
           </div>
         )}
       </div>
@@ -1369,46 +1183,48 @@ export function GitHubApp({ windowId: _windowId }: { windowId: string }) {
   /*  Root layout                                                      */
   /* ---------------------------------------------------------------- */
 
+  // Hide toolbar on mobile when detail is open — MobileSplitView nav bar is shown instead
+  const showToolbar = !isMobile || selectedId === null;
+
   return (
-    <div className="flex flex-col h-full min-h-0 overflow-hidden bg-shell-surface text-shell-text select-none relative">
-      {/* Toolbar — hidden on mobile when detail is shown */}
-      {showToolbar && (
-        <div className="flex items-center justify-between px-4 py-3 border-b border-white/5 shrink-0">
-          <div className="flex items-center gap-2">
-            <Github size={15} className="text-accent shrink-0" aria-hidden="true" />
-            <h1 className="text-sm font-semibold">GitHub</h1>
-          </div>
+    <div
+      ref={rootRef}
+      tabIndex={-1}
+      className={`${styles.root} flex flex-col h-full min-h-0 overflow-hidden bg-shell-bg text-shell-text select-none relative`}
+    >
+      {/* Mobile-only toolbar — hidden when detail is shown (MobileSplitView nav handles it).
+          On desktop the left rail carries the GitHub brand, so no extra toolbar. */}
+      {showToolbar && isMobile && (
+        <div className="flex items-center gap-2 px-4 py-3 border-b border-white/5 shrink-0">
+          <Github size={15} className="text-accent shrink-0" aria-hidden="true" />
+          <h1 className="text-sm font-semibold">GitHub</h1>
         </div>
       )}
 
-      {/* MobileSplitView — stacks on mobile, splits on desktop */}
+      {/* MobileSplitView — stacks on mobile, splits on desktop.
+          On desktop the "list" pane carries both the rail and the list column,
+          so its width spans the rail (208) plus the list column (~320). */}
       <MobileSplitView
         selectedId={selectedId}
         onBack={goBack}
         listTitle="GitHub"
         detailTitle={detailTitle}
-        listWidth={208}
+        listWidth={208 + 320}
         list={
-          isMobile
-            ? mobileListPane
-            : (
-              <div className="flex h-full overflow-hidden">
-                {sidebarUI}
-                <div className="flex-1 flex flex-col overflow-hidden">
-                  {authBanner}
-                  {listViewUI}
-                </div>
+          isMobile ? (
+            mobileListPane
+          ) : (
+            <div className="flex h-full overflow-hidden">
+              {sidebarUI}
+              <div className="flex-1 flex flex-col overflow-hidden">
+                {authBanner}
+                {listViewUI}
               </div>
-            )
+            </div>
+          )
         }
         detail={
-          detailUI ?? (
-            !isMobile ? (
-              <div className="flex items-center justify-center h-full text-shell-text-tertiary text-sm">
-                Select an item to view details
-              </div>
-            ) : null
-          )
+          detailUI ?? (!isMobile ? <div className={styles.emptyDetail}>Select an item to view details</div> : null)
         }
       />
     </div>

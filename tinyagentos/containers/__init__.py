@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 
 from .backend import ContainerInfo, _parse_memory, detect_runtime, get_backend, set_backend
@@ -39,24 +40,117 @@ async def _run(cmd: list[str], timeout: int = 120) -> tuple[int, str]:
 # ``patch("tinyagentos.containers._run")`` correctly intercepts them.
 # ---------------------------------------------------------------------------
 
+async def _resolve_container_project(name: str) -> str | None:
+    """Return the incus project a container lives in, or None if not found.
+
+    Searches ALL projects the client can see (``--all-projects``), not just the
+    ambient default. Multi-user installs place agent containers in a restricted
+    project (e.g. ``user-999``) while other agents sit in ``default``; a lookup
+    scoped to the ambient project alone misses the others, which is how undeploy
+    left orphaned containers behind. Errors return None (treated as "unknown").
+    """
+    code, output = await _run(["incus", "list", "--all-projects", "-f", "json"])
+    if code != 0:
+        return None
+    try:
+        instances = json.loads(output)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    for inst in instances:
+        if isinstance(inst, dict) and inst.get("name") == name:
+            return inst.get("project") or "default"
+    return None
+
+
 async def container_exists(name: str) -> bool:
     """Return True iff a container with the given name is known to the runtime.
 
-    Uses ``incus list --format=csv -c n --filter=name=<name>`` and checks
-    the output for an exact name match. Errors (incus not installed, daemon
-    down, malformed output) are treated as "unknown" and return False so
-    callers can take the safer no-container path rather than blocking on
-    cleanup of an orphan config row.
+    Searches across ALL projects (see ``_resolve_container_project``) so a
+    container in a restricted project (e.g. ``user-999``) is not mistaken for an
+    absent one. Errors (incus not installed, daemon down, malformed output) are
+    treated as "unknown" and return False so callers can take the safer
+    no-container path rather than blocking on cleanup of an orphan config row.
     """
-    code, output = await _run(
-        ["incus", "list", "--format=csv", "-c", "n", f"--filter=name={name}"]
-    )
+    return (await _resolve_container_project(name)) is not None
+
+
+# Prefix shared by every taOS-managed agent container. The current convention
+# is ``taos-agent-<slug>``; the legacy convention was ``taos-<slug>``. Both
+# share this prefix, which is how reconcile distinguishes taOS containers from
+# anything else on the host.
+TAOS_CONTAINER_PREFIX = "taos-"
+
+
+def candidate_agent_container_names(slug: str, display_name: str | None = None) -> list[str]:
+    """Return the container names an agent's slug could map to, newest
+    convention first.
+
+    Current deploys name containers ``taos-agent-<slug>``; legacy deploys used
+    ``taos-<slug>``. When the agent record lost its ``container_name`` link the
+    only way to find its container is to probe both conventions. A
+    ``display_name`` (if it slugifies differently from ``slug``) contributes its
+    own pair of candidates so a record whose slug drifted from the original
+    display name still resolves.
+    """
+    from tinyagentos.config import slugify_agent_name
+
+    slugs: list[str] = []
+    for s in (slug, slugify_agent_name(display_name) if display_name else None):
+        if s and s not in slugs:
+            slugs.append(s)
+    names: list[str] = []
+    for s in slugs:
+        for name in (f"taos-agent-{s}", f"taos-{s}"):
+            if name not in names:
+                names.append(name)
+    return names
+
+
+async def list_all_taos_containers() -> list[dict]:
+    """Return every taOS-managed container across ALL incus projects.
+
+    Each item is ``{"name": str, "project": str}``. Filters to names beginning
+    with :data:`TAOS_CONTAINER_PREFIX` so non-taOS containers are never
+    included. Errors (incus absent, daemon down, malformed output) return an
+    empty list.
+    """
+    try:
+        code, output = await _run(["incus", "list", "--all-projects", "-f", "json"])
+    except (FileNotFoundError, OSError):
+        # incus binary not present (dev hosts, CI). Treat as "no containers".
+        return []
     if code != 0:
-        return False
-    for line in output.splitlines():
-        if line.strip() == name:
-            return True
-    return False
+        return []
+    try:
+        instances = json.loads(output)
+    except (json.JSONDecodeError, TypeError):
+        return []
+    results: list[dict] = []
+    for inst in instances:
+        if not isinstance(inst, dict):
+            continue
+        name = inst.get("name", "")
+        if not name.startswith(TAOS_CONTAINER_PREFIX):
+            continue
+        results.append({"name": name, "project": inst.get("project") or "default"})
+    return results
+
+
+async def resolve_agent_container(slug: str, display_name: str | None = None) -> str | None:
+    """Resolve the live container backing an agent slug, or None.
+
+    Probes both the current (``taos-agent-<slug>``) and legacy (``taos-<slug>``)
+    naming conventions, plus the display-name variants, across ALL incus
+    projects. Returns the first matching container name. Used by delete to
+    rescue a container whose agent record lost its ``container_name`` link
+    rather than orphaning a still-running container.
+    """
+    candidates = candidate_agent_container_names(slug, display_name)
+    existing = {c["name"] for c in await list_all_taos_containers()}
+    for name in candidates:
+        if name in existing:
+            return name
+    return None
 
 
 async def list_containers(prefix: str = "taos-agent-") -> list[ContainerInfo]:
@@ -134,6 +228,7 @@ async def create_container(
     env: dict[str, str] | None = None,
     host_uid: int | None = None,
     root_size_gib: int | None = None,
+    remote: str | None = None,
 ) -> dict:
     """Create and start a new LXC container with mounts and env injected.
 
@@ -147,51 +242,80 @@ async def create_container(
     ``root_size_gib``: when provided, apply a rootfs disk quota via
     ``set_root_quota`` after launch. Enforced on btrfs/ZFS pools;
     accounting-only on dir-backed pools.
+
+    ``remote``: when set (e.g. ``"fedora-worker"``), the container is created
+    on that enrolled incus remote's nested incus instead of locally. The base
+    image must already exist on the remote (prefetched there); both the image
+    ref and the instance name are qualified with ``<remote>:``. Bind mounts are
+    skipped for a remote create — the host paths do not exist on the worker;
+    the agent reaches the controller over the network (Tailscale) instead.
     """
     import asyncio as _asyncio
+    # Qualify image + instance name for the target remote. The prefetched base
+    # alias lives on the remote, so the image ref is also remote-qualified.
+    target = f"{remote}:{name}" if remote else name
+    # A bare local alias (e.g. "taos-hermes-base", prefetched onto the remote)
+    # is remote-qualified; a remote-image-server ref (e.g.
+    # "images:debian/bookworm", the cold fallback) already names its own source
+    # and must NOT be prefixed, or incus rejects "<remote>:images:debian/...".
+    if remote and ":" not in image:
+        image_ref = f"{remote}:{image}"
+    else:
+        image_ref = image
+
     code, output = await _run(
-        ["incus", "launch", image, name], timeout=300,
+        ["incus", "launch", image_ref, target], timeout=300,
     )
     if code != 0:
         return {"success": False, "error": output}
 
-    if host_uid is not None:
+    # raw.idmap maps container-root to a host UID so the trace bind-mount is
+    # writable. It is meaningless for a remote create (the host_uid is the
+    # CONTROLLER's, not the worker's, and the bind-mount is skipped anyway); a
+    # cross-host UID with no subuid mapping on the worker stops the container
+    # from starting. Skip it for remote.
+    if host_uid is not None and not remote:
         await _run([
-            "incus", "config", "set", name, "raw.idmap",
+            "incus", "config", "set", target, "raw.idmap",
             f"both {host_uid} 0",
         ])
-        await _run(["incus", "stop", name, "--force"])
-        await _run(["incus", "start", name])
+        await _run(["incus", "stop", target, "--force"])
+        await _run(["incus", "start", target])
         await _asyncio.sleep(3)
 
     # Root quota — set before mounts/env so subsequent writes are subject to limit.
     if root_size_gib is not None:
-        quota_result = await set_root_quota(name, root_size_gib)
+        quota_result = await set_root_quota(target, root_size_gib)
         if not quota_result["success"]:
             logger.warning(
                 "create_container: root quota not applied for %s: %s",
-                name, quota_result.get("note", ""),
+                target, quota_result.get("note", ""),
             )
 
     if memory_limit is not None:
-        await _run(["incus", "config", "set", name, "limits.memory", memory_limit])
+        await _run(["incus", "config", "set", target, "limits.memory", memory_limit])
     if cpu_limit is not None:
-        await _run(["incus", "config", "set", name, "limits.cpu", str(cpu_limit)])
-    for idx, (host_path, container_path) in enumerate(mounts or []):
-        device_name = f"taos-mount-{idx}"
-        mcode, mout = await _run([
-            "incus", "config", "device", "add", name, device_name, "disk",
-            f"source={host_path}", f"path={container_path}",
-        ])
-        if mcode != 0:
-            logger.error(f"incus mount {host_path}->{container_path} failed: {mout}")
+        await _run(["incus", "config", "set", target, "limits.cpu", str(cpu_limit)])
+    # Bind mounts map host paths into the container; they only make sense for a
+    # local create. A remote worker has no access to the controller's filesystem.
+    if remote and mounts:
+        logger.info("create_container: skipping %d bind mount(s) for remote %s", len(mounts), remote)
+    elif not remote:
+        for idx, (host_path, container_path) in enumerate(mounts or []):
+            device_name = f"taos-mount-{idx}"
+            mcode, mout = await _run([
+                "incus", "config", "device", "add", target, device_name, "disk",
+                f"source={host_path}", f"path={container_path}",
+            ])
+            if mcode != 0:
+                logger.error(f"incus mount {host_path}->{container_path} failed: {mout}")
     for key, value in (env or {}).items():
         ecode, eout = await _run([
-            "incus", "config", "set", name, f"environment.{key}={value}",
+            "incus", "config", "set", target, f"environment.{key}={value}",
         ])
         if ecode != 0:
             logger.error(f"incus env set {key} failed: {eout}")
-    return {"success": True, "name": name}
+    return {"success": True, "name": name, "remote": remote}
 
 
 async def exec_in_container(name: str, cmd: list[str], timeout: int = 300) -> tuple[int, str]:
@@ -223,9 +347,17 @@ async def restart_container(name: str) -> dict:
 
 
 async def destroy_container(name: str) -> dict:
-    """Stop and delete a container."""
-    await _run(["incus", "stop", name, "--force"])
-    code, output = await _run(["incus", "delete", name, "--force"])
+    """Stop and delete a container, in whatever project it lives in.
+
+    Resolves the container's actual project first so an agent in a restricted
+    project (e.g. ``user-999``) is destroyed rather than left orphaned when the
+    ambient project is ``default``. Falls back to the ambient project when the
+    lookup finds nothing (preserves the original behavior for fresh installs).
+    """
+    proj = await _resolve_container_project(name)
+    proj_args = ["--project", proj] if proj else []
+    await _run(["incus", "stop", *proj_args, name, "--force"])
+    code, output = await _run(["incus", "delete", *proj_args, name, "--force"])
     return {"success": code == 0, "output": output}
 
 
@@ -264,6 +396,30 @@ async def add_proxy_device(
     if bind_mode:
         cmd.append(f"bind={bind_mode}")
     code, output = await _run(cmd)
+    if code != 0 and "Proxy devices are forbidden" in (output or ""):
+        # Multi-user installs put agent containers in a restricted incus
+        # project (e.g. user-999) which blocks proxy devices by default. taOS
+        # needs proxy devices to wire the container's localhost to host
+        # services (LiteLLM, the controller). Only the trusted controller adds
+        # devices, never the agent inside the container, so relaxing this one
+        # restriction is safe; the isolation that matters (idmap, disk paths,
+        # network) stays. Self-heal: allow proxy devices on the project named
+        # in the error and retry once, so deploys work regardless of how the
+        # per-user project was provisioned (the provisioning is outside taOS).
+        m = re.search(r'project "([^"]+)"', output or "")
+        if m:
+            project = m.group(1)
+            allow_code, _ = await _run([
+                "incus", "project", "set", project,
+                "restricted.devices.proxy", "allow",
+            ])
+            if allow_code == 0:
+                logger.warning(
+                    "add_proxy_device: project %r forbade proxy devices; set "
+                    "restricted.devices.proxy=allow and retried %s",
+                    project, device_name,
+                )
+                code, output = await _run(cmd)
     return {"success": code == 0, "output": output}
 
 
@@ -275,6 +431,21 @@ async def get_container_logs(name: str, lines: int = 100) -> str:
     return output if code == 0 else f"Error getting logs: {output}"
 
 
+def _is_snapshot_forbidden(output: str) -> bool:
+    """True when an incus error means the container's project forbids snapshots.
+
+    Detects the restriction robustly by its wording rather than by a hard-coded
+    project name, so it fires for any per-user project (user-999, user-1001, …):
+    incus 6.x phrases it as ``Project "user-999" doesn't allow for snapshot
+    creation``. Matches both the curly and straight apostrophe and is
+    case-insensitive.
+    """
+    low = (output or "").lower().replace("’", "'")
+    return "snapshot creation" in low and (
+        "doesn't allow" in low or "does not allow" in low or "not allowed" in low
+    )
+
+
 async def snapshot_create(name: str, snapshot_name: str) -> dict:
     """Create a named snapshot of a container.
 
@@ -283,9 +454,43 @@ async def snapshot_create(name: str, snapshot_name: str) -> dict:
 
     Docker: ``docker commit <name> taos/<snapshot_name>:latest``.
 
+    Self-heals project snapshot restrictions: multi-user installs put agent
+    containers in a restricted incus project (e.g. user-999) provisioned
+    outside taOS, which can forbid snapshot creation. A snapshot is taOS's
+    point-in-time restore guarantee, so rather than fail the archive we set
+    ``restricted.snapshots=allow`` on the offending project (mirroring the
+    ``add_proxy_device`` self-heal for ``restricted.devices.proxy``) and retry
+    once. Only the trusted controller snapshots, never the agent inside the
+    container, so relaxing this one restriction is safe.
+
     Returns ``{"success": bool, "output": str}``.
     """
     code, output = await _run(["incus", "snapshot", "create", name, snapshot_name])
+    if code != 0 and _is_snapshot_forbidden(output):
+        # Find the project named in the error; fall back to resolving it from
+        # the container itself if the message did not quote one.
+        m = re.search(r'[Pp]roject "([^"]+)"', output or "")
+        project = m.group(1) if m else await _resolve_container_project(name)
+        if project:
+            allow_code, allow_out = await _run([
+                "incus", "project", "set", project,
+                "restricted.snapshots", "allow",
+            ])
+            if allow_code == 0:
+                logger.warning(
+                    "snapshot_create: project %r forbade snapshots; set "
+                    "restricted.snapshots=allow and retried %s/%s",
+                    project, name, snapshot_name,
+                )
+                code, output = await _run(
+                    ["incus", "snapshot", "create", name, snapshot_name]
+                )
+            else:
+                logger.warning(
+                    "snapshot_create: could not relax restricted.snapshots on "
+                    "project %r: %s",
+                    project, allow_out,
+                )
     return {"success": code == 0, "output": output}
 
 
@@ -633,6 +838,10 @@ __all__ = [
     "LXCBackend",
     "DockerBackend",
     "container_exists",
+    "TAOS_CONTAINER_PREFIX",
+    "candidate_agent_container_names",
+    "list_all_taos_containers",
+    "resolve_agent_container",
     "list_containers",
     "set_root_quota",
     "create_container",

@@ -1,8 +1,16 @@
-# Contributing to TinyAgentOS
+# Contributing to taOS
 
-Welcome — and thanks for your interest in contributing. TinyAgentOS is a self-hosted AI agent platform for low-power hardware. Before diving in, please read the [README](README.md) for a project overview.
+Welcome — and thanks for your interest in contributing. taOS is a self-hosted AI agent platform for low-power hardware. Before diving in, please read the [README](README.md) for a project overview.
 
 > **Note:** The project is in early development. APIs and interfaces may change. That is fine — contributions of all sizes are welcome.
+
+---
+
+## License & Contributor License Agreement
+
+taOS is licensed under the **taOS Sustainable Use License** (source-available, not open source; see [`LICENSE`](LICENSE)) — free to use, modify, and self-host for personal use and for your own organisation's internal business purposes, with a separate commercial license required to sell it, host it as a paid service, or build it into a product you monetise.
+
+To keep this sustainable, **all contributors must agree to the Contributor License Agreement ([`CLA.md`](CLA.md))** before their contributions are merged. The CLA grants jaylfc the right to include and **relicense** your contributions under the project's licenses; **you keep ownership of your work**. You sign once — on your first pull request, comment **"I have read the CLA Document and I hereby sign the CLA"** and the CLA check turns green; it then covers all your future contributions.
 
 ---
 
@@ -11,12 +19,10 @@ Welcome — and thanks for your interest in contributing. TinyAgentOS is a self-
 ```bash
 git clone https://github.com/jaylfc/tinyagentos.git
 cd tinyagentos
-python3 -m venv venv
-source venv/bin/activate
-pip install -e ".[dev]"
+uv sync --extra dev
 # Build the desktop SPA — static/desktop/ is gitignored (generated artifact)
 cd desktop && npm install && npm run build && cd ..
-pytest tests/ -v
+uv run pytest tests/ --ignore=tests/e2e -n auto
 ```
 
 Python 3.10 or later and Node.js 22 or later are required.
@@ -50,14 +56,21 @@ The app catalog is one of the easiest ways to contribute. See [Adding an App to 
 1. Fork the repository
 2. Create a branch: `git checkout -b feat/my-feature`
 3. Make your changes and add tests
-4. Run `pytest tests/ -v` — all tests must pass
-5. Open a pull request against `main`
+4. Run `uv run pytest tests/ --ignore=tests/e2e -n auto` - all tests must pass
+5. Open a pull request against **`dev`**, not `master`
 
 Keep pull requests focused. One feature or fix per PR is easier to review.
+
+> **Branches:** `master` is the stable branch that installs track, so it only
+> receives tested changes promoted from `dev`. All contributions target `dev`.
+> If you open a PR against `master` by mistake, no problem — we'll retarget it
+> to `dev` (the commits and review carry over).
 
 ### Documentation
 
 Documentation improvements are always welcome — typo fixes, clarifications, better examples. Open a PR directly.
+
+The taOS agent manual is compiled: edit `docs/agent-manual/` and run `python3 scripts/build-agent-manual.py` to regenerate `docs/taos-agent-manual.md`.
 
 ---
 
@@ -144,12 +157,13 @@ Submit a pull request. The CI will run the catalog tests automatically. Include 
 - One concern per module; avoid cross-importing between route files
 - Use `async def` for route handlers; use `await` for all I/O
 
-### Templates
+### Frontend
 
-- Use Pico CSS utility classes — do not introduce other CSS frameworks
-- Use htmx attributes (`hx-get`, `hx-target`, `hx-swap`) for dynamic updates
-- Write semantic HTML — use the right element for the job (`<nav>`, `<main>`, `<section>`, etc.)
+The UI is a React SPA (`desktop/`) built with Vite. Static assets are served from `static/desktop/` after `npm run build`. If you are adding a new UI surface:
+
+- Follow existing React patterns in `desktop/src/` — no server-rendered templates for new features
 - ARIA labels are required on interactive elements without visible text labels
+- One concern per component; keep API calls in dedicated hooks or service files
 
 ### Tests
 
@@ -179,7 +193,7 @@ Do not include AI tool attribution in commit messages.
 Run the full test suite:
 
 ```bash
-pytest tests/ -v
+uv run pytest tests/ --ignore=tests/e2e -n auto
 ```
 
 Run a specific test file:
@@ -188,9 +202,34 @@ Run a specific test file:
 pytest tests/test_catalog_sync.py -v
 ```
 
-The project has 959 tests. CI runs against Python 3.10, 3.11, 3.12, and 3.13 via GitHub Actions on every pull request. A PR cannot be merged until all four matrix jobs pass.
+The project has ~3,590 tests. CI runs against Python 3.12 and 3.13 on every pull request (two matrix jobs). Python 3.11 is added on the nightly scheduled run. A PR cannot be merged until all matrix jobs pass.
 
 When adding a feature, add tests that cover the new behaviour. When fixing a bug, add a regression test.
+
+---
+
+## Documentation gate
+
+A gate blocks PRs that add or remove certain feature code without a matching doc update. It only fires on structural changes (a file added or deleted), never on a plain edit, and only for a small set of conservative rules configured in `docs/doc-gate.toml`:
+
+| Change | Requires editing one of |
+|--------|--------------------------|
+| A desktop app under `desktop/src/apps/` is added or removed | `README.md` |
+| A route module under `tinyagentos/routes/` is added or removed | `docs/agent-coordination.md` |
+| An installer under `tinyagentos/installers/` or `scripts/install*` is added or removed | `README.md` |
+| A manifest under `app-catalog/` is added or removed | `README.md` |
+
+If your PR trips a rule and there is genuinely nothing to document (or you already covered it elsewhere), add a trailer line to a commit message instead of editing a doc:
+
+```
+Docs-Reviewed: no user-facing change, internal refactor only
+```
+
+The trailer must have non-empty text after the colon; a bare `Docs-Reviewed:` does not count.
+
+Run `scripts/install-git-hooks.sh` once to enable local hooks (`.githooks/pre-commit` and `.githooks/commit-msg`) so the gate runs before you push instead of after you open the PR. Local hooks are a convenience only: `.github/workflows/doc-gate.yml` is the authoritative check and runs on every PR regardless of local setup or `--no-verify`.
+
+To add a new rule, edit `docs/doc-gate.toml` -- rules are data, no code changes needed.
 
 ---
 
@@ -200,21 +239,21 @@ When adding a feature, add tests that cover the new behaviour. When fixing a bug
 tinyagentos/
   app.py               # FastAPI application factory, lifespan, route registration
   config.py            # Platform config, hardware detection
-  routes/              # One module per feature area (26 route modules)
-  templates/           # Jinja2 + htmx HTML templates (44 templates)
+  routes/              # One module per feature area (86 route modules)
+  templates/           # Minimal: only agent_debugger.html remains (frontend is a React SPA)
   channel_hub/         # Framework-agnostic messaging (6 connectors + message router)
-  adapters/            # Framework adapters (17 adapters, ~25 lines each)
+  adapters/            # Framework adapters (15 adapters, ~25 lines each)
   cluster/             # Distributed compute (worker registration, task routing, optimiser)
   worker/              # Cross-platform worker apps (system tray, Android, iOS)
   stores/              # Data access layer (SQLite via aiosqlite)
-app-catalog/           # YAML manifests for installable apps (87 apps)
-tests/                 # pytest test suite (858 tests)
+app-catalog/           # YAML manifests for installable apps (108 apps)
+tests/                 # pytest test suite (~3,590 tests)
 ```
 
-Routes are registered in `app.py`. Each route module imports its own store. Templates use htmx for partial page updates — full-page navigations are rare.
+Routes are registered in `app.py`. Route modules access stores via `request.app.state` (dependency injection set up in the app lifespan) — they do not import stores directly. The frontend is a React SPA; `templates/` is minimal and only used for the agent debugger page.
 
 ---
 
 ## Contact
 
-Questions not suited for a GitHub issue? Email jaylfc25@gmail.com.
+Questions not suited for a GitHub issue? Email info@taos.my.

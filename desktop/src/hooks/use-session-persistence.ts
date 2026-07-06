@@ -7,6 +7,7 @@ import { getApp } from "@/registry/app-registry";
 import { useBrowserStore } from "@/stores/browser-store";
 import { loadWindows as loadBrowserWindows, saveWindows as saveBrowserWindows } from "@/lib/browser-windows-api";
 import type { BrowserWindowState } from "@/apps/BrowserApp/types";
+import { useAuthReadyStore } from "@/stores/auth-ready-store";
 
 interface SavedWindow {
   appId: string;
@@ -26,20 +27,46 @@ export function useSessionPersistence() {
   const maximizeWindow = useProcessStore((s) => s.maximizeWindow);
   const snapWindow = useProcessStore((s) => s.snapWindow);
   const pinned = useDockStore((s) => s.pinned);
+  const dockIconSize = useDockStore((s) => s.iconSize);
+  const dockPosition = useDockStore((s) => s.position);
   const wallpaperId = useThemeStore((s) => s.wallpaperId);
   const widgets = useWidgetStore((s) => s.widgets);
 
   const browserWindows = useBrowserStore((s) => s.windows);
 
+  const authReady = useAuthReadyStore((s) => s.ready);
+
+  // `restored` guards the whole restore effect below (fires once per
+  // authenticated session). `dockRestored`/`wallpaperRestored` gate their own
+  // auto-save effects independently: the shared `restored` flag used to flip
+  // true the instant the effect *started*, not once its fetches actually
+  // landed, so a debounced auto-save (500ms wallpaper / 1s dock) could fire
+  // with the still-default in-memory value and overwrite the real saved
+  // setting before the slower restore GET came back (#1601, #1603).
   const restored = useRef(false);
+  const dockRestored = useRef(false);
+  const wallpaperRestored = useRef(false);
   const saveTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
   const dockTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wallpaperTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
   const widgetSaveTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
   const browserSaveTimeout = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Restore everything on mount (once)
+  // Restore everything once authenticated (once per session).
+  //
+  // SystemShortcuts (which owns this hook) mounts as a sibling of LoginGate,
+  // before LoginGate's /auth/status check resolves, so a mount-gated restore
+  // fires while logged out, 401s, and — since it only ran once — is never
+  // retried after a subsequent login. Gating on `authReady` (and resetting
+  // when it drops) means a fresh login always re-fetches this session's
+  // settings instead of leaving the defaults the pre-auth attempt left behind.
   useEffect(() => {
+    if (!authReady) {
+      restored.current = false;
+      dockRestored.current = false;
+      wallpaperRestored.current = false;
+      return;
+    }
     if (restored.current) return;
     restored.current = true;
 
@@ -67,22 +94,34 @@ export function useSessionPersistence() {
     // Restore dock
     fetch("/api/desktop/dock")
       .then((r) => r.json())
-      .then((data: { pinned?: string[] }) => {
+      .then((data: { pinned?: string[]; iconSize?: string; position?: string }) => {
         if (data.pinned && Array.isArray(data.pinned)) {
           useDockStore.getState().reorder(data.pinned);
         }
+        if (data.iconSize === "small" || data.iconSize === "medium" || data.iconSize === "large") {
+          useDockStore.getState().setIconSize(data.iconSize);
+        }
+        if (data.position === "bottom" || data.position === "left") {
+          useDockStore.getState().setPosition(data.position);
+        }
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        dockRestored.current = true;
+      });
 
     // Restore wallpaper
     fetch("/api/desktop/settings")
       .then((r) => r.json())
       .then((data: { wallpaper?: string }) => {
-        if (data.wallpaper && data.wallpaper !== "default") {
+        if (data.wallpaper) {
           useThemeStore.getState().setWallpaper(data.wallpaper);
         }
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        wallpaperRestored.current = true;
+      });
 
     // Restore widgets
     fetch("/api/desktop/widgets")
@@ -117,7 +156,7 @@ export function useSessionPersistence() {
         useBrowserStore.setState({ windows });
       })
       .catch(() => {});
-  }, [openWindow, updatePosition, updateSize, maximizeWindow, snapWindow]);
+  }, [authReady, openWindow, updatePosition, updateSize, maximizeWindow, snapWindow]);
 
   // Auto-save windows (debounced 2s)
   useEffect(() => {
@@ -147,27 +186,32 @@ export function useSessionPersistence() {
     };
   }, [windows]);
 
-  // Auto-save dock (debounced 1s)
+  // Auto-save dock (debounced 1s). Gated on dockRestored, not the outer
+  // `restored` flag: that flips true the instant the restore effect starts,
+  // before its fetch resolves, so this would otherwise fire on mount with
+  // the still-default dock state and could beat a slow restore GET to the
+  // backend, overwriting the real saved dock settings (#1603).
   useEffect(() => {
-    if (!restored.current) return;
+    if (!dockRestored.current) return;
 
     if (dockTimeout.current) clearTimeout(dockTimeout.current);
     dockTimeout.current = setTimeout(() => {
       fetch("/api/desktop/dock", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pinned }),
+        body: JSON.stringify({ pinned, iconSize: dockIconSize, position: dockPosition }),
       }).catch(() => {});
     }, 1000);
 
     return () => {
       if (dockTimeout.current) clearTimeout(dockTimeout.current);
     };
-  }, [pinned]);
+  }, [pinned, dockIconSize, dockPosition]);
 
-  // Auto-save wallpaper (debounced 500ms)
+  // Auto-save wallpaper (debounced 500ms). Gated on wallpaperRestored (see
+  // the dock effect above for why the outer `restored` flag isn't enough).
   useEffect(() => {
-    if (!restored.current) return;
+    if (!wallpaperRestored.current) return;
 
     if (wallpaperTimeout.current) clearTimeout(wallpaperTimeout.current);
     wallpaperTimeout.current = setTimeout(() => {

@@ -16,6 +16,14 @@ logger = logging.getLogger(__name__)
 # Quality threshold: minimum chars for readability extraction to count as success
 _MIN_CONTENT_CHARS = 100
 
+# Article fetches must not reach loopback / link-local / private hosts (SSRF).
+# We reuse the browser proxy's validated guard and walk redirects manually so a
+# 3xx to an internal address cannot smuggle past the front-door check.
+_MAX_ARTICLE_REDIRECTS = 5
+
+# Limit concurrent background ingest tasks to prevent resource exhaustion.
+_INGEST_SEMAPHORE_SLOTS = 5
+
 # Per-source default monitor config
 _DEFAULT_MONITOR: dict[str, dict] = {
     "reddit":  {"frequency": 3600,  "decay_rate": 1.5, "stop_after_days": 30,  "pinned": False, "last_poll": 0, "current_interval": 3600},
@@ -78,6 +86,7 @@ class IngestPipeline:
         category_engine: "CategoryEngine",
         qmd_base_url: str = "",
         llm_base_url: str = "",
+        max_concurrent: int = _INGEST_SEMAPHORE_SLOTS,
     ) -> None:
         self._store = store
         self._http_client = http_client
@@ -85,6 +94,9 @@ class IngestPipeline:
         self._category_engine = category_engine
         self._qmd_base_url = qmd_base_url
         self._llm_base_url = llm_base_url
+        if max_concurrent < 1:
+            raise ValueError(f"max_concurrent must be >= 1, got {max_concurrent}")
+        self._semaphore = asyncio.Semaphore(max_concurrent)
 
     async def submit(
         self,
@@ -93,6 +105,7 @@ class IngestPipeline:
         text: str = "",
         categories: list[str] | None = None,
         source: str = "unknown",
+        user_id: str = "",
     ) -> str:
         """Create a pending KnowledgeItem and return its id.
 
@@ -113,6 +126,7 @@ class IngestPipeline:
             metadata={"ingest_source": source},
             status="pending",
             monitor=monitor_config,
+            user_id=user_id,
         )
         return item_id
 
@@ -123,19 +137,21 @@ class IngestPipeline:
         text: str = "",
         categories: list[str] | None = None,
         source: str = "unknown",
+        user_id: str = "",
     ) -> str:
         """Submit and immediately fire ``run()`` as a background asyncio task."""
-        item_id = await self.submit(url=url, title=title, text=text, categories=categories, source=source)
+        item_id = await self.submit(url=url, title=title, text=text, categories=categories, source=source, user_id=user_id)
         asyncio.create_task(self._run_safe(item_id))
         return item_id
 
     async def _run_safe(self, item_id: str) -> None:
-        """Wrapper that catches all exceptions so background tasks never crash silently."""
-        try:
-            await self.run(item_id)
-        except Exception as exc:
-            logger.exception("IngestPipeline background task failed for %s: %s", item_id, exc)
-            await self._store.update_status(item_id, "error")
+        """Wrapper that enforces backpressure and catches all exceptions."""
+        async with self._semaphore:
+            try:
+                await self.run(item_id)
+            except Exception as exc:
+                logger.exception("IngestPipeline background task failed for %s: %s", item_id, exc)
+                await self._store.update_status(item_id, "error")
 
     async def run(self, item_id: str) -> None:
         """Execute all pipeline steps for an existing pending item."""
@@ -264,8 +280,34 @@ class IngestPipeline:
     async def _download_article(
         self, url: str, title: str, metadata: dict
     ) -> tuple[str, str, str, dict]:
-        """Fetch an article URL and extract readable text."""
-        resp = await self._http_client.get(url, timeout=30, follow_redirects=True)
+        """Fetch an article URL and extract readable text.
+
+        SSRF-guarded: the initial URL and every redirect hop are validated
+        against the loopback / link-local / private-range blocklist before the
+        request is issued, so an attacker-supplied URL (or a public URL that
+        302-redirects inward) cannot make the host fetch internal services.
+        """
+        from urllib.parse import urljoin
+
+        from tinyagentos.routes.desktop_browser.ssrf import (
+            SsrfBlockedError,
+            validate_url_or_raise,
+        )
+
+        current_url = url
+        resp = None
+        for _hop in range(_MAX_ARTICLE_REDIRECTS + 1):
+            validate_url_or_raise(current_url)  # raises SsrfBlockedError
+            resp = await self._http_client.get(
+                current_url, timeout=30, follow_redirects=False
+            )
+            if resp.is_redirect and resp.headers.get("location"):
+                current_url = urljoin(current_url, resp.headers["location"])
+                continue
+            break
+        else:
+            raise SsrfBlockedError(f"too many redirects fetching {url!r}")
+
         resp.raise_for_status()
         html = resp.text
         content = _extract_text_readability(html)

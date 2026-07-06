@@ -2,13 +2,16 @@ import { useState, useCallback, useEffect } from "react";
 import { TopBar } from "@/components/TopBar";
 import { Desktop } from "@/components/Desktop";
 import { Dock } from "@/components/Dock";
+import { ParticlesWallpaper } from "@/components/ParticlesWallpaper";
+import { WallpaperTextOverlay } from "@/components/WallpaperTextOverlay";
 import { Launchpad } from "@/components/Launchpad";
 import { SearchPalette } from "@/components/SearchPalette";
 import { ShortcutProvider, useShortcut } from "@/hooks/use-shortcut-registry";
 import { useSessionPersistence } from "@/hooks/use-session-persistence";
 import { useDeviceMode } from "@/hooks/use-device-mode";
 import { useIsPwa } from "@/hooks/use-is-pwa";
-import { useThemeStore } from "@/stores/theme-store";
+import { useThemeStore, restoreActiveTheme, installWebkitRepaintGuards } from "@/stores/theme-store";
+import { useOnAuthReady } from "@/hooks/use-on-auth-ready";
 import { useProcessStore } from "@/stores/process-store";
 import { useDockStore } from "@/stores/dock-store";
 import { getApp } from "@/registry/app-registry";
@@ -22,9 +25,14 @@ import { LoginScreen } from "@/components/LoginScreen";
 import { NotificationToasts } from "@/components/NotificationToast";
 import { NotificationCentre } from "@/components/NotificationCentre";
 import { useNotificationStore } from "@/stores/notification-store";
+import { useServerNotifications } from "@/hooks/use-server-notifications";
+import { useEventStream } from "@/hooks/use-event-stream";
+import { usePerfAutoDetect } from "@/lib/use-perf-autodetect";
 import { TaosAssistantPanel } from "@/components/TaosAssistantPanel";
 import { useTaosAgentStore } from "@/stores/taos-agent-store";
 import { InstallPromptBanner } from "@/shell/InstallPromptBanner";
+import { EffectsLayer } from "@/theme/effects/EffectsLayer";
+import { SafetyFloor } from "@/components/SafetyFloor";
 
 interface SystemShortcutsProps {
   toggleSearch: () => void;
@@ -77,7 +85,7 @@ function SystemShortcuts({ toggleSearch, toggleLaunchpad, toggleAssistant }: Sys
 
   useShortcut("Ctrl+Space", toggleSearch, "Toggle search palette", "system");
   useShortcut("Ctrl+l", toggleLaunchpad, "Toggle launchpad", "system");
-  useShortcut("Ctrl+/", toggleAssistant, "Toggle taOS Assistant", "system");
+  useShortcut("Ctrl+/", toggleAssistant, "Toggle taOS agent", "system");
   useShortcut("Ctrl+w", closeFocused, "Close focused window", "system");
   useShortcut("Ctrl+m", minimizeFocused, "Minimize focused window", "system");
   useShortcut("Ctrl+f", maximizeFocused, "Maximize/restore focused window", "system");
@@ -122,6 +130,20 @@ export function App() {
   const wallpaperImage = useThemeStore((s) => s.wallpaperImage);
   const wallpaperMobileImage = useThemeStore((s) => s.wallpaperMobileImage);
   const wallpaperFallback = useThemeStore((s) => s.wallpaperFallback);
+  const wallpaperLightImage = useThemeStore((s) => s.wallpaperLightImage);
+  const wallpaperLightMobileImage = useThemeStore((s) => s.wallpaperLightMobileImage);
+  const wallpaperLightFallback = useThemeStore((s) => s.wallpaperLightFallback);
+  const scheme = useThemeStore((s) => s.scheme);
+  const wallpaperKind = useThemeStore((s) => s.wallpaperKind);
+  const wallpaperComponent = useThemeStore((s) => s.wallpaperComponent);
+  const wallpaperOverlayText = useThemeStore((s) => s.wallpaperOverlayText);
+  const showOverlayText = useThemeStore((s) => s.showOverlayText);
+  const reduceEffects = useThemeStore((s) => s.reduceEffects);
+  const isAnimatedWallpaper = wallpaperKind === "animated";
+  const useLightWallpaper = scheme === "light" && !!wallpaperLightImage;
+  const effWallpaperImage = useLightWallpaper ? wallpaperLightImage : wallpaperImage;
+  const effWallpaperMobile = useLightWallpaper ? wallpaperLightMobileImage : wallpaperMobileImage;
+  const effWallpaperFallback = useLightWallpaper ? wallpaperLightFallback : wallpaperFallback;
   const windows = useProcessStore((s) => s.windows);
   const openWindow = useProcessStore((s) => s.openWindow);
   const closeWindow = useProcessStore((s) => s.closeWindow);
@@ -151,7 +173,67 @@ export function App() {
     return () => window.removeEventListener("open-launchpad", handler);
   }, []);
 
+  // Surface a window opened programmatically from inside an app (e.g. an agent
+  // shortcut launching a terminal/browser). On mobile a window is only visible
+  // when it is the active window, so callers dispatch this with the new window
+  // id; on desktop the window manager already renders it, so this just focuses.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      // Validate the event's detail shape at runtime rather than trusting a cast.
+      const detail = (e as CustomEvent<unknown>).detail;
+      const wid =
+        detail && typeof (detail as { windowId?: unknown }).windowId === "string"
+          ? (detail as { windowId: string }).windowId
+          : null;
+      if (wid) setActiveWindowId(wid);
+    };
+    window.addEventListener("taos:activate-window", handler);
+    return () => window.removeEventListener("taos:activate-window", handler);
+  }, [setActiveWindowId]);
+
   useSessionPersistence();
+
+  // First-run GPU auto-detect: probe the frame rate once and enable Reduce
+  // effects on a struggling device, so low-end hardware is smooth out of the
+  // box (#58). An explicit user choice is always honored and never overridden.
+  usePerfAutoDetect();
+
+  // Sync the persistent backend notification feed into the bell (desktop and
+  // mobile both render NotificationCentre under this component).
+  useServerNotifications();
+  // Open a persistent SSE connection for real-time OS updates. This is the
+  // primary push channel; useServerNotifications falls back to polling.
+  useEventStream();
+
+  // WebKit blanks backdrop-filter surfaces when the tab is hidden then shown
+  // again (switching back into taOS); re-composite them on return. Not
+  // auth-gated: it only installs a visibility listener, no per-user fetch.
+  useEffect(() => {
+    installWebkitRepaintGuards();
+  }, []);
+
+  // Re-apply the persisted active theme once authenticated, so a reload keeps
+  // the user's chosen theme app-wide (not only when Settings is opened).
+  //
+  // SystemShortcuts mounts as a sibling of LoginGate, before LoginGate's own
+  // /auth/status check resolves, so firing this on bare mount races the auth
+  // check: right after a logout there is no session cookie yet, the fetch
+  // inside restoreActiveTheme 401s, and — since this used to run once on
+  // mount — it was never retried once the user logged back in (#1601).
+  // useOnAuthReady defers it until auth is confirmed and re-runs it on a
+  // later re-login.
+  useOnAuthReady(() => {
+    void restoreActiveTheme();
+  });
+
+  // Apply reduce-effects / performance mode (#58) as a root attribute so the CSS
+  // in tokens.css can strip blur, big shadows and continuous animations on
+  // low-end devices. Reactive so the Settings toggle takes effect immediately.
+  useEffect(() => {
+    const root = document.documentElement;
+    if (reduceEffects) root.setAttribute("data-perf", "reduced");
+    else root.removeAttribute("data-perf");
+  }, [reduceEffects]);
 
   // Welcome notification — shown once per install, gated on a
   // localStorage flag so reload / refresh / re-mount don't replay it.
@@ -233,8 +315,14 @@ export function App() {
               Return to fullscreen
             </button>
           )}
-          <div className={`transition-all duration-500 ${launched ? "opacity-100 scale-100" : "opacity-0 scale-95"}`}>
+          {/* Keep the entrance zoom (scale-95 -> none animates), but do NOT
+              retain a transform once launched: a `transform` on this ancestor
+              (even scale(1)) makes a containing block for every position:fixed
+              descendant, which pins the dock to the top and renders context
+              menus in the wrong corner. Steady state must be transform-free. */}
+          <div className={`transition-all duration-500 ${launched ? "opacity-100" : "opacity-0 scale-95"}`}>
             <div className="h-screen w-screen flex flex-col overflow-hidden bg-shell-bg text-shell-text">
+              <EffectsLayer />
               <TopBar onSearchOpen={toggleSearch} onAssistantOpen={toggleAssistant} />
               <Desktop />
               <Dock onLaunchpadOpen={toggleLaunchpad} />
@@ -243,6 +331,7 @@ export function App() {
               <NotificationToasts />
               <NotificationCentre />
               <TaosAssistantPanel />
+              <SafetyFloor />
             </div>
           </div>
         </LoginGate>
@@ -258,10 +347,13 @@ export function App() {
     <ShortcutProvider>
       <SystemShortcuts toggleSearch={toggleSearch} toggleLaunchpad={toggleLaunchpad} toggleAssistant={toggleAssistant} />
       <LoginGate>
-    <div className={`taos-wallpaper h-screen w-screen flex flex-col text-shell-text${isBrowserMobile ? " taos-browser" : ""}`} style={{ backgroundColor: wallpaperFallback, ["--wallpaper-desktop" as never]: wallpaperImage, ["--wallpaper-mobile" as never]: wallpaperMobileImage }}>
+    <div className={`taos-wallpaper taos-mobile-root relative h-screen w-screen flex flex-col text-shell-text${isBrowserMobile ? " taos-browser" : ""}`} style={{ backgroundColor: effWallpaperFallback, ["--wallpaper-desktop" as never]: isAnimatedWallpaper ? "none" : effWallpaperImage, ["--wallpaper-mobile" as never]: isAnimatedWallpaper ? "none" : effWallpaperMobile }}>
+      {isAnimatedWallpaper && wallpaperComponent === "particles" && <ParticlesWallpaper />}
+      {showOverlayText && wallpaperOverlayText && <WallpaperTextOverlay text={wallpaperOverlayText} />}
+      <EffectsLayer />
       {/* Install banner — shown in browser mode, hidden in PWA */}
       {isBrowserMobile && <InstallPromptBanner />}
-      <div className={`flex-1 flex flex-col overflow-hidden transition-all duration-500 ${launched ? "opacity-100 scale-100" : "opacity-0 scale-95"}`}>
+      <div className={`relative z-[1] flex-1 flex flex-col overflow-hidden transition-all duration-500 ${launched ? "opacity-100 scale-100" : "opacity-0 scale-95"}`}>
         <MobileTopBar
           onHome={handleMobileHome}
           onSearch={() => { setCardSwitcherOpen(false); setSearchOpen((v) => !v); }}
@@ -291,6 +383,7 @@ export function App() {
         onToggleSwitcher={() => setCardSwitcherOpen((v) => !v)}
         onOpenLaunchpad={() => { setCardSwitcherOpen(false); setSearchOpen(false); setLaunchpadOpen((v) => !v); }}
         activeAppId={activeWindow?.appId ?? null}
+        isBrowserMobile={isBrowserMobile}
       />
       <CardSwitcher
         open={cardSwitcherOpen}
@@ -305,6 +398,8 @@ export function App() {
       <SearchPalette open={searchOpen} onClose={() => setSearchOpen(false)} onOpenApp={(wid) => setActiveWindowId(wid)} />
       <NotificationToasts />
       <NotificationCentre />
+      <TaosAssistantPanel />
+      <SafetyFloor />
     </div>
       </LoginGate>
     </ShortcutProvider>

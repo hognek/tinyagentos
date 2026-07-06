@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { X, Info, CheckCircle, AlertTriangle, AlertCircle, Server, Bot, BellOff } from "lucide-react";
 import { useNotificationStore, type Notification } from "@/stores/notification-store";
 import { useProcessStore } from "@/stores/process-store";
 import { getApp } from "@/registry/app-registry";
+import { ConsentActions, consentPayload } from "./ConsentActions";
 
 const LEVEL_ICONS = {
   info: Info,
@@ -264,22 +265,31 @@ function extractTagged(text: string, tag: string): string | undefined {
 /*  ToastItem                                                          */
 /* ------------------------------------------------------------------ */
 
-function ToastItem({ notif }: { notif: Notification }) {
+function ToastItem({ notif, onExpire }: { notif: Notification; onExpire: () => void }) {
   const dismiss = useNotificationStore((s) => s.dismiss);
+  const archiveRead = useNotificationStore((s) => s.archiveRead);
   const Icon = LEVEL_ICONS[notif.level];
   const isAgentPaused = notif.source === "agent.paused";
+  const consent = notif.source === "auth_requests" ? consentPayload(notif.data) : null;
+  // Stable boolean for the effect dependency — using the `consent` object
+  // would recreate the timer on every render because consentPayload() returns
+  // a new object reference each time.
+  const isConsentToast = consent !== null;
 
   useEffect(() => {
-    // Agent-paused toasts stay until the user explicitly acts on them.
-    if (isAgentPaused) return;
-    const timer = setTimeout(() => dismiss(notif.id), 5000);
+    // Agent-paused and consent toasts stay until the user explicitly acts.
+    if (isAgentPaused || isConsentToast) return;
+    // Auto-expiry only hides the toast; it must NOT archive. Archiving is an
+    // explicit user action (the X button / "Keep paused"). Otherwise every
+    // toast that simply times out would silently fill the History view.
+    const timer = setTimeout(onExpire, 5000);
     return () => clearTimeout(timer);
-  }, [notif.id, dismiss, isAgentPaused]);
+  }, [notif.id, onExpire, isAgentPaused, isConsentToast]);
 
   return (
     <div
       className={`flex items-start gap-3 p-3 rounded-xl border backdrop-blur-lg shadow-xl w-80 ${LEVEL_COLORS[notif.level]}`}
-      style={{ backgroundColor: "rgba(26, 27, 46, 0.9)" }}
+      style={{ backgroundColor: "var(--color-dock-bg)" }}
       role="alert"
       aria-live="assertive"
     >
@@ -291,6 +301,13 @@ function ToastItem({ notif }: { notif: Notification }) {
         )}
         {isAgentPaused && (
           <AgentPausedActions notif={notif} onDismiss={() => dismiss(notif.id)} />
+        )}
+        {consent && (
+          <ConsentActions
+            requestId={consent.requestId}
+            scopes={consent.scopes}
+            onResolved={() => archiveRead(notif.id)}
+          />
         )}
       </div>
       {!isAgentPaused && (
@@ -306,10 +323,34 @@ function ToastItem({ notif }: { notif: Notification }) {
   );
 }
 
+// A notification only pops as a toast when it is genuinely fresh. Without this,
+// a reload re-toasts the entire unread backlog (the whole server feed arrives
+// at once, all unread) -- the "notification spam on reload" bug. The backlog
+// still populates the bell; it just does not pop.
+const TOAST_FRESH_MS = 20_000;
+
 export function NotificationToasts() {
   const notifications = useNotificationStore((s) => s.notifications);
-  // Only show unread, non-persisted notifications as toasts (latest 3)
-  const active = notifications.filter((n) => !n.read).slice(0, 3);
+  // Each notification toasts at most once per session.
+  const toastedRef = useRef<Set<string>>(new Set());
+  const [toastIds, setToastIds] = useState<string[]>([]);
+
+  useEffect(() => {
+    const now = Date.now();
+    const toasted = toastedRef.current;
+    const fresh = notifications.filter(
+      (n) => !n.read && !toasted.has(n.id) && now - n.timestamp < TOAST_FRESH_MS,
+    );
+    if (fresh.length === 0) return;
+    for (const n of fresh) toasted.add(n.id);
+    setToastIds((prev) => [...fresh.map((n) => n.id), ...prev].slice(0, 3));
+  }, [notifications]);
+
+  const byId = new Map(notifications.map((n) => [n.id, n] as const));
+  const active = toastIds
+    .map((id) => byId.get(id))
+    .filter((n): n is Notification => !!n && !n.read && !n.archived)
+    .slice(0, 3);
 
   return (
     <div
@@ -318,7 +359,11 @@ export function NotificationToasts() {
       role="region"
     >
       {active.map((n) => (
-        <ToastItem key={n.id} notif={n} />
+        <ToastItem
+          key={n.id}
+          notif={n}
+          onExpire={() => setToastIds((prev) => prev.filter((id) => id !== n.id))}
+        />
       ))}
     </div>
   );

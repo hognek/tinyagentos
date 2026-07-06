@@ -18,7 +18,14 @@ from pathlib import Path
 
 import httpx
 
-from tinyagentos.providers import BACKEND_TYPE_MAP, CHAT_BACKEND_TYPE_MAP, CLOUD_TYPES as CLOUD_BACKEND_TYPES, NEEDS_API_BASE_TYPES
+from tinyagentos.providers import CLOUD_TYPES as CLOUD_BACKEND_TYPES
+from tinyagentos.litellm_config import (
+    EMBEDDING_ALIAS,
+    _is_embedding_model,
+    _discover_ollama_backends_concurrent,
+    generate_litellm_config,
+    get_litellm_master_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -59,311 +66,6 @@ def _pids_listening_on(port: int) -> list[int]:
             continue
     return pids
 
-# Canonical alias the deployer injects into agent containers as
-# TAOS_EMBEDDING_MODEL. Agents that want an embedding call this name and
-# LiteLLM routes it to whatever concrete embedding model the host has.
-# See docs/design/framework-agnostic-runtime.md.
-EMBEDDING_ALIAS = "taos-embedding-default"
-
-# Shared master key used for LiteLLM auth. When LiteLLM runs without a
-# Postgres DB it cannot issue per-agent virtual keys, so every client
-# (openclaw gateway, host-side key admin calls) authenticates with this
-# single value. Written into the config yaml AND exported into the
-# litellm subprocess env so whichever source LiteLLM reads first agrees.
-TAOS_LITELLM_MASTER_KEY = "sk-taos-master"
-
-
-def _is_embedding_model(name: str) -> bool:
-    """Classify a model name as embedding vs chat.
-
-    Heuristic match against the common embedding-model families. LiteLLM
-    has no reliable way to ask a backend "is this model an embedder?" so
-    we infer from the slug. Known families: anything containing ``embed``
-    (nomic-embed, qwen3-embedding, mxbai-embed-large), plus the BGE, GTE,
-    E5, and arctic-embed families whose canonical names don't always
-    include the word.
-
-    Rerankers include ``rerank`` in the slug and are always excluded —
-    they're a different endpoint shape that LiteLLM doesn't front today.
-    """
-    n = name.lower()
-    if "rerank" in n:
-        return False
-    if "embed" in n:
-        return True
-    # Known embedding families where the slug doesn't include "embed"
-    # verbatim. Match on dash-separated prefixes so "bge-something" hits
-    # but a hypothetical "bgem-chat" doesn't.
-    for prefix in ("bge-", "gte-", "e5-", "arctic-"):
-        if n.startswith(prefix):
-            return True
-    return False
-
-
-def _discover_ollama_models(url: str, timeout: float = 2.0) -> list[str]:
-    """Probe an ollama-compatible backend for its loaded model names.
-
-    Returns ``[]`` on any failure (backend down, network error, schema
-    drift) — the caller treats an empty list as "no models to auto-wire"
-    and falls back to the ``default`` alias. Kept sync because
-    ``generate_litellm_config`` is called from both sync and async
-    contexts and adding a timeout-bounded probe here is simpler than
-    plumbing async all the way through the subscriber chain.
-    """
-    try:
-        resp = httpx.get(f"{url.rstrip('/')}/api/tags", timeout=timeout)
-        if resp.status_code != 200:
-            return []
-        data = resp.json()
-        return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
-    except Exception as exc:
-        logger.debug("ollama model probe at %s failed: %s", url, exc)
-        return []
-
-
-def _local_backend_models_from_registry(
-    backend: dict, registry
-) -> list[str]:
-    """Find every installed model that can run on this local backend.
-
-    auto_register_from_manifest names backends ``local-<service-id>`` (e.g.
-    ``local-rk-llama-cpp`` for the rk-llama.cpp service). Each model
-    manifest declares ``variants[].requires.backends[].id`` listing the
-    runtime ids it supports. Cross-reference the two: every installed
-    model whose variants point at this backend's service id is a model
-    we can route requests to via this backend's URL.
-
-    Returns a deduplicated list of manifest ids — the LiteLLM model_name
-    aliases we want to create per local backend.
-    """
-    if registry is None:
-        return []
-
-    name = backend.get("name", "")
-    if not name.startswith("local-"):
-        return []
-    service_id = name[len("local-"):]
-    if not service_id:
-        return []
-
-    try:
-        installed_rows = registry.list_installed()
-    except Exception:  # noqa: BLE001
-        return []
-    installed_ids = {row.get("id") for row in installed_rows if row.get("id")}
-
-    matched: list[str] = []
-    for manifest_id in sorted(installed_ids):
-        manifest = registry.get(manifest_id) if hasattr(registry, "get") else None
-        if not manifest or getattr(manifest, "type", None) != "model":
-            continue
-        variants = getattr(manifest, "variants", None) or []
-        for v in variants:
-            if not isinstance(v, dict):
-                continue
-            for req in (v.get("requires", {}) or {}).get("backends", []) or []:
-                if isinstance(req, dict) and req.get("id") == service_id:
-                    matched.append(manifest_id)
-                    break
-            else:
-                continue
-            break
-    return matched
-
-
-def generate_litellm_config(
-    backends: list[dict],
-    default_model: str = "default",
-    *,
-    registry=None,
-) -> dict:
-    """Generate LiteLLM config from TinyAgentOS backend list.
-
-    Emits two kinds of model_list entries:
-
-    - Chat entries under the ``default`` alias, routing through each
-      ollama-compatible backend. Frameworks using the OpenAI SDK against
-      ``OPENAI_BASE_URL`` hit these with ``model="default"``.
-    - Embedding entries discovered by probing each ollama-compatible
-      backend's ``/api/tags``. The first embedding model found is also
-      aliased as ``taos-embedding-default`` so the deployer can inject
-      a stable model name into every agent container via
-      ``TAOS_EMBEDDING_MODEL``. Entries carry
-      ``model_info.mode: embedding`` so LiteLLM routes
-      ``/v1/embeddings`` requests to them instead of chat.
-    """
-    model_list = []
-    sorted_backends = sorted(backends, key=lambda b: b.get("priority", 99))
-    aliased_embedding_claimed = False
-
-    for backend in sorted_backends:
-        backend_type = backend.get("type", "ollama")
-        # Loudly flag cloud-type entries missing url/models so the next
-        # round of silent drops (the kilocode regression) is visible in
-        # logs instead of surfacing only as a broken agent much later.
-        if backend_type in CLOUD_BACKEND_TYPES:
-            if not backend.get("url") or not backend.get("models"):
-                logger.warning(
-                    "backend %s skipped — missing url or models (type=%s)",
-                    backend.get("name"),
-                    backend_type,
-                )
-        prefix = CHAT_BACKEND_TYPE_MAP.get(backend_type, "openai")
-        url = backend.get("url", "").rstrip("/")
-        model_name = backend.get("model", "default")
-
-        litellm_params = {
-            "model": f"{prefix}/{model_name}",
-        }
-
-        # Set api_base for local/self-hosted backends and openai-compatible
-        if backend_type in NEEDS_API_BASE_TYPES:
-            litellm_params["api_base"] = url
-
-        # API key from secrets reference
-        if backend.get("api_key_secret"):
-            litellm_params["api_key"] = f"os.environ/{backend['api_key_secret']}"
-        elif backend.get("api_key"):
-            litellm_params["api_key"] = backend["api_key"]
-
-        # For cloud backends with a declared models list, register each model
-        # by its exact id so agents can route requests to a specific model.
-        if backend_type in CLOUD_BACKEND_TYPES:
-            declared_models: list[str] = []
-            for m in backend.get("models") or []:
-                if isinstance(m, dict):
-                    mid = m.get("id") or m.get("name") or ""
-                else:
-                    mid = str(m)
-                if mid:
-                    declared_models.append(mid)
-
-            for model_id in declared_models:
-                per_model_params: dict = {
-                    "model": f"{prefix}/{model_id}",
-                }
-                # kilocode isn't a native LiteLLM provider — must set api_base
-                if backend_type == "kilocode":
-                    per_model_params["api_base"] = url
-                elif url and backend_type not in ("openai", "anthropic"):
-                    # For openrouter and other pass-through types, set api_base
-                    # when an explicit url is provided
-                    per_model_params["api_base"] = url
-                # API key resolution
-                if backend.get("api_key_secret"):
-                    per_model_params["api_key"] = f"os.environ/{backend['api_key_secret']}"
-                elif backend.get("api_key"):
-                    per_model_params["api_key"] = backend["api_key"]
-                model_list.append({
-                    "model_name": model_id,
-                    "litellm_params": per_model_params,
-                    "metadata": {
-                        "priority": backend.get("priority", 99),
-                        "backend_name": backend.get("name", ""),
-                    },
-                })
-
-        model_list.append({
-            "model_name": default_model,
-            "litellm_params": litellm_params,
-            "metadata": {
-                "priority": backend.get("priority", 99),
-                "backend_name": backend.get("name", ""),
-            },
-        })
-
-        # For local backends (name "local-<service-id>" from
-        # auto_register_from_manifest), also register every installed
-        # model that targets this backend as its own LiteLLM model_name.
-        # Independent of cloud/non-cloud: openai-compatible is in
-        # CLOUD_BACKEND_TYPES even when it's actually a local llama-server
-        # (e.g. rk-llama.cpp). Without this, an agent picker that says
-        # "use gemma-4-e2b-gguf" → LiteLLM call with that model_name →
-        # 400 because no such alias is registered.
-        backend_name = backend.get("name", "")
-        if backend_name.startswith("local-") and url:
-            for manifest_id in _local_backend_models_from_registry(backend, registry):
-                # Skip if already added (e.g. cloud per-model loop above
-                # already registered it under the same name).
-                if any(e.get("model_name") == manifest_id for e in model_list):
-                    continue
-                per_model_params: dict = {
-                    "model": f"{prefix}/{manifest_id}",
-                    "api_base": url,
-                }
-                if backend.get("api_key_secret"):
-                    per_model_params["api_key"] = f"os.environ/{backend['api_key_secret']}"
-                elif backend.get("api_key"):
-                    per_model_params["api_key"] = backend["api_key"]
-                model_list.append({
-                    "model_name": manifest_id,
-                    "litellm_params": per_model_params,
-                    "metadata": {
-                        "priority": backend.get("priority", 99),
-                        "backend_name": backend_name,
-                        "source": "local-installed",
-                    },
-                })
-
-        # Auto-discover embedding models on ollama-compatible backends and
-        # register each as its own LiteLLM entry. The first embedding model
-        # found across all backends also claims the stable
-        # ``taos-embedding-default`` alias so containers have one name to
-        # inject regardless of which rkllama box holds the model.
-        if backend_type in ("ollama", "rkllama"):
-            discovered = _discover_ollama_models(url)
-            for discovered_name in discovered:
-                if not _is_embedding_model(discovered_name):
-                    continue
-                embed_params = {
-                    "model": f"ollama/{discovered_name}",
-                    "api_base": url,
-                }
-                model_list.append({
-                    "model_name": discovered_name,
-                    "litellm_params": embed_params,
-                    "model_info": {"mode": "embedding"},
-                    "metadata": {
-                        "priority": backend.get("priority", 99),
-                        "backend_name": backend.get("name", ""),
-                    },
-                })
-                if not aliased_embedding_claimed:
-                    model_list.append({
-                        "model_name": EMBEDDING_ALIAS,
-                        "litellm_params": dict(embed_params),
-                        "model_info": {"mode": "embedding"},
-                        "metadata": {
-                            "priority": backend.get("priority", 99),
-                            "backend_name": backend.get("name", ""),
-                            "aliases": discovered_name,
-                        },
-                    })
-                    aliased_embedding_claimed = True
-
-    return {
-        "model_list": model_list,
-        "router_settings": {
-            "routing_strategy": "simple-shuffle",
-            "num_retries": 2,
-            "timeout": 120,
-            "enable_pre_call_checks": False,
-        },
-        "general_settings": {
-            "master_key": TAOS_LITELLM_MASTER_KEY,
-            "background_health_checks": False,
-            "disable_spend_logs": True,
-        },
-        # LiteLLM's proxy reads custom logger classes from
-        # ``litellm_settings.callbacks``. The loader (get_instance_fn) resolves
-        # the dotted path relative to the config file's directory — so the
-        # sibling ``taos_callback.py`` shim written by ``write_config`` below
-        # imports our installed module and re-exports the instance.
-        "litellm_settings": {
-            "callbacks": "taos_callback.proxy_handler_instance",
-        },
-    }
-
 
 class LLMProxy:
     """Manages LiteLLM proxy as a subprocess.
@@ -377,15 +79,23 @@ class LLMProxy:
 
     def __init__(
         self,
-        port: int = 4000,
+        port: int = 7834,
         config_dir: Path | None = None,
         database_url: str | None = None,
         local_token: str | None = None,
         registry=None,
+        data_dir: Path | None = None,
+        inhouse_keys: bool = False,
     ):
         self.port = port
         self.config_dir = config_dir or Path("/tmp/taos-litellm")
         self.database_url = database_url
+        # In-house key mode: mint/scope per-agent keys in a local SQLite store
+        # and authorize them via the custom_auth hook, instead of LiteLLM's
+        # Postgres/prisma virtual-key table. Lets virtual keys work with NO
+        # DATABASE_URL (the ARM / no-Postgres fix). Opt-in; the router,
+        # streaming, master key, and usage callback are unaffected.
+        self.inhouse_keys = inhouse_keys
         # Local auth token for taOS callbacks (POST /api/trace). Exported
         # to the LiteLLM subprocess as ``TAOS_LOCAL_TOKEN`` so the custom
         # logger in ``tinyagentos.litellm_callback`` can authenticate to
@@ -398,7 +108,38 @@ class LLMProxy:
         # gemma-4-e2b-gguf" would 400 on the proxy because the alias was
         # never created.
         self._registry = registry
+        # data_dir drives the per-install master key file (.litellm_master_key).
+        # When None, an in-memory key is used (acceptable in tests / routing-only mode).
+        self._data_dir = data_dir
         self._process: subprocess.Popen | None = None
+        self._keystore_cache = None
+        self._budget_store_cache = None
+        # One-shot guard: if litellm is missing at start() (e.g. a pre-fix
+        # update stripped the proxy extra), self-install it once per process
+        # rather than retry the slow install on every start() call.
+        self._selfheal_attempted = False
+
+    def _keystore(self):
+        """Lazily open the in-house key store (controller side)."""
+        if self._keystore_cache is None:
+            from tinyagentos.litellm_keystore import (
+                LiteLLMKeyStore,
+                default_keystore_path,
+            )
+            base = self._data_dir or self.config_dir
+            self._keystore_cache = LiteLLMKeyStore(default_keystore_path(base))
+        return self._keystore_cache
+
+    def _budget_store(self):
+        """Lazily open the in-house budget store (controller side)."""
+        if self._budget_store_cache is None:
+            from tinyagentos.agent_budget_store import (
+                AgentBudgetStore,
+                default_budget_path,
+            )
+            base = self._data_dir or self.config_dir
+            self._budget_store_cache = AgentBudgetStore(default_budget_path(base))
+        return self._budget_store_cache
 
     @property
     def url(self) -> str:
@@ -415,8 +156,11 @@ class LLMProxy:
             return False
         return self._process.poll() is None
 
-    def write_config(self, backends: list[dict]) -> Path:
+    async def write_config(self, backends: list[dict]) -> Path:
         """Generate and write LiteLLM config file.
+
+        Probes all ollama/rkllama backends concurrently so the
+        per-backend 2s timeout does not compound serially.
 
         Also writes a sibling ``taos_callback.py`` shim so LiteLLM's
         ``get_instance_fn`` can load the CustomLogger instance via its
@@ -425,7 +169,14 @@ class LLMProxy:
         callback code in one place.
         """
         self.config_dir.mkdir(parents=True, exist_ok=True)
-        config = generate_litellm_config(backends, registry=self._registry)
+        discovered = await _discover_ollama_backends_concurrent(backends)
+        config = generate_litellm_config(
+            backends,
+            registry=self._registry,
+            master_key=get_litellm_master_key(self._data_dir),
+            discovered=discovered,
+            inhouse_keys=self.inhouse_keys,
+        )
         config_path = self.config_dir / "litellm_config.yaml"
 
         import yaml
@@ -436,7 +187,163 @@ class LLMProxy:
             "from tinyagentos.litellm_callback import taos_callback "
             "as proxy_handler_instance\n"
         )
+        if self.inhouse_keys:
+            # Sibling shim so LiteLLM's config-dir-relative importer can load
+            # the custom_auth hook (general_settings.custom_auth: taos_auth...).
+            (self.config_dir / "taos_auth.py").write_text(
+                "from tinyagentos.litellm_auth import user_api_key_auth\n"
+            )
         return config_path
+
+    async def _selfheal_proxy_extra(self) -> bool:
+        """One-time attempt to install the missing litellm proxy extra.
+
+        install-server.sh installs ``.[proxy]`` (litellm + prisma), but any
+        update run by a pre-fix updater ran a bare ``uv sync --frozen`` and
+        pruned the extra out of the venv, so a fresh boot finds litellm gone
+        and every agent loses its LLM route. Since the proxy is core, install
+        it once here rather than leave it disabled. Bounded + non-fatal: on any
+        failure the proxy just stays disabled and the box keeps running.
+        """
+        import shutil
+        import sys
+
+        import tomllib
+
+        # The install dir is an ancestor of the venv python (normally the
+        # venv's grandparent: <root>/.venv/bin/python). Do NOT resolve(): the
+        # venv python is a symlink to the base interpreter (e.g.
+        # /usr/local/bin/python3.x), so resolving walks out of the install
+        # tree. Walk upward to the first ancestor whose pyproject.toml is
+        # OURS (project.name == tinyagentos): matching on the file alone
+        # could latch onto an unrelated project's pyproject higher up (e.g.
+        # one in $HOME) and pip-install that project's pins into our venv.
+        def _load_install_pyproject(parent: Path) -> dict | None:
+            pj = parent / "pyproject.toml"
+            if not pj.is_file():
+                return None
+            try:
+                with open(pj, "rb") as fh:
+                    doc = tomllib.load(fh)
+            except Exception:  # noqa: BLE001 - unreadable/foreign file: keep walking
+                return None
+            return doc if doc.get("project", {}).get("name") == "tinyagentos" else None
+
+        # Keep the parsed document alongside the root so the pip fallback
+        # below reuses it instead of re-opening and re-parsing the file.
+        project_root = None
+        pyproject_doc: dict | None = None
+        for parent in Path(sys.executable).parents:
+            pyproject_doc = _load_install_pyproject(parent)
+            if pyproject_doc is not None:
+                project_root = parent
+                break
+        if project_root is None:
+            logger.warning(
+                "proxy self-heal: no tinyagentos pyproject.toml above %s — skipping",
+                sys.executable,
+            )
+            return False
+
+        # Single source of truth for the extras (matches the updater); fall
+        # back to the literal if the import is unavailable for any reason.
+        try:
+            from tinyagentos.routes.settings import UPDATE_EXTRAS
+        except Exception:
+            UPDATE_EXTRAS = ("proxy",)
+
+        # HOME=install dir so uv resolves its cache under the service user.
+        env = {**os.environ, "HOME": str(project_root)}
+        uv = None
+        cand = project_root / ".local" / "bin" / "uv"
+        if cand.exists():
+            uv = str(cand)
+        uv = uv or shutil.which("uv")
+        if uv:
+            extra_args = [a for e in UPDATE_EXTRAS for a in ("--extra", e)]
+            cmd = [uv, "sync", "--frozen", *extra_args]
+        else:
+            # Without uv, install ONLY the extras' requirements (read from
+            # pyproject so the pins stay single-sourced). An editable
+            # reinstall (pip install -e .[proxy]) would re-resolve every
+            # project dependency — the exact churn this self-heal exists to
+            # undo — and a later bare `uv sync --frozen` would strip the
+            # extra right back out anyway.
+            try:
+                optional = pyproject_doc["project"]["optional-dependencies"]
+                # strip(): a stray newline/whitespace in a pyproject entry
+                # would otherwise reach pip verbatim and fail opaquely.
+                reqs = [
+                    r.strip()
+                    for e in UPDATE_EXTRAS
+                    for r in optional.get(e, [])
+                    if r.strip()
+                ]
+            except Exception as exc:  # noqa: BLE001 - non-fatal by design
+                logger.warning(
+                    "proxy self-heal: cannot read extras from pyproject: %s", exc
+                )
+                return False
+            if not reqs:
+                logger.warning(
+                    "proxy self-heal: no requirements found for extras %s",
+                    UPDATE_EXTRAS,
+                )
+                return False
+            pip = str(Path(sys.executable).parent / "pip")
+            # --no-input: never block the 900s window on a TTY prompt.
+            # --disable-pip-version-check: no upgrade nag in the captured
+            # stream. (No --quiet: failure output must stay in the logs.)
+            cmd = [
+                pip,
+                "install",
+                "--no-input",
+                "--disable-pip-version-check",
+                *reqs,
+            ]
+
+        logger.warning(
+            "proxy self-heal: litellm missing, installing the proxy extra: %s",
+            " ".join(cmd),
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(project_root),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except Exception as exc:  # noqa: BLE001 - non-fatal by design
+            logger.warning("proxy self-heal: could not spawn install: %s", exc)
+            return False
+
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=900)
+        except asyncio.TimeoutError:
+            # Kill the runaway install so it does not leak past the timeout.
+            logger.warning("proxy self-heal: install timed out after 900s — killing")
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+                pass
+            return False
+        except Exception as exc:  # noqa: BLE001 - non-fatal by design
+            logger.warning("proxy self-heal: install error: %s", exc)
+            return False
+
+        if proc.returncode == 0:
+            logger.info("proxy self-heal: install succeeded")
+            return True
+        tail = (out or b"").decode(errors="replace")[-400:]
+        logger.warning(
+            "proxy self-heal: install failed (rc=%s): %s", proc.returncode, tail
+        )
+        return False
 
     async def start(
         self,
@@ -503,7 +410,7 @@ class LLMProxy:
                     self.port,
                 )
 
-        config_path = self.write_config(backends)
+        config_path = await self.write_config(backends)
 
         # Resolve litellm binary from the same venv that's running
         # TinyAgentOS. systemd doesn't inherit the venv's bin/ on PATH, so
@@ -514,6 +421,16 @@ class LLMProxy:
         import sys
         venv_bin = Path(sys.executable).parent / "litellm"
         litellm_cmd = str(venv_bin) if venv_bin.exists() else shutil.which("litellm")
+        if not litellm_cmd and not self._selfheal_attempted:
+            # The proxy is a core dependency. A pre-fix update ran a bare
+            # `uv sync --frozen` and stripped the proxy extra, so a fresh boot
+            # finds litellm gone. Self-install it once (bounded, non-fatal);
+            # this runs inside the background litellm-bringup task so a slow
+            # install does not block controller startup.
+            self._selfheal_attempted = True
+            if await self._selfheal_proxy_extra():
+                venv_bin = Path(sys.executable).parent / "litellm"
+                litellm_cmd = str(venv_bin) if venv_bin.exists() else shutil.which("litellm")
         if not litellm_cmd:
             logger.warning("LiteLLM not installed — proxy disabled. Install with: pip install litellm[proxy]")
             return False
@@ -523,7 +440,7 @@ class LLMProxy:
         # whichever path the subprocess reads first matches the value the
         # deployer uses when auth'ing /key/generate and agent requests.
         env = os.environ.copy()
-        env["LITELLM_MASTER_KEY"] = TAOS_LITELLM_MASTER_KEY
+        env["LITELLM_MASTER_KEY"] = get_litellm_master_key(self._data_dir)
         # Forward the local auth token so the TaosLiteLLMCallback inside
         # the subprocess can POST to taOS's /api/trace (otherwise 401).
         if self.local_token:
@@ -539,10 +456,20 @@ class LLMProxy:
         existing_path = env.get("PATH", "")
         if venv_bin not in existing_path.split(os.pathsep):
             env["PATH"] = venv_bin + os.pathsep + existing_path if existing_path else venv_bin
-        # DATABASE_URL enables Postgres-backed virtual keys. Without it
-        # LiteLLM still routes chat/embeddings fine but /key/generate
-        # returns a server error.
-        if self.database_url:
+        if self.inhouse_keys:
+            # In-house key mode: the custom_auth hook authorizes per-agent
+            # tokens from this SQLite store. Point the subprocess at it and do
+            # NOT export DATABASE_URL, so LiteLLM never starts prisma (the ARM
+            # fix). The router still works fully without a DB.
+            from tinyagentos.litellm_keystore import default_keystore_path
+            base = self._data_dir or self.config_dir
+            env["TAOS_LITELLM_KEYSTORE"] = str(default_keystore_path(base))
+            from tinyagentos.agent_budget_store import default_budget_path
+            env["TAOS_AGENT_BUDGETS"] = str(default_budget_path(base))
+        elif self.database_url:
+            # DATABASE_URL enables Postgres-backed virtual keys. Without it
+            # LiteLLM still routes chat/embeddings fine but /key/generate
+            # returns a server error.
             env["DATABASE_URL"] = self.database_url
         # Resolve every api_key_secret into a real env var so the
         # os.environ/<name> markers in the generated config resolve to
@@ -615,7 +542,7 @@ class LLMProxy:
         so the default action fires: the process terminates. A full
         stop+start is the only reliable way to pick up config changes.
         """
-        new_path = self.write_config(backends)
+        new_path = await self.write_config(backends)
         if not self.is_running():
             return False
         logger.info("LiteLLM proxy restarting for config reload (%s)", new_path)
@@ -624,7 +551,27 @@ class LLMProxy:
 
     async def create_agent_key(self, agent_name: str, models: list[str] | None = None,
                                 max_budget: float | None = None) -> str | None:
-        """Create a per-agent virtual key via LiteLLM API."""
+        """Create a per-agent virtual key.
+
+        In-house mode mints a token in the local key store (no DB, works on
+        ARM). Otherwise it calls LiteLLM's Postgres-backed /key/generate.
+        """
+        if getattr(self, "inhouse_keys", False):
+            try:
+                # Mirror the Postgres path's ``models or ["default"]`` so an
+                # agent deployed without an explicit model is scoped to the
+                # default chat alias (still usable), not minted with an empty
+                # allowlist that the auth hook would then deny-all.
+                token = self._keystore().mint(agent_name, models or ["default"])
+            except Exception as e:
+                logger.warning("inhouse key mint failed for %s: %s", agent_name, e)
+                return None
+            if max_budget is not None:
+                try:
+                    self._budget_store().set_budget(agent_name, max_budget)
+                except Exception as e:
+                    logger.warning("inhouse budget set failed for %s: %s", agent_name, e)
+            return token
         if not self.is_running():
             return None
         # LiteLLM virtual keys require a Postgres DB. Without one,
@@ -643,7 +590,7 @@ class LLMProxy:
                 if max_budget is not None:
                     body["max_budget"] = max_budget
                 resp = await client.post(f"{self.url}/key/generate", json=body,
-                                          headers={"Authorization": f"Bearer {TAOS_LITELLM_MASTER_KEY}"})
+                                          headers={"Authorization": f"Bearer {get_litellm_master_key(self._data_dir)}"})
                 if resp.status_code == 200:
                     data = resp.json()
                     return data.get("key", data.get("token"))
@@ -656,14 +603,65 @@ class LLMProxy:
             logger.warning(f"Failed to create LiteLLM key for {agent_name}: {e}")
         return None
 
+    async def update_agent_key(self, key: str, models: list[str]) -> bool:
+        """Re-scope an existing virtual key's allowed models via /key/update.
+
+        Keeps the key VALUE unchanged (no container env push / restart needed):
+        the framework's ``/v1/models`` with this key then reflects the new
+        permitted set, so it natively sees exactly what the agent is allowed to
+        use. Returns True on success. No-op (False) in routing-only mode (no DB)
+        — there are no per-agent keys to scope there.
+        """
+        if getattr(self, "inhouse_keys", False):
+            if not key or not models:
+                logger.warning("update_agent_key (inhouse) needs key + models; refusing")
+                return False
+            try:
+                return self._keystore().set_models(key, models)
+            except Exception as e:
+                logger.warning("inhouse key re-scope failed: %s", e)
+                return False
+        if not self.is_running() or not self.database_url or not key:
+            return False
+        if not models:
+            # An empty scope is a caller error, not a request to allow nothing.
+            # Refuse rather than silently substitute a bogus "default" model
+            # (which would scope the key to a model that does not exist).
+            logger.warning("update_agent_key called with empty models; refusing to re-scope key")
+            return False
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(
+                    f"{self.url}/key/update",
+                    json={"key": key, "models": models},
+                    headers={"Authorization": f"Bearer {get_litellm_master_key(self._data_dir)}"},
+                )
+                if resp.status_code == 200:
+                    return True
+                logger.warning(
+                    "LiteLLM /key/update returned %d body=%.200s",
+                    resp.status_code, resp.text,
+                )
+        except Exception as e:
+            logger.warning("Failed to update LiteLLM key models: %s", e)
+        return False
+
     async def delete_agent_key(self, key: str) -> bool:
         """Delete a per-agent virtual key."""
+        if getattr(self, "inhouse_keys", False):
+            if not key:
+                return False
+            try:
+                return self._keystore().delete(key)
+            except Exception as e:
+                logger.warning("inhouse key delete failed: %s", e)
+                return False
         if not self.is_running():
             return False
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.post(f"{self.url}/key/delete", json={"keys": [key]},
-                                          headers={"Authorization": f"Bearer {TAOS_LITELLM_MASTER_KEY}"})
+                                          headers={"Authorization": f"Bearer {get_litellm_master_key(self._data_dir)}"})
                 if resp.status_code == 200:
                     return True
                 logger.warning(
@@ -681,7 +679,7 @@ class LLMProxy:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(f"{self.url}/key/info", params={"key": key},
-                                         headers={"Authorization": f"Bearer {TAOS_LITELLM_MASTER_KEY}"})
+                                         headers={"Authorization": f"Bearer {get_litellm_master_key(self._data_dir)}"})
                 if resp.status_code == 200:
                     return resp.json()
                 logger.warning(

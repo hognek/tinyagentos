@@ -78,6 +78,12 @@ class HardwareProfile:
     gpu: GpuInfo = field(default_factory=GpuInfo)
     disk: DiskInfo = field(default_factory=DiskInfo)
     os: OsInfo = field(default_factory=OsInfo)
+    # True when running inside WSL, where ram_mb is the WSL VM cap (50% of the
+    # Windows host by default) rather than the real machine RAM. mem_note carries
+    # a user-facing explanation + how to raise it. ram_mb is left as-is (it IS
+    # what the VM has); these only contextualize it so users are not confused.
+    wsl: bool = False
+    mem_note: str = ""
 
     @property
     def profile_id(self) -> str:
@@ -112,6 +118,8 @@ class HardwareProfile:
             gpu=GpuInfo(**data.get("gpu", {})),
             disk=DiskInfo(**data.get("disk", {})),
             os=OsInfo(**data.get("os", {})),
+            wsl=data.get("wsl", False),
+            mem_note=data.get("mem_note", ""),
         )
 
 
@@ -120,6 +128,24 @@ def _run(cmd: list[str]) -> str:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout.strip()
     except (subprocess.SubprocessError, FileNotFoundError):
         return ""
+
+
+def _soc_from_devicetree(text: str) -> str:
+    """Map a lowercased device-tree string to a known SoC id, or "".
+
+    `text` should combine /proc/device-tree/model and
+    /proc/device-tree/compatible: the board name in `model` often omits the
+    SoC ("Orange Pi 5 Plus") while `compatible` names it ("rockchip,rk3588").
+    """
+    if "rk3588" in text:
+        return "rk3588"
+    if "rk3576" in text:
+        return "rk3576"
+    if "bcm2712" in text:
+        return "bcm2712"
+    if "bcm2711" in text or "raspberry pi 4" in text:
+        return "bcm2711"
+    return ""
 
 
 def _detect_cpu() -> CpuInfo:
@@ -134,18 +160,15 @@ def _detect_cpu() -> CpuInfo:
                 cores += 1
             if "model name" in line.lower() or "hardware" in line.lower():
                 model = line.split(":")[-1].strip()
-        # Detect SoC for ARM
-        dt_model = Path("/proc/device-tree/model")
-        if dt_model.exists():
-            soc_str = dt_model.read_text().strip("\x00").lower()
-            if "rk3588" in soc_str:
-                soc = "rk3588"
-            elif "rk3576" in soc_str:
-                soc = "rk3576"
-            elif "bcm2712" in soc_str:
-                soc = "bcm2712"
-            elif "bcm2711" in soc_str or "raspberry pi 4" in soc_str:
-                soc = "bcm2711"
+        # Detect SoC for ARM. Read both model and compatible: the board name
+        # in device-tree/model often omits the SoC, so device-tree/compatible
+        # ("rockchip,rk3588") is the reliable source.
+        dt_text = ""
+        for dt in ("/proc/device-tree/model", "/proc/device-tree/compatible"):
+            p = Path(dt)
+            if p.exists():
+                dt_text += " " + p.read_text().replace("\x00", " ").lower()
+        soc = _soc_from_devicetree(dt_text)
     except OSError:
         pass
     # macOS / Apple Silicon detection
@@ -182,6 +205,20 @@ def _detect_ram() -> int:
     except OSError:
         pass
     return 0
+
+
+def _detect_wsl() -> bool:
+    """True when running inside WSL. The RAM seen here is the WSL VM cap (50% of
+    the Windows host by default), not the real machine, so a 16GB host shows
+    ~8GB. We surface this so the limit is explained rather than confusing."""
+    import os
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        version = Path("/proc/version").read_text().lower()
+        return "microsoft" in version or "wsl" in version
+    except OSError:
+        return False
 
 
 def _path_exists_safe(p: Path) -> bool:
@@ -343,6 +380,7 @@ _NVIDIA_VRAM_MB = [
     ("gtx 1070 ti",     8192),
     ("gtx 1070",        8192),
     ("gtx 1060",        6144),
+    ("gtx 1050 ti",     4096),
     # Datacenter / workstation
     ("h100",           81920),
     ("a100 80",        81920),
@@ -381,6 +419,42 @@ def _nvidia_vram_for_model(model: str) -> int:
         return 0
     needle = model.lower()
     for key, mb in _NVIDIA_VRAM_MB:
+        if key in needle:
+            return mb
+    return 0
+
+
+# VRAM lookup table for AMD Radeon RX GPUs. Keyed by normalised model
+# substrings matched case-insensitively. Longer/more-specific keys first.
+_AMD_VRAM_MB = [
+    # RX 7000 series (RDNA 3)
+    ("rx 7900 xtx",    24576),
+    ("rx 7900 xt",     20480),
+    ("rx 7800 xt",     16384),
+    ("rx 7700 xt",     12288),
+    ("rx 7600 xt",      16384),
+    ("rx 7600",         8192),
+    # RX 6000 series (RDNA 2)
+    ("rx 6900 xt",     16384),
+    ("rx 6800 xt",     16384),
+    ("rx 6800",        16384),
+    ("rx 6750 xt",     12288),
+    ("rx 6700 xt",     12288),
+    ("rx 6700",        10240),
+    ("rx 6650 xt",      8192),
+    ("rx 6600 xt",      8192),
+    ("rx 6600",         8192),
+    ("rx 6500 xt",      4096),
+    ("rx 6400",         4096),
+]
+
+
+def _amd_vram_for_model(model: str) -> int:
+    """Return known VRAM in MB for an AMD Radeon GPU model name, or 0 if unknown."""
+    if not model:
+        return 0
+    needle = model.lower()
+    for key, mb in _AMD_VRAM_MB:
         if key in needle:
             return mb
     return 0
@@ -444,6 +518,7 @@ def _detect_gpu() -> GpuInfo:
                 break
         gpu.rocm = Path("/opt/rocm").exists()
         gpu.vulkan = gpu.rocm
+        gpu.vram_mb = _amd_vram_for_model(gpu.model)
     else:
         # Check for integrated Mali (ARM) — multiple detection paths
         mali_found = False
@@ -537,13 +612,26 @@ def _detect_os() -> OsInfo:
 
 def detect_hardware() -> HardwareProfile:
     """Detect all hardware and return a profile."""
+    ram_mb = _detect_ram()
+    wsl = _detect_wsl()
+    mem_note = ""
+    if wsl:
+        gb = max(1, round(ram_mb / 1024))
+        mem_note = (
+            f"Running under WSL, which limits Linux to about {gb}GB "
+            "(50% of the Windows host by default). To use more, set "
+            "memory= in C:\\Users\\<you>\\.wslconfig then run "
+            "'wsl --shutdown'."
+        )
     return HardwareProfile(
         cpu=_detect_cpu(),
-        ram_mb=_detect_ram(),
+        ram_mb=ram_mb,
         npu=_detect_npu(),
         gpu=_detect_gpu(),
         disk=_detect_disk(),
         os=_detect_os(),
+        wsl=wsl,
+        mem_note=mem_note,
     )
 
 

@@ -47,10 +47,11 @@ class LeaseManager:
 
     async def init(self) -> None:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._db_path)
+        # isolation_level=None puts the connection in autocommit mode so we
+        # can issue BEGIN IMMEDIATE manually for atomic read-check-write.
+        self._conn = sqlite3.connect(self._db_path, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
-        self._conn.commit()
 
     async def close(self) -> None:
         if self._conn:
@@ -63,9 +64,25 @@ class LeaseManager:
         cursor = self._conn.execute(
             "DELETE FROM leases WHERE expires_at < ?", (now,)
         )
-        if cursor.rowcount > 0:
-            self._conn.commit()
         return cursor.rowcount
+
+    def _renew_locked(self, existing: sqlite3.Row, ttl: float, now: float) -> dict | None:
+        """Renew a lease that is already locked inside a transaction."""
+        if existing["renewed_count"] >= MAX_RENEW_COUNT:
+            return None  # Force release — prevent lease hogging
+
+        self._conn.execute(
+            "UPDATE leases SET expires_at = ?, renewed_count = renewed_count + 1 WHERE id = ?",
+            (now + ttl, existing["id"]),
+        )
+        return {
+            "id": existing["id"],
+            "resource_key": existing["resource_key"],
+            "agent_name": existing["agent_name"],
+            "acquired_at": existing["acquired_at"],
+            "expires_at": now + ttl,
+            "renewed_count": existing["renewed_count"] + 1,
+        }
 
     async def acquire(
         self,
@@ -73,35 +90,48 @@ class LeaseManager:
         agent_name: str,
         ttl: float = DEFAULT_TTL,
     ) -> dict | None:
-        """Acquire an exclusive lease on a resource.
+        """Acquire an exclusive lease on a resource, atomically.
+
+        Uses BEGIN IMMEDIATE so the cleanup + check + insert sequence is
+        serialised: two concurrent callers cannot both observe the lease as
+        absent and then both succeed.
 
         Returns lease dict on success, None if resource is already held
         by another agent.
         """
         ttl = min(ttl, MAX_TTL)
-        self._cleanup_expired()
-        now = time.time()
 
-        # Check existing lease
-        existing = self._conn.execute(
-            "SELECT * FROM leases WHERE resource_key = ?",
-            (resource_key,),
-        ).fetchone()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            now = time.time()
+            # Purge expired leases inside the lock
+            self._conn.execute("DELETE FROM leases WHERE expires_at < ?", (now,))
 
-        if existing:
-            if existing["agent_name"] == agent_name:
-                # Same agent — auto-renew
-                return await self.renew(resource_key, agent_name, ttl)
-            # Different agent holds it
-            return None
+            existing = self._conn.execute(
+                "SELECT * FROM leases WHERE resource_key = ?",
+                (resource_key,),
+            ).fetchone()
 
-        lease_id = uuid.uuid4().hex[:16]
-        self._conn.execute(
-            """INSERT INTO leases (id, resource_key, agent_name, acquired_at, expires_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (lease_id, resource_key, agent_name, now, now + ttl),
-        )
-        self._conn.commit()
+            if existing:
+                if existing["agent_name"] == agent_name:
+                    # Same agent — auto-renew inside the same transaction
+                    result = self._renew_locked(existing, ttl, now)
+                    self._conn.execute("COMMIT")
+                    return result
+                # Different agent holds it
+                self._conn.execute("COMMIT")
+                return None
+
+            lease_id = uuid.uuid4().hex[:16]
+            self._conn.execute(
+                """INSERT INTO leases (id, resource_key, agent_name, acquired_at, expires_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (lease_id, resource_key, agent_name, now, now + ttl),
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
         return {
             "id": lease_id,
@@ -137,7 +167,6 @@ class LeaseManager:
             "UPDATE leases SET expires_at = ?, renewed_count = renewed_count + 1 WHERE id = ?",
             (now + ttl, existing["id"]),
         )
-        self._conn.commit()
 
         return {
             "id": existing["id"],
@@ -154,7 +183,6 @@ class LeaseManager:
             "DELETE FROM leases WHERE resource_key = ? AND agent_name = ?",
             (resource_key, agent_name),
         )
-        self._conn.commit()
         return cursor.rowcount > 0
 
     async def check(self, resource_key: str) -> dict | None:
@@ -190,7 +218,6 @@ class LeaseManager:
             "DELETE FROM leases WHERE agent_name = ?",
             (agent_name,),
         )
-        self._conn.commit()
         return cursor.rowcount
 
     async def stats(self) -> dict:

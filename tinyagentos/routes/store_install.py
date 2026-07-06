@@ -9,6 +9,7 @@ script).
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import asdict
 from urllib.parse import urlparse
@@ -16,6 +17,12 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from tinyagentos.agent_image import (
+    FRAMEWORKS_WITH_DEDICATED_BASE,
+    base_image_alias,
+    base_image_url_for_alias,
+    ensure_image_present,
+)
 from tinyagentos.catalog.resolver import (
     DeviceCapability,
     ResolveErr,
@@ -26,6 +33,7 @@ from tinyagentos.catalog.resolver import (
 from tinyagentos.cluster.capabilities import hardware_to_targets
 from tinyagentos.installers.base import get_installer
 from tinyagentos.installers.lxc_installer import LXCInstaller
+from tinyagentos.task_utils import _create_supervised_task
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -104,6 +112,19 @@ async def get_device_capability(request: Request, target_remote: str | None) -> 
                 installed_backends = tuple(b for b in _KNOWN_BACKENDS if b in ids)
             except Exception:  # noqa: BLE001
                 installed_backends = ()
+        # A backend that is actually running but missing from the registry must
+        # still count as installed, so the resolver uses it (action="use")
+        # instead of trying to (re)install it. rkllama runs as a bare process on
+        # the Pi and is often not registered, which made every model install
+        # take a broken install_chain path (issue #783 follow-up).
+        if "rkllama" not in installed_backends:
+            try:
+                from tinyagentos.installers.rkllama_installer import rkllama_is_running
+                # Offload the blocking socket probe so it never stalls the loop.
+                if await asyncio.to_thread(rkllama_is_running):
+                    installed_backends = installed_backends + ("rkllama",)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("rkllama runtime detection skipped: %s", exc)
         return DeviceCapability(
             device_id="local",
             targets=targets,
@@ -183,6 +204,104 @@ def _registry_get(registry, app_id: str):
     return registry.get(app_id)
 
 
+async def _install_agent_framework(
+    request: Request, manifest, app_id: str, meta: dict, body: dict,
+) -> JSONResponse:
+    """Install an agent-framework manifest declaring ``install.method: script``.
+
+    That script (e.g. hermes/openclaw's ``scripts/install.sh``) is written to
+    run once *inside a fresh per-agent LXC container* at deploy time — it
+    installs Node/npm or pip packages, writes container-local config, and
+    enables systemd units for that container (see ``deployer.py``'s
+    method=="script" branch). Running it here, on the taOS controller host,
+    at Store-install time would be wrong: there is no target container yet,
+    and the script would pollute the host instead.
+
+    So "installing" a framework from the Store means: enable it for deploy
+    (mark it installed so the Store/Agents app reflect real state — the
+    adapter registry already knows how to deploy every listed framework),
+    kick off a best-effort background prefetch of its dedicated base image
+    (if it has one) so the first real deploy is fast, and notify the user it
+    is ready to deploy. Prefetch failure is non-fatal: the framework stays
+    enabled and a first deploy falls back to a cold image build.
+    """
+    registry = getattr(request.app.state, "registry", None)
+    store = getattr(request.app.state, "installed_apps", None)
+    version = body.get("version") or getattr(manifest, "version", "") or ""
+
+    if store is not None:
+        await store.install(app_id, version, meta)
+    if registry is not None and hasattr(registry, "mark_installed"):
+        registry.mark_installed(app_id, version)
+
+    prefetch_started = False
+    if app_id in FRAMEWORKS_WITH_DEDICATED_BASE:
+        alias = base_image_alias(app_id)
+        url = base_image_url_for_alias(alias)
+        bg_tasks = getattr(request.app.state, "_background_tasks", None)
+        if bg_tasks is None:
+            bg_tasks = set()
+            request.app.state._background_tasks = bg_tasks
+        _create_supervised_task(ensure_image_present(alias, url), bg_tasks)
+        prefetch_started = True
+
+    notifs = getattr(request.app.state, "notifications", None)
+    if notifs is not None:
+        try:
+            await notifs.add(
+                title=f"{getattr(manifest, 'name', app_id)} installed",
+                message="You can now deploy it from the Agents app",
+                level="success",
+                source="agent_framework",
+                data={"framework": app_id},
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("_install_agent_framework: notification failed for %s", app_id, exc_info=True)
+
+    return JSONResponse({
+        "ok": True,
+        "app_id": app_id,
+        "status": "installed",
+        "prefetch": "started" if prefetch_started else "skipped",
+    })
+
+
+def _docker_published_port(install_config: dict) -> int:
+    """Return the first host port a docker service publishes, or 0.
+
+    DockerInstaller maps each declared port as ``{p}:{p}`` so the host port
+    equals the container port. Ports may be declared either at the top level
+    (``install.ports``) or nested under ``install.requires.ports`` — mirror
+    the precedence DockerInstaller._generate_compose uses (requires first).
+    """
+    if not isinstance(install_config, dict):
+        return 0
+    ports = (install_config.get("requires") or {}).get("ports") or install_config.get("ports") or []
+    for p in ports:
+        try:
+            return int(p)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _manifest_first_port(manifest) -> int:
+    """Return the first port declared in a manifest's top-level ``requires.ports``.
+
+    Script-backed service manifests (rkllama, rk-llama-cpp, ollama, ...)
+    declare their port under the manifest's top-level ``requires`` block,
+    not under ``install`` (that's a docker-only convention — see
+    ``_docker_published_port``).
+    """
+    ports = (getattr(manifest, "requires", None) or {}).get("ports") or []
+    for p in ports:
+        try:
+            return int(p)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
 async def _legacy_install(request: Request, body: dict, app_id: str | None, target_remote: str | None) -> JSONResponse:
     """Legacy method-driven install path for non-model manifests.
 
@@ -207,6 +326,16 @@ async def _legacy_install(request: Request, body: dict, app_id: str | None, targ
             backend = install_block.get("method", "docker")
 
     meta = body.get("metadata") or {}
+
+    # Agent frameworks whose install.sh runs inside a per-agent LXC container
+    # at deploy time (method=="script") don't get a generic host-side
+    # install — see _install_agent_framework for why and what "install"
+    # means for them instead. Pip/docker-based frameworks (smolagents,
+    # langroid, ...) are unaffected and fall through to the normal dispatch
+    # below, unchanged.
+    if manifest is not None and getattr(manifest, "type", "") == "agent-framework" and backend == "script":
+        return await _install_agent_framework(request, manifest, app_id, meta, body)
+
     manifest_declared = manifest is not None
     if not manifest_declared:
         if isinstance(meta, dict) and meta.get("backend"):
@@ -261,7 +390,7 @@ async def _legacy_install(request: Request, body: dict, app_id: str | None, targ
             await store.update_runtime_location(
                 app_id,
                 host=urlparse(rkllama_url).hostname or "localhost",
-                port=urlparse(rkllama_url).port or 8080,
+                port=urlparse(rkllama_url).port or 7833,
                 backend="rkllama",
                 ui_path="/",
             )
@@ -325,6 +454,48 @@ async def _legacy_install(request: Request, body: dict, app_id: str | None, targ
         resp_target = _target_remote or "local"
         return JSONResponse({"ok": True, "app_id": app_id, "status": "installed", "target_remote": resp_target, **result})
 
+    # script — host-side backend/plugin manifests (e.g. ollama, rkllama,
+    # tailscale) that declare install.method: script. Previously this fell
+    # straight through to the default branch below and silently marked the
+    # app installed without ever running the script (same class of bug as
+    # #410 below for docker/pip, filed as #1582). Actually run it via
+    # ScriptInstaller and only mark installed / record the runtime location
+    # when the script EXITS 0. These scripts are written to be their own
+    # health gate (e.g. install-rkllama.sh delegates to install-rknpu.sh,
+    # which polls the service's HTTP port before returning) so rc==0 here
+    # means the service is actually up, not just that files landed on disk.
+    # On failure, surface the real script error and do not mark installed.
+    if backend == "script":
+        installer = get_installer("script")
+        try:
+            inst_result = await installer.install(app_id, install_config)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("_legacy_install: script installer raised for %s", app_id)
+            return JSONResponse({"error": f"script install failed: {exc}"}, status_code=500)
+        if not inst_result.get("success"):
+            return JSONResponse(
+                {"error": inst_result.get("error", "script install failed")},
+                status_code=500,
+            )
+        store = getattr(request.app.state, "installed_apps", None)
+        if store is not None:
+            await store.install(app_id, body.get("version", ""), meta)
+            # Record where the now-verified-running service actually
+            # listens, same as the docker branch below, so it gets a
+            # Launchpad shortcut / proxy target. Script-backed services are
+            # host-level systemd units (installed via sudo on this
+            # controller), not remote-incus deploys, so always 127.0.0.1.
+            script_port = _manifest_first_port(manifest) if manifest is not None else 0
+            if script_port:
+                await store.update_runtime_location(
+                    app_id, host="127.0.0.1", port=script_port, backend=app_id,
+                    ui_path=(install_config.get("ui_path", "/") if isinstance(install_config, dict) else "/"),
+                )
+        if registry is not None:
+            version = body.get("version") or (getattr(manifest, "version", "") if manifest else "")
+            registry.mark_installed(app_id, version)
+        return JSONResponse({"ok": True, "app_id": app_id, "status": "installed", **inst_result})
+
     # docker / pip — actually run the installer.
     # Previously this branch fell straight through to the installed-apps
     # store, which only marks the app installed in the registry without
@@ -370,22 +541,38 @@ async def _legacy_install(request: Request, body: dict, app_id: str | None, targ
         # Auto-start docker compose so the service is actually serving
         # on its declared ports. Pip installs don't have a generic start
         # command — those are libraries the user invokes from code.
-        # docker pull succeeded → image is on disk, the install is
-        # 'installed' even if compose up trips on a port collision /
-        # daemon hiccup. We surface a warning instead of failing the
-        # whole install so the user can `docker compose up -d` manually
-        # without re-pulling.
         if backend == "docker":
             try:
                 start_result = await installer.start(app_id)
                 if not start_result.get("success"):
-                    logger.warning(
-                        "_legacy_install: docker pull succeeded but compose up failed for %s: %s",
-                        app_id, start_result.get("output", "")[:500],
+                    detail = start_result.get("output", "") or start_result.get("error", "")
+                    logger.error(
+                        "_legacy_install: docker compose up failed for %s: %s",
+                        app_id, detail[:500],
+                    )
+                    return JSONResponse(
+                        {
+                            "ok": False,
+                            "error": (
+                                f"App container failed to start: {detail[:200] or 'unknown error'}. "
+                                "Port conflict or image error — check logs."
+                            ),
+                        },
+                        status_code=500,
                     )
             except (FileNotFoundError, OSError, RuntimeError) as exc:
-                logger.warning(
+                logger.error(
                     "_legacy_install: docker compose up raised for %s: %s", app_id, exc,
+                )
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "error": (
+                            f"App container failed to start: {exc}. "
+                            "Port conflict or image error — check logs."
+                        ),
+                    },
+                    status_code=500,
                 )
 
     # Default: delegate to InstalledAppsStore (records the install in db / store).
@@ -393,6 +580,34 @@ async def _legacy_install(request: Request, body: dict, app_id: str | None, targ
     await store.install(app_id, body.get("version", ""), meta)
     raw_remote = body.get("target_remote") or ""
     _target_remote = raw_remote if raw_remote and raw_remote != "local" else None
+
+    # Docker services publish on an ALLOCATED host port (the DockerInstaller
+    # maps {allocated_pool_port}:{container_port} so apps never bind a core port
+    # like 8080). Record that allocated host port as the runtime location so the
+    # app appears in /api/apps/installed and gets a Launchpad shortcut pointing
+    # at the right place. The installer returns it as inst_result["host_port"];
+    # use that, never the container port. (Falling back to the manifest's
+    # container port only for the no-ports / legacy case.) Without a recorded
+    # location a local docker install (e.g. SearxNG) succeeds but never surfaces
+    # a shortcut. Remote docker installs resolve the host from the registered
+    # incus remote; local installs use 127.0.0.1.
+    if backend == "docker":
+        docker_port = inst_result.get("host_port") or _docker_published_port(install_config)
+        if docker_port:
+            runtime_host = (
+                await _resolve_host(_target_remote) if _target_remote else "127.0.0.1"
+            )
+            await store.update_runtime_location(
+                app_id, host=runtime_host, port=docker_port, backend="docker",
+                ui_path=(install_config.get("ui_path", "/") if isinstance(install_config, dict) else "/"),
+            )
+        else:
+            logger.warning(
+                "_legacy_install: docker service %s declares no port; "
+                "no runtime location recorded (won't appear in Launchpad).",
+                app_id,
+            )
+
     if _target_remote is not None:
         try:
             import tinyagentos.containers as containers
@@ -408,12 +623,16 @@ async def _legacy_install(request: Request, body: dict, app_id: str | None, targ
                 )
         except Exception as exc:  # noqa: BLE001
             logger.warning("_legacy_install default: could not verify remote %r: %s", _target_remote, exc)
-        runtime_host = await _resolve_host(_target_remote)
-        await store.update_runtime_location(
-            app_id, host=runtime_host, port=0,
-            backend=meta.get("backend", "") if isinstance(meta, dict) else "",
-            ui_path=(install_config.get("ui_path", "/") if isinstance(install_config, dict) else "/"),
-        )
+        # Docker installs already recorded a full host:port location above —
+        # don't clobber it with the port=0 placeholder this branch records for
+        # backends (e.g. pip) that have no proxy-routable port.
+        if backend != "docker":
+            runtime_host = await _resolve_host(_target_remote)
+            await store.update_runtime_location(
+                app_id, host=runtime_host, port=0,
+                backend=meta.get("backend", "") if isinstance(meta, dict) else "",
+                ui_path=(install_config.get("ui_path", "/") if isinstance(install_config, dict) else "/"),
+            )
     if registry is not None:
         version = body.get("version") or (getattr(manifest, "version", "") if manifest else "")
         registry.mark_installed(app_id, version)
@@ -479,6 +698,44 @@ async def install_app(request: Request):
         # allows callers that don't have a manifest to install via metadata.
         progress.finish(install_id, success=False, error="manifest not found in registry")
         return await _legacy_install(request, body, manifest_id, target_remote)
+
+    # Non-commercial weights gate (#169): a manifest's code license (MIT etc.)
+    # can be permissive while the model weights it downloads are not (e.g.
+    # musicgen pulls Meta's CC-BY-NC 4.0 weights). Block the install until the
+    # user has explicitly accepted the weights license -- either previously
+    # (recorded in license_acceptances) or on this very request (accepted:
+    # true, sent by the frontend after the user clicks Agree in the license
+    # dialog). Applies uniformly, including to admins: license acceptance is
+    # a legal fact about the user, not a permission an admin role bypasses.
+    if getattr(manifest, "license_class", "") == "non-commercial":
+        license_store = getattr(request.app.state, "license_acceptances", None)
+        license_id = getattr(manifest, "weights_license", "") or manifest.id
+        user = _get_current_user(request)
+        user_id = (user or {}).get("id") or "anonymous"
+        already_accepted = (
+            await license_store.has_accepted(user_id, manifest.id, license_id)
+            if license_store is not None else False
+        )
+        accepted_now = bool(body.get("accepted", False))
+        if not already_accepted and not accepted_now:
+            progress.finish(install_id, success=False, error="needs_license_acceptance")
+            return JSONResponse(
+                {
+                    "needs_license_acceptance": True,
+                    "license_id": license_id,
+                    "weights_license": manifest.weights_license,
+                    "name": manifest.name,
+                    "text": (
+                        f"{manifest.name} downloads model weights licensed under "
+                        f"{manifest.weights_license}, for non-commercial use only. "
+                        "Continuing means you agree to that license for the "
+                        "weights this service uses."
+                    ),
+                },
+                status_code=412,
+            )
+        if accepted_now and not already_accepted and license_store is not None:
+            await license_store.record_acceptance(user_id, manifest.id, license_id)
 
     # Non-model manifests use the legacy method-driven path.
     if getattr(manifest, "type", "model") != "model":

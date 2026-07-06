@@ -1,13 +1,16 @@
 import { useEffect, useMemo, useRef } from "react";
 import { Tldraw, Editor, createTLStore, defaultShapeUtils, TLShape } from "@tldraw/tldraw";
+import { getAssetUrlsByMetaUrl } from "@tldraw/assets/urls";
 import "@tldraw/tldraw/tldraw.css";
 
 import { canvasApi, CanvasElement } from "./canvas-api";
+import { elementToShape } from "./element-to-shape";
 import { createCanvasStore } from "./canvas-store";
 import { subscribeCanvasStream } from "./canvas-sse";
 import { TaosNoteShapeUtil } from "./shapes/NoteShape";
 import { TaosLinkShapeUtil } from "./shapes/LinkShape";
 import { TaosImageShapeUtil } from "./shapes/ImageShape";
+import { TaosGenericShapeUtil } from "./shapes/GenericShape";
 import { useIsMobile } from "../../../hooks/use-is-mobile";
 
 interface CanvasBoardProps {
@@ -15,16 +18,34 @@ interface CanvasBoardProps {
   projectSlug: string;
 }
 
-const CUSTOM_SHAPE_UTILS = [TaosNoteShapeUtil, TaosLinkShapeUtil, TaosImageShapeUtil];
+const CUSTOM_SHAPE_UTILS = [
+  TaosNoteShapeUtil,
+  TaosLinkShapeUtil,
+  TaosImageShapeUtil,
+  TaosGenericShapeUtil,
+];
+
+// Self-host tldraw's fonts/translations/icons so they load same-origin.
+// taOS is offline-first and its CSP forbids cdn.tldraw.com; getAssetUrlsByMetaUrl
+// resolves every asset via import.meta.url, which Vite bundles to hashed
+// same-origin URLs that satisfy default-src/connect-src 'self'.
+const ASSET_URLS = getAssetUrlsByMetaUrl();
 
 export function CanvasBoard({ projectId, projectSlug }: CanvasBoardProps) {
   const isMobile = useIsMobile();
   const cacheRef = useRef(createCanvasStore());
   const editorRef = useRef<Editor | null>(null);
 
-  // In tldraw v4, shapeUtils are passed to <Tldraw>, not createTLStore
+  // The store validates records against its schema, so the custom shape utils
+  // must be passed to createTLStore (not just to <Tldraw>, which only governs
+  // rendering). Without this, store.put rejects taos-* shape types with a
+  // ValidationError ("got taos-generic").
   const store = useMemo(
-    () => createTLStore({ defaultName: `canvas-${projectId}` }),
+    () =>
+      createTLStore({
+        shapeUtils: [...defaultShapeUtils, ...CUSTOM_SHAPE_UTILS],
+        defaultName: `canvas-${projectId}`,
+      }),
     [projectId],
   );
 
@@ -61,6 +82,7 @@ export function CanvasBoard({ projectId, projectSlug }: CanvasBoardProps) {
     <div style={{ position: "relative", width: "100%", height: "100%" }}>
       <Tldraw
         store={store}
+        assetUrls={ASSET_URLS}
         shapeUtils={[...defaultShapeUtils, ...CUSTOM_SHAPE_UTILS] as any}
         onMount={(editor) => {
           editorRef.current = editor;
@@ -109,63 +131,59 @@ function hydrateEditor(
     if (toRemove.length) editor.deleteShapes(toRemove.map((s) => s.id) as any);
 
     for (const el of elements) {
-      const id = `shape:${el.id}` as TLShape["id"];
-      const existingShape = editor.getShape(id);
-      const newShape = elementToShape(el, projectSlug);
-      if (existingShape) {
-        editor.updateShape(newShape);
-      } else {
-        editor.createShape(newShape);
+      // Isolate each element: a single malformed shape (bad payload, a props
+      // shape tldraw's validator rejects, a version-skewed tldraw_shape) must
+      // not throw out of editor.run and take down the whole canvas. Skip it and
+      // keep going; the rest of the board still renders.
+      try {
+        const id = `shape:${el.id}` as TLShape["id"];
+        const existingShape = editor.getShape(id);
+        const newShape = elementToShape(el, projectSlug);
+        if (existingShape) {
+          editor.updateShape(newShape);
+        } else {
+          editor.createShape(newShape);
+        }
+      } catch (err) {
+        console.warn("canvas: skipping unrenderable element", el.id, err);
       }
     }
   });
 }
 
-function elementToShape(el: CanvasElement, projectSlug: string): any {
-  const baseProps = {
-    w: el.w, h: el.h,
-    taos_kind: el.kind,
-    taos_payload: el.payload,
-    taos_author_id: el.author_id,
-    taos_author_kind: el.author_kind,
-  };
+// taos_* lives in props for note/link/image and in meta for taos-generic.
+// Read from whichever is present so round-tripping works for every kind.
+function readTaos(shape: TLShape) {
+  const props = shape.props as any;
+  const meta = shape.meta as any;
   return {
-    id: `shape:${el.id}`,
-    type: shapeType(el.kind),
-    x: el.x, y: el.y, rotation: el.rotation,
-    props: el.kind === "image"
-      ? { ...baseProps, project_slug: projectSlug }
-      : baseProps,
+    kind: props.taos_kind ?? meta.taos_kind,
+    payload: props.taos_payload ?? meta.taos_payload,
   };
-}
-
-function shapeType(kind: string): string {
-  if (kind === "note") return "taos-note";
-  if (kind === "link") return "taos-link";
-  if (kind === "image") return "taos-image";
-  return "geo";
 }
 
 async function pushAdd(projectId: string, shape: TLShape) {
   if (!shape.id.toString().startsWith("shape:")) return;
   const props: any = shape.props;
+  const { kind, payload } = readTaos(shape);
   await canvasApi.addElement(projectId, {
     id: shape.id.toString().replace(/^shape:/, ""),
-    kind: (props.taos_kind ?? "user_shape") as any,
+    kind: (kind ?? "user_shape") as any,
     x: shape.x, y: shape.y,
     w: props.w ?? 100, h: props.h ?? 100,
     rotation: shape.rotation,
-    payload: props.taos_payload ?? { tldraw_shape: shape },
+    payload: payload ?? { tldraw_shape: shape },
   });
 }
 
 async function pushUpdate(projectId: string, shape: TLShape) {
   const elementId = shape.id.toString().replace(/^shape:/, "");
   const props: any = shape.props;
+  const { payload } = readTaos(shape);
   await canvasApi.updateElement(projectId, elementId, {
     x: shape.x, y: shape.y,
     w: props.w, h: props.h,
     rotation: shape.rotation,
-    payload: props.taos_payload,
+    payload,
   });
 }

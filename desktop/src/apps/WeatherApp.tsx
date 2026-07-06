@@ -276,143 +276,197 @@ export function WeatherApp() {
   const isHome = viewing && home && viewing.latitude === home.latitude && viewing.longitude === home.longitude;
 
   return (
-    <div style={{ height: "100%", display: "flex", flexDirection: "column", background: "linear-gradient(160deg, #1a2a4a 0%, #0e1a36 100%)", color: "white", overflow: "hidden" }}>
+    <div className="flex h-full flex-col overflow-hidden bg-shell-bg text-shell-text select-none">
       {/* Search bar */}
-      <div style={{ padding: 16, flexShrink: 0, borderBottom: "1px solid rgba(255,255,255,0.05)" }}>
-        <div style={{ position: "relative" }}>
-          <Search size={16} style={{ position: "absolute", left: 12, top: 12, color: "rgba(255,255,255,0.4)" }} />
+      <div className="flex-none border-b border-shell-border p-4">
+        <div className="relative">
+          <Search
+            size={16}
+            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-shell-text-tertiary"
+          />
           <input
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search for a town or city..."
-            style={{
-              width: "100%",
-              padding: "10px 12px 10px 36px",
-              background: "rgba(255,255,255,0.08)",
-              border: "1px solid rgba(255,255,255,0.1)",
-              borderRadius: 10,
-              color: "white",
-              fontSize: 14,
-              outline: "none",
-            }}
+            aria-label="Search for a town or city"
+            className="w-full rounded-xl border border-shell-border-strong bg-white/5 py-2.5 pl-9 pr-3 text-[14px] text-shell-text outline-none transition-colors placeholder:text-shell-text-tertiary focus-visible:border-accent/40 focus-visible:ring-2 focus-visible:ring-accent/30"
           />
           {searchResults.length > 0 && (
-            <div style={{ position: "absolute", top: "100%", left: 0, right: 0, marginTop: 4, background: "rgba(15,20,40,0.98)", backdropFilter: "blur(20px)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 10, maxHeight: 280, overflowY: "auto", zIndex: 10 }}>
+            <div className="absolute left-0 right-0 top-full z-10 mt-1.5 max-h-[280px] overflow-y-auto rounded-xl border border-shell-border-strong bg-shell-bg-glass shadow-[var(--shadow-card-hover)] backdrop-blur-xl">
               {searchResults.map((loc, i) => (
                 <button
                   key={`${loc.latitude}-${loc.longitude}-${i}`}
                   onClick={() => selectLocation(loc)}
-                  style={{ width: "100%", padding: "10px 14px", textAlign: "left", background: "none", border: "none", color: "white", fontSize: 13, display: "flex", alignItems: "center", gap: 10, cursor: "pointer" }}
-                  onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.06)")}
-                  onMouseLeave={(e) => (e.currentTarget.style.background = "none")}
+                  className="flex w-full items-center gap-2.5 px-3.5 py-2.5 text-left text-[13px] transition-colors hover:bg-white/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/30"
                 >
-                  <MapPin size={14} style={{ color: "rgba(255,255,255,0.4)" }} />
-                  <span style={{ flex: 1 }}>
-                    <span style={{ color: "rgba(255,255,255,0.9)" }}>{loc.name}</span>
-                    <span style={{ color: "rgba(255,255,255,0.4)", marginLeft: 6 }}>{loc.admin1 ? `${loc.admin1}, ` : ""}{loc.country}</span>
+                  <MapPin size={14} className="flex-none text-shell-text-tertiary" />
+                  <span className="flex-1 truncate">
+                    <span className="text-shell-text">{loc.name}</span>
+                    <span className="ml-1.5 text-shell-text-secondary">
+                      {loc.admin1 ? `${loc.admin1}, ` : ""}
+                      {loc.country}
+                    </span>
                   </span>
                 </button>
               ))}
             </div>
           )}
           {searching && query && searchResults.length === 0 && (
-            <div style={{ position: "absolute", top: "100%", left: 0, right: 0, marginTop: 4, padding: "12px 14px", background: "rgba(15,20,40,0.98)", backdropFilter: "blur(20px)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 10, fontSize: 13, color: "rgba(255,255,255,0.5)" }}>
+            <div className="absolute left-0 right-0 top-full z-10 mt-1.5 rounded-xl border border-shell-border-strong bg-shell-bg-glass px-3.5 py-3 text-[13px] text-shell-text-secondary backdrop-blur-xl">
               Searching...
             </div>
           )}
         </div>
       </div>
 
-      {/* Main content */}
-      <div style={{ flex: 1, overflowY: "auto", padding: 20 }}>
+      {/* Main content. Extra bottom inset so the last forecast row clears the
+          phone home indicator / dock edge. env(safe-area-inset-bottom) is 0 on
+          desktop, so the layout is unchanged there. */}
+      <div
+        className="flex-1 overflow-y-auto p-5"
+        style={{ paddingBottom: "calc(1.25rem + env(safe-area-inset-bottom, 0px))" }}
+      >
         {!viewing && (
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 12, color: "rgba(255,255,255,0.5)" }}>
-            <MapPin size={48} style={{ color: "rgba(255,255,255,0.2)" }} />
-            <p style={{ fontSize: 15 }}>Search for a location to see its weather</p>
+          <div className="flex h-full flex-col items-center justify-center gap-3 text-shell-text-secondary">
+            <MapPin size={48} className="opacity-30" />
+            <p className="text-[15px]">Search for a location to see its weather</p>
           </div>
         )}
 
         {viewing && loading && !forecast && (
-          <div style={{ textAlign: "center", color: "rgba(255,255,255,0.5)", marginTop: 40 }}>Loading forecast...</div>
+          <div className="mt-10 text-center text-shell-text-secondary">
+            Loading forecast...
+          </div>
         )}
 
         {viewing && forecast && info && (
           <>
             {/* Location header */}
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 20 }}>
-              <div>
-                <h1 style={{ fontSize: 24, fontWeight: 600, margin: 0, color: "rgba(255,255,255,0.95)" }}>{viewing.name}</h1>
-                <p style={{ fontSize: 13, color: "rgba(255,255,255,0.5)", margin: "2px 0 0" }}>{viewing.admin1 ? `${viewing.admin1}, ` : ""}{viewing.country}</p>
+            <div className="mb-5 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <h1 className="truncate text-[24px] font-bold tracking-[-0.02em] text-shell-text">
+                  {viewing.name}
+                </h1>
+                <p className="mt-0.5 truncate text-[13px] text-shell-text-secondary">
+                  {viewing.admin1 ? `${viewing.admin1}, ` : ""}
+                  {viewing.country}
+                </p>
               </div>
               <button
                 onClick={() => setAsHome(viewing)}
                 disabled={!!isHome}
-                style={{
-                  display: "flex", alignItems: "center", gap: 6,
-                  padding: "8px 14px",
-                  background: isHome ? "rgba(80,200,120,0.2)" : "rgba(255,255,255,0.08)",
-                  border: `1px solid ${isHome ? "rgba(80,200,120,0.3)" : "rgba(255,255,255,0.12)"}`,
-                  borderRadius: 8, color: isHome ? "rgb(150,220,170)" : "rgba(255,255,255,0.85)",
-                  fontSize: 12, fontWeight: 500, cursor: isHome ? "default" : "pointer",
-                }}
+                className={`flex flex-none items-center gap-1.5 rounded-lg border px-3.5 py-2 text-[12px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/30 ${
+                  isHome
+                    ? "cursor-default border-shell-border-strong bg-white/10 text-shell-text"
+                    : "border-shell-border-strong bg-white/5 text-shell-text-secondary hover:bg-white/10 hover:text-shell-text"
+                }`}
               >
-                {isHome ? <><Check size={14} /> Home</> : <><Home size={14} /> Set as home</>}
+                {isHome ? (
+                  <>
+                    <Check size={14} /> Home
+                  </>
+                ) : (
+                  <>
+                    <Home size={14} /> Set as home
+                  </>
+                )}
               </button>
             </div>
 
             {/* Current */}
-            <div style={{ display: "flex", alignItems: "center", gap: 16, marginBottom: 28, padding: "16px 20px", background: "rgba(255,255,255,0.05)", borderRadius: 16, border: "1px solid rgba(255,255,255,0.08)" }}>
-              <div style={{ fontSize: 72, lineHeight: 1 }}>{info.icon}</div>
-              <div style={{ flex: 1 }}>
+            <div className="mb-7 flex items-center gap-4 rounded-2xl border border-shell-border bg-white/5 px-5 py-4">
+              <div className="text-[72px] leading-none">{info.icon}</div>
+              <div className="min-w-0 flex-1">
                 <button
                   onClick={toggleTempUnit}
                   title="Tap to toggle °C / °F"
-                  style={{ display: "flex", alignItems: "baseline", gap: 8, background: "none", border: "none", padding: 0, cursor: "pointer", color: "inherit" }}
+                  className="flex items-baseline gap-2 rounded-md transition-colors hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/30"
                 >
-                  <span style={{ fontSize: 56, fontWeight: 300, lineHeight: 1, color: "rgba(255,255,255,0.95)" }}>
-                    {tempUnit === "C" ? forecast.current.temperature : cToF(forecast.current.temperature)}°
+                  <span className="text-[56px] font-light leading-none tabular-nums text-shell-text">
+                    {tempUnit === "C"
+                      ? forecast.current.temperature
+                      : cToF(forecast.current.temperature)}
+                    °
                   </span>
-                  <span style={{ fontSize: 18, color: "rgba(255,255,255,0.5)" }}>{tempUnit}</span>
+                  <span className="text-[18px] text-shell-text-secondary">
+                    {tempUnit}
+                  </span>
                 </button>
-                <p style={{ fontSize: 14, color: "rgba(255,255,255,0.7)", margin: "4px 0 0" }}>{info.label}</p>
-                <p style={{ fontSize: 12, color: "rgba(255,255,255,0.45)", margin: "2px 0 0" }}>Feels like {tempUnit === "C" ? forecast.current.feelsLike : cToF(forecast.current.feelsLike)}°</p>
+                <p className="mt-1 text-[14px] text-shell-text">{info.label}</p>
+                <p className="mt-0.5 text-[12px] text-shell-text-secondary">
+                  Feels like{" "}
+                  {tempUnit === "C"
+                    ? forecast.current.feelsLike
+                    : cToF(forecast.current.feelsLike)}
+                  °
+                </p>
               </div>
             </div>
 
             {/* Stats */}
-            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(140px, 1fr))", gap: 10, marginBottom: 28 }}>
-              <div style={{ padding: 14, background: "rgba(255,255,255,0.05)", borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)" }}>
-                <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 0.5, color: "rgba(255,255,255,0.4)" }}>Humidity</div>
-                <div style={{ fontSize: 20, fontWeight: 600, marginTop: 4 }}>{forecast.current.humidity}%</div>
+            <div className="mb-7 grid grid-cols-[repeat(auto-fit,minmax(140px,1fr))] gap-2.5">
+              <div className="rounded-2xl border border-shell-border bg-white/5 p-3.5">
+                <div className="text-[10px] uppercase tracking-[0.5px] text-shell-text-tertiary">
+                  Humidity
+                </div>
+                <div className="mt-1 text-[20px] font-semibold tabular-nums text-shell-text">
+                  {forecast.current.humidity}%
+                </div>
               </div>
               <button
                 onClick={toggleWindUnit}
                 title="Tap to toggle km/h / mph"
-                style={{ padding: 14, background: "rgba(255,255,255,0.05)", borderRadius: 12, border: "1px solid rgba(255,255,255,0.06)", textAlign: "left", cursor: "pointer", color: "inherit" }}
+                className="rounded-2xl border border-shell-border bg-white/5 p-3.5 text-left transition-colors hover:bg-white/10 hover:border-shell-border-strong focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/30"
               >
-                <div style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 0.5, color: "rgba(255,255,255,0.4)" }}>Wind</div>
-                <div style={{ fontSize: 20, fontWeight: 600, marginTop: 4 }}>
-                  {windUnit === "kmh" ? forecast.current.windSpeed : kmhToMph(forecast.current.windSpeed)}
-                  <span style={{ fontSize: 13, color: "rgba(255,255,255,0.5)", marginLeft: 4, fontWeight: 400 }}>{windUnit === "kmh" ? "km/h" : "mph"}</span>
+                <div className="text-[10px] uppercase tracking-[0.5px] text-shell-text-tertiary">
+                  Wind
+                </div>
+                <div className="mt-1 text-[20px] font-semibold tabular-nums text-shell-text">
+                  {windUnit === "kmh"
+                    ? forecast.current.windSpeed
+                    : kmhToMph(forecast.current.windSpeed)}
+                  <span className="ml-1 text-[13px] font-normal text-shell-text-secondary">
+                    {windUnit === "kmh" ? "km/h" : "mph"}
+                  </span>
                 </div>
               </button>
             </div>
 
             {/* 7-day forecast */}
             <div>
-              <h2 style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 0.8, color: "rgba(255,255,255,0.45)", margin: "0 0 10px", fontWeight: 600 }}>7-Day Forecast</h2>
-              <div style={{ background: "rgba(255,255,255,0.04)", borderRadius: 14, border: "1px solid rgba(255,255,255,0.06)", overflow: "hidden" }}>
+              <h2 className="mb-2.5 text-[11px] font-semibold uppercase tracking-[0.8px] text-shell-text-tertiary">
+                7-Day Forecast
+              </h2>
+              <div className="overflow-hidden rounded-2xl border border-shell-border bg-white/3">
                 {forecast.daily.map((day, i) => {
                   const dayInfo = codeInfo(day.weatherCode);
                   const dateObj = new Date(day.date);
-                  const label = i === 0 ? "Today" : dateObj.toLocaleDateString("en", { weekday: "short" });
+                  const label =
+                    i === 0
+                      ? "Today"
+                      : dateObj.toLocaleDateString("en", { weekday: "short" });
                   return (
-                    <div key={day.date} style={{ display: "flex", alignItems: "center", gap: 14, padding: "12px 16px", borderTop: i === 0 ? "none" : "1px solid rgba(255,255,255,0.05)" }}>
-                      <span style={{ width: 52, fontSize: 13, color: "rgba(255,255,255,0.8)", fontWeight: 500 }}>{label}</span>
-                      <span style={{ fontSize: 22, width: 32, textAlign: "center" }}>{dayInfo.icon}</span>
-                      <span style={{ flex: 1, fontSize: 12, color: "rgba(255,255,255,0.55)" }}>{dayInfo.label}</span>
-                      <span style={{ fontSize: 13, color: "rgba(255,255,255,0.5)", width: 36, textAlign: "right" }}>{tempUnit === "C" ? day.tempMin : cToF(day.tempMin)}°</span>
-                      <span style={{ fontSize: 13, color: "rgba(255,255,255,0.9)", width: 36, textAlign: "right", fontWeight: 500 }}>{tempUnit === "C" ? day.tempMax : cToF(day.tempMax)}°</span>
+                    <div
+                      key={day.date}
+                      className={`flex items-center gap-3.5 px-4 py-3 transition-colors hover:bg-white/5 ${
+                        i === 0 ? "" : "border-t border-shell-border"
+                      }`}
+                    >
+                      <span className="w-[52px] text-[13px] font-medium text-shell-text">
+                        {label}
+                      </span>
+                      <span className="w-8 text-center text-[22px]">
+                        {dayInfo.icon}
+                      </span>
+                      <span className="flex-1 truncate text-[12px] text-shell-text-secondary">
+                        {dayInfo.label}
+                      </span>
+                      <span className="w-9 text-right text-[13px] tabular-nums text-shell-text-secondary">
+                        {tempUnit === "C" ? day.tempMin : cToF(day.tempMin)}°
+                      </span>
+                      <span className="w-9 text-right text-[13px] font-medium tabular-nums text-shell-text">
+                        {tempUnit === "C" ? day.tempMax : cToF(day.tempMax)}°
+                      </span>
                     </div>
                   );
                 })}

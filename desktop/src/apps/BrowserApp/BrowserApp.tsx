@@ -1,13 +1,15 @@
 /**
  * BrowserApp v2 — top-level container.
  *
- * Mounted by WindowContent for each browser window. Composes:
- *   - Chrome      (browser-specific nav row + profile chip)
- *   - TabStrip    (compact tab strip with embedded AddressBar in active tab)
- *   - AddressBar  (URL input + suggest popover) — for now rendered ABOVE
- *                 TabStrip; PR 5 may move it inside the active tab per
- *                 the Q8 layout A "compact unified bar" mockup.
+ * Mounted by WindowContent for each browser window. Composes (top to bottom):
+ *   - TabStrip    (tab strip + Proxy/Streamed engine toggle)
+ *   - Chrome      (toolbar: nav buttons, pill omnibox with AddressBar, agent
+ *                  presence pill, settings, profile chip)
+ *   - BookmarksBar
  *   - TabRenderer (iframe pool + discard scheduler)
+ *
+ * On mobile, a single bottom bar hosts the window switcher, the AddressBar
+ * omnibox, and the tab overview.
  *
  * On mount, auto-creates the window entry in browser-store with the
  * default profile if it doesn't exist. Idempotent — preserves any
@@ -27,6 +29,7 @@ import { TabOverview } from "./TabOverview";
 import { WindowChooser } from "./WindowChooser";
 import { CapabilityPromptModal } from "./CapabilityPromptModal";
 import { BookmarksBar } from "./BookmarksBar";
+import { BrowserSidebar } from "./BrowserSidebar";
 import { useIsMobile } from "@/hooks/use-is-mobile";
 import { Layers, ListChecks } from "lucide-react";
 import { bootstrapPushSubscription } from "../../lib/browser-push-bootstrap";
@@ -57,15 +60,13 @@ export function BrowserApp({ windowId }: BrowserAppProps) {
     createWindow(windowId, DEFAULT_PROFILE_ID);
   }, [windowId, createWindow]);
 
-  // Register the Service Worker from the parent shell. copilot.js runs in
-  // a sandboxed iframe (no allow-same-origin) where navigator.serviceWorker
-  // is unavailable. Registration must happen here so the SW is active before
-  // any proxied iframes load. Guarded so test/SSR environments don't throw.
+  // The proxy service worker (/__taos/sw.js) now lives on the proxy origin and
+  // is registered from INSIDE the iframe (copilot.js), not here — the SW must
+  // belong to the proxy origin to intercept the proxied page's SPA fetches.
+  // We still bootstrap the web-push subscription, which binds to whichever
+  // service worker controls this shell origin.
   useEffect(() => {
     if (!('serviceWorker' in navigator)) return;
-    navigator.serviceWorker.register("/__taos/sw.js", { scope: "/" }).catch(() => {
-      // SW registration can fail in test/HTTP contexts — ignore
-    });
     bootstrapPushSubscription().catch(() => { /* swallow — non-fatal */ });
   }, []);
 
@@ -102,7 +103,12 @@ export function BrowserApp({ windowId }: BrowserAppProps) {
           />
         )}
 
-        <div className="flex-1 relative overflow-hidden">
+        {/* `flex` is required: TabRenderer's root is `flex flex-1` and only
+            grows to fill height when its parent is itself a flex container.
+            Without it the renderer collapses to 0 height and the page area is
+            blank (the desktop layout mounts TabRenderer directly in the column
+            flex root, so it doesn't hit this). */}
+        <div className="flex flex-1 relative overflow-hidden">
           <TabRenderer windowId={windowId} />
           {tabOverviewOpen && (
             <TabOverview
@@ -116,21 +122,23 @@ export function BrowserApp({ windowId }: BrowserAppProps) {
           )}
         </div>
 
-        <div className="flex items-center gap-1 px-2 py-1 bg-shell-surface border-t border-shell-border-subtle">
+        <div className="flex items-center gap-1 px-2 py-1 bg-shell-surface border-t border-shell-border">
           <button
             type="button"
             aria-label="Browser windows"
             onClick={() => setWindowChooserOpen(true)}
-            className="p-1.5 rounded hover:bg-shell-hover"
+            className="p-1.5 rounded hover:bg-white/[0.06]"
           >
             <Layers size={14} />
           </button>
-          <AddressBar windowId={windowId} />
+          <div className="flex flex-1 min-w-0 items-center h-9 px-3 rounded-full bg-shell-bg-deep border border-shell-border focus-within:border-accent/40">
+            <AddressBar windowId={windowId} />
+          </div>
           <button
             type="button"
             aria-label="Tab overview"
             onClick={() => setTabOverviewOpen(true)}
-            className="p-1.5 rounded hover:bg-shell-hover"
+            className="p-1.5 rounded hover:bg-white/[0.06]"
           >
             <ListChecks size={14} />
           </button>
@@ -142,19 +150,25 @@ export function BrowserApp({ windowId }: BrowserAppProps) {
 
   return (
     <div className="relative flex flex-col h-full bg-shell-bg overflow-hidden">
-      <Chrome windowId={windowId} />
-      <div className="flex items-center gap-1 px-2 py-1 bg-shell-surface border-b border-shell-border-subtle">
-        <AddressBar windowId={windowId} />
-      </div>
-      <BookmarksBar windowId={windowId} profileId={win.profileId} />
+      {/* Top chrome: tab strip + navigation toolbar */}
       <TabStrip windowId={windowId} />
-      <TabRenderer windowId={windowId} />
-      {findOpen && (
-        <FindInPage
-          windowId={windowId}
-          onClose={() => setFindOpen(false)}
-        />
-      )}
+      <Chrome windowId={windowId} />
+      <BookmarksBar windowId={windowId} profileId={win.profileId} />
+
+      {/* Body: collapsible sidebar + tab content area side by side */}
+      <div className="flex flex-1 min-h-0 overflow-hidden">
+        <BrowserSidebar windowId={windowId} />
+        <div className="relative flex flex-col flex-1 min-w-0 overflow-hidden">
+          <TabRenderer windowId={windowId} />
+          {findOpen && (
+            <FindInPage
+              windowId={windowId}
+              onClose={() => setFindOpen(false)}
+            />
+          )}
+        </div>
+      </div>
+
       {/* Listens for `taos-browser:capability-prompt` window events from
            agent-ws-bridge. Mounted at top of BrowserApp so any window's
            agents can trigger it; the modal is global per shell. */}

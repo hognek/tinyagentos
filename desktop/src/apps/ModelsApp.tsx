@@ -17,6 +17,8 @@ import {
   fetchCloudProviders,
   HOST_BADGE_CLASS,
 } from "@/lib/models";
+import { useProcessStore } from "@/stores/process-store";
+import { getApp } from "@/registry/app-registry";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -31,6 +33,9 @@ interface DownloadedModel {
   host: string;
   hostKind: "controller" | "worker" | "cloud";
   backend?: string;
+  /** Catalog manifest id — set when the backend could match this file to a
+   *  manifest variant. Delete calls DELETE /api/models/{modelId} using this. */
+  modelId?: string;
 }
 
 interface AvailableModel {
@@ -40,6 +45,21 @@ interface AvailableModel {
   compatibility: "green" | "yellow" | "red";
   capabilities: string[];
   size: string;
+  /** Default variant to request from POST /api/models/download. Undefined
+   * when the model has no variants (e.g. the offline MOCK_AVAILABLE
+   * fallback) — Download must then surface an error, not fake success. */
+  variantId?: string;
+  /** Backend's own verdict (has_downloaded_variant) — the authoritative
+   * source for "already installed", since the union `downloaded` list
+   * below is keyed by filename/host, not by catalog model id. */
+  installed?: boolean;
+}
+
+interface DownloadState {
+  downloadId?: string;
+  percent: number;
+  status: "starting" | "downloading" | "complete" | "error";
+  error?: string;
 }
 
 type SourceFilter = "all" | "local" | "workers" | "cloud";
@@ -47,11 +67,6 @@ type SourceFilter = "all" | "local" | "workers" | "cloud";
 /* ------------------------------------------------------------------ */
 /*  Fallback data                                                      */
 /* ------------------------------------------------------------------ */
-
-const MOCK_DOWNLOADED: DownloadedModel[] = [
-  { id: "qwen2.5-7b-q4", filename: "qwen2.5-7b-instruct-q4_k_m.gguf", size: "4.4 GB", format: "GGUF", quantization: "Q4_K_M", host: "controller", hostKind: "controller" },
-  { id: "phi3-mini-q5", filename: "phi-3-mini-4k-q5_k_m.gguf", size: "2.8 GB", format: "GGUF", quantization: "Q5_K_M", host: "controller", hostKind: "controller" },
-];
 
 function aggregatedToDownloaded(a: AggregatedModel): DownloadedModel {
   return {
@@ -63,6 +78,7 @@ function aggregatedToDownloaded(a: AggregatedModel): DownloadedModel {
     host: a.host,
     hostKind: a.hostKind,
     backend: a.backend,
+    modelId: a.modelId,
   };
 }
 
@@ -86,34 +102,122 @@ const COMPAT_STYLES: Record<string, { dot: string; label: string }> = {
 
 const CAPABILITY_COLORS: Record<string, string> = {
   chat: "bg-sky-500/20 text-sky-400",
-  code: "bg-violet-500/20 text-violet-400",
+  code: "bg-cyan-500/20 text-cyan-400",
   reasoning: "bg-amber-500/20 text-amber-400",
   multilingual: "bg-emerald-500/20 text-emerald-400",
 };
 
 /* ------------------------------------------------------------------ */
-/*  DownloadProgress                                                   */
+/*  DownloadProgress — polls the real backend, no fake timer           */
 /* ------------------------------------------------------------------ */
 
-function DownloadProgress({ name, onDone }: { name: string; onDone: () => void }) {
-  const [pct, setPct] = useState(0);
-  const timer = useRef<ReturnType<typeof setInterval>>(undefined);
+function DownloadProgress({
+  name,
+  state,
+  onUpdate,
+  onComplete,
+  onRetry,
+}: {
+  name: string;
+  state: DownloadState;
+  onUpdate: (next: DownloadState) => void;
+  onComplete: () => void;
+  onRetry: () => void;
+}) {
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const { downloadId, status } = state;
 
   useEffect(() => {
-    timer.current = setInterval(() => {
-      setPct((prev) => {
-        if (prev >= 100) {
-          clearInterval(timer.current);
-          setTimeout(onDone, 400);
-          return 100;
-        }
-        return prev + Math.random() * 8 + 2;
-      });
-    }, 300);
-    return () => clearInterval(timer.current);
-  }, [onDone]);
+    if (!downloadId || status === "complete" || status === "error") return undefined;
 
-  const progress = Math.min(100, Math.round(pct));
+    // A running backend download must not be flipped to error by a single
+    // transient poll miss (a proxy hiccup, a momentary 502). Only give up
+    // after several CONSECUTIVE failures; a real backend status of "error"
+    // is authoritative and stops immediately.
+    const MAX_POLL_FAILURES = 3;
+    let consecutiveFailures = 0;
+    let cancelled = false;
+    const controller = new AbortController();
+
+    const schedule = () => {
+      timer.current = setTimeout(() => void poll(), 1000);
+    };
+
+    // Self-scheduling recursive poll rather than setInterval, so a slow poll
+    // never overlaps a newer one and a stale response can't clobber fresher
+    // state.
+    const poll = async () => {
+      if (cancelled) return;
+      try {
+        const res = await fetch(`/api/models/downloads/${downloadId}`, {
+          credentials: "include",
+          signal: controller.signal,
+        });
+        const data = await res.json().catch(() => null);
+        if (!res.ok || !data || typeof data !== "object") {
+          throw new Error("invalid poll response");
+        }
+        consecutiveFailures = 0;
+        if (cancelled) return;
+        if (data.status === "complete") {
+          onUpdate({ downloadId, percent: 100, status: "complete" });
+          onComplete();
+        } else if (data.status === "error") {
+          onUpdate({
+            downloadId,
+            percent: data.percent ?? state.percent,
+            status: "error",
+            // || not ?? — the backend initialises error to "", and an
+            // empty alert helps nobody.
+            error: data.error || "Download failed",
+          });
+        } else {
+          onUpdate({
+            downloadId,
+            percent: data.percent ?? state.percent,
+            status: "downloading",
+          });
+          schedule();
+        }
+      } catch (e) {
+        if (cancelled || (e as { name?: string })?.name === "AbortError") return;
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= MAX_POLL_FAILURES) {
+          onUpdate({
+            downloadId,
+            percent: state.percent,
+            status: "error",
+            error: "Lost contact with the download; retry to continue",
+          });
+          return;
+        }
+        schedule();
+      }
+    };
+
+    void poll();
+    return () => {
+      cancelled = true;
+      controller.abort();
+      if (timer.current) clearTimeout(timer.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [downloadId, status]);
+
+  const progress = Math.min(100, Math.round(state.percent));
+
+  if (state.status === "error") {
+    return (
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs text-red-400 truncate" role="alert">
+          {name}: {state.error || "Download failed"}
+        </span>
+        <Button variant="outline" size="sm" onClick={onRetry}>
+          Retry
+        </Button>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-1.5">
@@ -142,11 +246,27 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
   const [search, setSearch] = useState("");
   const [source, setSource] = useState<SourceFilter>("all");
   const [subFilter, setSubFilter] = useState<string | null>(null);
-  const [downloading, setDownloading] = useState<Set<string>>(new Set());
+  const [downloading, setDownloading] = useState<Record<string, DownloadState>>({});
 
   const [isFallback, setIsFallback] = useState(false);
 
+  const openWindow = useProcessStore((s) => s.openWindow);
+  const openProvidersApp = () => {
+    const app = getApp("providers");
+    if (app) openWindow("providers", app.defaultSize);
+  };
+
+  // fetchModels is called both on mount and right after a download/delete
+  // completes. Those calls can overlap (the mount fetch is still in flight
+  // when a fast download finishes) and network responses can resolve out of
+  // order, so a stale response must never clobber a fresher one — the same
+  // problem DownloadProgress's poll() solves with cancellation below. A
+  // monotonically increasing sequence number lets only the LAST call's
+  // response commit state.
+  const fetchSeqRef = useRef(0);
+
   const fetchModels = useCallback(async () => {
+    const seq = ++fetchSeqRef.current;
     // Kick off cluster workers + providers in parallel with /api/models so the
     // union (controller + workers + cloud) is ready in a single state flip.
     const workersPromise = fetchClusterWorkers();
@@ -182,6 +302,7 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
                 filename: (d.filename as string) ?? "unknown",
                 size_mb: (d.size_mb as number) ?? 0,
                 format: (d.format as string) ?? "bin",
+                model_id: d.model_id as string | undefined,
               }),
             ),
           );
@@ -207,14 +328,26 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
             const variants = Array.isArray(m.variants)
               ? (m.variants as Array<Record<string, unknown>>)
               : [];
-            // Pick smallest variant for display size estimate.
+            // Pick the smallest variant (by size_mb) as both the display
+            // size estimate and the default download target, falling back
+            // to the first variant when none carry a usable size_mb.
             let sizeLabel = "\u2014";
+            let variantId: string | undefined;
             if (variants.length > 0) {
-              const sizes = variants
-                .map((v) => (v.size_mb as number) ?? 0)
-                .filter((n) => n > 0);
-              if (sizes.length > 0) {
-                sizeLabel = fmtSize(Math.min(...sizes));
+              const sized = variants.filter(
+                (v) => typeof v.size_mb === "number" && (v.size_mb as number) > 0,
+              );
+              const smallest =
+                sized.length > 0
+                  ? sized.reduce((a, b) =>
+                      (b.size_mb as number) < (a.size_mb as number) ? b : a,
+                    )
+                  : variants[0];
+              variantId = (smallest?.id as string) || undefined;
+              if (sized.length > 0) {
+                sizeLabel = fmtSize(
+                  Math.min(...sized.map((v) => v.size_mb as number)),
+                );
               }
             }
             const compat =
@@ -231,9 +364,15 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
                 ? (m.capabilities as string[])
                 : [],
               size: sizeLabel,
+              variantId,
+              installed: Boolean(m.has_downloaded_variant),
             };
           });
 
+          // A newer fetchModels() call has already started (or finished) —
+          // committing this stale response would clobber fresher state, e.g.
+          // flipping a just-completed download back to "not installed".
+          if (seq !== fetchSeqRef.current) return;
           setDownloaded(downloadedList);
           setAvailable(availableList);
           setIsFallback(false);
@@ -257,6 +396,7 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
       const cloudList = cloudProvidersToAggregated(providers).map(
         aggregatedToDownloaded,
       );
+      if (seq !== fetchSeqRef.current) return;
       if (workerList.length > 0 || cloudList.length > 0) {
         setDownloaded([...workerList, ...cloudList]);
         setAvailable(MOCK_AVAILABLE);
@@ -267,8 +407,13 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
     } catch {
       /* ignore */
     }
-    setDownloaded(MOCK_DOWNLOADED);
-    setAvailable(MOCK_AVAILABLE);
+    if (seq !== fetchSeqRef.current) return;
+    // No real models reachable anywhere (backend down AND no providers/workers
+    // configured) — leave the lists empty so the clear "No models yet" empty
+    // state renders instead of misleading mock cards. This is what makes the
+    // `isFallback && downloaded.length === 0` empty state actually reachable.
+    setDownloaded([]);
+    setAvailable([]);
     setIsFallback(true);
     setLoading(false);
   }, []);
@@ -277,33 +422,129 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
     fetchModels();
   }, [fetchModels]);
 
-  const handleDelete = (id: string) => {
-    setDownloaded((prev) => prev.filter((m) => m.id !== id));
-  };
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<Record<string, string>>({});
 
-  const handleDownload = (model: AvailableModel) => {
-    setDownloading((prev) => new Set(prev).add(model.id));
-  };
+  const handleDelete = useCallback(
+    async (model: DownloadedModel) => {
+      if (!model.modelId) {
+        setDeleteError((prev) => ({
+          ...prev,
+          [model.id]: "Cannot delete: unrecognised model file",
+        }));
+        return;
+      }
+      setDeletingId(model.id);
+      setDeleteError((prev) => {
+        const next = { ...prev };
+        delete next[model.id];
+        return next;
+      });
+      try {
+        const res = await fetch(`/api/models/${encodeURIComponent(model.modelId)}`, {
+          method: "DELETE",
+          credentials: "include",
+        });
+        const data = await res.json().catch(() => ({}) as Record<string, unknown>);
+        if (!res.ok) {
+          setDeleteError((prev) => ({
+            ...prev,
+            [model.id]:
+              (data.error as string) ||
+              (data.detail as string) ||
+              "The model could not be deleted",
+          }));
+          return;
+        }
+        // Re-fetch the real catalog instead of assuming success locally, so
+        // the list reflects backend truth (mirrors handleDownloadComplete).
+        await fetchModels();
+      } catch {
+        setDeleteError((prev) => ({
+          ...prev,
+          [model.id]: "Could not reach the backend to delete the model",
+        }));
+      } finally {
+        setDeletingId(null);
+      }
+    },
+    [fetchModels],
+  );
 
-  const handleDownloadDone = (model: AvailableModel) => {
-    setDownloading((prev) => {
-      const next = new Set(prev);
-      next.delete(model.id);
-      return next;
-    });
-    setDownloaded((prev) => [
+  const handleDownload = useCallback(async (model: AvailableModel) => {
+    if (!model.variantId) {
+      setDownloading((prev) => ({
+        ...prev,
+        [model.id]: {
+          percent: 0,
+          status: "error",
+          error: "No downloadable variant for this model",
+        },
+      }));
+      return;
+    }
+    setDownloading((prev) => ({
       ...prev,
-      {
-        id: model.id,
-        filename: `${model.id}-q4_k_m.gguf`,
-        size: model.size,
-        format: "GGUF",
-        quantization: "Q4_K_M",
-        host: "controller",
-        hostKind: "controller",
-      },
-    ]);
-  };
+      [model.id]: { percent: 0, status: "starting" },
+    }));
+    try {
+      const res = await fetch("/api/models/download", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          app_id: model.id,
+          variant_id: model.variantId,
+        }),
+      });
+      const data = await res.json().catch(() => ({}) as Record<string, unknown>);
+      if (!res.ok || !data.download_id) {
+        setDownloading((prev) => ({
+          ...prev,
+          [model.id]: {
+            percent: 0,
+            status: "error",
+            error:
+              (data.error as string) ||
+              (data.detail as string) ||
+              "The download could not be started",
+          },
+        }));
+        return;
+      }
+      setDownloading((prev) => ({
+        ...prev,
+        [model.id]: {
+          percent: 0,
+          status: "downloading",
+          downloadId: data.download_id as string,
+        },
+      }));
+    } catch {
+      setDownloading((prev) => ({
+        ...prev,
+        [model.id]: {
+          percent: 0,
+          status: "error",
+          error: "Could not reach the backend to start the download",
+        },
+      }));
+    }
+  }, []);
+
+  const handleDownloadComplete = useCallback(
+    async (modelId: string) => {
+      setDownloading((prev) => {
+        const next = { ...prev };
+        delete next[modelId];
+        return next;
+      });
+      // Re-fetch the real catalog instead of fabricating a downloaded
+      // entry, so the Downloaded Models list reflects backend truth.
+      await fetchModels();
+    },
+    [fetchModels],
+  );
 
   const q = search.toLowerCase();
 
@@ -417,7 +658,7 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
                 aria-pressed={subFilter === opt}
                 className={`text-[11px] px-2 py-0.5 rounded-full border transition-colors ${
                   subFilter === opt
-                    ? "bg-violet-500/25 border-violet-500/40 text-violet-200"
+                    ? "bg-cyan-500/25 border-cyan-500/40 text-cyan-200"
                     : "bg-white/5 border-white/10 text-shell-text-secondary hover:bg-white/10"
                 }`}
               >
@@ -433,6 +674,19 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
         {loading ? (
           <div className="flex items-center justify-center h-full text-shell-text-tertiary text-sm">
             Loading models...
+          </div>
+        ) : isFallback && downloaded.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-full gap-4 text-center px-6 py-16">
+            <Brain size={40} className="text-shell-text-tertiary opacity-30" aria-hidden="true" />
+            <div className="space-y-1">
+              <p className="text-sm font-medium text-shell-text">No models yet</p>
+              <p className="text-xs text-shell-text-tertiary max-w-xs">
+                Add a provider to see cloud models, or connect a worker with a local model.
+              </p>
+            </div>
+            <Button variant="outline" size="sm" onClick={openProvidersApp}>
+              Open Providers
+            </Button>
           </div>
         ) : (
           <>
@@ -476,7 +730,8 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
                               <Button
                                 variant="ghost"
                                 size="icon"
-                                onClick={() => handleDelete(model.id)}
+                                onClick={() => handleDelete(model)}
+                                disabled={deletingId === model.id}
                                 className="h-7 w-7 hover:text-red-400 hover:bg-red-500/15"
                                 aria-label={`Delete ${model.filename}`}
                                 title="Delete model"
@@ -499,6 +754,11 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
                               <span className="ml-auto tabular-nums">{model.size}</span>
                             )}
                           </div>
+                          {deleteError[model.id] && (
+                            <p className="text-[11px] text-red-400" role="alert">
+                              {deleteError[model.id]}
+                            </p>
+                          )}
                         </CardContent>
                       </Card>
                     );
@@ -511,7 +771,7 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
             {filteredCloud.length > 0 && (
               <section aria-label="Cloud models">
                 <div className="flex items-center gap-2 mb-3">
-                  <Cloud size={15} className="text-violet-400" />
+                  <Cloud size={15} className="text-cyan-400" />
                   <h2 className="text-sm font-semibold">Cloud Models</h2>
                   <span className="text-xs text-shell-text-tertiary">({filteredCloud.length})</span>
                 </div>
@@ -521,7 +781,7 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
                       <CardContent className="p-3.5 flex flex-col gap-2">
                         <div className="flex items-center gap-1.5 min-w-0">
                           <p className="text-sm font-medium truncate" title={model.filename}>{model.filename}</p>
-                          <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-violet-500/15 text-violet-200 font-semibold whitespace-nowrap shrink-0">
+                          <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 font-semibold whitespace-nowrap shrink-0">
                             {model.host}
                           </span>
                         </div>
@@ -536,17 +796,25 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
             )}
 
             {/* Downloading */}
-            {downloading.size > 0 && (
+            {Object.keys(downloading).length > 0 && (
               <section aria-label="Downloads in progress">
                 <h2 className="text-sm font-semibold mb-3">Downloading</h2>
                 <div className="space-y-2">
-                  {[...downloading].map((id) => {
+                  {Object.entries(downloading).map(([id, state]) => {
                     const model = available.find((m) => m.id === id);
                     if (!model) return null;
                     return (
                       <Card key={id}>
                         <CardContent className="p-3.5">
-                          <DownloadProgress name={model.name} onDone={() => handleDownloadDone(model)} />
+                          <DownloadProgress
+                            name={model.name}
+                            state={state}
+                            onUpdate={(next) =>
+                              setDownloading((prev) => ({ ...prev, [id]: next }))
+                            }
+                            onComplete={() => handleDownloadComplete(id)}
+                            onRetry={() => handleDownload(model)}
+                          />
                         </CardContent>
                       </Card>
                     );
@@ -572,8 +840,14 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   {filteredAvailable.map((model) => {
                     const compat = COMPAT_STYLES[model.compatibility] ?? { dot: "bg-emerald-400", label: "Recommended" };
-                    const isDownloaded = downloaded.some((d) => d.id === model.id);
-                    const isDownloading = downloading.has(model.id);
+                    const isDownloaded =
+                      model.installed || downloaded.some((d) => d.id === model.id);
+                    const dlState = downloading[model.id];
+                    // Only treat a download as in-progress while it is actually
+                    // running. On error the card button must return to an
+                    // actionable Retry, not a stuck disabled "Downloading...".
+                    const isDownloading = dlState != null && dlState.status !== "error";
+                    const isErrored = dlState != null && dlState.status === "error";
 
                     return (
                       <Card key={model.id}>
@@ -617,10 +891,10 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
                               size="sm"
                               onClick={() => handleDownload(model)}
                               disabled={isDownloading}
-                              aria-label={`Download ${model.name}`}
+                              aria-label={`${isErrored ? "Retry download of" : "Download"} ${model.name}`}
                             >
                               <Download size={12} />
-                              {isDownloading ? "Downloading..." : "Download"}
+                              {isDownloading ? "Downloading..." : isErrored ? "Retry" : "Download"}
                             </Button>
                           )}
                         </CardFooter>

@@ -10,6 +10,17 @@ from fastapi import APIRouter, Request, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
+from tinyagentos.workspace_trash import (
+    TrashItemNotFound,
+    TrashRestoreConflict,
+    empty_trash,
+    get_trash_dir,
+    list_trash_items,
+    move_to_trash,
+    purge_trash_item,
+    restore_trash_item,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,6 +63,13 @@ def _get_workspace_root(request: Request) -> Path:
     return ws
 
 
+def _get_workspace_trash_dir(request: Request) -> Path:
+    """Return the trash directory backing the user workspace, creating it on
+    first access."""
+    data_dir = request.app.state.config_path.parent
+    return get_trash_dir(data_dir, "workspace")
+
+
 def _resolve_safe(workspace: Path, subpath: str) -> Path | None:
     """Resolve subpath relative to workspace, returning None if outside workspace."""
     try:
@@ -61,6 +79,16 @@ def _resolve_safe(workspace: Path, subpath: str) -> Path | None:
         return None
     except Exception:
         return None
+
+
+def _is_within(dst: Path, src: Path) -> bool:
+    """True if *dst* is *src* itself or nested inside it.
+
+    Copying or moving a directory into a path under itself makes
+    ``shutil.copytree`` / ``Path.rename`` raise, which would otherwise escape
+    as a bare 500. Both paths are already resolved by ``_resolve_safe``.
+    """
+    return dst == src or dst.is_relative_to(src)
 
 
 class MkdirRequest(BaseModel):
@@ -211,6 +239,72 @@ async def api_mkdir(request: Request, body: MkdirRequest):
     return {"path": str(rel), "status": "created"}
 
 
+class RenameRequest(BaseModel):
+    src: str
+    dst: str
+
+
+@router.post("/api/workspace/rename")
+async def api_rename(request: Request, body: RenameRequest):
+    """Rename or move a file/directory within the user workspace."""
+    workspace = _get_workspace_root(request)
+
+    if not body.src.strip() or not body.dst.strip():
+        return JSONResponse({"error": "src and dst are required"}, status_code=400)
+
+    src = _resolve_safe(workspace, body.src.strip())
+    dst = _resolve_safe(workspace, body.dst.strip())
+    if src is None or dst is None:
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    if not src.exists():
+        return JSONResponse({"error": "Source not found"}, status_code=404)
+    if dst.exists():
+        return JSONResponse({"error": "Target already exists"}, status_code=409)
+    if _is_within(dst, src):
+        return JSONResponse(
+            {"error": "Cannot move a directory into itself"}, status_code=400
+        )
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    src.rename(dst)
+    return {"path": str(dst.relative_to(workspace)), "status": "renamed"}
+
+
+class CopyRequest(BaseModel):
+    src: str
+    dst: str
+
+
+@router.post("/api/workspace/copy")
+async def api_copy(request: Request, body: CopyRequest):
+    """Copy a file or directory tree within the user workspace."""
+    workspace = _get_workspace_root(request)
+
+    if not body.src.strip() or not body.dst.strip():
+        return JSONResponse({"error": "src and dst are required"}, status_code=400)
+
+    src = _resolve_safe(workspace, body.src.strip())
+    dst = _resolve_safe(workspace, body.dst.strip())
+    if src is None or dst is None:
+        return JSONResponse({"error": "Invalid path"}, status_code=400)
+    if not src.exists():
+        return JSONResponse({"error": "Source not found"}, status_code=404)
+    if dst.exists():
+        return JSONResponse({"error": "Target already exists"}, status_code=409)
+    if _is_within(dst, src):
+        return JSONResponse(
+            {"error": "Cannot copy a directory into itself"}, status_code=400
+        )
+
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    # Run the blocking copy off the event loop so large trees do not stall it.
+    if src.is_dir():
+        await asyncio.to_thread(shutil.copytree, src, dst)
+    else:
+        await asyncio.to_thread(shutil.copy2, src, dst)
+    return {"path": str(dst.relative_to(workspace)), "status": "copied"}
+
+
 @router.get("/api/workspace/files/{file_path:path}")
 async def api_get_file(request: Request, file_path: str):
     """Stream a single file from the user workspace — used for thumbnails,
@@ -226,7 +320,13 @@ async def api_get_file(request: Request, file_path: str):
 
 @router.delete("/api/workspace/files/{file_path:path}")
 async def api_delete_file(request: Request, file_path: str):
-    """Delete a file or directory from the user workspace."""
+    """Move a file or directory from the user workspace to the trash.
+
+    Nothing is permanently removed here — the item is relocated under the
+    workspace's trash directory with metadata recording where it came from,
+    so it can be restored (or purged) via the ``/api/workspace/trash``
+    routes below.
+    """
     workspace = _get_workspace_root(request)
 
     target = _resolve_safe(workspace, file_path)
@@ -236,12 +336,54 @@ async def api_delete_file(request: Request, file_path: str):
     if not target.exists():
         return JSONResponse({"error": f"'{file_path}' not found"}, status_code=404)
 
-    if target.is_dir():
-        shutil.rmtree(target)
-    else:
-        target.unlink()
+    trash_dir = _get_workspace_trash_dir(request)
+    move_to_trash(trash_dir, target, file_path)
 
     return {"path": file_path, "status": "deleted"}
+
+
+@router.get("/api/workspace/trash")
+async def api_list_trash(request: Request):
+    """List items in the user workspace's trash, newest-deleted first."""
+    trash_dir = _get_workspace_trash_dir(request)
+    return {"items": list_trash_items(trash_dir)}
+
+
+@router.post("/api/workspace/trash/{item_id}/restore")
+async def api_restore_trash_item(request: Request, item_id: str):
+    """Restore a trashed item back to its original workspace path."""
+    workspace = _get_workspace_root(request)
+    trash_dir = _get_workspace_trash_dir(request)
+    try:
+        metadata = restore_trash_item(trash_dir, workspace, item_id)
+    except TrashItemNotFound:
+        return JSONResponse({"error": "item not found"}, status_code=404)
+    except TrashRestoreConflict:
+        return JSONResponse(
+            {"error": "a file already exists at the original path"}, status_code=409
+        )
+    return {"status": "restored", "path": metadata["original_path"]}
+
+
+@router.delete("/api/workspace/trash/{item_id}")
+async def api_purge_trash_item(request: Request, item_id: str):
+    """Permanently delete one item from the trash."""
+    trash_dir = _get_workspace_trash_dir(request)
+    try:
+        found = purge_trash_item(trash_dir, item_id)
+    except TrashItemNotFound:
+        return JSONResponse({"error": "item not found"}, status_code=404)
+    if not found:
+        return JSONResponse({"error": "item not found"}, status_code=404)
+    return {"status": "purged", "id": item_id}
+
+
+@router.delete("/api/workspace/trash")
+async def api_empty_trash(request: Request):
+    """Permanently delete every item in the user workspace's trash."""
+    trash_dir = _get_workspace_trash_dir(request)
+    count = empty_trash(trash_dir)
+    return {"status": "emptied", "count": count}
 
 
 @router.get("/api/workspace/stats")

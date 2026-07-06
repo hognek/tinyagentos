@@ -44,12 +44,29 @@ async def store(tmp_path):
     await s.close()
 
 
+# Capture the real SSRF validator before any test patches it, so the
+# loopback-block test can exercise the genuine guard.
+from tinyagentos.routes.desktop_browser import ssrf as _ssrf_mod
+_REAL_VALIDATE_URL = _ssrf_mod.validate_url_or_raise
+
+
+@pytest.fixture(autouse=True)
+def _ssrf_noop():
+    """Happy-path ingest tests fetch example.com; stub the SSRF guard so they
+    stay hermetic (no real DNS). The dedicated SSRF test re-patches the real
+    validator for its scope."""
+    with patch.object(_ssrf_mod, "validate_url_or_raise", lambda url: None):
+        yield
+
+
 @pytest.fixture
 def mock_http():
     client = AsyncMock()
     # Default: return minimal HTML for article fetch
     response = MagicMock()
     response.status_code = 200
+    response.is_redirect = False
+    response.headers = {}
     response.text = "<html><body><article><p>This is the main article content with enough text to pass the quality threshold.</p></article></body></html>"
     response.raise_for_status = MagicMock()
     client.get = AsyncMock(return_value=response)
@@ -165,6 +182,8 @@ async def test_summarise_called_when_llm_url_set(store):
 
     article_response = AsyncMock()
     article_response.status_code = 200
+    article_response.is_redirect = False
+    article_response.headers = {}
     article_response.text = "<html><body><p>Long enough article body text content here for testing purposes.</p></body></html>"
     article_response.raise_for_status = MagicMock()
 
@@ -241,6 +260,103 @@ async def test_embed_called_when_qmd_url_set(store):
     assert any("ingest" in c for c in calls)
 
 
+# ------------------------------------------------------------------
+# Ingest backpressure semaphore (#659)
+# ------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_semaphore_is_created_with_default_slots(pipeline):
+    """Pipeline should have a Semaphore with the default slot count."""
+    import asyncio
+    assert isinstance(pipeline._semaphore, asyncio.Semaphore)
+    # Default is 5 as defined by _INGEST_SEMAPHORE_SLOTS.
+    assert pipeline._semaphore._value == 5
+
+
+@pytest.mark.asyncio
+async def test_semaphore_custom_max_concurrent(store, mock_http):
+    """max_concurrent kwarg controls the Semaphore slot count."""
+    from tinyagentos.knowledge_ingest import IngestPipeline
+    notif = AsyncMock()
+    notif.emit_event = AsyncMock()
+    cat_engine = AsyncMock()
+    cat_engine.categorise = AsyncMock(return_value=[])
+    p = IngestPipeline(
+        store=store,
+        http_client=mock_http,
+        notifications=notif,
+        category_engine=cat_engine,
+        max_concurrent=2,
+    )
+    assert p._semaphore._value == 2
+
+
+@pytest.mark.asyncio
+async def test_max_concurrent_zero_raises(store, mock_http):
+    """max_concurrent=0 must raise ValueError to prevent Semaphore(0) deadlock."""
+    from tinyagentos.knowledge_ingest import IngestPipeline
+    notif = AsyncMock()
+    cat_engine = AsyncMock()
+    with pytest.raises(ValueError, match="max_concurrent"):
+        IngestPipeline(
+            store=store,
+            http_client=mock_http,
+            notifications=notif,
+            category_engine=cat_engine,
+            max_concurrent=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_semaphore_limits_concurrent_tasks(store, mock_http):
+    """At most max_concurrent tasks run the pipeline body simultaneously."""
+    import asyncio
+    from tinyagentos.knowledge_ingest import IngestPipeline
+
+    active: list[int] = []
+    peak: list[int] = []
+
+    async def counting_run(self, item_id: str) -> None:
+        active.append(1)
+        peak.append(len(active))
+        await asyncio.sleep(0)  # yield to let other tasks start
+        active.pop()
+        # call real pipeline logic via store update only
+        await self._store.update_status(item_id, "ready")
+
+    notif = AsyncMock()
+    notif.emit_event = AsyncMock()
+    cat_engine = AsyncMock()
+    cat_engine.categorise = AsyncMock(return_value=[])
+
+    p = IngestPipeline(
+        store=store,
+        http_client=mock_http,
+        notifications=notif,
+        category_engine=cat_engine,
+        max_concurrent=2,
+    )
+
+    # Submit 6 items
+    ids = []
+    for i in range(6):
+        item_id = await p.submit(
+            url=f"https://example.com/batch-{i}",
+            title=f"Batch {i}",
+            text="Enough content to proceed.",
+            categories=["Test"],
+            source="test",
+        )
+        ids.append(item_id)
+
+    # Patch run so we can count concurrency
+    with patch.object(IngestPipeline, "run", counting_run):
+        tasks = [asyncio.create_task(p._run_safe(item_id)) for item_id in ids]
+        await asyncio.gather(*tasks)
+
+    assert max(peak) <= 2, f"Peak concurrency {max(peak)} exceeded semaphore limit 2"
+
+
 @pytest.mark.asyncio
 async def test_categories_from_caller_are_preserved(store):
     """When categories are provided at submit time, they bypass the engine."""
@@ -276,3 +392,24 @@ async def test_categories_from_caller_are_preserved(store):
     item = await store.get_item(item_id)
     assert "AI/ML" in item["categories"]
     assert "Rockchip" in item["categories"]
+
+
+@pytest.mark.asyncio
+async def test_download_article_blocks_internal_url(pipeline, store):
+    """SSRF guard: an article URL pointing at loopback is rejected, the item
+    lands in error, and the host never fetches the internal address."""
+    # Re-patch the real validator for this test (overrides the autouse no-op).
+    with patch.object(_ssrf_mod, "validate_url_or_raise", _REAL_VALIDATE_URL):
+        item_id = await pipeline.submit(
+            url="http://127.0.0.1/admin",
+            title="",
+            text="",
+            categories=[],
+            source="test",
+        )
+        await pipeline.run(item_id)
+    item = await store.get_item(item_id)
+    assert item["status"] == "error"
+    # The guard raises before any HTTP call to the internal address.
+    for call in pipeline._http_client.get.await_args_list:
+        assert "127.0.0.1" not in str(call)

@@ -23,8 +23,14 @@ import {
   Recycle,
   RotateCcw,
   Bot,
+  Copy,
+  Scissors,
+  ClipboardPaste,
+  Pencil,
+  FolderOpen,
 } from "lucide-react";
 import { Button, Card, Toolbar, ToolbarGroup, ToolbarSpacer } from "@/components/ui";
+import { ContextMenu, type MenuItem } from "@/components/ContextMenu";
 import { MobileSplitView } from "@/components/mobile/MobileSplitView";
 import { useIsMobile } from "@/hooks/use-is-mobile";
 import { resolveAgentEmoji } from "@/lib/agent-emoji";
@@ -44,6 +50,19 @@ interface RecycleItem {
 interface RecycleResponse {
   items: RecycleItem[];
   status?: string;
+}
+
+// Item shape returned by GET /api/workspace/trash — the move-to-trash bin
+// backing the user's own workspace (see tinyagentos/workspace_trash.py).
+// Distinct from RecycleItem above, which is the per-agent container
+// trash-cli bin: this one is populated by deletes made in the Files app
+// itself, on the user's own workspace files.
+interface WorkspaceTrashItem {
+  id: string;
+  name: string;
+  original_path: string;
+  is_dir: boolean;
+  deleted_at: string; // ISO string
 }
 
 interface FileEntry {
@@ -225,6 +244,20 @@ function workspaceDeleteUrl(location: "workspace" | string, path: string): strin
   return null;
 }
 
+function workspaceCopyUrl(location: "workspace" | string): string | null {
+  // Only the user workspace exposes a copy endpoint on the backend. Agent /
+  // project / shared-folder locations do not, so copy/cut/paste stays disabled
+  // there to avoid runtime 404s.
+  if (location === "workspace") return `/api/workspace/copy`;
+  return null;
+}
+
+function workspaceRenameUrl(location: "workspace" | string): string | null {
+  // Only the user workspace exposes a rename endpoint on the backend.
+  if (location === "workspace") return `/api/workspace/rename`;
+  return null;
+}
+
 function workspaceStatsUrl(location: "workspace" | string): string | null {
   if (location === "workspace") return `/api/workspace/stats`;
   if (isAgentLocation(location)) {
@@ -234,6 +267,28 @@ function workspaceStatsUrl(location: "workspace" | string): string | null {
     return `/api/projects/${encodeURIComponent(projectSlug(location))}/stats`;
   }
   return null;
+}
+
+// Split a file name into its base and extension. Directories (and dotfiles
+// with no extension) keep the whole name as the base so the " copy" suffix
+// lands before any real extension.
+function splitNameExt(name: string): { base: string; ext: string } {
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0) return { base: name, ext: "" };
+  return { base: name.slice(0, dot), ext: name.slice(dot) };
+}
+
+// Pick a name that does not collide with anything already in the listing.
+// Produces "foo copy.txt", then "foo copy 2.txt", "foo copy 3.txt", ...
+function nextCopyName(name: string, taken: Set<string>): string {
+  const { base, ext } = splitNameExt(name);
+  let candidate = `${base} copy${ext}`;
+  let n = 2;
+  while (taken.has(candidate)) {
+    candidate = `${base} copy ${n}${ext}`;
+    n += 1;
+  }
+  return candidate;
 }
 
 function getFileIcon(name: string, isDir: boolean) {
@@ -272,6 +327,8 @@ interface FileRowProps {
   deleteConfirm: string | null;
   handleDelete: (path: string) => void;
   setDeleteConfirm: (path: string | null) => void;
+  onContextMenu: (e: React.MouseEvent, f: FileEntry) => void;
+  isCut: boolean;
 }
 
 function FileRow({
@@ -283,6 +340,8 @@ function FileRow({
   deleteConfirm,
   handleDelete,
   setDeleteConfirm,
+  onContextMenu,
+  isCut,
 }: FileRowProps) {
   const Icon = getFileIcon(f.name, f.is_dir);
   const relPath = f.path || (currentPath ? `${currentPath}/${f.name}` : f.name);
@@ -314,7 +373,8 @@ function FileRow({
     <tr
       key={f.path || f.name}
       data-file-row
-      className="border-b border-white/5 hover:bg-shell-surface/50 transition-colors group"
+      onContextMenu={(e) => onContextMenu(e, f)}
+      className={`border-b border-white/5 hover:bg-shell-surface/50 transition-colors group ${isCut ? "opacity-50" : ""}`}
       {...dragHandlers}
     >
       <td className="px-3 py-2">
@@ -398,10 +458,13 @@ function FileRow({
 export function FilesApp({
   windowId: _windowId,
   rootPath,
-}: { windowId: string; rootPath?: string }) {
+  path: initialPath,
+}: { windowId: string; rootPath?: string; path?: string }) {
   const isMobile = useIsMobile();
 
-  const [currentPath, setCurrentPath] = useState("");
+  // `path` opens straight into a sub-directory (e.g. double-clicking a Desktop
+  // folder); the load effect fetches currentPath on mount.
+  const [currentPath, setCurrentPath] = useState(initialPath ?? "");
   const [location, setLocation] = useState<"workspace" | string>(() => rootPath ?? "workspace");
   const [files, setFiles] = useState<FileEntry[]>([]);
   const [sharedFolders, setSharedFolders] = useState<SharedFolder[]>([]);
@@ -415,14 +478,29 @@ export function FilesApp({
   const [uploading, setUploading] = useState(false);
   const [sharedExpanded, setSharedExpanded] = useState(true);
   const [deleteConfirm, setDeleteConfirm] = useState<string | null>(null);
-  // null = showing sidebar (list pane); non-null = showing file browser (detail pane)
-  const [selectedLocation, setSelectedLocation] = useState<string | null>(rootPath ?? null);
+  // null = showing sidebar (list pane); non-null = showing file browser (detail pane).
+  // An initial path (or rootPath) opens straight into the browser pane.
+  const [selectedLocation, setSelectedLocation] = useState<string | null>(
+    rootPath ?? (initialPath != null ? "workspace" : null),
+  );
 
-  // Recycle bin
+  // Clipboard for cut/copy/paste. Cross-location paste is out of scope for v1.
+  const [clipboard, setClipboard] = useState<
+    { mode: "cut" | "copy"; location: string; path: string; name: string } | null
+  >(null);
+  // Context menu anchor + payload. file === null targets the empty list area.
+  const [menu, setMenu] = useState<{ x: number; y: number; file: FileEntry | null } | null>(null);
+
+  // Recycle bin (per-agent container trash-cli)
   const [recycleItems, setRecycleItems] = useState<RecycleItem[]>([]);
   const [recycleContainerOffline, setRecycleContainerOffline] = useState<string[]>([]);
   const [recycleLoading, setRecycleLoading] = useState(false);
   const [recycleError, setRecycleError] = useState<string | null>(null);
+
+  // Workspace trash (host-side move-to-trash backing the user's own Files)
+  const [workspaceTrashItems, setWorkspaceTrashItems] = useState<WorkspaceTrashItem[]>([]);
+  const [workspaceTrashLoading, setWorkspaceTrashLoading] = useState(false);
+  const [workspaceTrashError, setWorkspaceTrashError] = useState<string | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dragCounter = useRef(0);
@@ -604,6 +682,50 @@ export function FilesApp({
     }
   }, [fetchRecycle]);
 
+  /* ---- Workspace trash ---- */
+  const fetchWorkspaceTrash = useCallback(async () => {
+    setWorkspaceTrashLoading(true);
+    setWorkspaceTrashError(null);
+    try {
+      const data = await apiFetch<{ items: WorkspaceTrashItem[] }>("/api/workspace/trash");
+      setWorkspaceTrashItems(Array.isArray(data.items) ? data.items : []);
+    } catch (e: unknown) {
+      setWorkspaceTrashError(e instanceof Error ? e.message : "Failed to load trash");
+    } finally {
+      setWorkspaceTrashLoading(false);
+    }
+  }, []);
+
+  const handleWorkspaceTrashRestore = useCallback(async (item: WorkspaceTrashItem) => {
+    try {
+      await apiFetch(`/api/workspace/trash/${encodeURIComponent(item.id)}/restore`, { method: "POST" });
+      fetchWorkspaceTrash();
+    } catch (e: unknown) {
+      setWorkspaceTrashError(e instanceof Error ? e.message : "Restore failed");
+    }
+  }, [fetchWorkspaceTrash]);
+
+  const handleWorkspaceTrashPurge = useCallback(async (item: WorkspaceTrashItem) => {
+    if (!window.confirm(`Permanently delete "${item.original_path}"? This cannot be undone.`)) return;
+    try {
+      await apiFetch(`/api/workspace/trash/${encodeURIComponent(item.id)}`, { method: "DELETE" });
+      fetchWorkspaceTrash();
+    } catch (e: unknown) {
+      setWorkspaceTrashError(e instanceof Error ? e.message : "Delete failed");
+    }
+  }, [fetchWorkspaceTrash]);
+
+  const handleEmptyWorkspaceTrash = useCallback(async () => {
+    if (workspaceTrashItems.length === 0) return;
+    if (!window.confirm("Permanently delete everything in the trash? This cannot be undone.")) return;
+    try {
+      await apiFetch("/api/workspace/trash", { method: "DELETE" });
+      fetchWorkspaceTrash();
+    } catch (e: unknown) {
+      setWorkspaceTrashError(e instanceof Error ? e.message : "Empty trash failed");
+    }
+  }, [fetchWorkspaceTrash, workspaceTrashItems.length]);
+
   /* ---- Actions ---- */
   const handleNewFolder = useCallback(async () => {
     const mkdirUrl = workspaceMkdirUrl(location);
@@ -658,6 +780,61 @@ export function FilesApp({
       setError(msg);
     }
   }, [currentPath, fetchFiles, location]);
+
+  const handleRename = useCallback(async (file: FileEntry) => {
+    const renameUrl = workspaceRenameUrl(location);
+    if (!renameUrl) return;
+    const next = prompt("Rename to:", file.name);
+    const trimmed = next?.trim();
+    if (!trimmed || trimmed === file.name) return;
+    const dst = currentPath ? `${currentPath}/${trimmed}` : trimmed;
+    try {
+      await apiFetch(renameUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src: file.path, dst }),
+      });
+      fetchFiles(currentPath);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Rename failed");
+    }
+  }, [currentPath, fetchFiles, location]);
+
+  const handlePaste = useCallback(async () => {
+    if (!clipboard) return;
+    // Cross-location paste is not supported in v1.
+    if (clipboard.location !== location) return;
+    const url = clipboard.mode === "copy" ? workspaceCopyUrl(location) : workspaceRenameUrl(location);
+    if (!url) return;
+
+    let name = clipboard.name;
+    let dst = currentPath ? `${currentPath}/${name}` : name;
+
+    if (dst === clipboard.path) {
+      // Pasting into the same directory the item came from.
+      if (clipboard.mode === "cut") {
+        // Moving onto itself is a no-op.
+        setClipboard(null);
+        return;
+      }
+      // Copy: duplicate in place under a non-colliding name.
+      const taken = new Set(files.map((f) => f.name));
+      name = nextCopyName(clipboard.name, taken);
+      dst = currentPath ? `${currentPath}/${name}` : name;
+    }
+
+    try {
+      await apiFetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ src: clipboard.path, dst }),
+      });
+      if (clipboard.mode === "cut") setClipboard(null);
+      fetchFiles(currentPath);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : "Paste failed");
+    }
+  }, [clipboard, currentPath, fetchFiles, files, location]);
 
   /* ---- Drag and drop ---- */
   const onDragEnter = useCallback((e: React.DragEvent) => {
@@ -905,6 +1082,7 @@ export function FilesApp({
                 setCurrentPath("");
                 setSelectedLocation("recycle");
                 fetchRecycle();
+                fetchWorkspaceTrash();
               }}
               className={`w-full flex items-center justify-between px-4 py-3.5 text-sm text-shell-text active:bg-white/10 transition-colors ${location === "recycle" ? "bg-white/10" : ""}`}
               aria-label="Recycle Bin"
@@ -923,6 +1101,7 @@ export function FilesApp({
               setLocation("recycle");
               setCurrentPath("");
               fetchRecycle();
+              fetchWorkspaceTrash();
             }}
             className="w-full justify-start mx-1.5 mt-1 px-3"
             aria-label="Recycle Bin"
@@ -1032,29 +1211,52 @@ export function FilesApp({
       <div className="shrink-0 flex items-center gap-2 px-4 py-3 border-b border-white/5">
         <Recycle size={15} className="text-shell-text-tertiary" aria-hidden="true" />
         <span className="text-sm font-medium">Recycle Bin</span>
+        {workspaceTrashItems.length > 0 && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={handleEmptyWorkspaceTrash}
+            className="h-7 ml-auto text-xs text-shell-text-tertiary hover:text-red-400"
+            aria-label="Empty workspace trash"
+          >
+            Empty Trash
+          </Button>
+        )}
         <Button
           variant="ghost"
           size="icon"
-          onClick={fetchRecycle}
-          className="h-7 w-7 ml-auto"
+          onClick={() => {
+            fetchRecycle();
+            fetchWorkspaceTrash();
+          }}
+          className={`h-7 w-7 ${workspaceTrashItems.length > 0 ? "" : "ml-auto"}`}
           aria-label="Refresh recycle bin"
         >
-          <RefreshCw size={13} className={recycleLoading ? "animate-spin" : ""} aria-hidden="true" />
+          <RefreshCw size={13} className={recycleLoading || workspaceTrashLoading ? "animate-spin" : ""} aria-hidden="true" />
         </Button>
       </div>
 
       {/* Error */}
-      {recycleError && (
+      {(recycleError || workspaceTrashError) && (
         <div className="mx-3 mt-2 flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 text-red-400 text-xs">
           <AlertCircle size={14} className="shrink-0" aria-hidden="true" />
-          <span className="flex-1">{recycleError}</span>
-          <button onClick={() => setRecycleError(null)} className="hover:text-red-300" aria-label="Dismiss error">&times;</button>
+          <span className="flex-1">{recycleError || workspaceTrashError}</span>
+          <button
+            onClick={() => {
+              setRecycleError(null);
+              setWorkspaceTrashError(null);
+            }}
+            className="hover:text-red-300"
+            aria-label="Dismiss error"
+          >
+            &times;
+          </button>
         </div>
       )}
 
       {/* Content */}
       <div className="flex-1 overflow-auto p-3">
-        {recycleLoading && recycleItems.length === 0 && (
+        {(recycleLoading || workspaceTrashLoading) && recycleItems.length === 0 && workspaceTrashItems.length === 0 && (
           <div className="flex items-center justify-center h-full text-shell-text-tertiary">
             <RefreshCw size={20} className="animate-spin" aria-hidden="true" />
           </div>
@@ -1067,11 +1269,61 @@ export function FilesApp({
           </div>
         ))}
 
-        {!recycleLoading && recycleItems.length === 0 && recycleContainerOffline.length === 0 && (
+        {!recycleLoading && !workspaceTrashLoading && recycleItems.length === 0 && workspaceTrashItems.length === 0 && recycleContainerOffline.length === 0 && (
           <div className="flex flex-col items-center justify-center h-full text-shell-text-tertiary gap-2 text-center">
             <Recycle size={40} className="opacity-30" aria-hidden="true" />
-            <span className="text-sm">Recycle bin is empty. Deleted files land here automatically — 30-day retention.</span>
+            <span className="text-sm">Recycle bin is empty. Deleted files land here automatically.</span>
           </div>
+        )}
+
+        {/* Items deleted from the user's own Files workspace */}
+        {workspaceTrashItems.length > 0 && (
+          <section className="mb-4" aria-label="Trashed items from your workspace">
+            <div className="flex items-center gap-1.5 mb-2">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-shell-text-tertiary">
+                My Files
+              </span>
+            </div>
+            <div className="space-y-1.5">
+              {workspaceTrashItems.map((item) => (
+                <Card
+                  key={item.id}
+                  className="flex items-center gap-3 px-3 py-2.5 hover:bg-shell-surface/50 transition-colors"
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="text-xs truncate font-mono" title={item.original_path}>
+                      {item.original_path}
+                    </div>
+                    <div className="text-[10px] text-shell-text-tertiary mt-0.5">
+                      {formatDate(Math.floor(new Date(item.deleted_at).getTime() / 1000))}
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-1 shrink-0">
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 hover:bg-emerald-500/15 hover:text-emerald-400"
+                      onClick={() => handleWorkspaceTrashRestore(item)}
+                      aria-label={`Restore ${item.original_path}`}
+                      title="Restore"
+                    >
+                      <RotateCcw size={13} aria-hidden="true" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="h-7 w-7 hover:bg-red-500/15 hover:text-red-400"
+                      onClick={() => handleWorkspaceTrashPurge(item)}
+                      aria-label={`Permanently delete ${item.original_path}`}
+                      title="Delete permanently"
+                    >
+                      <Trash2 size={13} aria-hidden="true" />
+                    </Button>
+                  </div>
+                </Card>
+              ))}
+            </div>
+          </section>
         )}
 
         {Object.keys(recycleByAgent).map((agentName) => (
@@ -1238,7 +1490,7 @@ export function FilesApp({
         <div className="mx-3 mt-2 flex items-center gap-2 px-3 py-2 rounded-lg bg-red-500/10 text-red-400 text-xs">
           <AlertCircle size={14} className="shrink-0" />
           <span className="flex-1">{error}</span>
-          <button onClick={() => setError(null)} className="hover:text-red-300">&times;</button>
+          <button onClick={() => setError(null)} className="hover:text-red-300" aria-label="Dismiss error">&times;</button>
         </div>
       )}
 
@@ -1249,6 +1501,12 @@ export function FilesApp({
         onDragLeave={onDragLeave}
         onDragOver={onDragOver}
         onDrop={onDrop}
+        onContextMenu={(e) => {
+          // Only the empty list background; rows/cards stopPropagation.
+          if (!isWritable) return;
+          e.preventDefault();
+          setMenu({ x: e.clientX, y: e.clientY, file: null });
+        }}
       >
         {/* Drop overlay */}
         {dragging && (
@@ -1292,7 +1550,14 @@ export function FilesApp({
               return (
                 <Card
                   key={f.path || f.name}
-                  className="group relative bg-transparent border-transparent hover:bg-shell-surface hover:border-white/[0.06] transition-colors"
+                  onContextMenu={(e) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setMenu({ x: e.clientX, y: e.clientY, file: f });
+                  }}
+                  className={`group relative bg-transparent border-transparent hover:bg-shell-surface hover:border-white/[0.06] transition-colors ${
+                    clipboard?.mode === "cut" && clipboard.location === location && clipboard.path === f.path ? "opacity-50" : ""
+                  }`}
                 >
                 <button
                   onClick={() => {
@@ -1406,6 +1671,12 @@ export function FilesApp({
                   deleteConfirm={deleteConfirm}
                   handleDelete={handleDelete}
                   setDeleteConfirm={setDeleteConfirm}
+                  onContextMenu={(e, file) => {
+                    e.preventDefault();
+                    e.stopPropagation();
+                    setMenu({ x: e.clientX, y: e.clientY, file });
+                  }}
+                  isCut={clipboard?.mode === "cut" && clipboard.location === location && clipboard.path === f.path}
                 />
               ))}
             </tbody>
@@ -1415,6 +1686,79 @@ export function FilesApp({
       </div>
     </div>
   );
+
+  /* ---- Context menu ---- */
+  const openFile = useCallback((f: FileEntry) => {
+    if (f.is_dir) {
+      navigateTo(f.path || (currentPath ? `${currentPath}/${f.name}` : f.name));
+    } else if (isWritable) {
+      window.open(fileUrl(location, f.path || f.name), "_blank");
+    }
+  }, [navigateTo, currentPath, isWritable, location]);
+
+  const copySupported = workspaceCopyUrl(location) !== null;
+  const moveSupported = workspaceRenameUrl(location) !== null;
+  const pasteAcrossLocation = clipboard !== null && clipboard.location !== location;
+  const pasteOpSupported = clipboard?.mode === "cut" ? moveSupported : copySupported;
+  const canPaste = clipboard !== null && !pasteAcrossLocation && pasteOpSupported;
+
+  const buildFileMenu = (f: FileEntry): MenuItem[] => {
+    const items: MenuItem[] = [
+      {
+        label: "Open",
+        icon: f.is_dir ? <FolderOpen size={14} /> : <FileText size={14} />,
+        action: () => openFile(f),
+      },
+    ];
+    if (!f.is_dir && isWritable) {
+      items.push({
+        label: "Download",
+        icon: <Download size={14} />,
+        action: () => window.open(fileUrl(location, f.path || f.name), "_blank"),
+      });
+    }
+    if (isWritable) {
+      items.push(
+        { label: "", separator: true },
+        { label: "Rename", icon: <Pencil size={14} />, action: () => handleRename(f) },
+        {
+          label: "Cut",
+          icon: <Scissors size={14} />,
+          disabled: !moveSupported,
+          action: () => setClipboard({ mode: "cut", location, path: f.path, name: f.name }),
+        },
+        {
+          label: "Copy",
+          icon: <Copy size={14} />,
+          disabled: !copySupported,
+          action: () => setClipboard({ mode: "copy", location, path: f.path, name: f.name }),
+        },
+        { label: "", separator: true },
+        {
+          label: "Delete",
+          icon: <Trash2 size={14} className="text-red-400" />,
+          action: () => handleDelete(f.path),
+        },
+      );
+    }
+    return items;
+  };
+
+  const buildEmptyMenu = (): MenuItem[] => {
+    if (!isWritable) return [];
+    const pasteLabel = pasteAcrossLocation ? "Paste (unavailable here)" : "Paste";
+    return [
+      { label: "New Folder", icon: <FolderPlus size={14} />, action: handleNewFolder },
+      {
+        label: pasteLabel,
+        icon: <ClipboardPaste size={14} />,
+        disabled: !canPaste,
+        action: handlePaste,
+      },
+      { label: "", separator: true },
+      { label: "Upload", icon: <Upload size={14} />, action: () => fileInputRef.current?.click() },
+    ];
+  };
 
   /* ---- Root layout ---- */
   return (
@@ -1428,6 +1772,14 @@ export function FilesApp({
         detailTitle={locationTitle}
         listWidth={208}
       />
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          onClose={() => setMenu(null)}
+          items={menu.file ? buildFileMenu(menu.file) : buildEmptyMenu()}
+        />
+      )}
     </div>
   );
 }

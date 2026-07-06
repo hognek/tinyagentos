@@ -4,12 +4,19 @@ import { useProcessStore } from "@/stores/process-store";
 import { useThemeStore } from "@/stores/theme-store";
 import { useWidgetStore } from "@/stores/widget-store";
 import { useSnapZones } from "@/hooks/use-snap-zones";
+import { useDeepNavigation } from "@/hooks/use-deep-navigation";
+import { useDesktopControl } from "@/hooks/use-desktop-control";
+import { useDesktopCommandStream } from "@/hooks/use-desktop-command-stream";
 import { getApp } from "@/registry/app-registry";
 import { Window } from "./Window";
 import { SnapOverlay } from "./SnapOverlay";
 import { WidgetLayer } from "./WidgetLayer";
 import { ContextMenu, type MenuItem } from "./ContextMenu";
 import { WallpaperPicker } from "./WallpaperPicker";
+import { DesktopIcons } from "./DesktopIcons";
+import { ParticlesWallpaper } from "./ParticlesWallpaper";
+import { WallpaperTextOverlay } from "./WallpaperTextOverlay";
+import { ScreenshotFlash } from "./ScreenshotFlash";
 
 type ContextMenuState = {
   x: number;
@@ -22,6 +29,20 @@ export function Desktop() {
   const wallpaperImage = useThemeStore((s) => s.wallpaperImage);
   const wallpaperMobileImage = useThemeStore((s) => s.wallpaperMobileImage);
   const wallpaperFallback = useThemeStore((s) => s.wallpaperFallback);
+  const wallpaperLightImage = useThemeStore((s) => s.wallpaperLightImage);
+  const wallpaperLightMobileImage = useThemeStore((s) => s.wallpaperLightMobileImage);
+  const wallpaperLightFallback = useThemeStore((s) => s.wallpaperLightFallback);
+  const scheme = useThemeStore((s) => s.scheme);
+  const wallpaperKind = useThemeStore((s) => s.wallpaperKind);
+  const wallpaperComponent = useThemeStore((s) => s.wallpaperComponent);
+  const wallpaperOverlayText = useThemeStore((s) => s.wallpaperOverlayText);
+  const showOverlayText = useThemeStore((s) => s.showOverlayText);
+  const isAnimated = wallpaperKind === "animated";
+  // Invert the wallpaper with the theme: use the light variant when present.
+  const useLight = scheme === "light" && !!wallpaperLightImage;
+  const effImage = useLight ? wallpaperLightImage : wallpaperImage;
+  const effMobile = useLight ? wallpaperLightMobileImage : wallpaperMobileImage;
+  const effFallback = useLight ? wallpaperLightFallback : wallpaperFallback;
   const { showWidgets, toggleWidgets } = useWidgetStore();
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const [wallpaperPickerOpen, setWallpaperPickerOpen] = useState(false);
@@ -49,11 +70,20 @@ export function Desktop() {
     if (app) openWindow(appId, app.defaultSize);
   }, [openWindow]);
 
+  // Deep-navigation API: `?app=` URL param on load + `taos:open-app` event at
+  // runtime (lets the taOS agent drive the desktop). See the hook for details.
+  useDeepNavigation(openWindow);
+  useDesktopControl();
+  // Backend -> browser command channel: lets the taOS agent drive this desktop
+  // (open apps, move/arrange windows) by pushing commands the controller streams
+  // here. Re-dispatches to the taos:open-app / taos:window receivers above.
+  useDesktopCommandStream();
+
   const menuItems: MenuItem[] = [
     {
       label: "New Folder",
       icon: <FolderPlus size={14} />,
-      action: () => openApp("files"),
+      action: () => window.dispatchEvent(new CustomEvent("taos:new-desktop-folder")),
     },
     { label: "", separator: true },
     {
@@ -110,10 +140,14 @@ export function Desktop() {
   return (
     <div
       className="taos-wallpaper relative flex-1 overflow-hidden"
-      style={{ backgroundColor: wallpaperFallback, ["--wallpaper-desktop" as never]: wallpaperImage, ["--wallpaper-mobile" as never]: wallpaperMobileImage }}
+      style={{ backgroundColor: effFallback, ["--wallpaper-desktop" as never]: isAnimated ? "none" : effImage, ["--wallpaper-mobile" as never]: isAnimated ? "none" : effMobile }}
       onContextMenu={handleContextMenu}
       data-desktop-surface
     >
+      {isAnimated && wallpaperComponent === "particles" && <ParticlesWallpaper />}
+      {showOverlayText && wallpaperOverlayText && <WallpaperTextOverlay text={wallpaperOverlayText} />}
+      <ScreenshotFlash />
+      <DesktopIcons />
       <SnapOverlay bounds={previewBounds} />
       <WidgetLayer />
       {windows.map((win) => (

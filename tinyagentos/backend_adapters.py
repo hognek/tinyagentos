@@ -6,6 +6,27 @@ from abc import ABC, abstractmethod
 import httpx
 
 
+def _describe_health_error(exc: Exception, url: str) -> str:
+    """Human-readable reason a health probe against *url* failed.
+
+    Every adapter below used to swallow the real exception and report a
+    bare ``{"status": "error"}`` — the Providers "Test" button then had
+    nothing to show but a hardcoded "unknown error" (#1614). This gives
+    each caught exception a specific, actionable description instead.
+    """
+    if isinstance(exc, httpx.ConnectError):
+        return f"Connection refused connecting to {url} — is the service running?"
+    if isinstance(exc, httpx.ConnectTimeout):
+        return f"Connection to {url} timed out"
+    if isinstance(exc, httpx.TimeoutException):
+        return f"{url} did not respond in time"
+    if isinstance(exc, httpx.HTTPStatusError):
+        return f"{url} returned HTTP {exc.response.status_code}"
+    if isinstance(exc, httpx.HTTPError):
+        return f"could not reach {url}: {exc}"
+    return str(exc) or repr(exc)
+
+
 class BackendAdapter(ABC):
     @abstractmethod
     async def health(self, client: httpx.AsyncClient, url: str) -> dict:
@@ -30,38 +51,14 @@ class OllamaCompatAdapter(BackendAdapter):
                 for m in data.get("models", [])
             ]
             return {"status": "ok", "response_ms": elapsed_ms, "models": models}
-        except Exception:
+        except Exception as exc:
             elapsed_ms = int((time.monotonic() - start) * 1000)
-            return {"status": "error", "response_ms": elapsed_ms, "models": []}
-
-
-class RknnSdAdapter(BackendAdapter):
-    """Adapter for the taOS RKNN Stable Diffusion server (RK3588 NPU).
-
-    Exposes GET /health, GET /v1/models, POST /v1/images/generations.
-    """
-
-    async def health(self, client: httpx.AsyncClient, url: str) -> dict:
-        start = time.monotonic()
-        base = url.rstrip("/")
-        try:
-            resp = await client.get(f"{base}/health", timeout=10)
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-            resp.raise_for_status()
-            models = []
-            try:
-                mr = await client.get(f"{base}/v1/models", timeout=10)
-                if mr.status_code == 200:
-                    models = [
-                        {"name": m.get("id", m.get("name", "")), "size_mb": 0}
-                        for m in mr.json().get("data", mr.json() if isinstance(mr.json(), list) else [])
-                    ]
-            except Exception:
-                pass
-            return {"status": "ok", "response_ms": elapsed_ms, "models": models}
-        except Exception:
-            elapsed_ms = int((time.monotonic() - start) * 1000)
-            return {"status": "error", "response_ms": elapsed_ms, "models": []}
+            return {
+                "status": "error",
+                "response_ms": elapsed_ms,
+                "models": [],
+                "error": _describe_health_error(exc, url),
+            }
 
 
 class StableDiffusionCppAdapter(BackendAdapter):
@@ -80,9 +77,14 @@ class StableDiffusionCppAdapter(BackendAdapter):
             resp = await client.get(f"{base}/sdapi/v1/options", timeout=10)
             elapsed_ms = int((time.monotonic() - start) * 1000)
             resp.raise_for_status()
-        except Exception:
+        except Exception as exc:
             elapsed_ms = int((time.monotonic() - start) * 1000)
-            return {"status": "error", "response_ms": elapsed_ms, "models": []}
+            return {
+                "status": "error",
+                "response_ms": elapsed_ms,
+                "models": [],
+                "error": _describe_health_error(exc, base),
+            }
 
         # Server is alive — fetch model list best-effort; empty list is fine.
         models = []
@@ -94,6 +96,46 @@ class StableDiffusionCppAdapter(BackendAdapter):
                     {"name": m.get("title", m.get("model_name", "")), "size_mb": 0}
                     for m in (data if isinstance(data, list) else [])
                 ]
+        except Exception:
+            pass
+
+        return {"status": "ok", "response_ms": elapsed_ms, "models": models}
+
+
+class IOPaintAdapter(BackendAdapter):
+    """Adapter for IOPaint (https://github.com/Sanster/IOPaint), the
+    lama-cleaner successor used as the self-hosted image-editing backend.
+
+    IOPaint has no /health route; GET /api/v1/server-config responds once the
+    server is up and reports the enabled plugins. There is no "model list" in
+    the catalog sense (the LaMa erase model + plugins are server-fixed), so we
+    surface the loaded model name as a single entry for visibility.
+    """
+
+    async def health(self, client: httpx.AsyncClient, url: str) -> dict:
+        start = time.monotonic()
+        base = url.rstrip("/")
+        try:
+            resp = await client.get(f"{base}/api/v1/server-config", timeout=10)
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            resp.raise_for_status()
+        except Exception as exc:
+            elapsed_ms = int((time.monotonic() - start) * 1000)
+            return {
+                "status": "error",
+                "response_ms": elapsed_ms,
+                "models": [],
+                "error": _describe_health_error(exc, base),
+            }
+
+        models = []
+        try:
+            mr = await client.get(f"{base}/api/v1/model", timeout=10)
+            if mr.status_code == 200:
+                data = mr.json()
+                name = data.get("name") if isinstance(data, dict) else None
+                if name:
+                    models = [{"name": name, "size_mb": 0}]
         except Exception:
             pass
 
@@ -124,9 +166,14 @@ class OpenAICompatAdapter(BackendAdapter):
             except Exception:
                 pass
             return {"status": "ok", "response_ms": elapsed_ms, "models": models}
-        except Exception:
+        except Exception as exc:
             elapsed_ms = int((time.monotonic() - start) * 1000)
-            return {"status": "error", "response_ms": elapsed_ms, "models": []}
+            return {
+                "status": "error",
+                "response_ms": elapsed_ms,
+                "models": [],
+                "error": _describe_health_error(exc, base),
+            }
 
 
 class CloudAPIAdapter(BackendAdapter):
@@ -158,10 +205,20 @@ class CloudAPIAdapter(BackendAdapter):
                     except Exception:
                         pass
                 return {"status": "ok", "response_ms": elapsed_ms, "models": models}
-            return {"status": "error", "response_ms": elapsed_ms, "models": []}
-        except Exception:
+            return {
+                "status": "error",
+                "response_ms": elapsed_ms,
+                "models": [],
+                "error": f"{base}/models returned HTTP {resp.status_code}",
+            }
+        except Exception as exc:
             elapsed_ms = int((time.monotonic() - start) * 1000)
-            return {"status": "error", "response_ms": elapsed_ms, "models": []}
+            return {
+                "status": "error",
+                "response_ms": elapsed_ms,
+                "models": [],
+                "error": _describe_health_error(exc, base),
+            }
 
 
 # Type aliases for backwards compatibility with tests
@@ -183,9 +240,13 @@ _ADAPTERS: dict[str, BackendAdapter] = {
     "anthropic": CloudAPIAdapter(),
     "openrouter": CloudAPIAdapter(),
     "kilocode": CloudAPIAdapter(),
+    "deepseek": CloudAPIAdapter(),
     "openai-compatible": CloudAPIAdapter(),
     "sd-cpp": StableDiffusionCppAdapter(),
-    "rknn-sd": RknnSdAdapter(),
+    "iopaint": IOPaintAdapter(),
+    # flux-fill is served behind an A1111-compatible image server in practice;
+    # reuse the sd-cpp probe shape (it answers /sdapi/v1/options).
+    "flux-fill": StableDiffusionCppAdapter(),
 }
 
 

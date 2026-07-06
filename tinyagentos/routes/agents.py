@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from datetime import datetime, timezone
+import math
+import time
+from collections import OrderedDict
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -11,23 +14,15 @@ from pydantic import BaseModel
 import taosmd.agents as tm_agents
 
 from tinyagentos.agent_db import find_agent, get_agent_summaries
-from tinyagentos.config import save_config_locked, validate_agent_name, slugify_agent_name
-
+from tinyagentos.config import save_config_locked, validate_agent_name, unique_agent_slug
+from tinyagentos.routes import agent_archive
+from tinyagentos.routes import agent_deploy
+from tinyagentos.routes import agent_import
 logger = logging.getLogger(__name__)
 
 EXPORT_VERSION = 1
 
-# Cloud provider backend types whose advertised models are routable for a
-# deploy / model-change. Mirrors providers.CLOUD_TYPES; kept local to avoid a
-# cross-route import. #351 tracks consolidating these provider-type lists.
-_CLOUD_PROVIDER_TYPES = ("openai", "anthropic", "openrouter", "kilocode", "openai-compatible")
-
 router = APIRouter()
-
-
-def _archive_timestamp() -> str:
-    """UTC timestamp as YYYYMMDDTHHMMSS for archive naming."""
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
 
 
 class AgentCreate(BaseModel):
@@ -44,6 +39,126 @@ class AgentUpdate(BaseModel):
     color: str | None = None
     emoji: str | None = None
     can_read_user_memory: bool | None = None
+
+
+class IdempotencyCache:
+    """In-flight request deduplication cache keyed by Idempotency-Key.
+
+    ``try_reserve(key)`` returns ``("proceed", event)`` when this caller
+    should do the work, or ``("wait", event)`` when another caller is
+    already handling this key — the caller should ``await event.wait()``
+    and then call ``get(key)`` for the cached result.
+
+    ``set(key, result)`` stores the result and fires the event so all
+    waiters can proceed.
+
+    This closes the race in the naive get-then-set pattern where
+    ``cache.get()`` releases the lock before the write, letting a
+    concurrent retry with the same Idempotency-Key create a duplicate.
+    """
+
+    _TTL_SECONDS: float = 3600.0  # cached results expire after 1 hour
+    _MAX_SIZE: int = 1000         # LRU cap; oldest completed entry evicted first
+
+    def __init__(self) -> None:
+        # Values: (event, result_or_None, inserted_at)
+        self._entries: OrderedDict[str, tuple[asyncio.Event, dict | None, float]] = OrderedDict()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _is_expired(self, inserted_at: float) -> bool:
+        return (time.monotonic() - inserted_at) >= self._TTL_SECONDS
+
+    def _evict_if_needed(self) -> None:
+        """Drop the oldest *completed* entry when over the size cap."""
+        while len(self._entries) >= self._MAX_SIZE:
+            # Walk from the front (oldest) and evict the first completed entry.
+            # In-flight entries (event not set) are skipped so we never pull
+            # the rug out from under a waiter.
+            for k, (ev, _res, _ts) in self._entries.items():
+                if ev.is_set():
+                    del self._entries[k]
+                    break
+            else:
+                # All remaining entries are in-flight; nothing safe to evict.
+                break
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def try_reserve(self, key: str) -> tuple[str, asyncio.Event]:
+        """Attempt to reserve *key*.
+
+        Returns ``("proceed", event)`` when this caller owns the key
+        and should perform the work.
+
+        Returns ``("wait", event)`` when another caller already reserved
+        the key — await ``event.wait()`` and call ``get()`` for the
+        result.
+        """
+        entry = self._entries.get(key)
+        if entry is not None:
+            ev, _res, inserted_at = entry
+            # Treat TTL-expired *completed* entries as absent so a fresh
+            # request doesn't get a stale cached result.
+            if ev.is_set() and self._is_expired(inserted_at):
+                del self._entries[key]
+            else:
+                # Move to end (most-recently-used) so LRU eviction keeps
+                # frequently retried keys alive longest.
+                self._entries.move_to_end(key)
+                return ("wait", ev)
+
+        self._evict_if_needed()
+        event = asyncio.Event()
+        self._entries[key] = (event, None, time.monotonic())
+        return ("proceed", event)
+
+    def set(self, key: str, result: dict) -> None:
+        """Store *result* and wake all waiters on *key*."""
+        entry = self._entries.get(key)
+        if entry is None:
+            self._evict_if_needed()
+            event = asyncio.Event()
+            event.set()
+            self._entries[key] = (event, result, time.monotonic())
+            return
+        event, _, inserted_at = entry
+        self._entries[key] = (event, result, inserted_at)
+        self._entries.move_to_end(key)
+        event.set()
+
+    def get(self, key: str) -> dict | None:
+        """Return the cached result for *key*, or ``None``.
+
+        Returns ``None`` for unknown or TTL-expired keys.
+        """
+        entry = self._entries.get(key)
+        if entry is None:
+            return None
+        ev, result, inserted_at = entry
+        if ev.is_set() and self._is_expired(inserted_at):
+            del self._entries[key]
+            return None
+        self._entries.move_to_end(key)
+        return result
+
+    def release(self, key: str) -> None:
+        """Unblock any waiters on *key* without storing a useful result.
+
+        Call this in a ``finally`` block so that an unexpected exception
+        never leaves the event unset and waiters hanging indefinitely.
+        Waiters that resume will receive ``None`` from ``get()``.
+        No-op when the event is already set (i.e. ``set()`` already called).
+        """
+        entry = self._entries.get(key)
+        if entry is not None:
+            ev, _res, _ts = entry
+            if not ev.is_set():
+                ev.set()
 
 
 @router.get("/api/agents")
@@ -76,6 +191,56 @@ async def list_archived_agents(request: Request):
     return config.archived_agents
 
 
+def _resolve_agent_by_bearer(request: Request) -> dict | None:
+    """Return the agent whose llm_key matches the Authorization: Bearer token.
+
+    Returns None if the header is missing/malformed or no agent matches.
+    """
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return None
+    token = auth[7:]
+    if not token:
+        return None
+    config = request.app.state.config
+    return next((a for a in config.agents if a.get("llm_key") == token), None)
+
+
+@router.get("/api/agents/me/models")
+async def agent_get_own_models(request: Request):
+    """Return the calling agent's permitted model set (authed by its LiteLLM key)."""
+    agent = _resolve_agent_by_bearer(request)
+    if agent is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    permitted = [m for m in (agent.get("permitted_models") or [agent.get("model")]) if m]
+    return {"permitted": permitted, "current": agent.get("model")}
+
+
+class AgentSelfModelUpdate(BaseModel):
+    model: str
+
+
+@router.post("/api/agents/me/model")
+async def agent_set_own_model(request: Request, body: AgentSelfModelUpdate):
+    """Move the calling agent's active primary within its permitted set (authed by its LiteLLM key)."""
+    agent = _resolve_agent_by_bearer(request)
+    if agent is None:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    model = body.model
+    permitted = [m for m in (agent.get("permitted_models") or [agent.get("model")]) if m]
+    if model not in permitted:
+        return JSONResponse(
+            {"error": f"model '{model}' is not in this agent's permitted set", "permitted": permitted},
+            status_code=403,
+        )
+
+    agent["model"] = model
+    config = request.app.state.config
+    await save_config_locked(config, config.config_path)
+    return {"status": "updated", "current": model}
+
+
 @router.get("/api/agents/{name}/deploy-status")
 async def get_deploy_status(request: Request, name: str):
     """Get the background deploy task status for an agent."""
@@ -105,27 +270,57 @@ async def add_agent(request: Request, body: AgentCreate):
     If the slug collides with an existing agent, a numeric suffix is
     appended until it's unique.
     """
-    config = request.app.state.config
-    display_name = body.name.strip()
-    name_error = validate_agent_name(display_name)
-    if name_error:
-        return JSONResponse({"error": name_error}, status_code=400)
+    # --- Idempotency guard ---
+    idempotency_cache = getattr(request.app.state, "idempotency_cache", None)
+    idempotency_key = request.headers.get("Idempotency-Key")
+    # Scope the cache key by endpoint so /api/agents and /api/agents/deploy
+    # cannot collide even when the client reuses the same header value.
+    scoped_key = (
+        f"{request.method}:{request.url.path}:{idempotency_key}"
+        if idempotency_key
+        else None
+    )
+    if scoped_key and idempotency_cache is not None:
+        mode, event = idempotency_cache.try_reserve(scoped_key)
+        if mode == "wait":
+            await event.wait()
+            cached = idempotency_cache.get(scoped_key)
+            if cached is None:
+                return JSONResponse({"error": "concurrent request failed"}, status_code=503)
+            return cached
 
-    slug = slugify_agent_name(display_name)
-    unique_slug = slug
-    suffix = 2
-    while find_agent(config, unique_slug):
-        unique_slug = f"{slug}-{suffix}"
-        suffix += 1
-        if suffix > 100:
-            return JSONResponse({"error": "Could not generate a unique agent slug"}, status_code=400)
+    # Wrap so any unexpected exception still unblocks idempotency waiters.
+    try:
+        config = request.app.state.config
+        display_name = body.name.strip()
+        name_error = validate_agent_name(display_name)
+        if name_error:
+            err = {"error": name_error}
+            if scoped_key and idempotency_cache is not None:
+                idempotency_cache.set(scoped_key, err)
+            return JSONResponse(err, status_code=400)
 
-    agent = body.model_dump()
-    agent["name"] = unique_slug
-    agent["display_name"] = display_name
-    config.agents.append(agent)
-    await save_config_locked(config, config.config_path)
-    return {"status": "created", "name": unique_slug, "display_name": display_name}
+        try:
+            unique_slug = unique_agent_slug(config, display_name)
+        except ValueError as e:
+            err = {"error": str(e)}
+            if scoped_key and idempotency_cache is not None:
+                idempotency_cache.set(scoped_key, err)
+            return JSONResponse(err, status_code=400)
+
+        agent = body.model_dump()
+        agent["name"] = unique_slug
+        agent["display_name"] = display_name
+        config.agents.append(agent)
+        await save_config_locked(config, config.config_path)
+        result = {"status": "created", "name": unique_slug, "display_name": display_name}
+        if scoped_key and idempotency_cache is not None:
+            idempotency_cache.set(scoped_key, result)
+        return result
+    finally:
+        # No-op when set() already fired; unblocks waiters on unexpected exceptions.
+        if scoped_key and idempotency_cache is not None:
+            idempotency_cache.release(scoped_key)
 
 
 @router.put("/api/agents/{name}")
@@ -173,241 +368,6 @@ async def update_agent_permissions(request: Request, name: str, body: AgentPermi
     }
 
 
-async def _archive_agent_fully(request: Request, name: str) -> dict:
-    """Archive via incus snapshot. Zero-copy on btrfs/ZFS pools; rsync fallback
-    on dir-backed. Container stays intact (snapshots live alongside); restoring
-    is snapshot restore. Purge = incus delete.
-
-    Archive target:
-      - pool: (default) — snapshot lives in-pool alongside the container.
-      - path:/abs/path — export snapshot tarball to that path.
-      - s3://bucket — export + upload (not yet implemented; log + skip).
-
-    Returns ``{"error": ..., "status_code": ...}`` on failure so callers
-    can re-raise as JSONResponse.
-    """
-    import json as _json
-    from tinyagentos.containers import container_exists, stop_container, snapshot_create
-
-    config = request.app.state.config
-    agent = find_agent(config, name)
-    if agent is None:
-        return {"error": f"Agent '{name}' not found", "status_code": 404}
-
-    agent_id = agent.get("id")
-    if not agent_id:
-        import uuid
-        agent_id = uuid.uuid4().hex[:12]
-        agent["id"] = agent_id
-
-    ts = _archive_timestamp()
-    slug = agent["name"]
-    container = f"taos-agent-{slug}"
-    snapshot_name = f"taos-archive-{ts}"
-    data_dir = request.app.state.data_dir
-    archive_subdir = f"{slug}-{ts}"
-    archive_base = data_dir / "archive" / archive_subdir
-
-    # 0) Probe container existence first. A failed deploy can leave a config
-    #    row with no container behind it; in that case we skip stop/snapshot
-    #    entirely and decide between hard-delete and tombstone based on
-    #    whether there is any history worth preserving.
-    has_container = await container_exists(container)
-
-    if not has_container:
-        # Hard-delete when the agent has no chat history and no trace dir —
-        # a tombstone for a never-used failed deploy is just archive clutter.
-        # Otherwise create a tombstone (no snapshot) so the user can still
-        # see it in Archived and purge from there.
-        has_chat_history = False
-        channel_id = agent.get("chat_channel_id")
-        if channel_id:
-            try:
-                msg_store = request.app.state.chat_messages
-                msgs = await msg_store.get_all_messages_for_channel(channel_id)
-                has_chat_history = bool(msgs)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("archive(orphan): chat check failed for %s: %s", slug, exc)
-        trace_dir = data_dir / "trace" / slug
-        has_trace_history = trace_dir.exists() and any(trace_dir.iterdir())
-
-        # Always revoke LiteLLM key first (best effort, same as below).
-        llm_key = agent.get("llm_key")
-        llm_proxy = getattr(request.app.state, "llm_proxy", None)
-        if llm_key and llm_proxy and llm_proxy.is_running():
-            try:
-                await llm_proxy.delete_agent_key(llm_key)
-            except Exception:
-                pass
-
-        if not has_chat_history and not has_trace_history:
-            # Hard-delete: drop the config row and return. No tombstone for
-            # orphan rows from a never-used failed deploy.
-            config.agents = [a for a in config.agents if a["name"] != name]
-            await save_config_locked(config, config.config_path)
-            return {
-                "status": "deleted",
-                "name": slug,
-                "id": agent_id,
-                "note": "orphan config row (no container); hard-deleted",
-            }
-
-        # Tombstone path: write an archive entry with no snapshot so the
-        # user can purge it from the Archived view.
-        original_snapshot = dict(agent)
-        archive_entry = {
-            "id": agent_id,
-            "archived_at": ts,
-            "archived_slug": slug,
-            "snapshot_name": None,
-            "export_path": None,
-            "archive_dir": f"archive/{archive_subdir}",
-            "original": original_snapshot,
-        }
-        config.agents = [a for a in config.agents if a["name"] != name]
-        config.archived_agents.append(archive_entry)
-        await save_config_locked(config, config.config_path)
-        return {
-            "status": "archived",
-            "name": slug,
-            "id": agent_id,
-            "archived_at": ts,
-            "snapshot_name": None,
-            "export_path": None,
-            "note": "orphan config row (no container); tombstone created",
-        }
-
-    # 1) Force-stop the container. Best-effort — container may not exist
-    #    (partial deploy), which is fine; the snapshot step below is the gate.
-    try:
-        await stop_container(container, force=True)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("archive: stop failed for %s: %s", slug, exc)
-
-    # 2) Create snapshot. If this fails (container not found, pool error, etc.)
-    #    we abort without mutating config so the agent stays in the live list.
-    snap_result = await snapshot_create(container, snapshot_name)
-    if not snap_result.get("success"):
-        out = (snap_result.get("output") or "").strip()
-        return {
-            "error": (
-                f"archive failed: could not create snapshot {snapshot_name} "
-                f"on {container}: {out or 'unknown error'}. "
-                f"Agent left in live list — fix container state and retry."
-            ),
-            "status_code": 500,
-        }
-
-    # 3) If archive.target is set to something other than "pool:", export
-    #    the snapshot as a tarball. "s3://" is logged + skipped (not yet
-    #    implemented per pivot doc §10.2).
-    export_path: str | None = None
-    archive_target = (config.archive or {}).get("target", "pool:")
-    if archive_target and archive_target != "pool:":
-        if archive_target.startswith("path:"):
-            dest_dir = archive_target[len("path:"):]
-            tarball_dir = data_dir / "archive" / archive_subdir
-            tarball_dir.mkdir(parents=True, exist_ok=True)
-            tarball_path = tarball_dir / f"{snapshot_name}.tar.gz"
-            from tinyagentos.containers import _run as _c_run
-            ecode, eout = await _c_run([
-                "incus", "export", f"{container}/{snapshot_name}",
-                str(tarball_path),
-            ], timeout=600)
-            if ecode == 0:
-                export_path = str(tarball_path)
-                logger.info("archive: exported snapshot to %s", export_path)
-            else:
-                logger.warning(
-                    "archive: incus export failed for %s/%s: %s — "
-                    "snapshot still in-pool, export path not recorded",
-                    container, snapshot_name, eout,
-                )
-        elif archive_target.startswith("s3://"):
-            logger.warning(
-                "archive: s3 export target '%s' not yet implemented — "
-                "snapshot lives in-pool only",
-                archive_target,
-            )
-        else:
-            logger.warning("archive: unknown archive.target '%s', ignoring", archive_target)
-
-    # 4) Export chat history to a host-side path alongside any tarball.
-    #    Chat is host-owned state; we don't write inside the container.
-    channel_id = agent.get("chat_channel_id")
-    if channel_id:
-        try:
-            msg_store = request.app.state.chat_messages
-            all_msgs = await msg_store.get_all_messages_for_channel(channel_id)
-            chat_export_dir = archive_base / "chat"
-            chat_export_dir.mkdir(parents=True, exist_ok=True)
-            chat_export_file = chat_export_dir / "chat-export.jsonl"
-            try:
-                with chat_export_file.open("w", encoding="utf-8") as fh:
-                    for m in all_msgs:
-                        fh.write(_json.dumps(m, default=str) + "\n")
-                chat_export_file.chmod(0o600)
-                logger.info(
-                    "archive: wrote %d messages to %s", len(all_msgs), chat_export_file
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "archive: chat-export write failed for %s: %s — "
-                    "messages still in global DB, re-export safe to retry",
-                    slug, exc,
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("archive: chat-export failed for %s: %s", slug, exc)
-
-        # 4b) Flag the channel archived with full metadata.
-        try:
-            ch_store = request.app.state.chat_channels
-            await ch_store.set_settings(
-                channel_id,
-                {
-                    "archived": True,
-                    "archived_at": ts,
-                    "archived_agent_id": agent_id,
-                    "archived_agent_slug": slug,
-                },
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("archive: channel flag failed for %s: %s", channel_id, exc)
-
-    # 5) Revoke LiteLLM key (best effort).
-    llm_key = agent.get("llm_key")
-    llm_proxy = getattr(request.app.state, "llm_proxy", None)
-    if llm_key and llm_proxy and llm_proxy.is_running():
-        try:
-            await llm_proxy.delete_agent_key(llm_key)
-        except Exception:
-            pass
-
-    # 6) Move config entry out of agents into archived_agents.
-    original_snapshot = dict(agent)
-    archive_entry = {
-        "id": agent_id,
-        "archived_at": ts,
-        "archived_slug": slug,
-        "snapshot_name": snapshot_name,
-        "export_path": export_path,
-        "archive_dir": f"archive/{archive_subdir}",
-        "original": original_snapshot,
-    }
-    config.agents = [a for a in config.agents if a["name"] != name]
-    config.archived_agents.append(archive_entry)
-    await save_config_locked(config, config.config_path)
-
-    return {
-        "status": "archived",
-        "name": slug,
-        "id": agent_id,
-        "archived_at": ts,
-        "snapshot_name": snapshot_name,
-        "export_path": export_path,
-    }
-
-
 @router.delete("/api/agents/{name}")
 async def delete_agent(request: Request, name: str):
     """Archive an agent instead of hard-deleting it. The agent's
@@ -415,7 +375,7 @@ async def delete_agent(request: Request, name: str):
     bucket so the user can restore it later — or permanently purge it
     via ``DELETE /api/agents/archived/{id}``.
     """
-    result = await _archive_agent_fully(request, name)
+    result = await agent_archive.archive_agent_fully(request, name)
     if "error" in result:
         return JSONResponse({"error": result["error"]}, status_code=result["status_code"])
     return result
@@ -449,6 +409,10 @@ class DeployAgentRequest(BaseModel):
     memory_config: dict | None = None
     source_persona_id: str | None = None
     save_to_library: dict | None = None  # {"name": str, "description": str|None}
+    # KV-cache quantisation — sent by DeployWizard; defaults mirror normalize_agent.
+    kv_cache_quant_k: str = "fp16"
+    kv_cache_quant_v: str = "fp16"
+    kv_cache_quant_boundary_layers: int = 0
 
 
 @router.post("/api/agents/deploy")
@@ -472,310 +436,290 @@ async def deploy_agent_endpoint(request: Request, body: DeployAgentRequest):
        We never silently retarget a pinned deploy.
     6. Model not found anywhere in the cluster — 404.
     """
-    config = request.app.state.config
-    display_name = body.name.strip()
-    name_error = validate_agent_name(display_name)
-    if name_error:
-        return JSONResponse({"error": name_error}, status_code=400)
-    # Derive a container-safe slug and ensure uniqueness
-    slug = slugify_agent_name(display_name)
-    unique_slug = slug
-    suffix = 2
-    while find_agent(config, unique_slug):
-        unique_slug = f"{slug}-{suffix}"
-        suffix += 1
-        if suffix > 100:
-            return JSONResponse({"error": "Could not generate a unique agent slug"}, status_code=400)
-    # Rewrite body.name to the unique slug; the original user-entered name
-    # is preserved as display_name for the UI.
-    body.name = unique_slug
-    # Validate framework against catalog instead of hardcoded list
-    if body.framework != "none":
-        registry = request.app.state.registry
-        known = {a.id for a in registry.list_available(type_filter="agent-framework")}
-        if body.framework not in known:
-            return JSONResponse({"error": f"Unknown framework '{body.framework}'. Available: {sorted(known)}"}, status_code=400)
+    # --- Idempotency guard ---
+    idempotency_cache = getattr(request.app.state, "idempotency_cache", None)
+    idempotency_key = request.headers.get("Idempotency-Key")
+    # Scope the cache key by endpoint so /api/agents and /api/agents/deploy
+    # cannot collide even when the client reuses the same header value.
+    scoped_key = (
+        f"{request.method}:{request.url.path}:{idempotency_key}"
+        if idempotency_key
+        else None
+    )
+    if scoped_key and idempotency_cache is not None:
+        mode, event = idempotency_cache.try_reserve(scoped_key)
+        if mode == "wait":
+            await event.wait()
+            cached = idempotency_cache.get(scoped_key)
+            if cached is None:
+                return JSONResponse({"error": "concurrent request failed"}, status_code=503)
+            return cached
 
-    # ------------------------------------------------------------------
-    # Cross-worker deploy routing (task #176 stub)
-    # ------------------------------------------------------------------
-    # Resolve the requested model's host BEFORE we touch config or kick
-    # off a background deploy. If the model lives on a remote worker we
-    # need to either route there (no local container) or reject the
-    # deploy with a clear 409 when the user's pin conflicts with where
-    # the model actually is.
-    if body.model:
-        from tinyagentos.cluster.model_resolver import find_model_hosts
-
-        cluster = getattr(request.app.state, "cluster_manager", None)
-        catalog = getattr(request.app.state, "backend_catalog", None)
-        local_models = catalog.all_models() if catalog is not None else []
-
-        # Cloud model ids are whatever openai/anthropic-typed backends
-        # advertise. Keep this a best-effort: missing provider state just
-        # means cloud models resolve as "not_found" and the caller can
-        # retry once providers are configured.
-        cloud_models: list[str] = []
+    # Wrap so any unexpected exception still unblocks idempotency waiters.
+    try:
+        config = request.app.state.config
+        display_name = body.name.strip()
+        name_error = validate_agent_name(display_name)
+        if name_error:
+            if scoped_key and idempotency_cache is not None:
+                idempotency_cache.set(scoped_key, {"error": name_error})
+            return JSONResponse({"error": name_error}, status_code=400)
+        # Derive a container-safe slug and ensure uniqueness
         try:
-            for b in config.backends or []:
-                # All cloud provider types, not just openai/anthropic — kilocode,
-                # openrouter and openai-compatible advertise routable cloud models
-                # too. Mirrors providers.CLOUD_TYPES (#351 tracks consolidating
-                # these lists). Without this, deploying an agent on e.g.
-                # kilo-auto/free 404s as "model not found".
-                if b.get("type") in _CLOUD_PROVIDER_TYPES:
-                    for m in b.get("models") or []:
-                        if isinstance(m, dict):
-                            mid = m.get("id") or m.get("name") or ""
-                        else:
-                            mid = str(m)
-                        if mid:
-                            cloud_models.append(mid)
-        except Exception:  # noqa: BLE001
-            pass
+            unique_slug = unique_agent_slug(config, display_name)
+        except ValueError as e:
+            err = {"error": str(e)}
+            if scoped_key and idempotency_cache is not None:
+                idempotency_cache.set(scoped_key, err)
+            return JSONResponse(err, status_code=400)
+        # Rewrite body.name to the unique slug; the original user-entered name
+        # is preserved as display_name for the UI.
+        body.name = unique_slug
+        # Validate framework against catalog and check RAM headroom.
+        fw_err = agent_deploy.validate_framework_and_ram(request, body)
+        if fw_err is not None:
+            if scoped_key and idempotency_cache is not None:
+                idempotency_cache.set(scoped_key, json.loads(fw_err.body))
+            return fw_err
 
-        location = find_model_hosts(
-            body.model,
-            cluster_state=cluster,
-            local_models=local_models,
-            cloud_models=cloud_models,
-        )
+        # ------------------------------------------------------------------
+        # Cross-worker deploy routing (task #176 stub)
+        # ------------------------------------------------------------------
+        routed = agent_deploy.resolve_deploy_routing(request, body)
+        if routed is not None:
+            if scoped_key and idempotency_cache is not None:
+                idempotency_cache.set(scoped_key, json.loads(routed.body))
+            return routed
 
-        if location.kind == "not_found":
-            return JSONResponse(
-                {
-                    "error": (
-                        f"model '{body.model}' was not found on the controller, "
-                        f"on any online worker, or among configured cloud providers. "
-                        f"Download it first or pick a model that is already in the cluster."
-                    ),
-                },
-                status_code=404,
-            )
+        # Explicit target_worker pin: create the agent container ON that
+        # worker's nested incus (remote deploy) rather than locally. Resolves
+        # the controller callback host (Tailscale IP) and prefetches the base.
+        deploy_remote, deploy_taos_host, remote_err = await agent_deploy.configure_remote_deploy(request, body)
+        if remote_err is not None:
+            if scoped_key and idempotency_cache is not None:
+                idempotency_cache.set(scoped_key, json.loads(remote_err.body))
+            return remote_err
 
-        if location.kind == "worker":
-            # Case 5: pin conflict — user asked for a specific worker
-            # that does not hold the model.
-            if body.target_worker and body.target_worker not in location.hosts:
-                return JSONResponse(
-                    {
-                        "error": (
-                            f"model '{body.model}' is not on worker "
-                            f"'{body.target_worker}'. It is available on: "
-                            f"{location.hosts}. Deploy there, or wait for "
-                            f"Phase 1.5 network model placement."
-                        ),
-                        "model": body.model,
-                        "pinned_worker": body.target_worker,
-                        "available_on": location.hosts,
-                    },
-                    status_code=409,
+        # Register the agent with taosmd BEFORE mutating config so a failure
+        # here aborts cleanly with no half-state.
+        try:
+            tm_agents.register_agent(unique_slug)
+        except tm_agents.AgentExistsError:
+            pass  # idempotent — agent already registered, proceed normally
+        except Exception as e:
+            logger.exception("register_agent(%s) failed", unique_slug)
+            err_body = {"error": f"Could not register agent with taosmd: {e}"}
+            if scoped_key and idempotency_cache is not None:
+                idempotency_cache.set(scoped_key, err_body)
+            return JSONResponse(err_body, status_code=500)
+
+        # Add agent entry immediately with deploying status. qmd_url has
+        # been removed from the agent schema — every agent reads and writes
+        # through the shared host qmd.service, addressed by agent name and
+        # the bind-mounted per-agent SQLite at /memory. See
+        # docs/design/framework-agnostic-runtime.md.
+        from tinyagentos.config import normalize_agent
+        emoji = (body.emoji or "").strip() or None
+        new_agent = normalize_agent({
+            "name": body.name,
+            "display_name": display_name,
+            "host": "",
+            "color": body.color,
+            "emoji": emoji,
+            "status": "deploying",
+            "can_read_user_memory": body.can_read_user_memory,
+            "on_worker_failure": body.on_worker_failure,
+            "fallback_models": [m for m in body.fallback_models if m],
+            "model": body.model,
+            "framework": body.framework,
+        })
+        # Apply persona fields to the agent record.
+        new_agent["soul_md"] = body.soul_md
+        new_agent["agent_md"] = body.agent_md
+        new_agent["memory_plugin"] = body.memory_plugin
+        new_agent["memory_config"] = body.memory_config
+        new_agent["source_persona_id"] = body.source_persona_id
+        new_agent["migrated_to_v2_personas"] = True
+        # Apply KV-cache quantisation choices from the deploy wizard.
+        new_agent["kv_cache_quant_k"] = body.kv_cache_quant_k
+        new_agent["kv_cache_quant_v"] = body.kv_cache_quant_v
+        new_agent["kv_cache_quant_boundary_layers"] = body.kv_cache_quant_boundary_layers
+
+        config.agents.append(new_agent)
+        await save_config_locked(config, config.config_path)
+
+        # Write to user persona library if requested.
+        if body.save_to_library:
+            store = getattr(request.app.state, "user_personas", None)
+            if store is not None:
+                store.create(
+                    name=body.save_to_library.get("name") or body.name,
+                    description=body.save_to_library.get("description"),
+                    soul_md=body.soul_md,
+                    agent_md=body.agent_md,
                 )
 
-            # Cases 3 + 4: route to the worker that holds the model.
-            # Phase 1.5 will actually instruct the worker to launch; for
-            # now we return a 202 naming the destination so the caller
-            # knows where the agent needs to land. Deliberately do NOT
-            # add a local agent entry — a ghost entry on the controller
-            # for an agent that lives on Fedora would confuse both the
-            # UI and the LXC bulk-ops endpoints.
-            chosen = body.target_worker or location.canonical_host
-            return JSONResponse(
-                {
-                    "status": "routed",
-                    "name": body.name,
-                    "model": body.model,
-                    "worker": chosen,
-                    "available_on": location.hosts,
-                    "message": (
-                        f"model '{body.model}' lives on worker '{chosen}'. "
-                        f"Routed deploy target only — remote launch lands "
-                        f"with Phase 1.5 network model placement."
-                    ),
-                },
-                status_code=202,
-            )
-        # kind == "controller" or "cloud": fall through to the unchanged
-        # controller-local deploy path below.
+        # Record deploy task
+        deploy_tasks = request.app.state.deploy_tasks
+        deploy_tasks[body.name] = {"status": "deploying", "name": body.name}
 
-    # Register the agent with taosmd BEFORE mutating config so a failure
-    # here aborts cleanly with no half-state.
-    try:
-        tm_agents.register_agent(unique_slug)
-    except tm_agents.AgentExistsError:
-        pass  # idempotent — agent already registered, proceed normally
-    except Exception as e:
-        logger.exception("register_agent(%s) failed", unique_slug)
-        return JSONResponse(
-            {"error": f"Could not register agent with taosmd: {e}"},
-            status_code=500,
-        )
+        from tinyagentos.deployer import deploy_agent, DeployRequest
+        data_dir = request.app.state.data_dir
+        llm_proxy = getattr(request.app.state, "llm_proxy", None)
+        secrets_store = getattr(request.app.state, "secrets", None)
 
-    # Add agent entry immediately with deploying status. qmd_url has
-    # been removed from the agent schema — every agent reads and writes
-    # through the shared host qmd.service, addressed by agent name and
-    # the bind-mounted per-agent SQLite at /memory. See
-    # docs/design/framework-agnostic-runtime.md.
-    from tinyagentos.config import normalize_agent
-    emoji = (body.emoji or "").strip() or None
-    new_agent = normalize_agent({
-        "name": body.name,
-        "display_name": display_name,
-        "host": "",
-        "color": body.color,
-        "emoji": emoji,
-        "status": "deploying",
-        "can_read_user_memory": body.can_read_user_memory,
-        "on_worker_failure": body.on_worker_failure,
-        "fallback_models": [m for m in body.fallback_models if m],
-        "model": body.model,
-        "framework": body.framework,
-    })
-    # Apply persona fields to the agent record.
-    new_agent["soul_md"] = body.soul_md
-    new_agent["agent_md"] = body.agent_md
-    new_agent["memory_plugin"] = body.memory_plugin
-    new_agent["memory_config"] = body.memory_config
-    new_agent["source_persona_id"] = body.source_persona_id
-    new_agent["migrated_to_v2_personas"] = True
-
-    config.agents.append(new_agent)
-    await save_config_locked(config, config.config_path)
-
-    # Write to user persona library if requested.
-    if body.save_to_library:
-        store = getattr(request.app.state, "user_personas", None)
-        if store is not None:
-            store.create(
-                name=body.save_to_library.get("name") or body.name,
-                description=body.save_to_library.get("description"),
-                soul_md=body.soul_md,
-                agent_md=body.agent_md,
-            )
-
-    # Record deploy task
-    deploy_tasks = request.app.state.deploy_tasks
-    deploy_tasks[body.name] = {"status": "deploying", "name": body.name}
-
-    from tinyagentos.deployer import deploy_agent, DeployRequest
-    data_dir = request.app.state.data_dir
-    llm_proxy = getattr(request.app.state, "llm_proxy", None)
-
-    async def _background_deploy():
-        try:
-            result = await deploy_agent(DeployRequest(
-                name=body.name,
-                framework=body.framework,
-                model=body.model,
-                data_dir=data_dir,
-                color=body.color,
-                emoji=emoji,
-                memory_limit=body.memory_limit,
-                cpu_limit=body.cpu_limit,
-                extra_config={
-                    "llm_proxy": llm_proxy,
-                    "registry": request.app.state.registry,
-                },
-                can_read_user_memory=body.can_read_user_memory,
-            ))
-            agent = find_agent(config, body.name)
-            if result.get("success"):
-                if agent is not None:
-                    agent["host"] = result.get("ip", "")
-                    agent["status"] = "running"
-                    agent["llm_key"] = result.get("llm_key")
-                    # Save config now so the bootstrap endpoint can return
-                    # the llm_key before we start the openclaw service.
-                    await save_config_locked(config, config.config_path)
-                    # Start the openclaw service now that llm_key is written.
-                    # install.sh enables the service but defers start so the
-                    # bootstrap endpoint (which requires llm_key) succeeds.
-                    if body.framework == "openclaw":
-                        try:
-                            from tinyagentos.containers import exec_in_container
-                            container_name = f"taos-agent-{body.name}"
-                            start_code, start_out = await exec_in_container(
-                                container_name,
-                                ["systemctl", "start", "openclaw.service"],
-                                timeout=30,
-                            )
-                            if start_code != 0:
-                                logger.warning(
-                                    "openclaw service start returned %d: %s",
-                                    start_code, start_out
+        async def _background_deploy():
+            try:
+                # Prefetch the base onto the worker here (not in the request
+                # path) so a cold ~300-500MB import never blocks POST /deploy.
+                if deploy_remote:
+                    await agent_deploy.prefetch_base_onto_worker(request, body)
+                result = await deploy_agent(DeployRequest(
+                    name=body.name,
+                    framework=body.framework,
+                    model=body.model,
+                    data_dir=data_dir,
+                    color=body.color,
+                    emoji=emoji,
+                    memory_limit=body.memory_limit,
+                    cpu_limit=body.cpu_limit,
+                    extra_config={
+                        "llm_proxy": llm_proxy,
+                        "registry": request.app.state.registry,
+                    },
+                    can_read_user_memory=body.can_read_user_memory,
+                    secrets_store=secrets_store,
+                    remote=deploy_remote,
+                    taos_host=deploy_taos_host,
+                ))
+                agent = find_agent(config, body.name)
+                if result.get("success"):
+                    if agent is not None:
+                        agent["host"] = result.get("ip", "")
+                        agent["status"] = "running"
+                        agent["llm_key"] = result.get("llm_key")
+                        # Save config now so the bootstrap endpoint can return
+                        # the llm_key before we start the openclaw service.
+                        await save_config_locked(config, config.config_path)
+                        # Start the openclaw service now that llm_key is written.
+                        # install.sh enables the service but defers start so the
+                        # bootstrap endpoint (which requires llm_key) succeeds.
+                        if body.framework == "openclaw":
+                            try:
+                                from tinyagentos.containers import exec_in_container
+                                container_name = f"taos-agent-{body.name}"
+                                start_code, start_out = await exec_in_container(
+                                    container_name,
+                                    ["systemctl", "start", "openclaw.service"],
+                                    timeout=30,
                                 )
-                            else:
-                                logger.info("openclaw.service started in %s", container_name)
-                        except Exception as exc:  # noqa: BLE001
-                            logger.warning("Failed to start openclaw.service: %s", exc)
-                    # Auto-create a 1:1 DM channel so the Messages app
-                    # shows this agent immediately. Safe to call even if
-                    # the channel exists from a prior failed deploy — the
-                    # store doesn't enforce uniqueness on name, so at worst
-                    # you get duplicate entries. In practice this branch
-                    # only runs on first successful deploy for a given
-                    # agent record because the route creates the agent
-                    # with status='deploying'.
-                    if not agent.get("chat_channel_id"):
-                        try:
-                            ch_store = request.app.state.chat_channels
-                            channel = await ch_store.create_channel(
-                                name=display_name,
-                                type="dm",
-                                created_by="user",
-                                members=["user", body.name],
-                                description=f"Direct messages with {display_name}",
-                            )
-                            if channel and channel.get("id"):
-                                agent["chat_channel_id"] = channel["id"]
-                        except Exception as exc:  # noqa: BLE001
-                            # DM channel creation failing shouldn't fail
-                            # the whole deploy — the user can still see
-                            # the agent in the Agents app and retry from
-                            # there. Log and move on.
-                            logger.warning("DM channel create failed for %s: %s", body.name, exc)
-                deploy_tasks[body.name] = {"status": "success", "name": body.name, "result": result}
-            else:
+                                if start_code != 0:
+                                    logger.warning(
+                                        "openclaw service start returned %d: %s",
+                                        start_code, start_out
+                                    )
+                                else:
+                                    logger.info("openclaw.service started in %s", container_name)
+                            except Exception as exc:  # noqa: BLE001
+                                logger.warning("Failed to start openclaw.service: %s", exc)
+                        # Auto-create a 1:1 DM channel so the Messages app
+                        # shows this agent immediately. Safe to call even if
+                        # the channel exists from a prior failed deploy — the
+                        # store doesn't enforce uniqueness on name, so at worst
+                        # you get duplicate entries. In practice this branch
+                        # only runs on first successful deploy for a given
+                        # agent record because the route creates the agent
+                        # with status='deploying'.
+                        if not agent.get("chat_channel_id"):
+                            try:
+                                ch_store = request.app.state.chat_channels
+                                channel = await ch_store.create_channel(
+                                    name=display_name,
+                                    type="dm",
+                                    created_by="user",
+                                    members=["user", body.name],
+                                    description=f"Direct messages with {display_name}",
+                                )
+                                if channel and channel.get("id"):
+                                    agent["chat_channel_id"] = channel["id"]
+                            except Exception as exc:  # noqa: BLE001
+                                # DM channel creation failing shouldn't fail
+                                # the whole deploy — the user can still see
+                                # the agent in the Agents app and retry from
+                                # there. Log and move on.
+                                logger.warning("DM channel create failed for %s: %s", body.name, exc)
+                    deploy_tasks[body.name] = {"status": "success", "name": body.name, "result": result}
+                else:
+                    if agent is not None:
+                        agent["status"] = "failed"
+                    err_msg = result.get("error", "unknown error")
+                    deploy_tasks[body.name] = {
+                        "status": "failed",
+                        "name": body.name,
+                        "error": err_msg,
+                    }
+                    notif = getattr(request.app.state, "notifications", None)
+                    if notif:
+                        await notif.add(
+                            title=f"Deploy failed: {body.name}",
+                            message=f"Deploy failed for {body.name}: {err_msg}",
+                            level="error",
+                            source="agents.deploy",
+                        )
+            except Exception as exc:  # noqa: BLE001
+                agent = find_agent(config, body.name)
                 if agent is not None:
                     agent["status"] = "failed"
+                err_msg = str(exc)
                 deploy_tasks[body.name] = {
                     "status": "failed",
                     "name": body.name,
-                    "error": result.get("error", "unknown error"),
+                    "error": err_msg,
                 }
-        except Exception as exc:  # noqa: BLE001
-            agent = find_agent(config, body.name)
-            if agent is not None:
-                agent["status"] = "failed"
-            deploy_tasks[body.name] = {
-                "status": "failed",
-                "name": body.name,
-                "error": str(exc),
-            }
-        finally:
-            await save_config_locked(config, config.config_path)
+                notif = getattr(request.app.state, "notifications", None)
+                if notif:
+                    await notif.add(
+                        title=f"Deploy failed: {body.name}",
+                        message=f"Deploy failed for {body.name}: {err_msg}",
+                        level="error",
+                        source="agents.deploy",
+                    )
+            finally:
+                await save_config_locked(config, config.config_path)
 
-    asyncio.create_task(_background_deploy())
+        asyncio.create_task(_background_deploy())
 
-    # Archive smoke-check: verify trace path end-to-end after provisioning.
-    # A failure here does NOT abort the deploy — it surfaces a warning flag.
-    archive = getattr(request.app.state, "archive", None)
-    smoke_ok = False
-    if archive is not None:
+        # Archive smoke-check: verify trace path end-to-end after provisioning.
+        # A failure here does NOT abort the deploy — it surfaces a warning flag.
+        smoke_ok = await agent_deploy.archive_smoke_check(request, unique_slug, body.framework)
+
+        result = {"status": "deploying", "name": body.name, "archive_smoke_ok": smoke_ok}
+
+        if scoped_key and idempotency_cache is not None:
+            idempotency_cache.set(scoped_key, result)
+
+        return result
+    finally:
+        # No-op when set() already fired; unblocks waiters on unexpected exceptions.
+        if scoped_key and idempotency_cache is not None:
+            idempotency_cache.release(scoped_key)
+
+
+async def _bulk_container_op(config, op):
+    """Run an async container op over every configured agent, collecting per-agent results.
+
+    `op` is an async callable taking the container name (e.g. start_container).
+    Returns {agent_name: {"success": bool}} or {"success": False, "error": str} on exception.
+    """
+    results = {}
+    for agent in config.agents:
+        name = agent["name"]
         try:
-            await archive.record(
-                event_type="agent_deployed",
-                data={"slug": unique_slug, "framework": body.framework},
-                agent_name=unique_slug,
-                summary=f"deployed {unique_slug}",
-            )
-            rows = await archive.query(agent_name=unique_slug, limit=1)
-            smoke_ok = bool(rows)
-        except Exception:
-            logger.exception("archive smoke-check failed for %s", unique_slug)
-            smoke_ok = False
-
-    return {"status": "deploying", "name": body.name, "archive_smoke_ok": smoke_ok}
+            result = await op(f"taos-agent-{name}")
+            results[name] = {"success": result.get("success", False)}
+        except Exception as e:
+            results[name] = {"success": False, "error": str(e)}
+    return results
 
 
 @router.post("/api/agents/bulk/start")
@@ -783,14 +727,7 @@ async def bulk_start_agents(request: Request):
     """Start all agent containers."""
     from tinyagentos.containers import start_container
     config = request.app.state.config
-    results = {}
-    for agent in config.agents:
-        name = agent["name"]
-        try:
-            result = await start_container(f"taos-agent-{name}")
-            results[name] = {"success": result.get("success", False)}
-        except Exception as e:
-            results[name] = {"success": False, "error": str(e)}
+    results = await _bulk_container_op(config, start_container)
     return {"action": "start", "results": results}
 
 
@@ -803,14 +740,7 @@ async def bulk_stop_agents(request: Request):
     report = {}
     if orchestrator is not None:
         report = await orchestrator.prepare("all", "stop")
-    results = {}
-    for agent in config.agents:
-        name = agent["name"]
-        try:
-            result = await stop_container(f"taos-agent-{name}")
-            results[name] = {"success": result.get("success", False)}
-        except Exception as e:
-            results[name] = {"success": False, "error": str(e)}
+    results = await _bulk_container_op(config, stop_container)
     return {"action": "stop", "prepare_report": report, "results": results}
 
 
@@ -819,14 +749,7 @@ async def bulk_restart_agents(request: Request):
     """Restart all agent containers."""
     from tinyagentos.containers import restart_container
     config = request.app.state.config
-    results = {}
-    for agent in config.agents:
-        name = agent["name"]
-        try:
-            result = await restart_container(f"taos-agent-{name}")
-            results[name] = {"success": result.get("success", False)}
-        except Exception as e:
-            results[name] = {"success": False, "error": str(e)}
+    results = await _bulk_container_op(config, restart_container)
     return {"action": "restart", "results": results}
 
 
@@ -919,7 +842,48 @@ class AgentImport(BaseModel):
 
 
 @router.post("/api/agents/import")
-async def import_agent(request: Request, body: AgentImport):
+async def import_agent(request: Request):
+    """Import an agent.
+
+    Two content types share this path:
+
+    * ``multipart/form-data``: a Hermes profile EXPORT bundle upload
+      (framework + bundle file + name + model + secrets JSON). Deploys a
+      Hermes agent and restores the profile inside the container. Handled
+      by ``agent_import.import_hermes_agent``.
+    * ``application/json``: the existing portable JSON config import
+      (``AgentImport`` body) used by the export/import round-trip.
+
+    Dispatch on Content-Type so both clients keep working on one route.
+    """
+    content_type = request.headers.get("content-type", "")
+    if content_type.startswith("multipart/form-data") or content_type.startswith(
+        "application/x-www-form-urlencoded"
+    ):
+        form = await request.form()
+        bundle = form.get("bundle")
+        return await agent_import.import_hermes_agent(
+            request,
+            framework=str(form.get("framework", "")),
+            bundle=bundle if hasattr(bundle, "filename") else None,
+            name=str(form.get("name", "")),
+            model=(str(form["model"]) if form.get("model") else None),
+            secrets=(str(form["secrets"]) if form.get("secrets") else None),
+        )
+
+    # JSON config import.
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "request body must be JSON or multipart/form-data"}, status_code=400)
+    try:
+        body = AgentImport(**payload)
+    except Exception as e:
+        return JSONResponse({"error": f"invalid import payload: {e}"}, status_code=400)
+    return await _import_agent_json(request, body)
+
+
+async def _import_agent_json(request: Request, body: AgentImport):
     """Import an agent from an exported JSON config."""
     config = request.app.state.config
 
@@ -959,7 +923,7 @@ async def destroy_agent(request: Request, name: str):
     /api/agents/{name} — archives the agent. True permanent deletion
     happens via ``DELETE /api/agents/archived/{id}``.
     """
-    result = await _archive_agent_fully(request, name)
+    result = await agent_archive.archive_agent_fully(request, name)
     if "error" in result:
         return JSONResponse({"error": result["error"]}, status_code=result["status_code"])
     return result
@@ -967,261 +931,54 @@ async def destroy_agent(request: Request, name: str):
 
 @router.post("/api/agents/archived/{archive_id}/restore")
 async def restore_archived_agent(request: Request, archive_id: str):
-    import json as _json
-    from tinyagentos.containers import (
-        snapshot_restore, rename_container, start_container, set_env, exec_in_container,
-    )
-
-    config = request.app.state.config
-    entry = next((a for a in config.archived_agents if a.get("id") == archive_id), None)
-    if entry is None:
-        return JSONResponse({"error": f"Archived agent '{archive_id}' not found"}, status_code=404)
-
-    original = entry.get("original", {}) or {}
-    desired_slug = entry.get("archived_slug") or original.get("name")
-    if not desired_slug:
-        return JSONResponse({"error": "Archive entry is corrupted (no slug)"}, status_code=500)
-
-    snapshot_name = entry.get("snapshot_name")
-    if not snapshot_name:
-        return JSONResponse(
-            {"error": "Archive entry has no snapshot_name — created with legacy archive path"},
-            status_code=500,
-        )
-
-    # The container name is derived from the original slug (unchanged since
-    # archive; we snapshot in-place, not rename).
-    container = f"taos-agent-{desired_slug}"
-
-    # Resolve slug collisions with currently-live agents.
-    final_slug = desired_slug
-    suffix = 2
-    while find_agent(config, final_slug):
-        final_slug = f"{desired_slug}-{suffix}"
-        suffix += 1
-        if suffix > 100:
-            return JSONResponse({"error": "Could not resolve restore slug"}, status_code=500)
-
-    data_dir = request.app.state.data_dir
-    archive_base = data_dir / entry.get("archive_dir", "")
-
-    # 1) Restore snapshot. Container must be stopped (archive left it stopped).
-    snap_result = await snapshot_restore(container, snapshot_name)
-    if not snap_result.get("success"):
-        out = (snap_result.get("output") or "").strip()
-        return JSONResponse(
-            {
-                "error": (
-                    f"restore failed: snapshot_restore {container}/{snapshot_name} "
-                    f"failed: {out or 'unknown error'}"
-                ),
-            },
-            status_code=500,
-        )
-
-    # 2) Rename if the slug changed (collision resolution).
-    rename_ok = True
-    target_container = f"taos-agent-{final_slug}"
-    if final_slug != desired_slug:
-        try:
-            rename_result = await rename_container(container, target_container)
-            rename_ok = rename_result.get("success", False)
-            if not rename_ok:
-                logger.warning(
-                    "restore: rename %s -> %s failed: %s",
-                    container, target_container, rename_result.get("output", ""),
-                )
-        except Exception as exc:  # noqa: BLE001
-            rename_ok = False
-            logger.warning("restore: rename failed: %s", exc)
-    else:
-        target_container = container
-
-    # 3) Start container.
-    try:
-        await start_container(target_container)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("restore: start_container failed for %s: %s", target_container, exc)
-
-    # 4) Mint new LiteLLM key if proxy running.
-    llm_proxy = getattr(request.app.state, "llm_proxy", None)
-    new_key = None
-    if llm_proxy and llm_proxy.is_running():
-        try:
-            new_key = await llm_proxy.create_agent_key(final_slug)
-        except Exception:
-            pass
-
-    # 5) Update openclaw env in the restored container with the new key.
-    #    Uses incus config set environment.OPENAI_API_KEY=<new> so the
-    #    value persists in the container's config and does not require a
-    #    bind-mounted file. Also restart openclaw.service if present.
-    if new_key is not None:
-        try:
-            env_result = await set_env(target_container, "OPENAI_API_KEY", new_key)
-            if not env_result.get("success"):
-                logger.warning(
-                    "restore: set_env OPENAI_API_KEY failed for %s: %s",
-                    target_container, env_result.get("output", ""),
-                )
-            else:
-                # Best-effort: restart openclaw.service if it is present.
-                try:
-                    await exec_in_container(
-                        target_container,
-                        ["systemctl", "restart", "openclaw.service"],
-                        timeout=30,
-                    )
-                except Exception:
-                    pass
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("restore: env key update failed for %s: %s", target_container, exc)
-
-    # 6) Re-import chat-export.jsonl from the archive path if present.
-    try:
-        chat_export_file = archive_base / "chat" / "chat-export.jsonl"
-        if chat_export_file.exists():
-            msg_store = request.app.state.chat_messages
-            imported = 0
-            try:
-                with chat_export_file.open("r", encoding="utf-8") as fh:
-                    for raw_line in fh:
-                        raw_line = raw_line.strip()
-                        if not raw_line:
-                            continue
-                        try:
-                            msg = _json.loads(raw_line)
-                            await msg_store.ensure_message(msg)
-                            imported += 1
-                        except Exception as line_exc:  # noqa: BLE001
-                            logger.warning("restore: bad export line, skipping: %s", line_exc)
-                logger.info("restore: re-imported %d messages from chat-export", imported)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("restore: chat-export read failed for %s: %s", final_slug, exc)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("restore: chat re-import outer failed: %s", exc)
-
-    # 7) Unflag all channels where archived_agent_id matches this archive entry.
-    agent_id_to_unflag = entry.get("id")
-    try:
-        ch_store = request.app.state.chat_channels
-        channel_id = original.get("chat_channel_id")
-        if channel_id:
-            await ch_store.set_settings(channel_id, {"archived": False})
-        all_channels = await ch_store.list_channels(archived=True)
-        for ch in all_channels:
-            ch_settings = ch.get("settings") or {}
-            if ch_settings.get("archived_agent_id") == agent_id_to_unflag:
-                await ch_store.set_settings(ch["id"], {"archived": False})
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("restore: channel unflag failed: %s", exc)
-
-    # 8) Move config entry from archived_agents back to agents.
-    restored = dict(original)
-    restored["name"] = final_slug
-    restored["status"] = "stopped"
-    restored["host"] = ""
-    if new_key is not None:
-        restored["llm_key"] = new_key
-    config.agents.append(restored)
-    config.archived_agents = [a for a in config.archived_agents if a.get("id") != archive_id]
-    await save_config_locked(config, config.config_path)
-
-    return {
-        "status": "restored",
-        "id": archive_id,
-        "name": final_slug,
-        "display_name": restored.get("display_name", final_slug),
-        "container_renamed": rename_ok,
-        "new_llm_key": new_key is not None,
-    }
+    return await agent_archive.restore_archived(request, archive_id)
 
 
 @router.delete("/api/agents/archived/{archive_id}")
 async def purge_archived_agent(request: Request, archive_id: str):
-    """True permanent deletion: destroys the archived container (and all its
-    snapshots) via ``incus delete --force``, wipes any exported tarball,
-    deletes chat channels and messages, and drops the config entry.
-    Irreversible.
-    """
-    import shutil
-    from tinyagentos.containers import destroy_container
+    return await agent_archive.purge_archived(request, archive_id)
+
+
+@router.post("/api/agents/reconcile-orphan-channels")
+async def reconcile_orphan_channels(request: Request):
+    """Archive agent DM channels whose agent is in no list (active, failed,
+    or archived). Idempotent; never hard-deletes. Returns the channels
+    archived on this pass."""
+    from tinyagentos.chat.orphan_reconcile import reconcile_orphan_dm_channels
 
     config = request.app.state.config
-    entry = next((a for a in config.archived_agents if a.get("id") == archive_id), None)
-    if entry is None:
-        return JSONResponse({"error": f"Archived agent '{archive_id}' not found"}, status_code=404)
+    chat_channels = request.app.state.chat_channels
+    registry_ids = await _registry_canonical_ids(request.app.state)
+    archived = await reconcile_orphan_dm_channels(
+        config, chat_channels, registry_ids=registry_ids
+    )
+    return {"status": "ok", "archived": archived, "count": len(archived)}
 
-    archived_slug = entry.get("archived_slug") or (entry.get("original") or {}).get("name") or ""
-    container_name = f"taos-agent-{archived_slug}" if archived_slug else ""
-    data_dir = request.app.state.data_dir
-    archive_base = data_dir / entry.get("archive_dir", "")
 
-    # 1) Destroy container (destroys all snapshots too in incus).
-    #    "not found" is fine — container may already be gone.
-    if container_name:
-        try:
-            await destroy_container(container_name)
-        except Exception:
-            pass
+@router.post("/api/agents/reconcile-orphan-containers")
+async def reconcile_orphan_containers(request: Request, clean: bool = False):
+    """Find taOS containers with no backing agent record (live or archived).
 
-    # 2) Wipe exported archive tarball path if one was recorded.
-    export_path = entry.get("export_path")
-    if export_path:
-        import os as _os
-        try:
-            if _os.path.isdir(export_path):
-                shutil.rmtree(export_path, ignore_errors=True)
-            elif _os.path.isfile(export_path):
-                _os.unlink(export_path)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("purge: export path cleanup failed %s: %s", export_path, exc)
+    Report-only by default. Pass ``?clean=true`` to snapshot-then-archive each
+    orphan so it gets a restore point and shows in Archived. Idempotent; only
+    ever touches containers carrying the taOS naming prefix."""
+    from tinyagentos.agent_orphan_reconcile import reconcile_orphaned_agent_containers
 
-    # 3) Wipe archive dir (chat-export + any other host-side state).
-    if archive_base.exists():
-        try:
-            shutil.rmtree(archive_base, ignore_errors=True)
-        except Exception:
-            pass
+    results = await reconcile_orphaned_agent_containers(request, clean=clean)
+    return {"status": "ok", "containers": results, "count": len(results)}
 
-    # 4) Delete messages + channels for every DM channel belonging to this agent.
-    archive_id_for_purge = entry.get("id")
+
+async def _registry_canonical_ids(state) -> list[str]:
+    """Best-effort list of canonical agent ids from the registry, so the
+    reconcile can recognise a former agent whose config row is gone."""
+    registry = getattr(state, "agent_registry", None)
+    if registry is None:
+        return []
     try:
-        ch_store = request.app.state.chat_channels
-        msg_store = request.app.state.chat_messages
-        channels_to_purge: list[str] = []
-        channel_id = (entry.get("original") or {}).get("chat_channel_id")
-        if channel_id:
-            channels_to_purge.append(channel_id)
-        try:
-            archived_channels = await ch_store.list_channels(archived=True)
-            for ch in archived_channels:
-                ch_settings = ch.get("settings") or {}
-                if (
-                    ch_settings.get("archived_agent_id") == archive_id_for_purge
-                    and ch["id"] not in channels_to_purge
-                ):
-                    channels_to_purge.append(ch["id"])
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("purge: channel scan failed: %s", exc)
-
-        for cid in channels_to_purge:
-            try:
-                await msg_store.delete_channel_messages(cid)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("purge: delete messages for channel %s failed: %s", cid, exc)
-            try:
-                await ch_store.delete_channel(cid)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("purge: delete channel %s failed: %s", cid, exc)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("purge: channel/message cleanup failed: %s", exc)
-
-    # 5) Drop archived_agents entry.
-    config.archived_agents = [a for a in config.archived_agents if a.get("id") != archive_id]
-    await save_config_locked(config, config.config_path)
-
-    return {"status": "purged", "id": archive_id}
+        rows = await registry.list_all()
+    except Exception:  # noqa: BLE001
+        return []
+    return [r.get("canonical_id") for r in rows if r.get("canonical_id")]
 
 
 @router.post("/api/agents/{name}/resume")
@@ -1319,32 +1076,22 @@ async def update_agent_model(request: Request, name: str, body: AgentModelUpdate
         return JSONResponse({"error": "model must not be empty"}, status_code=400)
 
     # Validate reachability against the live cluster state.
-    from tinyagentos.cluster.model_resolver import find_model_hosts
-
-    cluster = getattr(request.app.state, "cluster_manager", None)
-    catalog = getattr(request.app.state, "backend_catalog", None)
-    local_models = catalog.all_models() if catalog is not None else []
-
-    cloud_models: list[str] = []
-    try:
-        for b in config.backends or []:
-            # All cloud provider types (see _CLOUD_PROVIDER_TYPES / #351), so a
-            # model change to a kilocode/openrouter/openai-compatible model
-            # resolves instead of 404ing.
-            if b.get("type") in _CLOUD_PROVIDER_TYPES:
-                for m in b.get("models") or []:
-                    mid = (m.get("id") or m.get("name") or "") if isinstance(m, dict) else str(m)
-                    if mid:
-                        cloud_models.append(mid)
-    except Exception:  # noqa: BLE001
-        pass
-
-    location = find_model_hosts(
-        model_id,
-        cluster_state=cluster,
-        local_models=local_models,
-        cloud_models=cloud_models,
+    from tinyagentos.cluster.model_resolver import (
+        describe_downloaded_backend_down,
+        resolve_model_location,
     )
+
+    location = resolve_model_location(request, model_id)
+
+    if location.kind == "downloaded_backend_down":
+        return JSONResponse(
+            {
+                "error": describe_downloaded_backend_down(location, model_id),
+                "model": model_id,
+                "backend": location.backend_id,
+            },
+            status_code=409,
+        )
 
     if location.kind == "not_found":
         return JSONResponse(
@@ -1363,12 +1110,189 @@ async def update_agent_model(request: Request, name: str, body: AgentModelUpdate
     agent["model"] = model_id
     was_paused = agent.get("paused", False)
     agent["paused"] = False
+
+    # Ensure the new primary is in the permitted set and scope the key to
+    # the full permitted set (not just [model_id]).
+    permitted = agent.get("permitted_models") or []
+    if model_id not in permitted:
+        permitted = [model_id, *permitted]
+    agent["permitted_models"] = permitted
+
     await save_config_locked(config, config.config_path)
+
+    # Re-scope the agent's LiteLLM virtual key so it's actually ALLOWED to use
+    # the new model — without this the change only updates taOS's record and
+    # LiteLLM would 403 the new model. The key value is unchanged, so no
+    # container restart/env push is needed; the framework's /v1/models (with
+    # this key) reflects the new permitted set immediately. (Routing-only mode
+    # without a key DB is a no-op.) Pushing model.primary into the framework
+    # config + reverse reconcile from the framework are tracked in #570.
+    proxy = getattr(request.app.state, "llm_proxy", None)
+    llm_key = agent.get("llm_key")
+    key_rescoped = False
+    if proxy is not None and llm_key:
+        try:
+            key_rescoped = await proxy.update_agent_key(llm_key, permitted)
+        except Exception:
+            logger.exception("update_agent_model: re-scoping key for %s failed", name)
+
+    framework = agent.get("framework")
+    if framework in ("openclaw", "hermes"):
+        from tinyagentos.framework_model_sync import push_model_config_to_framework
+        try:
+            await push_model_config_to_framework(name, framework, agent["model"], permitted)
+        except Exception:
+            logger.exception("model sync: pushing framework config for %s failed", name)
 
     return {
         "status": "updated",
         "name": name,
         "model": model_id,
+        "permitted": permitted,
         "resumed": was_paused,
         "location": location.kind,
+        "key_rescoped": key_rescoped,
     }
+
+
+@router.get("/api/agents/{name}/permitted-models")
+async def get_permitted_models(request: Request, name: str):
+    """Return the permitted model set and current primary for an agent."""
+    config = request.app.state.config
+    agent = find_agent(config, name)
+    if not agent:
+        return JSONResponse({"error": f"Agent '{name}' not found"}, status_code=404)
+    permitted = [m for m in (agent.get("permitted_models") or [agent.get("model")]) if m]
+    return {"permitted": permitted, "current": agent.get("model")}
+
+
+class PermittedModelsUpdate(BaseModel):
+    models: list[str]
+
+
+@router.put("/api/agents/{name}/permitted-models")
+async def set_permitted_models(request: Request, name: str, body: PermittedModelsUpdate):
+    """Set the permitted model set for an agent and re-scope its LiteLLM key."""
+    config = request.app.state.config
+    agent = find_agent(config, name)
+    if not agent:
+        return JSONResponse({"error": f"Agent '{name}' not found"}, status_code=404)
+
+    if not body.models:
+        return JSONResponse({"error": "models must not be empty"}, status_code=400)
+
+    # Build the final set up front — the current primary must always be a
+    # member — so it is validated alongside the requested models. Otherwise an
+    # unreachable current model could be injected into the key scope unchecked.
+    permitted = list(body.models)
+    current = agent.get("model")
+    if current and current not in permitted:
+        permitted = [current, *permitted]
+
+    from tinyagentos.cluster.model_resolver import (
+        describe_downloaded_backend_down,
+        resolve_model_location,
+    )
+
+    for model_id in permitted:
+        location = resolve_model_location(request, model_id)
+        if location.kind == "downloaded_backend_down":
+            return JSONResponse(
+                {
+                    "error": describe_downloaded_backend_down(location, model_id),
+                    "model": model_id,
+                    "backend": location.backend_id,
+                },
+                status_code=409,
+            )
+        if location.kind == "not_found":
+            return JSONResponse(
+                {"error": f"model '{model_id}' is not reachable anywhere in the cluster right now.", "model": model_id},
+                status_code=409,
+            )
+
+    agent["permitted_models"] = permitted
+    await save_config_locked(config, config.config_path)
+
+    proxy = getattr(request.app.state, "llm_proxy", None)
+    llm_key = agent.get("llm_key")
+    key_rescoped = False
+    if proxy is not None and llm_key:
+        try:
+            key_rescoped = await proxy.update_agent_key(llm_key, permitted)
+        except Exception:
+            logger.exception("set_permitted_models: re-scoping key for %s failed", name)
+
+    framework = agent.get("framework")
+    if framework in ("openclaw", "hermes"):
+        from tinyagentos.framework_model_sync import push_model_config_to_framework
+        try:
+            await push_model_config_to_framework(name, framework, agent["model"], permitted)
+        except Exception:
+            logger.exception("model sync: pushing framework config for %s failed", name)
+
+    return {
+        "status": "updated",
+        "name": name,
+        "permitted": permitted,
+        "current": agent.get("model"),
+        "key_rescoped": key_rescoped,
+    }
+
+
+def _budget_store_for_request(request: Request):
+    from tinyagentos.agent_budget_store import AgentBudgetStore, default_budget_path
+    data_dir = request.app.state.data_dir
+    return AgentBudgetStore(default_budget_path(data_dir))
+
+
+def _budget_response(agent_name: str, rec: dict | None) -> dict:
+    if rec is None:
+        return {"agent": agent_name, "max_budget_usd": None, "spend_usd": 0.0}
+    return {"agent": rec["agent"], "max_budget_usd": rec["max_budget_usd"], "spend_usd": rec["spend_usd"]}
+
+
+@router.get("/api/agents/{name}/budget")
+async def get_agent_budget(request: Request, name: str):
+    """Return an agent's LLM budget cap and current spend."""
+    config = request.app.state.config
+    agent = find_agent(config, name)
+    if not agent:
+        return JSONResponse({"error": f"Agent '{name}' not found"}, status_code=404)
+    store = _budget_store_for_request(request)
+    return _budget_response(name, store.get(name))
+
+
+class AgentBudgetUpdate(BaseModel):
+    max_budget_usd: float | None
+
+
+@router.put("/api/agents/{name}/budget")
+async def set_agent_budget(request: Request, name: str, body: AgentBudgetUpdate):
+    """Set (or clear, with null) an agent's LLM budget cap."""
+    config = request.app.state.config
+    agent = find_agent(config, name)
+    if not agent:
+        return JSONResponse({"error": f"Agent '{name}' not found"}, status_code=404)
+    if body.max_budget_usd is not None and (
+        not math.isfinite(body.max_budget_usd) or body.max_budget_usd < 0
+    ):
+        return JSONResponse(
+            {"error": "max_budget_usd must be null or a finite non-negative number"},
+            status_code=400,
+        )
+    store = _budget_store_for_request(request)
+    store.set_budget(name, body.max_budget_usd)
+    return _budget_response(name, store.get(name))
+
+
+@router.post("/api/agents/{name}/budget/reset")
+async def reset_agent_budget(request: Request, name: str):
+    """Zero an agent's recorded spend, keeping its cap in place."""
+    config = request.app.state.config
+    agent = find_agent(config, name)
+    if not agent:
+        return JSONResponse({"error": f"Agent '{name}' not found"}, status_code=404)
+    store = _budget_store_for_request(request)
+    store.reset_spend(name)
+    return _budget_response(name, store.get(name))

@@ -5,6 +5,8 @@ version: 0.9.5
 description: "Lightricks open video gen — 2B params, real-time generation on H100, 24 fps, 768×512. Apache-2.0 weights, fastest open video model in its class."
 homepage: https://huggingface.co/Lightricks/LTX-Video
 license: Apache-2.0
+# T5 text-encoder prompt limit (diffusers LTXPipeline max_sequence_length default).
+context_window: 128
 capabilities:
 - video-generation
 - image-to-video

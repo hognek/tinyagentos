@@ -33,6 +33,10 @@ export interface AggregatedModel {
   /** Optional format (GGUF, etc.). */
   format?: string;
   quantization?: string;
+  /** Catalog manifest id — set for controller-local files the backend could
+   *  match against a manifest variant's naming convention. Lets Delete call
+   *  DELETE /api/models/{modelId} instead of guessing it from the filename. */
+  modelId?: string;
 }
 
 const SIZE_RE = /[Qq]\d[_A-Za-z0-9]*/;
@@ -46,6 +50,7 @@ export interface ControllerDownloaded {
   filename: string;
   size_mb?: number;
   format?: string;
+  model_id?: string;
 }
 
 /** Map a controller /api/models downloaded_files entry to an AggregatedModel. */
@@ -64,6 +69,7 @@ export function controllerDownloadedToAggregated(
     size: fmtSize(d.size_mb ?? 0),
     format: (d.format ?? "bin").toUpperCase(),
     quantization: quant,
+    modelId: d.model_id,
   };
 }
 
@@ -121,7 +127,7 @@ export interface CloudProvider {
   source?: string;
 }
 
-export const CLOUD_PROVIDER_TYPES = ["openai", "anthropic", "openrouter", "kilocode", "openai-compatible"] as const;
+export const CLOUD_PROVIDER_TYPES = ["openai", "anthropic", "openrouter", "kilocode", "deepseek", "openai-compatible"] as const;
 
 /** Flatten /api/providers cloud providers into AggregatedModel entries. */
 export function cloudProvidersToAggregated(providers: CloudProvider[]): AggregatedModel[] {
@@ -238,6 +244,97 @@ export async function fetchCloudProviders(): Promise<CloudProvider[]> {
   } catch {
     return [];
   }
+}
+
+/**
+ * Build the unified agent model list exactly the way the agent deploy
+ * wizard does, so every model chooser (deploy wizard, taOS agent settings)
+ * shows the same set: downloaded controller-catalog models, cluster-worker
+ * models, and cloud-provider models from LiteLLM's /v1/models keyed back to
+ * their provider via /api/providers.
+ *
+ * The cloud lane intersects LiteLLM's authoritative /v1/models with the
+ * provider map so each entry lands under the right source (cloud / worker /
+ * controller) and aliases LiteLLM exposes for routing are dropped.
+ */
+export async function loadAgentModels(): Promise<AggregatedModel[]> {
+  const out: AggregatedModel[] = [];
+
+  // 1) Downloaded controller-catalog models.
+  try {
+    const res = await fetch("/api/models", { headers: { Accept: "application/json" } });
+    const ct = res.headers.get("content-type") ?? "";
+    if (res.ok && ct.includes("application/json")) {
+      const data = await res.json();
+      const list: Record<string, unknown>[] = Array.isArray(data)
+        ? data
+        : Array.isArray(data?.models) ? data.models : [];
+      for (const m of list.filter((m) => m.has_downloaded_variant === true)) {
+        out.push({
+          key: `controller:${String(m.id)}`,
+          id: String(m.id),
+          name: String(m.name ?? m.id),
+          host: "controller",
+          hostKind: "controller",
+        });
+      }
+    }
+  } catch { /* leave controller models empty */ }
+
+  // 2) Cluster-worker-hosted models.
+  try {
+    const workers = await fetchClusterWorkers();
+    out.push(...workersToAggregated(workers));
+  } catch { /* leave worker models empty */ }
+
+  // 3) Cloud-provider models: LiteLLM /v1/models keyed back to a provider.
+  try {
+    const [modelsRes, providers] = await Promise.all([
+      fetch("/api/providers/models?refresh=true", { headers: { Accept: "application/json" } }),
+      fetchCloudProviders(),
+    ]);
+    const providerByModelId = new Map<string, { name: string; kind: ModelHostKind }>();
+    for (const p of providers) {
+      const isCloud = (CLOUD_PROVIDER_TYPES as readonly string[]).includes(p.type ?? "");
+      const isNetwork = typeof p.source === "string" && p.source.startsWith("worker:");
+      const kind: ModelHostKind = isCloud ? "cloud" : isNetwork ? "worker" : "controller";
+      const pname = p.name ?? p.type ?? "provider";
+      for (const m of Array.isArray(p.models) ? p.models : []) {
+        const mid = m.id ?? m.name;
+        if (mid && !providerByModelId.has(mid)) providerByModelId.set(mid, { name: pname, kind });
+      }
+    }
+    const mct = modelsRes.headers.get("content-type") ?? "";
+    if (modelsRes.ok && mct.includes("application/json")) {
+      const body = await modelsRes.json();
+      const data: { id?: string }[] = Array.isArray(body?.data) ? body.data : [];
+      for (const entry of data) {
+        const mid = entry?.id;
+        if (!mid || typeof mid !== "string") continue;
+        if (mid === "default" || mid === "taos-embedding-default") continue;
+        const provider = providerByModelId.get(mid);
+        if (!provider) continue; // LiteLLM internal alias, not a real provider model
+        out.push({
+          key: `${provider.kind}:${provider.name}:${mid}`,
+          id: mid,
+          name: `${mid} (${provider.name})`,
+          host: provider.name,
+          hostKind: provider.kind,
+        });
+      }
+    }
+  } catch { /* leave cloud models empty */ }
+
+  // Dedupe on (hostKind, host, id); first writer wins (controller over worker).
+  const seen = new Set<string>();
+  const union: AggregatedModel[] = [];
+  for (const m of out) {
+    const k = `${m.hostKind}:${m.host}:${m.id}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    union.push(m);
+  }
+  return union;
 }
 
 /** Teal host badge class matching the Loaded Models widget. */

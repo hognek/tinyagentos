@@ -5,6 +5,8 @@ import { useWidgetStore } from "@/stores/widget-store";
 import { useNotificationStore } from "@/stores/notification-store";
 import { useProcessStore } from "@/stores/process-store";
 import { StatusIndicators } from "./StatusIndicators";
+import { AgentKillSwitch } from "./AgentKillSwitch";
+import { withCsrf } from "@/lib/csrf";
 
 interface Props {
   onSearchOpen: () => void;
@@ -15,7 +17,7 @@ function PowerMenu() {
   const openWindow = useProcessStore((s) => s.openWindow);
 
   const lock = async () => {
-    await fetch("/auth/lock", { method: "POST", credentials: "include" }).catch(() => {});
+    await fetch("/auth/lock", { method: "POST", credentials: "include", headers: withCsrf({ method: "POST" })?.headers }).catch(() => {});
     window.location.reload();
   };
 
@@ -50,8 +52,7 @@ function PowerMenu() {
           align="end"
           sideOffset={6}
           className="z-50 min-w-[180px] rounded-xl border border-white/10 bg-shell-surface p-1.5 shadow-2xl backdrop-blur-xl"
-          style={{ backgroundColor: "rgba(28,26,44,0.96)" }}
-          onEscapeKeyDown={() => {}}
+          style={{ backgroundColor: "var(--color-dock-bg)" }}
         >
           <DropdownMenu.Item
             className={menuItem}
@@ -98,7 +99,7 @@ function PowerMenu() {
 export function TopBar({ onSearchOpen, onAssistantOpen }: Props) {
   const clock = useClock();
   const { showWidgets, toggleWidgets } = useWidgetStore();
-  const unreadCount = useNotificationStore((s) => s.notifications.filter((n) => !n.read).length);
+  const unreadCount = useNotificationStore((s) => s.notifications.filter((n) => !n.read && !n.archived).length);
   const toggleCentre = useNotificationStore((s) => s.toggleCentre);
 
   return (
@@ -118,8 +119,8 @@ export function TopBar({ onSearchOpen, onAssistantOpen }: Props) {
       <button
         onClick={onAssistantOpen}
         className="ml-3 p-1 rounded hover:bg-shell-surface-hover transition-colors text-shell-text-secondary"
-        aria-label="Open taOS Assistant"
-        title="taOS Assistant"
+        aria-label="Open taOS agent"
+        title="taOS agent"
       >
         <Sparkles size={14} />
       </button>
@@ -137,6 +138,7 @@ export function TopBar({ onSearchOpen, onAssistantOpen }: Props) {
       <div className="flex items-center gap-3 ml-auto">
         <StatusIndicators />
         <span className="text-xs text-shell-text-tertiary">{clock}</span>
+        <AgentKillSwitch />
         <PowerMenu />
         <button
           onClick={toggleWidgets}

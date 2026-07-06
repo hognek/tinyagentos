@@ -11,8 +11,12 @@ import {
   Check,
   RefreshCw,
   Trash2,
-  BookmarkPlus,
+  Bookmark,
+  ArrowUp,
+  ArrowDown,
+  MessageSquare,
   Eye,
+  AlignLeft,
 } from "lucide-react";
 import { Button, Input } from "@/components/ui";
 import {
@@ -34,6 +38,7 @@ import { listItems, deleteItem, ingestUrl } from "@/lib/knowledge";
 import type { KnowledgeItem } from "@/lib/knowledge";
 import { MobileSplitView } from "@/components/mobile/MobileSplitView";
 import { useIsMobile } from "@/hooks/use-is-mobile";
+import "./RedditApp.css";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -90,46 +95,32 @@ function CommentNode({ comment, maxDepth = 4 }: CommentNodeProps) {
   const toggleCollapse = () => setCollapsed((v) => !v);
 
   return (
-    <li
-      role="listitem"
-      className="text-sm"
-      style={{ marginLeft: comment.depth > 0 ? "2rem" : 0 }}
-    >
+    <li role="listitem">
       {/* Comment header */}
-      <div className="flex items-center gap-2 py-0.5">
+      <div className="rd-cmt-head">
         <button
+          className="rd-collapse"
           aria-label={collapsed ? "Expand comment" : "Collapse comment"}
           aria-expanded={!collapsed}
           onClick={toggleCollapse}
-          className="text-shell-text-tertiary hover:text-shell-text shrink-0"
         >
-          {collapsed ? (
-            <ChevronRight size={13} />
-          ) : (
-            <ChevronDown size={13} />
-          )}
+          {collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} />}
         </button>
         {isDeleted ? (
-          <span className="text-shell-text-tertiary italic text-xs">
+          <span className="rd-cmt-meta" style={{ fontStyle: "italic" }}>
             [deleted]
           </span>
         ) : (
           <>
-            <span className="font-semibold text-xs text-shell-text">
-              u/{comment.author}
-            </span>
+            <span className="rd-cmt-author">u/{comment.author}</span>
             {comment.distinguished === "moderator" && (
-              <span className="text-[10px] text-green-400 font-semibold">MOD</span>
+              <span className="rd-mod">MOD</span>
             )}
-            <span className="text-shell-text-tertiary text-xs">
-              {formatScore(comment.score)} pts
-            </span>
-            <span className="text-shell-text-tertiary text-xs">·</span>
-            <span className="text-shell-text-tertiary text-xs">
-              {timeAgo(comment.created_utc)}
-            </span>
+            <span className="rd-cmt-meta">{formatScore(comment.score)} pts</span>
+            <span className="rd-cmt-meta">·</span>
+            <span className="rd-cmt-meta">{timeAgo(comment.created_utc)}</span>
             {comment.edited && (
-              <span className="text-shell-text-tertiary text-xs italic">
+              <span className="rd-cmt-meta" style={{ fontStyle: "italic" }}>
                 (edited)
               </span>
             )}
@@ -139,29 +130,36 @@ function CommentNode({ comment, maxDepth = 4 }: CommentNodeProps) {
 
       {/* Comment body */}
       {!collapsed && !isDeleted && (
-        <p className="text-shell-text-secondary text-xs whitespace-pre-wrap mt-0.5 ml-5 pb-1 leading-relaxed">
+        <p className="rd-cmt-body" style={{ marginLeft: 20 }}>
           {comment.body}
         </p>
       )}
 
       {/* Replies */}
       {!collapsed && comment.replies.length > 0 && (
-        <div className="border-l border-white/5 ml-5 mt-0.5">
-          {showReplies || comment.depth < maxDepth ? (
-            <ul role="list" className="space-y-1">
-              {comment.replies.map((r) => (
-                <CommentNode key={r.id} comment={r} maxDepth={maxDepth} />
-              ))}
-            </ul>
-          ) : (
-            <button
-              className="text-xs text-accent hover:underline ml-3 py-0.5"
-              onClick={() => setShowReplies(true)}
-              aria-label={`Show ${comment.replies.length} more replies`}
-            >
-              Show {comment.replies.length} more {comment.replies.length === 1 ? "reply" : "replies"}
-            </button>
-          )}
+        <div className="rd-cmt-rail">
+          <div className="rd-thread-line" />
+          <div style={{ flex: 1, minWidth: 0 }}>
+            {showReplies || comment.depth < maxDepth ? (
+              <ul
+                role="list"
+                style={{ display: "flex", flexDirection: "column", gap: 4 }}
+              >
+                {comment.replies.map((r) => (
+                  <CommentNode key={r.id} comment={r} maxDepth={maxDepth} />
+                ))}
+              </ul>
+            ) : (
+              <button
+                className="rd-more-replies"
+                onClick={() => setShowReplies(true)}
+                aria-label={`Show ${comment.replies.length} more replies`}
+              >
+                Show {comment.replies.length} more{" "}
+                {comment.replies.length === 1 ? "reply" : "replies"}
+              </button>
+            )}
+          </div>
         </div>
       )}
     </li>
@@ -191,100 +189,82 @@ function PostCard({ post, savedItem, onOpen, onSave, saving }: PostCardProps) {
   };
 
   return (
-    <div
-      className="border border-white/5 rounded-lg p-3 bg-shell-surface/30 hover:bg-shell-surface/50 transition-colors"
-      role="article"
-    >
-      {/* Title row */}
-      <div className="flex items-start gap-2 mb-1">
-        <div className="flex-1 min-w-0">
+    <article className="rd-post">
+      {/* Vote rail — shows the post score with the Reddit upvote affordance */}
+      <div className="rd-vote">
+        <span className="rd-arrow up" aria-hidden="true">
+          <ArrowUp size={17} />
+        </span>
+        <span className="rd-score">{formatScore(post.score)}</span>
+        <span className="rd-arrow" aria-hidden="true">
+          <ArrowDown size={17} />
+        </span>
+      </div>
+
+      <div className="rd-post-body">
+        {/* Meta row */}
+        <div className="rd-post-meta">
+          <span className="rd-chip-sub">r/{post.subreddit}</span>
+          <span>u/{post.author}</span>
+          <span className="rd-sep">·</span>
+          <span>{timeAgo(post.created_utc)}</span>
+          {post.flair && <span className="rd-flair">{post.flair}</span>}
+        </div>
+
+        {/* Title */}
+        <button
+          className="rd-post-title"
+          onClick={() => onOpen(post)}
+          onKeyDown={handleKeyDown}
+          tabIndex={0}
+          aria-label={`Open thread: ${post.title}`}
+        >
+          {post.title}
+        </button>
+
+        {/* Selftext preview */}
+        {post.is_self && post.selftext && (
+          <p className="rd-post-excerpt">{post.selftext}</p>
+        )}
+
+        {/* Category pills if saved */}
+        {isSaved && savedItem.categories.length > 0 && (
+          <div className="rd-cat-pills">
+            {savedItem.categories.map((cat) => (
+              <span key={cat} className="rd-cat">
+                {cat}
+              </span>
+            ))}
+          </div>
+        )}
+
+        {/* Actions */}
+        <div className="rd-post-actions">
+          <span className="rd-pa">
+            <MessageSquare size={13} />
+            {post.num_comments} comments
+          </span>
           <button
-            className="text-left text-sm font-medium text-shell-text hover:text-accent transition-colors leading-snug cursor-pointer"
-            onClick={() => onOpen(post)}
-            onKeyDown={handleKeyDown}
-            tabIndex={0}
-            aria-label={`Open thread: ${post.title}`}
+            className={isSaved ? "rd-pa-btn saved" : "rd-pa-btn save-cta"}
+            onClick={() => onSave(post)}
+            disabled={saving || isSaved}
+            aria-label={isSaved ? "Saved to Library" : "Save to Library"}
           >
-            {post.title}
+            {isSaved ? (
+              <>
+                <Check size={12} />
+                Saved
+              </>
+            ) : (
+              <>
+                <Bookmark size={12} />
+                {saving ? "Saving…" : "Save to Library"}
+              </>
+            )}
           </button>
         </div>
       </div>
-
-      {/* Meta row */}
-      <div className="flex items-center gap-2 flex-wrap mb-1.5">
-        <span className="text-[11px] font-semibold px-1.5 py-0.5 rounded-full bg-orange-500/20 text-orange-400 border border-orange-500/30">
-          r/{post.subreddit}
-        </span>
-        <span className="text-xs text-shell-text-tertiary">
-          u/{post.author}
-        </span>
-        <span className="text-shell-text-tertiary text-xs">·</span>
-        <span className="text-xs text-shell-text-tertiary">
-          {formatScore(post.score)} pts
-        </span>
-        <span className="text-shell-text-tertiary text-xs">·</span>
-        <span className="text-xs text-shell-text-tertiary">
-          {post.num_comments} comments
-        </span>
-        <span className="text-shell-text-tertiary text-xs">·</span>
-        <span className="text-xs text-shell-text-tertiary">
-          {timeAgo(post.created_utc)}
-        </span>
-        {post.flair && (
-          <>
-            <span className="text-shell-text-tertiary text-xs">·</span>
-            <span className="text-[11px] px-1.5 py-0.5 rounded bg-white/5 text-shell-text-tertiary border border-white/10">
-              {post.flair}
-            </span>
-          </>
-        )}
-      </div>
-
-      {/* Selftext preview */}
-      {post.is_self && post.selftext && (
-        <p className="text-xs text-shell-text-secondary line-clamp-2 mb-2 leading-relaxed">
-          {post.selftext}
-        </p>
-      )}
-
-      {/* Category pills if saved */}
-      {isSaved && savedItem.categories.length > 0 && (
-        <div className="flex flex-wrap gap-1 mb-2">
-          {savedItem.categories.map((cat) => (
-            <span
-              key={cat}
-              className="text-[10px] px-1.5 py-0.5 rounded-full bg-accent/10 text-accent border border-accent/20"
-            >
-              {cat}
-            </span>
-          ))}
-        </div>
-      )}
-
-      {/* Actions */}
-      <div className="flex items-center gap-2 mt-1">
-        <Button
-          variant={isSaved ? "secondary" : "ghost"}
-          size="sm"
-          className="h-6 text-xs gap-1 px-2"
-          onClick={() => onSave(post)}
-          disabled={saving || isSaved}
-          aria-label={isSaved ? "Saved to Library" : "Save to Library"}
-        >
-          {isSaved ? (
-            <>
-              <Check size={11} />
-              Saved
-            </>
-          ) : (
-            <>
-              <BookmarkPlus size={11} />
-              {saving ? "Saving…" : "Save to Library"}
-            </>
-          )}
-        </Button>
-      </div>
-    </div>
+    </article>
   );
 }
 
@@ -303,24 +283,32 @@ export function RedditApp({ windowId: _windowId }: { windowId: string }) {
   const [subs, setSubs] = useState<string[]>(POPULAR_SUBS);
   const [addSubOpen, setAddSubOpen] = useState(false);
   const [newSub, setNewSub] = useState("");
-  const [activeSection, setActiveSection] = useState<SidebarSection>("subreddits");
+  const [activeSection, setActiveSection] =
+    useState<SidebarSection>("subreddits");
 
   /* ---------- feed ---------- */
-  const [listing, setListing] = useState<RedditListing>({ posts: [], after: null });
+  const [listing, setListing] = useState<RedditListing>({
+    posts: [],
+    after: null,
+  });
   const [feedLoading, setFeedLoading] = useState(false);
   const [sort, setSort] = useState<SortMode>("hot");
   const [searchQuery, setSearchQuery] = useState("");
   const [searchInput, setSearchInput] = useState("");
 
   /* ---------- auth ---------- */
-  const [authStatus, setAuthStatus] = useState<RedditAuthStatus>({ authenticated: false });
+  const [authStatus, setAuthStatus] = useState<RedditAuthStatus>({
+    authenticated: false,
+  });
 
   /* ---------- knowledge items (saved) ---------- */
   const [savedItems, setSavedItems] = useState<KnowledgeItem[]>([]);
   const [savingPostId, setSavingPostId] = useState<string | null>(null);
 
   /* ---------- thread view ---------- */
-  const [threadTab, setThreadTab] = useState<"comments" | "history" | "metadata">("comments");
+  const [threadTab, setThreadTab] = useState<
+    "comments" | "history" | "metadata"
+  >("comments");
   const [threadSaved, setThreadSaved] = useState<KnowledgeItem | null>(null);
   const [threadSaving, setThreadSaving] = useState(false);
   const [confirmDeleteThread, setConfirmDeleteThread] = useState(false);
@@ -399,7 +387,9 @@ export function RedditApp({ windowId: _windowId }: { windowId: string }) {
           i.source_url === `https://www.reddit.com${post.permalink}`,
       );
       setThreadSaved(match ?? null);
-      setMonitorEnabled(match ? (match.monitor?.current_interval ?? 0) > 0 : false);
+      setMonitorEnabled(
+        match ? (match.monitor?.current_interval ?? 0) > 0 : false,
+      );
     },
     [savedItems],
   );
@@ -502,327 +492,167 @@ export function RedditApp({ windowId: _windowId }: { windowId: string }) {
   const sidebarUI = (
     <nav
       className="flex flex-col overflow-hidden h-full"
+      style={{ background: "var(--color-shell-bg-deep)" }}
       aria-label="Reddit navigation"
     >
-      {/* Header — shown on desktop only; MobileSplitView provides its own nav bar on mobile */}
+      {/* Header — desktop only; MobileSplitView provides its own nav bar on mobile */}
       {!isMobile && (
-        <div className="flex items-center gap-2 px-3 py-3 border-b border-white/5 shrink-0">
-          <ScrollText size={15} className="text-orange-400" />
-          <h1 className="text-sm font-semibold">Reddit</h1>
+        <div className="rd-sb-head shrink-0">
+          <span className="rd-mark">
+            <ScrollText size={14} />
+          </span>
+          <h1>Reddit</h1>
         </div>
       )}
 
-      <div className="flex-1 overflow-y-auto space-y-4" style={isMobile ? { padding: "8px 0 16px" } : { padding: "0.5rem" }}>
+      <div
+        className="flex-1 overflow-y-auto flex flex-col"
+        style={{ padding: "14px 10px", gap: 22 }}
+      >
         {/* Subreddits */}
-        {isMobile ? (
+        <section>
+          <div className="rd-group-h">
+            <span>Subreddits</span>
+            <button
+              className="rd-add"
+              aria-label="Add subreddit"
+              onClick={() => setAddSubOpen((v) => !v)}
+            >
+              <Plus size={13} />
+            </button>
+          </div>
+
+          {addSubOpen && !isMobile && (
+            <div className="flex gap-1 mb-1 px-1">
+              <Input
+                value={newSub}
+                onChange={(e) => setNewSub(e.target.value)}
+                placeholder="r/subreddit"
+                className="h-7 text-xs flex-1"
+                aria-label="New subreddit name"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") addSub();
+                  if (e.key === "Escape") setAddSubOpen(false);
+                }}
+                autoFocus
+              />
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-7 px-1.5 text-xs"
+                onClick={addSub}
+                aria-label="Confirm add subreddit"
+              >
+                <Check size={11} />
+              </Button>
+            </div>
+          )}
+
+          {subs.map((sub) => {
+            const active = activeSection === "subreddits" && activeSub === sub;
+            return (
+              <button
+                key={sub}
+                type="button"
+                className={active ? "rd-item active" : "rd-item"}
+                aria-pressed={active}
+                onClick={() => {
+                  setActiveSub(sub);
+                  setActiveSection("subreddits");
+                  setSearchQuery("");
+                  setSearchInput("");
+                }}
+              >
+                <span className="rd-rslash">r/</span>
+                <span className="rd-label">{sub}</span>
+              </button>
+            );
+          })}
+        </section>
+
+        {/* Saved Posts */}
+        <section>
+          <div className="rd-group-h">
+            <span
+              style={{ display: "inline-flex", alignItems: "center", gap: 6 }}
+            >
+              Saved Posts
+              {!authStatus.authenticated && <Lock size={10} />}
+            </span>
+          </div>
+          {authStatus.authenticated ? (
+            <button
+              type="button"
+              className={
+                activeSection === "saved" ? "rd-item active" : "rd-item"
+              }
+              aria-pressed={activeSection === "saved"}
+              onClick={() => {
+                setActiveSection("saved");
+                setActiveSub(null);
+              }}
+            >
+              <span className="rd-label">Reddit Saved</span>
+            </button>
+          ) : (
+            <p className="rd-muted">Not connected</p>
+          )}
+        </section>
+
+        {/* Monitored */}
+        <section>
+          <div className="rd-group-h">
+            <span>Monitored</span>
+          </div>
+          {monitoredItems.length === 0 ? (
+            <p className="rd-muted">None yet</p>
+          ) : (
+            monitoredItems.map((item) => (
+              <button
+                key={item.id}
+                type="button"
+                className={
+                  activeSection === "monitored" && activeSub === item.id
+                    ? "rd-item active"
+                    : "rd-item"
+                }
+                onClick={() => {
+                  setActiveSection("monitored");
+                  setActiveSub(item.id);
+                }}
+                aria-label={`Monitored: ${item.title}`}
+              >
+                <Eye size={13} style={{ flexShrink: 0 }} />
+                <span className="rd-label">{item.title}</span>
+              </button>
+            ))
+          )}
+        </section>
+
+        {/* History — desktop only, matches mockup */}
+        {!isMobile && (
+          <section>
+            <div className="rd-group-h">
+              <span>History</span>
+            </div>
+            <p className="rd-muted">Last 30 days of reads</p>
+          </section>
+        )}
+      </div>
+
+      {/* Auth status footer */}
+      <div className="rd-foot shrink-0">
+        {authStatus.authenticated ? (
           <>
-            {/* Mobile: iOS 26 grouped container */}
-            <div>
-              <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 0.5, color: "rgba(255,255,255,0.45)", padding: "8px 20px 6px", fontWeight: 600, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <span>Subreddits</span>
-                <button
-                  aria-label="Add subreddit"
-                  onClick={() => setAddSubOpen((v) => !v)}
-                  style={{ color: "rgba(255,255,255,0.45)", background: "none", border: "none", cursor: "pointer", padding: "0 4px" }}
-                >
-                  <Plus size={14} />
-                </button>
-              </div>
-              <div
-                style={{
-                  margin: "0 12px",
-                  borderRadius: 16,
-                  background: "rgba(255,255,255,0.05)",
-                  border: "1px solid rgba(255,255,255,0.08)",
-                  overflow: "hidden",
-                }}
-              >
-                {subs.map((sub, idx, arr) => {
-                  const active = activeSection === "subreddits" && activeSub === sub;
-                  return (
-                    <button
-                      key={sub}
-                      type="button"
-                      aria-pressed={active}
-                      onClick={() => {
-                        setActiveSub(sub);
-                        setActiveSection("subreddits");
-                        setSearchQuery("");
-                        setSearchInput("");
-                      }}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 10,
-                        width: "100%",
-                        padding: "14px 16px",
-                        background: active ? "rgba(255,255,255,0.08)" : "none",
-                        border: "none",
-                        borderBottom: idx === arr.length - 1 ? "none" : "1px solid rgba(255,255,255,0.06)",
-                        cursor: "pointer",
-                        color: "inherit",
-                        textAlign: "left",
-                      }}
-                    >
-                      <span style={{ color: "#fb923c", fontSize: 12, fontWeight: 700, flexShrink: 0 }}>r/</span>
-                      <span style={{ flex: 1, fontSize: 15, fontWeight: 500, color: "rgba(255,255,255,0.9)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{sub}</span>
-                      <svg width="8" height="14" viewBox="0 0 8 14" fill="none" style={{ color: "rgba(255,255,255,0.3)", flexShrink: 0 }}>
-                        <path d="M1 1L7 7L1 13" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                      </svg>
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            {/* Mobile: Saved Posts */}
-            <div>
-              <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 0.5, color: "rgba(255,255,255,0.45)", padding: "0 20px 6px", fontWeight: 600, display: "flex", alignItems: "center", gap: 6 }}>
-                <span>Saved Posts</span>
-                {!authStatus.authenticated && <Lock size={10} />}
-              </div>
-              <div
-                style={{
-                  margin: "0 12px",
-                  borderRadius: 16,
-                  background: "rgba(255,255,255,0.05)",
-                  border: "1px solid rgba(255,255,255,0.08)",
-                  overflow: "hidden",
-                }}
-              >
-                {authStatus.authenticated ? (
-                  <button
-                    type="button"
-                    aria-pressed={activeSection === "saved"}
-                    onClick={() => { setActiveSection("saved"); setActiveSub(null); }}
-                    style={{
-                      display: "flex", alignItems: "center", gap: 10, width: "100%",
-                      padding: "14px 16px", background: activeSection === "saved" ? "rgba(255,255,255,0.08)" : "none",
-                      border: "none", cursor: "pointer", color: "inherit", textAlign: "left",
-                    }}
-                  >
-                    <span style={{ flex: 1, fontSize: 15, fontWeight: 500, color: "rgba(255,255,255,0.9)" }}>Reddit Saved</span>
-                    <svg width="8" height="14" viewBox="0 0 8 14" fill="none" style={{ color: "rgba(255,255,255,0.3)", flexShrink: 0 }}>
-                      <path d="M1 1L7 7L1 13" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                    </svg>
-                  </button>
-                ) : (
-                  <div style={{ padding: "14px 16px", fontSize: 14, color: "rgba(255,255,255,0.4)", fontStyle: "italic" }}>Not connected</div>
-                )}
-              </div>
-            </div>
-
-            {/* Mobile: Monitored */}
-            {monitoredItems.length > 0 && (
-              <div>
-                <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 0.5, color: "rgba(255,255,255,0.45)", padding: "0 20px 6px", fontWeight: 600 }}>
-                  Monitored
-                </div>
-                <div
-                  style={{
-                    margin: "0 12px",
-                    borderRadius: 16,
-                    background: "rgba(255,255,255,0.05)",
-                    border: "1px solid rgba(255,255,255,0.08)",
-                    overflow: "hidden",
-                  }}
-                >
-                  {monitoredItems.map((item, idx, arr) => (
-                    <button
-                      key={item.id}
-                      type="button"
-                      onClick={() => setActiveSection("monitored")}
-                      aria-label={`Monitored: ${item.title}`}
-                      style={{
-                        display: "flex", alignItems: "center", gap: 10, width: "100%",
-                        padding: "14px 16px", background: "none", border: "none",
-                        borderBottom: idx === arr.length - 1 ? "none" : "1px solid rgba(255,255,255,0.06)",
-                        cursor: "pointer", color: "inherit", textAlign: "left",
-                      }}
-                    >
-                      <Eye size={13} style={{ flexShrink: 0, color: "rgba(255,255,255,0.5)" }} />
-                      <span style={{ flex: 1, fontSize: 14, color: "rgba(255,255,255,0.85)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.title}</span>
-                      <svg width="8" height="14" viewBox="0 0 8 14" fill="none" style={{ color: "rgba(255,255,255,0.3)", flexShrink: 0 }}>
-                        <path d="M1 1L7 7L1 13" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
-                      </svg>
-                    </button>
-                  ))}
-                </div>
-              </div>
-            )}
-
-            {/* Auth status footer */}
-            <div style={{ padding: "4px 20px 8px" }}>
-              {authStatus.authenticated ? (
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <span style={{ width: 8, height: 8, borderRadius: "50%", background: "#22c55e", flexShrink: 0 }} />
-                  <span style={{ fontSize: 12, color: "rgba(255,255,255,0.5)" }}>u/{authStatus.username}</span>
-                </div>
-              ) : (
-                <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                  <span style={{ width: 8, height: 8, borderRadius: "50%", background: "rgba(255,255,255,0.3)", flexShrink: 0 }} />
-                  <a href="/api/reddit/auth/login" style={{ fontSize: 12, color: "rgb(100,180,255)" }} aria-label="Connect Reddit account">
-                    Not connected
-                  </a>
-                </div>
-              )}
-            </div>
+            <span className="rd-ok" />
+            <span>u/{authStatus.username}</span>
           </>
         ) : (
           <>
-            {/* Desktop: compact button list */}
-            <section>
-              <div className="flex items-center justify-between px-2 mb-1.5">
-                <p className="text-[10px] uppercase tracking-wider text-shell-text-tertiary">
-                  Subreddits
-                </p>
-                <button
-                  aria-label="Add subreddit"
-                  onClick={() => setAddSubOpen((v) => !v)}
-                  className="text-shell-text-tertiary hover:text-accent transition-colors"
-                >
-                  <Plus size={12} />
-                </button>
-              </div>
-
-              {addSubOpen && (
-                <div className="flex gap-1 mb-1 px-1">
-                  <Input
-                    value={newSub}
-                    onChange={(e) => setNewSub(e.target.value)}
-                    placeholder="r/subreddit"
-                    className="h-6 text-xs flex-1"
-                    aria-label="New subreddit name"
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") addSub();
-                      if (e.key === "Escape") setAddSubOpen(false);
-                    }}
-                    autoFocus
-                  />
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    className="h-6 px-1.5 text-xs"
-                    onClick={addSub}
-                    aria-label="Confirm add subreddit"
-                  >
-                    <Check size={11} />
-                  </Button>
-                </div>
-              )}
-
-              <div className="space-y-0.5">
-                {subs.map((sub) => {
-                  const active = activeSection === "subreddits" && activeSub === sub;
-                  return (
-                    <Button
-                      key={sub}
-                      variant={active ? "secondary" : "ghost"}
-                      size="sm"
-                      aria-pressed={active}
-                      onClick={() => {
-                        setActiveSub(sub);
-                        setActiveSection("subreddits");
-                        setSearchQuery("");
-                        setSearchInput("");
-                      }}
-                      className="w-full justify-start text-xs h-7 px-2 gap-1.5"
-                    >
-                      <span className="text-orange-400 text-[10px] font-bold">r/</span>
-                      {sub}
-                    </Button>
-                  );
-                })}
-              </div>
-            </section>
-
-            <section>
-              <div className="flex items-center gap-1.5 px-2 mb-1.5">
-                <p className="text-[10px] uppercase tracking-wider text-shell-text-tertiary">
-                  Saved Posts
-                </p>
-                {!authStatus.authenticated && (
-                  <Lock size={10} className="text-shell-text-tertiary" />
-                )}
-              </div>
-              {authStatus.authenticated ? (
-                <Button
-                  variant={activeSection === "saved" ? "secondary" : "ghost"}
-                  size="sm"
-                  aria-pressed={activeSection === "saved"}
-                  onClick={() => {
-                    setActiveSection("saved");
-                    setActiveSub(null);
-                  }}
-                  className="w-full justify-start text-xs h-7 px-2"
-                >
-                  Reddit Saved
-                </Button>
-              ) : (
-                <p className="text-[11px] text-shell-text-tertiary px-2 italic">
-                  Not connected
-                </p>
-              )}
-            </section>
-
-            <section>
-              <p className="text-[10px] uppercase tracking-wider text-shell-text-tertiary px-2 mb-1.5">
-                Monitored
-              </p>
-              <div className="space-y-0.5">
-                {monitoredItems.length === 0 ? (
-                  <p className="text-[11px] text-shell-text-tertiary px-2 italic">
-                    None yet
-                  </p>
-                ) : (
-                  monitoredItems.map((item) => (
-                    <Button
-                      key={item.id}
-                      variant={activeSection === "monitored" && activeSub === item.id ? "secondary" : "ghost"}
-                      size="sm"
-                      onClick={() => { setActiveSection("monitored"); }}
-                      className="w-full justify-start text-xs h-7 px-2 truncate"
-                      aria-label={`Monitored: ${item.title}`}
-                    >
-                      <Eye size={11} className="shrink-0 mr-1" />
-                      <span className="truncate">{item.title}</span>
-                    </Button>
-                  ))
-                )}
-              </div>
-            </section>
-
-            <section>
-              <p className="text-[10px] uppercase tracking-wider text-shell-text-tertiary px-2 mb-1.5">
-                History
-              </p>
-              <p className="text-[11px] text-shell-text-tertiary px-2 italic">
-                Coming soon
-              </p>
-            </section>
-
-            {/* Auth status at bottom */}
-            <div className="border-t border-white/5 px-3 py-2 shrink-0 mt-auto">
-              {authStatus.authenticated ? (
-                <div className="flex items-center gap-1.5">
-                  <span className="w-2 h-2 rounded-full bg-green-500 shrink-0" />
-                  <span className="text-xs text-shell-text-secondary truncate">
-                    u/{authStatus.username}
-                  </span>
-                </div>
-              ) : (
-                <div className="flex items-center gap-1.5">
-                  <span className="w-2 h-2 rounded-full bg-shell-text-tertiary shrink-0" />
-                  <a
-                    href="/api/reddit/auth/login"
-                    className="text-xs text-accent hover:underline"
-                    aria-label="Connect Reddit account"
-                  >
-                    Not connected
-                  </a>
-                </div>
-              )}
-            </div>
+            <span className="rd-off" />
+            <a href="/api/reddit/auth/login" aria-label="Connect Reddit account">
+              Not connected
+            </a>
           </>
         )}
       </div>
@@ -840,66 +670,72 @@ export function RedditApp({ windowId: _windowId }: { windowId: string }) {
 
   const feedViewUI = (
     <main className="flex-1 flex flex-col overflow-hidden">
-      {/* Search + sort bar */}
-      <div className="px-4 py-3 border-b border-white/5 shrink-0 space-y-2">
-        <form onSubmit={handleSearch} className="flex gap-2" role="search">
-          <Input
+      {/* Toolbar: title + search + sort */}
+      <div className="rd-toolbar">
+        {activeSub && (
+          <h2>
+            <span className="rd-rslash">r/</span>
+            {activeSub}
+          </h2>
+        )}
+
+        <form onSubmit={handleSearch} className="rd-search" role="search">
+          <button type="submit" className="rd-search-submit" aria-label="Run search">
+            <Search size={15} />
+          </button>
+          <input
             ref={searchRef}
             value={searchInput}
             onChange={(e) => setSearchInput(e.target.value)}
-            placeholder={
-              activeSub
-                ? `Search r/${activeSub}…`
-                : "Search Reddit…"
-            }
-            className="flex-1 h-8 text-sm"
+            placeholder={activeSub ? `Search r/${activeSub}…` : "Search Reddit…"}
             aria-label="Search Reddit"
           />
-          <Button
-            type="submit"
-            variant="ghost"
-            size="sm"
-            className="h-8 px-2"
-            aria-label="Run search"
-          >
-            <Search size={14} />
-          </Button>
         </form>
 
-        {/* Sort controls */}
-        <div className="flex items-center gap-1" role="group" aria-label="Sort posts">
+        {/* Sort segmented control */}
+        <div className="rd-segmented" role="group" aria-label="Sort posts">
           {(["hot", "new", "top"] as SortMode[]).map((s) => (
-            <Button
+            <button
               key={s}
-              variant={sort === s ? "secondary" : "ghost"}
-              size="sm"
-              className="h-6 text-xs px-2 capitalize"
+              type="button"
+              className={sort === s ? "rd-seg on" : "rd-seg"}
               aria-pressed={sort === s}
               onClick={() => setSort(s)}
             >
               {s}
-            </Button>
+            </button>
           ))}
         </div>
       </div>
 
       {/* Post list */}
-      <div className="flex-1 overflow-y-auto p-3 space-y-2">
+      <div className="rd-feed">
         {feedLoading && (
-          <div className="flex items-center justify-center py-12">
-            <RefreshCw size={18} className="animate-spin text-shell-text-tertiary" />
-          </div>
+          <>
+            <div className="rd-skeleton" aria-hidden="true" />
+            <div className="rd-skeleton" aria-hidden="true" />
+            <div className="rd-skeleton" aria-hidden="true" />
+            <span className="sr-only" role="status">
+              Loading posts
+            </span>
+          </>
         )}
 
-        {!feedLoading && !activeSub && activeSection === "subreddits" && !searchQuery && (
-          <div className="flex flex-col items-center justify-center py-16 text-shell-text-tertiary">
-            <ScrollText size={36} className="mb-3 opacity-30" />
-            <p className="text-sm">Select a subreddit to browse</p>
-          </div>
-        )}
+        {!feedLoading &&
+          !activeSub &&
+          activeSection === "subreddits" &&
+          !searchQuery && (
+            <div className="rd-empty">
+              <ScrollText size={36} style={{ opacity: 0.3 }} />
+              <p>Select a subreddit to browse</p>
+            </div>
+          )}
 
         {!feedLoading && listing.posts.length > 0 && (
-          <ul role="list" className="space-y-2">
+          <ul
+            role="list"
+            style={{ display: "flex", flexDirection: "column", gap: 12 }}
+          >
             {listing.posts.map((post) => (
               <li key={post.id} role="listitem">
                 <PostCard
@@ -917,8 +753,8 @@ export function RedditApp({ windowId: _windowId }: { windowId: string }) {
         {!feedLoading &&
           listing.posts.length === 0 &&
           (activeSub || searchQuery || activeSection === "saved") && (
-            <div className="flex flex-col items-center justify-center py-16 text-shell-text-tertiary">
-              <p className="text-sm">No posts found</p>
+            <div className="rd-empty">
+              <p>No posts found</p>
             </div>
           )}
       </div>
@@ -936,268 +772,227 @@ export function RedditApp({ windowId: _windowId }: { windowId: string }) {
     return (
       <main className="flex-1 flex flex-col overflow-hidden">
         {/* Back button + action bar */}
-        <div className="px-3 py-2 border-b border-white/5 shrink-0 flex items-center justify-between gap-2 flex-wrap">
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-7 text-xs gap-1.5"
+        <div className="rd-thread-bar">
+          <button
+            className="rd-back"
             onClick={goBackToFeed}
             aria-label="Back to feed"
           >
-            <ChevronLeft size={13} />
+            <ChevronLeft size={15} />
             Back to feed
-          </Button>
+          </button>
 
           {post && (
-            <div className="flex items-center gap-1.5 flex-wrap">
+            <div className="rd-thread-actions">
               <a
                 href={`https://www.reddit.com${post.permalink}`}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="flex items-center gap-1 text-xs text-shell-text-tertiary hover:text-accent transition-colors"
+                className="rd-t-btn"
                 aria-label="Open on Reddit"
               >
-                <ExternalLink size={12} />
+                <ExternalLink size={13} />
                 Reddit
               </a>
 
               {threadSaved ? (
                 <>
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    className="h-6 text-xs gap-1 px-2"
+                  <button
+                    className="rd-t-btn is-saved"
                     disabled
                     aria-label="Already saved to Library"
                   >
-                    <Check size={11} />
+                    <Check size={13} />
                     Saved
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-6 text-xs gap-1 px-2"
+                  </button>
+                  <button
+                    className="rd-t-btn"
                     onClick={handleReIngestThread}
                     aria-label="Re-ingest this thread"
                   >
-                    <RefreshCw size={11} />
+                    <RefreshCw size={13} />
                     Re-ingest
-                  </Button>
+                  </button>
                   {confirmDeleteThread ? (
                     <>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="h-6 text-xs px-2 text-red-400 hover:text-red-300"
+                      <button
+                        className="rd-t-btn danger"
                         onClick={handleDeleteThread}
                         aria-label="Confirm delete from Library"
                       >
                         Confirm Delete
-                      </Button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="h-6 text-xs px-2"
+                      </button>
+                      <button
+                        className="rd-t-btn"
                         onClick={() => setConfirmDeleteThread(false)}
                         aria-label="Cancel delete"
                       >
                         Cancel
-                      </Button>
+                      </button>
                     </>
                   ) : (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-6 text-xs gap-1 px-2 text-red-400 hover:text-red-300"
+                    <button
+                      className="rd-t-btn danger"
                       onClick={() => setConfirmDeleteThread(true)}
                       aria-label="Delete from Library"
                     >
-                      <Trash2 size={11} />
-                    </Button>
+                      <Trash2 size={13} />
+                    </button>
                   )}
                 </>
               ) : (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-6 text-xs gap-1 px-2"
+                <button
+                  className="rd-t-btn"
                   onClick={handleSaveThread}
                   disabled={threadSaving}
                   aria-label="Save to Library"
                 >
-                  <BookmarkPlus size={11} />
+                  <Bookmark size={13} />
                   {threadSaving ? "Saving…" : "Save to Library"}
-                </Button>
+                </button>
               )}
             </div>
           )}
         </div>
 
-        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        <div className="rd-thread">
           {threadLoading && (
-            <div className="flex items-center justify-center py-16">
-              <RefreshCw size={20} className="animate-spin text-shell-text-tertiary" />
+            <div className="rd-spin">
+              <RefreshCw size={20} className="animate-spin" />
             </div>
           )}
 
           {!threadLoading && post && (
-            <>
+            <div className="rd-thread-inner">
               {/* Post header */}
-              <div className="space-y-2">
-                <h2 className="text-base font-semibold text-shell-text leading-snug">
-                  {post.title}
-                </h2>
+              <h1 className="rd-thread-title">{post.title}</h1>
 
-                <div className="flex items-center gap-2 flex-wrap">
-                  <span className="text-[11px] font-semibold px-1.5 py-0.5 rounded-full bg-orange-500/20 text-orange-400 border border-orange-500/30">
-                    r/{post.subreddit}
-                  </span>
-                  <span className="text-xs text-shell-text-tertiary">
-                    by u/{post.author}
-                  </span>
-                  <span className="text-shell-text-tertiary text-xs">·</span>
-                  <span className="text-xs text-shell-text-tertiary">
-                    {formatScore(post.score)} pts
-                  </span>
-                  <span className="text-shell-text-tertiary text-xs">·</span>
-                  <span className="text-xs text-shell-text-tertiary">
-                    {Math.round(post.upvote_ratio * 100)}% upvoted
-                  </span>
-                  <span className="text-shell-text-tertiary text-xs">·</span>
-                  <span className="text-xs text-shell-text-tertiary">
-                    {timeAgo(post.created_utc)}
-                  </span>
-                </div>
-
-                {/* Summary if saved */}
-                {threadSaved?.summary && (
-                  <div className="bg-accent/5 border border-accent/20 rounded-lg px-3 py-2">
-                    <p className="text-[10px] uppercase tracking-wider text-accent mb-1 font-semibold">
-                      Summary
-                    </p>
-                    <p className="text-xs text-shell-text-secondary leading-relaxed">
-                      {threadSaved.summary}
-                    </p>
-                  </div>
-                )}
-
-                {/* Post body */}
-                {post.is_self && post.selftext && (
-                  <div className="bg-white/3 rounded-lg px-3 py-2 border border-white/5">
-                    <p className="text-sm text-shell-text-secondary whitespace-pre-wrap leading-relaxed">
-                      {post.selftext}
-                    </p>
-                  </div>
-                )}
-
-                {!post.is_self && (
-                  <a
-                    href={post.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-xs text-accent hover:underline flex items-center gap-1"
-                    aria-label={`External link: ${post.url}`}
-                  >
-                    <ExternalLink size={11} />
-                    {stripRedditDomain(post.url) || post.url}
-                  </a>
-                )}
+              <div className="rd-thread-meta">
+                <span className="rd-chip-sub">r/{post.subreddit}</span>
+                <span>by u/{post.author}</span>
+                <span className="rd-sep">·</span>
+                <span>{formatScore(post.score)} pts</span>
+                <span className="rd-sep">·</span>
+                <span className="rd-ratio">
+                  {Math.round(post.upvote_ratio * 100)}% upvoted
+                </span>
+                <span className="rd-sep">·</span>
+                <span>{timeAgo(post.created_utc)}</span>
               </div>
 
-              {/* Tabs */}
-              <div>
-                <div
-                  role="tablist"
-                  aria-label="Thread sections"
-                  className="flex gap-1 border-b border-white/5 pb-0 mb-3"
+              {/* Summary if saved */}
+              {threadSaved?.summary && (
+                <div className="rd-summary">
+                  <div className="rd-lbl">
+                    <AlignLeft size={11} />
+                    Library summary
+                  </div>
+                  <p>{threadSaved.summary}</p>
+                </div>
+              )}
+
+              {/* Post body */}
+              {post.is_self && post.selftext && (
+                <div className="rd-selftext">{post.selftext}</div>
+              )}
+
+              {!post.is_self && (
+                <a
+                  href={post.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="rd-extlink"
+                  aria-label={`External link: ${post.url}`}
                 >
-                  {(["comments", "history", "metadata"] as const).map(
-                    (tab) => (
-                      <button
-                        key={tab}
-                        role="tab"
-                        aria-selected={threadTab === tab}
-                        onClick={() => setThreadTab(tab)}
-                        className={[
-                          "px-3 py-1.5 text-xs capitalize border-b-2 transition-colors",
-                          threadTab === tab
-                            ? "border-accent text-accent"
-                            : "border-transparent text-shell-text-tertiary hover:text-shell-text",
-                        ].join(" ")}
-                      >
-                        {tab}
-                        {tab === "comments" && (
-                          <span className="ml-1 text-[10px] opacity-60">
-                            ({post.num_comments})
-                          </span>
-                        )}
-                      </button>
-                    ),
+                  <ExternalLink size={12} />
+                  {stripRedditDomain(post.url) || post.url}
+                </a>
+              )}
+
+              {/* Tabs */}
+              <div
+                role="tablist"
+                aria-label="Thread sections"
+                className="rd-tabs"
+              >
+                {(["comments", "history", "metadata"] as const).map((tab) => (
+                  <button
+                    key={tab}
+                    role="tab"
+                    aria-selected={threadTab === tab}
+                    onClick={() => setThreadTab(tab)}
+                    className={threadTab === tab ? "rd-tab on" : "rd-tab"}
+                  >
+                    {tab}
+                    {tab === "comments" && (
+                      <span className="rd-badge">{post.num_comments}</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+
+              {/* Comments tab */}
+              {threadTab === "comments" && (
+                <ul role="list" className="rd-comments">
+                  {comments.length === 0 ? (
+                    <li
+                      className="rd-muted"
+                      style={{ padding: "16px 0", textAlign: "center" }}
+                    >
+                      No comments yet
+                    </li>
+                  ) : (
+                    comments.map((c) => <CommentNode key={c.id} comment={c} />)
+                  )}
+                </ul>
+              )}
+
+              {/* History tab */}
+              {threadTab === "history" && (
+                <div className="rd-muted" style={{ padding: "16px 0" }}>
+                  {threadSaved ? (
+                    <p>Monitoring snapshots will appear here when available.</p>
+                  ) : (
+                    <p>Save this thread to the Library to enable monitoring.</p>
                   )}
                 </div>
+              )}
 
-                {/* Comments tab */}
-                {threadTab === "comments" && (
-                  <ul role="list" className="space-y-2">
-                    {comments.length === 0 ? (
-                      <li className="text-sm text-shell-text-tertiary py-4 text-center italic">
-                        No comments yet
-                      </li>
-                    ) : (
-                      comments.map((c) => (
-                        <CommentNode key={c.id} comment={c} />
-                      ))
-                    )}
-                  </ul>
-                )}
-
-                {/* History tab */}
-                {threadTab === "history" && (
-                  <div className="text-sm text-shell-text-tertiary py-4">
-                    {threadSaved ? (
-                      <p className="italic">
-                        Monitoring snapshots will appear here when available.
-                      </p>
-                    ) : (
-                      <p className="italic">
-                        Save this thread to the Library to enable monitoring.
-                      </p>
-                    )}
-                  </div>
-                )}
-
-                {/* Metadata tab */}
-                {threadTab === "metadata" && post && (
-                  <dl className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs">
-                    {[
+              {/* Metadata tab */}
+              {threadTab === "metadata" && post && (
+                <dl className="rd-meta-grid">
+                  {(
+                    [
                       ["Subreddit", `r/${post.subreddit}`],
                       ["Author", `u/${post.author}`],
                       ["Score", formatScore(post.score)],
-                      ["Upvote ratio", `${Math.round(post.upvote_ratio * 100)}%`],
+                      [
+                        "Upvote ratio",
+                        `${Math.round(post.upvote_ratio * 100)}%`,
+                      ],
                       ["Comments", String(post.num_comments)],
                       ["Flair", post.flair || "—"],
                       ["Type", post.is_self ? "Text post" : "Link post"],
-                      ["Posted", new Date(post.created_utc * 1000).toLocaleString()],
+                      [
+                        "Posted",
+                        new Date(post.created_utc * 1000).toLocaleString(),
+                      ],
                       ["Permalink", post.permalink],
-                    ].map(([label, value]) => (
-                      <div key={label} className="contents">
-                        <dt className="text-shell-text-tertiary font-medium truncate">
-                          {label}
-                        </dt>
-                        <dd className="text-shell-text truncate" title={value}>
-                          {value}
-                        </dd>
-                      </div>
-                    ))}
-                  </dl>
-                )}
-              </div>
-            </>
+                    ] as [string, string][]
+                  ).map(([label, value]) => (
+                    <div key={label} className="contents">
+                      <dt>{label}</dt>
+                      <dd title={value}>{value}</dd>
+                    </div>
+                  ))}
+                </dl>
+              )}
+            </div>
           )}
 
           {!threadLoading && !thread && (
-            <div className="flex flex-col items-center justify-center py-16 text-shell-text-tertiary">
-              <p className="text-sm">Failed to load thread</p>
+            <div className="rd-empty">
+              <p>Failed to load thread</p>
             </div>
           )}
         </div>
@@ -1224,29 +1019,27 @@ export function RedditApp({ windowId: _windowId }: { windowId: string }) {
   const detailContent = view === "thread" ? threadViewUI : feedViewUI;
 
   return (
-    <div className="flex flex-col h-full min-h-0 overflow-hidden bg-shell-base text-shell-text relative">
+    <div className="reddit-app flex flex-col h-full min-h-0 overflow-hidden bg-shell-base text-shell-text relative">
       <MobileSplitView
         selectedId={splitSelectedId}
         onBack={handleSplitBack}
         listTitle="Reddit"
         detailTitle={activeSub ? `r/${activeSub}` : undefined}
-        listWidth={208}
+        listWidth={224}
         list={sidebarUI}
         detail={
-          splitSelectedId !== null
-            ? detailContent
-            : !isMobile
-            ? (
-              <div className="flex flex-col items-center justify-center h-full text-shell-text-tertiary">
-                <ScrollText size={36} className="mb-3 opacity-20" />
-                <p className="text-sm">Select a subreddit</p>
-              </div>
-            )
-            : null
+          splitSelectedId !== null ? (
+            detailContent
+          ) : !isMobile ? (
+            <div className="rd-empty" style={{ height: "100%" }}>
+              <ScrollText size={36} style={{ opacity: 0.2 }} />
+              <p>Select a subreddit</p>
+            </div>
+          ) : null
         }
       />
 
-      {/* Add subreddit modal — bottom sheet on mobile, centred on desktop */}
+      {/* Add subreddit modal — bottom sheet on mobile */}
       {isMobile && addSubOpen && (
         <div
           className="absolute inset-0 z-50 flex items-end bg-black/50 backdrop-blur-sm"
@@ -1256,7 +1049,13 @@ export function RedditApp({ windowId: _windowId }: { windowId: string }) {
           aria-label="Add subreddit"
         >
           <div
-            style={{ borderRadius: "20px 20px 0 0", width: "100%", background: "var(--shell-surface, #1a1a2e)", padding: "20px 16px 32px" }}
+            style={{
+              borderRadius: "20px 20px 0 0",
+              width: "100%",
+              background: "var(--color-shell-bg)",
+              borderTop: "1px solid var(--color-shell-border)",
+              padding: "20px 16px calc(32px + env(safe-area-inset-bottom))",
+            }}
             onClick={(e) => e.stopPropagation()}
           >
             <p className="text-sm font-semibold mb-3">Add Subreddit</p>

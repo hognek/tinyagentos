@@ -6,19 +6,19 @@ from tinyagentos.config import auto_register_from_manifest, AppConfig
 
 def test_auto_register_adds_backend(tmp_path: Path):
     """auto_register_from_manifest writes a backend entry from a manifest file."""
-    manifest = tmp_path / "rknn-sd.yaml"
+    manifest = tmp_path / "sd-cpp.yaml"
     manifest.write_text("""
-id: rknn-sd
-name: RKNN Stable Diffusion
-type: rknn-sd
-default_url: http://localhost:7863
+id: sd-cpp
+name: Stable Diffusion CPP
+type: sd-cpp
+default_url: http://localhost:7864
 capabilities:
   - image-generation
 lifecycle:
   auto_manage: true
   keep_alive_minutes: 10
-  start_cmd: "systemctl start tinyagentos-rknn-sd"
-  stop_cmd: "systemctl stop tinyagentos-rknn-sd"
+  start_cmd: "systemctl start tinyagentos-sdcpp"
+  stop_cmd: "systemctl stop tinyagentos-sdcpp"
   startup_timeout_seconds: 90
 """)
     config = AppConfig()
@@ -26,31 +26,31 @@ lifecycle:
     assert added is True
     assert len(config.backends) == 1
     b = config.backends[0]
-    assert b["name"] == "local-rknn-sd"
-    assert b["type"] == "rknn-sd"
-    assert b["url"] == "http://localhost:7863"
+    assert b["name"] == "local-sd-cpp"
+    assert b["type"] == "sd-cpp"
+    assert b["url"] == "http://localhost:7864"
     assert b["priority"] == 99
     assert b["enabled"] is True
     assert b["auto_manage"] is True
     assert b["keep_alive_minutes"] == 10
-    assert b["start_cmd"] == "systemctl start tinyagentos-rknn-sd"
-    assert b["stop_cmd"] == "systemctl stop tinyagentos-rknn-sd"
+    assert b["start_cmd"] == "systemctl start tinyagentos-sdcpp"
+    assert b["stop_cmd"] == "systemctl stop tinyagentos-sdcpp"
     assert b["startup_timeout_seconds"] == 90
 
 
 def test_auto_register_idempotent(tmp_path: Path):
     """Calling auto_register_from_manifest twice does not add duplicates."""
-    manifest = tmp_path / "rknn-sd.yaml"
+    manifest = tmp_path / "sd-cpp.yaml"
     manifest.write_text("""
-id: rknn-sd
-name: RKNN Stable Diffusion
-type: rknn-sd
-default_url: http://localhost:7863
+id: sd-cpp
+name: Stable Diffusion CPP
+type: sd-cpp
+default_url: http://localhost:7864
 lifecycle:
   auto_manage: true
   keep_alive_minutes: 10
-  start_cmd: "systemctl start tinyagentos-rknn-sd"
-  stop_cmd: "systemctl stop tinyagentos-rknn-sd"
+  start_cmd: "systemctl start tinyagentos-sdcpp"
+  stop_cmd: "systemctl stop tinyagentos-sdcpp"
   startup_timeout_seconds: 90
 """)
     config = AppConfig()
@@ -64,16 +64,16 @@ def test_auto_register_catalog_manifest_format(tmp_path: Path):
     type: service with lifecycle.backend_type and lifecycle.default_url."""
     manifest = tmp_path / "manifest.yaml"
     manifest.write_text("""
-id: rknn-stable-diffusion
-name: RKNN Stable Diffusion
+id: stable-diffusion-cpp
+name: Stable Diffusion CPP
 type: service
 lifecycle:
-  backend_type: rknn-sd
-  default_url: http://localhost:7863
+  backend_type: sd-cpp
+  default_url: http://localhost:7864
   auto_manage: true
   keep_alive_minutes: 10
-  start_cmd: "systemctl start tinyagentos-rknn-sd"
-  stop_cmd: "systemctl stop tinyagentos-rknn-sd"
+  start_cmd: "systemctl start tinyagentos-sdcpp"
+  stop_cmd: "systemctl stop tinyagentos-sdcpp"
   startup_timeout_seconds: 90
 """)
     config = AppConfig()
@@ -81,12 +81,12 @@ lifecycle:
     assert added is True
     assert len(config.backends) == 1
     b = config.backends[0]
-    assert b["name"] == "local-rknn-stable-diffusion"
-    assert b["type"] == "rknn-sd"
-    assert b["url"] == "http://localhost:7863"
+    assert b["name"] == "local-stable-diffusion-cpp"
+    assert b["type"] == "sd-cpp"
+    assert b["url"] == "http://localhost:7864"
     assert b["auto_manage"] is True
-    assert b["start_cmd"] == "systemctl start tinyagentos-rknn-sd"
-    assert b["stop_cmd"] == "systemctl stop tinyagentos-rknn-sd"
+    assert b["start_cmd"] == "systemctl start tinyagentos-sdcpp"
+    assert b["stop_cmd"] == "systemctl stop tinyagentos-sdcpp"
 
 
 def test_auto_register_keep_alive_zero(tmp_path: Path):
@@ -296,3 +296,30 @@ default_url: http://localhost:8080
     config = AppConfig()
     added = auto_register_from_manifest(manifest, config)  # no hardware_profile kwarg
     assert added is True
+
+
+_CATALOG = Path(__file__).resolve().parents[1] / "app-catalog" / "services"
+
+
+@pytest.mark.parametrize(
+    "service, backend_type, url",
+    [
+        ("iopaint", "iopaint", "http://127.0.0.1:30493"),
+        ("flux-fill", "flux-fill", "http://127.0.0.1:38298"),
+    ],
+)
+def test_shipped_image_edit_manifests_register(service, backend_type, url):
+    """The real iopaint/flux-fill catalog manifests must register a backend
+    entry on install, otherwise the Images Studio edit tier has no backend
+    with the image-editing capability and every edit request returns 503.
+
+    Both carry the backend type via lifecycle.backend_type on the catalog
+    (type: service) path; regressing the lifecycle block silently breaks the
+    edit tier."""
+    manifest = _CATALOG / service / "manifest.yaml"
+    config = AppConfig()
+    added = auto_register_from_manifest(manifest, config)
+    assert added is True
+    entry = config.backends[-1]
+    assert entry["type"] == backend_type
+    assert entry["url"] == url

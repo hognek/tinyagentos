@@ -5,7 +5,7 @@ import {
 } from "lucide-react";
 import { Card, CardContent, Button } from "@/components/ui";
 import type { ClusterWorker } from "@/lib/cluster";
-import { workerStatus, workerHardwareSummary, workerShortIp, STATUS_PILL_CLASS, STATUS_LABEL } from "@/lib/cluster";
+import { workerStatus, workerHardwareSummary, workerShortIp, normalizeBackendName, STATUS_PILL_CLASS, STATUS_LABEL } from "@/lib/cluster";
 
 interface ActivityData {
   timestamp: number;
@@ -172,9 +172,10 @@ function formatMb(mb: number | null | undefined): string {
 }
 
 function colourForLoad(pct: number): string {
-  if (pct < 50) return "#43e97b";
-  if (pct < 80) return "#febc2e";
-  return "#ff5f57";
+  // Token-backed traffic-light scale so the bar tracks the theme.
+  if (pct < 50) return "var(--color-traffic-maximize)";
+  if (pct < 80) return "var(--color-traffic-minimize)";
+  return "var(--color-traffic-close)";
 }
 
 function LoadBar({ value, label, unit = "%" }: { value: number; label?: string; unit?: string }) {
@@ -270,7 +271,7 @@ export function ActivityApp({ windowId: _windowId }: { windowId: string }) {
     ...clusterWorkers.flatMap((w) => {
       const out: LoadedModel[] = [];
       for (const b of w.backends ?? []) {
-        const backendName = b.name ?? b.type ?? "backend";
+        const backendName = normalizeBackendName(b.name ?? b.type ?? "backend");
         const activeList = (b as { loaded_models?: unknown }).loaded_models;
         const models = Array.isArray(activeList) ? activeList : [];
         for (const model of models) {
@@ -368,8 +369,10 @@ export function ActivityApp({ windowId: _windowId }: { windowId: string }) {
           </CardContent>
         </Card>
 
-        {/* NPU */}
-        {(npu.cores || npu.type) && (
+        {/* NPU -- only when one is actually present. type "none" (or absent)
+            means no NPU, so the whole card is hidden rather than showing a
+            debugfs-permission message on hardware that has no NPU at all. */}
+        {npu.type && npu.type !== "none" && (
           <Card className="col-span-12 md:col-span-6 p-4">
             <CardContent className="p-0">
               <div className="flex items-center justify-between mb-3">
@@ -624,7 +627,7 @@ export function ActivityApp({ windowId: _windowId }: { windowId: string }) {
                               className="text-[9px] px-1.5 py-0.5 rounded-full bg-sky-500/15 text-sky-200 font-medium"
                               title={b.type ?? b.name ?? ""}
                             >
-                              {b.name ?? b.type ?? "backend"}
+                              {normalizeBackendName(b.name ?? b.type ?? "backend")}
                             </span>
                           ))
                         )}
@@ -639,7 +642,7 @@ export function ActivityApp({ windowId: _windowId }: { windowId: string }) {
                             {capabilities.map((c) => (
                               <span
                                 key={`${w.name}-c-${c}`}
-                                className="text-[9px] px-1.5 py-0.5 rounded-full bg-violet-500/15 text-violet-200 font-medium"
+                                className="text-[9px] px-1.5 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 font-medium"
                                 aria-label={`Current capability: ${c}`}
                               >
                                 {c}
@@ -699,7 +702,7 @@ export function ActivityApp({ windowId: _windowId }: { windowId: string }) {
             <CardContent className="p-0">
               <div className="flex items-center justify-between mb-3">
                 <div className="flex items-center gap-2">
-                  <Network size={14} className="text-indigo-400" />
+                  <Network size={14} className="text-cyan-400" />
                   <h3 className="text-xs font-semibold text-shell-text">Network</h3>
                 </div>
               </div>
@@ -726,7 +729,7 @@ export function ActivityApp({ windowId: _windowId }: { windowId: string }) {
             <CardContent className="p-0">
               <div className="flex items-center justify-between mb-3">
                 <div className="flex items-center gap-2">
-                  <Activity size={14} className="text-violet-400" />
+                  <Activity size={14} className="text-cyan-400" />
                   <h3 className="text-xs font-semibold text-shell-text">Scheduler</h3>
                 </div>
                 <div className="flex items-center gap-3 text-[10px] text-shell-text-tertiary tabular-nums">
@@ -747,7 +750,7 @@ export function ActivityApp({ windowId: _windowId }: { windowId: string }) {
                   const tierLabel = ["GPU", "NPU", "CPU", "CLUSTER"][r.tier] ?? "?";
                   const tierColor = [
                     "text-emerald-400 bg-emerald-500/10",
-                    "text-violet-400 bg-violet-500/10",
+                    "text-cyan-400 bg-cyan-500/10",
                     "text-sky-400 bg-sky-500/10",
                     "text-amber-400 bg-amber-500/10",
                   ][r.tier] ?? "text-shell-text-tertiary bg-white/5";
@@ -791,7 +794,7 @@ export function ActivityApp({ windowId: _windowId }: { windowId: string }) {
                         {r.capabilities.map((c) => (
                           <span
                             key={`ready-${c}`}
-                            className="text-[9px] px-1.5 py-0.5 rounded-full bg-violet-500/20 text-violet-200 font-medium"
+                            className="text-[9px] px-1.5 py-0.5 rounded-full bg-cyan-500/20 text-cyan-200 font-medium"
                             title="Ready now — backend is loaded"
                           >
                             {c}
@@ -824,14 +827,28 @@ export function ActivityApp({ windowId: _windowId }: { windowId: string }) {
                   const cpuLabel = hardwareLabel("cpu", hw);
                   if (cpuLabel) cards.push({ kind: "cpu", label: cpuLabel, tierIdx: 2 });
 
+                  // The controller self-registers as a worker named "local"
+                  // (loopback url). Its NPU/CPU are already shown above as the
+                  // controller's own scheduler resources, so for the local node
+                  // only surface devices the controller does not already list
+                  // (e.g. an integrated GPU it does not schedule on). This
+                  // avoids the same physical hardware appearing twice.
+                  const isSelf =
+                    w.name === "local" ||
+                    /\/\/(127\.0\.0\.1|localhost|\[::1\])(:|\/|$)/.test(w.url || "");
+                  const controllerTiers = new Set(schedulerStats.resources.map((res) => res.tier));
+                  const visibleCards = isSelf
+                    ? cards.filter((c) => !controllerTiers.has(c.tierIdx))
+                    : cards;
+
                   const tierLabels = ["GPU", "NPU", "CPU"];
                   const tierColors = [
                     "text-emerald-400 bg-emerald-500/10",
-                    "text-violet-400 bg-violet-500/10",
+                    "text-cyan-400 bg-cyan-500/10",
                     "text-sky-400 bg-sky-500/10",
                   ];
 
-                  return cards.map((card) => (
+                  return visibleCards.map((card) => (
                     <div
                       key={`${w.name}-${card.kind}`}
                       className={`p-2 rounded-lg border ${online ? "bg-white/[0.02] border-white/5" : "bg-white/[0.01] border-white/5 opacity-60"}`}
@@ -863,7 +880,7 @@ export function ActivityApp({ windowId: _windowId }: { windowId: string }) {
                             ...(w.capabilities || []).map((c) => (
                               <span
                                 key={`worker-ready-${c}`}
-                                className="text-[9px] px-1.5 py-0.5 rounded-full bg-violet-500/20 text-violet-200 font-medium"
+                                className="text-[9px] px-1.5 py-0.5 rounded-full bg-cyan-500/20 text-cyan-200 font-medium"
                                 title="Ready now — backend is loaded"
                               >
                                 {c}
@@ -893,7 +910,7 @@ export function ActivityApp({ windowId: _windowId }: { windowId: string }) {
                       t.status === "complete"
                         ? "text-emerald-400"
                         : t.status === "running"
-                        ? "text-violet-400"
+                        ? "text-cyan-400"
                         : t.status === "error"
                         ? "text-red-400"
                         : t.status === "rejected"

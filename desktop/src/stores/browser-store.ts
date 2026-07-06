@@ -17,6 +17,9 @@ import type {
 } from "@/apps/BrowserApp/types";
 
 const NEW_TAB_URL = "about:blank";
+// The browser's homepage: the first tab when a window opens, and the Home
+// button target. New blank tabs still open about:blank.
+export const HOME_URL = "https://taos.my";
 const MAX_RECENTLY_CLOSED = 50;
 
 let _tabIdCounter = 0;
@@ -91,6 +94,13 @@ interface BrowserStore {
     patch: Partial<Pick<Tab, "readerAvailable" | "readerActive" | "readerExtract">>,
   ) => void;
 
+  // Live session (full Neko browser) — set/clear per tab
+  setTabLiveSession: (
+    windowId: string,
+    tabId: string,
+    liveSession: { nekoUrl: string; streamToken: string } | null,
+  ) => void;
+
   // Agent pin set — local state mutations; server calls happen via browser-agent-api.ts
   addPinnedAgent: (windowId: string, tabId: string, agentId: string) => void;
   removePinnedAgent: (windowId: string, tabId: string, agentId: string) => void;
@@ -102,7 +112,7 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
   createWindow(windowId, profileId) {
     set((s) => {
       if (s.windows[windowId]) return s; // idempotent
-      const initialTab = makeTab();
+      const initialTab = makeTab(HOME_URL);
       const win: BrowserWindowState = {
         windowId,
         profileId,
@@ -253,10 +263,11 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
         historyIndex: newHistory.length - 1,
         state: "live",
         lastActiveAt: Date.now(),
-        // Reset reader state on navigation — new URL invalidates the extract
+        // Reset reader state and live session on navigation
         readerAvailable: undefined,
         readerActive: undefined,
         readerExtract: null,
+        liveSession: undefined,
       };
     }));
   },
@@ -366,6 +377,13 @@ export const useBrowserStore = create<BrowserStore>((set, get) => ({
       };
     });
   },
+  setTabLiveSession(windowId, tabId, liveSession) {
+    set((s) => updateTab(s, windowId, tabId, (t) => ({
+      ...t,
+      liveSession: liveSession ?? undefined,
+    })));
+  },
+
   setTabReader(windowId, tabId, patch) {
     set((s) => updateTab(s, windowId, tabId, (t) => ({ ...t, ...patch })));
   },

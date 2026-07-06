@@ -26,6 +26,17 @@ from tinyagentos.skills import SkillStore
 @pytest_asyncio.fixture
 async def app_with_store(tmp_path):
     app = FastAPI()
+
+    # This bare app has no AuthMiddleware, so simulate an already-authenticated
+    # admin request (request.state.is_admin) -- these tests exercise the skill
+    # implementations themselves, not the admin-or-local-token authz gate that
+    # execute_skill now enforces (see test_skill_exec_authz.py for that).
+    @app.middleware("http")
+    async def _fake_admin_auth(request, call_next):
+        request.state.is_admin = True
+        request.state.via = "session"
+        return await call_next(request)
+
     app.include_router(router)
     store = SkillStore(tmp_path / "skills.db")
     await store.init()
@@ -105,6 +116,82 @@ async def test_file_write_and_read(app_with_store):
         )
         assert read_resp.status_code == 200
         assert read_resp.json().get("content") == "hello world"
+
+
+@pytest.mark.asyncio
+async def test_list_files_lists_workspace(app_with_store):
+    async with AsyncClient(
+        transport=ASGITransport(app=app_with_store), base_url="http://test"
+    ) as client:
+        await client.post(
+            "/api/skill-exec/file_write/call",
+            json={"args": {"path": "a.txt", "content": "hello"}},
+        )
+        await client.post(
+            "/api/skill-exec/file_write/call",
+            json={"args": {"path": "sub/b.txt", "content": "x"}},
+        )
+        resp = await client.post("/api/skill-exec/list_files/call", json={"args": {}})
+        assert resp.status_code == 200
+        by_name = {e["name"]: e for e in resp.json()["entries"]}
+        assert by_name["a.txt"]["type"] == "file" and by_name["a.txt"]["size"] == 5
+        assert by_name["sub"]["type"] == "dir"
+        sub = await client.post(
+            "/api/skill-exec/list_files/call", json={"args": {"path": "sub"}}
+        )
+        assert {e["name"] for e in sub.json()["entries"]} == {"b.txt"}
+
+
+@pytest.mark.asyncio
+async def test_agent_name_traversal_rejected(app_with_store):
+    """A traversal agent_name must not escape the workspaces base via any file
+    skill (it feeds the workspace path before the per-call path check)."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app_with_store), base_url="http://test"
+    ) as client:
+        for skill in ("file_read", "file_write", "list_files"):
+            resp = await client.post(
+                f"/api/skill-exec/{skill}/call",
+                json={"args": {"agent_name": "../../../../etc", "path": ""}},
+            )
+            body = resp.json()
+            assert "error" in body and "agent_name" in body["error"], (skill, body)
+
+
+@pytest.mark.asyncio
+async def test_list_files_rejects_path_outside_workspace(app_with_store):
+    async with AsyncClient(
+        transport=ASGITransport(app=app_with_store), base_url="http://test"
+    ) as client:
+        resp = await client.post(
+            "/api/skill-exec/list_files/call", json={"args": {"path": "../.."}}
+        )
+        assert resp.json().get("error") == "Path outside workspace"
+
+
+@pytest.mark.asyncio
+async def test_symlink_escape_rejected(app_with_store):
+    """A symlink inside the workspace pointing outside must not let file_read or
+    list_files escape: resolve() canonicalises the symlink and the containment
+    check then rejects the escaped target."""
+    import os
+    ws = app_with_store.state.agent_workspaces_dir / "default"
+    ws.mkdir(parents=True, exist_ok=True)
+    outside = app_with_store.state.agent_workspaces_dir.parent / "outside-secret"
+    outside.mkdir(parents=True, exist_ok=True)
+    (outside / "secret.txt").write_text("top secret")
+    os.symlink(outside, ws / "escape")
+    async with AsyncClient(
+        transport=ASGITransport(app=app_with_store), base_url="http://test"
+    ) as client:
+        r = await client.post(
+            "/api/skill-exec/list_files/call", json={"args": {"path": "escape"}}
+        )
+        assert r.json().get("error") == "Path outside workspace"
+        r2 = await client.post(
+            "/api/skill-exec/file_read/call", json={"args": {"path": "escape/secret.txt"}}
+        )
+        assert r2.json().get("error") == "Path outside workspace"
 
 
 @pytest.mark.asyncio

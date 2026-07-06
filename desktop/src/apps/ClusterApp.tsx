@@ -3,7 +3,7 @@ import { MobileSplitView } from "@/components/mobile/MobileSplitView";
 import {
   Network, RefreshCw, ExternalLink, Copy, Check, Trash2, Wand2,
   Cpu, MemoryStick, HardDrive, CircuitBoard, Zap, Server, Monitor,
-  X,
+  X, Plus,
 } from "lucide-react";
 import { Button, Card, CardContent } from "@/components/ui";
 import type { ClusterWorker, WorkerStatus } from "@/lib/cluster";
@@ -12,6 +12,7 @@ import {
   workerHardwareSummary,
   workerShortIp,
   formatRelativeSeconds,
+  normalizeBackendName,
   STATUS_PILL_CLASS,
   STATUS_LABEL,
 } from "@/lib/cluster";
@@ -87,14 +88,14 @@ function WorkerListCard({
               key={`${worker.name}-lb-${i}`}
               className="text-[9px] px-1.5 py-0.5 rounded-full bg-sky-500/15 text-sky-200 font-medium"
             >
-              {b.name ?? b.type ?? "backend"}
+              {normalizeBackendName(b.name ?? b.type ?? "backend")}
             </span>
           ))
         )}
         {capabilities.slice(0, 4).map((c) => (
           <span
             key={`${worker.name}-lc-${c}`}
-            className="text-[9px] px-1.5 py-0.5 rounded-full bg-violet-500/15 text-violet-200 font-medium"
+            className="text-[9px] px-1.5 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 font-medium"
             aria-label={`Current capability: ${c}`}
           >
             {c}
@@ -329,7 +330,7 @@ function WorkerDetail({
                 >
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[12px] font-medium text-shell-text truncate">
-                      {b.name ?? b.type ?? "backend"}
+                      {normalizeBackendName(b.name ?? b.type ?? "backend")}
                     </span>
                     {b.type && (
                       <span className="text-[10px] text-shell-text-tertiary">{b.type}</span>
@@ -345,7 +346,7 @@ function WorkerDetail({
                       {b.capabilities.map((c) => (
                         <span
                           key={`b-${i}-cap-${c}`}
-                          className="text-[9px] px-1.5 py-0.5 rounded-full bg-violet-500/15 text-violet-200 font-medium"
+                          className="text-[9px] px-1.5 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 font-medium"
                         >
                           {c}
                         </span>
@@ -393,7 +394,7 @@ function WorkerDetail({
         {/* Capabilities */}
         <Section
           title={`Capabilities (${capabilities.length} active${latentCaps.length > 0 ? ` · ${latentCaps.length} potential` : ""})`}
-          icon={<Zap size={14} className="text-violet-400" />}
+          icon={<Zap size={14} className="text-cyan-400" />}
         >
           {capabilities.length === 0 && latentCaps.length === 0 ? (
             <p className="text-[11px] text-shell-text-tertiary italic">No capabilities reported</p>
@@ -408,7 +409,7 @@ function WorkerDetail({
                     {capabilities.map((c) => (
                       <span
                         key={`detail-cap-${c}`}
-                        className="text-[10px] px-2 py-0.5 rounded-full bg-violet-500/15 text-violet-200 font-medium"
+                        className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 font-medium"
                         aria-label={`Current capability: ${c}`}
                       >
                         {c}
@@ -633,6 +634,44 @@ export function ClusterApp({ windowId: _windowId }: { windowId: string }) {
     setBusy(false);
   }, [showToast]);
 
+  // Manual (free-tier) Add worker: the worker shows a PIN, the user enters its
+  // IP + PIN here, and the controller authorises that code so the worker's poll
+  // can claim its key. No discovery -- the automated path is taOSgo.
+  const [addOpen, setAddOpen] = useState(false);
+  const [addIp, setAddIp] = useState("");
+  const [addPin, setAddPin] = useState("");
+  const [addBusy, setAddBusy] = useState(false);
+
+  const submitAddWorker = useCallback(async () => {
+    const ip = addIp.trim();
+    const pin = addPin.trim();
+    if (!ip || !pin) {
+      showToast("Enter the worker IP and PIN");
+      return;
+    }
+    setAddBusy(true);
+    try {
+      const res = await fetch("/api/cluster/pairing/manual", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json" },
+        body: JSON.stringify({ url: ip, code: pin }),
+      });
+      if (res.ok) {
+        showToast("Worker authorised. It will connect shortly.");
+        setAddOpen(false);
+        setAddIp("");
+        setAddPin("");
+        fetchWorkers();
+      } else {
+        const j = await res.json().catch(() => ({}));
+        showToast(j.error ? `Add worker failed: ${j.error}` : `Add worker failed (${res.status})`);
+      }
+    } catch (e) {
+      showToast(e instanceof Error ? e.message : "Network error");
+    }
+    setAddBusy(false);
+  }, [addIp, addPin, showToast, fetchWorkers]);
+
   return (
     <div className="flex flex-col h-full min-h-0 overflow-hidden bg-shell-bg text-shell-text select-none">
       {/* Toolbar */}
@@ -645,6 +684,16 @@ export function ClusterApp({ windowId: _windowId }: { windowId: string }) {
           </span>
         </div>
         <div className="flex items-center gap-1.5 shrink-0">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setAddOpen(true)}
+            aria-label="Add a worker"
+            className="gap-1.5"
+          >
+            <Plus size={14} />
+            Add worker
+          </Button>
           <label htmlFor="cluster-sort" className="sr-only">
             Sort by
           </label>
@@ -687,14 +736,24 @@ export function ClusterApp({ windowId: _windowId }: { windowId: string }) {
               ) : sortedWorkers.length === 0 ? (
                 <div className="flex flex-col items-center gap-2 py-6 text-center">
                   <p className="text-[11px] text-shell-text-tertiary">No workers registered yet.</p>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => setAddOpen(true)}
+                    className="gap-1.5"
+                    aria-label="Add a worker"
+                  >
+                    <Plus size={14} />
+                    Add worker
+                  </Button>
                   <a
                     href="https://github.com/jaylfc/tinyagentos#distributed-compute-cluster"
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="text-[11px] px-3 py-1.5 rounded-md bg-white/5 border border-white/10 text-shell-text-secondary hover:bg-white/10 transition-colors"
+                    className="text-[10px] text-shell-text-tertiary hover:text-shell-text-secondary underline underline-offset-2"
                     aria-label="How to add a worker (opens docs in new tab)"
                   >
-                    How to add a worker
+                    or read the docs
                   </a>
                 </div>
               ) : (
@@ -726,6 +785,65 @@ export function ClusterApp({ windowId: _windowId }: { windowId: string }) {
           }
         />
       </div>
+
+      {/* Add worker (manual / free-tier) modal */}
+      {addOpen && (
+        <div
+          className="absolute inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Add a worker"
+          onClick={() => !addBusy && setAddOpen(false)}
+        >
+          <div
+            className="w-full max-w-sm rounded-xl border border-white/10 bg-shell-bg-deep p-5 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="text-sm font-semibold text-shell-text">Add a worker</h3>
+              <Button variant="ghost" size="icon" onClick={() => setAddOpen(false)} aria-label="Close">
+                <X size={14} />
+              </Button>
+            </div>
+            <p className="text-[11px] text-shell-text-tertiary mb-3 leading-relaxed">
+              Install the worker on the other machine. It shows a PIN. Enter that machine's
+              IP and the PIN below, then it joins the cluster. For one-tap setup from anywhere,
+              taOSgo handles this automatically.
+            </p>
+            <label className="block text-[10px] uppercase tracking-wide text-shell-text-tertiary mb-1" htmlFor="add-worker-ip">
+              Worker IP address
+            </label>
+            <input
+              id="add-worker-ip"
+              value={addIp}
+              onChange={(e) => setAddIp(e.target.value)}
+              placeholder="192.168.1.50"
+              autoComplete="off"
+              className="w-full h-9 mb-3 rounded-md border border-white/10 bg-shell-bg px-2.5 text-sm text-shell-text focus-visible:outline-none focus-visible:border-accent/40 focus-visible:ring-2 focus-visible:ring-accent/20"
+            />
+            <label className="block text-[10px] uppercase tracking-wide text-shell-text-tertiary mb-1" htmlFor="add-worker-pin">
+              Pairing PIN
+            </label>
+            <input
+              id="add-worker-pin"
+              value={addPin}
+              onChange={(e) => setAddPin(e.target.value)}
+              placeholder="shown on the worker"
+              autoComplete="off"
+              onKeyDown={(e) => { if (e.key === "Enter") submitAddWorker(); }}
+              className="w-full h-9 mb-4 rounded-md border border-white/10 bg-shell-bg px-2.5 text-sm font-mono tracking-widest text-shell-text focus-visible:outline-none focus-visible:border-accent/40 focus-visible:ring-2 focus-visible:ring-accent/20"
+            />
+            <div className="flex justify-end gap-2">
+              <Button variant="ghost" size="sm" onClick={() => setAddOpen(false)} disabled={addBusy}>
+                Cancel
+              </Button>
+              <Button variant="default" size="sm" onClick={submitAddWorker} disabled={addBusy}>
+                {addBusy ? "Authorising..." : "Add worker"}
+              </Button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Toast */}
       {toast && (

@@ -5,7 +5,28 @@ import httpx
 from httpx import AsyncClient, ASGITransport
 from unittest.mock import AsyncMock, patch, MagicMock
 from tinyagentos.app import create_app
-from tinyagentos.routes.models import get_downloaded_models
+from tinyagentos.installers.model_paths import models_root
+from tinyagentos.routes.models import DEFAULT_MODELS_DIR, get_downloaded_models
+
+
+class TestDefaultModelsDir:
+    """DEFAULT_MODELS_DIR must track the install dir (via models_root()),
+    not a hardcoded /opt/tinyagentos literal — so an existing install at
+    /opt/tinyagentos and a fresh one at /opt/taos both resolve correctly.
+    """
+
+    def test_tracks_models_root(self):
+        assert DEFAULT_MODELS_DIR == models_root()
+
+    def test_is_not_hardcoded_opt_tinyagentos(self):
+        assert str(DEFAULT_MODELS_DIR) != "/opt/tinyagentos/models"
+
+    def test_honours_env_override(self, monkeypatch, tmp_path):
+        # models_root() reads TAOS_MODELS_ROOT at call time, so no module reload
+        # is needed; DEFAULT_MODELS_DIR is bound to models_root() (see
+        # test_tracks_models_root). Avoids the global-state race of reload.
+        monkeypatch.setenv("TAOS_MODELS_ROOT", str(tmp_path / "alt-models"))
+        assert models_root() == tmp_path / "alt-models"
 
 
 @pytest.fixture
@@ -22,7 +43,8 @@ def catalog_with_models(tmp_path):
              "backend": ["ollama", "llama-cpp"]},
             {"id": "npu", "name": "NPU RKLLM", "format": "rkllm", "size_mb": 200,
              "min_ram_mb": 0, "download_url": "https://example.com/npu.rkllm",
-             "backend": ["rkllama"], "requires_npu": ["rk3588"]},
+             "backend": ["rkllama"], "requires_npu": ["rk3588"],
+             "requires": {"backends": [{"id": "rkllama"}]}},
         ],
         "hardware_tiers": {"arm-npu-16gb": {"recommended": "npu", "fallback": "small"}},
         "install": {"method": "download"},
@@ -135,6 +157,34 @@ class TestModelsAPI:
         for m in data["models"]:
             assert m["has_downloaded_variant"] is False
 
+    async def test_downloaded_file_carries_model_id(self, models_app, models_client):
+        """A downloaded file whose name matches the
+        {manifest.id}-{variant.id}.{format} convention used by
+        POST /api/models/download must carry that manifest id in
+        downloaded_files, so the frontend can wire per-file Delete to
+        DELETE /api/models/{model_id} without reverse-engineering the
+        naming convention itself (#1581)."""
+        models_dir = models_app.state.models_dir
+        (models_dir / "test-model-small.gguf").write_bytes(b"x" * 100)
+
+        resp = await models_client.get("/api/models")
+        data = resp.json()
+        entry = next(f for f in data["downloaded_files"] if f["filename"] == "test-model-small.gguf")
+        assert entry["model_id"] == "test-model"
+
+    async def test_downloaded_file_without_manifest_match_has_no_model_id(
+        self, models_app, models_client
+    ):
+        """A file that doesn't match any manifest's naming convention (e.g. a
+        legacy/manually-placed file) must not get a fabricated model_id."""
+        models_dir = models_app.state.models_dir
+        (models_dir / "some-legacy-file.gguf").write_bytes(b"x" * 100)
+
+        resp = await models_client.get("/api/models")
+        data = resp.json()
+        entry = next(f for f in data["downloaded_files"] if f["filename"] == "some-legacy-file.gguf")
+        assert "model_id" not in entry
+
     async def test_registry_installed_with_disk_evidence_marks_downloaded(
         self, models_client, models_app, tmp_path
     ):
@@ -200,6 +250,143 @@ class TestModelsDelete:
         assert data["status"] == "deleted"
         assert data["deleted_files"] == []
 
+    async def test_delete_using_model_id_surfaced_in_list(self, models_app, models_client):
+        """End-to-end: the model_id GET /api/models attaches to a downloaded
+        file is exactly the id DELETE /api/models/{model_id} needs to remove
+        it — this is the wiring the frontend Delete button now relies on."""
+        models_dir = models_app.state.models_dir
+        (models_dir / "test-model-small.gguf").write_bytes(b"x" * 100)
+
+        list_resp = await models_client.get("/api/models")
+        entry = next(
+            f for f in list_resp.json()["downloaded_files"]
+            if f["filename"] == "test-model-small.gguf"
+        )
+        model_id = entry["model_id"]
+
+        delete_resp = await models_client.delete(f"/api/models/{model_id}")
+        assert delete_resp.status_code == 200
+        assert "test-model-small.gguf" in delete_resp.json()["deleted_files"]
+        assert not (models_dir / "test-model-small.gguf").exists()
+
+
+@pytest.mark.asyncio
+class TestModelDownload:
+    """POST /api/models/download must route variants that declare
+    requires.backends: [{id: rkllama}] through rkllama's own /api/pull
+    (RkllamaInstaller) instead of the generic byte-download path — a raw
+    file dump is invisible to the running rkllama server, so it can never
+    be selected as an agent model or deployed (#1599 / #1600).
+    """
+
+    async def test_generic_variant_still_uses_download_manager(self, models_app, models_client):
+        resp = await models_client.post(
+            "/api/models/download",
+            json={"app_id": "test-model", "variant_id": "small"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["download_id"] == "test-model-small"
+        task = models_app.state.download_manager.get_progress("test-model-small")
+        assert task is not None
+        assert task.url == "https://example.com/small.gguf"
+
+    async def test_rkllama_variant_routes_through_installer(self, models_app, models_client):
+        with patch(
+            "tinyagentos.installers.rkllama_installer.RkllamaInstaller.install",
+            new=AsyncMock(return_value={"success": True, "app_id": "test-model"}),
+        ) as mock_install:
+            resp = await models_client.post(
+                "/api/models/download",
+                json={"app_id": "test-model", "variant_id": "npu"},
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        download_id = data["download_id"]
+        assert download_id == "test-model-npu"
+        mock_install.assert_awaited_once()
+        assert mock_install.await_args.args[0] == "test-model"
+
+        # Drain the background task so the tracked DownloadTask settles.
+        task = models_app.state.download_manager.get_progress(download_id)
+        await models_app.state.download_manager._running[download_id]
+        assert task.status == "complete"
+
+    async def test_rkllama_variant_install_failure_marks_task_error(self, models_app, models_client):
+        with patch(
+            "tinyagentos.installers.rkllama_installer.RkllamaInstaller.install",
+            new=AsyncMock(return_value={"success": False, "error": "pull failed"}),
+        ):
+            resp = await models_client.post(
+                "/api/models/download",
+                json={"app_id": "test-model", "variant_id": "npu"},
+            )
+        assert resp.status_code == 200
+        download_id = resp.json()["download_id"]
+        task = models_app.state.download_manager.get_progress(download_id)
+        await models_app.state.download_manager._running[download_id]
+        assert task.status == "error"
+        assert task.error == "pull failed"
+
+    async def test_rkllama_variant_success_records_registry_and_refreshes_catalog(
+        self, models_app, models_client
+    ):
+        """rkllama pulls the weight into its own model store, not
+        models_dir, so a successful install must leave a breadcrumb (the
+        install registry) and force an immediate catalog refresh -- otherwise
+        the model would show as not-downloaded until the next 30s poll tick
+        (#1648).
+        """
+        fake_catalog = MagicMock()
+        fake_catalog.refresh = AsyncMock()
+        # Live evidence for the manifest id only (not the full variant id) so
+        # this exercises registry_corroborated's has_live_evidence path
+        # rather than the pre-existing _matches_live_backend exact match.
+        fake_catalog.all_models = MagicMock(return_value=[{"name": "test-model:latest"}])
+        models_app.state.backend_catalog = fake_catalog
+
+        with patch(
+            "tinyagentos.installers.rkllama_installer.RkllamaInstaller.install",
+            new=AsyncMock(return_value={"success": True, "app_id": "test-model"}),
+        ):
+            resp = await models_client.post(
+                "/api/models/download",
+                json={"app_id": "test-model", "variant_id": "npu"},
+            )
+        download_id = resp.json()["download_id"]
+        await models_app.state.download_manager._running[download_id]
+
+        fake_catalog.refresh.assert_awaited_once()
+        installed = models_app.state.registry.list_installed()
+        assert any(row["id"] == "test-model" for row in installed)
+
+        list_resp = await models_client.get("/api/models")
+        model = next(m for m in list_resp.json()["models"] if m["id"] == "test-model")
+        npu_variant = next(v for v in model["variants"] if v["id"] == "npu")
+        assert npu_variant["downloaded"] is True
+
+    async def test_rkllama_variant_failure_skips_registry_and_catalog_refresh(
+        self, models_app, models_client
+    ):
+        fake_catalog = MagicMock()
+        fake_catalog.refresh = AsyncMock()
+        models_app.state.backend_catalog = fake_catalog
+
+        with patch(
+            "tinyagentos.installers.rkllama_installer.RkllamaInstaller.install",
+            new=AsyncMock(return_value={"success": False, "error": "pull failed"}),
+        ):
+            resp = await models_client.post(
+                "/api/models/download",
+                json={"app_id": "test-model", "variant_id": "npu"},
+            )
+        download_id = resp.json()["download_id"]
+        await models_app.state.download_manager._running[download_id]
+
+        fake_catalog.refresh.assert_not_awaited()
+        installed = models_app.state.registry.list_installed()
+        assert not any(row["id"] == "test-model" for row in installed)
+
 
 @pytest.mark.asyncio
 class TestModelRecommendations:
@@ -250,23 +437,6 @@ class TestGetDownloadedModels:
 
 
 @pytest.fixture
-def app_with_rknn_sd_backend(tmp_path):
-    config = {
-        "server": {"host": "0.0.0.0", "port": 6969},
-        "backends": [
-            {"name": "rknn-sd-npu", "type": "rknn-sd", "url": "http://localhost:7863", "priority": 1}
-        ],
-        "qmd": {"url": "http://localhost:7832"},
-        "agents": [],
-        "metrics": {"poll_interval": 30, "retention_days": 30},
-    }
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(yaml.dump(config))
-    (tmp_path / ".setup_complete").touch()
-    return create_app(data_dir=tmp_path)
-
-
-@pytest.fixture
 def app_with_sd_cpp_backend(tmp_path):
     config = {
         "server": {"host": "0.0.0.0", "port": 6969},
@@ -298,77 +468,6 @@ async def _make_auth_client(app):
 
 @pytest.mark.asyncio
 class TestLoadedModelsImageBackends:
-    async def test_rknn_sd_loaded_when_pipeline_loaded(self, app_with_rknn_sd_backend):
-        """rknn-sd: /health with pipeline_loaded=true -> entry appears in loaded list."""
-        app = app_with_rknn_sd_backend
-
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "status": "ok",
-            "model": "lcm-dreamshaper-v7-rknn",
-            "pipeline_loaded": True,
-        }
-
-        async with await _make_auth_client(app) as c:
-            with patch.object(app.state, "http_client") as mock_http:
-                mock_http.get = AsyncMock(return_value=mock_response)
-                resp = await c.get("/api/models/loaded")
-        await app.state.metrics.close()
-        await app.state.qmd_client.close()
-        await app.state.http_client.aclose()
-
-        assert resp.status_code == 200
-        data = resp.json()
-        entries = [e for e in data["loaded"] if e["backend"] == "rknn-sd-npu"]
-        assert len(entries) == 1
-        entry = entries[0]
-        assert entry["name"] == "lcm-dreamshaper-v7-rknn"
-        assert entry["backend_type"] == "rknn-sd"
-        assert entry["purpose"] == "image-generation"
-        assert entry["size_mb"] is None
-        assert entry["vram_mb"] is None
-
-    async def test_rknn_sd_not_loaded_when_pipeline_not_loaded(self, app_with_rknn_sd_backend):
-        """rknn-sd: /health with pipeline_loaded=false -> no entry in loaded list."""
-        app = app_with_rknn_sd_backend
-
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
-            "status": "ok",
-            "model": "lcm-dreamshaper-v7-rknn",
-            "pipeline_loaded": False,
-        }
-
-        async with await _make_auth_client(app) as c:
-            with patch.object(app.state, "http_client") as mock_http:
-                mock_http.get = AsyncMock(return_value=mock_response)
-                resp = await c.get("/api/models/loaded")
-        await app.state.metrics.close()
-        await app.state.qmd_client.close()
-        await app.state.http_client.aclose()
-
-        assert resp.status_code == 200
-        data = resp.json()
-        entries = [e for e in data["loaded"] if e["backend"] == "rknn-sd-npu"]
-        assert entries == []
-
-    async def test_rknn_sd_offline_skipped(self, app_with_rknn_sd_backend):
-        """rknn-sd backend: ConnectError is swallowed; loaded list is empty."""
-        app = app_with_rknn_sd_backend
-
-        async with await _make_auth_client(app) as c:
-            with patch.object(app.state, "http_client") as mock_http:
-                mock_http.get = AsyncMock(side_effect=httpx.ConnectError("refused"))
-                resp = await c.get("/api/models/loaded")
-        await app.state.metrics.close()
-        await app.state.qmd_client.close()
-        await app.state.http_client.aclose()
-
-        assert resp.status_code == 200
-        assert resp.json()["loaded"] == []
-
     async def test_sd_cpp_never_appears_in_loaded(self, app_with_sd_cpp_backend):
         """sd-cpp: /sdapi/v1/options doesn't expose load state; backend is skipped entirely."""
         app = app_with_sd_cpp_backend
@@ -406,3 +505,34 @@ class TestLoadedModelsImageBackends:
 
         assert resp.status_code == 200
         assert resp.json()["loaded"] == []
+
+
+@pytest.mark.asyncio
+class TestDeleteModel:
+    async def test_delete_removes_all_model_suffixes(self, models_app, models_client):
+        """DELETE removes every recognised model suffix (incl .safetensors/.onnx
+        and uppercase) but leaves non-model files alone. Regression: the old
+        hardcoded (.gguf,.rkllm,.bin) list orphaned .safetensors/.onnx files."""
+        models_dir = models_app.state.models_dir
+        # NB: use uppercase .GGUF only (no lowercase twin) — it proves both the
+        # .gguf suffix match AND case-insensitivity, and avoids a case-insensitive
+        # filesystem (macOS) collapsing .gguf/.GGUF into one file.
+        for fn in (
+            "test-model.GGUF",      # uppercase → exercises case-insensitive match
+            "test-model.safetensors",
+            "test-model.onnx",
+        ):
+            (models_dir / fn).write_bytes(b"x")
+        (models_dir / "test-model.txt").write_bytes(b"x")  # non-model, must survive
+
+        resp = await models_client.delete("/api/models/test-model")
+        assert resp.status_code == 200
+        deleted = set(resp.json()["deleted_files"])
+        assert {
+            "test-model.GGUF",
+            "test-model.safetensors",
+            "test-model.onnx",
+        } <= deleted
+        assert not (models_dir / "test-model.safetensors").exists()
+        assert not (models_dir / "test-model.onnx").exists()
+        assert (models_dir / "test-model.txt").exists()

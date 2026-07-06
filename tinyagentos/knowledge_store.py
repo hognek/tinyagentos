@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS knowledge_items (
     status TEXT NOT NULL DEFAULT 'pending',
     monitor TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    user_id TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_ki_source_type ON knowledge_items(source_type);
 CREATE INDEX IF NOT EXISTS idx_ki_status ON knowledge_items(status);
@@ -89,19 +90,45 @@ def _row_to_item(row: tuple) -> dict:
         "monitor": json.loads(row[14] or "{}"),
         "created_at": row[15],
         "updated_at": row[16],
+        "user_id": row[17] if len(row) > 17 else "",
     }
+
+
+
+async def _migration_v1_add_user_id(conn) -> None:
+    """Add user_id column and index to knowledge_items (idempotent).
+
+    Runs at the top of _post_init so it self-heals databases created before
+    the multi-user keying was introduced.  SQLite lacks IF NOT EXISTS for
+    ADD COLUMN prior to 3.37, so we use PRAGMA table_info for broad
+    compatibility.
+    """
+    existing_cols = {
+        row[1]
+        for row in await (
+            await conn.execute("PRAGMA table_info(knowledge_items)")
+        ).fetchall()
+    }
+    if "user_id" not in existing_cols:
+        await conn.execute(
+            "ALTER TABLE knowledge_items ADD COLUMN user_id TEXT NOT NULL DEFAULT ''"
+        )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_ki_user_id ON knowledge_items(user_id)"
+    )
+    await conn.commit()
 
 
 class KnowledgeStore(BaseStore):
     """SQLite + FTS5 store for the Knowledge Base Service."""
 
     SCHEMA = KNOWLEDGE_SCHEMA
-
     def __init__(self, db_path: Path, media_dir: Path | None = None) -> None:
         super().__init__(db_path)
         self.media_dir = media_dir or db_path.parent / "knowledge-media"
 
     async def _post_init(self) -> None:
+        await _migration_v1_add_user_id(self._db)
         self.media_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -124,6 +151,7 @@ class KnowledgeStore(BaseStore):
         thumbnail: str | None = None,
         status: str = "pending",
         monitor: dict | None = None,
+        user_id: str = "",
     ) -> str:
         """Insert a new KnowledgeItem and add it to the FTS index. Returns the item id."""
         assert self._db is not None
@@ -133,13 +161,13 @@ class KnowledgeStore(BaseStore):
             """INSERT INTO knowledge_items
                (id, source_type, source_url, source_id, title, author, summary,
                 content, media_path, thumbnail, categories, tags, metadata,
-                status, monitor, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                status, monitor, created_at, updated_at, user_id)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 item_id, source_type, source_url, source_id, title, author,
                 summary, content, media_path, thumbnail,
                 json.dumps(categories), json.dumps(tags), json.dumps(metadata),
-                status, json.dumps(monitor or {}), now, now,
+                status, json.dumps(monitor or {}), now, now, user_id,
             ),
         )
         await self._db.execute(
@@ -149,16 +177,31 @@ class KnowledgeStore(BaseStore):
         await self._db.commit()
         return item_id
 
-    async def get_item(self, item_id: str) -> dict | None:
-        """Fetch a single item by id. Returns None if not found."""
+    async def get_item(self, item_id: str, user_id: str | None = None) -> dict | None:
+        """Fetch a single item by id.
+
+        When *user_id* is given, only items owned by that user are returned
+        (existence-hiding: returns None for items owned by other users).
+        Pass ``user_id=None`` (default) to skip ownership filtering — used
+        internally and by admin callers.
+        """
         assert self._db is not None
-        cursor = await self._db.execute(
-            """SELECT id, source_type, source_url, source_id, title, author, summary,
-                      content, media_path, thumbnail, categories, tags, metadata,
-                      status, monitor, created_at, updated_at
-               FROM knowledge_items WHERE id = ?""",
-            (item_id,),
-        )
+        if user_id is not None:
+            cursor = await self._db.execute(
+                """SELECT id, source_type, source_url, source_id, title, author, summary,
+                          content, media_path, thumbnail, categories, tags, metadata,
+                          status, monitor, created_at, updated_at, user_id
+                   FROM knowledge_items WHERE id = ? AND user_id = ?""",
+                (item_id, user_id),
+            )
+        else:
+            cursor = await self._db.execute(
+                """SELECT id, source_type, source_url, source_id, title, author, summary,
+                          content, media_path, thumbnail, categories, tags, metadata,
+                          status, monitor, created_at, updated_at, user_id
+                   FROM knowledge_items WHERE id = ?""",
+                (item_id,),
+            )
         row = await cursor.fetchone()
         return _row_to_item(row) if row else None
 
@@ -205,14 +248,22 @@ class KnowledgeStore(BaseStore):
         category: str | None = None,
         limit: int = 50,
         offset: int = 0,
+        user_id: str | None = None,
     ) -> list[dict]:
-        """List items with optional filters, newest first."""
+        """List items with optional filters, newest first.
+
+        When *user_id* is given, only items owned by that user are returned.
+        Pass ``user_id=None`` (default) to list all items (admin / internal use).
+        """
         assert self._db is not None
         sql = """SELECT id, source_type, source_url, source_id, title, author, summary,
                         content, media_path, thumbnail, categories, tags, metadata,
-                        status, monitor, created_at, updated_at
+                        status, monitor, created_at, updated_at, user_id
                  FROM knowledge_items WHERE 1=1"""
         params: list = []
+        if user_id is not None:
+            sql += " AND user_id = ?"
+            params.append(user_id)
         if source_type:
             sql += " AND source_type = ?"
             params.append(source_type)
@@ -220,13 +271,24 @@ class KnowledgeStore(BaseStore):
             sql += " AND status = ?"
             params.append(status)
         if category:
-            sql += " AND categories LIKE ?"
-            params.append(f'%"{category}"%')
+            # Use json_each() instead of a LIKE scan so this is an exact
+            # match on a JSON array element rather than a substring scan.
+            sql += (
+                " AND id IN ("
+                "SELECT ki2.id FROM knowledge_items ki2, "
+                "json_each(ki2.categories) WHERE json_each.value = ?"
+                ")"
+            )
+            params.append(category)
         sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         cursor = await self._db.execute(sql, params)
         rows = await cursor.fetchall()
         return [_row_to_item(r) for r in rows]
+
+    async def list_for_user(self, user_id: str, **kwargs) -> list[dict]:
+        """List items belonging to a specific user. Convenience wrapper around list_items."""
+        return await self.list_items(user_id=user_id, **kwargs)
 
     async def delete_item(self, item_id: str) -> bool:
         """Delete an item and its FTS entry. Returns True if a row was deleted."""
@@ -242,35 +304,67 @@ class KnowledgeStore(BaseStore):
     # FTS search
     # ------------------------------------------------------------------
 
-    async def search_fts(self, query: str, limit: int = 20) -> list[dict]:
-        """Keyword search across title, content, summary, author using FTS5."""
-        assert self._db is not None
-        safe_query = query.replace('"', '""')
-        sql = """
-            SELECT i.id, i.source_type, i.source_url, i.source_id, i.title, i.author,
-                   i.summary, i.content, i.media_path, i.thumbnail, i.categories,
-                   i.tags, i.metadata, i.status, i.monitor, i.created_at, i.updated_at
-            FROM knowledge_fts f
-            JOIN knowledge_items i ON i.id = f.id
-            WHERE knowledge_fts MATCH ?
-            ORDER BY rank
-            LIMIT ?
+    async def search_fts(self, query: str, limit: int = 20, user_id: str | None = None) -> list[dict]:
+        """Keyword search across title, content, summary, author using FTS5.
+
+        When *user_id* is given, results are restricted to items owned by that user.
+        Pass ``user_id=None`` (default) to search across all items (admin / internal).
         """
-        try:
-            cursor = await self._db.execute(sql, (safe_query, limit))
-            rows = await cursor.fetchall()
-        except Exception:
-            # Fallback to LIKE when FTS query syntax is invalid
-            fallback = """
+        assert self._db is not None
+        # Wrap as a quoted phrase so FTS5 operators in user input are not
+        # interpreted (AND, OR, NOT, *, NEAR, column:filter, etc.).
+        safe_query = '"' + query.replace('"', '""') + '"'
+        if user_id is not None:
+            sql = """
+                SELECT i.id, i.source_type, i.source_url, i.source_id, i.title, i.author,
+                       i.summary, i.content, i.media_path, i.thumbnail, i.categories,
+                       i.tags, i.metadata, i.status, i.monitor, i.created_at, i.updated_at,
+                       i.user_id
+                FROM knowledge_fts f
+                JOIN knowledge_items i ON i.id = f.id
+                WHERE knowledge_fts MATCH ? AND i.user_id = ?
+                ORDER BY rank
+                LIMIT ?
+            """
+            fts_params = (safe_query, user_id, limit)
+            fallback_params_fn = lambda pattern: (pattern, pattern, pattern, user_id, limit)
+            fallback_sql = """
                 SELECT id, source_type, source_url, source_id, title, author, summary,
                        content, media_path, thumbnail, categories, tags, metadata,
-                       status, monitor, created_at, updated_at
+                       status, monitor, created_at, updated_at, user_id
+                FROM knowledge_items
+                WHERE (title LIKE ? OR content LIKE ? OR summary LIKE ?) AND user_id = ?
+                ORDER BY created_at DESC LIMIT ?
+            """
+        else:
+            sql = """
+                SELECT i.id, i.source_type, i.source_url, i.source_id, i.title, i.author,
+                       i.summary, i.content, i.media_path, i.thumbnail, i.categories,
+                       i.tags, i.metadata, i.status, i.monitor, i.created_at, i.updated_at,
+                       i.user_id
+                FROM knowledge_fts f
+                JOIN knowledge_items i ON i.id = f.id
+                WHERE knowledge_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+            """
+            fts_params = (safe_query, limit)
+            fallback_params_fn = lambda pattern: (pattern, pattern, pattern, limit)
+            fallback_sql = """
+                SELECT id, source_type, source_url, source_id, title, author, summary,
+                       content, media_path, thumbnail, categories, tags, metadata,
+                       status, monitor, created_at, updated_at, user_id
                 FROM knowledge_items
                 WHERE title LIKE ? OR content LIKE ? OR summary LIKE ?
                 ORDER BY created_at DESC LIMIT ?
             """
+        try:
+            cursor = await self._db.execute(sql, fts_params)
+            rows = await cursor.fetchall()
+        except Exception:
+            # Fallback to LIKE when FTS query syntax is invalid
             pattern = f"%{query}%"
-            cursor = await self._db.execute(fallback, (pattern, pattern, pattern, limit))
+            cursor = await self._db.execute(fallback_sql, fallback_params_fn(pattern))
             rows = await cursor.fetchall()
         return [_row_to_item(r) for r in rows]
 

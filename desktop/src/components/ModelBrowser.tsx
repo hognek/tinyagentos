@@ -103,7 +103,7 @@ export function ModelBrowser({
     "compatible",
   );
   const [downloading, setDownloading] = useState<
-    Record<string, { percent: number; status: string }>
+    Record<string, { percent: number; status: string; error?: string }>
   >({});
   const [loadedModels, setLoadedModels] = useState<LoadedModel[]>([]);
 
@@ -243,17 +243,27 @@ export function ModelBrowser({
         });
         const data = await res.json();
         if (!data.download_id) {
-          setDownloading((prev) => {
-            const n = { ...prev };
-            delete n[key];
-            return n;
-          });
+          // Keep the failure on screen: silently clearing here made a
+          // rejected install look like an instant success (#1548).
+          setDownloading((prev) => ({
+            ...prev,
+            [key]: {
+              percent: 0,
+              status: "error",
+              error: data.error || data.detail || "The download could not be started",
+            },
+          }));
           return;
         }
         const interval = setInterval(async () => {
           try {
             const pr = await fetch(`/api/models/downloads/${data.download_id}`);
             const task = await pr.json();
+            // A proxy error page or empty body must land in the catch below
+            // (which surfaces an error), not TypeError into a stuck spinner.
+            if (!task || typeof task !== "object") {
+              throw new Error("invalid poll response");
+            }
             setDownloading((prev) => ({
               ...prev,
               [key]: {
@@ -272,14 +282,32 @@ export function ModelBrowser({
               onModelDownloaded?.(modelId, variantId);
             } else if (task.status === "error") {
               clearInterval(interval);
-              setDownloading((prev) => {
-                const n = { ...prev };
-                delete n[key];
-                return n;
-              });
+              // A failed download must stay visible with its cause; clearing
+              // it made an immediate failure indistinguishable from a
+              // completed install (#1548).
+              setDownloading((prev) => ({
+                ...prev,
+                [key]: {
+                  percent: task.percent ?? 0,
+                  status: "error",
+                  // || not ??: the backend initialises error to an empty
+                  // string, and an empty alert helps nobody.
+                  error: task.error || "Download failed",
+                },
+              }));
             }
           } catch {
+            // Losing the poll (network blip, proxy error page) must not
+            // strand a spinner with no outcome; surface it as an error.
             clearInterval(interval);
+            setDownloading((prev) => ({
+              ...prev,
+              [key]: {
+                percent: 0,
+                status: "error",
+                error: "Lost contact with the download; retry to continue",
+              },
+            }));
           }
         }, 2000);
       } catch {
@@ -308,7 +336,7 @@ export function ModelBrowser({
     >
       <div
         className="w-full max-w-4xl h-full max-h-full flex flex-col rounded-2xl border border-white/10 overflow-hidden"
-        style={{ backgroundColor: "rgba(26, 27, 46, 0.98)" }}
+        style={{ backgroundColor: "var(--color-dock-bg)" }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -515,7 +543,31 @@ export function ModelBrowser({
                               </div>
                             </div>
                             <div className="shrink-0">
-                              {dl ? (
+                              {dl && dl.status === "error" ? (
+                                <div
+                                  className="flex items-center gap-2 max-w-[260px]"
+                                  role="alert"
+                                >
+                                  <span
+                                    className="text-[10px] text-red-400 flex items-center gap-1 truncate"
+                                    title={dl.error}
+                                  >
+                                    <AlertTriangle size={10} className="shrink-0" />
+                                    <span className="truncate">
+                                      {dl.error || "Download failed"}
+                                    </span>
+                                  </span>
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={() =>
+                                      startDownload(model.id, variant.id)
+                                    }
+                                  >
+                                    Retry
+                                  </Button>
+                                </div>
+                              ) : dl ? (
                                 <div className="flex items-center gap-2 text-xs text-shell-text-secondary">
                                   <Loader2
                                     size={12}
@@ -572,11 +624,11 @@ export function ModelBrowser({
                         <div className="flex items-start justify-between gap-3">
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2 flex-wrap">
-                              <Cloud size={13} className="text-violet-400 shrink-0" />
+                              <Cloud size={13} className="text-cyan-400 shrink-0" />
                               <h3 className="text-sm font-semibold text-shell-text truncate">
                                 {cm.name ?? cm.id}
                               </h3>
-                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-violet-500/20 text-violet-300 font-medium shrink-0">
+                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 font-medium shrink-0">
                                 {cm.providerName}
                               </span>
                             </div>

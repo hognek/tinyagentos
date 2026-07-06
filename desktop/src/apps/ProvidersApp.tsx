@@ -18,8 +18,8 @@ import { useIsMobile } from "@/hooks/use-is-mobile";
 /* ------------------------------------------------------------------ */
 
 /** Fallback constants used before the API call completes. */
-const FALLBACK_CLOUD_TYPES = ["openai", "anthropic", "openrouter", "kilocode", "openai-compatible"] as const;
-const FALLBACK_LOCAL_TYPES = ["rkllama", "ollama", "llama-cpp", "vllm", "exo", "mlx", "sd-cpp", "rknn-sd"] as const;
+const FALLBACK_CLOUD_TYPES = ["openai", "anthropic", "openrouter", "kilocode", "deepseek", "openai-compatible"] as const;
+const FALLBACK_LOCAL_TYPES = ["rkllama", "ollama", "llama-cpp", "vllm", "exo", "mlx", "sd-cpp"] as const;
 
 /** Active cloud types — seeded with fallback, updated from /api/providers/types.
  *  Referenced by isCloud() and groupByCategory() directly so they don't
@@ -34,8 +34,13 @@ const DEFAULT_URLS: Partial<Record<ProviderType, string>> = {
   anthropic: "https://api.anthropic.com/v1",
   openrouter: "https://openrouter.ai/api/v1",
   kilocode: "https://api.kilo.ai/api/gateway",
+  deepseek: "https://api.deepseek.com",
   ollama: "http://localhost:11434",
-  rkllama: "http://localhost:8080",
+  // taOS default rkllama port since the 7833 migration (adjacent to qmd on
+  // 7832) -- see _DEFAULT_RKLLAMA_PORT in rkllama_installer.py. 8080 is the
+  // legacy upstream default; prefilling it here left new installs pointed
+  // at a dead port with a permanent false "Error" (#1578).
+  rkllama: "http://localhost:7833",
   "llama-cpp": "http://localhost:8080",
   vllm: "http://localhost:8000",
 };
@@ -71,6 +76,12 @@ const CLOUD_PROVIDER_META: Record<string, CloudProviderMeta> = {
     description: "500+ models, smart routing",
     url: "https://api.kilo.ai/api/gateway",
     keyPlaceholder: "kilo-...",
+  },
+  deepseek: {
+    label: "DeepSeek",
+    description: "DeepSeek V4 Pro, Flash, Reasoner",
+    url: "https://api.deepseek.com",
+    keyPlaceholder: "sk-...",
   },
   "openai-compatible": {
     label: "OpenAI-Compatible",
@@ -161,7 +172,7 @@ function TypePill({ type }: { type: string }) {
   return (
     <span
       className={`text-[10px] px-1.5 py-0.5 rounded font-medium ${
-        cloud ? "bg-violet-500/20 text-violet-300" : "bg-teal-500/20 text-teal-300"
+        cloud ? "bg-sky-500/20 text-sky-300" : "bg-teal-500/20 text-teal-300"
       }`}
     >
       {type}
@@ -1003,7 +1014,7 @@ function ProviderDetail({
                     (provider.enabled ?? true) ? "bg-emerald-500" : "bg-zinc-600"
                   }`}
                 >
-                  <span className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-transform ${
+                  <span className={`absolute left-0.5 top-0.5 w-3 h-3 rounded-full bg-white transition-transform ${
                     (provider.enabled ?? true) ? "translate-x-4" : "translate-x-0.5"
                   }`} />
                 </button>
@@ -1029,7 +1040,7 @@ function ProviderDetail({
                   return (
                     <span
                       key={`m-${i}-${label}`}
-                      className="text-[10px] px-2 py-0.5 rounded-full bg-violet-500/15 text-violet-200 font-medium"
+                      className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 font-medium"
                     >
                       {label}
                     </span>
@@ -1061,7 +1072,7 @@ function ProviderDetail({
                     (provider.enabled ?? true) ? "bg-emerald-500" : "bg-zinc-600"
                   }`}
                 >
-                  <span className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-transform ${
+                  <span className={`absolute left-0.5 top-0.5 w-3 h-3 rounded-full bg-white transition-transform ${
                     (provider.enabled ?? true) ? "translate-x-4" : "translate-x-0.5"
                   }`} />
                 </button>
@@ -1078,7 +1089,7 @@ function ProviderDetail({
                     (provider.auto_manage ?? false) ? "bg-emerald-500" : "bg-zinc-600"
                   }`}
                 >
-                  <span className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-transform ${
+                  <span className={`absolute left-0.5 top-0.5 w-3 h-3 rounded-full bg-white transition-transform ${
                     (provider.auto_manage ?? false) ? "translate-x-4" : "translate-x-0.5"
                   }`} />
                 </button>

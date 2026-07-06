@@ -6,8 +6,15 @@ const MessagesApp = lazy(() => import("./apps/MessagesApp").then((m) => ({ defau
 export function ChatStandalone() {
   return (
     <div
-      className="h-screen w-screen flex flex-col overflow-hidden"
-      style={{ backgroundColor: "#1a1b2e", paddingTop: "env(safe-area-inset-top, 0px)" }}
+      className="w-screen flex flex-col overflow-hidden"
+      style={{
+        // 100dvh exactly fills the visible standalone area; 100vh (h-screen)
+        // resolves to the larger viewport in an installed iOS PWA and leaves
+        // dead space at the bottom.
+        height: "100dvh",
+        backgroundColor: "var(--color-shell-bg)",
+        paddingTop: "env(safe-area-inset-top, 0px)",
+      }}
     >
       <InstallPromptBanner />
       <Suspense fallback={

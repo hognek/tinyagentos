@@ -1,4 +1,10 @@
+import hashlib
+import hmac
+import json as _json
+import os
 import sqlite3
+import sys
+import time
 
 import pytest
 import pytest_asyncio
@@ -7,6 +13,174 @@ from httpx import ASGITransport, AsyncClient
 
 from tinyagentos.app import create_app
 from tinyagentos.routes.desktop import SPA_DIR
+
+
+# ---------------------------------------------------------------------------
+# Cluster HMAC pairing helpers (used by cluster tests across multiple files)
+# ---------------------------------------------------------------------------
+
+def _cluster_code_hash(code: str) -> str:
+    return hashlib.sha256(code.encode()).hexdigest()
+
+
+def sign_worker_request(
+    key: bytes,
+    name: str,
+    method: str,
+    path: str,
+    body: bytes,
+) -> dict:
+    """Return the three HMAC auth headers for a worker request."""
+    ts = str(int(time.time()))
+    body_hash = hashlib.sha256(body).hexdigest()
+    message = f"{ts}.{method.upper()}.{path}.{body_hash}".encode()
+    sig = hmac.new(key, message, hashlib.sha256).hexdigest()
+    return {
+        "X-TAOS-Worker-Name": name,
+        "X-TAOS-Timestamp": ts,
+        "X-TAOS-Signature": sig,
+    }
+
+
+async def _pair_and_register_worker(
+    client,
+    app,
+    payload: dict,
+    code_prefix: str = "test-pairing-code",
+) -> object:
+    """Pair a worker and POST to /api/cluster/workers with HMAC auth.
+
+    Drives the full announce -> confirm -> claim flow to obtain a signing
+    key, then sends the registration request with the correct headers.
+    Returns the httpx Response from the final POST.
+    """
+    name = payload["name"]
+    url = payload.get("url", "http://localhost:9000")
+    platform = payload.get("platform", "linux")
+    code = code_prefix + name
+
+    # init() opens a fresh aiosqlite connection every call, so only run it
+    # when the store has not been initialised yet (avoids leaking connections
+    # in tests that pair multiple workers).
+    if app.state.cluster_pairing._db is None:  # noqa: SLF001
+        await app.state.cluster_pairing.init()
+    ch = _cluster_code_hash(code)
+
+    resp = await client.post(
+        "/api/cluster/pairing/announce",
+        json={"name": name, "url": url, "platform": platform, "code_hash": ch},
+    )
+    assert resp.status_code == 200, f"announce failed for {name!r}: {resp.text}"
+
+    resp = await client.post(
+        "/api/cluster/pairing/confirm",
+        json={"name": name, "code": code},
+    )
+    assert resp.status_code == 200, f"confirm failed for {name!r}: {resp.text}"
+
+    resp = await client.post(
+        "/api/cluster/pairing/claim",
+        json={"name": name, "code": code},
+    )
+    assert resp.status_code == 200, f"claim failed for {name!r}: {resp.text}"
+    key = bytes.fromhex(resp.json()["signing_key"])
+
+    body = _json.dumps(payload).encode()
+    headers = sign_worker_request(key, name, "POST", "/api/cluster/workers", body)
+    return await client.post(
+        "/api/cluster/workers",
+        content=body,
+        headers={**headers, "content-type": "application/json"},
+    )
+
+
+@pytest.fixture
+def pair_and_register_worker():
+    """Function fixture so test files in any directory can use the pairing
+    helper without importing from conftest (tests/ is not a package, so
+    ``from tests.conftest import ...`` breaks under CI's import mode)."""
+    return _pair_and_register_worker
+
+
+# macOS + Python 3.14: after the interpreter loads ObjC-backed extension
+# modules (psutil, zeroconf, Pillow, lxml …), forking a child process with
+# subprocess violates macOS's "unsafe after ObjC runtime init" restriction and
+# produces SIGSEGV in git/bash children (exit code -11).  Setting this env var
+# tells the ObjC runtime to skip the fork-safety check in child processes.
+# The variable propagates automatically to every subprocess the test suite
+# spawns; it is a no-op on Linux (ignored) so CI is unaffected.
+if sys.platform == "darwin":
+    os.environ.setdefault("OBJC_DISABLE_INITIALIZE_FORK_SAFETY", "YES")
+
+
+def _patch_aiosqlite_daemon_threads():
+    """Patch aiosqlite's Connection so its worker thread is a daemon thread.
+
+    When aiosqlite connections are not explicitly closed before the asyncio
+    event loop shuts down, their background worker threads remain blocked on
+    SimpleQueue.get().  Because the thread is NOT a daemon, Python's
+    interpreter shutdown joins it — waiting forever for a thread that will
+    never receive the stop sentinel.  This causes pytest to hang for tens of
+    minutes after printing the test summary.
+
+    Observed on CI (Python 3.12 / 3.13, Ubuntu): after the suite finishes
+    pytest is killed by the 45-minute Actions timeout rather than exiting
+    normally.  The same underlying issue causes a SIGSEGV on Python 3.14
+    macOS when the semaphore is torn down under the blocked thread.
+
+    Fix (two layers):
+    1. Mark the worker thread daemon=True so interpreter shutdown kills it
+       instead of joining it — avoids the indefinite block.
+    2. Guard call_soon_threadsafe with an is_closed() pre-check so the
+       worker does not crash if it receives a future tied to a dead loop.
+
+    Applied to all supported Python versions (3.11+) because the hang
+    reproduces on 3.12 and 3.13 in CI.  The patch is safe: daemon=True
+    only affects abnormal exit (loop closed before Connection.close());
+    normal teardown still sends the stop sentinel via the queue.
+    """
+    import aiosqlite.core as _core
+    from threading import Thread
+
+    _STOP = _core._STOP_RUNNING_SENTINEL
+
+    def _threadsafe_call(loop, callback, *args):
+        """Deliver result/exception only if the event loop is still alive."""
+        try:
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(callback, *args)
+        except RuntimeError:
+            # Race: loop closed between the is_closed() check and the call.
+            pass
+
+    def _safe_worker(tx):
+        while True:
+            future, function = tx.get()
+            try:
+                result = function()
+                if future:
+                    _threadsafe_call(
+                        future.get_loop(), _core.set_result, future, result
+                    )
+                if result is _STOP:
+                    break
+            except BaseException as exc:
+                if future:
+                    _threadsafe_call(
+                        future.get_loop(), _core.set_exception, future, exc
+                    )
+
+    _core._connection_worker_thread = _safe_worker
+
+    # Monkey-patch Connection.__init__ to mark the worker thread daemon so
+    # interpreter shutdown does not wait (and deadlock) on it.
+    _orig_init = _core.Connection.__init__
+
+    def _patched_init(self, connector, iter_chunk_size, loop=None):
+        _orig_init(self, connector, iter_chunk_size, loop)
+        self._thread.daemon = True
+
+    _core.Connection.__init__ = _patched_init
 
 
 def pytest_configure(config):
@@ -28,6 +202,12 @@ def pytest_configure(config):
         f = SPA_DIR / name
         if not f.exists():
             f.write_text(body)
+
+    # Apply the aiosqlite daemon-thread patch unconditionally: the hang
+    # (pytest blocked after test summary) reproduces on 3.12 and 3.13 in
+    # CI, not just on 3.14.  The SIGSEGV on 3.14 macOS has the same root
+    # cause.  daemon=True is safe for all supported versions.
+    _patch_aiosqlite_daemon_threads()
 
 
 @pytest.fixture
@@ -73,6 +253,10 @@ async def client(app, tmp_data_dir):
     if secrets_store._db is not None:
         await secrets_store.close()
     await secrets_store.init()
+    broker_store = app.state.broker_store
+    if broker_store._db is not None:
+        await broker_store.close()
+    await broker_store.init()
     scheduler = app.state.scheduler
     if scheduler._db is not None:
         await scheduler.close()
@@ -121,15 +305,77 @@ async def client(app, tmp_data_dir):
     if project_store._db is not None:
         await project_store.close()
     await project_store.init()
+    board_audit = app.state.board_audit
+    if board_audit._db is not None:
+        await board_audit.close()
+    await board_audit.init()
+    receipt_store = app.state.receipt_store
+    if receipt_store._db is not None:
+        await receipt_store.close()
+    await receipt_store.init()
     project_task_store = app.state.project_task_store
     if project_task_store._db is not None:
         await project_task_store.close()
     await project_task_store.init()
+    routine_store = app.state.routine_store
+    if routine_store._db is not None:
+        await routine_store.close()
+    await routine_store.init()
+    decision_store = app.state.decision_store
+    if decision_store._db is not None:
+        await decision_store.close()
+    await decision_store.init()
+    execution_policies = app.state.execution_policies
+    if execution_policies._db is not None:
+        await execution_policies.close()
+    await execution_policies.init()
+    coding_session_store = app.state.coding_session_store
+    if coding_session_store._db is not None:
+        await coding_session_store.close()
+    await coding_session_store.init()
     app.state.projects_root.mkdir(parents=True, exist_ok=True)
     canvas_store = app.state.canvas_store
     if canvas_store._db is not None:
         await canvas_store.close()
     await canvas_store.init()
+    themes = app.state.themes
+    if themes._db is not None:
+        await themes.close()
+    await themes.init()
+    office_docs = app.state.office_docs
+    if office_docs._db is not None:
+        await office_docs.close()
+    await office_docs.init()
+    web_sites = app.state.web_sites
+    if web_sites._db is not None:
+        await web_sites.close()
+    await web_sites.init()
+    song_store = app.state.song_store
+    if song_store._db is not None:
+        await song_store.close()
+    await song_store.init()
+    design_docs = app.state.design_docs
+    if design_docs._db is not None:
+        await design_docs.close()
+    await design_docs.init()
+    # app_grants ledger (per-app capability grants) is lifespan-owned; tests that
+    # bypass the lifespan must init it so the userspace broker can consult it.
+    await app.state.app_grants.init()
+    # license_acceptances ledger (non-commercial weights accept-gate, #169) is
+    # also lifespan-owned; same bypass-init requirement.
+    await app.state.license_acceptances.init()
+    feedback_store = app.state.feedback_store
+    if feedback_store._db is not None:
+        await feedback_store.close()
+    await feedback_store.init()
+    client_log_store = app.state.client_log_store
+    if client_log_store._db is not None:
+        await client_log_store.close()
+    await client_log_store.init()
+    device_store = app.state.device_store
+    if device_store._db is not None:
+        await device_store.close()
+    await device_store.init()
     # BrowserApp v2 stores
     from tinyagentos.routes.desktop_browser.store import BrowserStore, BrowserCookieStore
     _browser_store = BrowserStore(tmp_data_dir / "browser.sqlite3")
@@ -141,12 +387,21 @@ async def client(app, tmp_data_dir):
     )
     await _browser_cookie_store.init()
     app.state.browser_cookie_store = _browser_cookie_store
+    # Lifespan-owned objects set to None by create_app() — tests that bypass
+    # the lifespan need these initialised so routes don't fail on NoneType.
+    from tinyagentos.routes.desktop_browser.copilot_ws import CopilotTicketStore, CopilotHub
+    app.state.copilot_ticket_store = CopilotTicketStore()
+    app.state.copilot_hub = CopilotHub()
     # Auth middleware requires a configured user — set up a test admin so all
     # routes respond normally instead of returning 401 needs_onboarding.
     app.state.auth.setup_user("admin", "Test Admin", "", "testpass")
     _record = app.state.auth.find_user("admin")
     _uid = _record["id"] if _record else ""
     _token = app.state.auth.create_session(user_id=_uid, long_lived=True)
+    # Mark startup complete so the guard middleware lets test requests through.
+    # The test client bypasses the lifespan, so we set this manually after all
+    # stores have been manually initialized above.
+    app.state._startup_complete = True
     transport = ASGITransport(app=app)
     async with AsyncClient(
         transport=transport,
@@ -156,6 +411,8 @@ async def client(app, tmp_data_dir):
         yield c
     await canvas_store.close()
     await project_task_store.close()
+    await routine_store.close()
+    await board_audit.close()
     await project_store.close()
     await chat_channels.close()
     await chat_messages.close()
@@ -169,8 +426,16 @@ async def client(app, tmp_data_dir):
     await channel_store.close()
     await scheduler.close()
     await secrets_store.close()
+    await broker_store.close()
     await notif_store.close()
     await store.close()
+    await office_docs.close()
+    await web_sites.close()
+    await song_store.close()
+    await design_docs.close()
+    await coding_session_store.close()
+    await feedback_store.close()
+    await client_log_store.close()
     await app.state.qmd_client.close()
     await app.state.http_client.aclose()
     await _browser_store.close()
@@ -298,10 +563,18 @@ async def client_with_qmd(app_with_qmd):
     if project_store._db is not None:
         await project_store.close()
     await project_store.init()
+    board_audit = app_with_qmd.state.board_audit
+    if board_audit._db is not None:
+        await board_audit.close()
+    await board_audit.init()
     project_task_store = app_with_qmd.state.project_task_store
     if project_task_store._db is not None:
         await project_task_store.close()
     await project_task_store.init()
+    routine_store = app_with_qmd.state.routine_store
+    if routine_store._db is not None:
+        await routine_store.close()
+    await routine_store.init()
     app_with_qmd.state.projects_root.mkdir(parents=True, exist_ok=True)
     canvas_store = app_with_qmd.state.canvas_store
     if canvas_store._db is not None:
@@ -311,6 +584,7 @@ async def client_with_qmd(app_with_qmd):
     _record = app_with_qmd.state.auth.find_user("admin")
     _uid = _record["id"] if _record else ""
     _token = app_with_qmd.state.auth.create_session(user_id=_uid, long_lived=True)
+    app_with_qmd.state._startup_complete = True
     transport = ASGITransport(app=app_with_qmd)
     async with AsyncClient(
         transport=transport,
@@ -320,6 +594,8 @@ async def client_with_qmd(app_with_qmd):
         yield c
     await canvas_store.close()
     await project_task_store.close()
+    await routine_store.close()
+    await board_audit.close()
     await project_store.close()
     await chat_channels.close()
     await chat_messages.close()

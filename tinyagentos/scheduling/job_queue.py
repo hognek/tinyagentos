@@ -97,10 +97,11 @@ class JobQueue:
 
     async def init(self) -> None:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._db_path)
+        # isolation_level=None puts the connection in autocommit mode so we
+        # can issue BEGIN IMMEDIATE manually for atomic read-check-write.
+        self._conn = sqlite3.connect(self._db_path, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA)
-        self._conn.commit()
 
         # Load custom limits from config
         for row in self._conn.execute("SELECT key, value FROM queue_config").fetchall():
@@ -112,13 +113,18 @@ class JobQueue:
                     pass
 
         # Mark any stale "running" jobs as failed (from a crash/restart)
-        stale = self._conn.execute(
-            "UPDATE jobs SET status = 'failed', error = 'stale: process restarted' "
-            "WHERE status = 'running'"
-        )
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            stale = self._conn.execute(
+                "UPDATE jobs SET status = 'failed', error = 'stale: process restarted' "
+                "WHERE status = 'running'"
+            )
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
         if stale.rowcount > 0:
             logger.info("Marked %d stale running jobs as failed", stale.rowcount)
-            self._conn.commit()
 
     async def close(self) -> None:
         if self._conn:
@@ -148,7 +154,6 @@ class JobQueue:
             (job_id, job_type, priority, agent_name,
              json.dumps(payload or {}), resource_type, estimated_seconds, now),
         )
-        self._conn.commit()
         return job_id
 
     # ------------------------------------------------------------------
@@ -156,45 +161,51 @@ class JobQueue:
     # ------------------------------------------------------------------
 
     async def dequeue(self, resource_types: list[str] | None = None) -> dict | None:
-        """Get the next eligible job to run.
+        """Get the next eligible job to run, atomically.
 
-        Checks concurrency limits for the job's resource type.
+        Uses BEGIN IMMEDIATE to acquire a write lock before the read-check-update
+        sequence so two concurrent callers cannot both claim the same job.
+
         Returns the job dict or None if nothing is eligible.
         """
-        # Count currently running jobs per resource type
-        running = {}
-        for row in self._conn.execute(
-            "SELECT resource_type, COUNT(*) as n FROM jobs WHERE status = 'running' GROUP BY resource_type"
-        ).fetchall():
-            running[row["resource_type"]] = row["n"]
-
-        # Find the next pending job whose resource type has capacity
         query = "SELECT * FROM jobs WHERE status = 'pending'"
         params: list = []
         if resource_types:
             placeholders = ",".join("?" * len(resource_types))
             query += f" AND resource_type IN ({placeholders})"
             params.extend(resource_types)
-        query += " ORDER BY priority DESC, created_at ASC LIMIT 1"
+        query += " ORDER BY priority DESC, created_at ASC"
 
-        candidates = self._conn.execute(query, params).fetchall()
-        for row in candidates:
-            resource = row["resource_type"]
-            limit = self._limits.get(resource, 1)
-            current = running.get(resource, 0)
-            if current < limit:
-                # Claim the job
-                now = time.time()
-                self._conn.execute(
-                    "UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?",
-                    (now, row["id"]),
-                )
-                self._conn.commit()
-                # Re-fetch to get updated status
-                claimed = self._conn.execute(
-                    "SELECT * FROM jobs WHERE id = ?", (row["id"],)
-                ).fetchone()
-                return dict(claimed)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Count currently running jobs per resource type (inside the lock)
+            running: dict[str, int] = {}
+            for row in self._conn.execute(
+                "SELECT resource_type, COUNT(*) as n FROM jobs WHERE status = 'running' GROUP BY resource_type"
+            ).fetchall():
+                running[row["resource_type"]] = row["n"]
+
+            # Walk pending jobs in priority order and claim the first one with capacity
+            for row in self._conn.execute(query, params).fetchall():
+                resource = row["resource_type"]
+                limit = self._limits.get(resource, 1)
+                current = running.get(resource, 0)
+                if current < limit:
+                    now = time.time()
+                    self._conn.execute(
+                        "UPDATE jobs SET status = 'running', started_at = ? WHERE id = ?",
+                        (now, row["id"]),
+                    )
+                    claimed = self._conn.execute(
+                        "SELECT * FROM jobs WHERE id = ?", (row["id"],)
+                    ).fetchone()
+                    self._conn.execute("COMMIT")
+                    return dict(claimed)
+
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
         return None
 
@@ -209,7 +220,6 @@ class JobQueue:
             "UPDATE jobs SET status = 'completed', completed_at = ?, result_json = ? WHERE id = ? AND status = 'running'",
             (now, json.dumps(result or {}), job_id),
         )
-        self._conn.commit()
         return cursor.rowcount > 0
 
     async def fail(self, job_id: str, error: str) -> bool:
@@ -219,7 +229,6 @@ class JobQueue:
             "UPDATE jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ? AND status = 'running'",
             (now, error, job_id),
         )
-        self._conn.commit()
         return cursor.rowcount > 0
 
     async def cancel(self, job_id: str) -> bool:
@@ -228,7 +237,6 @@ class JobQueue:
             "UPDATE jobs SET status = 'cancelled' WHERE id = ? AND status = 'pending'",
             (job_id,),
         )
-        self._conn.commit()
         return cursor.rowcount > 0
 
     # ------------------------------------------------------------------
@@ -285,7 +293,6 @@ class JobQueue:
             "INSERT INTO queue_config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (f"limit_{resource_type}", str(max_concurrent)),
         )
-        self._conn.commit()
 
     async def get_limits(self) -> dict[str, int]:
         return dict(self._limits)
@@ -301,7 +308,6 @@ class JobQueue:
             "DELETE FROM jobs WHERE status IN ('completed', 'failed', 'cancelled') AND created_at < ?",
             (cutoff,),
         )
-        self._conn.commit()
         return cursor.rowcount
 
     # ------------------------------------------------------------------
