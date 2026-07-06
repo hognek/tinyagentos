@@ -288,7 +288,7 @@ class TestResolveOpencodeBinary:
         assert ocr.resolve_opencode_binary() == str(system_bin)
 
     def test_does_not_probe_arbitrary_user_homes(self, monkeypatch):
-        """Security: the candidate list must not glob /home/* — running a binary
+        """Security: the candidate list must not glob /home/*, since running a binary
         from a non-privileged user's home is a privilege-escalation vector on a
         multi-user box (#1616 security review)."""
         from tinyagentos import opencode_runtime as ocr

@@ -56,7 +56,7 @@ def _opencode_candidate_paths() -> list[Path]:
 
     Only **trusted** locations: root-controlled system paths, root's own home,
     and the ``taos`` service user's own home. We deliberately do NOT probe
-    arbitrary users' ``~/.opencode/bin`` — taOS is multi-user, and executing a
+    arbitrary users' ``~/.opencode/bin``: taOS is multi-user, and executing a
     binary from a non-privileged user's home would let that user plant a
     malicious ``opencode`` and escalate to the service account. An operator who
     installed opencode into their own home points at it explicitly via the
