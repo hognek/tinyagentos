@@ -81,6 +81,10 @@ const SECTIONS: SectionDef[] = [
   { id: "logs", label: "Logs", icon: ScrollText },
 ];
 
+// Sections that require admin privileges to view (GHSA-47g9: backend already
+// 403s these for non-admins, this hides them from the sidebar/content too).
+const ADMIN_ONLY = new Set(["system", "storage", "memory", "backup", "updates", "advanced", "users", "logs"]);
+
 const PLACEHOLDER_SYSTEM: SystemInfo = {
   cpu: "Detecting...",
   ram: "Detecting...",
@@ -748,8 +752,30 @@ export function SettingsApp({ windowId: _windowId, section: initialSection }: { 
     isSection(initialSection) ? initialSection : "system"
   );
   const [mobileShowSection, setMobileShowSection] = useState(false);
+  // Fail-closed: default to false so admin-only sections never flash for a
+  // non-admin while the check is still in flight.
+  const [isAdmin, setIsAdmin] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/auth/status", { credentials: "include" })
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (cancelled) return;
+        setIsAdmin(!!data?.user?.is_admin);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setIsAdmin(false);
+      });
+    return () => { cancelled = true; };
+  }, []);
 
   const isMobile = typeof window !== "undefined" && window.innerWidth < 640;
+
+  const visibleSections = isAdmin ? SECTIONS : SECTIONS.filter((s) => !ADMIN_ONLY.has(s.id));
+  const effectiveSection: Section =
+    !isAdmin && ADMIN_ONLY.has(section) ? (visibleSections[0]?.id ?? section) : section;
 
   const content: Record<Section, ReactNode> = {
     account: <AccountSection />,
@@ -778,8 +804,8 @@ export function SettingsApp({ windowId: _windowId, section: initialSection }: { 
       aria-label="Settings sections"
     >
       <div className="p-3 space-y-1">
-        {SECTIONS.map((s) => {
-          const active = section === s.id;
+        {visibleSections.map((s) => {
+          const active = effectiveSection === s.id;
           const Icon = s.icon;
           return (
             <Button
@@ -807,7 +833,7 @@ export function SettingsApp({ windowId: _windowId, section: initialSection }: { 
           <ChevronLeft size={14} /> Back
         </Button>
       )}
-      {content[section]}
+      {content[effectiveSection]}
     </main>
   );
 
