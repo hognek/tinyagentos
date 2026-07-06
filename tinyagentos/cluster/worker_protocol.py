@@ -60,3 +60,41 @@ class WorkerInfo:
     worker_lxc_image_version: str | None = None  # Ubuntu image version, e.g. "ubuntu/24.04/amd64"
     degraded: bool = False
     degraded_reason: str | None = None
+    # Real-time GPU VRAM reported on every heartbeat (free/used in MiB).
+    # Default None means unreported / no probe available (e.g. non-NVIDIA
+    # hardware such as RK3588, Apple Silicon, or CPU-only workers) and must
+    # stay distinct from an explicit 0 -- consumers (Skald's TaosDispatcher,
+    # the lease pre-claim VRAM check) treat None as "unknown", not "no VRAM
+    # free", so those workers are never permanently un-leasable.
+    free_vram_mb: int | None = None
+    used_vram_mb: int | None = None
+
+
+@dataclass
+class GpuLease:
+    """A time-limited reservation of GPU capacity on a cluster worker.
+
+    Created by ``POST /api/cluster/leases/claim`` and tracked in the
+    controller's in-memory ``ClusterManager._leases`` dict.  Expired
+    leases are swept by the same monitor loop that marks workers
+    offline.
+
+    Attributes:
+        lease_id: Short unique id (``l_<8 hex>``).
+        resource_id: ``{worker_name}:{resource_name}``, e.g.
+            ``"hognehermes:gpu-cuda-0"``.
+        caller: Human-readable label for the lease holder
+            (``"skald-dispatcher"``, ``"a2a-agent:extract"``). Exposed as
+            ``caller`` consistently across the dataclass and every API
+            response (claim, release, renew, list).
+        expires_at: wall-clock timestamp (``time.time()``) after which the
+            lease is considered stale and automatically freed.
+        required_vram_mb: How many MiB of VRAM the caller declared it
+            needs.  Used by the pre-claim check to refuse a claim when
+            the worker's ``free_vram_mb`` is too low.
+    """
+    lease_id: str
+    resource_id: str
+    caller: str = ""
+    expires_at: float = 0.0
+    required_vram_mb: int = 0

@@ -1,8 +1,9 @@
 from __future__ import annotations
 import asyncio
 import logging
+import secrets
 import time
-from tinyagentos.cluster.worker_protocol import WorkerInfo
+from tinyagentos.cluster.worker_protocol import GpuLease, WorkerInfo
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,11 @@ def _format_hw(hw) -> str:
 class ClusterManager:
     def __init__(self, notifications=None, capabilities=None):
         self._workers: dict[str, WorkerInfo] = {}
+        self._leases: dict[str, GpuLease] = {}
+        # Serializes all lease-table mutations (claim/release/renew/expiry
+        # sweep) so a claim's find-existing -> check-VRAM -> store sequence
+        # is atomic even when multiple requests are in flight at once.
+        self._lease_lock = asyncio.Lock()
         self._monitor_task: asyncio.Task | None = None
         self._notifications = notifications  # NotificationStore, optional
         self._capabilities = capabilities    # CapabilityChecker, optional
@@ -177,6 +183,8 @@ class ClusterManager:
         kv_cache_quant_k_support: list[str] | None = None,
         kv_cache_quant_v_support: list[str] | None = None,
         kv_cache_quant_boundary_layer_protect: bool | None = None,
+        free_vram_mb: int | None = None,
+        used_vram_mb: int | None = None,
     ) -> bool:
         """Accept a worker heartbeat.
 
@@ -215,6 +223,10 @@ class ClusterManager:
             worker.kv_cache_quant_v_support = list(kv_cache_quant_v_support)
         if kv_cache_quant_boundary_layer_protect is not None:
             worker.kv_cache_quant_boundary_layer_protect = bool(kv_cache_quant_boundary_layer_protect)
+        if free_vram_mb is not None:
+            worker.free_vram_mb = int(free_vram_mb)
+        if used_vram_mb is not None:
+            worker.used_vram_mb = int(used_vram_mb)
         # Fire worker.online notification when a previously-offline worker recovers.
         # heartbeat() is sync, so schedule the async emit as a background task.
         if self._notifications and prev_status in ("offline", "stale"):
@@ -250,6 +262,138 @@ class ClusterManager:
             if w.host_lan_ip == host_lan_ip:
                 return w
         return None
+
+    # ── Lease management ───────────────────────────────────────────────
+
+    def _parse_resource_id(self, resource_id: str) -> tuple[str, str] | None:
+        """Split ``"worker-name:gpu-cuda-0"`` into (worker_name, resource_name)."""
+        if ":" not in resource_id:
+            return None
+        worker, rest = resource_id.split(":", 1)
+        return worker, rest
+
+    def _worker_for_resource(self, resource_id: str) -> WorkerInfo | None:
+        """Return the WorkerInfo for a resource_id, or None."""
+        parsed = self._parse_resource_id(resource_id)
+        if parsed is None:
+            return None
+        worker_name, _ = parsed
+        worker = self._workers.get(worker_name)
+        if worker is None or worker.status != "online":
+            return None
+        return worker
+
+    def find_existing_lease(self, resource_id: str) -> GpuLease | None:
+        """Return the active (non-expired) lease for a resource, if any."""
+        now = time.time()
+        for lease in self._leases.values():
+            if lease.resource_id == resource_id and lease.expires_at > now:
+                return lease
+        return None
+
+    async def claim_lease(
+        self,
+        resource_id: str,
+        caller: str = "",
+        ttl_seconds: float = 30,
+        required_vram_mb: int = 0,
+    ) -> GpuLease | None:
+        """Attempt to claim a GPU lease on ``resource_id``.
+
+        Fails if:
+        - The resource_id is malformed.
+        - The target worker is not online.
+        - Another active lease already exists for this resource.
+        - ``required_vram_mb > worker.free_vram_mb`` (when
+          ``required_vram_mb > 0`` and the worker's free VRAM is known).
+          A worker that has never reported VRAM (``free_vram_mb is None``,
+          e.g. non-NVIDIA hardware with no probe) is never refused on VRAM
+          grounds since we cannot prove insufficient capacity.
+
+        The find-existing / check-VRAM / store sequence runs under
+        ``_lease_lock`` so two concurrent claims for the same resource
+        cannot both succeed.
+        """
+        worker = self._worker_for_resource(resource_id)
+        if worker is None:
+            logger.debug("claim_lease: worker not found or offline for %s", resource_id)
+            return None
+
+        async with self._lease_lock:
+            existing = self.find_existing_lease(resource_id)
+            if existing is not None:
+                logger.debug(
+                    "claim_lease: resource %s already leased by %r (expires in %.0fs)",
+                    resource_id, existing.caller, existing.expires_at - time.time(),
+                )
+                return None
+
+            if (
+                required_vram_mb > 0
+                and worker.free_vram_mb is not None
+                and required_vram_mb > worker.free_vram_mb
+            ):
+                logger.debug(
+                    "claim_lease: %s needs %d MiB VRAM but %s has %d MiB free",
+                    caller, required_vram_mb, worker.name, worker.free_vram_mb,
+                )
+                return None
+
+            lease_id = f"l_{secrets.token_hex(4)}"
+            lease = GpuLease(
+                lease_id=lease_id,
+                resource_id=resource_id,
+                caller=caller,
+                expires_at=time.time() + ttl_seconds,
+                required_vram_mb=required_vram_mb,
+            )
+            self._leases[lease_id] = lease
+            logger.info(
+                "Lease claimed: %s on %s by %r (ttl=%.0fs, vram=%d MiB)",
+                lease_id, resource_id, caller, ttl_seconds, required_vram_mb,
+            )
+            return lease
+
+    async def release_lease(self, lease_id: str) -> bool:
+        """Release a lease by id.  Idempotent — returns True even if the
+        lease was already expired or never existed."""
+        async with self._lease_lock:
+            lease = self._leases.pop(lease_id, None)
+        if lease is not None:
+            logger.info("Lease released: %s on %s", lease_id, lease.resource_id)
+        return True  # idempotent
+
+    async def renew_lease(self, lease_id: str, ttl_seconds: float = 30) -> GpuLease | None:
+        """Extend a lease's TTL.  Returns the lease, or None if expired/unknown."""
+        async with self._lease_lock:
+            lease = self._leases.get(lease_id)
+            if lease is None:
+                return None
+            now = time.time()
+            if lease.expires_at <= now:
+                self._leases.pop(lease_id, None)
+                return None
+            lease.expires_at = now + ttl_seconds
+            return lease
+
+    def get_leases(self) -> list[GpuLease]:
+        """Return a snapshot of active (non-expired) leases."""
+        now = time.time()
+        return [lease for lease in self._leases.values() if lease.expires_at > now]
+
+    def _sweep_expired_leases(self):
+        """Remove leases whose TTL has elapsed.  Called from _monitor_loop
+        while holding ``_lease_lock``."""
+        now = time.time()
+        expired = [
+            lid for lid, lease in self._leases.items()
+            if lease.expires_at <= now
+        ]
+        for lid in expired:
+            lease = self._leases.pop(lid)
+            logger.debug("Lease expired: %s on %s", lid, lease.resource_id)
+
+    # ── Capability routing ─────────────────────────────────────────────
 
     def get_workers_for_capability(self, capability: str) -> list[WorkerInfo]:
         """Get online workers that support a capability, sorted by priority (lowest load first)."""
@@ -341,7 +485,8 @@ class ClusterManager:
         }
 
     async def _monitor_loop(self):
-        """Monitor worker heartbeats, mark stale workers as offline."""
+        """Monitor worker heartbeats, mark stale workers as offline, and
+        sweep expired GPU leases."""
         while True:
             now = time.time()
             for worker in self._workers.values():
@@ -359,4 +504,18 @@ class ClusterManager:
                             f"No heartbeat for {HEARTBEAT_TIMEOUT}s. Capabilities may be reduced.",
                             level="warning",
                         )
+                    # Release any active leases for this worker's resources.
+                    # Match on the exact worker name (not a resource_id
+                    # prefix) so "gpu-node" and "gpu-node-2" don't collide.
+                    async with self._lease_lock:
+                        offline_lids = [
+                            lid for lid, lease in self._leases.items()
+                            if (parsed := self._parse_resource_id(lease.resource_id))
+                            and parsed[0] == worker.name
+                        ]
+                        for lid in offline_lids:
+                            self._leases.pop(lid, None)
+                            logger.debug("Lease %s released — worker %s went offline", lid, worker.name)
+            async with self._lease_lock:
+                self._sweep_expired_leases()
             await asyncio.sleep(5)
