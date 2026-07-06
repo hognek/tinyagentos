@@ -236,8 +236,21 @@ class TestResolveOpencodeBinary:
     def test_prefers_path_lookup(self, monkeypatch):
         from tinyagentos import opencode_runtime as ocr
 
+        monkeypatch.delenv("TAOS_OPENCODE_BIN", raising=False)
         monkeypatch.setattr(ocr.shutil, "which", lambda name: "/usr/local/bin/opencode")
         assert ocr.resolve_opencode_binary() == "/usr/local/bin/opencode"
+
+    def test_env_override_wins(self, tmp_path, monkeypatch):
+        """TAOS_OPENCODE_BIN is the explicit operator override and beats PATH."""
+        from tinyagentos import opencode_runtime as ocr
+
+        binary = tmp_path / "my-opencode"
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+        monkeypatch.setenv("TAOS_OPENCODE_BIN", str(binary))
+        # Even with a PATH hit, the override wins.
+        monkeypatch.setattr(ocr.shutil, "which", lambda name: "/usr/local/bin/opencode")
+        assert ocr.resolve_opencode_binary() == str(binary)
 
     def test_falls_back_to_installer_default_location(self, tmp_path, monkeypatch):
         from tinyagentos import opencode_runtime as ocr
@@ -249,16 +262,40 @@ class TestResolveOpencodeBinary:
         binary.write_text("#!/bin/sh\n")
         binary.chmod(0o755)
 
+        monkeypatch.delenv("TAOS_OPENCODE_BIN", raising=False)
         monkeypatch.setattr(ocr.shutil, "which", lambda name: None)
         monkeypatch.setattr(ocr.Path, "home", classmethod(lambda cls: fake_home))
 
         assert ocr.resolve_opencode_binary() == str(binary)
 
+    def test_finds_binary_installed_under_another_user_home(self, tmp_path, monkeypatch):
+        """#1616: opencode installed by the operator lands in *their* home, not
+        the taos service user's. The service must still find it via the extra
+        candidate locations."""
+        from tinyagentos import opencode_runtime as ocr
+
+        operator_bin = tmp_path / "home" / "operator" / ".opencode" / "bin" / "opencode"
+        operator_bin.parent.mkdir(parents=True)
+        operator_bin.write_text("#!/bin/sh\n")
+        operator_bin.chmod(0o755)
+
+        monkeypatch.delenv("TAOS_OPENCODE_BIN", raising=False)
+        monkeypatch.setattr(ocr.shutil, "which", lambda name: None)
+        # taos service user's own home has no opencode; the operator's does.
+        monkeypatch.setattr(
+            ocr, "_opencode_candidate_paths",
+            lambda: [tmp_path / "taos-home" / ".opencode" / "bin" / "opencode", operator_bin],
+        )
+        assert ocr.resolve_opencode_binary() == str(operator_bin)
+
     def test_returns_none_when_not_installed_anywhere(self, tmp_path, monkeypatch):
         from tinyagentos import opencode_runtime as ocr
 
+        monkeypatch.delenv("TAOS_OPENCODE_BIN", raising=False)
         monkeypatch.setattr(ocr.shutil, "which", lambda name: None)
-        monkeypatch.setattr(ocr.Path, "home", classmethod(lambda cls: tmp_path / "no-home"))
+        # Neutralise the host filesystem so a real opencode on the CI runner
+        # doesn't leak into this "nothing installed" case.
+        monkeypatch.setattr(ocr, "_opencode_candidate_paths", lambda: [])
 
         assert ocr.resolve_opencode_binary() is None
 

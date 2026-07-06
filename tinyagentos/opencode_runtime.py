@@ -40,24 +40,61 @@ class OpenCodeBinaryNotFoundError(RuntimeError):
     """
 
 
+# Standard system-wide install locations to probe beyond PATH. The controller
+# runs as the unprivileged ``taos`` service user (a non-login systemd service),
+# so it neither sources shell rc PATH exports nor shares a home with whoever
+# ran opencode's installer.
+_OPENCODE_SYSTEM_PATHS = (
+    "/usr/local/bin/opencode",
+    "/usr/bin/opencode",
+    "/opt/opencode/bin/opencode",
+)
+
+
+def _opencode_candidate_paths() -> list[Path]:
+    """Ordered candidate binary locations to probe after PATH lookup.
+
+    Covers the #1616 case: opencode's official installer drops the binary in
+    the *invoking* user's ``~/.opencode/bin``, but the ``taos`` service user's
+    own home is the install dir, not the human operator's home, so an opencode
+    "installed system-wide" (as the operator or root) was invisible. We now also
+    look at standard system paths and every real user's installer location.
+
+    Broken out from :func:`resolve_opencode_binary` so tests can neutralise the
+    host filesystem.
+    """
+    candidates: list[Path] = [Path.home() / ".opencode" / "bin" / "opencode"]
+    candidates += [Path(p) for p in _OPENCODE_SYSTEM_PATHS]
+    # The installer's per-user location for whoever actually ran it (root or a
+    # human operator), which the service user's own home never covers.
+    candidates.append(Path("/root/.opencode/bin/opencode"))
+    candidates += sorted(Path("/home").glob("*/.opencode/bin/opencode"))
+    return candidates
+
+
 def resolve_opencode_binary() -> str | None:
     """Locate the opencode binary, working around the PATH gap above.
 
     Checks, in order:
-      1. ``shutil.which("opencode")`` -- covers PATH already containing it.
-      2. ``~/.opencode/bin/opencode`` -- the official installer's fixed
-         location, which a non-login process (e.g. a systemd service) never
-         picks up via PATH alone.
+      1. ``TAOS_OPENCODE_BIN`` env var -- explicit operator override.
+      2. ``shutil.which("opencode")`` -- covers PATH already containing it.
+      3. The service user's own ``~/.opencode/bin/opencode``.
+      4. Standard system paths + every real user's ``~/.opencode/bin`` (the
+         installer's per-user location), so opencode installed by the operator
+         under their own home is still found by the ``taos`` service (#1616).
 
     Returns the resolved path, or ``None`` if opencode isn't installed
     anywhere we know to look.
     """
+    override = os.environ.get("TAOS_OPENCODE_BIN")
+    if override and Path(override).is_file() and os.access(override, os.X_OK):
+        return override
     found = shutil.which("opencode")
     if found:
         return found
-    candidate = Path.home() / ".opencode" / "bin" / "opencode"
-    if candidate.is_file() and os.access(candidate, os.X_OK):
-        return str(candidate)
+    for candidate in _opencode_candidate_paths():
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
     return None
 
 
