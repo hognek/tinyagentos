@@ -1146,6 +1146,10 @@ async def update_agent_model(request: Request, name: str, body: AgentModelUpdate
                 name,
             )
             agent["llm_key"] = None
+            # Persist the discard: the earlier save_config_locked ran before the
+            # re-scope, so without this the stale key survives on disk and the
+            # next deploy would still use it.
+            await save_config_locked(config, config.config_path)
 
     framework = agent.get("framework")
     if framework in ("openclaw", "hermes"):

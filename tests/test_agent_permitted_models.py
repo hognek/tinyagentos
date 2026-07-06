@@ -368,9 +368,19 @@ async def test_update_agent_model_downloaded_backend_down_returns_actionable_409
 @pytest.mark.asyncio
 async def test_update_agent_model_discards_stale_key_on_re_scope_failure(monkeypatch):
     """When update_agent_key returns False (e.g. routing-only mode or provider
-    type mismatch), the stale per-agent key must be discarded so the deployer
-    falls back to the master key on the next deploy."""
-    _patch_save(monkeypatch)
+    type mismatch), the stale per-agent key must be discarded AND that discard
+    must be persisted -- the earlier save runs before the re-scope, so without a
+    second save the stale key survives on disk and the next deploy still uses
+    it."""
+    # Record the persisted llm_key at each save so we can assert the discard was
+    # actually written, not just mutated in memory.
+    saved_keys = []
+    import tinyagentos.routes.agents as mod
+
+    async def _recording_save(config, path, *a, **k):
+        saved_keys.append(config.agents[0].get("llm_key"))
+
+    monkeypatch.setattr(mod, "save_config_locked", _recording_save)
     _patch_resolver(monkeypatch, {})
     # routing-only proxy (no database_url) — update_agent_key returns False
     proxy = _FakeProxy(db=False)
@@ -390,8 +400,11 @@ async def test_update_agent_model_discards_stale_key_on_re_scope_failure(monkeyp
     resp = await update_agent_model(req, "alpha", body)
     assert resp["status"] == "updated"
     assert resp["key_rescoped"] is False
-    # The stale key must be discarded
+    # The stale key must be discarded in memory...
     assert agents[0].get("llm_key") is None
+    # ...and persisted: the final save must have written the None, otherwise the
+    # on-disk config keeps the stale key (the bug this guards against).
+    assert saved_keys and saved_keys[-1] is None
 
 
 # ---------------------------------------------------------------------------
