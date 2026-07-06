@@ -58,4 +58,68 @@ if ! grep -q "systemctl enable --now rkllama.service" "$NPU_SCRIPT"; then
   exit 1
 fi
 
+echo "test: rkllama models land in the unified taOS tree (#1548)"
+# The service must point rkllama at \$RKLLAMA_MODELS, and that path must be
+# resolved from the unified root (TAOS_MODELS_ROOT / <project>/data/models),
+# not the old per-install ~/rkllama/models, so the Models UI scan sees pulls.
+if ! grep -q -- "--models \$RKLLAMA_MODELS" "$NPU_SCRIPT"; then
+  echo "FAIL: rkllama.service ExecStart no longer uses --models \$RKLLAMA_MODELS"
+  exit 1
+fi
+if ! grep -q 'TAOS_MODELS_ROOT' "$NPU_SCRIPT"; then
+  echo "FAIL: install-rknpu.sh no longer honours TAOS_MODELS_ROOT for the unified model tree"
+  exit 1
+fi
+if ! grep -q 'data/models/rkllama' "$NPU_SCRIPT"; then
+  echo "FAIL: install-rknpu.sh no longer derives the unified <project>/data/models/rkllama path"
+  exit 1
+fi
+
+echo "test: migrate_legacy_models moves legacy models, is idempotent, and never re-downloads"
+MIG_FN="$(sed -n '/^migrate_legacy_models() {/,/^}/p' "$NPU_SCRIPT")"
+if [ -z "$MIG_FN" ]; then
+  echo "FAIL: could not extract migrate_legacy_models() from $NPU_SCRIPT"
+  exit 1
+fi
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+mig_out="$(
+  (
+    log() { :; }
+    run_as_user() { "$@"; }  # tests run as the invoking user
+    LEGACY_RKLLAMA_MODELS="$TMP/legacy"
+    RKLLAMA_MODELS="$TMP/unified"
+    mkdir -p "$LEGACY_RKLLAMA_MODELS/gemma3-270m" "$RKLLAMA_MODELS"
+    echo weights > "$LEGACY_RKLLAMA_MODELS/gemma3-270m/model.rkllm"
+    # Pre-existing model at destination must NOT be clobbered by a legacy copy.
+    mkdir -p "$RKLLAMA_MODELS/qwen3-1.7b" "$LEGACY_RKLLAMA_MODELS/qwen3-1.7b"
+    echo keep > "$RKLLAMA_MODELS/qwen3-1.7b/model.rkllm"
+    echo stale > "$LEGACY_RKLLAMA_MODELS/qwen3-1.7b/model.rkllm"
+    eval "$MIG_FN"
+    migrate_legacy_models
+    migrate_legacy_models  # second run must be a clean no-op
+    [ -f "$RKLLAMA_MODELS/gemma3-270m/model.rkllm" ] || { echo "MISSING_MIGRATED"; exit 1; }
+    [ ! -d "$LEGACY_RKLLAMA_MODELS/gemma3-270m" ] || { echo "LEGACY_NOT_MOVED"; exit 1; }
+    [ "$(cat "$RKLLAMA_MODELS/qwen3-1.7b/model.rkllm")" = "keep" ] || { echo "CLOBBERED_EXISTING"; exit 1; }
+    echo OK
+  ) 2>&1
+)" && mrc=0 || mrc=$?
+if [ "$mrc" -ne 0 ] || ! grep -q '^OK$' <<<"$mig_out"; then
+  echo "FAIL: migrate_legacy_models misbehaved: $mig_out"
+  exit 1
+fi
+echo "PASS: migrate_legacy_models moves new models, keeps existing, idempotent"
+
+echo "test: service user is granted render+video groups for NPU/GPU access"
+# The unit runs rkllama as \$TARGET_USER (not root), so on RK3588 that user
+# must be in render+video to reach the DRI/mpp device nodes.
+if ! grep -q 'User=\$TARGET_USER' "$NPU_SCRIPT"; then
+  echo "FAIL: rkllama.service no longer runs as \$TARGET_USER (would run as root)"
+  exit 1
+fi
+if ! grep -qE 'for _grp in render video' "$NPU_SCRIPT"; then
+  echo "FAIL: install-rknpu.sh no longer grants the service user render+video groups"
+  exit 1
+fi
+
 echo "all tests passed"

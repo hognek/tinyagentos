@@ -1707,6 +1707,18 @@ ensure_taos_user() {
     else
         warn "'docker' group not found — skipping (install Docker first, then re-run to add 'taos' to the group)"
     fi
+
+    # GPU/NPU device access. Backends (rkllama, image-gen, hardware video
+    # encode) run as 'taos', not root, and reach the accelerator through the
+    # render/video group-owned DRI/mpp device nodes (mode 660). Without these
+    # groups an NPU/GPU model load fails with a device-permission error.
+    for _dev_grp in render video; do
+        if getent group "$_dev_grp" >/dev/null 2>&1; then
+            $sudo_cmd usermod -aG "$_dev_grp" taos >/dev/null 2>&1 \
+                && log "added 'taos' to the '$_dev_grp' group (GPU/NPU device access)" \
+                || warn "could not add 'taos' to '$_dev_grp' — GPU/NPU backends may fail"
+        fi
+    done
 }
 
 # --- data dir ownership + permissions ------------------------------------
