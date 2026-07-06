@@ -399,6 +399,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     desktop_settings = DesktopSettingsStore(data_dir / "desktop.db")
     from tinyagentos.device_store import DeviceStore
     device_store = DeviceStore(data_dir / "devices.db")
+    from tinyagentos.push.apns import apns_sender_from_env
+    apns_sender = apns_sender_from_env()
     user_memory = UserMemoryStore(data_dir / "user_memory.db")
     user_personas = UserPersonaStore(data_dir / "user_personas.db")
     installed_apps = InstalledAppsStore(data_dir / "installed_apps.db")
@@ -839,6 +841,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         app.state.canvas_store = canvas_store
         app.state.desktop_settings = desktop_settings
         app.state.device_store = device_store
+        app.state.apns_sender = apns_sender
         app.state.user_memory = user_memory
         app.state.user_personas = user_personas
         app.state.installed_apps = installed_apps
@@ -1526,6 +1529,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.canvas_store = canvas_store
     app.state.desktop_settings = desktop_settings
     app.state.device_store = device_store
+    app.state.apns_sender = apns_sender
     app.state.user_memory = user_memory
     app.state.user_personas = user_personas
     app.state.installed_apps = installed_apps
