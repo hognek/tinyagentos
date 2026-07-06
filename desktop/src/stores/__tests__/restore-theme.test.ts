@@ -99,21 +99,28 @@ describe("restoreActiveTheme does not clobber the persisted wallpaper", () => {
     expect(useThemeStore.getState().wallpaperId).toBe("ocean");
   });
 
-  it("still applies the theme's declared defaultWallpaperId on restore", async () => {
+  it("does NOT override the user's persisted wallpaper with the theme's default (#1603)", async () => {
+    // The user actively picked Ocean while on Indigo. On boot,
+    // useSessionPersistence restores that persisted pick; restoreActiveTheme
+    // must not stomp it back to Indigo's declared default (neural-live).
     vi.spyOn(globalThis, "fetch").mockImplementation((input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.includes("/api/preferences/themes")) {
         return Promise.resolve(new Response(JSON.stringify({ active_theme_id: "indigo" })));
       }
-      // Provide an Indigo-like theme that declares neural-live.
+      // Provide an Indigo-like theme that declares neural-live as its default.
       return Promise.resolve(
         new Response(JSON.stringify([{ theme_id: "indigo", config: { tokens: {}, defaultWallpaperId: "neural-live" } }])),
       );
     });
+    // Stand in for useSessionPersistence having restored the user's pick.
+    useThemeStore.getState().setWallpaper("ocean");
+    expect(useThemeStore.getState().wallpaperId).toBe("ocean");
 
     await restoreActiveTheme();
 
     expect(useThemeStore.getState().activeThemeId).toBe("indigo");
-    expect(useThemeStore.getState().wallpaperId).toBe("neural-live");
+    // The user's explicit pick wins over the theme's declared default.
+    expect(useThemeStore.getState().wallpaperId).toBe("ocean");
   });
 });

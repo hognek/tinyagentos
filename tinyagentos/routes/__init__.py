@@ -64,6 +64,9 @@ def register_all_routers(app):
     from tinyagentos.routes.decisions import router as decisions_router
     app.include_router(decisions_router)
 
+    from tinyagentos.routes.devices import router as devices_router
+    app.include_router(devices_router)
+
     from tinyagentos.routes.observatory import router as observatory_router
     app.include_router(observatory_router)
 

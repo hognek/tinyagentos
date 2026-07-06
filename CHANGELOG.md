@@ -7,6 +7,18 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
 
 ## [Unreleased]
 
+## [1.0.0-beta.32] - 2026-07-06
+
+### Fixed
+- Weather app location search works again. The app looks up cities and forecasts from the open-meteo API, but the Content-Security-Policy only allowed same-origin connections, so the browser silently blocked every lookup and the search field did nothing. The two open-meteo origins are now allowed. Reported by @mandresve (#1668).
+- Desktop wallpaper no longer resets on login for anyone using a theme that declares a default wallpaper. Your explicitly chosen wallpaper is now authoritative on restore and is not overridden by the theme's default. Reported by @mandresve (#1603).
+
+### Added
+- Groundwork for the native iOS and watchOS client: a per-user device registry with revocable per-device scoped tokens, device management endpoints, a device-token auth path, and an APNs push sender (inactive until configured). No user-facing app yet; this is the server foundation the mobile app will build on (#1671).
+
+### Changed
+- Governance: answering a gated Decision no longer sends the asking agent a duplicate message, and delegation and retry replies now state honestly whether the action actually completed (#174).
+
 ## [1.0.0-beta.31] - 2026-07-06
 
 ### Fixed

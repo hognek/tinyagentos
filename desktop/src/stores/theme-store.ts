@@ -402,36 +402,28 @@ export function setWallpaperForActiveTheme(value: string) {
   useThemeStore.setState({ wallpaperByTheme: { ...wallpaperByTheme, [activeThemeId]: value } });
 }
 
-// Apply the right wallpaper to the live desktop when switching to a theme.
+// Apply the right wallpaper to the live desktop when the user actively SWITCHES
+// to a theme (keepTheme). This is symmetric: switching away from a theme that
+// set its own wallpaper (e.g. Indigo -> neural-live) back to Dark/Light must not
+// leave neural-live stuck. Resolution order:
+//   1. a wallpaper the user explicitly picked for the target theme, else
+//   2. the target theme's declared defaultWallpaperId, else
+//   3. the global default wallpaper (never the previous theme's).
 //
-// This runs in two contexts with different correctness needs:
-//
-//   * Live switch (keepTheme): the user is actively changing themes, so it is
-//     safe and desirable to be symmetric -- switching away from a theme that
-//     set its own wallpaper (e.g. Indigo -> neural-live) back to Dark/Light
-//     must not leave neural-live stuck. Resolution order:
-//       1. a wallpaper the user explicitly picked for the target theme, else
-//       2. the target theme's declared defaultWallpaperId, else
-//       3. the global default wallpaper (never the previous theme's).
-//
-//   * Restore (restoreActiveTheme, on boot): the user's chosen wallpaper is
-//     persisted separately (PUT /api/desktop/settings) and restored by
-//     useSessionPersistence. The per-theme memory (wallpaperIdByTheme) is
-//     in-memory only and empty at boot, so a global-default fallback would race
-//     that restore and reset a custom wallpaper back to graphite. On restore we
-//     therefore only act on a positive reason -- the target theme's declared
-//     defaultWallpaperId -- and never force the global default, leaving the
-//     persisted wallpaper untouched.
-function applyThemeDefaultWallpaper(themeId: string, cfg: ThemeConfig, opts?: { restore?: boolean }) {
+// On BOOT/restore this is deliberately NOT called. The user's chosen wallpaper
+// is persisted separately (PUT /api/desktop/settings) and restored by
+// useSessionPersistence, and that persisted choice is authoritative. A theme's
+// declared default is applied (and thus persisted) when the user switches to
+// the theme, so it already survives restore through that persisted value.
+// Re-applying the theme default on boot would override a wallpaper the user
+// later picked while on the theme, which is exactly the "wallpaper always
+// resets" report in #1603 -- so the user's persisted pick now wins.
+function applyThemeDefaultWallpaper(themeId: string, cfg: ThemeConfig) {
   const state = useThemeStore.getState();
-  // Explicit user choice for this theme always wins.
+  // Explicit user choice for this theme always wins, else the theme's declared
+  // default, else the global default (never the previous theme's wallpaper).
   const remembered = state.wallpaperIdByTheme[themeId];
-  // On restore there is no in-memory memory to trust and the global default
-  // must never override the separately-persisted wallpaper, so the theme's own
-  // declared default is the only positive reason to change anything.
-  const target = opts?.restore
-    ? cfg.defaultWallpaperId
-    : (remembered ?? cfg.defaultWallpaperId ?? DEFAULT_WP.id);
+  const target = remembered ?? cfg.defaultWallpaperId ?? DEFAULT_WP.id;
   if (!target) return; // no positive reason to change the wallpaper
   if (target === state.wallpaperId) return; // already showing it
   const wp = WALLPAPERS.find((w) => w.id === target);
@@ -492,7 +484,9 @@ export async function restoreActiveTheme(): Promise<void> {
         ...(cfg.wallpaper ? { [themeId]: cfg.wallpaper } : {}),
       },
     });
-    applyThemeDefaultWallpaper(themeId, cfg, { restore: true });
+    // Do NOT apply the theme's default wallpaper here: useSessionPersistence
+    // restores the user's persisted wallpaper, which is authoritative (#1603).
+    // The theme default was already persisted when the theme was selected.
   } catch {
     // best-effort: ignore
   }
