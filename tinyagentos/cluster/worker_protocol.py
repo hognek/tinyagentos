@@ -14,6 +14,7 @@ class WorkerInfo:
     hardware: dict = field(default_factory=dict)  # From hardware detection
     backends: list[dict] = field(default_factory=list)  # Available inference backends
     models: list[str] = field(default_factory=list)     # Currently loaded models
+    available_models: list[dict] = field(default_factory=list)  # Models this worker CAN load (from Skald sidecar manifest)
     capabilities: list[str] = field(default_factory=list)  # embed, chat, rerank, image-gen, tts, etc
     status: str = "online"            # online | offline | busy
     last_heartbeat: float = 0
