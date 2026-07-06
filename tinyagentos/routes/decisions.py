@@ -249,14 +249,19 @@ async def answer_decision(decision_id: str, body: AnswerIn, request: Request, us
     updated = await store.answer(decision_id, body.value, answered_by)
     if updated is None:
         return JSONResponse({"error": "already answered or not pending"}, status_code=409)
-    await _apply_app_grant(request, updated, body.value)
-    await _apply_execution_grant(request, updated, body.value)
-    await _apply_delegation_grant(request, updated, body.value)
-    await _route_answer_to_agent(updated, body.value)
+    # Each kind-specific handler runs its side effect and returns True if it
+    # already routed a reply to the asking agent (a more informative,
+    # kind-specific message). Only route the generic answer when none did, so
+    # a gated decision does not send the agent two messages.
+    routed_app = await _apply_app_grant(request, updated, body.value)
+    routed_exec = await _apply_execution_grant(request, updated, body.value)
+    routed_deleg = await _apply_delegation_grant(request, updated, body.value)
+    if not (routed_app or routed_exec or routed_deleg):
+        await _route_answer_to_agent(updated, body.value)
     return updated
 
 
-async def _apply_execution_grant(request: Request, decision: dict, value) -> None:
+async def _apply_execution_grant(request: Request, decision: dict, value) -> bool:
     """Side effect for an execution-gate Decision (agent governance #160 slice
     1): the decision's metadata carries {kind: "execution_gate", agent_name,
     action_class, tool}. Approving it writes a short-lived execution grant so
@@ -266,16 +271,18 @@ async def _apply_execution_grant(request: Request, decision: dict, value) -> Non
     store hiccup must not fail the answer."""
     meta = decision.get("metadata") or {}
     if meta.get("kind") != "execution_gate":
-        return
+        return False
     policies = getattr(request.app.state, "execution_policies", None)
     agent_name = meta.get("agent_name")
     action_class = meta.get("action_class")
     if policies is None or not agent_name or not action_class:
-        return
+        return False
     approved = value == "approve"
+    granted = False
     try:
         if approved:
             await policies.add_grant(agent_name, action_class, decision.get("id"))
+            granted = True
     except Exception:
         # Best-effort: the answer is already persisted, so a grant-store write
         # must not fail the request. Log it rather than swallow silently so a
@@ -285,15 +292,20 @@ async def _apply_execution_grant(request: Request, decision: dict, value) -> Non
             agent_name, decision.get("id"), exc_info=True,
         )
     # decision["from_agent"] is already agent_name (set when the gate created
-    # this decision in skill_exec.py); reuse the existing answer-routing path
-    # with a retry-specific message instead of the generic answer text.
-    await _route_answer_to_agent(
-        decision,
-        "you may retry the action now" if approved else "your action was denied",
-    )
+    # this decision in skill_exec.py); reuse the existing answer-routing path.
+    # Only tell the agent it may retry when the grant actually persisted -- if
+    # the write failed, the gate will re-prompt on retry, so say so honestly.
+    if not approved:
+        reply = "your action was denied"
+    elif granted:
+        reply = "you may retry the action now"
+    else:
+        reply = "your action was approved, but saving the grant failed - please retry"
+    await _route_answer_to_agent(decision, reply)
+    return True
 
 
-async def _apply_delegation_grant(request: Request, decision: dict, value) -> None:
+async def _apply_delegation_grant(request: Request, decision: dict, value) -> bool:
     """Side effect for a delegation-gate Decision (#161 gated delegation): the
     decision's metadata carries {kind: "delegation_gate", from_agent, to_agent,
     task_id, task_title, note}. Approving it writes a short-lived delegate
@@ -304,21 +316,15 @@ async def _apply_delegation_grant(request: Request, decision: dict, value) -> No
     grant-store or delegation-completion hiccup must not fail the answer."""
     meta = decision.get("metadata") or {}
     if meta.get("kind") != "delegation_gate":
-        return
+        return False
     policies = getattr(request.app.state, "execution_policies", None)
     from_agent = meta.get("from_agent")
     to_agent = meta.get("to_agent")
     if policies is None or not from_agent or not to_agent:
-        return
+        return False
     approved = value == "approve"
+    completed = False
     if approved:
-        try:
-            await policies.add_grant(from_agent, "delegate", decision.get("id"))
-        except Exception:
-            logger.warning(
-                "delegate grant write failed for agent %s (decision %s)",
-                from_agent, decision.get("id"), exc_info=True,
-            )
         try:
             from tinyagentos.routes.delegation import complete_delegation
             await complete_delegation(
@@ -330,31 +336,51 @@ async def _apply_delegation_grant(request: Request, decision: dict, value) -> No
                 project_id=decision.get("project_id"),
                 note=meta.get("note") or "",
             )
+            completed = True
         except Exception:
             logger.warning(
                 "delegation completion failed for decision %s", decision.get("id"), exc_info=True,
             )
-    await _route_answer_to_agent(
-        decision,
-        "delegation approved - the task has been assigned" if approved else "delegation denied",
-    )
+        # Grant the delegate capability only once THIS delegation actually
+        # completed. Writing it before completion leaked a grant on failure: a
+        # later delegation by the same agent would then skip approval while the
+        # original assignment had silently never happened.
+        if completed:
+            try:
+                await policies.add_grant(from_agent, "delegate", decision.get("id"))
+            except Exception:
+                logger.warning(
+                    "delegate grant write failed for agent %s (decision %s)",
+                    from_agent, decision.get("id"), exc_info=True,
+                )
+    # Tell the agent the truth: only claim the task was assigned when the
+    # completion actually succeeded, so a failed assign is not reported as done.
+    if not approved:
+        reply = "delegation denied"
+    elif completed:
+        reply = "delegation approved - the task has been assigned"
+    else:
+        reply = "delegation approved, but assigning the task failed - please retry"
+    await _route_answer_to_agent(decision, reply)
+    return True
 
 
-async def _apply_app_grant(request: Request, decision: dict, value) -> None:
+async def _apply_app_grant(request: Request, decision: dict, value) -> bool:
     """Side effect for an app-grant consent Decision: write the per-capability
     grant decisions to the app_grants ledger. The decision's metadata carries
     {kind: "app_grant", app_id, capabilities}; for the multi_select consent card
     the answer is the list of granted capability values, so the rest are denied.
     Best-effort: the answer is already persisted, so a grant-store hiccup must
-    not fail the answer."""
+    not fail the answer. Returns False: app grants do not route an agent reply,
+    so the caller sends the generic answer."""
     meta = decision.get("metadata") or {}
     if meta.get("kind") != "app_grant":
-        return
+        return False
     grants = getattr(request.app.state, "app_grants", None)
     app_id = meta.get("app_id")
     caps = meta.get("capabilities") or []
     if grants is None or not app_id:
-        return
+        return False
     user_id = decision.get("user_id") or ""
     granted = set(value if isinstance(value, list) else [value])
     try:
@@ -372,3 +398,4 @@ async def _apply_app_grant(request: Request, decision: dict, value) -> None:
             "app_grant ledger write failed for app %s (decision %s)",
             app_id, decision.get("id"), exc_info=True,
         )
+    return False
