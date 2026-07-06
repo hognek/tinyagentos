@@ -1,30 +1,58 @@
 """Tests for GPU lease API (taOS #893)."""
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 
 import pytest
+
+from test_routes_cluster_pairing import pair_worker, sign_worker_request
 
 from tinyagentos.cluster.manager import ClusterManager
 from tinyagentos.cluster.worker_protocol import GpuLease, WorkerInfo
 
 
+async def _register_worker(client, app, name, url, capabilities=None, hardware=None):
+    """Pair and register a worker over signed HTTP so it clears the worker
+    HMAC gate on /api/cluster/workers. Returns the worker's signing key."""
+    await app.state.cluster_pairing.init()
+    key = await pair_worker(client, app, name, url)
+    body = {"name": name, "url": url, "capabilities": capabilities or []}
+    if hardware is not None:
+        body["hardware"] = hardware
+    body_bytes = json.dumps(body).encode()
+    path = "/api/cluster/workers"
+    headers = sign_worker_request(key, name, "POST", path, body_bytes)
+    headers["content-type"] = "application/json"
+    resp = await client.post(path, content=body_bytes, headers=headers)
+    assert resp.status_code == 200, resp.text
+    return key
+
+
+async def _heartbeat(client, key, name, **fields):
+    """Send a signed heartbeat for `name` carrying the given extra fields."""
+    body = {"name": name, **fields}
+    body_bytes = json.dumps(body).encode()
+    path = "/api/cluster/heartbeat"
+    headers = sign_worker_request(key, name, "POST", path, body_bytes)
+    headers["content-type"] = "application/json"
+    resp = await client.post(path, content=body_bytes, headers=headers)
+    assert resp.status_code == 200, resp.text
+    return resp
+
+
 @pytest.mark.asyncio
-async def test_claim_lease_success(client):
+async def test_claim_lease_success(client, app):
     """Claiming a lease on an online worker with enough VRAM returns 200."""
     # Register a worker with free VRAM
-    await client.post("/api/cluster/workers", json={
-        "name": "gpu-node",
-        "url": "http://10.0.0.1:9000",
-        "capabilities": ["llm-chat"],
-        "hardware": {"gpu": {"model": "GTX 1080", "vram_mb": 8192}},
-    })
+    key = await _register_worker(
+        client, app, "gpu-node", "http://10.0.0.1:9000",
+        capabilities=["llm-chat"],
+        hardware={"gpu": {"model": "GTX 1080", "vram_mb": 8192}},
+    )
     # Send a heartbeat with free VRAM
-    await client.post("/api/cluster/heartbeat", json={
-        "name": "gpu-node",
-        "free_vram_mb": 6000,
-        "used_vram_mb": 2000,
-    })
+    await _heartbeat(client, key, "gpu-node", free_vram_mb=6000, used_vram_mb=2000)
 
     resp = await client.post("/api/cluster/leases/claim", json={
         "resource_id": "gpu-node:gpu-cuda-0",
@@ -43,18 +71,10 @@ async def test_claim_lease_success(client):
 
 
 @pytest.mark.asyncio
-async def test_claim_lease_insufficient_vram(client):
+async def test_claim_lease_insufficient_vram(client, app):
     """Claiming with required_vram_mb > free_vram_mb returns 409."""
-    await client.post("/api/cluster/workers", json={
-        "name": "gpu-node",
-        "url": "http://10.0.0.1:9000",
-        "capabilities": ["llm-chat"],
-    })
-    await client.post("/api/cluster/heartbeat", json={
-        "name": "gpu-node",
-        "free_vram_mb": 1000,
-        "used_vram_mb": 7000,
-    })
+    key = await _register_worker(client, app, "gpu-node", "http://10.0.0.1:9000", capabilities=["llm-chat"])
+    await _heartbeat(client, key, "gpu-node", free_vram_mb=1000, used_vram_mb=7000)
 
     resp = await client.post("/api/cluster/leases/claim", json={
         "resource_id": "gpu-node:gpu-cuda-0",
@@ -65,18 +85,10 @@ async def test_claim_lease_insufficient_vram(client):
 
 
 @pytest.mark.asyncio
-async def test_claim_lease_already_leased(client):
+async def test_claim_lease_already_leased(client, app):
     """A second claim on the same resource returns 409 with the existing lease info."""
-    await client.post("/api/cluster/workers", json={
-        "name": "gpu-node",
-        "url": "http://10.0.0.1:9000",
-        "capabilities": ["llm-chat"],
-    })
-    await client.post("/api/cluster/heartbeat", json={
-        "name": "gpu-node",
-        "free_vram_mb": 8000,
-        "used_vram_mb": 0,
-    })
+    key = await _register_worker(client, app, "gpu-node", "http://10.0.0.1:9000", capabilities=["llm-chat"])
+    await _heartbeat(client, key, "gpu-node", free_vram_mb=8000, used_vram_mb=0)
 
     # First claim succeeds
     resp1 = await client.post("/api/cluster/leases/claim", json={
@@ -96,7 +108,22 @@ async def test_claim_lease_already_leased(client):
     err = resp2.json()
     assert err["error"] == "resource already leased"
     assert err["lease_id"] == lease_id
-    assert err["holder"] == "skald-dispatcher"
+    assert err["caller"] == "skald-dispatcher"
+
+
+@pytest.mark.asyncio
+async def test_claim_lease_unknown_vram_is_granted(client, app):
+    """A worker that never reported VRAM (free_vram_mb stays None, e.g.
+    RK3588/Apple Silicon/CPU-only) must not be refused on VRAM grounds."""
+    await _register_worker(client, app, "cpu-node", "http://10.0.0.2:9000", capabilities=["llm-chat"])
+    # No heartbeat with free_vram_mb ever sent -- it stays at its default (None).
+
+    resp = await client.post("/api/cluster/leases/claim", json={
+        "resource_id": "cpu-node:gpu-cuda-0",
+        "required_vram_mb": 4000,
+    })
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "claimed"
 
 
 @pytest.mark.asyncio
@@ -124,17 +151,10 @@ async def test_claim_lease_malformed_resource_id(client):
 
 
 @pytest.mark.asyncio
-async def test_release_lease_idempotent(client):
+async def test_release_lease_idempotent(client, app):
     """Releasing a lease returns 200; releasing again is also 200."""
-    await client.post("/api/cluster/workers", json={
-        "name": "gpu-node",
-        "url": "http://10.0.0.1:9000",
-        "capabilities": ["llm-chat"],
-    })
-    await client.post("/api/cluster/heartbeat", json={
-        "name": "gpu-node",
-        "free_vram_mb": 8000,
-    })
+    key = await _register_worker(client, app, "gpu-node", "http://10.0.0.1:9000", capabilities=["llm-chat"])
+    await _heartbeat(client, key, "gpu-node", free_vram_mb=8000)
 
     claim = await client.post("/api/cluster/leases/claim", json={
         "resource_id": "gpu-node:gpu-cuda-0",
@@ -165,17 +185,10 @@ async def test_release_lease_unknown(client):
 
 
 @pytest.mark.asyncio
-async def test_renew_lease_success(client):
+async def test_renew_lease_success(client, app):
     """Renewing an active lease extends its TTL."""
-    await client.post("/api/cluster/workers", json={
-        "name": "gpu-node",
-        "url": "http://10.0.0.1:9000",
-        "capabilities": ["llm-chat"],
-    })
-    await client.post("/api/cluster/heartbeat", json={
-        "name": "gpu-node",
-        "free_vram_mb": 8000,
-    })
+    key = await _register_worker(client, app, "gpu-node", "http://10.0.0.1:9000", capabilities=["llm-chat"])
+    await _heartbeat(client, key, "gpu-node", free_vram_mb=8000)
 
     claim = await client.post("/api/cluster/leases/claim", json={
         "resource_id": "gpu-node:gpu-cuda-0",
@@ -195,17 +208,10 @@ async def test_renew_lease_success(client):
 
 
 @pytest.mark.asyncio
-async def test_renew_lease_expired(client):
+async def test_renew_lease_expired(client, app):
     """Renewing an expired lease returns 409."""
-    await client.post("/api/cluster/workers", json={
-        "name": "gpu-node",
-        "url": "http://10.0.0.1:9000",
-        "capabilities": ["llm-chat"],
-    })
-    await client.post("/api/cluster/heartbeat", json={
-        "name": "gpu-node",
-        "free_vram_mb": 8000,
-    })
+    key = await _register_worker(client, app, "gpu-node", "http://10.0.0.1:9000", capabilities=["llm-chat"])
+    await _heartbeat(client, key, "gpu-node", free_vram_mb=8000)
 
     claim = await client.post("/api/cluster/leases/claim", json={
         "resource_id": "gpu-node:gpu-cuda-0",
@@ -225,17 +231,10 @@ async def test_renew_lease_expired(client):
 
 
 @pytest.mark.asyncio
-async def test_list_leases(client):
+async def test_list_leases(client, app):
     """GET /leases returns active leases only."""
-    await client.post("/api/cluster/workers", json={
-        "name": "gpu-node",
-        "url": "http://10.0.0.1:9000",
-        "capabilities": ["llm-chat"],
-    })
-    await client.post("/api/cluster/heartbeat", json={
-        "name": "gpu-node",
-        "free_vram_mb": 8000,
-    })
+    key = await _register_worker(client, app, "gpu-node", "http://10.0.0.1:9000", capabilities=["llm-chat"])
+    await _heartbeat(client, key, "gpu-node", free_vram_mb=8000)
 
     # No leases yet
     resp = await client.get("/api/cluster/leases")
@@ -260,17 +259,10 @@ async def test_list_leases(client):
 
 
 @pytest.mark.asyncio
-async def test_expired_lease_returns_409_on_claim(client):
+async def test_expired_lease_returns_409_on_claim(client, app):
     """After a lease expires, a new claim on the same resource succeeds."""
-    await client.post("/api/cluster/workers", json={
-        "name": "gpu-node",
-        "url": "http://10.0.0.1:9000",
-        "capabilities": ["llm-chat"],
-    })
-    await client.post("/api/cluster/heartbeat", json={
-        "name": "gpu-node",
-        "free_vram_mb": 8000,
-    })
+    key = await _register_worker(client, app, "gpu-node", "http://10.0.0.1:9000", capabilities=["llm-chat"])
+    await _heartbeat(client, key, "gpu-node", free_vram_mb=8000)
 
     # Claim with very short TTL
     await client.post("/api/cluster/leases/claim", json={
@@ -292,7 +284,7 @@ async def test_expired_lease_returns_409_on_claim(client):
 # ── ClusterManager unit tests ──────────────────────────────────────────
 
 
-def _worker(name, free_vram=0):
+def _worker(name, free_vram=None):
     w = WorkerInfo(
         name=name,
         url=f"http://{name}:9000",
@@ -304,12 +296,13 @@ def _worker(name, free_vram=0):
     return w
 
 
+@pytest.mark.asyncio
 class TestClusterManagerLeases:
-    def test_claim_success(self):
+    async def test_claim_success(self):
         mgr = ClusterManager()
         mgr._workers["gpu-node"] = _worker("gpu-node", free_vram=6000)
 
-        lease = mgr.claim_lease(
+        lease = await mgr.claim_lease(
             "gpu-node:gpu-cuda-0",
             caller="test",
             ttl_seconds=30,
@@ -321,87 +314,98 @@ class TestClusterManagerLeases:
         assert lease.caller == "test"
         assert lease.required_vram_mb == 4000
 
-    def test_claim_fails_insufficient_vram(self):
+    async def test_claim_fails_insufficient_vram(self):
         mgr = ClusterManager()
         mgr._workers["gpu-node"] = _worker("gpu-node", free_vram=1000)
 
-        lease = mgr.claim_lease(
+        lease = await mgr.claim_lease(
             "gpu-node:gpu-cuda-0",
             required_vram_mb=8000,
         )
         assert lease is None
 
-    def test_claim_fails_already_leased(self):
+    async def test_claim_unknown_vram_is_granted(self):
+        """free_vram_mb is None (never reported) -- must not be refused."""
+        mgr = ClusterManager()
+        mgr._workers["gpu-node"] = _worker("gpu-node", free_vram=None)
+
+        lease = await mgr.claim_lease(
+            "gpu-node:gpu-cuda-0",
+            required_vram_mb=8000,
+        )
+        assert lease is not None
+
+    async def test_claim_fails_already_leased(self):
         mgr = ClusterManager()
         mgr._workers["gpu-node"] = _worker("gpu-node", free_vram=8000)
 
-        first = mgr.claim_lease("gpu-node:gpu-cuda-0", caller="first")
+        first = await mgr.claim_lease("gpu-node:gpu-cuda-0", caller="first")
         assert first is not None
 
-        second = mgr.claim_lease("gpu-node:gpu-cuda-0", caller="second")
+        second = await mgr.claim_lease("gpu-node:gpu-cuda-0", caller="second")
         assert second is None
 
-    def test_claim_fails_worker_offline(self):
+    async def test_claim_fails_worker_offline(self):
         mgr = ClusterManager()
         w = _worker("gpu-node", free_vram=8000)
         w.status = "offline"
         mgr._workers["gpu-node"] = w
 
-        lease = mgr.claim_lease("gpu-node:gpu-cuda-0")
+        lease = await mgr.claim_lease("gpu-node:gpu-cuda-0")
         assert lease is None
 
-    def test_claim_fails_missing_worker(self):
+    async def test_claim_fails_missing_worker(self):
         mgr = ClusterManager()
-        lease = mgr.claim_lease("nonexistent:gpu-cuda-0")
+        lease = await mgr.claim_lease("nonexistent:gpu-cuda-0")
         assert lease is None
 
-    def test_release_idempotent(self):
+    async def test_release_idempotent(self):
         mgr = ClusterManager()
         mgr._workers["gpu-node"] = _worker("gpu-node", free_vram=8000)
 
-        lease = mgr.claim_lease("gpu-node:gpu-cuda-0")
+        lease = await mgr.claim_lease("gpu-node:gpu-cuda-0")
         assert lease is not None
 
         # Releasing works
-        assert mgr.release_lease(lease.lease_id) is True
+        assert await mgr.release_lease(lease.lease_id) is True
 
         # Releasing again (idempotent)
-        assert mgr.release_lease(lease.lease_id) is True
+        assert await mgr.release_lease(lease.lease_id) is True
 
-    def test_release_unknown(self):
+    async def test_release_unknown(self):
         mgr = ClusterManager()
-        assert mgr.release_lease("l_nonexistent") is True
+        assert await mgr.release_lease("l_nonexistent") is True
 
-    def test_renew_active(self):
+    async def test_renew_active(self):
         mgr = ClusterManager()
         mgr._workers["gpu-node"] = _worker("gpu-node", free_vram=8000)
 
-        lease = mgr.claim_lease("gpu-node:gpu-cuda-0", ttl_seconds=10)
+        lease = await mgr.claim_lease("gpu-node:gpu-cuda-0", ttl_seconds=10)
         original_expiry = lease.expires_at
 
-        renewed = mgr.renew_lease(lease.lease_id, ttl_seconds=60)
+        renewed = await mgr.renew_lease(lease.lease_id, ttl_seconds=60)
         assert renewed is not None
         assert renewed.expires_at > original_expiry
 
-    def test_renew_expired(self):
+    async def test_renew_expired(self):
         mgr = ClusterManager()
         mgr._workers["gpu-node"] = _worker("gpu-node", free_vram=8000)
 
-        lease = mgr.claim_lease("gpu-node:gpu-cuda-0", ttl_seconds=0.001)
+        lease = await mgr.claim_lease("gpu-node:gpu-cuda-0", ttl_seconds=0.001)
         time.sleep(0.1)
 
-        renewed = mgr.renew_lease(lease.lease_id, ttl_seconds=30)
+        renewed = await mgr.renew_lease(lease.lease_id, ttl_seconds=30)
         assert renewed is None
 
-    def test_renew_unknown(self):
+    async def test_renew_unknown(self):
         mgr = ClusterManager()
-        assert mgr.renew_lease("l_nonexistent") is None
+        assert await mgr.renew_lease("l_nonexistent") is None
 
-    def test_get_leases_active_only(self):
+    async def test_get_leases_active_only(self):
         mgr = ClusterManager()
         mgr._workers["gpu-node"] = _worker("gpu-node", free_vram=8000)
 
-        mgr.claim_lease("gpu-node:gpu-cuda-0", ttl_seconds=30)
+        await mgr.claim_lease("gpu-node:gpu-cuda-0", ttl_seconds=30)
         assert len(mgr.get_leases()) == 1
 
         # Add an expired lease manually
@@ -413,12 +417,12 @@ class TestClusterManagerLeases:
         # get_leases only returns active (non-expired)
         assert len(mgr.get_leases()) == 1
 
-    def test_sweep_removes_expired(self):
+    async def test_sweep_removes_expired(self):
         mgr = ClusterManager()
         mgr._workers["gpu-node"] = _worker("gpu-node", free_vram=8000)
 
         # Claim with instant TTL
-        lease = mgr.claim_lease("gpu-node:gpu-cuda-0", ttl_seconds=0.001)
+        lease = await mgr.claim_lease("gpu-node:gpu-cuda-0", ttl_seconds=0.001)
         time.sleep(0.1)
 
         # Before sweep, expired lease still in dict
@@ -428,13 +432,44 @@ class TestClusterManagerLeases:
         assert lease.lease_id not in mgr._leases
         assert len(mgr.get_leases()) == 0
 
-    def test_claim_after_release_succeeds(self):
+    async def test_claim_after_release_succeeds(self):
         mgr = ClusterManager()
         mgr._workers["gpu-node"] = _worker("gpu-node", free_vram=8000)
 
-        first = mgr.claim_lease("gpu-node:gpu-cuda-0", caller="first")
-        mgr.release_lease(first.lease_id)
+        first = await mgr.claim_lease("gpu-node:gpu-cuda-0", caller="first")
+        await mgr.release_lease(first.lease_id)
 
-        second = mgr.claim_lease("gpu-node:gpu-cuda-0", caller="second")
+        second = await mgr.claim_lease("gpu-node:gpu-cuda-0", caller="second")
         assert second is not None
         assert second.caller == "second"
+
+    async def test_claim_concurrent_same_resource_exactly_one_succeeds(self):
+        """Many concurrent claim() calls for the same resource must yield
+        exactly one lease -- the find-existing/check-VRAM/store sequence
+        is serialized by ClusterManager._lease_lock."""
+        mgr = ClusterManager()
+        mgr._workers["gpu-node"] = _worker("gpu-node", free_vram=8000)
+
+        results = await asyncio.gather(*[
+            mgr.claim_lease("gpu-node:gpu-cuda-0", caller=f"caller-{i}")
+            for i in range(20)
+        ])
+        successes = [r for r in results if r is not None]
+        assert len(successes) == 1
+        assert len(mgr.get_leases()) == 1
+
+    async def test_claim_serialized_by_lease_lock(self):
+        """A claim() call must actually wait for _lease_lock -- proves the
+        atomic critical section is wired up, not just present in name."""
+        mgr = ClusterManager()
+        mgr._workers["gpu-node"] = _worker("gpu-node", free_vram=8000)
+
+        async with mgr._lease_lock:
+            task = asyncio.create_task(
+                mgr.claim_lease("gpu-node:gpu-cuda-0", caller="blocked")
+            )
+            await asyncio.sleep(0.05)
+            assert not task.done()
+
+        result = await task
+        assert result is not None

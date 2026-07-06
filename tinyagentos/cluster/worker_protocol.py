@@ -61,11 +61,13 @@ class WorkerInfo:
     degraded: bool = False
     degraded_reason: str | None = None
     # Real-time GPU VRAM reported on every heartbeat (free/used in MiB).
-    # Default 0 means unreported / no GPU; consumers (Skald's TaosDispatcher)
-    # use these to sort candidates by actual availability instead of total
-    # capacity. Worker reports them; controller stores them; API surfaces them.
-    free_vram_mb: int = 0
-    used_vram_mb: int = 0
+    # Default None means unreported / no probe available (e.g. non-NVIDIA
+    # hardware such as RK3588, Apple Silicon, or CPU-only workers) and must
+    # stay distinct from an explicit 0 -- consumers (Skald's TaosDispatcher,
+    # the lease pre-claim VRAM check) treat None as "unknown", not "no VRAM
+    # free", so those workers are never permanently un-leasable.
+    free_vram_mb: int | None = None
+    used_vram_mb: int | None = None
 
 
 @dataclass
@@ -82,9 +84,11 @@ class GpuLease:
         resource_id: ``{worker_name}:{resource_name}``, e.g.
             ``"hognehermes:gpu-cuda-0"``.
         caller: Human-readable label for the lease holder
-            (``"skald-dispatcher"``, ``"a2a-agent:extract"``).
-        expires_at: monotonic timestamp after which the lease is
-            considered stale and automatically freed.
+            (``"skald-dispatcher"``, ``"a2a-agent:extract"``). Exposed as
+            ``caller`` consistently across the dataclass and every API
+            response (claim, release, renew, list).
+        expires_at: wall-clock timestamp (``time.time()``) after which the
+            lease is considered stale and automatically freed.
         required_vram_mb: How many MiB of VRAM the caller declared it
             needs.  Used by the pre-claim check to refuse a claim when
             the worker's ``free_vram_mb`` is too low.

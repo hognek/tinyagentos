@@ -308,7 +308,7 @@ class ClusterManager:
           ``required_vram_mb > 0`` and the worker's free VRAM is known).
           A worker that has never reported VRAM (``free_vram_mb is None``,
           e.g. non-NVIDIA hardware with no probe) is never refused on VRAM
-          grounds — we cannot prove insufficient capacity.
+          grounds since we cannot prove insufficient capacity.
 
         The find-existing / check-VRAM / store sequence runs under
         ``_lease_lock`` so two concurrent claims for the same resource

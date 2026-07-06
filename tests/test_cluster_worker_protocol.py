@@ -127,10 +127,12 @@ class TestKvQuantUnion:
 # ---------------------------------------------------------------------------
 
 class TestWorkerInfoVramDefaults:
-    def test_default_vram_is_zero(self):
+    def test_default_vram_is_none(self):
+        """Default is None (unknown), not 0 -- a worker with no VRAM probe
+        (e.g. RK3588, Apple Silicon, CPU-only) must not read as 0 free."""
         w = WorkerInfo(name="w", url="http://localhost:9000")
-        assert w.free_vram_mb == 0
-        assert w.used_vram_mb == 0
+        assert w.free_vram_mb is None
+        assert w.used_vram_mb is None
 
     def test_vram_stored_and_serialised(self):
         w = WorkerInfo(
