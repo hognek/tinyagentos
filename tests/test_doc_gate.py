@@ -71,6 +71,17 @@ class TestEvaluateRules:
         changed = [("M", "tinyagentos/routes/agents.py")]
         assert dg.evaluate_rules(changed, [], APPS_RULE_CONFIG) == []
 
+    def test_added_test_file_does_not_trigger_structural_rule(self):
+        """Adding a co-located test under an app dir is not a structural app
+        change and must not fire the 'apps' rule (#171). Same for a new Python
+        test module vs the 'routes' rule."""
+        changed = [
+            ("A", "desktop/src/apps/__tests__/SettingsApp.test.tsx"),
+            ("A", "desktop/src/apps/Foo/Foo.test.tsx"),
+            ("A", "tests/test_new_route.py"),
+        ]
+        assert dg.evaluate_rules(changed, [], APPS_RULE_CONFIG) == []
+
     def test_deleted_route_file_triggers_routes_rule(self):
         changed = [("D", "tinyagentos/routes/old_routes.py")]
         failures = dg.evaluate_rules(changed, [], APPS_RULE_CONFIG)
