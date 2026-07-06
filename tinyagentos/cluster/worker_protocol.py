@@ -64,3 +64,31 @@ class WorkerInfo:
     # capacity. Worker reports them; controller stores them; API surfaces them.
     free_vram_mb: int = 0
     used_vram_mb: int = 0
+
+
+@dataclass
+class GpuLease:
+    """A time-limited reservation of GPU capacity on a cluster worker.
+
+    Created by ``POST /api/cluster/leases/claim`` and tracked in the
+    controller's in-memory ``ClusterManager._leases`` dict.  Expired
+    leases are swept by the same monitor loop that marks workers
+    offline.
+
+    Attributes:
+        lease_id: Short unique id (``l_<8 hex>``).
+        resource_id: ``{worker_name}:{resource_name}``, e.g.
+            ``"hognehermes:gpu-cuda-0"``.
+        caller: Human-readable label for the lease holder
+            (``"skald-dispatcher"``, ``"a2a-agent:extract"``).
+        expires_at: monotonic timestamp after which the lease is
+            considered stale and automatically freed.
+        required_vram_mb: How many MiB of VRAM the caller declared it
+            needs.  Used by the pre-claim check to refuse a claim when
+            the worker's ``free_vram_mb`` is too low.
+    """
+    lease_id: str
+    resource_id: str
+    caller: str = ""
+    expires_at: float = 0.0
+    required_vram_mb: int = 0

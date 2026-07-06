@@ -1,8 +1,9 @@
 from __future__ import annotations
 import asyncio
 import logging
+import secrets
 import time
-from tinyagentos.cluster.worker_protocol import WorkerInfo
+from tinyagentos.cluster.worker_protocol import GpuLease, WorkerInfo
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ def _format_hw(hw) -> str:
 class ClusterManager:
     def __init__(self, notifications=None, capabilities=None):
         self._workers: dict[str, WorkerInfo] = {}
+        self._leases: dict[str, GpuLease] = {}
         self._monitor_task: asyncio.Task | None = None
         self._notifications = notifications  # NotificationStore, optional
         self._capabilities = capabilities    # CapabilityChecker, optional
@@ -245,6 +247,123 @@ class ClusterManager:
                 return w
         return None
 
+    # ── Lease management ───────────────────────────────────────────────
+
+    def _parse_resource_id(self, resource_id: str) -> tuple[str, str] | None:
+        """Split ``"worker-name:gpu-cuda-0"`` into (worker_name, resource_name)."""
+        if ":" not in resource_id:
+            return None
+        worker, rest = resource_id.split(":", 1)
+        return worker, rest
+
+    def _worker_for_resource(self, resource_id: str) -> WorkerInfo | None:
+        """Return the WorkerInfo for a resource_id, or None."""
+        parsed = self._parse_resource_id(resource_id)
+        if parsed is None:
+            return None
+        worker_name, _ = parsed
+        worker = self._workers.get(worker_name)
+        if worker is None or worker.status != "online":
+            return None
+        return worker
+
+    def _find_existing_lease(self, resource_id: str) -> GpuLease | None:
+        """Return the active (non-expired) lease for a resource, if any."""
+        now = time.time()
+        for lease in self._leases.values():
+            if lease.resource_id == resource_id and lease.expires_at > now:
+                return lease
+        return None
+
+    def claim_lease(
+        self,
+        resource_id: str,
+        caller: str = "",
+        ttl_seconds: float = 30,
+        required_vram_mb: int = 0,
+    ) -> GpuLease | None:
+        """Attempt to claim a GPU lease on ``resource_id``.
+
+        Fails if:
+        - The resource_id is malformed.
+        - The target worker is not online.
+        - Another active lease already exists for this resource.
+        - ``required_vram_mb > worker.free_vram_mb`` (when
+          ``required_vram_mb > 0``).
+        """
+        worker = self._worker_for_resource(resource_id)
+        if worker is None:
+            logger.debug("claim_lease: worker not found or offline for %s", resource_id)
+            return None
+
+        existing = self._find_existing_lease(resource_id)
+        if existing is not None:
+            logger.debug(
+                "claim_lease: resource %s already leased by %r (expires in %.0fs)",
+                resource_id, existing.caller, existing.expires_at - time.time(),
+            )
+            return None
+
+        if required_vram_mb > 0 and required_vram_mb > worker.free_vram_mb:
+            logger.debug(
+                "claim_lease: %s needs %d MiB VRAM but %s has %d MiB free",
+                caller, required_vram_mb, worker.name, worker.free_vram_mb,
+            )
+            return None
+
+        lease_id = f"l_{secrets.token_hex(4)}"
+        lease = GpuLease(
+            lease_id=lease_id,
+            resource_id=resource_id,
+            caller=caller,
+            expires_at=time.time() + ttl_seconds,
+            required_vram_mb=required_vram_mb,
+        )
+        self._leases[lease_id] = lease
+        logger.info(
+            "Lease claimed: %s on %s by %r (ttl=%.0fs, vram=%d MiB)",
+            lease_id, resource_id, caller, ttl_seconds, required_vram_mb,
+        )
+        return lease
+
+    def release_lease(self, lease_id: str) -> bool:
+        """Release a lease by id.  Idempotent — returns True even if the
+        lease was already expired or never existed."""
+        lease = self._leases.pop(lease_id, None)
+        if lease is not None:
+            logger.info("Lease released: %s on %s", lease_id, lease.resource_id)
+        return True  # idempotent
+
+    def renew_lease(self, lease_id: str, ttl_seconds: float = 30) -> GpuLease | None:
+        """Extend a lease's TTL.  Returns the lease, or None if expired/unknown."""
+        lease = self._leases.get(lease_id)
+        if lease is None:
+            return None
+        now = time.time()
+        if lease.expires_at <= now:
+            self._leases.pop(lease_id, None)
+            return None
+        lease.expires_at = now + ttl_seconds
+        return lease
+
+    def get_leases(self) -> list[GpuLease]:
+        """Return a snapshot of active (non-expired) leases."""
+        now = time.time()
+        return [lease for lease in self._leases.values() if lease.expires_at > now]
+
+    def _sweep_expired_leases(self):
+        """Remove leases whose TTL has elapsed.  Called from _monitor_loop."""
+        now = time.time()
+        expired = [
+            lid for lid, lease in self._leases.items()
+            if lease.expires_at <= now
+        ]
+        for lid in expired:
+            lease = self._leases.pop(lid)
+            logger.debug("Lease expired: %s on %s", lid, lease.resource_id)
+
+    # ── Capability routing ─────────────────────────────────────────────
+
     def get_workers_for_capability(self, capability: str) -> list[WorkerInfo]:
         """Get online workers that support a capability, sorted by priority (lowest load first)."""
         eligible = [
@@ -333,7 +452,8 @@ class ClusterManager:
         }
 
     async def _monitor_loop(self):
-        """Monitor worker heartbeats, mark stale workers as offline."""
+        """Monitor worker heartbeats, mark stale workers as offline, and
+        sweep expired GPU leases."""
         while True:
             now = time.time()
             for worker in self._workers.values():
@@ -347,4 +467,13 @@ class ClusterManager:
                             f"No heartbeat for {HEARTBEAT_TIMEOUT}s. Capabilities may be reduced.",
                             level="warning",
                         )
+                    # Release any active leases for this worker's resources
+                    offline_lids = [
+                        lid for lid, lease in self._leases.items()
+                        if lease.resource_id.startswith(worker.name + ":")
+                    ]
+                    for lid in offline_lids:
+                        self._leases.pop(lid, None)
+                        logger.debug("Lease %s released — worker %s went offline", lid, worker.name)
+            self._sweep_expired_leases()
             await asyncio.sleep(5)
