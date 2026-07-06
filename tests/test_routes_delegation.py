@@ -243,6 +243,78 @@ class TestDelegationApprovalFlow:
         new_task = next(t for t in tasks if t["title"] == "Brand new task")
         assert new_task["assignee_id"] == "to-agent"
 
+    async def test_approving_routes_exactly_one_honest_message(self, client, app, monkeypatch):
+        """Answering a delegation gate must send the asking agent a SINGLE
+        reply: the delegation handler owns the message, so the generic
+        answer-router must not also fire (the old code sent two)."""
+        from tinyagentos.routes import decisions as decisions_mod
+
+        calls: list[str] = []
+
+        async def _capture(decision, value):
+            calls.append(str(value))
+
+        monkeypatch.setattr(decisions_mod, "_route_answer_to_agent", _capture)
+
+        _project, task = await _make_project_and_task(app)
+        agent_client = _local_token_client(app)
+        try:
+            resp = await agent_client.post(
+                "/api/agents/from-agent/delegate",
+                json={"to_agent": "to-agent", "task_id": task["id"]},
+            )
+        finally:
+            await agent_client.aclose()
+        decision_id = resp.json()["decision_id"]
+
+        answer_resp = await client.post(
+            f"/api/decisions/{decision_id}/answer", json={"value": "approve"}
+        )
+        assert answer_resp.status_code == 200
+        assert len(calls) == 1
+        assert calls[0] == "delegation approved - the task has been assigned"
+
+    async def test_failed_completion_reports_retry_not_success(self, client, app, monkeypatch):
+        """If assigning the task fails after approval, the agent must be told
+        the truth (retry), never that the task was assigned."""
+        from tinyagentos.routes import decisions as decisions_mod
+
+        calls: list[str] = []
+
+        async def _capture(decision, value):
+            calls.append(str(value))
+
+        monkeypatch.setattr(decisions_mod, "_route_answer_to_agent", _capture)
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("assign failed")
+
+        # _apply_delegation_grant imports complete_delegation from this module
+        # at call time, so patching it here intercepts the assignment.
+        import tinyagentos.routes.delegation as delegation_mod
+        monkeypatch.setattr(delegation_mod, "complete_delegation", _boom)
+
+        _project, task = await _make_project_and_task(app)
+        agent_client = _local_token_client(app)
+        try:
+            resp = await agent_client.post(
+                "/api/agents/from-agent/delegate",
+                json={"to_agent": "to-agent", "task_id": task["id"]},
+            )
+        finally:
+            await agent_client.aclose()
+        decision_id = resp.json()["decision_id"]
+
+        answer_resp = await client.post(
+            f"/api/decisions/{decision_id}/answer", json={"value": "approve"}
+        )
+        assert answer_resp.status_code == 200
+        assert len(calls) == 1
+        assert "please retry" in calls[0]
+        # The task must NOT have been assigned.
+        still_open = await app.state.project_task_store.get_task(task["id"])
+        assert still_open["assignee_id"] is None
+
 
 @pytest.mark.asyncio
 class TestDelegationTaskTitleCreatesTask:
