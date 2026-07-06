@@ -165,6 +165,8 @@ class ClusterManager:
         kv_cache_quant_k_support: list[str] | None = None,
         kv_cache_quant_v_support: list[str] | None = None,
         kv_cache_quant_boundary_layer_protect: bool | None = None,
+        free_vram_mb: int | None = None,
+        used_vram_mb: int | None = None,
     ) -> bool:
         """Accept a worker heartbeat.
 
@@ -203,6 +205,10 @@ class ClusterManager:
             worker.kv_cache_quant_v_support = list(kv_cache_quant_v_support)
         if kv_cache_quant_boundary_layer_protect is not None:
             worker.kv_cache_quant_boundary_layer_protect = bool(kv_cache_quant_boundary_layer_protect)
+        if free_vram_mb is not None:
+            worker.free_vram_mb = int(free_vram_mb)
+        if used_vram_mb is not None:
+            worker.used_vram_mb = int(used_vram_mb)
         # Fire worker.online notification when a previously-offline worker recovers.
         # heartbeat() is sync, so schedule the async emit as a background task.
         if self._notifications and prev_status in ("offline", "stale"):

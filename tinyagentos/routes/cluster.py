@@ -66,6 +66,12 @@ class HeartbeatBody(BaseModel):
     storage_cap_bytes: int | None = None
     storage_used_bytes: int | None = None
     bytes_deduped_total: int | None = None
+    # Real-time GPU VRAM reported by the worker on every heartbeat.
+    # Optional so legacy workers that don't send them leave stored values
+    # unchanged. Consumers (e.g. Skald's TaosDispatcher) use these to
+    # rank candidates by actual free memory, not total capacity.
+    free_vram_mb: int | None = None
+    used_vram_mb: int | None = None
 
 
 class RouteRequest(BaseModel):
@@ -232,6 +238,8 @@ async def worker_heartbeat(request: Request, body: HeartbeatBody):
         kv_cache_quant_k_support=body.kv_cache_quant_k_support,
         kv_cache_quant_v_support=body.kv_cache_quant_v_support,
         kv_cache_quant_boundary_layer_protect=body.kv_cache_quant_boundary_layer_protect,
+        free_vram_mb=body.free_vram_mb,
+        used_vram_mb=body.used_vram_mb,
     )
     if not ok:
         return JSONResponse({"error": "Worker not registered"}, status_code=404)

@@ -120,3 +120,82 @@ class TestKvQuantUnion:
         mgr.heartbeat("w1", kv_cache_quant_support=["fp16", "turboquant-k3v2"])
         result = mgr.kv_quant_union()
         assert "turboquant-k3v2" in result
+
+
+# ---------------------------------------------------------------------------
+# WorkerInfo VRAM fields (taOS #894 slice)
+# ---------------------------------------------------------------------------
+
+class TestWorkerInfoVramDefaults:
+    def test_default_vram_is_zero(self):
+        w = WorkerInfo(name="w", url="http://localhost:9000")
+        assert w.free_vram_mb == 0
+        assert w.used_vram_mb == 0
+
+    def test_vram_stored_and_serialised(self):
+        w = WorkerInfo(
+            name="w",
+            url="http://localhost:9000",
+            free_vram_mb=8192,
+            used_vram_mb=4096,
+        )
+        assert w.free_vram_mb == 8192
+        assert w.used_vram_mb == 4096
+        d = asdict(w)
+        assert d["free_vram_mb"] == 8192
+        assert d["used_vram_mb"] == 4096
+
+    def test_vram_roundtrip(self):
+        w = WorkerInfo(
+            name="w",
+            url="http://localhost:9000",
+            free_vram_mb=12288,
+            used_vram_mb=2048,
+        )
+        d = asdict(w)
+        w2 = WorkerInfo(**{k: v for k, v in d.items() if not isinstance(v, bytes)})
+        assert w2.free_vram_mb == 12288
+        assert w2.used_vram_mb == 2048
+
+
+# ---------------------------------------------------------------------------
+# ClusterManager heartbeat VRAM storage (taOS #894 slice)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestHeartbeatVram:
+    async def _register(self, mgr: ClusterManager, name: str) -> WorkerInfo:
+        w = WorkerInfo(name=name, url=f"http://localhost:900{name[-1]}")
+        await mgr.register_worker(w)
+        return w
+
+    async def test_heartbeat_stores_vram(self):
+        mgr = ClusterManager()
+        await self._register(mgr, "w1")
+        mgr.heartbeat("w1", free_vram_mb=8192, used_vram_mb=4096)
+        w = mgr.get_worker("w1")
+        assert w.free_vram_mb == 8192
+        assert w.used_vram_mb == 4096
+
+    async def test_heartbeat_omitting_vram_preserves_prior(self):
+        """Legacy heartbeat without VRAM fields leaves stored values unchanged."""
+        mgr = ClusterManager()
+        await self._register(mgr, "w1")
+        mgr.heartbeat("w1", free_vram_mb=12288, used_vram_mb=4096)
+        # Sparse heartbeat — only load + models, no VRAM fields
+        mgr.heartbeat("w1", load=0.5, models=["phi3"])
+        w = mgr.get_worker("w1")
+        assert w.free_vram_mb == 12288
+        assert w.used_vram_mb == 4096
+        assert w.load == 0.5
+        assert w.models == ["phi3"]
+
+    async def test_vram_zero_is_stored(self):
+        """Explicit zero is stored (distinct from 'not sent' which preserves prior)."""
+        mgr = ClusterManager()
+        await self._register(mgr, "w1")
+        mgr.heartbeat("w1", free_vram_mb=8192, used_vram_mb=4096)
+        mgr.heartbeat("w1", free_vram_mb=0, used_vram_mb=0)
+        w = mgr.get_worker("w1")
+        assert w.free_vram_mb == 0
+        assert w.used_vram_mb == 0

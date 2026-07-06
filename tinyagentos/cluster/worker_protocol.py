@@ -58,3 +58,9 @@ class WorkerInfo:
     worker_lxc_image_version: str | None = None  # Ubuntu image version, e.g. "ubuntu/24.04/amd64"
     degraded: bool = False
     degraded_reason: str | None = None
+    # Real-time GPU VRAM reported on every heartbeat (free/used in MiB).
+    # Default 0 means unreported / no GPU; consumers (Skald's TaosDispatcher)
+    # use these to sort candidates by actual availability instead of total
+    # capacity. Worker reports them; controller stores them; API surfaces them.
+    free_vram_mb: int = 0
+    used_vram_mb: int = 0

@@ -393,7 +393,7 @@ class WorkerAgent:
         the 404 case (controller restarted and forgot about us) and
         trigger a re-registration.
         """
-        from tinyagentos.cluster.worker_capacity import capacity_snapshot
+        from tinyagentos.cluster.worker_capacity import capacity_snapshot, gpu_vram_snapshot
 
         try:
             load = psutil.cpu_percent() / 100.0
@@ -401,6 +401,7 @@ class WorkerAgent:
             caps = self.detect_capabilities(backends)
             kv_quant = self.detect_kv_quant_support(backends)
             snap = capacity_snapshot()
+            vram = gpu_vram_snapshot()
             async with httpx.AsyncClient(timeout=5) as client:
                 resp = await client.post(
                     f"{self.controller_url}/api/cluster/heartbeat",
@@ -416,6 +417,8 @@ class WorkerAgent:
                         "storage_cap_bytes": snap["storage_cap_bytes"],
                         "storage_used_bytes": snap["storage_used_bytes"],
                         "bytes_deduped_total": snap["bytes_deduped_total"],
+                        "free_vram_mb": vram["free_vram_mb"] if vram else 0,
+                        "used_vram_mb": vram["used_vram_mb"] if vram else 0,
                     },
                 )
                 return resp.status_code

@@ -96,3 +96,24 @@ def capacity_snapshot(
         "storage_used_bytes": used,
         "bytes_deduped_total": read_bees_deduped_total(bees_status_path),
     }
+
+
+def gpu_vram_snapshot() -> dict | None:
+    """Return real-time free/used VRAM for the first GPU, or None.
+
+    Dispatches to the appropriate probe based on what's available on
+    this worker (nvidia-smi, etc). Returns a dict with ``free_vram_mb``
+    and ``used_vram_mb`` integers, or ``None`` when no GPU probe is
+    available or the probe fails.
+
+    Called from the worker heartbeat loop alongside capacity_snapshot().
+    Best-effort: a missing nvidia-smi or a probe timeout is not an error.
+    """
+    from tinyagentos.system_stats import read_nvidia_vram
+
+    pair = read_nvidia_vram()
+    if pair is None:
+        return None
+    used_mb, total_mb = pair
+    free_mb = max(0, total_mb - used_mb)
+    return {"free_vram_mb": free_mb, "used_vram_mb": used_mb}
