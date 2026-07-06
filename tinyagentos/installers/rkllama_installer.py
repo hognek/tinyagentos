@@ -97,9 +97,15 @@ def default_rkllama_url() -> str:
 
 
 _PLAIN_PERCENT_RE = re.compile(r"^\s*(\d{1,3})(?:\.\d+)?\s*%\s*$")
+# "error" at the start of a plain-text line, followed by a colon, whitespace,
+# or end of line -- matches "Error: ...", "error ..." but not "errored" or
+# "error-free", which merely begin with those letters and aren't failures.
+_PLAIN_ERROR_RE = re.compile(r"error(?::|\s|$)", re.IGNORECASE)
 
 
-def _report_pull_progress(line: str, on_progress: Callable[[int, int], None]) -> None:
+def _report_pull_progress(
+    line: str, on_progress: Callable[[int, int], None], data: dict | None = None
+) -> None:
     """Parse one line from rkllama's /api/pull stream and forward
     ``(completed, total)`` to ``on_progress``.
 
@@ -116,11 +122,9 @@ def _report_pull_progress(line: str, on_progress: Callable[[int, int], None]) ->
     blanks) is ignored -- a stray or malformed line must never abort the
     install.
     """
-    try:
-        data = json.loads(line)
-    except (TypeError, ValueError):
-        data = None
-    if isinstance(data, dict):
+    if data is None:
+        data = _line_as_dict(line)
+    if data is not None:
         completed = data.get("completed")
         total = data.get("total")
         if isinstance(completed, (int, float)) and isinstance(total, (int, float)) and total > 0:
@@ -134,21 +138,37 @@ def _report_pull_progress(line: str, on_progress: Callable[[int, int], None]) ->
     on_progress(percent, 100)
 
 
-def _parse_pull_error(line: str) -> str | None:
-    """Return a human error string if a pull-stream line reports a failure, else
-    None. Handles both the ndjson shape (``{"status":"error","error":...}``) and
-    the plain-text ``"Error: ..."`` lines rkllama emits, so a failed download
-    surfaces its real cause instead of a generic "not registered" (#1548)."""
+def _line_as_dict(line: str) -> dict | None:
+    """Best-effort parse of a pull-stream line into a dict, else None. Shared by
+    the progress and error parsers so a single line is JSON-decoded once and
+    both answer from the same result (no risk of the two diverging on edge
+    cases like BOMs or trailing junk)."""
     try:
         data = json.loads(line)
     except (TypeError, ValueError):
-        data = None
-    if isinstance(data, dict):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _parse_pull_error(line: str, data: dict | None = None) -> str | None:
+    """Return a human error string if a pull-stream line reports a failure, else
+    None. Handles both the ndjson shape (``{"status":"error","error":...}``) and
+    the plain-text ``"Error: ..."`` lines rkllama emits, so a failed download
+    surfaces its real cause instead of a generic "not registered" (#1548).
+
+    ``data`` may be a pre-parsed dict for the line (from ``_line_as_dict``) so a
+    line isn't JSON-decoded twice; when omitted it is parsed here."""
+    if data is None:
+        data = _line_as_dict(line)
+    if data is not None:
         if str(data.get("status", "")).lower() == "error":
             return str(data.get("error") or "unknown error")
         return None
     stripped = line.strip()
-    if stripped.lower().startswith("error"):
+    # Match the word "error" (case-insensitive) at the start -- "Error: <msg>",
+    # "error <msg>" -- but not tokens that merely begin with those letters, like
+    # "errored gracefully" or "error-free", which are not failures.
+    if _PLAIN_ERROR_RE.match(stripped):
         return stripped
     return None
 
@@ -238,11 +258,15 @@ class RkllamaInstaller(AppInstaller):
                     async for line in resp.aiter_lines():
                         if line:
                             last_line = line
-                            err = _parse_pull_error(line)
+                            # Parse the line's JSON once and share it with both
+                            # the error and progress parsers so they can't
+                            # disagree on the same line.
+                            parsed = _line_as_dict(line)
+                            err = _parse_pull_error(line, parsed)
                             if err:
                                 pull_error = err
                             if on_progress is not None:
-                                _report_pull_progress(line, on_progress)
+                                _report_pull_progress(line, on_progress, parsed)
                     logger.info(
                         "rkllama install: pull complete for %s (last line: %s)",
                         app_id, last_line[:200],
