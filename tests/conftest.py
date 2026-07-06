@@ -372,6 +372,10 @@ async def client(app, tmp_data_dir):
     if client_log_store._db is not None:
         await client_log_store.close()
     await client_log_store.init()
+    device_store = app.state.device_store
+    if device_store._db is not None:
+        await device_store.close()
+    await device_store.init()
     # BrowserApp v2 stores
     from tinyagentos.routes.desktop_browser.store import BrowserStore, BrowserCookieStore
     _browser_store = BrowserStore(tmp_data_dir / "browser.sqlite3")
