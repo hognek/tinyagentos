@@ -397,6 +397,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     chat_hub = ChatHub()
     canvas_store = CanvasStore(data_dir / "canvas.db")
     desktop_settings = DesktopSettingsStore(data_dir / "desktop.db")
+    from tinyagentos.device_store import DeviceStore
+    device_store = DeviceStore(data_dir / "devices.db")
     user_memory = UserMemoryStore(data_dir / "user_memory.db")
     user_personas = UserPersonaStore(data_dir / "user_personas.db")
     installed_apps = InstalledAppsStore(data_dir / "installed_apps.db")
@@ -518,6 +520,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         projects_root.mkdir(parents=True, exist_ok=True)
         await canvas_store.init()
         await desktop_settings.init()
+        await device_store.init()
         await user_memory.init()
         await installed_apps.init()
         await feedback_store.init()
@@ -835,6 +838,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         app.state.agent_chat_router = AgentChatRouter(app.state)
         app.state.canvas_store = canvas_store
         app.state.desktop_settings = desktop_settings
+        app.state.device_store = device_store
         app.state.user_memory = user_memory
         app.state.user_personas = user_personas
         app.state.installed_apps = installed_apps
@@ -1339,6 +1343,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await install_registry_store.close()
         await user_memory.close()
         await desktop_settings.close()
+        await device_store.close()
         await canvas_store.close()
         try:
             bb = getattr(app.state, "beads_bridge", None)
@@ -1520,6 +1525,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.typing = None
     app.state.canvas_store = canvas_store
     app.state.desktop_settings = desktop_settings
+    app.state.device_store = device_store
     app.state.user_memory = user_memory
     app.state.user_personas = user_personas
     app.state.installed_apps = installed_apps
