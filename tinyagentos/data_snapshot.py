@@ -46,8 +46,8 @@ def _harden_perms(root: Path) -> None:
                 pass
 
 
-def snapshot_data_dir(data_dir: Path) -> Optional[Path]:
-    """Copy data_dir into data-backups/pre-switch-<ts>/, skipping _EXCLUDE.
+def snapshot_data_dir(data_dir: Path, prefix: str = "pre-switch") -> Optional[Path]:
+    """Copy data_dir into data-backups/{prefix}-<ts>/, skipping _EXCLUDE.
 
     Returns the backup path, or None if data_dir doesn't exist. Best-effort:
     per-entry copy failures are logged, not raised.
@@ -62,7 +62,7 @@ def snapshot_data_dir(data_dir: Path) -> Optional[Path]:
     ts = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
     backups_root = data_dir / "data-backups"
     backups_root.mkdir(parents=True, exist_ok=True)
-    dest = backups_root / f"pre-switch-{ts}"
+    dest = backups_root / f"{prefix}-{ts}"
     dest.mkdir(parents=True, exist_ok=True)
     for d in (backups_root, dest):
         try:
