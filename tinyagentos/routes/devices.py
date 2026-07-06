@@ -3,17 +3,24 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from tinyagentos.auth_context import CurrentUser, current_user
 
 router = APIRouter()
 
+# Cap devices per user so a compromised or looping client cannot issue unbounded
+# scoped tokens (token-issuance + storage exhaustion). A push token is at most a
+# few hundred bytes; the bound is generous but keeps a single value finite.
+_MAX_DEVICES_PER_USER = 50
+_MAX_PUSH_TOKEN = 4096
+_MAX_DISPLAY_NAME = 200
+
 
 class RegisterIn(BaseModel):
     platform: str
-    display_name: str = ""
-    push_token: str = ""
+    display_name: str = Field(default="", max_length=_MAX_DISPLAY_NAME)
+    push_token: str = Field(default="", max_length=_MAX_PUSH_TOKEN)
 
     @field_validator("platform")
     @classmethod
@@ -24,7 +31,7 @@ class RegisterIn(BaseModel):
 
 
 class PushTokenIn(BaseModel):
-    push_token: str
+    push_token: str = Field(max_length=_MAX_PUSH_TOKEN)
 
 
 @router.post("/api/devices/register")
@@ -32,6 +39,11 @@ async def register_device(
     body: RegisterIn, request: Request, user: CurrentUser = Depends(current_user)
 ):
     store = request.app.state.device_store
+    if len(await store.list_for_user(user.user_id)) >= _MAX_DEVICES_PER_USER:
+        return JSONResponse(
+            {"error": f"device limit reached ({_MAX_DEVICES_PER_USER})"},
+            status_code=429,
+        )
     device = await store.register(
         user_id=user.user_id,
         platform=body.platform,

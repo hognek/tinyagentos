@@ -101,10 +101,28 @@ def apns_sender_from_env() -> ApnsSender:
     team_id = os.environ.get("TAOS_APNS_TEAM_ID")
     bundle_id = os.environ.get("TAOS_APNS_BUNDLE_ID")
     key_path = os.environ.get("TAOS_APNS_KEY_PATH")
+    # Default to Apple's production gateway; TAOS_APNS_SANDBOX routes dev/TestFlight
+    # builds to the sandbox gateway (a token minted for one is rejected by the other).
+    host = (
+        "api.sandbox.push.apple.com"
+        if os.environ.get("TAOS_APNS_SANDBOX", "").lower() in ("1", "true", "yes")
+        else "api.push.apple.com"
+    )
     if key_id and team_id and bundle_id and key_path and os.path.isfile(key_path):
+        # The .p8 signing key is a long-lived credential; warn (do not fail) if it
+        # is group/world accessible so the operator can tighten it to 600.
+        try:
+            if os.stat(key_path).st_mode & 0o077:
+                logger.warning(
+                    "APNs signing key %s is group/world accessible; tighten to 600",
+                    key_path,
+                )
+        except OSError:
+            pass
         with open(key_path) as fh:
             key_pem = fh.read()
         return HttpApnsSender(
-            key_pem=key_pem, key_id=key_id, team_id=team_id, bundle_id=bundle_id
+            key_pem=key_pem, key_id=key_id, team_id=team_id,
+            bundle_id=bundle_id, host=host,
         )
     return NullApnsSender()
