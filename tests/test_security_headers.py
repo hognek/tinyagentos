@@ -27,6 +27,16 @@ class TestSecurityHeaders:
         assert "wss:" in csp
 
     @pytest.mark.asyncio
+    async def test_csp_allows_weather_open_meteo_origins(self, client):
+        # Regression for #1668: the built-in Weather app fetches the open-meteo
+        # geocoding + forecast APIs directly, so both origins must be in
+        # connect-src or default-src 'self' silently blocks every city search.
+        resp = await client.get("/api/health")
+        csp = resp.headers.get("content-security-policy", "")
+        assert "https://geocoding-api.open-meteo.com" in csp
+        assert "https://api.open-meteo.com" in csp
+
+    @pytest.mark.asyncio
     async def test_x_frame_options_sameorigin(self, client):
         resp = await client.get("/api/health")
         assert resp.headers.get("x-frame-options", "").upper() == "SAMEORIGIN"
