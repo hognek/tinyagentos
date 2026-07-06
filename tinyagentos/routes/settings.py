@@ -503,7 +503,7 @@ async def set_container_runtime(request: Request):
     """Set the container runtime preference."""
     body = await request.json()
     runtime = body.get("runtime", "auto")
-    if runtime not in ("auto", "apple", "lxc", "docker", "podman"):
+    if runtime not in ("auto", "apple", "lxc", "docker", "podman", "native"):
         return JSONResponse({"error": f"Invalid runtime: {runtime}"}, status_code=400)
     config = request.app.state.config
     config.container_runtime = runtime
@@ -522,6 +522,9 @@ async def set_container_runtime(request: Request):
         set_backend(LXCBackend())
     elif effective in ("docker", "podman"):
         set_backend(DockerBackend(binary=effective))
+    elif effective == "native":
+        from tinyagentos.containers.native import NativeBackend
+        set_backend(NativeBackend())
     return {"status": "updated", "runtime": effective}
 
 
