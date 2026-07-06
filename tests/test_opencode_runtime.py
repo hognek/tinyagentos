@@ -268,25 +268,35 @@ class TestResolveOpencodeBinary:
 
         assert ocr.resolve_opencode_binary() == str(binary)
 
-    def test_finds_binary_installed_under_another_user_home(self, tmp_path, monkeypatch):
-        """#1616: opencode installed by the operator lands in *their* home, not
-        the taos service user's. The service must still find it via the extra
-        candidate locations."""
+    def test_finds_first_executable_candidate(self, tmp_path, monkeypatch):
+        """resolve_opencode_binary walks the trusted candidate list and returns
+        the first existing executable, skipping earlier non-existent ones (e.g.
+        the service user's own home has none, but a system path does)."""
         from tinyagentos import opencode_runtime as ocr
 
-        operator_bin = tmp_path / "home" / "operator" / ".opencode" / "bin" / "opencode"
-        operator_bin.parent.mkdir(parents=True)
-        operator_bin.write_text("#!/bin/sh\n")
-        operator_bin.chmod(0o755)
+        system_bin = tmp_path / "usr" / "local" / "bin" / "opencode"
+        system_bin.parent.mkdir(parents=True)
+        system_bin.write_text("#!/bin/sh\n")
+        system_bin.chmod(0o755)
 
         monkeypatch.delenv("TAOS_OPENCODE_BIN", raising=False)
         monkeypatch.setattr(ocr.shutil, "which", lambda name: None)
-        # taos service user's own home has no opencode; the operator's does.
         monkeypatch.setattr(
             ocr, "_opencode_candidate_paths",
-            lambda: [tmp_path / "taos-home" / ".opencode" / "bin" / "opencode", operator_bin],
+            lambda: [tmp_path / "taos-home" / ".opencode" / "bin" / "opencode", system_bin],
         )
-        assert ocr.resolve_opencode_binary() == str(operator_bin)
+        assert ocr.resolve_opencode_binary() == str(system_bin)
+
+    def test_does_not_probe_arbitrary_user_homes(self, monkeypatch):
+        """Security: the candidate list must not glob /home/* — running a binary
+        from a non-privileged user's home is a privilege-escalation vector on a
+        multi-user box (#1616 security review)."""
+        from tinyagentos import opencode_runtime as ocr
+
+        for candidate in ocr._opencode_candidate_paths():
+            assert not str(candidate).startswith("/home/"), (
+                f"must not probe arbitrary user home: {candidate}"
+            )
 
     def test_returns_none_when_not_installed_anywhere(self, tmp_path, monkeypatch):
         from tinyagentos import opencode_runtime as ocr
