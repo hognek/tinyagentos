@@ -585,7 +585,17 @@ migrate_legacy_models() {
 }
 
 pull_models() {
-    run_as_user mkdir -p "$RKLLAMA_MODELS"
+    # The unified root (TAOS_MODELS_ROOT / <project>/data/models) may live under
+    # a tree the service user can't write (e.g. a project dir owned by someone
+    # else -> EACCES). If creating it as $TARGET_USER fails, fall back to the
+    # always-safe per-install path under $TARGET_HOME so the install still
+    # succeeds. RKLLAMA_MODELS is global, so install_systemd_unit (called after
+    # pull_models) picks up the fallback too.
+    if ! run_as_user mkdir -p "$RKLLAMA_MODELS" 2>/dev/null; then
+        warn "cannot create $RKLLAMA_MODELS as $TARGET_USER; falling back to $LEGACY_RKLLAMA_MODELS"
+        RKLLAMA_MODELS="$LEGACY_RKLLAMA_MODELS"
+        run_as_user mkdir -p "$RKLLAMA_MODELS"
+    fi
     migrate_legacy_models
 
     fetch_model "qwen3-embedding-0.6b" "$EMBEDDING_LOCAL_NAME" "$EMBEDDING_URL" \
