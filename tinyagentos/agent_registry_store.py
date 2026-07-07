@@ -328,17 +328,20 @@ class AgentRegistryStore(BaseStore):
 
     SCHEMA = SCHEMA
 
-    # Serializes set_reporting's cycle-check-then-write so two concurrent org
-    # edits (A->B and B->A) can't both pass the cycle guard and then both write
-    # a persisted cycle. The shared aiosqlite connection yields on every await
-    # inside the check, so the read chain and the write must be held together.
-    _reporting_lock: asyncio.Lock
+    def __init__(self, db_path: Path):
+        super().__init__(db_path)
+        # Serializes set_reporting's cycle-check-then-write so two concurrent
+        # org edits (A->B and B->A) can't both pass the cycle guard and then
+        # both write a persisted cycle. The shared aiosqlite connection yields
+        # on every await inside the check, so the read chain and the write must
+        # be held together. Created at construction (not in init()) so it always
+        # exists before any caller, independent of init ordering.
+        self._reporting_lock = asyncio.Lock()
 
     async def init(self) -> None:
         await super().init()
         if self._db is not None:
             self._db.row_factory = aiosqlite.Row
-        self._reporting_lock = asyncio.Lock()
 
     async def _post_init(self) -> None:
         """Idempotently ensure the status column exists and is backfilled."""
