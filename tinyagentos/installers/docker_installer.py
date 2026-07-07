@@ -27,13 +27,53 @@ class DockerInstaller(AppInstaller):
         parent directories as needed.  The string ``{secret_key}`` in
         ``content`` is replaced with a random 64-hex-char secret so that
         apps like SearXNG can ship a default settings file without a
-        hard-coded key.
+        hard-coded key.  The secret is persisted in ``<app_dir>/.secret_key``
+        so re-installs keep it stable.
         """
         config_files = install_config.get("config_files", [])
         if not config_files:
             return
         app_dir = self.apps_dir / app_id
-        secret_key = secrets.token_hex(32)
+
+        # Validate each entry has required keys before using them.
+        for i, entry in enumerate(config_files):
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"config_files[{i}] must be a dict, got {type(entry).__name__}"
+                )
+            if "path" not in entry:
+                raise ValueError(f"config_files[{i}] missing required key 'path'")
+            if "content" not in entry:
+                raise ValueError(f"config_files[{i}] missing required key 'content'")
+
+        # Validate paths: reject '..' components and absolute paths; confirm
+        # the resolved path stays within app_dir (path-traversal protection).
+        resolved_app_dir = app_dir.resolve()
+        for i, entry in enumerate(config_files):
+            path = entry["path"]
+            if path.startswith("/"):
+                raise ValueError(
+                    f"config_files[{i}].path must be relative, got {path!r}"
+                )
+            if ".." in Path(path).parts:
+                raise ValueError(
+                    f"config_files[{i}].path must not contain '..', got {path!r}"
+                )
+            resolved = (app_dir / path).resolve()
+            if not str(resolved).startswith(str(resolved_app_dir) + "/"):
+                raise ValueError(
+                    f"config_files[{i}].path resolves outside app_dir: {path!r}"
+                )
+
+        # Persist secret_key per app so re-installs don't rotate it.
+        secret_key_path = app_dir / ".secret_key"
+        if secret_key_path.exists():
+            secret_key = secret_key_path.read_text().strip()
+        else:
+            secret_key = secrets.token_hex(32)
+            app_dir.mkdir(parents=True, exist_ok=True)
+            secret_key_path.write_text(secret_key)
+
         for entry in config_files:
             path = entry["path"]
             content = entry["content"]

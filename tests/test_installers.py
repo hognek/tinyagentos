@@ -115,7 +115,7 @@ class TestDockerInstaller:
         # {secret_key} must be replaced with a 64-hex-char random string
         assert "{secret_key}" not in content
         assert content.startswith('secret_key: "')
-        key_val = content[len('secret_key: "'):-1]  # strip prefix and trailing quote
+        key_val = content.split('"')[1]  # extract the value between quotes
         assert len(key_val) == 64
         assert all(c in "0123456789abcdef" for c in key_val)
 
@@ -126,6 +126,62 @@ class TestDockerInstaller:
         installer._write_config_files("app", {"image": "x:1"})
         # Should not raise, should not create the app dir
         assert not (tmp_path / "app").exists()
+
+    def test_write_config_files_rejects_missing_path(self, tmp_path):
+        installer = DockerInstaller(apps_dir=tmp_path)
+        with pytest.raises(ValueError, match="missing required key 'path'"):
+            installer._write_config_files("app", {
+                "config_files": [{"content": "x"}]
+            })
+
+    def test_write_config_files_rejects_missing_content(self, tmp_path):
+        installer = DockerInstaller(apps_dir=tmp_path)
+        with pytest.raises(ValueError, match="missing required key 'content'"):
+            installer._write_config_files("app", {
+                "config_files": [{"path": "f.yml"}]
+            })
+
+    def test_write_config_files_rejects_absolute_path(self, tmp_path):
+        installer = DockerInstaller(apps_dir=tmp_path)
+        with pytest.raises(ValueError, match="must be relative"):
+            installer._write_config_files("app", {
+                "config_files": [{"path": "/etc/passwd", "content": "x"}]
+            })
+
+    def test_write_config_files_rejects_dotdot_path(self, tmp_path):
+        installer = DockerInstaller(apps_dir=tmp_path)
+        with pytest.raises(ValueError, match="must not contain '..'"):
+            installer._write_config_files("app", {
+                "config_files": [{"path": "../escape.yml", "content": "x"}]
+            })
+
+    def test_write_config_files_rejects_path_resolving_outside_app_dir(self, tmp_path):
+        installer = DockerInstaller(apps_dir=tmp_path)
+        # Create a symlink that points outside app_dir
+        app_dir = tmp_path / "app"
+        app_dir.mkdir(parents=True)
+        symlink = app_dir / "escape"
+        symlink.symlink_to(tmp_path / "outside")
+        with pytest.raises(ValueError, match="resolves outside app_dir"):
+            installer._write_config_files("app", {
+                "config_files": [{"path": "escape/target.yml", "content": "x"}]
+            })
+
+    def test_write_config_files_persists_secret_key_across_calls(self, tmp_path):
+        installer = DockerInstaller(apps_dir=tmp_path)
+        config = {
+            "config_files": [
+                {"path": "settings.yml", "content": 'secret_key: "{secret_key}"'},
+            ]
+        }
+        installer._write_config_files("searxng", config)
+        first_key = (tmp_path / "searxng" / "settings.yml").read_text()
+        # Call again — must reuse the persisted secret, not generate a new one
+        installer._write_config_files("searxng", config)
+        second_key = (tmp_path / "searxng" / "settings.yml").read_text()
+        assert first_key == second_key
+        # The .secret_key file must exist
+        assert (tmp_path / "searxng" / ".secret_key").exists()
 
     @pytest.mark.asyncio
     async def test_start_runs_compose_up(self, tmp_path):
