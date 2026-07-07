@@ -59,7 +59,10 @@ class _IncusPtyHandle(PtyHandle):
             self._proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self._proc.kill()
-            self._proc.wait(timeout=2)
+            try:
+                self._proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 def _open_incus_pty(container: str, shell_cmd: str) -> _IncusPtyHandle:

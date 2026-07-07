@@ -48,6 +48,24 @@ _ALLOWED_WRITE_ROOTS: tuple[str, ...] = (
 )
 
 
+def _validate_env_value(key: str, value: str) -> str | None:
+    """Return an error message if *value* is unsafe for systemd unit files.
+
+    Newlines in env values can inject arbitrary systemd directives
+    into the unit file (e.g. ``ExecStart=/bin/bash\\nRestart=always``
+    exploiting naive line-by-line construction).  This validator rejects
+    any value containing ``\\n`` or ``\\r``.
+
+    Returns ``None`` when the value is safe to write.
+    """
+    if "\n" in value or "\r" in value:
+        return (
+            f"env value for {key!r} must not contain newlines or "
+            f"carriage returns (potential systemd directive injection)"
+        )
+    return None
+
+
 def _safe_host_path(remote_path: str, *, allowed_roots: tuple[str, ...] = _ALLOWED_WRITE_ROOTS) -> str | None:
     """Return the resolved real path if *remote_path* is safe, or None.
 
@@ -125,7 +143,10 @@ class _NativePtyHandle(PtyHandle):
             self._proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             self._proc.kill()
-            self._proc.wait(timeout=2)
+            try:
+                self._proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
 
 
 async def _run(cmd: list[str], timeout: int = 120) -> tuple[int, str]:
@@ -326,9 +347,13 @@ class NativeBackend(ContainerBackend):
             }
 
         unit_path = _service_unit_path(name)
-        # Build environment lines
+        # Build environment lines — reject newlines in values (they can
+        # inject arbitrary systemd directives into the unit file).
         env_lines = ""
         for key, value in (env or {}).items():
+            err = _validate_env_value(key, value)
+            if err is not None:
+                return {"success": False, "name": name, "error": err}
             env_lines += f"Environment={key}={value}\n"
 
         memory_limit_line = ""
@@ -589,6 +614,12 @@ WantedBy=multi-user.target
         unit_path = _service_unit_path(name)
         if not unit_path.exists():
             return {"success": False, "output": f"unit {name}.service not found"}
+
+        # Reject newlines in env values — they can inject arbitrary
+        # systemd directives into the unit file.
+        err = _validate_env_value(key, value)
+        if err is not None:
+            return {"success": False, "output": err}
 
         try:
             content = unit_path.read_text()
