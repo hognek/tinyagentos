@@ -106,7 +106,7 @@ export function TopBar({ onSearchOpen, onAssistantOpen }: Props) {
   const openWindow = useProcessStore((s) => s.openWindow);
 
   const openSettingsUpdates = () => {
-    openWindow("settings", { w: 760, h: 520 });
+    openWindow("settings", { w: 760, h: 520 }, { section: "updates" });
   };
 
   return (

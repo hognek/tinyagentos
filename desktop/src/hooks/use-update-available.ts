@@ -8,7 +8,10 @@
  * Pass an explicit buildVersion to override (used by UpdateAvailableToast
  * whose prop already carries the version).
  *
- * Returns true when a newer backend version is available.
+ * Returns true when a newer backend version is available. Both the SPA
+ * build version and the backend version are checked against the dev
+ * pattern — a dev-style version on either side suppresses the badge
+ * so local hacking doesn't trigger false positives.
  */
 import { useBackendStatus } from "@/contexts/BackendStatusContext";
 
@@ -40,6 +43,6 @@ export function useUpdateAvailable(buildVersionOverride?: string): boolean {
     (typeof __TAOS_VERSION__ === "string" ? __TAOS_VERSION__ : "dev");
 
   if (DEV_VERSION_PATTERN.test(buildVersion)) return false;
-  if (!currentVersion) return false;
+  if (!currentVersion || DEV_VERSION_PATTERN.test(currentVersion)) return false;
   return strippedVersion(currentVersion) !== strippedVersion(buildVersion);
 }

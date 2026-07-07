@@ -19,8 +19,6 @@ import { useUpdateAvailable } from "@/hooks/use-update-available";
 import { useBackendStatus } from "@/contexts/BackendStatusContext";
 import { useNotificationStore } from "@/stores/notification-store";
 
-declare const __TAOS_VERSION__: string | undefined;
-
 interface Props {
   buildVersion: string;
 }
