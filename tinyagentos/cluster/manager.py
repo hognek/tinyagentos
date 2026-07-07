@@ -51,6 +51,10 @@ class ClusterManager:
     async def stop(self):
         if self._monitor_task:
             self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
 
     async def register_worker(self, info: WorkerInfo) -> None:
         # Snapshot capabilities before adding worker
