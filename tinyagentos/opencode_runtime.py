@@ -90,8 +90,13 @@ def resolve_opencode_binary() -> str | None:
     anywhere we know to look.
     """
     override = os.environ.get("TAOS_OPENCODE_BIN")
-    if override and _is_executable(Path(override)):
-        return override
+    if override:
+        if _is_executable(Path(override)):
+            return override
+        logger.warning(
+            "TAOS_OPENCODE_BIN=%s is not an executable file; ignoring it and "
+            "falling back to PATH and standard locations.", override,
+        )
     found = shutil.which("opencode")
     if found:
         return found
