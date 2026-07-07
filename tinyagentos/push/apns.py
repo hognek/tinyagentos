@@ -31,6 +31,10 @@ class NullApnsSender:
         logger.info("APNs not configured; dropping push to %s", push_token[:8])
         return False
 
+    async def aclose(self) -> None:
+        # No client to close; present so shutdown can call aclose() uniformly.
+        return None
+
 
 def build_apns_payload(
     *, title: str, body: str, data: dict | None = None, content_available: bool = False
@@ -94,6 +98,13 @@ class HttpApnsSender:
             logger.warning("APNs send failed for %s", push_token[:8], exc_info=True)
             return False
         return resp.status_code == 200
+
+    async def aclose(self) -> None:
+        # Close the httpx client (the one this sender self-created, or an
+        # injected one). aclose() is idempotent, so re-closing is harmless.
+        client = self._client
+        if client is not None:
+            await client.aclose()
 
 
 def apns_sender_from_env() -> ApnsSender:

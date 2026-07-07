@@ -1353,6 +1353,14 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await user_memory.close()
         await desktop_settings.close()
         await device_store.close()
+        # Close the APNs sender's httpx client (self-created by HttpApnsSender);
+        # guarded so the Null sender or a missing attribute is a no-op.
+        _apns = getattr(app.state, "apns_sender", None)
+        if _apns is not None and hasattr(_apns, "aclose"):
+            try:
+                await _apns.aclose()
+            except Exception:
+                logger.exception("apns sender aclose failed")
         await canvas_store.close()
         try:
             bb = getattr(app.state, "beads_bridge", None)
