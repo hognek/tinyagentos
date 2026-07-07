@@ -84,12 +84,21 @@ def _scan_roots(request: Request) -> list[Path]:
     Legacy ``data/models`` plus the new shared layout root
     (~/models/<backend>/<family>/<id>/...). Both get walked so files
     placed by older installers still surface alongside the new tree.
+
+    Also includes wherever the installed rkllama service actually writes its
+    models (read from its systemd unit), so a model downloaded by an *existing*
+    rkllama install whose service predates the unified tree is still discovered,
+    without needing to regenerate that service (#1548).
     """
     primary = _models_dir(request)
     extra = getattr(request.app.state, "models_root", None)
     roots = [primary]
     if extra is not None and Path(extra) != primary:
         roots.append(Path(extra))
+    from tinyagentos.installers.rkllama_installer import rkllama_service_models_dir
+    rkllama_dir = rkllama_service_models_dir()
+    if rkllama_dir is not None and rkllama_dir not in roots:
+        roots.append(rkllama_dir)
     return roots
 
 
