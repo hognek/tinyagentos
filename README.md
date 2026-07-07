@@ -39,7 +39,7 @@ Most AI assistants keep your memory, conversations, and files on their servers. 
 - **Offline memory.** Your AI's long-term memory is a self-hosted knowledge graph on your own box (a £170 Orange Pi is enough), not a row in someone else's cloud database.
 - **Self-hosted agents and chat.** Your agents, their conversations, and your channels run on hardware you control.
 - **Your compute, your models.** A local model catalog and cluster inference on your own devices; cloud models are opt-in, never required.
-- **Auditable and exit-able.** Source-available, with a self-hostable binary mirror and an air-gapped install path. Nothing locks you in.
+- **Auditable and exit-able.** Open source (AGPL-3.0), with a self-hostable binary mirror and an air-gapped install path. Nothing locks you in.
 
 Sovereignty by default, cloud by choice. Run taOS fully offline, or connect a cloud model or paid remote access (taOSgo) when you decide it is worth it. The default is that your data never leaves your hardware.
 
@@ -789,6 +789,8 @@ taOS is better for the people testing it, filing issues, and sending fixes:
 
 ## License
 
-taOS Sustainable Use License v0.1 -- source-available, not open source. See [LICENSE](LICENSE).
+taOS is open source under the [GNU Affero General Public License v3.0 or later](LICENSE) (AGPL-3.0-or-later).
 
-Free to use, modify, and self-host for personal use and for your own organisation's internal business purposes -- forever. A separate commercial license from jaylfc is required to sell taOS, host it as a paid service, or build it into a product or service you monetise (contact info@taos.my). Prior releases tagged under AGPL-3.0 remain available under AGPL-3.0.
+You may use, modify, and self-host taOS freely under the AGPL, including for your own organisation's internal business purposes. The AGPL's one condition for network use is that if you run a modified taOS as a service for others, you make your modified source available to those users, also under the AGPL.
+
+A separate **commercial license** is available from jaylfc for anyone who wants to use taOS on terms the AGPL does not grant them -- for example embedding it in a proprietary product, or offering it as a hosted or managed service without releasing modifications under the AGPL. See [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) or contact info@taos.my.
