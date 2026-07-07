@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 import shutil
 from pathlib import Path
 
@@ -17,6 +18,30 @@ class DockerInstaller(AppInstaller):
 
     def _compose_path(self, app_id: str) -> Path:
         return self.apps_dir / app_id / "docker-compose.yaml"
+
+    def _write_config_files(self, app_id: str, install_config: dict) -> None:
+        """Write declarative config files from the manifest to the app directory.
+
+        ``install_config['config_files']`` is a list of ``{path, content}``
+        objects.  Each file is written to ``<app_dir>/<path>``, creating
+        parent directories as needed.  The string ``{secret_key}`` in
+        ``content`` is replaced with a random 64-hex-char secret so that
+        apps like SearXNG can ship a default settings file without a
+        hard-coded key.
+        """
+        config_files = install_config.get("config_files", [])
+        if not config_files:
+            return
+        app_dir = self.apps_dir / app_id
+        secret_key = secrets.token_hex(32)
+        for entry in config_files:
+            path = entry["path"]
+            content = entry["content"]
+            if "{secret_key}" in content:
+                content = content.replace("{secret_key}", secret_key)
+            full_path = app_dir / path
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            full_path.write_text(content)
 
     @staticmethod
     def _is_named_volume(source: str) -> bool:
@@ -96,6 +121,10 @@ class DockerInstaller(AppInstaller):
     async def install(self, app_id: str, install_config: dict, **kwargs) -> dict:
         app_dir = self.apps_dir / app_id
         app_dir.mkdir(parents=True, exist_ok=True)
+
+        # Seed any declarative config files before compose generation so
+        # bind mounts like ./settings.yml resolve against the app dir.
+        self._write_config_files(app_id, install_config)
 
         compose, host_port = self._generate_compose(app_id, install_config)
         compose_path = self._compose_path(app_id)

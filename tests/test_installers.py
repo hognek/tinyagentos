@@ -98,6 +98,35 @@ class TestDockerInstaller:
         assert "volumes" not in compose  # no named volumes → no top-level block
         assert host_port is None
 
+    def test_write_config_files_creates_files_with_substitution(self, tmp_path):
+        installer = DockerInstaller(apps_dir=tmp_path)
+        installer._write_config_files("searxng", {
+            "config_files": [
+                {"path": "settings.yml", "content": 'secret_key: "{secret_key}"'},
+                {"path": "sub/deep.yml", "content": "key: static"},
+            ]
+        })
+        settings_yml = tmp_path / "searxng" / "settings.yml"
+        deep_yml = tmp_path / "searxng" / "sub" / "deep.yml"
+        assert settings_yml.exists()
+        assert deep_yml.exists()
+
+        content = settings_yml.read_text()
+        # {secret_key} must be replaced with a 64-hex-char random string
+        assert "{secret_key}" not in content
+        assert content.startswith('secret_key: "')
+        key_val = content[len('secret_key: "'):-1]  # strip prefix and trailing quote
+        assert len(key_val) == 64
+        assert all(c in "0123456789abcdef" for c in key_val)
+
+        assert deep_yml.read_text() == "key: static"
+
+    def test_write_config_files_noop_when_no_config_files(self, tmp_path):
+        installer = DockerInstaller(apps_dir=tmp_path)
+        installer._write_config_files("app", {"image": "x:1"})
+        # Should not raise, should not create the app dir
+        assert not (tmp_path / "app").exists()
+
     @pytest.mark.asyncio
     async def test_start_runs_compose_up(self, tmp_path):
         installer = DockerInstaller(apps_dir=tmp_path)
