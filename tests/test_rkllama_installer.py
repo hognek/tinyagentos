@@ -6,6 +6,8 @@ roundtrip to /api/pull is exercised manually on the Pi (see PR description).
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import httpx
 import pytest
 import respx
@@ -424,3 +426,29 @@ class TestRkllamaServiceManifest:
         script = install.get("script")
         assert script, "rkllama manifest declares no install.script"
         assert (repo / script).is_file(), f"rkllama install script missing: {script}"
+
+
+class TestRkllamaServiceModelsDir:
+    """rkllama_service_models_dir parses the --models path from the installed
+    systemd unit so taOS can scan wherever an existing rkllama writes (#1548)."""
+
+    def test_parses_models_flag(self, tmp_path):
+        from tinyagentos.installers.rkllama_installer import rkllama_service_models_dir
+        unit = tmp_path / "rkllama.service"
+        unit.write_text(
+            "[Service]\n"
+            "ExecStart=/opt/x/.venv/bin/python /opt/x/.venv/bin/rkllama_server "
+            "--processor rk3588 --port 7833 --models /home/jay/rkllama/models "
+            "--preload a,b\n"
+        )
+        assert rkllama_service_models_dir(unit) == Path("/home/jay/rkllama/models")
+
+    def test_none_when_unit_absent(self, tmp_path):
+        from tinyagentos.installers.rkllama_installer import rkllama_service_models_dir
+        assert rkllama_service_models_dir(tmp_path / "nope.service") is None
+
+    def test_none_when_no_models_flag(self, tmp_path):
+        from tinyagentos.installers.rkllama_installer import rkllama_service_models_dir
+        unit = tmp_path / "rkllama.service"
+        unit.write_text("[Service]\nExecStart=/usr/bin/rkllama_server --port 7833\n")
+        assert rkllama_service_models_dir(unit) is None

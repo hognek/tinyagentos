@@ -20,6 +20,7 @@ import logging
 import re
 import socket
 import urllib.request
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -94,6 +95,37 @@ def default_rkllama_url() -> str:
         )
         return f"http://localhost:{_LEGACY_RKLLAMA_PORT}"
     return f"http://localhost:{_DEFAULT_RKLLAMA_PORT}"
+
+
+_RKLLAMA_UNIT_PATH = Path("/etc/systemd/system/rkllama.service")
+# rkllama_server ... --models <dir> ...  (space or = between flag and value)
+_RKLLAMA_MODELS_ARG_RE = re.compile(r"--models[=\s]+(\S+)")
+
+
+def rkllama_service_models_dir(
+    unit_path: Path = _RKLLAMA_UNIT_PATH,
+) -> Path | None:
+    """Directory the installed rkllama systemd service actually writes models
+    to, parsed from its unit's ``ExecStart --models`` flag.
+
+    Lets taOS discover models wherever an *existing* rkllama install puts them,
+    even one whose service predates the unified-model-store change (#1682) and
+    therefore writes to a directory taOS's own roots don't cover. Updating the
+    controller doesn't regenerate that service, so without this an existing
+    install's downloads stay invisible until a manual reinstall (#1548).
+
+    Returns ``None`` when there is no readable unit or no ``--models`` flag.
+    """
+    try:
+        text = unit_path.read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if line.strip().startswith("ExecStart"):
+            m = _RKLLAMA_MODELS_ARG_RE.search(line)
+            if m:
+                return Path(m.group(1).strip("'\""))
+    return None
 
 
 _PLAIN_PERCENT_RE = re.compile(r"^\s*(\d{1,3})(?:\.\d+)?\s*%\s*$")
