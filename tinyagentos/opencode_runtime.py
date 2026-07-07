@@ -90,15 +90,26 @@ def resolve_opencode_binary() -> str | None:
     anywhere we know to look.
     """
     override = os.environ.get("TAOS_OPENCODE_BIN")
-    if override and Path(override).is_file() and os.access(override, os.X_OK):
+    if override and _is_executable(Path(override)):
         return override
     found = shutil.which("opencode")
     if found:
         return found
     for candidate in _opencode_candidate_paths():
-        if candidate.is_file() and os.access(candidate, os.X_OK):
+        if _is_executable(candidate):
             return str(candidate)
     return None
+
+
+def _is_executable(path: Path) -> bool:
+    """True if ``path`` is an existing executable file. Swallows OSError so an
+    inaccessible candidate (e.g. ``/root/.opencode/...`` when not running as
+    root -- ``is_file()`` raises PermissionError there) is treated as absent
+    rather than aborting resolution."""
+    try:
+        return path.is_file() and os.access(path, os.X_OK)
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------------------

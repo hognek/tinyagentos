@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -290,9 +291,12 @@ class TestResolveOpencodeBinary:
     def test_does_not_probe_arbitrary_user_homes(self, monkeypatch):
         """Security: the candidate list must not glob /home/*, since running a binary
         from a non-privileged user's home is a privilege-escalation vector on a
-        multi-user box (#1616 security review)."""
+        multi-user box (#1616 security review). The service user's own home
+        (e.g. /opt/taos) is fine; only *arbitrary* /home/* is banned, so pin
+        home outside /home to isolate it from the CI runner's /home/runner."""
         from tinyagentos import opencode_runtime as ocr
 
+        monkeypatch.setattr(ocr.Path, "home", classmethod(lambda cls: Path("/opt/taos")))
         for candidate in ocr._opencode_candidate_paths():
             assert not str(candidate).startswith("/home/"), (
                 f"must not probe arbitrary user home: {candidate}"
