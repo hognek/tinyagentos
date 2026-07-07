@@ -38,6 +38,10 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL = 60  # seconds between agent queue sweeps
 REWAKE_COOLDOWN = 300  # seconds before the same (agent, task) may be re-woken
 _WAKE_STAGGER_SECONDS = 0.5  # deterministic gap between successive wakes in a tick
+# Cap the cumulative per-tick stagger well under HEARTBEAT_INTERVAL so a large
+# fleet cannot push a tick past the next sweep. Once this budget is spent, the
+# remaining wakes in the tick fire without added delay.
+_MAX_TICK_STAGGER_SECONDS = HEARTBEAT_INTERVAL / 4
 
 
 def _heartbeat_enabled(app_state) -> bool:
@@ -154,6 +158,7 @@ async def _heartbeat_tick(app_state) -> None:
     now = time.time()
 
     woke_this_tick = 0
+    staggered_seconds = 0.0
     for agent in getattr(config, "agents", None) or []:
         if agent.get("status") != "running":
             continue
@@ -172,9 +177,11 @@ async def _heartbeat_tick(app_state) -> None:
             # Spread successive wakes within a tick so the downstream LLM turns
             # don't all fire at one instant on a large fleet. Deterministic (not
             # random) to stay testable; only agents we actually wake sleep, so
-            # skipped agents above add no delay.
-            if woke_this_tick:
+            # skipped agents above add no delay. The cumulative stagger is
+            # capped so a large fleet cannot push the tick past the next sweep.
+            if woke_this_tick and staggered_seconds < _MAX_TICK_STAGGER_SECONDS:
                 await asyncio.sleep(_WAKE_STAGGER_SECONDS)
+                staggered_seconds += _WAKE_STAGGER_SECONDS
             woke_this_tick += 1
             # Debounce only a wake that actually reached the agent's queue; a
             # failed enqueue retries next tick instead of silencing the agent

@@ -91,6 +91,19 @@ async def test_http_sender_self_creates_and_closes_client():
 
 
 @pytest.mark.asyncio
+async def test_http_sender_does_not_close_injected_client():
+    # When a client is injected, the caller owns it; aclose() must not close it.
+    injected = httpx.AsyncClient(http2=True)
+    sender = HttpApnsSender(
+        key_pem="pem", key_id="KID", team_id="TID", bundle_id="com.taos.app",
+        client=injected,
+    )
+    await sender.aclose()
+    assert injected.is_closed is False
+    await injected.aclose()
+
+
+@pytest.mark.asyncio
 async def test_null_sender_aclose_is_noop():
     # NullApnsSender exposes a no-op aclose so shutdown can call it uniformly.
     assert await NullApnsSender().aclose() is None
