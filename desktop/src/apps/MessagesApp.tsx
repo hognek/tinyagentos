@@ -2316,7 +2316,7 @@ export function MessagesApp({
                     />
                   ) : (
                     <div className="relative">
-                      {msg.content && msg.state !== "streaming" && msg.state !== "pending" && (
+                      {msg.content && msg.author_type === "agent" && msg.state !== "streaming" && msg.state !== "pending" && (
                         <CopyButton
                           content={msg.content}
                           className="absolute -top-1 right-0 p-1 rounded opacity-0 group-hover:opacity-100 focus:opacity-100 bg-shell-surface border border-white/10 text-shell-text-secondary hover:text-shell-text transition-opacity select-none z-10"
@@ -3123,25 +3123,46 @@ export function MessagesApp({
 
 function CopyButton({ content, className }: { content: string; className?: string }) {
   const [copied, setCopied] = useState(false);
+  const [clipError, setClipError] = useState(false);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const errorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /* Clear any pending timers on unmount so we never setState on a dead component. */
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+      if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+    };
+  }, []);
 
   const handleCopy = async () => {
     if (!content) return;
     try {
       await navigator.clipboard.writeText(content);
       setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      setClipError(false);
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => setCopied(false), 1500);
     } catch {
-      // ignore
+      setClipError(true);
+      if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+      errorTimerRef.current = setTimeout(() => setClipError(false), 2500);
     }
   };
 
   return (
     <button
       onClick={handleCopy}
-      aria-label={copied ? "Copied" : "Copy message"}
+      aria-label={copied ? "Copied" : clipError ? "Copy failed — check clipboard permissions" : "Copy message"}
       className={className}
     >
-      {copied ? <Check size={10} /> : <Copy size={10} />}
+      {copied ? (
+        <Check size={10} />
+      ) : clipError ? (
+        <X size={10} className="text-red-400" />
+      ) : (
+        <Copy size={10} />
+      )}
     </button>
   );
 }
