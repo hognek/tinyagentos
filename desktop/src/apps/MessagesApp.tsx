@@ -22,6 +22,8 @@ import {
   RotateCcw,
   MessagesSquare,
   Search,
+  Copy,
+  Check,
 } from "lucide-react";
 import {
   Button,
@@ -2313,8 +2315,15 @@ export function MessagesApp({
                       onCancel={() => setEditingMessageId(null)}
                     />
                   ) : (
-                    <div className={`${isMobile ? "text-[14px]" : "text-[15px]"} leading-[1.46] whitespace-pre-wrap break-words ${isDeadAgent ? "text-shell-text-secondary" : "text-shell-text"}`}>
-                      {renderContent(msg.content)}
+                    <div className="relative">
+                      {msg.content && msg.author_type === "agent" && msg.state !== "streaming" && msg.state !== "pending" && (
+                        <CopyButton
+                          content={msg.content}
+                          className="absolute -top-1 right-0 p-1 rounded opacity-0 group-hover:opacity-100 focus:opacity-100 bg-shell-surface border border-white/10 text-shell-text-secondary hover:text-shell-text transition-opacity select-none z-10"
+                        />
+                      )}
+                      <div className={`${isMobile ? "text-[14px]" : "text-[15px]"} leading-[1.46] whitespace-pre-wrap break-words select-text ${isDeadAgent ? "text-shell-text-secondary" : "text-shell-text"}`}>
+                        {renderContent(msg.content)}
                       {msg.state === "pending" && (
                         <span className="ml-1 text-shell-text-tertiary">...</span>
                       )}
@@ -2328,6 +2337,7 @@ export function MessagesApp({
                       {msg.state === "error" && (
                         <span className="ml-1 text-red-400 text-[11px]">(error)</span>
                       )}
+                    </div>
                     </div>
                   )}
                   {msg.metadata?.pin_requested && msg.author_type === "agent" && (
@@ -3103,5 +3113,56 @@ export function MessagesApp({
         )
       )}
     </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  CopyButton — hover copy affordance for message bubbles             */
+/*  Matches the CodeBlock + TaosAssistantPanel copy-button pattern.    */
+/* ------------------------------------------------------------------ */
+
+function CopyButton({ content, className }: { content: string; className?: string }) {
+  const [copied, setCopied] = useState(false);
+  const [clipError, setClipError] = useState(false);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const errorTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  /* Clear any pending timers on unmount so we never setState on a dead component. */
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+      if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+    };
+  }, []);
+
+  const handleCopy = async () => {
+    if (!content) return;
+    try {
+      await navigator.clipboard.writeText(content);
+      setCopied(true);
+      setClipError(false);
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setClipError(true);
+      if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
+      errorTimerRef.current = setTimeout(() => setClipError(false), 2500);
+    }
+  };
+
+  return (
+    <button
+      onClick={handleCopy}
+      aria-label={copied ? "Copied" : clipError ? "Copy failed — check clipboard permissions" : "Copy message"}
+      className={className}
+    >
+      {copied ? (
+        <Check size={10} />
+      ) : clipError ? (
+        <X size={10} className="text-red-400" />
+      ) : (
+        <Copy size={10} />
+      )}
+    </button>
   );
 }
