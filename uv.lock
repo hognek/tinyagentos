@@ -3017,12 +3017,13 @@ wheels = [
 
 [[package]]
 name = "tinyagentos"
-version = "1.0.0b34"
+version = "1.0.0b35"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
     { name = "argon2-cffi" },
     { name = "croniter" },
+    { name = "cryptography" },
     { name = "diff-match-patch" },
     { name = "fastapi" },
     { name = "httpx" },
@@ -3073,6 +3074,7 @@ requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20.0" },
     { name = "argon2-cffi", specifier = ">=23.1.0" },
     { name = "croniter", specifier = ">=6.2.3" },
+    { name = "cryptography", specifier = ">=48.0" },
     { name = "diff-match-patch", specifier = ">=20230430" },
     { name = "fastapi", specifier = ">=0.115.0,<0.137" },
     { name = "httpx", specifier = ">=0.27.0" },

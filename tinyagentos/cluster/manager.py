@@ -51,6 +51,10 @@ class ClusterManager:
     async def stop(self):
         if self._monitor_task:
             self._monitor_task.cancel()
+            try:
+                await self._monitor_task
+            except asyncio.CancelledError:
+                pass
 
     async def register_worker(self, info: WorkerInfo) -> None:
         # Snapshot capabilities before adding worker
@@ -314,12 +318,16 @@ class ClusterManager:
         ``_lease_lock`` so two concurrent claims for the same resource
         cannot both succeed.
         """
-        worker = self._worker_for_resource(resource_id)
-        if worker is None:
-            logger.debug("claim_lease: worker not found or offline for %s", resource_id)
-            return None
-
         async with self._lease_lock:
+            # Resolve the worker and re-check its status inside the lock: the
+            # monitor loop marks workers offline and sweeps their leases under
+            # this same lock, so a lookup before the lock could admit a lease
+            # against a worker that went offline while we waited (TOCTOU).
+            worker = self._worker_for_resource(resource_id)
+            if worker is None:
+                logger.debug("claim_lease: worker not found or offline for %s", resource_id)
+                return None
+
             existing = self.find_existing_lease(resource_id)
             if existing is not None:
                 logger.debug(
@@ -339,7 +347,7 @@ class ClusterManager:
                 )
                 return None
 
-            lease_id = f"l_{secrets.token_hex(4)}"
+            lease_id = f"l_{secrets.token_hex(16)}"
             lease = GpuLease(
                 lease_id=lease_id,
                 resource_id=resource_id,

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tinyagentos"
-version = "1.0.0-beta.34"
+version = "1.0.0-beta.35"
 description = "Self-hosted AI agent memory system for low-power hardware"
 license = { file = "LICENSE" }
 # Upper-capped at <3.14 because litellm (the proxy extra, the agent/model proxy
@@ -48,6 +48,10 @@ dependencies = [
     "diff-match-patch>=20230430",
     # Cron expression parsing for project routines (schedule -> next_fire).
     "croniter>=6.2.3",
+    # ES256 signing for APNs JWTs (tinyagentos/push/apns.py), imported at
+    # startup via app.py. Previously only pulled in transitively through
+    # pywebpush; declare it directly so the import is guaranteed.
+    "cryptography>=48.0",
 ]
 
 [project.optional-dependencies]
