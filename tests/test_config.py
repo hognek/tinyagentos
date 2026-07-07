@@ -355,3 +355,27 @@ class TestLitellmPortPin:
         assert config.server["litellm_port"] == 5000
         # File must not be rewritten when no pin was applied.
         assert p.stat().st_mtime == original_mtime
+
+
+def test_load_config_migrates_legacy_rkllama_port(tmp_path):
+    """An install seeded before the taOS default moved to :7833 keeps a stale
+    localhost:8080 rkllama provider; load_config heals it to :7833 (#1697)."""
+    import yaml
+    from tinyagentos.config import load_config
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump({
+        "backends": [
+            {"name": "rkllama", "type": "rkllama", "url": "http://localhost:8080"},
+            {"name": "custom-rk", "type": "rkllama", "url": "http://10.0.0.5:8080"},
+            {"name": "ollama", "type": "ollama", "url": "http://localhost:8080"},
+        ]
+    }))
+    cfg = load_config(cfg_path)
+    by_name = {b["name"]: b["url"] for b in cfg.backends}
+    # auto-seeded localhost rkllama -> healed to 7833
+    assert by_name["rkllama"] == "http://localhost:7833"
+    # deliberate custom host -> untouched
+    assert by_name["custom-rk"] == "http://10.0.0.5:8080"
+    # non-rkllama backend on 8080 -> untouched
+    assert by_name["ollama"] == "http://localhost:8080"

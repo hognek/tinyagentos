@@ -72,6 +72,31 @@ class AppConfig:
             d["archive"] = self.archive
         return d
 
+# rkllama's taOS default port moved from the upstream 8080 to 7833. Installs
+# seeded before that switch kept a stale ``localhost:8080`` provider URL, so the
+# Providers page and live model discovery point at a dead port (#1697). We heal
+# only the auto-seeded localhost default, never a deliberately-set custom host.
+_LEGACY_RKLLAMA_URLS = frozenset(
+    {"http://localhost:8080", "http://127.0.0.1:8080"}
+)
+
+
+def _migrate_legacy_rkllama_port(backends: list[dict]) -> None:
+    """Rewrite a stale ``rkllama`` provider URL from the legacy :8080 to :7833
+    in place (#1697). Idempotent and targeted: only the auto-seeded localhost
+    default is touched."""
+    for b in backends:
+        if b.get("type") != "rkllama":
+            continue
+        url = (b.get("url") or "").rstrip("/")
+        if url in _LEGACY_RKLLAMA_URLS:
+            b["url"] = url.replace(":8080", ":7833")
+            log.info(
+                "migrating rkllama provider %r from legacy :8080 to :7833 (#1697)",
+                b.get("name"),
+            )
+
+
 def load_config(path: Path) -> AppConfig:
     if not path.exists():
         # Fresh install: build defaults with litellm_port explicitly recorded
@@ -109,9 +134,11 @@ def load_config(path: Path) -> AppConfig:
             "new installs use %d, see #795",
             _LITELLM_PORT_LEGACY, _LITELLM_PORT_NEW,
         )
+    backends = data.get("backends", [])
+    _migrate_legacy_rkllama_port(backends)
     cfg = AppConfig(
         server=server,
-        backends=data.get("backends", []),
+        backends=backends,
         qmd=data.get("qmd", DEFAULT_CONFIG["qmd"].copy()),
         agents=agents,
         metrics=data.get("metrics", DEFAULT_CONFIG["metrics"].copy()),
