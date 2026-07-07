@@ -1019,18 +1019,8 @@ export function MessagesApp({
       ? items.filter((ch) => (unread[ch.id] ?? 0) > 0 || ch.id === selectedChannel)
       : items;
 
-  /* ---- typing emitter + slash menu derived state ---- */
+  /* ---- typing emitter ---- */
   const emitTyping = useTypingEmitter(selectedChannel, "user");
-  // In a DM (2 members: user + 1 agent), a leading "/" opens the agent's
-  // slash menu.  In a group channel (3+ members), the user must prefix
-  // with "@agentname /" so we know which agent's commands to show.
-  const isDm = (currentChannel?.members?.length ?? 0) <= 2;
-  const showSlash = isDm ? input.startsWith("/") : /@\S+\s+\//.test(input);
-  // The agent scoped by "@agentname /" (group only; undefined in DM).
-  const slashAgent = !isDm && showSlash ? input.match(/@(\S+)\s+\//)?.[1] || undefined : undefined;
-  const slashQuery = showSlash
-    ? (isDm ? input.slice(1).split(/\s/, 1)[0] : input.slice(input.indexOf("/") + 1).split(/\s/, 1)[0]) || ""
-    : "";
 
   /* ---- mutex: settings vs thread panel ---- */
   const handleOpenSettings = () => {
@@ -1429,6 +1419,18 @@ export function MessagesApp({
   const allChannels = [...channels, ...archivedChannels];
   const currentChannel = allChannels.find((c) => c.id === selectedChannel);
   const isCurrentArchived = currentChannel?.settings?.archived === true;
+
+  /* ---- slash menu derived state ---- */
+  // In a DM (2 members: user + 1 agent), a leading "/" opens the agent's
+  // slash menu.  In a group channel (3+ members), the user must prefix
+  // with "@agentname /" so we know which agent's commands to show.
+  const isDm = (currentChannel?.members?.length ?? 0) === 2;
+  const showSlash = isDm ? input.startsWith("/") : /^@\S+\s+\//.test(input);
+  // The agent scoped by "@agentname /" (group only; undefined in DM).
+  const slashAgent = !isDm && showSlash ? input.match(/^@(\S+)\s+\//)?.[1] || undefined : undefined;
+  const slashQuery = showSlash
+    ? (isDm ? input.slice(1).split(/\s/, 1)[0] : input.slice(input.indexOf("/") + 1).split(/\s/, 1)[0]) || ""
+    : "";
 
   /* ---- @mention autocomplete: candidates = channel members + "all" ---- */
   const mentionCandidates: string[] = (() => {

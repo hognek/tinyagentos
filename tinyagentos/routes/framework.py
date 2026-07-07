@@ -128,8 +128,8 @@ async def agent_slash_commands(request: Request, slug: str):
     """Return the slash commands for a single agent by slug.
 
     Returns {slug: [{name, description}, ...]} so callers can key
-    by slug without transforming the shape.  Unknown agent or
-    framework → empty command list.
+    by slug without transforming the shape.  Unknown agent →
+    404, unknown framework → empty command list.
     """
     config = getattr(request.app.state, "config", None)
     agents = getattr(config, "agents", []) if config else []
