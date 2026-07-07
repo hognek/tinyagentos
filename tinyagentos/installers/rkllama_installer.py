@@ -144,7 +144,7 @@ def rkllama_service_models_dir(
         return result
     try:
         proc = subprocess.run(
-            ["systemctl", "show", "rkllama", "--property=ExecStart", "--value"],
+            ["systemctl", "show", "rkllama.service", "--property=ExecStart", "--value"],
             capture_output=True, text=True, timeout=5,
         )
     except (OSError, subprocess.SubprocessError):
