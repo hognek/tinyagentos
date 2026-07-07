@@ -379,3 +379,31 @@ def test_load_config_migrates_legacy_rkllama_port(tmp_path):
     assert by_name["custom-rk"] == "http://10.0.0.5:8080"
     # non-rkllama backend on 8080 -> untouched
     assert by_name["ollama"] == "http://localhost:8080"
+
+
+def test_load_config_migrates_legacy_rkllama_backend_name(tmp_path):
+    """An install seeded before #1710 names the rkllama backend local-npu,
+    whose service-id (npu) never matches the RKLLM manifests'
+    requires.backends id (rkllama), so installed chat models get no LiteLLM
+    alias. load_config renames it to local-rkllama so the service-id matches."""
+    import yaml
+    from tinyagentos.config import load_config
+
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text(yaml.safe_dump({
+        "backends": [
+            {"name": "local-npu", "type": "rkllama", "url": "http://localhost:7833"},
+            {"name": "custom-rk", "type": "rkllama", "url": "http://10.0.0.5:8080"},
+            {"name": "local-npu", "type": "ollama", "url": "http://localhost:11434"},
+        ]
+    }))
+    cfg = load_config(cfg_path)
+    rkllama_names = [b["name"] for b in cfg.backends if b["type"] == "rkllama"]
+    # The auto-seeded rkllama local-npu is renamed to local-rkllama.
+    assert "local-rkllama" in rkllama_names
+    assert "local-npu" not in rkllama_names
+    # A deliberately custom rkllama name is untouched.
+    assert "custom-rk" in rkllama_names
+    # A non-rkllama backend that happens to be named local-npu is untouched.
+    ollama = [b for b in cfg.backends if b["type"] == "ollama"][0]
+    assert ollama["name"] == "local-npu"

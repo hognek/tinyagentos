@@ -97,6 +97,29 @@ def _migrate_legacy_rkllama_port(backends: list[dict]) -> None:
             )
 
 
+def _migrate_legacy_rkllama_backend_name(backends: list[dict]) -> None:
+    """Rename the auto-seeded rkllama backend ``local-npu`` to ``local-rkllama``
+    in place (#1710).
+
+    LiteLLM registers an installed local chat model only when a backend named
+    ``local-<service-id>`` exists whose service-id matches the
+    ``requires.backends[].id`` the model's manifest declares. Every RKLLM model
+    manifest declares ``id: rkllama``, but the shipped seed named the backend
+    ``local-npu`` (service-id ``npu``), which never matches. The result is that
+    an installed RKLLM chat model gets no LiteLLM alias and an agent selecting
+    it receives no output. Renaming to ``local-rkllama`` makes the service-id
+    ``rkllama`` and restores the match. Idempotent and targeted: only the
+    legacy-named rkllama default is touched, and it collapses the boot-time
+    dedup collision with auto_register's own ``local-rkllama``."""
+    for b in backends:
+        if b.get("type") == "rkllama" and b.get("name") == "local-npu":
+            b["name"] = "local-rkllama"
+            log.info(
+                "migrating rkllama backend name local-npu to local-rkllama so "
+                "installed RKLLM models resolve in LiteLLM (#1710)",
+            )
+
+
 def load_config(path: Path) -> AppConfig:
     if not path.exists():
         # Fresh install: build defaults with litellm_port explicitly recorded
@@ -136,6 +159,7 @@ def load_config(path: Path) -> AppConfig:
         )
     backends = data.get("backends", [])
     _migrate_legacy_rkllama_port(backends)
+    _migrate_legacy_rkllama_backend_name(backends)
     cfg = AppConfig(
         server=server,
         backends=backends,
