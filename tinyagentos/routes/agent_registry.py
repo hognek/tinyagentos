@@ -750,8 +750,18 @@ async def update_org_fields(
         return JSONResponse({"error": "not found"}, status_code=404)
     require_owner_or_admin(user, record["user_id"])
 
+    if body.role is None and body.title is None and body.reports_to is None:
+        # An all-None body is a no-op write; reject it rather than returning a
+        # misleading 200 that reports success while changing nothing.
+        return JSONResponse({"error": "no fields to update"}, status_code=400)
+
     if body.role is not None or body.title is not None:
-        await store.set_role_title(canonical_id, role=body.role, title=body.title)
+        # Normalize whitespace-only values to "" so set_role_title clears the
+        # field (NULL), matching the reports_to ""-clears convention below;
+        # a None field is left untouched.
+        role = body.role.strip() if body.role is not None else None
+        title = body.title.strip() if body.title is not None else None
+        await store.set_role_title(canonical_id, role=role, title=title)
 
     if body.reports_to is not None:
         manager_id = body.reports_to or None  # "" clears the manager

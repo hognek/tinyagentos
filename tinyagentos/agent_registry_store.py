@@ -11,6 +11,7 @@ The public key is exposed via GET /api/agents/registry/pubkey so the A2A bus
 (taOSmd) can verify tokens independently without needing the private key.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -326,6 +327,16 @@ class AgentRegistryStore(BaseStore):
     """
 
     SCHEMA = SCHEMA
+
+    def __init__(self, db_path: Path):
+        super().__init__(db_path)
+        # Serializes set_reporting's cycle-check-then-write so two concurrent
+        # org edits (A->B and B->A) can't both pass the cycle guard and then
+        # both write a persisted cycle. The shared aiosqlite connection yields
+        # on every await inside the check, so the read chain and the write must
+        # be held together. Created at construction (not in init()) so it always
+        # exists before any caller, independent of init ordering.
+        self._reporting_lock = asyncio.Lock()
 
     async def init(self) -> None:
         await super().init()
@@ -650,10 +661,34 @@ class AgentRegistryStore(BaseStore):
     ) -> Optional[dict]:
         """Set *role* and/or *title* on *canonical_id* (free-form strings).
 
-        Only the provided (non-None) fields are changed.  Returns the updated
-        record, or None if *canonical_id* does not exist.
+        Only the provided (non-None) fields are changed. A provided empty
+        string clears the field (stores NULL), matching the ""-clears
+        convention used for reports_to. Returns the updated record, or None if
+        *canonical_id* does not exist.
         """
-        return await self.update(canonical_id, role=role, title=title)
+        if self._db is None:
+            raise RuntimeError("AgentRegistryStore not initialised")
+        record = await self.get(canonical_id)
+        if record is None:
+            return None
+
+        cols: list[str] = []
+        vals: list = []
+        if role is not None:
+            cols.append("role = ?")
+            vals.append(role or None)
+        if title is not None:
+            cols.append("title = ?")
+            vals.append(title or None)
+        if not cols:
+            return record
+        vals.append(canonical_id)
+        await self._db.execute(
+            f"UPDATE agent_registry SET {', '.join(cols)} WHERE canonical_id = ?",
+            vals,
+        )
+        await self._db.commit()
+        return await self.get(canonical_id)
 
     async def set_reporting(
         self, canonical_id: str, reports_to: Optional[str]
@@ -673,43 +708,49 @@ class AgentRegistryStore(BaseStore):
         """
         if self._db is None:
             raise RuntimeError("AgentRegistryStore not initialised")
-        record = await self.get(canonical_id)
-        if record is None:
-            raise KeyError(canonical_id)
 
-        if reports_to is not None:
-            if reports_to == canonical_id:
-                raise ValueError("an agent cannot report to itself")
-            manager = await self.get(reports_to)
-            if manager is None:
-                raise ValueError(f"reports_to manager not found: {reports_to!r}")
+        # Hold the lock across the whole cycle-check-then-write. Every await in
+        # the check yields the shared aiosqlite connection, so without this two
+        # concurrent edits (A->B and B->A) could both pass the guard and then
+        # both write, persisting a cycle.
+        async with self._reporting_lock:
+            record = await self.get(canonical_id)
+            if record is None:
+                raise KeyError(canonical_id)
 
-            # Cycle guard: walk the candidate manager's existing reports_to
-            # chain; if it ever reaches canonical_id, this edge would close a
-            # loop. `seen` guards against looping forever on an already-
-            # corrupt chain independent of the depth cap.
-            seen: set[str] = set()
-            current: Optional[str] = reports_to
-            depth = 0
-            while current is not None and depth < self._MAX_REPORTS_TO_WALK:
-                if current == canonical_id:
-                    raise ValueError(
-                        f"assigning reports_to={reports_to!r} would create "
-                        f"a reporting cycle"
-                    )
-                if current in seen:
-                    break
-                seen.add(current)
-                current_record = await self.get(current)
-                current = current_record.get("reports_to") if current_record else None
-                depth += 1
+            if reports_to is not None:
+                if reports_to == canonical_id:
+                    raise ValueError("an agent cannot report to itself")
+                manager = await self.get(reports_to)
+                if manager is None:
+                    raise ValueError(f"reports_to manager not found: {reports_to!r}")
 
-        await self._db.execute(
-            "UPDATE agent_registry SET reports_to = ? WHERE canonical_id = ?",
-            (reports_to, canonical_id),
-        )
-        await self._db.commit()
-        return await self.get(canonical_id)  # type: ignore[return-value]
+                # Cycle guard: walk the candidate manager's existing reports_to
+                # chain; if it ever reaches canonical_id, this edge would close a
+                # loop. `seen` guards against looping forever on an already-
+                # corrupt chain independent of the depth cap.
+                seen: set[str] = set()
+                current: Optional[str] = reports_to
+                depth = 0
+                while current is not None and depth < self._MAX_REPORTS_TO_WALK:
+                    if current == canonical_id:
+                        raise ValueError(
+                            f"assigning reports_to={reports_to!r} would create "
+                            f"a reporting cycle"
+                        )
+                    if current in seen:
+                        break
+                    seen.add(current)
+                    current_record = await self.get(current)
+                    current = current_record.get("reports_to") if current_record else None
+                    depth += 1
+
+            await self._db.execute(
+                "UPDATE agent_registry SET reports_to = ? WHERE canonical_id = ?",
+                (reports_to, canonical_id),
+            )
+            await self._db.commit()
+            return await self.get(canonical_id)  # type: ignore[return-value]
 
     async def direct_reports(self, canonical_id: str) -> list[dict]:
         """Return the agents whose reports_to is *canonical_id*, oldest first."""
