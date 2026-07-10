@@ -11,6 +11,8 @@ staging testing. (A blank override still yields a 503 'service unavailable'.)
 """
 from __future__ import annotations
 
+import json
+import logging
 import os
 import re
 
@@ -18,7 +20,16 @@ import httpx
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
+from tinyagentos.taosnet import mesh_credentials
+
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
+
+# Per-host service tokens the join ready payload carries. They are persisted
+# server-side and stripped from the browser-facing poll body so a bearer
+# credential never sits in browser JavaScript.
+_JOIN_SERVICE_TOKENS = ("controller_token", "sites_token")
 
 # Only these account actions are proxied. The upstream base is operator config
 # (env), never user input, so there is no open-proxy / SSRF surface.
@@ -204,8 +215,48 @@ async def cluster_join_deny(request: Request, rid: str):
     return await _forward_to(request, "POST", f"{_JOIN_BASE}/requests/{rid}/deny")
 
 
+def _persist_join_credentials(resp: Response) -> Response:
+    """When a poll response carries the per-host service tokens, persist them
+    server-side (host-bound) and return a copy with those tokens ALWAYS stripped,
+    so a bearer credential never reaches browser JavaScript.
+
+    Security ordering: stripping is decoupled from persistence. Once a 200 JSON
+    body is seen to contain a service token it is always stripped, whether or not
+    the save succeeds (a save failure is logged; the credentials are re-delivered
+    on the next poll -- but they are never leaked to the browser to compensate).
+    A non-200 body, or one that does not parse to a dict carrying a service token,
+    is returned untouched. Parsing does not depend on the Content-Type header (a
+    JSON body served without one must not bypass stripping). Relayed headers
+    (Set-Cookie etc.) are preserved.
+    """
+    if resp.status_code != 200:
+        return resp
+    try:
+        body = json.loads(resp.body)
+    except (ValueError, TypeError):
+        return resp
+    if not isinstance(body, dict) or not any(body.get(k) for k in _JOIN_SERVICE_TOKENS):
+        return resp
+    # Persist best-effort; never let a save error keep the token in the body.
+    try:
+        mesh_credentials.save_mesh_credentials(body)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cluster-join: could not persist mesh credentials: %s", exc)
+    stripped = {k: v for k, v in body.items() if k not in _JOIN_SERVICE_TOKENS}
+    out = Response(
+        content=json.dumps(stripped).encode("utf-8"),
+        status_code=200,
+        media_type="application/json",
+    )
+    for raw in resp.raw_headers:
+        if raw[0].decode("latin-1").lower() in ("set-cookie", "location", "cache-control"):
+            out.raw_headers.append(raw)
+    return out
+
+
 @router.get("/api/account/cluster/join/requests/{rid}/poll")
 async def cluster_join_poll(request: Request, rid: str):
     if not _valid_rid(rid):
         return JSONResponse({"error": "invalid request id"}, status_code=400)
-    return await _forward_to(request, "GET", f"{_JOIN_BASE}/requests/{rid}/poll")
+    resp = await _forward_to(request, "GET", f"{_JOIN_BASE}/requests/{rid}/poll")
+    return _persist_join_credentials(resp)
