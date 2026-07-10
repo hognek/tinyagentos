@@ -298,6 +298,19 @@ async def _do_approve(request: Request, request_id: str, body: ApproveBody, user
             ),
         )
 
+    # project_tasks binds the token to a specific project and adds a membership
+    # row, so require the human to pick that project explicitly in the consent
+    # card. Never fall back to the agent-supplied project_id for a task grant:
+    # POST /api/agents/auth-requests is unauthenticated, so the request could
+    # name any existing project the operator never validated. Other scopes keep
+    # the fallback so global tokens still work. Checked before any registration
+    # so a rejected approval never leaves an orphaned agent.
+    if "project_tasks" in body.granted_scopes and body.project_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="project_id is required when granting project_tasks",
+        )
+
     registry = _get_registry_store(request)
     private_pem, _public_pem = _get_keypair(request)
     grants_store = _get_grants_store(request)
@@ -347,6 +360,37 @@ async def _do_approve(request: Request, request_id: str, body: ApproveBody, user
         # Also write a RelationshipManager permission edge so the existing
         # permission-check path (can_communicate etc.) is aware of the agent.
         await rel_mgr.set_permission(canonical_id, "taos-instance", scope)
+
+    # If the agent was granted project_tasks and bound to a project, add it as a
+    # member of that project so it shows up in the project's Members and joins the
+    # project a2a channel (membership is synced into the channel). Best-effort: a
+    # membership failure never blocks the approval, which the token + grant already
+    # authorize.
+    if effective_project and "project_tasks" in body.granted_scopes:
+        try:
+            pstore = getattr(request.app.state, "project_store", None)
+            if pstore is not None:
+                await pstore.add_member(
+                    project_id=effective_project,
+                    member_id=canonical_id,
+                    member_kind="native",
+                    role="member",
+                )
+                from tinyagentos.projects.a2a import ensure_a2a_channel
+
+                await ensure_a2a_channel(
+                    request.app.state.chat_channels,
+                    pstore,
+                    effective_project,
+                    config=getattr(request.app.state, "config", None),
+                )
+        except Exception:  # noqa: BLE001 - membership is best-effort, never blocks approval
+            logger.warning(
+                "auth-approve: could not sync %s membership/a2a channel for project %s",
+                canonical_id,
+                effective_project,
+                exc_info=True,
+            )
 
     # Atomically commit the decision.
     result = await auth_store.set_decision(
