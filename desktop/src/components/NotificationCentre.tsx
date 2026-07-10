@@ -76,6 +76,7 @@ function NotificationItem({
           <ConsentActions
             requestId={consent.requestId}
             scopes={consent.scopes}
+            requestedProjectId={consent.projectId}
             onResolved={() => onResolveConsent(n.id)}
           />
         </div>
