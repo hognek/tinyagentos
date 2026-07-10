@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ipaddress
+import re
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -23,10 +24,45 @@ _A2A_BUS_READ_PATHS = frozenset({
     "/api/a2a/bus/channels",
     "/api/a2a/bus/messages",
 })
+# Authenticated A2A bus WRITE path: an agent may POST here with its own registry
+# JWT (scope a2a_send, verified by the route, which forces the bus `from` to the
+# agent's own handle so it posts as itself instead of the owner's account).
+_A2A_BUS_WRITE_PATHS = frozenset({
+    "/api/a2a/bus/send",
+})
 # Every path that accepts a registry JWT in place of the admin session.  The
 # passthrough is allowlisted to exactly these paths -- a registry JWT must never
 # authenticate an arbitrary route (no skeleton key).
-_AGENT_TOKEN_PATHS = _REGISTRY_FEED_PATHS | _A2A_BUS_READ_PATHS
+_AGENT_TOKEN_PATHS = _REGISTRY_FEED_PATHS | _A2A_BUS_READ_PATHS | _A2A_BUS_WRITE_PATHS
+
+# Project kanban routes an agent may reach with its own registry JWT (scope
+# project_tasks, verified + project-bound by the route).  These are DYNAMIC
+# paths (/api/projects/{pid}/tasks...), so an exact frozenset can't match them;
+# a (method, compiled-regex) allowlist is used instead.  Each pattern is fully
+# anchored and uses a slash-free segment ([^/]+) with an exact segment count, so
+# sibling routes that must stay session-only -- POST .../tasks (create),
+# /members, /relationships, /audit, /activity, project lifecycle -- never match.
+# This is the project-scoped analogue of the exact _AGENT_TOKEN_PATHS contract:
+# the token only reaches the handler, which then verifies the JWT + grant +
+# project binding.  Anything not listed here is NOT reachable by a registry JWT.
+_SEG = r"[^/]+"
+_AGENT_TASK_ROUTES = (
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks/ready$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}$")),
+    ("GET", re.compile(rf"^/api/projects/tasks/{_SEG}/context$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/comments$")),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/comments$")),
+    # PATCH (free task-field mutation) is intentionally NOT here: it is broader
+    # than the "read + lifecycle + comments" the project_tasks scope documents.
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/(claim|release|close|reopen)$")),
+)
+
+
+def _is_agent_task_path(method: str, path: str) -> bool:
+    """True only for the exact subset of task routes a project_tasks token may
+    reach.  Strict method + anchored-regex match; everything else is excluded."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_TASK_ROUTES)
 # Bundle assets and the SPA shell HTML must be reachable without auth so:
 #   1. The browser can install and cache the shell for offline / PWA use.
 #   2. After a backend restart the cached shell loads immediately without
@@ -206,15 +242,20 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     request.state.via = "local_token"
                 return await call_next(request)
 
-        # Agent-token endpoints (registry feeds + read-only A2A bus proxy) accept
-        # a registry JWT as an alternative to the admin session.  This branch
-        # sits AFTER the local-token check on purpose: a local token is
+        # Agent-token endpoints (registry feeds + A2A bus proxy + project kanban)
+        # accept a registry JWT as an alternative to the admin session.  This
+        # branch sits AFTER the local-token check on purpose: a local token is
         # admin-equivalent and must keep its admin semantics on these paths
         # (taOSmd polls the feeds with it today).  Only a Bearer that is NOT the
         # local token falls through to here; it is PASSED THROUGH and the route
-        # verifies the registry JWT + scope grant.  The allowlist is exact so a
-        # registry JWT can never authenticate any other route (no skeleton key).
-        if path in _AGENT_TOKEN_PATHS and auth_header.lower().startswith("bearer "):
+        # verifies the registry JWT + scope grant (+ project binding for task
+        # routes).  The allowlist -- the exact _AGENT_TOKEN_PATHS plus the
+        # anchored task-route matcher -- is closed so a registry JWT can never
+        # authenticate any other route (no skeleton key).
+        if (
+            path in _AGENT_TOKEN_PATHS
+            or _is_agent_task_path(request.method, path)
+        ) and auth_header.lower().startswith("bearer "):
             request.state.user_id = None
             request.state.is_admin = False
             request.state.via = "registry_jwt_candidate"
