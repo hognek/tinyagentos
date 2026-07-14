@@ -97,7 +97,7 @@ describe("ConsentActions", () => {
       <ConsentActions requestId="req-p" scopes={["project_tasks", "a2a_send"]} onResolved={onResolved} />,
     );
     // The picker appears and the single project is auto-selected.
-    await screen.findByLabelText(/Grant project_tasks for project/i);
+    await screen.findByLabelText(/Grant project access for/i);
 
     fireEvent.click(screen.getByRole("button", { name: /allow/i }));
     await waitFor(() => expect(onResolved).toHaveBeenCalledTimes(1));
@@ -125,7 +125,7 @@ describe("ConsentActions", () => {
     vi.stubGlobal("fetch", fetchMock);
     render(<ConsentActions requestId="req-m" scopes={["project_tasks"]} />);
 
-    const select = await screen.findByLabelText(/Grant project_tasks for project/i);
+    const select = await screen.findByLabelText(/Grant project access for/i);
     expect(screen.getByRole("button", { name: /allow/i })).toBeDisabled();
 
     fireEvent.change(select, { target: { value: "p2" } });
@@ -151,7 +151,7 @@ describe("ConsentActions", () => {
     const onResolved = vi.fn();
     render(<ConsentActions requestId="req-c" scopes={["project_tasks"]} onResolved={onResolved} />);
 
-    await screen.findByLabelText(/Grant project_tasks for project/i);
+    await screen.findByLabelText(/Grant project access for/i);
     expect(screen.getByRole("button", { name: /allow/i })).toBeDisabled();
 
     fireEvent.click(screen.getByRole("button", { name: /new/i }));
