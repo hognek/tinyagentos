@@ -428,6 +428,61 @@ class TestCanvasScopeApproval:
         await grants.close()
 
     @pytest.mark.asyncio
+    async def test_approve_canvas_scopes_with_blank_project_is_rejected(
+        self, client, monkeypatch, tmp_path
+    ):
+        # A blank or whitespace project_id is not a real binding: it must fail
+        # closed exactly like a missing one, or a downstream truthy check would
+        # treat the token as unbound and allow cross-project canvas access.
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.agent_grants_store import AgentGrantsStore
+
+        for blank in ("", "   "):
+            registry = AgentRegistryStore(tmp_path / f"reg-canvas-blank-{len(blank)}.db")
+            await registry.init()
+            auth_store = AuthRequestsStore(tmp_path / f"auth-canvas-blank-{len(blank)}.db")
+            await auth_store.init()
+            grants = AgentGrantsStore(tmp_path / f"grants-canvas-blank-{len(blank)}.db")
+            await grants.init()
+            priv, pub = load_or_create_signing_keypair(
+                tmp_path / f"keys-canvas-blank-{len(blank)}"
+            )
+
+            record = await auth_store.create(
+                identity_claim="canvas-bot",
+                framework="canvas-cli",
+                requested_scopes=["canvas_write"],
+                requested_skills=None,
+                reason="",
+                duration_secs=None,
+                project_id="prj-canvas-1",
+            )
+
+            monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+            monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+            monkeypatch.setattr(client._transport.app.state, "agent_grants", grants)
+            monkeypatch.setattr(
+                client._transport.app.state, "agent_registry_keypair", (priv, pub)
+            )
+
+            resp = await client.post(
+                f"/api/agents/auth-requests/{record['id']}/approve",
+                json={"granted_scopes": ["canvas_write"], "project_id": blank},
+            )
+            assert resp.status_code == 400, (blank, resp.text)
+            assert "project_id" in resp.text
+            # The blank-project approval must not register an agent.
+            assert await registry.list_all() == []
+
+            await registry.close()
+            await auth_store.close()
+            await grants.close()
+
+    @pytest.mark.asyncio
     async def test_approve_cannot_widen_canvas_scopes(
         self, client, monkeypatch, tmp_path
     ):

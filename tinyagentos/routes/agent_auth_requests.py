@@ -316,7 +316,10 @@ async def _do_approve(request: Request, request_id: str, body: ApproveBody, user
     # tokens still work. Checked before any registration so a rejected approval
     # never leaves an orphaned agent.
     needs_project = bool(set(body.granted_scopes) & _PROJECT_SCOPES)
-    if needs_project and body.project_id is None:
+    # Reject None, "", and whitespace-only: a blank project_id is not a real
+    # binding, and a downstream truthy check would treat it as unbound, so an
+    # empty string must fail closed exactly like a missing one.
+    if needs_project and not (body.project_id and body.project_id.strip()):
         missing = sorted(set(body.granted_scopes) & _PROJECT_SCOPES)
         raise HTTPException(
             status_code=400,
