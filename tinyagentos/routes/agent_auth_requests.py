@@ -28,6 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from aiosqlite import IntegrityError
 from tinyagentos.agent_registry_store import _slugify, mint_registry_token
 from tinyagentos.auth_context import CurrentUser, current_user
 
@@ -348,21 +349,50 @@ async def _do_approve(request: Request, request_id: str, body: ApproveBody, user
             ),
         )
 
-    reg_record = await registry.register(
-        framework=record["framework"],
-        display_name=display_name,
-        user_id=user.user_id,
-        origin="external-selfjoin",
-        handle="",
-    )
-    canonical_id = reg_record["canonical_id"]
+    # Register with the handle SET at birth. external-selfjoin agents are born
+    # 'pending' (governance lifecycle), so the partial unique index
+    # ux_agent_active_handle (active + non-empty handle) does not fire at INSERT
+    # time; it fires only when we flip the row to 'active' below.  That removes
+    # the old window (register handle='' -> set active -> update handle) in which
+    # an agent could sit ACTIVE with an empty handle, and lets SQLite reject a
+    # duplicate active handle the instant a concurrent approve tries to take it.
+    canonical_id = None
+    try:
+        reg_record = await registry.register(
+            framework=record["framework"],
+            display_name=display_name,
+            user_id=user.user_id,
+            origin="external-selfjoin",
+            handle=handle,
+        )
+        canonical_id = reg_record["canonical_id"]
 
-    # Consent approval IS the activation. external-selfjoin agents are born
-    # 'pending' (governance lifecycle); approving the auth-request transitions
-    # them to 'active' so they are NOT in the bus inactive/revocation feed and
-    # @taOSmd's identity-AND-grant gate accepts them.
-    await registry.set_status(canonical_id, "active", actor=user.user_id)
-    await registry.update(canonical_id, handle=handle)
+        # Consent approval IS the activation. external-selfjoin agents are born
+        # 'pending' (governance lifecycle); approving the auth-request transitions
+        # them to 'active' so they are NOT in the bus inactive/revocation feed and
+        # @taOSmd's identity-AND-grant gate accepts them.
+        await registry.set_status(canonical_id, "active", actor=user.user_id)
+    except IntegrityError:
+        # A concurrent approve already took this active handle (the partial
+        # unique index fired). Roll back the failed write and remove the
+        # half-registered pending row so we never leave an active-without-handle
+        # agent or a stale pending row. Return the same friendly 409.
+        try:
+            await registry.rollback()
+        except Exception:  # noqa: BLE001 - never mask the 409 below
+            pass
+        if canonical_id is not None:
+            try:
+                await registry.delete(canonical_id)
+            except Exception:  # noqa: BLE001 - never mask the 409 below
+                pass
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"handle '{handle}' is already in use by active agent; "
+                f"pick a different identity_claim"
+            ),
+        )
 
     # Resolve effective project binding: admin override wins; fall back to the
     # project_id the agent requested (may be None for a global token).

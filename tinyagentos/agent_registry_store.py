@@ -47,6 +47,16 @@ CREATE TABLE IF NOT EXISTS agent_registry (
     revoked_at      TEXT,
     status          TEXT    NOT NULL DEFAULT 'active'
 );
+
+-- Partial unique index: at most ONE active agent may own any given non-empty
+-- handle. SQLite enforces this atomically, so two concurrent consent approvals
+-- of the same identity_claim cannot both flip to 'active' with the same handle.
+-- Pending / suspended / revoked rows and empty handles are excluded from the
+-- index, so (a) a handle can be reused once its owner leaves 'active', and (b)
+-- pre-existing empty-handle active agents never block the index's creation.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_agent_active_handle
+    ON agent_registry(handle)
+    WHERE status = 'active' AND handle != '';
 """
 
 # ---------------------------------------------------------------------------
@@ -424,6 +434,26 @@ class AgentRegistryStore(BaseStore):
     # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------
+
+    async def rollback(self) -> None:
+        """Roll back the current transaction, clearing any failed write so the
+        connection can accept new statements.  No-op if the store is closed or
+        no transaction is open.
+        """
+        if self._db is not None:
+            await self._db.rollback()
+
+    async def delete(self, canonical_id: str) -> None:
+        """Permanently remove *canonical_id* (used to clean up a half-registered
+        row when a concurrent approve wins the active-handle race).  Returns
+        silently if *canonical_id* does not exist.
+        """
+        if self._db is None:
+            raise RuntimeError("AgentRegistryStore not initialised")
+        await self._db.execute(
+            "DELETE FROM agent_registry WHERE canonical_id = ?", (canonical_id,)
+        )
+        await self._db.commit()
 
     async def get(self, canonical_id: str) -> Optional[dict]:
         """Return the record for *canonical_id*, or ``None``."""

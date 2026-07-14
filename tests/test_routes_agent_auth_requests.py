@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 
 
@@ -716,6 +717,161 @@ class TestHandleCollisionSuspendedAllowsReuse:
         new_active = [a for a in new_agents if a["status"] == "active"]
         assert len(new_active) == 1
         assert new_active[0]["handle"] == "taosmd-dev"
+
+        await registry.close()
+        await auth_store.close()
+        await grants.close()
+
+
+class TestPartialUniqueHandleIndex:
+    """The DB (not just the application pre-check) must reject a duplicate
+    active handle, so two concurrent approvals of the same identity_claim
+    cannot both become active with identical handles (a2a 'from' spoofing)."""
+
+    @pytest.mark.asyncio
+    async def test_index_blocks_two_active_with_same_handle(self, tmp_path):
+        from tinyagentos.agent_registry_store import AgentRegistryStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-idx.db")
+        await registry.init()
+
+        # Both born pending with the same handle (allowed: index only covers
+        # active + non-empty handle).
+        a = await registry.register(
+            framework="openclaw", display_name="a", origin="external-selfjoin",
+            handle="dup-handle",
+        )
+        b = await registry.register(
+            framework="openclaw", display_name="b", origin="external-selfjoin",
+            handle="dup-handle",
+        )
+        await registry.set_status(a["canonical_id"], "active")
+
+        # The second activation must be rejected by the partial unique index.
+        with pytest.raises(Exception) as exc:
+            await registry.set_status(b["canonical_id"], "active")
+        assert "ux_agent_active_handle" in str(exc.value) or "UNIQUE" in str(exc.value)
+
+        # And the loser must never be left active with the handle.
+        b_row = await registry.get(b["canonical_id"])
+        assert b_row["status"] == "pending"
+        await registry.close()
+
+
+class TestConcurrentApproveSameIdentity:
+    """Two approvals racing on the SAME identity_claim: exactly one active
+    agent with the handle set, the other returns 409 and leaves no extra
+    active (or pending) agent behind."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_approve_one_active_other_409(
+        self, client, monkeypatch, tmp_path
+    ):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.agent_grants_store import AgentGrantsStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-race.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-race.db")
+        await auth_store.init()
+        grants = AgentGrantsStore(tmp_path / "grants-race.db")
+        await grants.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-race")
+
+        # Two independent auth requests for the SAME identity_claim. The
+        # per-request lock does NOT protect this case (different request ids),
+        # so this exercises the unique-index race directly.
+        r1 = await auth_store.create(
+            identity_claim="@taOSmd-dev", framework="openclaw",
+            requested_scopes=["memory_read"], requested_skills=None, reason="",
+            duration_secs=None, project_id=None,
+        )
+        r2 = await auth_store.create(
+            identity_claim="@taOSmd-dev", framework="openclaw",
+            requested_scopes=["memory_read"], requested_skills=None, reason="",
+            duration_secs=None, project_id=None,
+        )
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "agent_grants", grants)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        async def _approve(rid):
+            return await client.post(
+                f"/api/agents/auth-requests/{rid}/approve",
+                json={"granted_scopes": ["memory_read"]},
+            )
+
+        # Drive both approvals concurrently so neither pre-check sees an active
+        # handle yet; the unique index decides the winner.
+        resps = await asyncio.gather(_approve(r1["id"]), _approve(r2["id"]))
+
+        statuses = sorted(r.status_code for r in resps)
+        assert statuses == [200, 409], [r.status_code for r in resps]
+
+        active = await registry.list_all(status="active")
+        assert len(active) == 1, active
+        # The winner's handle is set and non-empty.
+        assert active[0]["handle"] == "taosmd-dev"
+        assert active[0]["handle"]
+
+        # The loser is not left behind as an active or pending agent.
+        assert len(await registry.list_all()) == 1
+
+        await registry.close()
+        await auth_store.close()
+        await grants.close()
+
+    @pytest.mark.asyncio
+    async def test_approved_active_handle_is_nonempty(
+        self, client, monkeypatch, tmp_path
+    ):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.agent_grants_store import AgentGrantsStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-nonempty.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-nonempty.db")
+        await auth_store.init()
+        grants = AgentGrantsStore(tmp_path / "grants-nonempty.db")
+        await grants.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-nonempty")
+
+        record = await auth_store.create(
+            identity_claim="grok-bot", framework="grok",
+            requested_scopes=["memory_read"], requested_skills=None, reason="",
+            duration_secs=None, project_id=None,
+        )
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "agent_grants", grants)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            f"/api/agents/auth-requests/{record['id']}/approve",
+            json={"granted_scopes": ["memory_read"]},
+        )
+        assert resp.status_code == 200, resp.text
+
+        active = await registry.list_all(status="active")
+        assert len(active) == 1
+        # Never left active with an empty handle (the orphan-window bug).
+        assert active[0]["handle"]
+        assert active[0]["handle"] == "grok-bot"
 
         await registry.close()
         await auth_store.close()
