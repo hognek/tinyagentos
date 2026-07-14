@@ -9,6 +9,7 @@ from starlette.responses import RedirectResponse
 
 from tinyagentos.auth_middleware import (
     AuthMiddleware,
+    _is_agent_canvas_path,
     _is_exempt,
     _is_loopback_client,
 )
@@ -259,6 +260,113 @@ class TestAuthMiddlewareDispatch:
             path="/api/system/prepare-shutdown",
             client_host="203.0.113.5",
             headers={"accept": "application/json"},
+            auth_mgr=_default_auth_mgr(),
+        )
+        call_next = AsyncMock()
+
+        resp = await middleware.dispatch(req, call_next)
+
+        assert resp.status_code == 401
+        call_next.assert_not_awaited()
+
+
+class TestIsAgentCanvasPath:
+    def test_list_elements_get_allowed(self):
+        assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/elements") is True
+
+    def test_create_element_post_allowed(self):
+        assert _is_agent_canvas_path("POST", "/api/projects/proj-1/canvas/elements") is True
+
+    def test_delete_element_allowed(self):
+        assert _is_agent_canvas_path("DELETE", "/api/projects/proj-1/canvas/elements/el-1") is True
+
+    def test_snapshot_png_allowed(self):
+        assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/snapshot.png") is True
+
+    def test_snapshot_tldr_allowed(self):
+        assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/snapshot.tldr") is True
+
+    def test_stream_allowed(self):
+        assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/stream") is True
+
+    def test_update_element_patch_not_allowed(self):
+        assert _is_agent_canvas_path("PATCH", "/api/projects/proj-1/canvas/elements/el-1") is False
+
+    def test_permissions_patch_not_allowed(self):
+        assert _is_agent_canvas_path("PATCH", "/api/projects/proj-1/canvas/permissions/agent-1") is False
+
+    def test_extra_path_segment_not_allowed(self):
+        assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/elements/el-1/extra") is False
+
+    def test_wrong_method_not_allowed(self):
+        assert _is_agent_canvas_path("POST", "/api/projects/proj-1/canvas/elements/el-1") is False
+
+    def test_nested_element_path_not_allowed(self):
+        assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/elements/x/y") is False
+
+
+class TestCanvasAgentTokenDispatch:
+    @pytest.mark.asyncio
+    async def test_canvas_list_elements_bearer_passes(self):
+        middleware = AuthMiddleware(app=MagicMock())
+        auth_mgr = _default_auth_mgr()
+        auth_mgr.validate_local_token.return_value = False
+        req = _request(
+            method="GET",
+            path="/api/projects/proj-1/canvas/elements",
+            headers={"authorization": "Bearer registry-jwt"},
+            auth_mgr=auth_mgr,
+        )
+        call_next = AsyncMock(return_value=JSONResponse({"elements": []}))
+
+        resp = await middleware.dispatch(req, call_next)
+
+        assert resp.status_code == 200
+        assert req.state.via == "registry_jwt_candidate"
+        call_next.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_canvas_delete_element_bearer_passes(self):
+        middleware = AuthMiddleware(app=MagicMock())
+        auth_mgr = _default_auth_mgr()
+        auth_mgr.validate_local_token.return_value = False
+        req = _request(
+            method="DELETE",
+            path="/api/projects/proj-1/canvas/elements/el-1",
+            headers={"authorization": "Bearer registry-jwt"},
+            auth_mgr=auth_mgr,
+        )
+        call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
+
+        resp = await middleware.dispatch(req, call_next)
+
+        assert resp.status_code == 200
+        assert req.state.via == "registry_jwt_candidate"
+        call_next.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_canvas_permissions_patch_requires_session(self):
+        middleware = AuthMiddleware(app=MagicMock())
+        req = _request(
+            method="PATCH",
+            path="/api/projects/proj-1/canvas/permissions/agent-1",
+            headers={"authorization": "Bearer registry-jwt"},
+            auth_mgr=_default_auth_mgr(),
+        )
+        call_next = AsyncMock()
+
+        resp = await middleware.dispatch(req, call_next)
+
+        assert resp.status_code == 401
+        call_next.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_canvas_extra_segment_requires_session(self):
+        middleware = AuthMiddleware(app=MagicMock())
+        req = _request(
+            method="GET",
+            path="/api/projects/proj-1/canvas/elements/el-1/extra",
+            headers={"authorization": "Bearer registry-jwt"},
             auth_mgr=_default_auth_mgr(),
         )
         call_next = AsyncMock()
