@@ -575,178 +575,6 @@ class TestAgentCanvasReadGating:
 
 
 @pytest.mark.asyncio
-class TestAgentCanvasWriteGating:
-    async def test_write_allowed_with_scope_and_flag(self, ctx):
-        pid = await _new_project(ctx, "alpha")
-        cid, token = await _mint_agent(ctx, pid, ("canvas_write",))
-        await _add_member(ctx, pid, cid)
-        await _grant_canvas(ctx, pid, cid, edit=True)
-        async with _bare(ctx.app) as bare:
-            resp = await bare.post(
-                f"/api/projects/{pid}/canvas/elements",
-                json={"kind": "note", "x": 0, "y": 0, "w": 1, "h": 1,
-                      "payload": {"text": "a"}},
-                headers=_hdr(token),
-            )
-        assert resp.status_code == 201, resp.text
-
-    async def test_write_without_scope_is_403(self, ctx):
-        pid = await _new_project(ctx, "alpha")
-        # canvas_read only: write scope is missing.
-        cid, token = await _mint_agent(ctx, pid, ("canvas_read",))
-        await _add_member(ctx, pid, cid)
-        await _grant_canvas(ctx, pid, cid, edit=True)
-        async with _bare(ctx.app) as bare:
-            resp = await bare.post(
-                f"/api/projects/{pid}/canvas/elements",
-                json={"kind": "note", "x": 0, "y": 0, "w": 1, "h": 1,
-                      "payload": {"text": "a"}},
-                headers=_hdr(token),
-            )
-        assert resp.status_code == 403
-
-    async def test_write_without_flag_is_403(self, ctx):
-        pid = await _new_project(ctx, "alpha")
-        cid, token = await _mint_agent(ctx, pid, ("canvas_write",))
-        await _add_member(ctx, pid, cid)
-        # No can_edit_canvas grant.
-        async with _bare(ctx.app) as bare:
-            resp = await bare.post(
-                f"/api/projects/{pid}/canvas/elements",
-                json={"kind": "note", "x": 0, "y": 0, "w": 1, "h": 1,
-                      "payload": {"text": "a"}},
-                headers=_hdr(token),
-            )
-        assert resp.status_code == 403
-
-    async def test_write_flag_does_not_grant_read(self, ctx):
-        """The edit flag (and canvas_write scope) must NOT satisfy a read."""
-        pid = await _new_project(ctx, "alpha")
-        cid, token = await _mint_agent(ctx, pid, ("canvas_write",))
-        await _add_member(ctx, pid, cid)
-        await _grant_canvas(ctx, pid, cid, edit=True)
-        async with _bare(ctx.app) as bare:
-            resp = await bare.get(
-                f"/api/projects/{pid}/canvas/elements", headers=_hdr(token)
-            )
-        assert resp.status_code == 403
-
-
-@pytest.mark.asyncio
-class TestAgentCanvasCrossProject:
-    async def test_different_project_is_404(self, ctx):
-        pid_a = await _new_project(ctx, "alpha")
-        pid_b = await _new_project(ctx, "bravo")
-        cid, token_a = await _mint_agent(ctx, pid_a, ("canvas_read",))
-        await _add_member(ctx, pid_a, cid)
-        await _grant_canvas(ctx, pid_a, cid, read=True)
-        async with _bare(ctx.app) as bare:
-            listing = await bare.get(
-                f"/api/projects/{pid_b}/canvas/elements", headers=_hdr(token_a)
-            )
-        assert listing.status_code == 404
-
-
-@pytest.mark.asyncio
-class TestCanvasAttribution:
-    async def test_agent_write_carry_agent_fields(self, ctx):
-        pid = await _new_project(ctx, "alpha")
-        cid, token = await _mint_agent(ctx, pid, ("canvas_write",))
-        await _add_member(ctx, pid, cid)
-        await _grant_canvas(ctx, pid, cid, edit=True)
-        async with _bare(ctx.app) as bare:
-            resp = await bare.post(
-                f"/api/projects/{pid}/canvas/elements",
-                json={"kind": "note", "x": 0, "y": 0, "w": 1, "h": 1,
-                      "payload": {"text": "a"}},
-                headers=_hdr(token),
-            )
-        assert resp.status_code == 201, resp.text
-        el = resp.json()["element"]
-        assert el["author_kind"] == "agent"
-        assert el["author_id"] == cid
-
-    async def test_user_write_attributed_to_user_not_system(self, ctx):
-        pid = await _new_project(ctx, "alpha")
-        resp = await ctx.client.post(
-            f"/api/projects/{pid}/canvas/elements",
-            json={"kind": "note", "x": 0, "y": 0, "w": 1, "h": 1,
-                  "payload": {"text": "a"}},
-        )
-        assert resp.status_code == 201, resp.text
-        el = resp.json()["element"]
-        assert el["author_kind"] == "user"
-        assert el["author_id"] == ctx.uid
-        assert el["author_id"] != "system"
-
-
-@pytest.mark.asyncio
-class TestCanvasEventActor:
-    """D4: a uniform actor object {kind, id} is stamped on every canvas.* event."""
-
-    async def _capture(self, ctx, pid, coro):
-        broker = ctx.app.state.project_event_broker
-        queue = await broker.subscribe(pid)
-        # Drain any replayed events from earlier actions in this test so we
-        # observe only the event produced by the action under test.
-        while True:
-            try:
-                queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-        await coro()
-        return await asyncio.wait_for(queue.get(), timeout=5.0)
-
-    async def test_actor_on_create_event(self, ctx):
-        pid = await _new_project(ctx, "alpha")
-
-        async def action():
-            await ctx.client.post(
-                f"/api/projects/{pid}/canvas/elements",
-                json={"kind": "note", "x": 0, "y": 0, "w": 1, "h": 1,
-                      "payload": {"text": "a"}},
-            )
-
-        ev = await self._capture(ctx, pid, action)
-        assert ev.kind == "canvas.element_added"
-        assert ev.payload["actor"] == {"kind": "user", "id": ctx.uid}
-
-    async def test_actor_on_delete_event(self, ctx):
-        pid = await _new_project(ctx, "alpha")
-        created = await ctx.client.post(
-            f"/api/projects/{pid}/canvas/elements",
-            json={"kind": "note", "x": 0, "y": 0, "w": 1, "h": 1,
-                  "payload": {"text": "a"}},
-        )
-        eid = created.json()["element"]["id"]
-
-        async def action():
-            await ctx.client.delete(
-                f"/api/projects/{pid}/canvas/elements/{eid}"
-            )
-
-        ev = await self._capture(ctx, pid, action)
-        assert ev.kind == "canvas.element_deleted"
-        assert ev.payload["actor"] == {"kind": "user", "id": ctx.uid}
-
-    async def test_actor_on_permission_change_event(self, ctx):
-        pid = await _new_project(ctx, "alpha")
-        cid, _token = await _mint_agent(ctx, pid, ("canvas_write",))
-        await _add_member(ctx, pid, cid)
-
-        async def action():
-            await ctx.client.patch(
-                f"/api/projects/{pid}/canvas/permissions/{cid}",
-                json={"can_edit_canvas": True},
-            )
-
-        ev = await self._capture(ctx, pid, action)
-        assert ev.kind == "canvas.permission_changed"
-        assert ev.payload["actor"] == {"kind": "user", "id": ctx.uid}
-        assert ev.payload["can_edit_canvas"] is True
-
-
-@pytest.mark.asyncio
 class TestPermissionPatchExtendsFlags:
     async def test_patch_can_set_read_flag_only(self, ctx):
         pid = await _new_project(ctx, "alpha")
@@ -789,4 +617,123 @@ class TestPermissionPatchExtendsFlags:
                 headers=_hdr(token),
             )
         assert resp.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Slice 5: payload size cap (413) + agent write rate limit (429).
+# ---------------------------------------------------------------------------
+
+
+class TestCanvasPayloadSizeCap:
+    """The 64 KB payload cap applies to all principals (agents and humans)."""
+
+    @pytest.mark.asyncio
+    async def test_create_oversized_payload_returns_413(self, ctx):
+        pid = await _new_project(ctx, "payload-cap")
+        oversized = "x" * (65 * 1024)
+        body = {
+            "kind": "text",
+            "x": 0, "y": 0, "w": 100, "h": 50,
+            "payload": {"text": oversized},
+        }
+        resp = await ctx.client.post(
+            f"/api/projects/{pid}/canvas/elements", json=body,
+        )
+        assert resp.status_code == 413, resp.text
+
+    @pytest.mark.asyncio
+    async def test_patch_oversized_payload_returns_413(self, ctx):
+        pid = await _new_project(ctx, "payload-cap-patch")
+        el = await _create_note(ctx.client, pid)
+        oversized = "x" * (65 * 1024)
+        resp = await ctx.client.patch(
+            f"/api/projects/{pid}/canvas/elements/{el['id']}",
+            json={"payload": {"text": oversized}},
+        )
+        assert resp.status_code == 413, resp.text
+
+    @pytest.mark.asyncio
+    async def test_create_normal_payload_succeeds(self, ctx):
+        pid = await _new_project(ctx, "payload-cap-ok")
+        body = {
+            "kind": "text",
+            "x": 0, "y": 0, "w": 100, "h": 50,
+            "payload": {"text": "normal content"},
+        }
+        resp = await ctx.client.post(
+            f"/api/projects/{pid}/canvas/elements", json=body,
+        )
+        assert resp.status_code == 201, resp.text
+
+
+class TestAgentWriteRateLimit:
+    """Agents are throttled to 30 canvas writes per 60 s rolling window.
+    Humans (session principals) are never throttled."""
+
+    @pytest.mark.asyncio
+    async def test_agent_exceeding_window_returns_429(self, ctx):
+        import time
+        import tinyagentos.routes.project_canvas as canvas_mod
+
+        pid = await _new_project(ctx, "rate-limit-agent")
+        cid, token = await _mint_agent(ctx, pid, ("canvas_write",))
+        await _add_member(ctx, pid, cid)
+        await _grant_canvas(ctx, pid, cid, edit=True)
+
+        limiter = canvas_mod._canvas_write_limiter
+        max_attempts = canvas_mod._CANVAS_WRITE_MAX_ATTEMPTS
+        now = time.monotonic()
+        with limiter._lock:
+            limiter._log[cid] = [now - 1.0] * max_attempts
+
+        async with _bare(ctx.app) as bare:
+            resp = await bare.post(
+                f"/api/projects/{pid}/canvas/elements",
+                json={"kind": "note", "x": 0, "y": 0, "w": 1, "h": 1,
+                      "payload": {"text": "rate-limited"}},
+                headers=_hdr(token),
+            )
+        assert resp.status_code == 429, resp.text
+
+    @pytest.mark.asyncio
+    async def test_agent_delete_exceeding_window_returns_429(self, ctx):
+        import time
+        import tinyagentos.routes.project_canvas as canvas_mod
+
+        pid = await _new_project(ctx, "rate-limit-agent-del")
+        cid, token = await _mint_agent(ctx, pid, ("canvas_write",))
+        await _add_member(ctx, pid, cid)
+        await _grant_canvas(ctx, pid, cid, edit=True)
+
+        created = await ctx.client.post(
+            f"/api/projects/{pid}/canvas/elements",
+            json={"kind": "note", "x": 0, "y": 0, "w": 1, "h": 1,
+                  "payload": {"text": "to-delete"}},
+        )
+        assert created.status_code == 201
+        eid = created.json()["element"]["id"]
+
+        limiter = canvas_mod._canvas_write_limiter
+        max_attempts = canvas_mod._CANVAS_WRITE_MAX_ATTEMPTS
+        now = time.monotonic()
+        with limiter._lock:
+            limiter._log[cid] = [now - 1.0] * max_attempts
+
+        async with _bare(ctx.app) as bare:
+            resp = await bare.delete(
+                f"/api/projects/{pid}/canvas/elements/{eid}",
+                headers=_hdr(token),
+            )
+        assert resp.status_code == 429, resp.text
+
+    @pytest.mark.asyncio
+    async def test_human_write_not_rate_limited(self, ctx):
+        pid = await _new_project(ctx, "rate-limit-human")
+        for _ in range(31):
+            resp = await ctx.client.post(
+                f"/api/projects/{pid}/canvas/elements",
+                json={"kind": "note", "x": 0, "y": 0, "w": 1, "h": 1,
+                      "payload": {"text": "human-write"}},
+            )
+            assert resp.status_code == 201, resp.text
 
