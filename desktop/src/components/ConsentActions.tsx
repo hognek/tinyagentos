@@ -17,20 +17,6 @@ import { CheckCircle, XCircle } from "lucide-react";
  */
 const PROJECT_SCOPES = new Set(["project_tasks", "canvas_read", "canvas_write"]);
 
-const SCOPE_LABELS: Record<string, string> = {
-  memory_read: "Read agent memory",
-  memory_write: "Write agent memory",
-  a2a_send: "Send messages to other agents",
-  a2a_receive: "Receive messages from other agents",
-  files_read: "Read files",
-  files_write: "Write files",
-  tools_execute: "Execute tools",
-  registry_feeds_read: "Read registry feeds",
-  project_tasks: "Read and manage project tasks",
-  canvas_read: "Read project canvas",
-  canvas_write: "Write to project canvas",
-};
-
 interface ProjectOption {
   id: string;
   name: string;
