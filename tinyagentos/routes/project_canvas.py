@@ -307,6 +307,8 @@ async def canvas_stream(project_id: str, request: Request):
     auth = await _authorize_canvas_actor(request, project_id, "read")
     if isinstance(auth, JSONResponse):
         return auth
+    actor_kind, actor_id = auth
+    ps = request.app.state.project_store
     broker = request.app.state.project_event_broker
     queue = await broker.subscribe(project_id)
 
@@ -318,6 +320,13 @@ async def canvas_stream(project_id: str, request: Request):
                 try:
                     ev = await asyncio.wait_for(queue.get(), timeout=10.0)
                 except asyncio.TimeoutError:
+                    # Keepalive tick: re-verify a live agent principal's read
+                    # access so a revoked/removed agent cannot keep a long-lived
+                    # SSE open (slice 4). Session users are unaffected.
+                    if actor_kind == "agent":
+                        member = await ps.get_member(project_id, actor_id)
+                        if not (member or {}).get("can_read_canvas"):
+                            return
                     yield ":keepalive\n\n"
                     continue
                 if not str(ev.kind).startswith("canvas."):
