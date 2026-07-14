@@ -15,7 +15,21 @@ import { CheckCircle, XCircle } from "lucide-react";
  * right project at approval time. The chosen project id is passed to the approve
  * endpoint, which mints the token bound to it.
  */
-const PROJECT_SCOPE = "project_tasks";
+const PROJECT_SCOPES = new Set(["project_tasks", "canvas_read", "canvas_write"]);
+
+const SCOPE_LABELS: Record<string, string> = {
+  memory_read: "Read agent memory",
+  memory_write: "Write agent memory",
+  a2a_send: "Send messages to other agents",
+  a2a_receive: "Receive messages from other agents",
+  files_read: "Read files",
+  files_write: "Write files",
+  tools_execute: "Execute tools",
+  registry_feeds_read: "Read registry feeds",
+  project_tasks: "Read and manage project tasks",
+  canvas_read: "Read project canvas",
+  canvas_write: "Write to project canvas",
+};
 
 interface ProjectOption {
   id: string;
@@ -43,7 +57,7 @@ export function ConsentActions({
   requestedProjectId?: string;
   onResolved?: () => void;
 }) {
-  const needsProject = scopes.includes(PROJECT_SCOPE);
+  const needsProject = scopes.some((s) => PROJECT_SCOPES.has(s));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [projects, setProjects] = useState<ProjectOption[]>([]);
@@ -128,7 +142,7 @@ export function ConsentActions({
       projectId = created;
     }
     if (approved && needsProject && !projectId) {
-      setError("Select or create a project to grant project_tasks.");
+      setError("Select or create a project for the requested project access.");
       setBusy(false);
       return;
     }
@@ -172,7 +186,7 @@ export function ConsentActions({
             htmlFor={`consent-project-${requestId}`}
             className="block text-[11px] text-shell-text-secondary mb-1"
           >
-            Grant project_tasks for project
+            Grant project access for
           </label>
           {!creating ? (
             <div className="flex items-center gap-1.5">
