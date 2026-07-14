@@ -67,6 +67,7 @@ class ProjectStore(BaseStore):
     async def _post_init(self) -> None:
         for col_def in (
             "ALTER TABLE project_members ADD COLUMN can_edit_canvas INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE project_members ADD COLUMN can_read_canvas INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE project_members ADD COLUMN is_lead INTEGER NOT NULL DEFAULT 0",
             "ALTER TABLE projects ADD COLUMN user_id TEXT NOT NULL DEFAULT ''",
         ):
@@ -243,6 +244,17 @@ class ProjectStore(BaseStore):
             rows = await cur.fetchall()
             keys = [d[0] for d in cur.description]
         return [dict(zip(keys, r)) for r in rows]
+
+    async def get_member(self, project_id: str, member_id: str) -> dict | None:
+        async with self._db.execute(
+            "SELECT * FROM project_members WHERE project_id = ? AND member_id = ?",
+            (project_id, member_id),
+        ) as cur:
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            keys = [d[0] for d in cur.description]
+        return dict(zip(keys, row))
 
     async def log_activity(
         self,

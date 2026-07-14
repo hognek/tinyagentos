@@ -124,6 +124,10 @@ class ProjectCanvasStore(BaseStore):
             raise ValueError(f"agents may not emit kind={kind}")
         if author_kind not in ("user", "agent"):
             raise ValueError(f"invalid author_kind: {author_kind}")
+        # Enforce the per-project edit permission for agents (defense in depth:
+        # the route already gates on scope + can_edit_canvas, but the store is
+        # the authoritative floor so a direct caller can never bypass it).
+        await self._check_edit_permission(project_id, author_kind, author_id)
         eid = element.get("id") or new_id("cve")
         now = time.time()
         # Upsert: the client may re-send an element it already created (e.g. a
@@ -154,7 +158,10 @@ class ProjectCanvasStore(BaseStore):
         )
         await self._db.commit()
         new_el = await self.get_element(eid)
-        await self._publish(project_id, "canvas.element_added", {"element": new_el})
+        await self._publish(
+            project_id, "canvas.element_added",
+            {"element": new_el, "actor": {"kind": author_kind, "id": author_id}},
+        )
         return new_el
 
     async def list_elements(
@@ -239,7 +246,10 @@ class ProjectCanvasStore(BaseStore):
         updated = await self.get_element(element_id, project_id=project_id)
         if updated is None:
             raise ValueError(f"element not found: {element_id}")
-        await self._publish(project_id, "canvas.element_updated", {"element": updated})
+        await self._publish(
+            project_id, "canvas.element_updated",
+            {"element": updated, "actor": {"kind": author_kind, "id": author_id}},
+        )
         return updated
 
     async def delete_element(
@@ -262,5 +272,5 @@ class ProjectCanvasStore(BaseStore):
         if cur.rowcount == 1:
             await self._publish(
                 project_id, "canvas.element_deleted",
-                {"element_id": element_id},
+                {"element_id": element_id, "actor": {"kind": author_kind, "id": author_id}},
             )
