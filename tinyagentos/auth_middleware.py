@@ -62,8 +62,8 @@ _AGENT_CANVAS_ROUTES = (
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/elements$")),
     ("POST", re.compile(rf"^/api/projects/{_SEG}/canvas/elements$")),
     ("DELETE", re.compile(rf"^/api/projects/{_SEG}/canvas/elements/{_SEG}$")),
-    ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/snapshot.png$")),
-    ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/snapshot.tldr$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/snapshot\.png$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/snapshot\.tldr$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/stream$")),
 )
 

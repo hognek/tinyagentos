@@ -304,6 +304,19 @@ class TestIsAgentCanvasPath:
     def test_nested_element_path_not_allowed(self):
         assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/elements/x/y") is False
 
+    def test_single_element_get_not_allowed(self):
+        # There is no GET /elements/{id} route in the allowlist; only the
+        # collection GET and the DELETE of a single element are permitted.
+        assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/elements/el-1") is False
+
+    def test_snapshot_dot_is_literal_not_wildcard(self):
+        # The dot in snapshot.png / snapshot.tldr must be a literal, not a regex
+        # wildcard: a near-miss like snapshotXpng must NOT slip through the
+        # agent-token allowlist onto a session-only surface.
+        assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/snapshotXpng") is False
+        assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/snapshot_png") is False
+        assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/snapshotXtldr") is False
+
 
 class TestCanvasAgentTokenDispatch:
     @pytest.mark.asyncio
