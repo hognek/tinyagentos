@@ -61,6 +61,7 @@ _AGENT_TASK_ROUTES = (
 _AGENT_CANVAS_ROUTES = (
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/elements$")),
     ("POST", re.compile(rf"^/api/projects/{_SEG}/canvas/elements$")),
+    ("PATCH", re.compile(rf"^/api/projects/{_SEG}/canvas/elements/{_SEG}$")),
     ("DELETE", re.compile(rf"^/api/projects/{_SEG}/canvas/elements/{_SEG}$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/snapshot.png$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/snapshot.tldr$")),
@@ -76,8 +77,9 @@ def _is_agent_task_path(method: str, path: str) -> bool:
 
 def _is_agent_canvas_path(method: str, path: str) -> bool:
     """True only for the exact subset of canvas routes a canvas_read/canvas_write
-    token may reach.  Strict method + anchored-regex match; the PATCH elements
-    and PATCH permissions routes stay session-only."""
+    token may reach.  Strict method + anchored-regex match; the PATCH permissions
+    route stays session-only (owner/admin only) but the PATCH elements route is
+    reachable by a canvas_write-bound agent token, mirroring POST/DELETE."""
     return any(m == method and rx.match(path) for m, rx in _AGENT_CANVAS_ROUTES)
 # Bundle assets and the SPA shell HTML must be reachable without auth so:
 #   1. The browser can install and cache the shell for offline / PWA use.

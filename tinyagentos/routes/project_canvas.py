@@ -54,7 +54,16 @@ async def _authorize_canvas_actor(
     """
     uid = getattr(request.state, "user_id", None)
     if uid:
-        # Session owner/admin: unchanged session behavior, attributed to the user.
+        # Session path: project visibility gate (D3).  Only the project owner or
+        # an admin may touch the canvas; a human needs no scope and no checkbox,
+        # but a non-owner collapses into the SAME existence-hiding 404 the agent
+        # path uses (compare _get_owned_project on the task routes).  Attribution
+        # stays the verified user.
+        ps = request.app.state.project_store
+        project = await ps.get_project(project_id)
+        is_admin = bool(getattr(request.state, "is_admin", False))
+        if project is not None and not is_admin and project.get("user_id") != uid:
+            return JSONResponse({"error": "not found"}, status_code=404)
         return ("user", _user_id(request))
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.lower().startswith("bearer "):

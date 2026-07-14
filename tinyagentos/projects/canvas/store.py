@@ -210,6 +210,30 @@ class ProjectCanvasStore(BaseStore):
                 f"agent {author_id} has no can_edit_canvas on project {project_id}"
             )
 
+    async def check_read_permission(
+        self, project_id: str, author_kind: str, author_id: str
+    ) -> None:
+        """Gate canvas reads on can_read_canvas for agents (D3 read matrix).
+
+        Mirrors _check_edit_permission: humans bypass the floor, agents must hold
+        the per-project can_read_canvas flag, and a missing member row fails
+        closed.  This is the in-process analogue of the route-level canvas_read
+        scope check, guarding the agent MCP read path at the store floor."""
+        if author_kind == "user":
+            return
+        if author_kind != "agent":
+            raise ValueError(f"invalid author_kind: {author_kind}")
+        async with self._db.execute(
+            "SELECT can_read_canvas FROM project_members "
+            "WHERE project_id = ? AND member_id = ?",
+            (project_id, author_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None or not row[0]:
+            raise CanvasPermissionError(
+                f"agent {author_id} has no can_read_canvas on project {project_id}"
+            )
+
     async def update_element(
         self,
         *,

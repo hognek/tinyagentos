@@ -136,6 +136,39 @@ async def test_canvas_add_denied_without_permission(env):
 
 
 @pytest.mark.asyncio
+async def test_canvas_list_denied_without_read(env):
+    p, ctx, _ps, grant = env
+    # can_edit_canvas only: the read checkbox stays off, so the in-process
+    # read path must be blocked even though the agent can write.
+    await grant()
+    res = await ct.canvas_list_elements(
+        ctx, project_id=p["id"], agent_id="agent-1"
+    )
+    assert res["error"] == "permission_denied"
+
+
+@pytest.mark.asyncio
+async def test_canvas_list_allowed_with_read(env):
+    p, ctx, ps, grant = env
+    await grant()
+    await ps._db.execute(
+        "UPDATE project_members SET can_read_canvas = 1 "
+        "WHERE project_id = ? AND member_id = ?",
+        (p["id"], "agent-1"),
+    )
+    await ps._db.commit()
+    el = await ctx.canvas_store.add_element(
+        project_id=p["id"], author_kind="user", author_id="u",
+        element={"kind": "note", "x": 0, "y": 0, "w": 1, "h": 1, "payload": {"text": "x"}},
+    )
+    res = await ct.canvas_list_elements(
+        ctx, project_id=p["id"], agent_id="agent-1"
+    )
+    assert "elements" in res
+    assert [e["id"] for e in res["elements"]] == [el["id"]]
+
+
+@pytest.mark.asyncio
 async def test_canvas_update_denied_without_permission(env):
     p, ctx, _ps, _grant = env
     # An agent without the edit flag cannot mutate an existing element.

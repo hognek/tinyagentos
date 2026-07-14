@@ -400,6 +400,45 @@ async def test_canvas_stream_endpoint_exists(client):
 
 
 # ---------------------------------------------------------------------------
+# Finding 2 (adversarial review): session users must be gated by project
+# visibility (owner/admin). A non-owner collapses into the same existence-hiding
+# 404 the agent path uses (D3 matrix); owner/admin stays allowed, and an
+# allowed session write is still attributed to the verified user.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSessionCanvasOwnerGating:
+    async def test_owner_session_write_allowed(self, ctx):
+        pid = await _new_project(ctx, "owner-gate-write")
+        resp = await ctx.client.post(
+            f"/api/projects/{pid}/canvas/elements",
+            json={"kind": "note", "x": 0, "y": 0, "w": 1, "h": 1,
+                  "payload": {"text": "owned"}},
+        )
+        assert resp.status_code == 201, resp.text
+
+    async def test_non_owner_session_list_is_404(self, ctx):
+        pid = await _new_project(ctx, "nonowner-gate")
+        async with _non_owner_client(ctx.app) as other:
+            resp = await other.get(f"/api/projects/{pid}/canvas/elements")
+        assert resp.status_code == 404
+        assert resp.status_code != 403
+        assert resp.status_code != 200
+
+    async def test_non_owner_session_write_is_404(self, ctx):
+        pid = await _new_project(ctx, "nonowner-gate-write")
+        async with _non_owner_client(ctx.app) as other:
+            resp = await other.post(
+                f"/api/projects/{pid}/canvas/elements",
+                json={"kind": "note", "x": 0, "y": 0, "w": 1, "h": 1,
+                      "payload": {"text": "x"}},
+            )
+        assert resp.status_code == 404
+        assert resp.status_code != 403
+
+
+# ---------------------------------------------------------------------------
 # Slice 3: agent scope + per-project canvas permission gating (D3 matrix)
 # plus honest attribution and the uniform actor stamp (D4).
 # ---------------------------------------------------------------------------
@@ -439,6 +478,26 @@ async def _new_project(ctx, slug):
     resp = await ctx.client.post("/api/projects", json={"name": slug, "slug": slug})
     assert resp.status_code == 200, resp.text
     return resp.json()["id"]
+
+
+def _non_owner_client(app):
+    """A non-owner, non-admin session client for a second human user.
+
+    The project under test is owned by the admin `client` fixture user, so a
+    session minted for this user is an "other" human per the D3 matrix and must
+    collapse into an existence-hiding 404 on the canvas.
+    """
+    auth = app.state.auth
+    code = auth.add_user_invite("other", "admin")
+    rec = auth.complete_invite(
+        "other", code, "Other User", "o@example.com", "password123"
+    )
+    token = auth.create_session(user_id=rec["id"], long_lived=True)
+    return AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        cookies={"taos_session": token},
+    )
 
 
 async def _add_member(ctx, pid, member_id):

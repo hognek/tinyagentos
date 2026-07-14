@@ -30,7 +30,27 @@ class CanvasToolContext:
     data_root: Path
 
 
-async def canvas_list_elements(ctx: CanvasToolContext, *, project_id: str) -> dict:
+async def canvas_list_elements(
+    ctx: CanvasToolContext, *, project_id: str, agent_id: str
+) -> dict:
+    """List canvas elements an agent can read, gated by can_read_canvas (D3).
+
+    Surfaces the read-permission floor as a clean error, mirroring the other
+    in-process canvas tools so an agent without read access is told what to do
+    instead of silently receiving another principal's board contents."""
+    try:
+        await ctx.canvas_store.check_read_permission(
+            project_id, "agent", agent_id
+        )
+    except CanvasPermissionError:
+        return {
+            "error": "permission_denied",
+            "message": (
+                "This agent does not have read permission on the canvas. "
+                "Ask the user to enable it in project settings, or message "
+                "them to grant access."
+            ),
+        }
     elements = await ctx.canvas_store.list_elements(project_id)
     return {"elements": elements}
 
