@@ -531,3 +531,192 @@ class TestCanvasScopeApproval:
         monkeypatch.setattr(client._transport.app.state, "auth_requests", store)
         resp = await client.get("/api/agents/auth-requests/nonexistent123")
         assert resp.status_code == 404
+
+
+class TestHandleSetOnApprove:
+    """Slice 7: approve sets the registry handle from the sanitized identity
+    claim; the new agent then passes the a2a bus 'no handle' gate."""
+
+    @pytest.mark.asyncio
+    async def test_approve_sets_handle_on_registry(self, client, monkeypatch, tmp_path):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.agent_grants_store import AgentGrantsStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-handle.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-handle.db")
+        await auth_store.init()
+        grants = AgentGrantsStore(tmp_path / "grants-handle.db")
+        await grants.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-handle")
+
+        record = await auth_store.create(
+            identity_claim="@taOSmd-dev",
+            framework="openclaw",
+            requested_scopes=["memory_read"],
+            requested_skills=None,
+            reason="",
+            duration_secs=None,
+            project_id=None,
+        )
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "agent_grants", grants)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            f"/api/agents/auth-requests/{record['id']}/approve",
+            json={"granted_scopes": ["memory_read"]},
+        )
+        assert resp.status_code == 200, resp.text
+
+        agents = await registry.list_all()
+        assert len(agents) == 1
+        assert agents[0]["handle"] == "taosmd-dev"
+
+        handle = (agents[0].get("handle") or "").strip()
+        assert handle, "handle must be set so the a2a 'no handle' gate passes"
+
+        await registry.close()
+        await auth_store.close()
+        await grants.close()
+
+
+class TestHandleCollisionActiveRejects:
+    """Slice 7: a handle collision with an ACTIVE identity returns 409 and
+    leaves the auth request PENDING so the approver can pick another variant."""
+
+    @pytest.mark.asyncio
+    async def test_409_when_handle_collides_with_active(
+        self, client, monkeypatch, tmp_path
+    ):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.agent_grants_store import AgentGrantsStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-collide.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-collide.db")
+        await auth_store.init()
+        grants = AgentGrantsStore(tmp_path / "grants-collide.db")
+        await grants.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-collide")
+
+        existing = await registry.register(
+            framework="openclaw",
+            display_name="existing-agent",
+            user_id="user-existing",
+            origin="taos-deployed",
+            handle="taosmd-dev",
+        )
+
+        record = await auth_store.create(
+            identity_claim="@taOSmd-dev",
+            framework="openclaw",
+            requested_scopes=["memory_read"],
+            requested_skills=None,
+            reason="",
+            duration_secs=None,
+            project_id=None,
+        )
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "agent_grants", grants)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            f"/api/agents/auth-requests/{record['id']}/approve",
+            json={"granted_scopes": ["memory_read"]},
+        )
+        assert resp.status_code == 409, resp.text
+
+        pending = await auth_store.get(record["id"])
+        assert pending is not None
+        assert pending["status"] == "pending"
+
+        active_agents = await registry.list_all(status="active")
+        assert len(active_agents) == 1
+
+        await registry.close()
+        await auth_store.close()
+        await grants.close()
+
+
+class TestHandleCollisionSuspendedAllowsReuse:
+    """Slice 7: if the previous holder of the handle is SUSPENDED, the handle
+    may be reused and approval succeeds."""
+
+    @pytest.mark.asyncio
+    async def test_approve_succeeds_after_handle_holder_suspended(
+        self, client, monkeypatch, tmp_path
+    ):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.agent_grants_store import AgentGrantsStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-suspended.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-suspended.db")
+        await auth_store.init()
+        grants = AgentGrantsStore(tmp_path / "grants-suspended.db")
+        await grants.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-suspended")
+
+        old_agent = await registry.register(
+            framework="openclaw",
+            display_name="old-agent",
+            user_id="user-old",
+            origin="taos-deployed",
+            handle="taosmd-dev",
+        )
+        await registry.set_status(
+            old_agent["canonical_id"], "suspended", actor="user-old"
+        )
+
+        record = await auth_store.create(
+            identity_claim="@taOSmd-dev",
+            framework="openclaw",
+            requested_scopes=["memory_read"],
+            requested_skills=None,
+            reason="",
+            duration_secs=None,
+            project_id=None,
+        )
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "agent_grants", grants)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            f"/api/agents/auth-requests/{record['id']}/approve",
+            json={"granted_scopes": ["memory_read"]},
+        )
+        assert resp.status_code == 200, resp.text
+
+        new_agents = await registry.list_all()
+        new_active = [a for a in new_agents if a["status"] == "active"]
+        assert len(new_active) == 1
+        assert new_active[0]["handle"] == "taosmd-dev"
+
+        await registry.close()
+        await auth_store.close()
+        await grants.close()

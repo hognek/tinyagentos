@@ -28,7 +28,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from tinyagentos.agent_registry_store import mint_registry_token
+from tinyagentos.agent_registry_store import _slugify, mint_registry_token
 from tinyagentos.auth_context import CurrentUser, current_user
 
 logger = logging.getLogger(__name__)
@@ -336,6 +336,18 @@ async def _do_approve(request: Request, request_id: str, body: ApproveBody, user
     # non-empty value.
     _claim = record["identity_claim"].strip().removeprefix("@").strip()
     display_name = _claim or record["framework"]
+
+    handle = _slugify(_claim)
+    existing_active = await registry.get_by_handle(handle, status="active")
+    if existing_active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"handle '{handle}' is already in use by active agent "
+                f"{existing_active['canonical_id']}; pick a different identity_claim"
+            ),
+        )
+
     reg_record = await registry.register(
         framework=record["framework"],
         display_name=display_name,
@@ -350,6 +362,7 @@ async def _do_approve(request: Request, request_id: str, body: ApproveBody, user
     # them to 'active' so they are NOT in the bus inactive/revocation feed and
     # @taOSmd's identity-AND-grant gate accepts them.
     await registry.set_status(canonical_id, "active", actor=user.user_id)
+    await registry.update(canonical_id, handle=handle)
 
     # Resolve effective project binding: admin override wins; fall back to the
     # project_id the agent requested (may be None for a global token).
