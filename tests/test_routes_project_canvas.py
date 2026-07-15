@@ -573,7 +573,6 @@ class TestAgentCanvasReadGating:
             )
         assert resp.status_code == 403
 
-
 @pytest.mark.asyncio
 class TestAgentCanvasWriteGating:
     async def test_write_allowed_with_scope_and_flag(self, ctx):
@@ -1010,4 +1009,120 @@ def _stream_req(app, *, token=None, user_id=None, is_admin=False):
 
     req._receive = _receive
     return req
+# Slice 5: payload size cap (413) + agent write rate limit (429).
+# ---------------------------------------------------------------------------
+
+
+class TestCanvasPayloadSizeCap:
+    """The 64 KB payload cap applies to all principals (agents and humans)."""
+
+    @pytest.mark.asyncio
+    async def test_create_oversized_payload_returns_413(self, ctx):
+        pid = await _new_project(ctx, "payload-cap")
+        oversized = "x" * (65 * 1024)
+        body = {
+            "kind": "text",
+            "x": 0, "y": 0, "w": 100, "h": 50,
+            "payload": {"text": oversized},
+        }
+        resp = await ctx.client.post(
+            f"/api/projects/{pid}/canvas/elements", json=body,
+        )
+        assert resp.status_code == 413, resp.text
+
+    @pytest.mark.asyncio
+    async def test_patch_oversized_payload_returns_413(self, ctx):
+        pid = await _new_project(ctx, "payload-cap-patch")
+        el = await _create_note(ctx.client, pid)
+        oversized = "x" * (65 * 1024)
+        resp = await ctx.client.patch(
+            f"/api/projects/{pid}/canvas/elements/{el['id']}",
+            json={"payload": {"text": oversized}},
+        )
+        assert resp.status_code == 413, resp.text
+
+    @pytest.mark.asyncio
+    async def test_create_normal_payload_succeeds(self, ctx):
+        pid = await _new_project(ctx, "payload-cap-ok")
+        body = {
+            "kind": "text",
+            "x": 0, "y": 0, "w": 100, "h": 50,
+            "payload": {"text": "normal content"},
+        }
+        resp = await ctx.client.post(
+            f"/api/projects/{pid}/canvas/elements", json=body,
+        )
+        assert resp.status_code == 201, resp.text
+
+
+class TestAgentWriteRateLimit:
+    """Agents are throttled to 30 canvas writes per 60 s rolling window.
+    Humans (session principals) are never throttled."""
+
+    @pytest.mark.asyncio
+    async def test_agent_exceeding_window_returns_429(self, ctx):
+        import time
+        import tinyagentos.routes.project_canvas as canvas_mod
+
+        pid = await _new_project(ctx, "rate-limit-agent")
+        cid, token = await _mint_agent(ctx, pid, ("canvas_write",))
+        await _add_member(ctx, pid, cid)
+        await _grant_canvas(ctx, pid, cid, edit=True)
+
+        limiter = canvas_mod._canvas_write_limiter
+        max_attempts = canvas_mod._CANVAS_WRITE_MAX_ATTEMPTS
+        now = time.monotonic()
+        with limiter._lock:
+            limiter._log[cid] = [now - 1.0] * max_attempts
+
+        async with _bare(ctx.app) as bare:
+            resp = await bare.post(
+                f"/api/projects/{pid}/canvas/elements",
+                json={"kind": "note", "x": 0, "y": 0, "w": 1, "h": 1,
+                      "payload": {"text": "rate-limited"}},
+                headers=_hdr(token),
+            )
+        assert resp.status_code == 429, resp.text
+
+    @pytest.mark.asyncio
+    async def test_agent_delete_exceeding_window_returns_429(self, ctx):
+        import time
+        import tinyagentos.routes.project_canvas as canvas_mod
+
+        pid = await _new_project(ctx, "rate-limit-agent-del")
+        cid, token = await _mint_agent(ctx, pid, ("canvas_write",))
+        await _add_member(ctx, pid, cid)
+        await _grant_canvas(ctx, pid, cid, edit=True)
+
+        created = await ctx.client.post(
+            f"/api/projects/{pid}/canvas/elements",
+            json={"kind": "note", "x": 0, "y": 0, "w": 1, "h": 1,
+                  "payload": {"text": "to-delete"}},
+        )
+        assert created.status_code == 201
+        eid = created.json()["element"]["id"]
+
+        limiter = canvas_mod._canvas_write_limiter
+        max_attempts = canvas_mod._CANVAS_WRITE_MAX_ATTEMPTS
+        now = time.monotonic()
+        with limiter._lock:
+            limiter._log[cid] = [now - 1.0] * max_attempts
+
+        async with _bare(ctx.app) as bare:
+            resp = await bare.delete(
+                f"/api/projects/{pid}/canvas/elements/{eid}",
+                headers=_hdr(token),
+            )
+        assert resp.status_code == 429, resp.text
+
+    @pytest.mark.asyncio
+    async def test_human_write_not_rate_limited(self, ctx):
+        pid = await _new_project(ctx, "rate-limit-human")
+        for _ in range(31):
+            resp = await ctx.client.post(
+                f"/api/projects/{pid}/canvas/elements",
+                json={"kind": "note", "x": 0, "y": 0, "w": 1, "h": 1,
+                      "payload": {"text": "human-write"}},
+            )
+            assert resp.status_code == 201, resp.text
 

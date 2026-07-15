@@ -7,6 +7,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
+import time
+from collections import OrderedDict
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Request
@@ -20,11 +23,62 @@ from tinyagentos.projects.canvas.render import render_snapshot_png
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# Agent scopes (slice 1) that unlock canvas read / write on a project the token
-# is bound to. The write scope is strictly narrower than read: holding
-# canvas_write must NEVER satisfy a read, and vice versa (D3 enforcement matrix).
 _CANVAS_READ_SCOPE = "canvas_read"
 _CANVAS_WRITE_SCOPE = "canvas_write"
+
+_CANVAS_PAYLOAD_MAX_BYTES = 64 * 1024
+_CANVAS_WRITE_MAX_ATTEMPTS = 30
+_CANVAS_WRITE_WINDOW_SECONDS = 60
+_CANVAS_WRITE_MAX_KEYS = 10_000
+
+
+class _CanvasWriteLimiter:
+    def __init__(self, max_attempts: int = _CANVAS_WRITE_MAX_ATTEMPTS,
+                 window_seconds: int = _CANVAS_WRITE_WINDOW_SECONDS):
+        self._max = max_attempts
+        self._window = window_seconds
+        self._log: OrderedDict[str, list[float]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def _prune(self, key: str) -> None:
+        cutoff = time.monotonic() - self._window
+        if key not in self._log:
+            return
+        self._log[key] = [t for t in self._log[key] if t > cutoff]
+        if not self._log[key]:
+            del self._log[key]
+        else:
+            self._log.move_to_end(key)
+
+    def _ensure_capacity(self) -> None:
+        while len(self._log) >= _CANVAS_WRITE_MAX_KEYS:
+            self._log.popitem(last=False)
+
+    def is_limited(self, key: str) -> bool:
+        with self._lock:
+            self._prune(key)
+            return len(self._log.get(key, [])) >= self._max
+
+    def record(self, key: str) -> None:
+        with self._lock:
+            self._prune(key)
+            if key not in self._log:
+                self._ensure_capacity()
+                self._log[key] = []
+            self._log[key].append(time.monotonic())
+            self._log.move_to_end(key)
+
+
+_canvas_write_limiter = _CanvasWriteLimiter()
+
+
+def _check_payload_size(payload: dict) -> None:
+    size = len(json.dumps(payload, default=str).encode("utf-8"))
+    if size > _CANVAS_PAYLOAD_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"canvas payload exceeds {_CANVAS_PAYLOAD_MAX_BYTES // 1024} KB limit",
+        )
 
 
 def _user_id(request: Request) -> str:
@@ -136,8 +190,14 @@ async def create_canvas_element(
     if isinstance(auth, JSONResponse):
         return auth
     actor_kind, actor_id = auth
-    cs = request.app.state.project_canvas_store
+    if actor_kind == "agent" and _canvas_write_limiter.is_limited(actor_id):
+        return JSONResponse(
+            {"error": "rate_limit", "message": "too many canvas writes, try again later"},
+            status_code=429,
+        )
     element = payload.model_dump()
+    _check_payload_size(element.get("payload") or {})
+    cs = request.app.state.project_canvas_store
     element_id = element.pop("element_id", None)
     if element["kind"] == "link":
         url = (element.get("payload") or {}).get("url")
@@ -153,6 +213,8 @@ async def create_canvas_element(
         )
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
+    if actor_kind == "agent":
+        _canvas_write_limiter.record(actor_id)
     return {"element": new_el}
 
 
@@ -174,8 +236,15 @@ async def update_canvas_element(
     if isinstance(auth, JSONResponse):
         return auth
     actor_kind, actor_id = auth
+    if actor_kind == "agent" and _canvas_write_limiter.is_limited(actor_id):
+        return JSONResponse(
+            {"error": "rate_limit", "message": "too many canvas writes, try again later"},
+            status_code=429,
+        )
     cs = request.app.state.project_canvas_store
     patch = {k: v for k, v in payload.model_dump().items() if v is not None}
+    if "payload" in patch:
+        _check_payload_size(patch["payload"])
     try:
         updated = await cs.update_element(
             project_id=project_id, element_id=element_id, patch=patch,
@@ -185,6 +254,8 @@ async def update_canvas_element(
         return JSONResponse({"error": "permission_denied", "message": str(e)}, status_code=403)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
+    if actor_kind == "agent":
+        _canvas_write_limiter.record(actor_id)
     return {"element": updated}
 
 
@@ -194,6 +265,11 @@ async def delete_canvas_element(project_id: str, element_id: str, request: Reque
     if isinstance(auth, JSONResponse):
         return auth
     actor_kind, actor_id = auth
+    if actor_kind == "agent" and _canvas_write_limiter.is_limited(actor_id):
+        return JSONResponse(
+            {"error": "rate_limit", "message": "too many canvas writes, try again later"},
+            status_code=429,
+        )
     cs = request.app.state.project_canvas_store
     try:
         await cs.delete_element(
@@ -202,6 +278,8 @@ async def delete_canvas_element(project_id: str, element_id: str, request: Reque
         )
     except CanvasPermissionError as e:
         return JSONResponse({"error": "permission_denied", "message": str(e)}, status_code=403)
+    if actor_kind == "agent":
+        _canvas_write_limiter.record(actor_id)
     return Response(status_code=204)
 
 
