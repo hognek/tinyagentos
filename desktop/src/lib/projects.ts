@@ -36,9 +36,37 @@ export type ProjectTask = {
   closed_at: number | null;
   closed_by: string | null;
   close_reason: string | null;
+  element_id: string | null;
   created_by: string;
   created_at: number;
   updated_at: number;
+};
+
+export type ElementType =
+  | "generic"
+  | "code"
+  | "website"
+  | "design"
+  | "docs"
+  | "marketing"
+  | "business"
+  | (string & {});
+
+export type ProjectElement = {
+  id: string;
+  project_id: string;
+  name: string;
+  slug: string;
+  type: ElementType;
+  description: string;
+  assignee_id: string | null;
+  settings: Record<string, unknown>;
+  created_at: number;
+  updated_at: number;
+  archived_at: number | null;
+  open_tasks?: number;
+  total_tasks?: number;
+  canvas_items?: number;
 };
 
 export type ProjectActivity = {
@@ -90,6 +118,27 @@ export type Routine = {
   created_by: string;
   created_at: number;
   updated_at: number;
+};
+
+export type DocReviewState = "awaiting_review" | "approved" | "changes_requested";
+
+export type DocReview = {
+  id: string;
+  project_id: string;
+  doc_path: string;
+  review_state: DocReviewState;
+  reviewed_by: string | null;
+  reviewed_at: number | null;
+  changes_requested_by: string | null;
+  changes_requested_at: number | null;
+  created_at: number;
+  updated_at: number;
+};
+
+export type DocReviewMissing = {
+  project_id: string;
+  doc_path: string;
+  review_state: null;
 };
 
 export type TaskContextAncestor = { id: string; title: string; status: string };
@@ -210,6 +259,50 @@ export const projectsApi = {
       http<TaskContext>(`/api/projects/tasks/${tid}/context`),
   },
 
+  elements: {
+    list: (pid: string) =>
+      http<{ items: ProjectElement[] }>(`/api/projects/${pid}/elements`).then((r) => r.items),
+    get: (pid: string, eid: string) =>
+      http<ProjectElement>(`/api/projects/${pid}/elements/${eid}`),
+    create: (
+      pid: string,
+      input: {
+        name: string;
+        slug?: string;
+        type?: ElementType;
+        description?: string;
+        assignee_id?: string | null;
+        settings?: Record<string, unknown>;
+      },
+    ) =>
+      http<ProjectElement>(`/api/projects/${pid}/elements`, {
+        method: "POST",
+        body: JSON.stringify(input),
+      }),
+    update: (
+      pid: string,
+      eid: string,
+      patch: {
+        name?: string;
+        type?: ElementType;
+        description?: string;
+        assignee_id?: string | null;
+        settings?: Record<string, unknown>;
+      },
+    ) =>
+      http<ProjectElement>(`/api/projects/${pid}/elements/${eid}`, {
+        method: "PATCH",
+        body: JSON.stringify(patch),
+      }),
+    archive: (pid: string, eid: string) =>
+      http<ProjectElement>(`/api/projects/${pid}/elements/${eid}/archive`, { method: "POST" }),
+    remove: (pid: string, eid: string, mode?: "untag") =>
+      http<{ ok: boolean }>(
+        `/api/projects/${pid}/elements/${eid}${mode ? `?mode=${mode}` : ""}`,
+        { method: "DELETE" },
+      ),
+  },
+
   routines: {
     list: (pid: string) =>
       http<{ items: Routine[] }>(`/api/projects/${pid}/routines`).then((r) => r.items),
@@ -254,11 +347,43 @@ export const projectsApi = {
   activity: (pid: string) =>
     http<{ items: ProjectActivity[] }>(`/api/projects/${pid}/activity`).then((r) => r.items),
 
+  docReviews: {
+    list: (pid: string, state?: string) =>
+      http<{ items: DocReview[] }>(
+        `/api/projects/${encodeURIComponent(pid)}/doc-reviews${state ? `?state=${encodeURIComponent(state)}` : ""}`,
+      ).then((r) => r.items),
+    get: (pid: string, docPath: string) =>
+      http<DocReview | DocReviewMissing>(
+        `/api/projects/${encodeURIComponent(pid)}/doc-review/${encodeURIComponent(docPath)}`,
+      ),
+    set: (pid: string, docPath: string, state: string) =>
+      http<DocReview>(
+        `/api/projects/${encodeURIComponent(pid)}/doc-review/${encodeURIComponent(docPath)}`,
+        { method: "PUT", body: JSON.stringify({ state }) },
+      ),
+  },
+
   subscribeEvents(projectId: string, onEvent: (ev: ProjectEvent) => void): () => void {
     const es = new EventSource(`/api/projects/${projectId}/events`);
     es.onmessage = (e) => {
       try { onEvent(JSON.parse(e.data) as ProjectEvent); } catch { /* heartbeat / malformed — skip */ }
     };
     return () => es.close();
+  },
+
+  docReview: {
+    get: (pid: string, docPath: string) =>
+      http<DocReview | DocReviewMissing>(
+        `/api/projects/${pid}/doc-review/${encodeURIComponent(docPath)}`,
+      ),
+    set: (pid: string, docPath: string, state: DocReviewState) =>
+      http<DocReview>(`/api/projects/${pid}/doc-review/${encodeURIComponent(docPath)}`, {
+        method: "PUT",
+        body: JSON.stringify({ state }),
+      }),
+    list: (pid: string, state?: string) =>
+      http<{ items: DocReview[] }>(
+        `/api/projects/${pid}/doc-reviews${state ? `?state=${state}` : ""}`,
+      ).then((r) => r.items),
   },
 };
