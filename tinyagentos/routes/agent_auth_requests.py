@@ -54,6 +54,12 @@ VALID_SCOPES = frozenset({
     # agent's OWN project only (bound by the token's project_id claim). Does NOT
     # grant task create, member management, or project lifecycle.
     "project_tasks",
+    # Canvas access: read and write on a specific project's canvas. Like
+    # project_tasks, a project_id is required so the token is bound to the
+    # operator-validated project rather than whatever the unauthenticated agent
+    # named in the request.
+    "canvas_read",
+    "canvas_write",
 })
 
 
@@ -298,17 +304,26 @@ async def _do_approve(request: Request, request_id: str, body: ApproveBody, user
             ),
         )
 
-    # project_tasks binds the token to a specific project and adds a membership
-    # row, so require the human to pick that project explicitly in the consent
-    # card. Never fall back to the agent-supplied project_id for a task grant:
-    # POST /api/agents/auth-requests is unauthenticated, so the request could
-    # name any existing project the operator never validated. Other scopes keep
-    # the fallback so global tokens still work. Checked before any registration
-    # so a rejected approval never leaves an orphaned agent.
-    if "project_tasks" in body.granted_scopes and body.project_id is None:
+    _CANVAS_SCOPES = {"canvas_read", "canvas_write"}
+    _PROJECT_SCOPES = {"project_tasks"} | _CANVAS_SCOPES
+
+    # project_tasks and the canvas scopes bind the token to a specific project
+    # and add a membership row, so require the human to pick that project
+    # explicitly in the consent card. Never fall back to the agent-supplied
+    # project_id for these grants: POST /api/agents/auth-requests is
+    # unauthenticated, so the request could name any existing project the
+    # operator never validated. Other scopes keep the fallback so global
+    # tokens still work. Checked before any registration so a rejected approval
+    # never leaves an orphaned agent.
+    needs_project = bool(set(body.granted_scopes) & _PROJECT_SCOPES)
+    # Reject None, "", and whitespace-only: a blank project_id is not a real
+    # binding, and a downstream truthy check would treat it as unbound, so an
+    # empty string must fail closed exactly like a missing one.
+    if needs_project and not (body.project_id and body.project_id.strip()):
+        missing = sorted(set(body.granted_scopes) & _PROJECT_SCOPES)
         raise HTTPException(
             status_code=400,
-            detail="project_id is required when granting project_tasks",
+            detail=f"project_id is required when granting {missing}",
         )
 
     registry = _get_registry_store(request)
