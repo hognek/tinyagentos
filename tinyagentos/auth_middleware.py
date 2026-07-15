@@ -58,11 +58,27 @@ _AGENT_TASK_ROUTES = (
     ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/(claim|release|close|reopen)$")),
 )
 
+_AGENT_CANVAS_ROUTES = (
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/elements$")),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/canvas/elements$")),
+    ("DELETE", re.compile(rf"^/api/projects/{_SEG}/canvas/elements/{_SEG}$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/snapshot\.png$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/snapshot\.tldr$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/stream$")),
+)
+
 
 def _is_agent_task_path(method: str, path: str) -> bool:
     """True only for the exact subset of task routes a project_tasks token may
     reach.  Strict method + anchored-regex match; everything else is excluded."""
     return any(m == method and rx.match(path) for m, rx in _AGENT_TASK_ROUTES)
+
+
+def _is_agent_canvas_path(method: str, path: str) -> bool:
+    """True only for the exact subset of canvas routes a canvas_read/canvas_write
+    token may reach.  Strict method + anchored-regex match; the PATCH elements
+    and PATCH permissions routes stay session-only."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_CANVAS_ROUTES)
 # Bundle assets and the SPA shell HTML must be reachable without auth so:
 #   1. The browser can install and cache the shell for offline / PWA use.
 #   2. After a backend restart the cached shell loads immediately without
@@ -255,6 +271,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if (
             path in _AGENT_TOKEN_PATHS
             or _is_agent_task_path(request.method, path)
+            or _is_agent_canvas_path(request.method, path)
         ) and auth_header.lower().startswith("bearer "):
             request.state.user_id = None
             request.state.is_admin = False
