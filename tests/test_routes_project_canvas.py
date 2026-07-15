@@ -790,3 +790,224 @@ class TestPermissionPatchExtendsFlags:
             )
         assert resp.status_code == 401
 
+
+# ---------------------------------------------------------------------------
+# Slice 4: the SSE stream and the snapshot endpoints are gated by canvas_read
+# for agent principals, and the keepalive tick re-checks the live read flag so
+# a revoked agent cannot keep a long-lived stream open (lead-agent-identity
+# design, Slice 4 + Edge cases).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCanvasStreamAgentGating:
+    async def _connect_status(self, ctx, pid, token):
+        """Open the SSE route directly so we never read the infinite body.
+
+        A denied agent either raises HTTPException (missing scope) or returns a
+        JSONResponse (flag off); an allowed agent returns a StreamingResponse.
+        """
+        from fastapi import HTTPException as _HTTPExc
+        from starlette.responses import StreamingResponse as _SR
+        from starlette.responses import JSONResponse as _JR
+        from tinyagentos.routes.project_canvas import canvas_stream
+
+        try:
+            resp = await canvas_stream(pid, _stream_req(ctx.app, token=token))
+        except _HTTPExc as exc:
+            return exc.status_code
+        if isinstance(resp, _SR):
+            return 200
+        if isinstance(resp, _JR):
+            return resp.status_code
+        return None
+
+    async def test_stream_connect_allowed_with_read_scope_and_flag(self, ctx):
+        pid = await _new_project(ctx, "stream-read")
+        cid, token = await _mint_agent(ctx, pid, ("canvas_read",))
+        await _add_member(ctx, pid, cid)
+        await _grant_canvas(ctx, pid, cid, read=True)
+        assert await self._connect_status(ctx, pid, token) == 200
+
+    async def test_stream_connect_without_scope_is_403(self, ctx):
+        pid = await _new_project(ctx, "stream-noscope")
+        # canvas_write only: the read scope is missing.
+        cid, token = await _mint_agent(ctx, pid, ("canvas_write",))
+        await _add_member(ctx, pid, cid)
+        await _grant_canvas(ctx, pid, cid, read=True)
+        assert await self._connect_status(ctx, pid, token) == 403
+
+    async def test_stream_connect_without_flag_is_403(self, ctx):
+        pid = await _new_project(ctx, "stream-noflag")
+        cid, token = await _mint_agent(ctx, pid, ("canvas_read",))
+        await _add_member(ctx, pid, cid)
+        # can_read_canvas flag is off.
+        assert await self._connect_status(ctx, pid, token) == 403
+
+    async def test_stream_closes_after_read_flag_cleared(self, ctx):
+        """Slice 4 edge case: an agent principal's open stream must close once
+        its can_read_canvas flag is cleared, bounded by the keepalive interval."""
+        from tinyagentos.projects.events import ProjectEvent
+        from tinyagentos.routes.project_canvas import canvas_stream
+
+        pid = await _new_project(ctx, "stream-revoke")
+        cid, token = await _mint_agent(ctx, pid, ("canvas_read",))
+        await _add_member(ctx, pid, cid)
+        await _grant_canvas(ctx, pid, cid, read=True)
+        resp = await canvas_stream(pid, _stream_req(ctx.app, token=token))
+        gen = resp.body_iterator
+        broker = ctx.app.state.project_event_broker
+
+        # A published event lets the generator emit a data frame immediately,
+        # proving the agent principal's stream is live.
+        async def _emit(n):
+            await broker.publish(
+                pid, ProjectEvent(kind="canvas.element_added", payload={"n": n})
+            )
+
+        await _emit(1)
+        frame = await asyncio.wait_for(gen.__anext__(), timeout=5)
+        assert frame.startswith("data: ")
+        # Revoke read access while the stream is still open. The permissions
+        # PATCH publishes a canvas.permission_changed event that the live stream
+        # emits (proving liveness through events), then the next keepalive tick
+        # re-checks the flag and closes the stream.
+        await _grant_canvas(ctx, pid, cid, read=False)
+        closed = False
+        try:
+            while True:
+                await asyncio.wait_for(gen.__anext__(), timeout=12)
+        except StopAsyncIteration:
+            closed = True
+        assert closed
+
+
+@pytest.mark.asyncio
+class TestCanvasSnapshotAgentGating:
+    async def test_snapshot_png_allowed_with_read_scope_and_flag(self, ctx):
+        pid = await _new_project(ctx, "snap-read")
+        cid, token = await _mint_agent(ctx, pid, ("canvas_read",))
+        await _add_member(ctx, pid, cid)
+        await _grant_canvas(ctx, pid, cid, read=True)
+        async with _bare(ctx.app) as bare:
+            resp = await bare.get(
+                f"/api/projects/{pid}/canvas/snapshot.png", headers=_hdr(token)
+            )
+        assert resp.status_code == 200
+        assert resp.headers.get("content-type") == "image/png"
+
+    async def test_snapshot_png_write_only_is_403(self, ctx):
+        """Snapshots are READ scope only: a canvas_write-only token is denied."""
+        pid = await _new_project(ctx, "snap-wo")
+        cid, token = await _mint_agent(ctx, pid, ("canvas_write",))
+        await _add_member(ctx, pid, cid)
+        await _grant_canvas(ctx, pid, cid, read=True)
+        async with _bare(ctx.app) as bare:
+            resp = await bare.get(
+                f"/api/projects/{pid}/canvas/snapshot.png", headers=_hdr(token)
+            )
+        assert resp.status_code == 403
+
+    async def test_snapshot_png_without_flag_is_403(self, ctx):
+        pid = await _new_project(ctx, "snap-noflag")
+        cid, token = await _mint_agent(ctx, pid, ("canvas_read",))
+        await _add_member(ctx, pid, cid)
+        async with _bare(ctx.app) as bare:
+            resp = await bare.get(
+                f"/api/projects/{pid}/canvas/snapshot.png", headers=_hdr(token)
+            )
+        assert resp.status_code == 403
+
+    async def test_snapshot_tldr_write_only_is_403(self, ctx):
+        """Snapshots are READ scope only, even for the tldr endpoint."""
+        pid = await _new_project(ctx, "snap-tldr-wo")
+        cid, token = await _mint_agent(ctx, pid, ("canvas_write",))
+        await _add_member(ctx, pid, cid)
+        await _grant_canvas(ctx, pid, cid, read=True)
+        async with _bare(ctx.app) as bare:
+            resp = await bare.get(
+                f"/api/projects/{pid}/canvas/snapshot.tldr", headers=_hdr(token)
+            )
+        assert resp.status_code == 403
+
+    async def test_snapshot_tldr_allowed_with_read_scope_and_flag(self, ctx):
+        pid = await _new_project(ctx, "snap-tldr-read")
+        snap = ctx.app.state.canvas_snapshotter
+        if snap is None:
+            pytest.skip("canvas_snapshotter not available; needs container backend")
+        cid, token = await _mint_agent(ctx, pid, ("canvas_read",))
+        await _add_member(ctx, pid, cid)
+        await _grant_canvas(ctx, pid, cid, read=True)
+        async with _bare(ctx.app) as bare:
+            resp = await bare.get(
+                f"/api/projects/{pid}/canvas/snapshot.tldr", headers=_hdr(token)
+            )
+        assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# Slice 4 regression: session owner/admin behavior on stream + snapshots is
+# unchanged by the agent gating.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestCanvasStreamSnapshotSessionUnchanged:
+    async def test_owner_stream_connect_allowed(self, ctx):
+        from tinyagentos.routes.project_canvas import canvas_stream
+
+        pid = await _new_project(ctx, "owner-stream")
+        resp = await canvas_stream(
+            pid, _stream_req(ctx.app, user_id=ctx.uid, is_admin=True)
+        )
+        from starlette.responses import StreamingResponse as _SR
+
+        assert isinstance(resp, _SR)
+
+    async def test_owner_snapshot_png_allowed(self, ctx):
+        pid = await _new_project(ctx, "owner-snap")
+        resp = await ctx.client.get(
+            f"/api/projects/{pid}/canvas/snapshot.png"
+        )
+        assert resp.status_code == 200
+
+    async def test_session_gating_uses_project_visibility(self, ctx):
+        """A non-owner human session still collapses into 404 (D3 matrix),
+        so agent gating did not change session semantics."""
+        pid = await _new_project(ctx, "nonowner-snap")
+        async with _non_owner_client(ctx.app) as other:
+            resp = await other.get(
+                f"/api/projects/{pid}/canvas/snapshot.png"
+            )
+        assert resp.status_code == 404
+
+
+def _stream_req(app, *, token=None, user_id=None, is_admin=False):
+    """Build a minimal Starlette Request wired to the real app.state so the
+    canvas stream route can be invoked directly (no infinite-body client read)."""
+    from starlette.requests import Request as _StarletteRequest
+
+    headers = []
+    if token is not None:
+        headers.append((b"authorization", f"Bearer {token}".encode()))
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/x",
+        "query_string": b"",
+        "headers": headers,
+        "app": app,
+    }
+    req = _StarletteRequest(scope)
+    req.state.user_id = user_id
+    req.state.is_admin = is_admin
+
+    # is_disconnected() cancels its scope and awaits receive; an immediate,
+    # non-awaiting receive returns a normal request message so the check
+    # resolves to False (the stream is "connected").
+    async def _receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    req._receive = _receive
+    return req
+
