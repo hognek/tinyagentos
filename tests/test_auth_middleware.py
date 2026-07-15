@@ -289,8 +289,10 @@ class TestIsAgentCanvasPath:
     def test_stream_allowed(self):
         assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/stream") is True
 
-    def test_update_element_patch_not_allowed(self):
-        assert _is_agent_canvas_path("PATCH", "/api/projects/proj-1/canvas/elements/el-1") is False
+    def test_update_element_patch_allowed(self):
+        # canvas_write-bound agents may PATCH an element (create + update +
+        # delete all live under canvas_write), so the route is on the allowlist.
+        assert _is_agent_canvas_path("PATCH", "/api/projects/proj-1/canvas/elements/el-1") is True
 
     def test_permissions_patch_not_allowed(self):
         assert _is_agent_canvas_path("PATCH", "/api/projects/proj-1/canvas/permissions/agent-1") is False
