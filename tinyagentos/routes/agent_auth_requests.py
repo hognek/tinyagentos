@@ -28,7 +28,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from tinyagentos.agent_registry_store import mint_registry_token
+from aiosqlite import IntegrityError
+from tinyagentos.agent_registry_store import _slugify, mint_registry_token
 from tinyagentos.auth_context import CurrentUser, current_user
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,12 @@ VALID_SCOPES = frozenset({
     # agent's OWN project only (bound by the token's project_id claim). Does NOT
     # grant task create, member management, or project lifecycle.
     "project_tasks",
+    # Canvas access: read and write on a specific project's canvas. Like
+    # project_tasks, a project_id is required so the token is bound to the
+    # operator-validated project rather than whatever the unauthenticated agent
+    # named in the request.
+    "canvas_read",
+    "canvas_write",
 })
 
 
@@ -298,17 +305,26 @@ async def _do_approve(request: Request, request_id: str, body: ApproveBody, user
             ),
         )
 
-    # project_tasks binds the token to a specific project and adds a membership
-    # row, so require the human to pick that project explicitly in the consent
-    # card. Never fall back to the agent-supplied project_id for a task grant:
-    # POST /api/agents/auth-requests is unauthenticated, so the request could
-    # name any existing project the operator never validated. Other scopes keep
-    # the fallback so global tokens still work. Checked before any registration
-    # so a rejected approval never leaves an orphaned agent.
-    if "project_tasks" in body.granted_scopes and body.project_id is None:
+    _CANVAS_SCOPES = {"canvas_read", "canvas_write"}
+    _PROJECT_SCOPES = {"project_tasks"} | _CANVAS_SCOPES
+
+    # project_tasks and the canvas scopes bind the token to a specific project
+    # and add a membership row, so require the human to pick that project
+    # explicitly in the consent card. Never fall back to the agent-supplied
+    # project_id for these grants: POST /api/agents/auth-requests is
+    # unauthenticated, so the request could name any existing project the
+    # operator never validated. Other scopes keep the fallback so global
+    # tokens still work. Checked before any registration so a rejected approval
+    # never leaves an orphaned agent.
+    needs_project = bool(set(body.granted_scopes) & _PROJECT_SCOPES)
+    # Reject None, "", and whitespace-only: a blank project_id is not a real
+    # binding, and a downstream truthy check would treat it as unbound, so an
+    # empty string must fail closed exactly like a missing one.
+    if needs_project and not (body.project_id and body.project_id.strip()):
+        missing = sorted(set(body.granted_scopes) & _PROJECT_SCOPES)
         raise HTTPException(
             status_code=400,
-            detail="project_id is required when granting project_tasks",
+            detail=f"project_id is required when granting {missing}",
         )
 
     registry = _get_registry_store(request)
@@ -324,20 +340,62 @@ async def _do_approve(request: Request, request_id: str, body: ApproveBody, user
     # non-empty value.
     _claim = record["identity_claim"].strip().removeprefix("@").strip()
     display_name = _claim or record["framework"]
-    reg_record = await registry.register(
-        framework=record["framework"],
-        display_name=display_name,
-        user_id=user.user_id,
-        origin="external-selfjoin",
-        handle="",
-    )
-    canonical_id = reg_record["canonical_id"]
 
-    # Consent approval IS the activation. external-selfjoin agents are born
-    # 'pending' (governance lifecycle); approving the auth-request transitions
-    # them to 'active' so they are NOT in the bus inactive/revocation feed and
-    # @taOSmd's identity-AND-grant gate accepts them.
-    await registry.set_status(canonical_id, "active", actor=user.user_id)
+    handle = _slugify(_claim)
+    existing_active = await registry.get_by_handle(handle, status="active")
+    if existing_active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"handle '{handle}' is already in use by active agent "
+                f"{existing_active['canonical_id']}; pick a different identity_claim"
+            ),
+        )
+
+    # Register with the handle SET at birth. external-selfjoin agents are born
+    # 'pending' (governance lifecycle), so the partial unique index
+    # ux_agent_active_handle (active + non-empty handle) does not fire at INSERT
+    # time; it fires only when we flip the row to 'active' below.  That removes
+    # the old window (register handle='' -> set active -> update handle) in which
+    # an agent could sit ACTIVE with an empty handle, and lets SQLite reject a
+    # duplicate active handle the instant a concurrent approve tries to take it.
+    canonical_id = None
+    try:
+        reg_record = await registry.register(
+            framework=record["framework"],
+            display_name=display_name,
+            user_id=user.user_id,
+            origin="external-selfjoin",
+            handle=handle,
+        )
+        canonical_id = reg_record["canonical_id"]
+
+        # Consent approval IS the activation. external-selfjoin agents are born
+        # 'pending' (governance lifecycle); approving the auth-request transitions
+        # them to 'active' so they are NOT in the bus inactive/revocation feed and
+        # @taOSmd's identity-AND-grant gate accepts them.
+        await registry.set_status(canonical_id, "active", actor=user.user_id)
+    except IntegrityError:
+        # A concurrent approve already took this active handle (the partial
+        # unique index fired). Roll back the failed write and remove the
+        # half-registered pending row so we never leave an active-without-handle
+        # agent or a stale pending row. Return the same friendly 409.
+        try:
+            await registry.rollback()
+        except Exception:  # noqa: BLE001 - never mask the 409 below
+            pass
+        if canonical_id is not None:
+            try:
+                await registry.delete(canonical_id)
+            except Exception:  # noqa: BLE001 - never mask the 409 below
+                pass
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"handle '{handle}' is already in use by active agent; "
+                f"pick a different identity_claim"
+            ),
+        )
 
     # Resolve effective project binding: admin override wins; fall back to the
     # project_id the agent requested (may be None for a global token).

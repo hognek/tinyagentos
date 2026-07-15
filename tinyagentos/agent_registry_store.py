@@ -49,6 +49,24 @@ CREATE TABLE IF NOT EXISTS agent_registry (
 );
 """
 
+# Partial unique index: at most ONE active agent may own any given non-empty
+# handle. SQLite enforces this atomically, so two concurrent consent approvals
+# of the same identity_claim cannot both flip to 'active' with the same handle.
+# Pending / suspended / revoked rows and empty handles are excluded from the
+# index, so (a) a handle can be reused once its owner leaves 'active', and (b)
+# pre-existing empty-handle active agents never block the index's creation.
+#
+# This index references the ``status`` column, which is added by
+# _migration_v1_add_status on the migration path.  Per BaseStore's contract it
+# therefore CANNOT live in SCHEMA (the executescript runs before migrations and
+# would crash on a pre-status table); it is created in _post_init after the
+# migration guarantees the column exists.
+ACTIVE_HANDLE_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS ux_agent_active_handle
+    ON agent_registry(handle)
+    WHERE status = 'active' AND handle != '';
+"""
+
 # ---------------------------------------------------------------------------
 # Lifecycle state machine
 # ---------------------------------------------------------------------------
@@ -348,6 +366,9 @@ class AgentRegistryStore(BaseStore):
         await _migration_v1_add_status(self._db)
         await _migration_v2_strip_at_display_name(self._db)
         await _migration_v3_add_org_fields(self._db)
+        # Created after the status migration so the partial index's WHERE clause
+        # can reference the status column on the pre-status migration path.
+        await self._db.executescript(ACTIVE_HANDLE_INDEX)
 
     # ------------------------------------------------------------------
     # Registration
@@ -424,6 +445,26 @@ class AgentRegistryStore(BaseStore):
     # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------
+
+    async def rollback(self) -> None:
+        """Roll back the current transaction, clearing any failed write so the
+        connection can accept new statements.  No-op if the store is closed or
+        no transaction is open.
+        """
+        if self._db is not None:
+            await self._db.rollback()
+
+    async def delete(self, canonical_id: str) -> None:
+        """Permanently remove *canonical_id* (used to clean up a half-registered
+        row when a concurrent approve wins the active-handle race).  Returns
+        silently if *canonical_id* does not exist.
+        """
+        if self._db is None:
+            raise RuntimeError("AgentRegistryStore not initialised")
+        await self._db.execute(
+            "DELETE FROM agent_registry WHERE canonical_id = ?", (canonical_id,)
+        )
+        await self._db.commit()
 
     async def get(self, canonical_id: str) -> Optional[dict]:
         """Return the record for *canonical_id*, or ``None``."""

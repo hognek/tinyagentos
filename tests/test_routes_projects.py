@@ -1,4 +1,5 @@
 import pytest
+from httpx import ASGITransport, AsyncClient
 
 
 @pytest.mark.asyncio
@@ -701,3 +702,78 @@ async def test_ready_tasks_filter_by_element(client):
     )).json()["items"]
     assert all(t["element_id"] is None for t in none_items)
     assert len(none_items) == 1
+
+
+# ---------------------------------------------------------------------------
+# Slice 6 (D7): the Lead designation is an exclusive, project-level pointer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_set_lead_exclusive_leaves_only_last(client):
+    """Setting lead B after lead A leaves only B; the pointer holds one lead."""
+    pid = (await client.post("/api/projects", json={"name": "P", "slug": "lead-excl"})).json()["id"]
+    await client.post(f"/api/projects/{pid}/members", json={"mode": "native", "agent_id": "agent-a"})
+    await client.post(f"/api/projects/{pid}/members", json={"mode": "native", "agent_id": "agent-b"})
+
+    r1 = await client.patch(f"/api/projects/{pid}/lead", json={"member_id": "agent-a"})
+    assert r1.status_code == 200
+    assert r1.json()["lead_member_id"] == "agent-a"
+
+    r2 = await client.patch(f"/api/projects/{pid}/lead", json={"member_id": "agent-b"})
+    assert r2.status_code == 200
+    assert r2.json()["lead_member_id"] == "agent-b"
+
+    # The pointer cannot hold two leads; only the last one remains.
+    proj = (await client.get(f"/api/projects/{pid}")).json()
+    assert proj["lead_member_id"] == "agent-b"
+
+
+@pytest.mark.asyncio
+async def test_set_lead_non_member_returns_404(client):
+    pid = (await client.post("/api/projects", json={"name": "P", "slug": "lead-404"})).json()["id"]
+    await client.post(f"/api/projects/{pid}/members", json={"mode": "native", "agent_id": "agent-a"})
+
+    r = await client.patch(f"/api/projects/{pid}/lead", json={"member_id": "not-a-member"})
+    assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_clear_lead_to_null(client):
+    pid = (await client.post("/api/projects", json={"name": "P", "slug": "lead-null"})).json()["id"]
+    await client.post(f"/api/projects/{pid}/members", json={"mode": "native", "agent_id": "agent-a"})
+
+    r = await client.patch(f"/api/projects/{pid}/lead", json={"member_id": "agent-a"})
+    assert r.status_code == 200
+    assert r.json()["lead_member_id"] == "agent-a"
+    assert (await client.get(f"/api/projects/{pid}")).json()["lead_member_id"] == "agent-a"
+
+    r = await client.patch(f"/api/projects/{pid}/lead", json={"member_id": None})
+    assert r.status_code == 200
+    assert r.json()["lead_member_id"] is None
+    assert (await client.get(f"/api/projects/{pid}")).json()["lead_member_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_set_lead_requires_session(app, client):
+    """The lead route is session-only: an unauthenticated request is rejected."""
+    pid = (await client.post("/api/projects", json={"name": "P", "slug": "lead-auth"})).json()["id"]
+    await client.post(f"/api/projects/{pid}/members", json={"mode": "native", "agent_id": "agent-a"})
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as anon:
+        r = await anon.patch(f"/api/projects/{pid}/lead", json={"member_id": "agent-a"})
+    assert r.status_code in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_old_per_member_lead_route_removed(client):
+    """The retired per-member lead route is gone (replaced by the project pointer)."""
+    pid = (await client.post("/api/projects", json={"name": "P", "slug": "lead-old"})).json()["id"]
+    await client.post(f"/api/projects/{pid}/members", json={"mode": "native", "agent_id": "agent-a"})
+
+    r = await client.patch(
+        f"/api/projects/{pid}/members/agent-a/lead", json={"is_lead": True}
+    )
+    assert r.status_code == 404
+
