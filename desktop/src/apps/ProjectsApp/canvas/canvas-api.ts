@@ -92,15 +92,22 @@ export const canvasApi = {
     return r.ok;
   },
 
+  // Set a single canvas capability checkbox for an agent member. `flag` selects
+  // which capability to flip: "read" (can_read_canvas) or "edit" (can_edit_canvas).
+  // Both default OFF in the store, so the human ticks exactly what each agent
+  // may do. The backend permission PATCH accepts either field independently.
   async setPermission(
-    projectId: string, agentId: string, canEdit: boolean,
+    projectId: string, agentId: string, flag: "read" | "edit", allowed: boolean,
   ): Promise<void> {
+    const body = flag === "read"
+      ? { can_read_canvas: allowed }
+      : { can_edit_canvas: allowed };
     const r = await fetch(
       `/api/projects/${projectId}/canvas/permissions/${agentId}`,
       {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ can_edit_canvas: canEdit }),
+        body: JSON.stringify(body),
       },
     );
     if (!r.ok) throw new Error(`setPermission failed: ${r.status}`);

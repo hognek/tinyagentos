@@ -49,6 +49,24 @@ CREATE TABLE IF NOT EXISTS agent_registry (
 );
 """
 
+# Partial unique index: at most ONE active agent may own any given non-empty
+# handle. SQLite enforces this atomically, so two concurrent consent approvals
+# of the same identity_claim cannot both flip to 'active' with the same handle.
+# Pending / suspended / revoked rows and empty handles are excluded from the
+# index, so (a) a handle can be reused once its owner leaves 'active', and (b)
+# pre-existing empty-handle active agents never block the index's creation.
+#
+# This index references the ``status`` column, which is added by
+# _migration_v1_add_status on the migration path.  Per BaseStore's contract it
+# therefore CANNOT live in SCHEMA (the executescript runs before migrations and
+# would crash on a pre-status table); it is created in _post_init after the
+# migration guarantees the column exists.
+ACTIVE_HANDLE_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS ux_agent_active_handle
+    ON agent_registry(handle)
+    WHERE status = 'active' AND handle != '';
+"""
+
 # ---------------------------------------------------------------------------
 # Lifecycle state machine
 # ---------------------------------------------------------------------------
@@ -138,6 +156,54 @@ async def _migration_v3_add_org_fields(conn) -> None:
     if "reports_to" not in existing_cols:
         await conn.execute("ALTER TABLE agent_registry ADD COLUMN reports_to TEXT")
     await conn.commit()
+
+
+async def _migration_v4_dedupe_active_handles(conn) -> None:
+    """Blank duplicate active handles so ux_agent_active_handle can be created.
+
+    Handle uniqueness among active agents is a NEW invariant (the consent flow
+    added it).  Databases created before it can legally hold two active rows
+    with the same non-empty handle.  Creating the partial unique index over
+    such a DB raises IntegrityError, and since this runs in lifespan the whole
+    controller would fail to boot on every restart until manual DB surgery --
+    unacceptable for a no-terminal appliance.
+
+    Heal it non-destructively: keep the handle on the OLDEST active row (lowest
+    id, the most likely original owner) and blank it on the rest.  The rows
+    survive as active agents; empty handles are excluded from the index, so a
+    freed handle can be reclaimed later.  Every change is logged so an operator
+    can reconcile.  Idempotent: a clean DB has no duplicates and is untouched.
+    """
+    rows = await (
+        await conn.execute(
+            "SELECT id, canonical_id, handle FROM agent_registry "
+            "WHERE status = 'active' AND handle != '' ORDER BY handle, id"
+        )
+    ).fetchall()
+
+    seen_handles: set[str] = set()
+    demoted: list[tuple[str, str]] = []  # (canonical_id, handle)
+    for row in rows:
+        handle = row[2]
+        if handle in seen_handles:
+            demoted.append((row[1], handle))
+        else:
+            seen_handles.add(handle)
+
+    for canonical_id, handle in demoted:
+        await conn.execute(
+            "UPDATE agent_registry SET handle = '' WHERE canonical_id = ?",
+            (canonical_id,),
+        )
+        logger.warning(
+            "registry heal: blanked duplicate active handle %r on agent %s so the "
+            "active-handle unique index can be created; reassign a handle if needed",
+            handle,
+            canonical_id,
+        )
+    if demoted:
+        await conn.commit()
+
 
 # ---------------------------------------------------------------------------
 # Signing-key helpers (Ed25519, persisted to disk)
@@ -348,6 +414,22 @@ class AgentRegistryStore(BaseStore):
         await _migration_v1_add_status(self._db)
         await _migration_v2_strip_at_display_name(self._db)
         await _migration_v3_add_org_fields(self._db)
+        # Dedupe BEFORE the index so a pre-invariant DB with duplicate active
+        # handles cannot make the CREATE UNIQUE INDEX (hence boot) fail.
+        await _migration_v4_dedupe_active_handles(self._db)
+        # Created after the status migration so the partial index's WHERE clause
+        # can reference the status column on the pre-status migration path.
+        # Guard the index creation too: if some path we did not anticipate still
+        # leaves a duplicate, warn and continue rather than bricking boot -- the
+        # uniqueness is also enforced at write time (register/activation).
+        try:
+            await self._db.executescript(ACTIVE_HANDLE_INDEX)
+        except aiosqlite.IntegrityError:
+            logger.error(
+                "registry: could not create ux_agent_active_handle (duplicate "
+                "active handles remain); continuing without it -- write-time "
+                "uniqueness still applies. Reconcile duplicate handles manually."
+            )
 
     # ------------------------------------------------------------------
     # Registration
@@ -424,6 +506,26 @@ class AgentRegistryStore(BaseStore):
     # ------------------------------------------------------------------
     # Read
     # ------------------------------------------------------------------
+
+    async def rollback(self) -> None:
+        """Roll back the current transaction, clearing any failed write so the
+        connection can accept new statements.  No-op if the store is closed or
+        no transaction is open.
+        """
+        if self._db is not None:
+            await self._db.rollback()
+
+    async def delete(self, canonical_id: str) -> None:
+        """Permanently remove *canonical_id* (used to clean up a half-registered
+        row when a concurrent approve wins the active-handle race).  Returns
+        silently if *canonical_id* does not exist.
+        """
+        if self._db is None:
+            raise RuntimeError("AgentRegistryStore not initialised")
+        await self._db.execute(
+            "DELETE FROM agent_registry WHERE canonical_id = ?", (canonical_id,)
+        )
+        await self._db.commit()
 
     async def get(self, canonical_id: str) -> Optional[dict]:
         """Return the record for *canonical_id*, or ``None``."""
