@@ -7,6 +7,7 @@ export type Project = {
   created_by: string;
   created_at: number;
   updated_at: number;
+  lead_member_id?: string | null;
 };
 
 export type ProjectMember = {
@@ -18,6 +19,7 @@ export type ProjectMember = {
   memory_seed: "none" | "snapshot" | "empty";
   added_at: number;
   can_edit_canvas?: boolean;
+  can_read_canvas?: boolean;
   is_lead?: number;
 };
 
@@ -176,6 +178,13 @@ export const projectsApi = {
     http<Project>(`/api/projects/${id}/archive`, { method: "POST" }),
   remove: (id: string) =>
     http<Project>(`/api/projects/${id}`, { method: "DELETE" }),
+  // D7: the Lead is an exclusive, project-level designation. Pass a member id
+  // to promote that member, or null to clear the lead.
+  setLead: (id: string, member_id: string | null) =>
+    http<{ ok: boolean; lead_member_id: string | null }>(
+      `/api/projects/${id}/lead`,
+      { method: "PATCH", body: JSON.stringify({ member_id }) },
+    ),
 
   members: {
     list: (pid: string) =>
@@ -192,11 +201,6 @@ export const projectsApi = {
       }),
     remove: (pid: string, member_id: string) =>
       http<{ ok: boolean }>(`/api/projects/${pid}/members/${member_id}`, { method: "DELETE" }),
-    setLead: (pid: string, member_id: string, is_lead: boolean) =>
-      http<{ ok: boolean; is_lead: boolean }>(
-        `/api/projects/${pid}/members/${member_id}/lead`,
-        { method: "PATCH", body: JSON.stringify({ is_lead }) },
-      ),
   },
 
   tasks: {

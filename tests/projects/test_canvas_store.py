@@ -73,10 +73,17 @@ async def test_user_can_add_ideas_board_kind(store, kind):
 
 @pytest.mark.parametrize("kind", ["text", "mermaid", "flowchart", "mindmap_edge"])
 @pytest.mark.asyncio
-async def test_agent_can_emit_ideas_board_kind(store, kind):
-    # Agents may paint the ideas-board kinds via the canvas tools (#68).
-    e = await store.add_element(
-        project_id="p",
+async def test_agent_can_emit_ideas_board_kind(store_with_member, kind):
+    # Agents may paint the ideas-board kinds via the canvas tools (#68). The
+    # store enforces can_edit_canvas, so the member needs the edit flag set.
+    cs, _ = store_with_member
+    await cs._db.execute(
+        "UPDATE project_members SET can_edit_canvas = 1 "
+        "WHERE project_id = 'p1' AND member_id = 'agent-1'"
+    )
+    await cs._db.commit()
+    e = await cs.add_element(
+        project_id="p1",
         element={"kind": kind, "x": 0, "y": 0, "w": 1, "h": 1, "payload": {}},
         author_kind="agent", author_id="agent-1",
     )

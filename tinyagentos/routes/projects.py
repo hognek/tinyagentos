@@ -296,27 +296,38 @@ async def list_members(
     return {"items": await store.list_members(project_id)}
 
 
-class LeadIn(BaseModel):
-    is_lead: bool
+class ProjectLeadIn(BaseModel):
+    member_id: "str | None" = None
 
 
-@router.patch("/api/projects/{project_id}/members/{member_id}/lead")
-async def set_lead(
+@router.patch("/api/projects/{project_id}/lead")
+async def set_project_lead(
     project_id: str,
-    member_id: str,
-    body: LeadIn,
+    body: ProjectLeadIn,
     request: Request,
     user: CurrentUser = Depends(current_user),
 ):
+    """Set the project's exclusive Lead (D7). The single lead_member_id pointer
+    makes the one-lead-per-project invariant structural: setting a new lead
+    atomically unsets the previous one. ``member_id: null`` clears the lead.
+
+    Session-only (owner or admin, same gate as the members routes). A member id
+    not in the project returns 404.
+    """
     store = request.app.state.project_store
     p = await store.get_project(project_id)
     if p is None:
         return JSONResponse({"error": "not found"}, status_code=404)
     require_owner_or_admin(user, p["user_id"])
     try:
-        await store.set_member_lead(project_id, member_id, body.is_lead)
+        await store.set_lead(project_id, body.member_id)
     except KeyError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
+    await store.log_activity(
+        project_id, user.user_id, "project.lead_changed", {"member_id": body.member_id}
+    )
+    members = await store.list_members(project_id)
+    _mirror(request, {**p, "members": members})
     try:
         from tinyagentos.projects.a2a import ensure_a2a_channel
         await ensure_a2a_channel(
@@ -327,7 +338,7 @@ async def set_lead(
         )
     except Exception:
         logger.warning("a2a ensure failed for project %s on set_lead", project_id, exc_info=True)
-    return {"ok": True, "is_lead": body.is_lead}
+    return {"ok": True, "lead_member_id": body.member_id}
 
 
 @router.delete("/api/projects/{project_id}/members/{member_id}")

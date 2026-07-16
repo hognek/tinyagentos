@@ -124,6 +124,10 @@ class ProjectCanvasStore(BaseStore):
             raise ValueError(f"agents may not emit kind={kind}")
         if author_kind not in ("user", "agent"):
             raise ValueError(f"invalid author_kind: {author_kind}")
+        # Enforce the per-project edit permission for agents (defense in depth:
+        # the route already gates on scope + can_edit_canvas, but the store is
+        # the authoritative floor so a direct caller can never bypass it).
+        await self._check_edit_permission(project_id, author_kind, author_id)
         eid = element.get("id") or new_id("cve")
         now = time.time()
         # Upsert: the client may re-send an element it already created (e.g. a
@@ -154,7 +158,10 @@ class ProjectCanvasStore(BaseStore):
         )
         await self._db.commit()
         new_el = await self.get_element(eid)
-        await self._publish(project_id, "canvas.element_added", {"element": new_el})
+        await self._publish(
+            project_id, "canvas.element_added",
+            {"element": new_el, "actor": {"kind": author_kind, "id": author_id}},
+        )
         return new_el
 
     async def list_elements(
@@ -203,6 +210,30 @@ class ProjectCanvasStore(BaseStore):
                 f"agent {author_id} has no can_edit_canvas on project {project_id}"
             )
 
+    async def check_read_permission(
+        self, project_id: str, author_kind: str, author_id: str
+    ) -> None:
+        """Gate canvas reads on can_read_canvas for agents (D3 read matrix).
+
+        Mirrors _check_edit_permission: humans bypass the floor, agents must hold
+        the per-project can_read_canvas flag, and a missing member row fails
+        closed.  This is the in-process analogue of the route-level canvas_read
+        scope check, guarding the agent MCP read path at the store floor."""
+        if author_kind == "user":
+            return
+        if author_kind != "agent":
+            raise ValueError(f"invalid author_kind: {author_kind}")
+        async with self._db.execute(
+            "SELECT can_read_canvas FROM project_members "
+            "WHERE project_id = ? AND member_id = ?",
+            (project_id, author_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None or not row[0]:
+            raise CanvasPermissionError(
+                f"agent {author_id} has no can_read_canvas on project {project_id}"
+            )
+
     async def update_element(
         self,
         *,
@@ -239,7 +270,10 @@ class ProjectCanvasStore(BaseStore):
         updated = await self.get_element(element_id, project_id=project_id)
         if updated is None:
             raise ValueError(f"element not found: {element_id}")
-        await self._publish(project_id, "canvas.element_updated", {"element": updated})
+        await self._publish(
+            project_id, "canvas.element_updated",
+            {"element": updated, "actor": {"kind": author_kind, "id": author_id}},
+        )
         return updated
 
     async def delete_element(
@@ -262,5 +296,5 @@ class ProjectCanvasStore(BaseStore):
         if cur.rowcount == 1:
             await self._publish(
                 project_id, "canvas.element_deleted",
-                {"element_id": element_id},
+                {"element_id": element_id, "actor": {"kind": author_kind, "id": author_id}},
             )
