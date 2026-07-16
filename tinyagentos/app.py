@@ -61,6 +61,7 @@ from tinyagentos.benchmark import BenchmarkStore
 from tinyagentos.installation_state import InstallationState
 from tinyagentos.scheduler import BackendCatalog, HistoryStore, ScoreCache, TaskScheduler
 from tinyagentos.scheduler.discovery import build_scheduler as build_resource_scheduler
+from tinyagentos.scheduler.gpu_arbiter import GpuArbiter
 from tinyagentos.torrent_settings import TorrentSettingsStore
 from tinyagentos.relationships import RelationshipManager
 from tinyagentos.github_identities import GitHubIdentitiesStore
@@ -1146,6 +1147,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         # Build the resource scheduler from hardware profile + live catalog.
         # Phase 1: local resources only (NPU + CPU), capability-based routing
         # with fallback and priority. Cluster-aware dispatch is Phase 3.
+        resource_scheduler = None
         try:
             resource_scheduler = build_resource_scheduler(
                 hardware_profile,
@@ -1163,10 +1165,35 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
             logger.exception("resource scheduler failed to build — routes will use static config")
             app.state.resource_scheduler = None
 
-        # VRAM reservation manager — atomic check-and-reserve so two
-        # concurrent model loads cannot both pass a VRAM check before
-        # either consumes physical VRAM (TOCTOU race, taOS #1706).
-        app.state.vram_reservation = VramReservationManager()
+        # Single VRAM authority (taOS #185). One VramReservationManager is the
+        # sole ledger: it does atomic check-and-reserve so two concurrent model
+        # loads cannot both pass a VRAM check before either consumes physical
+        # VRAM (TOCTOU, #1706). The GPU arbiter reserves against THIS SAME
+        # instance for scheduler tasks, and the model-load path
+        # (routes/models.py) reserves against it too, so there is exactly one
+        # ledger and no double-counting.
+        vram_reservation = VramReservationManager()
+        app.state.vram_reservation = vram_reservation
+
+        # Build the GPU arbiter — VRAM-accounted admission control, queuing, and
+        # eviction for GPU-bound scheduler workloads, layered on the resource
+        # scheduler. It shares the reservation ledger above (does not keep its
+        # own), so admission for tasks and model loads draws from one authority.
+        try:
+            gpu_arbiter = GpuArbiter(
+                scheduler=resource_scheduler if resource_scheduler is not None else None,
+                cluster_manager=cluster_manager,
+                vram_reservation=vram_reservation,
+                max_queue_size=100,
+                eviction_enabled=True,
+            )
+            await gpu_arbiter.start()
+            app.state.gpu_arbiter = gpu_arbiter
+            cluster_manager._gpu_arbiter = gpu_arbiter
+            logger.info("GPU arbiter ready (queue size=100, eviction=enabled, shared VRAM ledger)")
+        except Exception:
+            logger.exception("GPU arbiter failed to start — GPU tasks will use vanilla scheduler")
+            app.state.gpu_arbiter = None
 
         # Detect and set container runtime
         from tinyagentos.containers.backend import configure_container_runtime
@@ -1347,6 +1374,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         # local_heartbeat_task is cancelled+awaited above under the bounded
         # cancel_and_wait budget alongside the supervised background tasks.
         await cluster_manager.stop()
+        if app.state.gpu_arbiter is not None:
+            await app.state.gpu_arbiter.stop()
         llm_proxy.stop()
         try:
             from tinyagentos.taos_agent_runtime import stop_taos_opencode_server
