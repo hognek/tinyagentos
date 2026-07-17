@@ -402,6 +402,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     execution_policy_store = ExecutionPolicyStore(data_dir / "execution_policies.db")
     from tinyagentos.notes.shared_docs_store import SharedDocsStore
     shared_docs_store = SharedDocsStore(data_dir / "shared_docs.db")
+    from tinyagentos.todo.todo_store import TodoStore
+    todo_store = TodoStore(data_dir / "todo.db")
     from tinyagentos.coding_sessions.launcher import CodingSessionLauncher
     from tinyagentos.coding_sessions.store import CodingSessionStore
     coding_session_store = CodingSessionStore(data_dir / "coding_sessions.db")
@@ -517,6 +519,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await decision_store.init()
         await execution_policy_store.init()
         await shared_docs_store.init()
+        await todo_store.init()
+        app.state.todo_store = todo_store
         await coding_session_store.init()
         app.state.coding_launcher = coding_launcher
         projects_root.mkdir(parents=True, exist_ok=True)
@@ -768,6 +772,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         channel_hub_router.set_archive(archive)  # Wire archive for zero-loss channel message capture
         # channel_hub_connectors, deploy_tasks, and idempotency_cache are
         # already set by the eager section; do not create new instances here.
+        app.state.todo_store = todo_store
         from tinyagentos.chat.group_policy import GroupPolicy
         app.state.group_policy = GroupPolicy()
         from tinyagentos.chat.reactions import WantsReplyRegistry
@@ -1515,6 +1520,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.decision_store = decision_store
     app.state.execution_policies = execution_policy_store
     app.state.shared_docs_store = shared_docs_store
+    app.state.todo_store = todo_store
     app.state.coding_session_store = coding_session_store
     app.state.beads_bridge = None
     app.state.canvas_snapshotter = None
