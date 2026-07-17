@@ -19,32 +19,37 @@ function readPackageVersion() {
 }
 
 function readBuildId() {
-  // Prefer the git short SHA so back-to-back builds on the same commit
-  // produce identical bundles. Fall back to an epoch-second timestamp
-  // when git isn't available (e.g. an sdist install).
+  // Include both the git short SHA (reproducible anchored identifier) and
+  // a high-resolution timestamp so every build — even back-to-back
+  // builds on the same commit — produces a unique identifier.  The SPA
+  // version-check poll relies on this to detect redeployed bundles.
+  //
+  // Format: {sha}.{timestamp}  (e.g. "a3bd632.lrx5f4m9abc")
+  // When git isn't available only the timestamp is emitted.
+  let sha = "";
   try {
-    const sha = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
+    sha = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
       cwd: HERE,
       stdio: ["ignore", "pipe", "ignore"],
     }).toString().trim();
-    if (sha) return sha;
   } catch {
-    // git not available — fall through to timestamp
+    // git not available — no SHA component
   }
-  // Two distinct fields encoded in base36 so two builds within the same
-  // second still produce distinct ids (Date.now() is millisecond-resolution
-  // but high-res nanos disambiguate even sub-millisecond bursts).
   const ms = Date.now().toString(36);
   const hr = process.hrtime.bigint().toString(36);
-  return `${ms}-${hr.slice(-6)}`;
+  // Take the last 6 base-36 chars of the nanosecond counter — combined
+  // with the ms component this yields ~2.1B unique values per ms tick,
+  // which is plenty for sub-millisecond build differentiation while
+  // keeping the stamp compact.
+  const stamp = `${ms}${hr.slice(-6)}`;
+  return sha ? `${sha}.${stamp}` : stamp;
 }
 
 // Service worker uses this string as its cache name (`taos-static-${VERSION}`).
-// If the string never changes between builds, the browser sees a byte-identical
-// SW on the next visit, never fires install/activate, never wipes the old
-// precache, and clients keep loading the previous bundle forever. Combining
-// the package version with the git SHA guarantees a fresh SW per build, so
-// stale-PWA recovery actually works after a controller upgrade.
+// Combining the package version with a unique build id (SHA + timestamp)
+// guarantees a fresh SW per build, so stale-PWA recovery actually works after
+// a controller upgrade and the SPA version-check poll detects redeployed
+// bundles even when the package version hasn't changed.
 export function readBackendVersion() {
   return `${readPackageVersion()}+${readBuildId()}`;
 }
