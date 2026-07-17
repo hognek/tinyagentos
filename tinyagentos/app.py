@@ -425,6 +425,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     shared_docs_store = SharedDocsStore(data_dir / "shared_docs.db")
     from tinyagentos.todo.todo_store import TodoStore
     todo_store = TodoStore(data_dir / "todo.db")
+    from tinyagentos.user_shares_store import UserSharesStore
+    user_shares_store = UserSharesStore(data_dir / "user_shares.db")
     from tinyagentos.coding_sessions.launcher import CodingSessionLauncher
     from tinyagentos.coding_sessions.store import CodingSessionStore
     coding_session_store = CodingSessionStore(data_dir / "coding_sessions.db")
@@ -577,6 +579,9 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await routine_store.init()
         await project_canvas_store.init()
         await decision_store.init()
+        app.state.decision_store = decision_store
+        await user_shares_store.init()
+        app.state.user_shares = user_shares_store
         await execution_policy_store.init()
         await shared_docs_store.init()
         await todo_store.init()
