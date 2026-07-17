@@ -270,11 +270,18 @@ class ClusterManager:
         # in sync with container reality. Optional — None leaves stale values
         # untouched for legacy workers that don't send these fields.
         if host_lan_ip is not None:
-            worker.host_lan_ip = host_lan_ip
+            # Reject empty string — a buggy/malicious heartbeat carrying
+            # "" would pass `is not None` and break find_worker_by_host_lan_ip().
+            if host_lan_ip:
+                worker.host_lan_ip = host_lan_ip
         if url is not None:
-            worker.url = url
+            # Reject empty string — same guard as host_lan_ip above.
+            if url:
+                worker.url = url
         if hardware is not None:
-            worker.hardware = hardware
+            # Reject empty dict — same guard as host_lan_ip above.
+            if hardware:
+                worker.hardware = hardware
         # LXC storage byte counters (taOS #1538): forward from worker
         # heartbeat so capacity reports stay current across restarts.
         if storage_cap_bytes is not None:

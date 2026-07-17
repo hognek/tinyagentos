@@ -546,17 +546,23 @@ class WorkerAgent:
             )
             return 0
 
+        from tinyagentos.hardware import detect_hardware
+        from dataclasses import asdict
+
         try:
             from tinyagentos.worker.pairing import sign_request_headers
+            # Re-resolve host_lan_ip, url, and hardware on every heartbeat
+            # so the controller stays in sync with container reality after
+            # DHCP moves or LXC restarts (taOS #1538).
+            # Note: the function call asdict(detect_hardware()) remains inside
+            # the try so a probe failure degrades gracefully (heartbeat skips
+            # this update) rather than crashing the run loop.
             load = psutil.cpu_percent() / 100.0
             backends = await self.detect_backends()
             caps = sorted(set(self.detect_capabilities(backends)) | set(self.extra_capabilities))
             kv_quant = self.detect_kv_quant_support(backends)
             snap = capacity_snapshot()
             vram = gpu_vram_snapshot()
-            # Re-resolve the host_lan_ip and worker_url on every heartbeat
-            # so the controller stays in sync with container reality after
-            # DHCP moves or LXC restarts (taOS #1538).
             adv_ip = os.environ.get("TAOS_ADVERTISE_IP", "").strip()
             live_url = (
                 self.advertise_url
@@ -566,8 +572,6 @@ class WorkerAgent:
                 or (backends[0]["url"] if backends else self.get_worker_url())
             )
             live_host_lan_ip = adv_ip or _detect_lan_ip(self.controller_url)
-            from tinyagentos.hardware import detect_hardware
-            from dataclasses import asdict
             live_hardware = asdict(detect_hardware())
             path = "/api/cluster/heartbeat"
             payload = {
