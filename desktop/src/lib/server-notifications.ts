@@ -179,6 +179,19 @@ export async function markServerRead(id: string): Promise<void> {
   }
 }
 
+/** Archive a single server-origin notification on the backend so it persists
+ *  across reloads and appears under History instead of the active Inbox.
+ *  No-op for client ids (notif-N) — those have no server row. */
+export async function archiveServerNotification(id: string): Promise<void> {
+  const n = serverId(id);
+  if (n == null) return;
+  try {
+    await fetch(`/api/notifications/${n}/archive`, withCsrf({ method: "POST" }));
+  } catch {
+    // best-effort; the optimistic local update already happened
+  }
+}
+
 /** Mark all server-origin notifications read on the backend. */
 export async function markAllServerRead(): Promise<void> {
   try {

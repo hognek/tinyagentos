@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { archiveServerNotification } from "@/lib/server-notifications";
 
 export interface Notification {
   id: string;
@@ -95,7 +96,10 @@ export const useNotificationStore = create<NotificationStore>((set, get) => ({
   },
 
   dismiss(id) {
-    if (id.startsWith("srv-")) dismissedServerIds.add(id);
+    if (id.startsWith("srv-")) {
+      dismissedServerIds.add(id);
+      void archiveServerNotification(id);
+    }
     set((s) => ({
       notifications: s.notifications.map((n) =>
         n.id === id ? { ...n, archived: true } : n,
@@ -107,7 +111,10 @@ export const useNotificationStore = create<NotificationStore>((set, get) => ({
     // Resolving a notification (e.g. answering an agent access-request) both
     // reads and archives it: it leaves the active Inbox and lands in History
     // rather than being marked read in place or silently removed (#62).
-    if (id.startsWith("srv-")) dismissedServerIds.add(id);
+    if (id.startsWith("srv-")) {
+      dismissedServerIds.add(id);
+      void archiveServerNotification(id);
+    }
     set((s) => ({
       notifications: s.notifications.map((n) =>
         n.id === id ? { ...n, archived: true, read: true } : n,
@@ -118,7 +125,10 @@ export const useNotificationStore = create<NotificationStore>((set, get) => ({
   clearAll() {
     set((s) => {
       for (const n of s.notifications) {
-        if (n.id.startsWith("srv-")) dismissedServerIds.add(n.id);
+        if (n.id.startsWith("srv-")) {
+          dismissedServerIds.add(n.id);
+          void archiveServerNotification(n.id);
+        }
       }
       return {
         notifications: s.notifications.map((n) => ({ ...n, archived: true })),

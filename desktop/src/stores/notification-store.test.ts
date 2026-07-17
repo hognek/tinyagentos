@@ -1,5 +1,12 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { useNotificationStore, type Notification } from "./notification-store";
+
+// Mock the backend archive call so the store's fire-and-forget fetch doesn't
+// leak into the test environment (the store calls it optimistically and best-
+// effort, never awaiting; here we verify the calls are made for srv-* ids).
+vi.mock("@/lib/server-notifications", () => ({
+  archiveServerNotification: vi.fn(),
+}));
 
 function srv(id: number, ts: number, read = false): Notification {
   return {
@@ -179,5 +186,59 @@ describe("dismiss archives instead of removing", () => {
 
     store.dismiss(id1);
     expect(store.unreadCount()).toBe(1);
+  });
+});
+
+describe("archive backend persistence", () => {
+  let archiveMock: ReturnType<typeof vi.fn>;
+
+  beforeEach(async () => {
+    const mod = await import("@/lib/server-notifications");
+    archiveMock = mod.archiveServerNotification as ReturnType<typeof vi.fn>;
+    archiveMock.mockClear();
+    useNotificationStore.setState({ notifications: [], centreOpen: false });
+  });
+
+  it("calls archiveServerNotification for srv-* ids on dismiss", () => {
+    const store = useNotificationStore.getState();
+    store.mergeServerNotifications([srv(1, 100)]);
+
+    store.dismiss("srv-1");
+
+    expect(archiveMock).toHaveBeenCalledTimes(1);
+    expect(archiveMock).toHaveBeenCalledWith("srv-1");
+  });
+
+  it("calls archiveServerNotification for srv-* ids on archiveRead", () => {
+    const store = useNotificationStore.getState();
+    store.mergeServerNotifications([srv(1, 100)]);
+
+    store.archiveRead("srv-1");
+
+    expect(archiveMock).toHaveBeenCalledTimes(1);
+    expect(archiveMock).toHaveBeenCalledWith("srv-1");
+  });
+
+  it("calls archiveServerNotification for each srv-* id on clearAll", () => {
+    const store = useNotificationStore.getState();
+    // Unique ids to avoid leaking into module-scoped dismissedServerIds from
+    // earlier tests in this file.
+    store.mergeServerNotifications([srv(8001, 100), srv(8002, 200)]);
+    store.addNotification({ source: "system", title: "local", body: "b", level: "info" });
+
+    store.clearAll();
+
+    expect(archiveMock).toHaveBeenCalledTimes(2);
+    expect(archiveMock).toHaveBeenCalledWith("srv-8001");
+    expect(archiveMock).toHaveBeenCalledWith("srv-8002");
+  });
+
+  it("does NOT call archiveServerNotification for client-origin (notif-N) ids", () => {
+    const store = useNotificationStore.getState();
+    const id = store.addNotification({ source: "system", title: "local", body: "b", level: "info" });
+
+    store.dismiss(id);
+
+    expect(archiveMock).not.toHaveBeenCalled();
   });
 });
