@@ -119,12 +119,14 @@ class BrowserSessionManager:
         url: str,
         profile_name: str = "default",
         *,
-        mobile: bool = False,
+        mobile: bool | None = None,
         now: float | None = None,
     ) -> dict:
         db = self._assert_db()
         if now is None:
             now = time.time()
+        if mobile is None:
+            mobile = (owner_type == "agent")  # agents default to mobile (cleaner DOM, fewer mis-clicks)
         session_id = uuid.uuid4().hex
         await db.execute(
             """INSERT INTO browser_sessions
@@ -398,10 +400,10 @@ class BrowserSessionManager:
             await db.execute(
                 """INSERT INTO browser_sessions
                    (id, owner_type, owner_id, profile_name, url, node, status,
-                    container_id, neko_url, cdp_url, created_at, updated_at, last_active)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    container_id, neko_url, cdp_url, is_mobile, created_at, updated_at, last_active)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (uuid.uuid4().hex, "agent", key[0], key[1], None, r.get("node"),
-                 "stopped", None, None, None, now, now, now),
+                 "stopped", None, None, None, 1, now, now, now),  # is_mobile=1: agents default to mobile
             )
             existing.add(key)
             inserted += 1

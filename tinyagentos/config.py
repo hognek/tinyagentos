@@ -62,6 +62,7 @@ class AppConfig:
     memory_url: str = "http://localhost:7900"
     wallhaven_api_key: str | None = None
     github_app_id: str = ""
+    browser: dict = field(default_factory=lambda: {"agent_viewport": "mobile"})
     config_path: Path | None = None
 
     def to_dict(self) -> dict:
@@ -83,6 +84,8 @@ class AppConfig:
             d["memory_url"] = self.memory_url
         if self.github_app_id:
             d["github_app_id"] = self.github_app_id
+        if self.browser.get("agent_viewport") != "mobile":
+            d["browser"] = self.browser
         return d
 
 # rkllama's taOS default port moved from the upstream 8080 to 7833. Installs
@@ -192,6 +195,7 @@ def load_config(path: Path) -> AppConfig:
         archive=archive_cfg,
         memory_url=data.get("memory_url", "http://localhost:7900"),
         github_app_id=str(data.get("github_app_id", "") or ""),
+        browser=data.get("browser", {"agent_viewport": "mobile"}),
         config_path=path,
         wallhaven_api_key=wallhaven_api_key,
     )
