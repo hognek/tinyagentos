@@ -29,7 +29,7 @@ interface Filters {
   level: string;
 }
 
-export function NotificationArchiveApp({ windowId }: { windowId: string }) {
+export function NotificationArchiveApp({ windowId: _windowId }: { windowId: string }) {
   const [archived, setArchived] = useState<Notification[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
