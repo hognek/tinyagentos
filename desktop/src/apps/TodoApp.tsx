@@ -90,14 +90,14 @@ function isOverdue(ts: number): boolean {
 
 function TodoItemRow({
   item,
-  itemCount,
+  sectionItems,
   onToggleDone,
   onEditSave,
   onDelete,
   onMove,
 }: {
   item: TodoItem;
-  itemCount: number;
+  sectionItems: TodoItem[];
   onToggleDone: (id: string, done: boolean) => void;
   onEditSave: (id: string, text: string) => Promise<void>;
   onDelete: (id: string) => void;
@@ -128,6 +128,7 @@ function TodoItemRow({
   }
 
   const overdue = item.due_at && isOverdue(item.due_at) && !item.done;
+  const sectionIdx = sectionItems.findIndex((i) => i.id === item.id);
 
   return (
     <li className="group flex flex-col gap-1">
@@ -234,7 +235,7 @@ function TodoItemRow({
               <button
                 type="button"
                 onClick={() => onMove(item.id, -1)}
-                disabled={item.position === 0}
+                disabled={sectionIdx <= 0}
                 aria-label="Move task up"
                 className="rounded p-1 text-shell-text-tertiary transition-colors hover:text-shell-text disabled:opacity-30"
               >
@@ -244,7 +245,7 @@ function TodoItemRow({
               <button
                 type="button"
                 onClick={() => onMove(item.id, 1)}
-                disabled={item.position >= itemCount - 1}
+                disabled={sectionIdx < 0 || sectionIdx >= sectionItems.length - 1}
                 aria-label="Move task down"
                 className="rounded p-1 text-shell-text-tertiary transition-colors hover:text-shell-text disabled:opacity-30"
               >
@@ -302,7 +303,11 @@ function TodoDetailPane({
     try {
       const r = await fetch(`/api/todo/${listId}`);
       if (!r.ok) throw new Error("Could not load list.");
-      const data: TodoDetail = await r.json();
+      const raw = await r.json();
+      const data: TodoDetail = {
+        ...raw,
+        items: Array.isArray(raw.items) ? raw.items : [],
+      };
       if (loadReqRef.current === myReq) setDoc(data);
     } catch (e) {
       if (loadReqRef.current === myReq)
@@ -411,18 +416,24 @@ function TodoDetailPane({
     }
   }
 
-  async function moveItem(itemId: string, direction: -1 | 1) {
+  async function moveItem(itemId: string, direction: -1 | 1, sectionItems: TodoItem[]) {
     if (!doc) return;
     const docItems: TodoItem[] = Array.isArray(doc.items) ? doc.items : [];
-    const items = [...docItems];
-    const idx = items.findIndex((i) => i.id === itemId);
-    if (idx < 0) return;
-    const newIdx = idx + direction;
-    if (newIdx < 0 || newIdx >= items.length) return;
+    const sectionIdx = sectionItems.findIndex((i) => i.id === itemId);
+    if (sectionIdx < 0) return;
+    const newSectionIdx = sectionIdx + direction;
+    if (newSectionIdx < 0 || newSectionIdx >= sectionItems.length) return;
 
-    // Swap positions locally
-    [items[idx], items[newIdx]] = [items[newIdx]!, items[idx]!];
-    const reordered = items.map((item, i) => ({
+    // Swap the two items within the full array by their ids
+    const itemA = sectionItems[sectionIdx]!;
+    const itemB = sectionItems[newSectionIdx]!;
+    const fullIdxA = docItems.findIndex((i) => i.id === itemA.id);
+    const fullIdxB = docItems.findIndex((i) => i.id === itemB.id);
+    if (fullIdxA < 0 || fullIdxB < 0) return;
+
+    const newItems = [...docItems];
+    [newItems[fullIdxA], newItems[fullIdxB]] = [newItems[fullIdxB]!, newItems[fullIdxA]!];
+    const reordered = newItems.map((item, i) => ({
       ...item,
       position: i,
     }));
@@ -536,11 +547,11 @@ function TodoDetailPane({
                 <TodoItemRow
                   key={item.id}
                   item={item}
-                  itemCount={items.length}
+                  sectionItems={incomplete}
                   onToggleDone={toggleDone}
                   onEditSave={editItem}
                   onDelete={deleteItem}
-                  onMove={moveItem}
+                  onMove={(id, dir) => moveItem(id, dir, incomplete)}
                 />
               ))}
             </ul>
@@ -557,11 +568,11 @@ function TodoDetailPane({
                   <TodoItemRow
                     key={item.id}
                     item={item}
-                    itemCount={items.length}
+                    sectionItems={complete}
                     onToggleDone={toggleDone}
                     onEditSave={editItem}
                     onDelete={deleteItem}
-                    onMove={moveItem}
+                    onMove={(id, dir) => moveItem(id, dir, complete)}
                   />
                 ))}
               </ul>
