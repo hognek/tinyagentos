@@ -21,7 +21,7 @@ class QmdClient:
         if self._client:
             await self._client.aclose()
 
-    async def embed(self, text: str, *, timeout: float | None = None) -> list[float]:
+    async def embed(self, text: str, *, timeout=httpx.USE_CLIENT_DEFAULT) -> list[float]:
         """Get embedding vector for text via qmd serve /embed.
 
         Parameters
@@ -29,9 +29,10 @@ class QmdClient:
         text:
             The text to embed.
         timeout:
-            Per-call timeout in seconds.  Overrides the client's default
-            (60 s) for this single request.  Useful when one slow model load
-            should not block the whole chain.
+            Per-call timeout in seconds, or httpx.USE_CLIENT_DEFAULT to keep
+            the client's default (60 s).  Pass a float to override for this
+            single request — useful when one slow model load should not block
+            the whole chain.
         """
         url = f"{self.base_url}/embed"
         client = self._client
@@ -51,15 +52,16 @@ class QmdClient:
         tags: list[str] | None = None,
         limit: int = 10,
         *,
-        timeout: float | None = None,
+        timeout=httpx.USE_CLIENT_DEFAULT,
     ) -> list[dict]:
         """Search documents via qmd serve /search.
 
         Parameters
         ----------
         timeout:
-            Per-call timeout in seconds.  Overrides the client's default
-            (60 s) for this single request.
+            Per-call timeout in seconds, or httpx.USE_CLIENT_DEFAULT to keep
+            the client's default (60 s).  Pass a float to override for this
+            single request.
         """
         url = f"{self.base_url}/search"
         client = self._client

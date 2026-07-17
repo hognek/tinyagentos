@@ -1,14 +1,12 @@
 """Tests for tinyagentos.clients.retry.with_retry."""
 from __future__ import annotations
 
-import asyncio
-import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import httpx
 import pytest
 
-from tinyagentos.clients.retry import with_retry, DEFAULT_RETRY_ON_STATUS
+from tinyagentos.clients.retry import with_retry
 
 
 # ---------------------------------------------------------------------------
@@ -136,8 +134,6 @@ class TestWithRetry:
         """Verify delays grow exponentially and respect max_delay (jitter disabled
         for deterministic assertions)."""
         sleep_calls: list[float] = []
-
-        original_sleep = asyncio.sleep
 
         async def _fake_sleep(seconds):
             sleep_calls.append(seconds)
