@@ -85,7 +85,7 @@ const MOCK_FRAMEWORK = {
   id: "openclaw",
   name: "OpenClaw",
   description: "General purpose agent",
-  verification_status: "stable",
+  verification_status: "beta",
 };
 
 describe("DeployWizard — 'no provider' banner at model step (fix #618)", () => {

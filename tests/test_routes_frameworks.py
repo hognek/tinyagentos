@@ -2,7 +2,7 @@ import pytest
 
 from tinyagentos.adapters import list_frameworks
 
-VALID_STATUSES = {"beta", "alpha", "broken"}
+VALID_STATUSES = {"tested", "beta", "experimental", "broken"}
 
 
 @pytest.mark.asyncio
@@ -54,21 +54,32 @@ async def test_frameworks_openclaw_is_beta(client):
 
 
 @pytest.mark.asyncio
-async def test_frameworks_at_least_one_alpha(client):
-    resp = await client.get("/api/frameworks")
-    assert resp.status_code == 200
-    alpha = [e for e in resp.json() if e["verification_status"] == "alpha"]
-    assert len(alpha) > 0, "no alpha frameworks found"
-
-
-@pytest.mark.asyncio
-async def test_frameworks_no_experimental_status(client):
-    """Regression guard: 'experimental' was retired in favour of 'alpha'."""
+async def test_frameworks_at_least_one_experimental(client):
     resp = await client.get("/api/frameworks")
     assert resp.status_code == 200
     experimental = [e for e in resp.json() if e["verification_status"] == "experimental"]
-    assert experimental == [], (
-        f"found entries still using retired 'experimental' status: {[e['id'] for e in experimental]}"
+    assert len(experimental) > 0, "no experimental frameworks found"
+
+
+@pytest.mark.asyncio
+async def test_frameworks_no_alpha_status(client):
+    """Regression guard: 'alpha' was retired in favour of 'experimental'."""
+    resp = await client.get("/api/frameworks")
+    assert resp.status_code == 200
+    alpha = [e for e in resp.json() if e["verification_status"] == "alpha"]
+    assert alpha == [], (
+        f"found entries still using retired 'alpha' status: {[e['id'] for e in alpha]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_frameworks_hermes_is_tested(client):
+    resp = await client.get("/api/frameworks")
+    assert resp.status_code == 200
+    hermes = next((e for e in resp.json() if e["id"] == "hermes"), None)
+    assert hermes is not None, "hermes adapter missing from response"
+    assert hermes["verification_status"] == "tested", (
+        f"expected hermes to be 'tested', got {hermes['verification_status']!r}"
     )
 
 
