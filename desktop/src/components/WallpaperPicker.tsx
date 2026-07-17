@@ -231,6 +231,38 @@ export function WallpaperPicker({ open, onClose }: Props) {
         </div>
           ))}
         </div>
+        {/* Browse online section */}
+        <div className="border-t border-shell-border shrink-0">
+          <button
+            onClick={() => setBrowseOnlineOpen((v) => !v)}
+            className="flex items-center gap-2 w-full px-4 py-2 text-xs text-shell-text-secondary hover:text-shell-text transition-colors"
+            aria-expanded={browseOnlineOpen}
+            aria-label="Browse online wallpapers"
+          >
+            <Globe size={13} />
+            Browse online
+            <span
+              className={`ml-auto text-[10px] transition-transform ${browseOnlineOpen ? "rotate-180" : ""}`}
+            >
+              ▼
+            </span>
+          </button>
+          {browseOnlineOpen && (
+            <div className="px-4 pb-3">
+              <WallhavenBrowser
+                onSelect={(url, label) => {
+                  // Apply remote wallpaper directly — set background-image to the full URL
+                  useThemeStore.setState({
+                    wallpaperId: `wallhaven-${Date.now()}`,
+                    wallpaperImage: `url('${url}')`,
+                    wallpaperKind: "image",
+                    wallpaperOverlayText: null,
+                  });
+                }}
+              />
+            </div>
+          )}
+        </div>
         {wallpaperKind === "animated" && (
           <div className="flex flex-col gap-2.5 px-4 py-3 border-t border-shell-border shrink-0">
             {SLIDERS.map((s) => (

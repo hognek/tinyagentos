@@ -40,7 +40,7 @@ export function WallhavenBrowser({ onSelect }: Props) {
   const [meta, setMeta] = useState<WallhavenMeta | null>(null);
   const [status, setStatus] = useState<Status>("idle");
   const [errorMsg, setErrorMsg] = useState("");
-  const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const debounceRef = useRef<ReturnType<typeof setTimeout>>();
 
   // Debounce search input (300ms)
   useEffect(() => {
@@ -80,7 +80,6 @@ export function WallhavenBrowser({ onSelect }: Props) {
 
         if (!resp.ok) {
           const body = await resp.json().catch(() => ({}));
-          if (cancelled) return;
           setErrorMsg(body.error || `Server error (${resp.status})`);
           setStatus("error");
           return;
@@ -110,7 +109,7 @@ export function WallhavenBrowser({ onSelect }: Props) {
 
   const handleSelect = useCallback(
     (img: WallhavenImage) => {
-      onSelect(img.path, `Wallhaven: ${img.id} (${img.resolution})`);
+      onSelect(img.url, `Wallhaven: ${img.id} (${img.resolution})`);
     },
     [onSelect],
   );
