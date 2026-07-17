@@ -296,6 +296,7 @@ function TodoDetailPane({
   const [error, setError] = useState<string | null>(null);
   const [newText, setNewText] = useState("");
   const [adding, setAdding] = useState(false);
+  const pendingToggles = useRef<Set<string>>(new Set());
 
   const loadReqRef = useRef(0);
   const loadDoc = useCallback(async () => {
@@ -325,7 +326,7 @@ function TodoDetailPane({
   }, [loadDoc]);
 
   async function addItem() {
-    if (!newText.trim() || !doc) return;
+    if (!newText.trim() || !doc || adding) return;
     setAdding(true);
     try {
       const r = await fetch(`/api/todo/${doc.id}/items`, {
@@ -381,7 +382,8 @@ function TodoDetailPane({
   }
 
   async function toggleDone(itemId: string, done: boolean) {
-    if (!doc) return;
+    if (!doc || pendingToggles.current.has(itemId)) return;
+    pendingToggles.current.add(itemId);
     // Optimistic update
     setDoc((prev) =>
       prev
@@ -413,6 +415,8 @@ function TodoDetailPane({
           : prev,
       );
       setError(e instanceof Error ? e.message : "Could not update task.");
+    } finally {
+      pendingToggles.current.delete(itemId);
     }
   }
 
@@ -467,10 +471,21 @@ function TodoDetailPane({
 
   if (!doc) {
     return (
-      <div className="flex h-full items-center justify-center">
-        <p className="text-sm text-red-400" role="alert">
-          {error ?? "List not found."}
-        </p>
+      <div className="flex h-full flex-col">
+        <button
+          type="button"
+          onClick={onBack}
+          aria-label="Back to lists"
+          className="flex items-center gap-1 px-4 py-3 text-sm text-shell-text-secondary transition-colors hover:text-shell-text md:hidden"
+        >
+          <ChevronLeft size={16} />
+          Back
+        </button>
+        <div className="flex flex-1 items-center justify-center">
+          <p className="text-sm text-red-400" role="alert">
+            {error ?? "List not found."}
+          </p>
+        </div>
       </div>
     );
   }
@@ -649,7 +664,7 @@ function CreateTodoForm({
   }, []);
 
   async function create() {
-    if (!title.trim()) return;
+    if (!title.trim() || creating) return;
     setCreating(true);
     setError(null);
     try {
@@ -722,18 +737,19 @@ function CreateTodoForm({
 export function TodoApp({ windowId: _windowId }: { windowId: string }) {
   const [lists, setLists] = useState<TodoList[]>([]);
   const [loading, setLoading] = useState(true);
+  const [listLoadError, setListLoadError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
 
   const loadLists = useCallback(async () => {
     try {
       const r = await fetch("/api/todo");
-      if (r.ok) {
-        const data: unknown = await r.json();
-        setLists(Array.isArray(data) ? (data as TodoList[]) : []);
-      }
-    } catch {
-      // Keep whatever was loaded.
+      if (!r.ok) throw new Error("Could not load lists.");
+      const data: unknown = await r.json();
+      setLists(Array.isArray(data) ? (data as TodoList[]) : []);
+      setListLoadError(null);
+    } catch (e) {
+      setListLoadError(e instanceof Error ? e.message : "Could not load lists.");
     } finally {
       setLoading(false);
     }
@@ -796,6 +812,10 @@ export function TodoApp({ windowId: _windowId }: { windowId: string }) {
         <div className="flex-1 overflow-y-auto px-3 py-3">
           {loading ? (
             <p className="text-sm text-shell-text-tertiary">Loading...</p>
+          ) : listLoadError ? (
+            <p className="text-sm text-red-400" role="alert">
+              {listLoadError}
+            </p>
           ) : lists.length === 0 ? (
             <div className="flex flex-col items-center gap-2 py-16 text-center">
               <ListChecks
