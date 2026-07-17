@@ -199,6 +199,31 @@ class ChatMessageStore(BaseStore):
         """Canonical delete = soft delete (Phase 2b-2a)."""
         return await self.soft_delete_message(message_id)
 
+    async def soft_delete_messages_after(
+        self, channel_id: str, after_timestamp: float,
+    ) -> list[str]:
+        """Soft-delete all non-deleted messages in *channel_id* whose
+        ``created_at`` is strictly greater than *after_timestamp*.
+        Returns the list of affected message ids so callers can broadcast
+        per-message delete events."""
+        now = time.time()
+        cursor = await self._db.execute(
+            """SELECT id FROM chat_messages
+               WHERE channel_id = ? AND created_at > ? AND deleted_at IS NULL""",
+            (channel_id, after_timestamp),
+        )
+        rows = await cursor.fetchall()
+        ids = [r[0] for r in rows]
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        await self._db.execute(
+            f"UPDATE chat_messages SET deleted_at = ? WHERE id IN ({placeholders})",
+            (now, *ids),
+        )
+        await self._db.commit()
+        return ids
+
     async def add_reaction(self, message_id: str, emoji: str, user_id: str) -> None:
         async with self._reaction_lock:
             async with self._db.execute(

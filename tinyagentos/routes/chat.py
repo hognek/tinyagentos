@@ -226,6 +226,26 @@ async def chat_ws(websocket: WebSocket):
                         "content": data["content"],
                         "edited_at": msg["edited_at"],
                     })
+                    # Truncate subsequent messages in this channel so the
+                    # agent branch is rewritten.
+                    truncated_ids = await msg_store.soft_delete_messages_after(
+                        msg["channel_id"], msg["created_at"],
+                    )
+                    for tid in truncated_ids:
+                        await hub.broadcast(msg["channel_id"], {
+                            "type": "message_delete",
+                            "seq": hub.next_seq(),
+                            "message_id": tid,
+                            "channel_id": msg["channel_id"],
+                        })
+                    # Re-trigger the agent.
+                    router_svc = getattr(
+                        websocket.app.state, "agent_chat_router", None,
+                    )
+                    ch_store = websocket.app.state.chat_channels
+                    channel = await ch_store.get_channel(msg["channel_id"])
+                    if router_svc is not None and channel is not None:
+                        router_svc.dispatch(msg, channel)
 
             elif msg_type == "delete":
                 msg_store = websocket.app.state.chat_messages
@@ -565,14 +585,32 @@ async def edit_message_endpoint(message_id: str, request: Request):
     if msg["author_id"] != caller_id:
         return JSONResponse({"error": "not the author"}, status_code=403)
     await msg_store.edit_message(message_id, body["content"])
+    # Truncate: soft-delete every message created after this one in the same
+    # channel so the agent sees the corrected branch on its next turn.
+    truncated_ids = await msg_store.soft_delete_messages_after(
+        msg["channel_id"], msg["created_at"],
+    )
     updated = await msg_store.get_message(message_id)
     hub = request.app.state.chat_hub
+    seq = hub.next_seq()
     await hub.broadcast(msg["channel_id"], {
-        "type": "message_edit", "seq": hub.next_seq(),
+        "type": "message_edit", "seq": seq,
         "message_id": message_id,
         "content": updated["content"],
         "edited_at": updated["edited_at"],
     })
+    for tid in truncated_ids:
+        seq = hub.next_seq()
+        await hub.broadcast(msg["channel_id"], {
+            "type": "message_delete", "seq": seq,
+            "channel_id": msg["channel_id"], "message_id": tid,
+        })
+    # Re-trigger the agent with the updated conversation branch.
+    router_svc = getattr(request.app.state, "agent_chat_router", None)
+    ch_store = request.app.state.chat_channels
+    channel = await ch_store.get_channel(msg["channel_id"])
+    if router_svc is not None and channel is not None:
+        router_svc.dispatch(updated, channel)
     return JSONResponse(updated)
 
 
