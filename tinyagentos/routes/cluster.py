@@ -273,6 +273,12 @@ class HeartbeatBody(BaseModel):
     host_lan_ip: str | None = None
     url: str | None = None
     hardware: dict | None = None
+    # Worker-initiated state transitions (taOS #890 C2).
+    # When the worker reports status="draining", the controller initiates
+    # a graceful drain. status="update-available" signals an update is
+    # ready but the worker is still accepting tasks.
+    status: str | None = None
+    drain_reason: str | None = None
 
 
 class RouteRequest(BaseModel):
@@ -521,6 +527,8 @@ async def worker_heartbeat(request: Request, body: HeartbeatBody):
         host_lan_ip=body.host_lan_ip,
         url=body.url,
         hardware=body.hardware,
+        status=body.status,
+        drain_reason=body.drain_reason,
     )
     if not ok:
         return JSONResponse({"error": "Worker not registered"}, status_code=404)

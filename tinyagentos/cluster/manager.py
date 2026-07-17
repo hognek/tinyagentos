@@ -205,6 +205,8 @@ class ClusterManager:
         storage_cap_bytes: int | None = None,
         storage_used_bytes: int | None = None,
         bytes_deduped_total: int | None = None,
+        status: str | None = None,
+        drain_reason: str | None = None,
     ) -> bool:
         """Accept a worker heartbeat.
 
@@ -212,6 +214,13 @@ class ClusterManager:
         (worker agent v2+), overwrite the worker's cached view so the
         cluster-wide catalog stays fresh. Old-style heartbeats that only
         carry load/models still work.
+
+        Worker-initiated state transitions (taOS #890 C2): the worker can
+        report ``status="update-available"`` or ``status="draining"`` to
+        initiate a self-drain. When the worker reports ``"draining"``, the
+        controller treats it identically to a controller-initiated drain:
+        no new tasks are routed, existing leases complete, and the monitor
+        loop auto-completes the drain when all leases are released.
         """
         worker = self._workers.get(name)
         if not worker:
@@ -225,7 +234,11 @@ class ClusterManager:
         # defeat the drain (taOS #890). Leave the drain to complete or be
         # cancelled explicitly; every other status re-onlines as before.
         if worker.status != "draining":
-            worker.status = "online"
+            # Honour worker-initiated status transitions (taOS #890 C2).
+            if status in ("draining", "update-available", "updating"):
+                worker.status = status
+            else:
+                worker.status = "online"
         if models is not None:
             worker.models = models
         if backends is not None:
@@ -290,6 +303,33 @@ class ClusterManager:
             worker.storage_used_bytes = int(storage_used_bytes)
         if bytes_deduped_total is not None:
             worker.bytes_deduped_total = int(bytes_deduped_total)
+        # Worker-initiated drain notification (taOS #890 C2).
+        # Emit when the worker transitions into draining/update-available on
+        # its own initiative, so the operator sees it in the activity feed.
+        if self._notifications and status in ("draining", "update-available", "updating") and prev_status not in (status,):
+            reason = drain_reason or "unspecified"
+            event_type = f"worker.{status}" if status != "draining" else "worker.drain"
+            title_map = {
+                "draining": f"Worker '{worker.name}' self-initiated drain",
+                "update-available": f"Worker '{worker.name}' has an update available",
+                "updating": f"Worker '{worker.name}' is updating",
+            }
+            detail_map = {
+                "draining": f"Worker '{worker.name}' is draining for {reason}. Tasks will complete before the update.",
+                "update-available": f"Worker '{worker.name}' reports an update is available (reason: {reason}). It will drain when ready.",
+                "updating": f"Worker '{worker.name}' is applying an update (reason: {reason}). It will restart when done.",
+            }
+            try:
+                asyncio.get_running_loop().create_task(
+                    self._notifications.emit_event(
+                        event_type,
+                        title_map.get(status, f"Worker '{worker.name}' {status}"),
+                        detail_map.get(status, f"Worker '{worker.name}' self-reported {status}: {reason}"),
+                        level="info",
+                    )
+                )
+            except RuntimeError:
+                pass
         # Fire worker.online notification when a previously-offline worker recovers.
         # heartbeat() is sync, so schedule the async emit as a background task.
         if self._notifications and prev_status in ("offline", "stale"):
@@ -372,7 +412,7 @@ class ClusterManager:
             return None
         worker_name, _ = parsed
         worker = self._workers.get(worker_name)
-        if worker is None or worker.status not in ("online",):
+        if worker is None or worker.status not in ("online", "update-available"):
             return None
         return worker
 
@@ -611,7 +651,7 @@ class ClusterManager:
         Draining workers are excluded (taOS #890)."""
         eligible = [
             w for w in self._workers.values()
-            if w.status == "online" and capability in w.capabilities
+            if w.status in ("online", "update-available") and capability in w.capabilities
         ]
         return sorted(eligible, key=lambda w: w.load)
 
@@ -654,8 +694,8 @@ class ClusterManager:
         all_capabilities: set[str] = set()
 
         for worker in self._workers.values():
-            if worker.status != "online":
-                continue  # skip offline and draining workers (taOS #890)
+            if worker.status not in ("online", "update-available"):
+                continue  # skip offline, draining, and updating workers (taOS #890)
 
             worker_caps = set(worker.capabilities or [])
             all_capabilities |= worker_caps
@@ -710,8 +750,8 @@ class ClusterManager:
                 # from routing and the aggregate catalog (taOS #1690).
                 if worker.name == "local":
                     continue
-                # Handle online workers that haven't heartbeated
-                if worker.status == "online" and (now - worker.last_heartbeat) > HEARTBEAT_TIMEOUT:
+                # Handle online / update-available workers that haven't heartbeated
+                if worker.status in ("online", "update-available") and (now - worker.last_heartbeat) > HEARTBEAT_TIMEOUT:
                     worker.status = "offline"
                     logger.warning(f"Worker '{worker.name}' marked offline (no heartbeat for {HEARTBEAT_TIMEOUT}s)")
                     if self._notifications:
