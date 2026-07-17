@@ -26,6 +26,13 @@ export interface BackendCapabilities {
   capabilities: string[];
 }
 
+export interface TaOSmdEndpoint {
+  url: string;
+  is_local: boolean;
+  reachable: boolean;
+  tier?: string;
+}
+
 export interface CatalogSession {
   id: number;
   date: string;
@@ -40,7 +47,7 @@ export interface CatalogSession {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Stats / capabilities                                               */
+/*  Stats / capabilities / endpoint                                   */
 /* ------------------------------------------------------------------ */
 
 export async function fetchMemoryStats(): Promise<Record<string, any>> {
@@ -64,6 +71,22 @@ export async function updateMemorySettings(settings: Record<string, any>): Promi
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(settings),
+  });
+}
+
+export async function fetchMemoryEndpoint(): Promise<TaOSmdEndpoint> {
+  const result = await fetchJson<TaOSmdEndpoint>(
+    `${API}/settings/memory-url`,
+    { url: "", is_local: true, reachable: false },
+  );
+  return result;
+}
+
+export async function updateMemoryEndpoint(url: string): Promise<TaOSmdEndpoint> {
+  return fetchJson<TaOSmdEndpoint>(`${API}/settings/memory-url`, { url, is_local: true, reachable: false }, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
   });
 }
 
