@@ -63,11 +63,19 @@ async def _run(args: list[str], cwd: Path) -> tuple[int, str]:
     return proc.returncode or 0, (stdout.decode() if stdout else "")
 
 
-async def update_to_master(project_dir: Path) -> UpdateResult:
+async def update_to_master(
+    project_dir: Path,
+    gpg_fingerprint: Optional[str] = None,
+    gpg_required: bool = False,
+) -> UpdateResult:
     """Pull origin/master robustly, handling dirty trees, branches, and divergence.
 
     Returns an UpdateResult describing what happened. On network failure the
     result carries a descriptive message and no destructive action has been taken.
+
+    When *gpg_fingerprint* is provided, the tip of ``origin/master`` is verified
+    via ``git verify-commit`` after fetch and before any destructive step.  If
+    *gpg_required* is True, a failed verification blocks the update entirely.
     """
     ts = int(time.time())
 
@@ -81,6 +89,28 @@ async def update_to_master(project_dir: Path) -> UpdateResult:
             new_sha="",
             message=f"Fetch failed — no changes applied. ({out.strip()[:200]})",
         )
+
+    # ── GPG signature verification (defence-in-depth) ──────────────────
+    if gpg_fingerprint:
+        from tinyagentos.gpg_verify import verify_commit
+        rc_verify, verify_out = await _run(
+            ["git", "rev-parse", "origin/master"], project_dir,
+        )
+        if rc_verify == 0:
+            remote_sha = verify_out.strip()
+            gpg_result = await verify_commit(project_dir, remote_sha, gpg_fingerprint)
+            if not gpg_result.ok:
+                logger.warning("update_runner: GPG verification failed: %s", gpg_result.status)
+                if gpg_required:
+                    return UpdateResult(
+                        previous_sha="",
+                        new_sha="",
+                        ok=False,
+                        message=f"GPG signature verification failed — update blocked. {gpg_result.status}",
+                    )
+                logger.warning("update_runner: GPG verification failed (warn-only) — proceeding")
+        else:
+            logger.warning("update_runner: could not resolve origin/master for GPG check")
 
     # 2. Probe current state
     _, branch_out = await _run(
@@ -177,13 +207,22 @@ async def update_to_master(project_dir: Path) -> UpdateResult:
     return result
 
 
-async def switch_to_branch(branch: str, project_dir: Path) -> UpdateResult:
+async def switch_to_branch(
+    branch: str,
+    project_dir: Path,
+    gpg_fingerprint: Optional[str] = None,
+    gpg_required: bool = False,
+) -> UpdateResult:
     """Switch the install to origin/<branch> safely.
 
     Fetches the branch (bails non-destructively on failure), tags the current
     tip for recovery, stashes a dirty tree, checks out (creating a local
     tracking branch if needed), ff-merges or hard-resets to origin/<branch>
     (tagging divergence), then restores the stash best-effort.
+
+    When *gpg_fingerprint* is provided, the tip of ``origin/<branch>`` is
+    verified via ``git verify-commit`` after fetch and before any destructive
+    step.  If *gpg_required* is True, a failed verification blocks the switch.
     """
     # Guard against flag-injection: `branch` reaches git argv (fetch/checkout)
     # and `origin/<branch>` refs. Callers validate too, but this is the unit
@@ -202,6 +241,28 @@ async def switch_to_branch(branch: str, project_dir: Path) -> UpdateResult:
         logger.warning("update_runner: fetch failed: %s", out[:500])
         return UpdateResult(previous_sha="", new_sha="", ok=False,
                             message=f"Fetch failed — no changes applied. ({out.strip()[:200]})")
+
+    # ── GPG signature verification (defence-in-depth) ──────────────────
+    if gpg_fingerprint:
+        from tinyagentos.gpg_verify import verify_commit
+        rc_gpg, gpg_out = await _run(
+            ["git", "rev-parse", f"origin/{branch}"], project_dir,
+        )
+        if rc_gpg == 0:
+            remote_sha = gpg_out.strip()
+            gpg_result = await verify_commit(project_dir, remote_sha, gpg_fingerprint)
+            if not gpg_result.ok:
+                logger.warning("update_runner: GPG verification failed: %s", gpg_result.status)
+                if gpg_required:
+                    return UpdateResult(
+                        previous_sha="",
+                        new_sha="",
+                        ok=False,
+                        message=f"GPG signature verification failed — switch blocked. {gpg_result.status}",
+                    )
+                logger.warning("update_runner: GPG verification failed (warn-only) — proceeding")
+        else:
+            logger.warning("update_runner: could not resolve origin/%s for GPG check", branch)
 
     _, cur_branch_out = await _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], project_dir)
     cur_branch = cur_branch_out.strip()
