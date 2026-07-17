@@ -1,4 +1,4 @@
-"""Tests for tinyagentos.worker.worker_manifest — local manifest parser."""
+"""Tests for tinyagentos.worker.worker_manifest -- local manifest parser."""
 from __future__ import annotations
 
 import json
@@ -22,20 +22,19 @@ from tinyagentos.worker.worker_manifest import (
 
 class TestSoftwareMapping:
     def test_llamacpp_maps_to_llama_cpp(self):
-        assert SOFTWARE_TO_BACKEND_TYPE["llamacpp"] == "llama-cpp"
+        assert SOFTWARE_TO_BACKEND_TYPE['llamacpp'] == 'llama-cpp'
 
     def test_embed_maps_to_llama_cpp(self):
-        assert SOFTWARE_TO_BACKEND_TYPE["embed"] == "llama-cpp"
+        assert SOFTWARE_TO_BACKEND_TYPE['embed'] == 'llama-cpp'
 
-    def test_kokoro_maps_to_kokoro(self):
-        assert SOFTWARE_TO_BACKEND_TYPE["kokoro"] == "kokoro"
-
-    def test_whisper_maps_to_whisper(self):
-        assert SOFTWARE_TO_BACKEND_TYPE["whisper"] == "whisper"
+    def test_unrecognised_software_not_in_mapping(self):
+        """kokoro and whisper are no longer mapped -- no probe candidates exist."""
+        assert 'kokoro' not in SOFTWARE_TO_BACKEND_TYPE
+        assert 'whisper' not in SOFTWARE_TO_BACKEND_TYPE
 
 
 # ---------------------------------------------------------------------------
-# load_manifest — file-based tests
+# load_manifest -- file-based tests
 # ---------------------------------------------------------------------------
 
 
@@ -59,12 +58,12 @@ class TestLoadManifest:
                     "health_url": "http://localhost:8080/health",
                 },
                 {
-                    "model_id": "kokoro-v1.0",
-                    "capability": "tts",
-                    "software": "kokoro",
-                    "port": 8880,
-                    "vram_required_gb": 0.5,
-                    "health_url": "http://localhost:8880/health",
+                    "model_id": "gemma-3-1b-it",
+                    "capability": "chat",
+                    "software": "llamacpp",
+                    "port": 9090,
+                    "vram_required_gb": 2.5,
+                    "health_url": "http://localhost:9090/health",
                 },
             ],
         }
@@ -79,7 +78,7 @@ class TestLoadManifest:
             assert result["resource_id"] == "worker-1:gpu-cuda-0"
             assert len(result["models"]) == 2
             assert result["models"][0]["model_id"] == "qwen3-embedding-8b"
-            assert result["models"][1]["model_id"] == "kokoro-v1.0"
+            assert result["models"][1]["model_id"] == "gemma-3-1b-it"
         finally:
             os.unlink(tmp_path)
 
@@ -216,8 +215,7 @@ class TestLoadManifestEdgeCases:
         try:
             result = load_manifest(tmp_path)
             assert len(result["models"]) == 1
-            # load_manifest doesn't validate individual fields —
-            # that's the enrichment layer's job.
+            # load_manifest doesn't validate individual fields -- # that's the enrichment layer's job.
         finally:
             os.unlink(tmp_path)
 
