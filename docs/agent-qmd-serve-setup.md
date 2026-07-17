@@ -1,76 +1,76 @@
-# Per-Agent QMD Serve Setup
+# QMD Memory Service Setup
 
-Each agent runs its own `qmd serve` instance inside its LXC container. This keeps agent data (memory, embeddings, QMD database) inside the agent's container where it belongs, enabling multi-host fallback and clean separation.
+taOS uses a single shared `qmd serve` process on the host for all agent memory
+operations — embedding, semantic search, keyword search, browse, and collection
+management. There is no per-agent QMD instance; every agent reads and writes
+through the shared host service, addressed by agent name and dbPath routing.
 
 ## Architecture
 
 ```
 Host (Orange Pi / x86)
 ├── rkllama (port 7833) — shared NPU/GPU inference
-├── taOS (port 6969) — web GUI, talks to each agent's qmd serve
+├── qmd serve (port 7832) — shared memory service
+│   ├── data/agent-memory/agent-alpha/index.sqlite
+│   ├── data/agent-memory/agent-beta/index.sqlite
+│   ├── data/agent-memory/agent-gamma/index.sqlite
+│   └── data/user-qmd-index/index.sqlite   (taOS user memory)
+├── taOS (port 6969) — web app, routes memory ops through qmd serve
 │
 ├── LXC: agent-alpha
 │   ├── agent framework gateway
-│   └── qmd serve (port 7832) → connects to host's rkllama
-│       └── ~/.cache/qmd/index.sqlite (agent's memory)
+│   └── /memory → host:data/agent-memory/agent-alpha/  (bind mount)
 │
 ├── LXC: agent-beta
 │   ├── agent framework gateway
-│   └── qmd serve (port 7832) → connects to host's rkllama
-│       └── ~/.cache/qmd/index.sqlite
+│   └── /memory → host:data/agent-memory/agent-beta/   (bind mount)
 │
 └── LXC: agent-gamma
     ├── agent framework gateway
-    └── qmd serve (port 7832) → connects to host's rkllama
-        └── ~/.cache/qmd/index.sqlite
+    └── /memory → host:data/agent-memory/agent-gamma/   (bind mount)
 ```
 
-**Key point:** Each agent's `qmd serve` uses the shared rkllama/ollama backend for inference but stores its own index database locally. taOS accesses each agent's memory via the agent's `qmd_url`.
+**Key point:** One shared `qmd serve` on the host handles all agents. Per-agent
+isolation comes from `dbPath` routing — each request specifies which SQLite
+file to operate on. taOS resolves `dbPath` to `data/agent-memory/{name}/index.sqlite`.
 
-## Install QMD in Agent LXC
+## Install QMD on the Host
 
 ```bash
-# Inside the agent's LXC container
-# Always install the latest published qmd so deployments match the
-# maintainer's setup.  The npm package is pre-built; installing from the
-# git source requires a TypeScript build step.
+# On the host — a single qmd installation serves all agents
 npm install -g @jaylfc/qmd@latest
 ```
 
 ## Configure QMD to Use Remote Backend
 
-Set the `QMD_SERVER` environment variable so the QMD CLI uses the remote model server for inference, but keep the index database local:
+Set the `QMD_SERVER` environment variable so the QMD CLI uses the remote model
+server for inference. The index databases live under `data/agent-memory/`.
 
 ```bash
-# The agent's qmd serve connects to rkllama on the host for inference
-# but stores its index in ~/.cache/qmd/index.sqlite locally
-export QMD_SERVER=http://<host-ip>:7832  # for CLI operations
+# The host qmd serve connects to rkllama/ollama for inference
+export QMD_SERVER=http://localhost:7833  # for CLI operations
 ```
 
-## Start QMD Serve in Agent LXC
+## Start QMD Serve on the Host
 
-Each agent runs its own `qmd serve` that:
-1. Serves its local index database via HTTP (search, browse, collections, status)
-2. Routes inference requests (embed, rerank, expand) to the shared rkllama backend on the host
+A single `qmd serve` runs on the host:
 
 ```bash
-qmd serve --port 7832 --bind 0.0.0.0 --backend rkllama --rkllama-url http://<host-ip>:7833
+qmd serve --port 7832 --bind 0.0.0.0 --backend rkllama --rkllama-url http://localhost:7833
 ```
 
-Replace `<host-ip>` with the host's IP address. If using Tailscale, the Tailscale IP avoids macvlan routing issues where LXC containers can't reach the host's LAN IP.
-
-## Systemd Service (Per Agent LXC)
+## Systemd Service (Host)
 
 Create `/etc/systemd/system/qmd-serve.service`:
 
 ```ini
 [Unit]
-Description=QMD Model Server (Agent Memory)
+Description=QMD Memory Service (shared host-level)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/qmd serve --port 7832 --bind 0.0.0.0 --backend rkllama --rkllama-url http://<host-ip>:7833
+ExecStart=/usr/local/bin/qmd serve --port 7832 --bind 0.0.0.0 --backend rkllama --rkllama-url http://localhost:7833
 Restart=on-failure
 RestartSec=5
 Environment=NODE_ENV=production
@@ -86,30 +86,43 @@ sudo systemctl enable --now qmd-serve
 
 ## taOS Config
 
-In taOS's `data/config.yaml`, point each agent to its QMD serve instance:
+In taOS's `data/config.yaml`, configure the shared qmd serve URL at the top
+level. Per-agent `qmd_url` has been removed from the agent schema.
 
 ```yaml
+qmd:
+  url: http://localhost:7832
+
 agents:
   - name: agent-alpha
     host: 10.0.0.10
-    qmd_url: http://10.0.0.10:7832
     color: "#98fb98"
   - name: agent-beta
     host: 10.0.0.11
-    qmd_url: http://10.0.0.11:7832
     color: "#ffd700"
   - name: agent-gamma
     host: 10.0.0.12
-    qmd_url: http://10.0.0.12:7832
     color: "#ff7eb3"
 ```
 
-taOS then queries each agent's endpoints:
-- `GET /status` — index health
-- `GET /collections` — list memory collections
-- `GET /search?q=X` — keyword search
-- `GET /browse?limit=20` — paginated browsing
-- `GET /health` — backend status
+taOS routes all memory operations through the shared `qmd.url` with agent-name
+based dbPath isolation:
+
+- `POST /api/memory/search` — keyword or semantic search (agent-aware)
+- `GET /api/memory/browse` — paginated browsing (agent-aware)
+- `GET /api/memory/collections/{agent_name}` — list collections
+- `DELETE /api/memory/chunk/{hash}` — delete by hash (agent-aware)
+- `POST /api/import/embed` — ingest files into agent memory
+
+## Agent Container Bind Mounts
+
+The deployer bind-mounts each agent's memory directory so the agent and the host
+see identical state:
+
+```
+data/agent-memory/agent-alpha/ → /memory (inside agent-alpha LXC)
+data/agent-memory/agent-beta/  → /memory (inside agent-beta LXC)
+```
 
 ## Firewall (shared A2A bus hosts)
 
@@ -127,30 +140,30 @@ If the bus port was changed via `TAOS_BUS_PORT`, substitute that value.
 
 ## Verify
 
-From the host, test each agent's QMD serve:
+From the host, test the shared qmd serve:
 
 ```bash
-# Check agent's memory status
-curl http://10.0.0.10:7832/status
+# Check memory service status
+curl http://localhost:7832/status
 
-# Search agent's memory
-curl "http://10.0.0.10:7832/search?q=meeting+notes"
+# Search an agent's memory (dbPath is resolved by taOS routes)
+curl "http://localhost:7832/search?q=meeting+notes&dbPath=data/agent-memory/agent-alpha/index.sqlite"
 
-# Browse recent chunks
-curl "http://10.0.0.11:7832/browse?limit=5"
+# Browse recent chunks for an agent
+curl "http://localhost:7832/browse?limit=5&dbPath=data/agent-memory/agent-alpha/index.sqlite"
 
-# Check collections
-curl http://10.0.0.12:7832/collections
+# Check collections for an agent
+curl "http://localhost:7832/collections?dbPath=data/agent-memory/agent-beta/index.sqlite"
 ```
 
 ## Embedding Content
 
-To add content to an agent's memory, run QMD commands inside the agent's LXC:
+Content is embedded through taOS routes (`POST /api/import/embed`) or directly
+via the qmd serve:
 
 ```bash
-# Inside the agent's LXC
-qmd collection add ~/workspace --name workspace
-qmd embed
+# Direct ingest via qmd serve
+curl -X POST http://localhost:7832/ingest \
+  -H "Content-Type: application/json" \
+  -d '{"body": "content to embed", "title": "note", "collection": "knowledge", "dbPath": "data/agent-memory/agent-alpha/index.sqlite"}'
 ```
-
-The embedding process uses the remote rkllama backend (via the `--backend rkllama` flag on qmd serve), but stores the vectors in the local SQLite database.
