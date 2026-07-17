@@ -344,7 +344,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # Check session cookie
         token = request.cookies.get("taos_session")
         if token:
-            user_id = auth_mgr.validate_session(token)
+            user_agent = request.headers.get("user-agent", "")
+            user_id = auth_mgr.validate_session(token, user_agent=user_agent)
             if user_id is not None:
                 user_record = auth_mgr.get_user_by_id(user_id)
                 request.state.user_id = user_id
