@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS user_shares (
     resource_id         TEXT NOT NULL,
     shared_with_user_id TEXT NOT NULL,
     permission           TEXT NOT NULL,
-    tier                TEXT NOT NULL DEFAULT 'once',
+    tier                TEXT NOT NULL DEFAULT 'once',   -- reserved for future tier enforcement (currently unused)
     granted_at          TEXT NOT NULL,
     expires_at          TEXT,
     status              TEXT NOT NULL DEFAULT 'pending',
@@ -94,17 +94,37 @@ class UserSharesStore(BaseStore):
     ) -> dict:
         """Insert or replace a share for the exact 5-column key.
 
+        *tier* is reserved for future tier-based enforcement and is
+        currently ignored (the column is kept for forward compatibility).
+
         Idempotent re-share: calling add_share again with the same
         (owner_user_id, resource_type, resource_id, shared_with_user_id,
         permission) tuple replaces the existing share rather than creating
         a duplicate.  The delete+insert+select runs under the write lock
         for atomicity.
+
+        If the existing share was already accepted, the re-share preserves
+        the original ``status`` and ``granted_at`` so an already-granted
+        access is not silently revoked.
         """
         if self._db is None:
             raise RuntimeError("UserSharesStore not initialised — call init() first")
 
         now = datetime.now(timezone.utc).isoformat()
         async with self._write_lock:
+            # Fetch the existing row's status + granted_at so re-share
+            # preserves an already-accepted grant (Kilo W1 fix).
+            existing = await (
+                await self._db.execute(
+                    "SELECT status, granted_at FROM user_shares "
+                    "WHERE owner_user_id = ? AND resource_type = ? "
+                    "AND resource_id = ? AND shared_with_user_id = ? "
+                    "AND permission = ?",
+                    (owner_user_id, resource_type, resource_id,
+                     shared_with_user_id, permission),
+                )
+            ).fetchone()
+
             # Remove any existing row for the exact key first.
             await self._db.execute(
                 "DELETE FROM user_shares "
@@ -113,15 +133,25 @@ class UserSharesStore(BaseStore):
                 (owner_user_id, resource_type, resource_id,
                  shared_with_user_id, permission),
             )
+
+            # Preserve accepted status + original granted_at on re-share;
+            # new shares start as 'pending' with the current timestamp.
+            if existing and existing["status"] == "accepted":
+                status_ = existing["status"]
+                granted_at_ = existing["granted_at"]
+            else:
+                status_ = "pending"
+                granted_at_ = now
+
             await self._db.execute(
                 """
                 INSERT INTO user_shares
                     (owner_user_id, resource_type, resource_id,
-                     shared_with_user_id, permission, tier, granted_at, expires_at, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     shared_with_user_id, permission, granted_at, expires_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (owner_user_id, resource_type, resource_id,
-                 shared_with_user_id, permission, tier, now, expires_at, 'pending'),
+                 shared_with_user_id, permission, granted_at_, expires_at, status_),
             )
             await self._db.commit()
             row = await (
@@ -191,6 +221,21 @@ class UserSharesStore(BaseStore):
             (share_id,),
         )
         await self._db.commit()
+
+    async def get_share_by_id(self, share_id: int) -> dict | None:
+        """Return a share by its primary key, or None if not found.
+
+        Direct ``SELECT ... WHERE id = ?`` — O(1) indexed lookup that
+        works regardless of ownership or expiry, so admin revoke and
+        consent accept/deny can resolve any share.
+        """
+        if self._db is None:
+            raise RuntimeError("UserSharesStore not initialised")
+        cursor = await self._db.execute(
+            "SELECT * FROM user_shares WHERE id = ?", (share_id,)
+        )
+        row = await cursor.fetchone()
+        return _row_to_dict(row) if row else None
 
     async def user_can_access(
         self, resource_type: str, resource_id: str, user_id: str

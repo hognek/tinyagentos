@@ -30,6 +30,10 @@ router = APIRouter()
 # Request bodies
 # ---------------------------------------------------------------------------
 
+VALID_RESOURCE_TYPES = ("agent", "project", "knowledge_base", "note", "file")
+VALID_PERMISSIONS = ("read", "write", "admin")
+
+
 class CreateShareRequest(BaseModel):
     resource_type: str
     resource_id: str
@@ -62,24 +66,14 @@ async def user_can_access(
 
 
 async def _find_share_by_id(request: Request, share_id: int) -> dict | None:
-    """Look up a share by id across active shares and the caller's owned shares.
+    """Look up a share by its primary key.
 
-    Active-shares-first avoids scanning expired shares in the common case
-    where the share is still alive.
+    Uses ``store.get_share_by_id`` — an O(1) indexed lookup that works
+    regardless of ownership, status, or expiry, so admin revoke and
+    consent accept/deny can resolve any share.
     """
     store = _get_user_shares_store(request)
-    # Active shares first (covers the common case for both owner and admin).
-    for s in await store.list_active_shares():
-        if s["id"] == share_id:
-            return s
-    # Fall back to caller's owned shares (includes expired shares the owner
-    # might still want to delete).
-    user_id: str = getattr(request.state, "user_id", "")
-    if user_id:
-        for s in await store.list_shares(user_id):
-            if s["id"] == share_id:
-                return s
-    return None
+    return await store.get_share_by_id(share_id)
 
 
 # ---------------------------------------------------------------------------
@@ -118,6 +112,20 @@ async def create_share(
     # Decision against yourself.
     if target_user_id == user.user_id:
         raise HTTPException(status_code=400, detail="cannot share with yourself")
+
+    # Validate resource_type and permission against known sets (Kilo S5).
+    if body.resource_type not in VALID_RESOURCE_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"invalid resource_type '{body.resource_type}'; "
+            f"expected one of {VALID_RESOURCE_TYPES}",
+        )
+    if body.permission not in VALID_PERMISSIONS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"invalid permission '{body.permission}'; "
+            f"expected one of {VALID_PERMISSIONS}",
+        )
 
     # Create (or replace) the share.  The store's write lock makes this
     # idempotent for concurrent same-key writes.
