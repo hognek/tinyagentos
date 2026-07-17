@@ -10,6 +10,10 @@ framework: hermes
 display_name: Hermes Agent Gateway
 version: "1.0.0"
 
+# -- Verification status (see docs/…/§Framework verification model) ------------
+# tested / beta / experimental / broken
+verification_status: tested
+
 # -- Protocol endpoints the adapter speaks -----------------------------------
 endpoints:
   llm: openai-chat              # Hermes natively speaks OpenAI /v1/chat/completions

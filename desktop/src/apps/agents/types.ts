@@ -56,7 +56,8 @@ export interface Framework {
   id: string;
   name: string;
   description: string;
-  verification_status: "beta" | "alpha" | "broken";
+  verification_status: "tested" | "beta" | "experimental" | "broken";
+  tracking_issue?: string;
 }
 
 // AgentModel is defined and exported from ModelPickerFlow
