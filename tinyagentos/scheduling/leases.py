@@ -51,6 +51,7 @@ class LeaseManager:
     def __init__(self, db_path: str | Path = "data/leases.db"):
         self._db_path = str(db_path)
         self._conn: sqlite3.Connection | None = None
+        self._lock = asyncio.Lock()
 
     def _sync_init(self) -> None:
         self._conn = sqlite3.connect(self._db_path, isolation_level=None, check_same_thread=False)
@@ -60,7 +61,8 @@ class LeaseManager:
 
     async def init(self) -> None:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(self._sync_init)
+        async with self._lock:
+            await asyncio.to_thread(self._sync_init)
 
     async def close(self) -> None:
         if self._conn:
@@ -162,9 +164,10 @@ class LeaseManager:
         Returns lease dict on success, None if resource is already held
         by another agent.
         """
-        return await asyncio.to_thread(
-            self._sync_acquire, resource_key, agent_name, ttl
-        )
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_acquire, resource_key, agent_name, ttl
+            )
 
     def _sync_renew(
         self, resource_key: str, agent_name: str, ttl: float
@@ -197,9 +200,10 @@ class LeaseManager:
         ttl: float = DEFAULT_TTL,
     ) -> dict | None:
         """Renew an existing lease. Only the holder can renew."""
-        return await asyncio.to_thread(
-            self._sync_renew, resource_key, agent_name, ttl
-        )
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_renew, resource_key, agent_name, ttl
+            )
 
     def _sync_release(self, resource_key: str, agent_name: str) -> bool:
         cursor = self._conn.execute(
@@ -210,9 +214,10 @@ class LeaseManager:
 
     async def release(self, resource_key: str, agent_name: str) -> bool:
         """Release a lease. Only the holder can release."""
-        return await asyncio.to_thread(
-            self._sync_release, resource_key, agent_name
-        )
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_release, resource_key, agent_name
+            )
 
     def _sync_check(self, resource_key: str) -> dict | None:
         self._cleanup_expired()
@@ -224,7 +229,8 @@ class LeaseManager:
 
     async def check(self, resource_key: str) -> dict | None:
         """Check who holds a lease on a resource. Returns lease dict or None."""
-        return await asyncio.to_thread(self._sync_check, resource_key)
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_check, resource_key)
 
     def _sync_is_held_by(self, resource_key: str, agent_name: str) -> bool:
         self._cleanup_expired()
@@ -236,9 +242,10 @@ class LeaseManager:
 
     async def is_held_by(self, resource_key: str, agent_name: str) -> bool:
         """Check if a specific agent holds the lease."""
-        return await asyncio.to_thread(
-            self._sync_is_held_by, resource_key, agent_name
-        )
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_is_held_by, resource_key, agent_name
+            )
 
     def _sync_agent_leases(self, agent_name: str) -> list[dict]:
         self._cleanup_expired()
@@ -250,7 +257,8 @@ class LeaseManager:
 
     async def agent_leases(self, agent_name: str) -> list[dict]:
         """List all active leases held by an agent."""
-        return await asyncio.to_thread(self._sync_agent_leases, agent_name)
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_agent_leases, agent_name)
 
     def _sync_release_all(self, agent_name: str) -> int:
         cursor = self._conn.execute(
@@ -261,7 +269,8 @@ class LeaseManager:
 
     async def release_all(self, agent_name: str) -> int:
         """Release all leases held by an agent (e.g., on agent shutdown)."""
-        return await asyncio.to_thread(self._sync_release_all, agent_name)
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_release_all, agent_name)
 
     def _sync_stats(self) -> dict:
         self._cleanup_expired()
@@ -271,4 +280,5 @@ class LeaseManager:
 
     async def stats(self) -> dict:
         """Lease statistics."""
-        return await asyncio.to_thread(self._sync_stats)
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_stats)

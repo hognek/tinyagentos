@@ -179,6 +179,7 @@ class MeshSync:
         self._node_id = node_id or hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]
         self._is_controller = is_controller
         self._conn: sqlite3.Connection | None = None
+        self._lock = asyncio.Lock()
 
     def _sync_init(self) -> None:
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
@@ -188,7 +189,8 @@ class MeshSync:
 
     async def init(self) -> None:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(self._sync_init)
+        async with self._lock:
+            await asyncio.to_thread(self._sync_init)
 
     async def close(self) -> None:
         if self._conn:
@@ -211,7 +213,8 @@ class MeshSync:
 
     async def add_peer(self, peer_id: str, url: str) -> dict:
         """Register a sync peer (worker or controller)."""
-        return await asyncio.to_thread(self._sync_add_peer, peer_id, url)
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_add_peer, peer_id, url)
 
     def _sync_remove_peer(self, peer_id: str) -> bool:
         cursor = self._conn.execute("DELETE FROM sync_peers WHERE peer_id = ?", (peer_id,))
@@ -219,14 +222,16 @@ class MeshSync:
         return cursor.rowcount > 0
 
     async def remove_peer(self, peer_id: str) -> bool:
-        return await asyncio.to_thread(self._sync_remove_peer, peer_id)
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_remove_peer, peer_id)
 
     def _sync_list_peers(self) -> list[dict]:
         rows = self._conn.execute("SELECT * FROM sync_peers ORDER BY created_at").fetchall()
         return [dict(r) for r in rows]
 
     async def list_peers(self) -> list[dict]:
-        return await asyncio.to_thread(self._sync_list_peers)
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_list_peers)
 
     # ------------------------------------------------------------------
     # Delta export (controller → worker)
@@ -398,10 +403,11 @@ class MeshSync:
         Returns:
             {tables_synced, total_records, errors}.
         """
-        return await asyncio.to_thread(
-            self._sync_pull_from_peer,
-            peer_id, source_dbs, target_dbs, allow_private,
-        )
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_pull_from_peer,
+                peer_id, source_dbs, target_dbs, allow_private,
+            )
 
     async def push_to_peer(
         self,
@@ -484,7 +490,8 @@ class MeshSync:
         }
 
     async def stats(self) -> dict:
-        return await asyncio.to_thread(self._sync_stats)
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_stats)
 
 
 # ---------------------------------------------------------------------------
@@ -534,8 +541,8 @@ def _import_delta_sync(
                 tuple(record[c] for c in peer_cols),
             )
             imported += 1
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Import failed for %s record: %s", table, e)
 
     if imported:
         target_db.commit()
