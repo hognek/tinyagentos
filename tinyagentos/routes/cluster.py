@@ -266,6 +266,13 @@ class HeartbeatBody(BaseModel):
     # rank candidates by actual free memory, not total capacity.
     free_vram_mb: int | None = None
     used_vram_mb: int | None = None
+    # Registration-drift refresh (taOS #1538): workers report their live
+    # host_lan_ip, url, and hardware on every heartbeat so the cluster
+    # manager stays in sync with container reality. Optional so legacy
+    # workers that don't send them leave stored values unchanged.
+    host_lan_ip: str | None = None
+    url: str | None = None
+    hardware: dict | None = None
 
 
 class RouteRequest(BaseModel):
@@ -506,6 +513,14 @@ async def worker_heartbeat(request: Request, body: HeartbeatBody):
         kv_cache_quant_boundary_layer_protect=body.kv_cache_quant_boundary_layer_protect,
         free_vram_mb=body.free_vram_mb,
         used_vram_mb=body.used_vram_mb,
+        # LXC storage counters (forwarded from worker heartbeat)
+        storage_cap_bytes=body.storage_cap_bytes,
+        storage_used_bytes=body.storage_used_bytes,
+        bytes_deduped_total=body.bytes_deduped_total,
+        # Registration-drift refresh (taOS #1538)
+        host_lan_ip=body.host_lan_ip,
+        url=body.url,
+        hardware=body.hardware,
     )
     if not ok:
         return JSONResponse({"error": "Worker not registered"}, status_code=404)
