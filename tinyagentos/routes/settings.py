@@ -1,7 +1,9 @@
 from __future__ import annotations
 import asyncio
 import datetime
+import httpx
 import io
+import ipaddress
 import logging
 import os
 import shutil
@@ -1075,31 +1077,88 @@ async def set_update_channel(request: Request, body: UpdateChannel):
 # Memory URL (taOSmd)
 # ---------------------------------------------------------------------------
 
+_MEMORY_URL_PROBE_CACHE: dict = {}  # {url: (timestamp, bool)}
+
+
+def _is_local_url(url: str) -> bool:
+    """Return True if *url* points to the local machine (loopback or private)."""
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    if hostname in ("localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        addr = ipaddress.ip_address(hostname)
+        return addr.is_loopback or addr.is_private
+    except ValueError:
+        return False
+
+
+async def _probe_taosmd(request: Request, url: str) -> bool:
+    """Probe the taOSmd /health endpoint.  Returns True if reachable."""
+    try:
+        client = request.app.state.http_client
+        resp = await client.get(
+            f"{url}/health",
+            timeout=httpx.Timeout(3.0, connect=2.0),
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
 class MemoryUrlUpdate(BaseModel):
     url: str
 
 
 @router.get("/api/settings/memory-url")
 async def get_memory_url(request: Request):
-    """Return the current taOSmd memory URL."""
+    """Return the current taOSmd memory URL with local/reachable probes."""
     config = request.app.state.config
-    return {"url": config.memory_url}
+    url = config.memory_url
+    is_local = _is_local_url(url)
+
+    # Return cached probe result if fresh (< 30 s), else re-probe.
+    cached = _MEMORY_URL_PROBE_CACHE.get(url)
+    now = time.monotonic()
+    if cached and (now - cached[0]) < 30:
+        reachable = cached[1]
+    else:
+        reachable = await _probe_taosmd(request, url)
+        _MEMORY_URL_PROBE_CACHE[url] = (now, reachable)
+
+    return {"url": url, "is_local": is_local, "reachable": reachable}
 
 
 @router.put("/api/settings/memory-url")
 async def set_memory_url(request: Request, body: MemoryUrlUpdate):
-    """Update the taOSmd memory URL and persist to config."""
+    """Update the taOSmd memory URL, persist to config, and probe reachability.
+
+    The URL is always accepted and persisted.  The *reachable* field reports
+    the probe result but does not gate the save."""
     url = body.url.strip()
     if not url:
         return JSONResponse({"error": "URL must not be empty"}, status_code=400)
+    # Strip a single trailing slash (not a character set).
+    if url.endswith("/"):
+        url = url[:-1]
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return JSONResponse({"error": "URL must use http:// or https:// scheme"}, status_code=400)
     if not parsed.netloc:
         return JSONResponse({"error": "URL must include a hostname"}, status_code=400)
+
+    is_local = _is_local_url(url)
+    reachable = await _probe_taosmd(request, url)
+
     config = request.app.state.config
     config.memory_url = url
     await save_config_locked(config, request.app.state.config_path)
     # Keep app.state.taosmd_url in sync for runtime access
     request.app.state.taosmd_url = url
-    return {"status": "saved", "url": url}
+
+    # Cache the probe result so the next GET is instant.
+    _MEMORY_URL_PROBE_CACHE[url] = (time.monotonic(), reachable)
+
+    return {"url": url, "is_local": is_local, "reachable": reachable}

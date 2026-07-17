@@ -330,3 +330,153 @@ class TestRebuildResultStructured:
         assert r.rebuilt is True
         assert r.success is False
         assert r.message == "x"
+
+
+class TestMemoryUrlSettings:
+    """Contract: GET /api/settings/memory-url returns {url, is_local, reachable}
+    and PUT probes the new target before returning (#1911)."""
+
+    @pytest.mark.asyncio
+    async def test_get_returns_default_url(self, client):
+        """Default URL is localhost:7900, is_local=True, reachable depends on env."""
+        resp = await client.get("/api/settings/memory-url")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["url"] == "http://localhost:7900"
+        assert data["is_local"] is True
+        assert isinstance(data["reachable"], bool)
+
+    @pytest.mark.asyncio
+    async def test_get_returns_is_local_true_for_localhost(self, client, app):
+        """Setting the config URL to a loopback address must report is_local=True."""
+        app.state.config.memory_url = "http://127.0.0.1:7900"
+        resp = await client.get("/api/settings/memory-url")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["url"] == "http://127.0.0.1:7900"
+        assert data["is_local"] is True
+
+    @pytest.mark.asyncio
+    async def test_get_returns_is_local_false_for_remote(self, client, app):
+        """A remote URL must report is_local=False."""
+        app.state.config.memory_url = "https://memory.example.com:7900"
+        resp = await client.get("/api/settings/memory-url")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["url"] == "https://memory.example.com:7900"
+        assert data["is_local"] is False
+
+    @pytest.mark.asyncio
+    async def test_put_sets_url_and_probes(self, client, app):
+        """PUT persists the URL to config and returns probe result."""
+        resp = await client.put(
+            "/api/settings/memory-url",
+            json={"url": "http://192.168.1.100:7900"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["url"] == "http://192.168.1.100:7900"
+        assert data["is_local"] is True  # 192.168.x.x is private
+        assert isinstance(data["reachable"], bool)
+        # Verify it persisted on config
+        assert app.state.config.memory_url == "http://192.168.1.100:7900"
+
+    @pytest.mark.asyncio
+    async def test_put_rejects_empty_url(self, client):
+        """Empty URL must return 400."""
+        resp = await client.put(
+            "/api/settings/memory-url",
+            json={"url": ""},
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_put_rejects_non_http_scheme(self, client):
+        """A non-http scheme must return 400."""
+        resp = await client.put(
+            "/api/settings/memory-url",
+            json={"url": "ftp://localhost:7900"},
+        )
+        assert resp.status_code == 400
+        assert "http" in resp.json()["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_get_reflects_put(self, client, app):
+        """After PUT, GET must return the new URL."""
+        await client.put(
+            "/api/settings/memory-url",
+            json={"url": "https://taosmd.local:8443"},
+        )
+        resp = await client.get("/api/settings/memory-url")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["url"] == "https://taosmd.local:8443"
+        assert data["is_local"] is False
+
+    @pytest.mark.asyncio
+    async def test_is_local_url_helper(self):
+        """Unit-test _is_local_url directly."""
+        from tinyagentos.routes.settings import _is_local_url
+
+        assert _is_local_url("http://localhost:7900") is True
+        assert _is_local_url("http://127.0.0.1:7900") is True
+        assert _is_local_url("http://[::1]:7900") is True
+        assert _is_local_url("http://10.0.0.1:7900") is True   # private
+        assert _is_local_url("http://192.168.1.1:7900") is True  # private
+        assert _is_local_url("https://example.com:7900") is False
+        assert _is_local_url("http://8.8.8.8:7900") is False  # public IP
+
+    @pytest.mark.asyncio
+    async def test_put_probes_and_reports_unreachable(self, client):
+        """When taosmd is not running, reachable must be False."""
+        resp = await client.put(
+            "/api/settings/memory-url",
+            json={"url": "http://localhost:19999"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["reachable"] is False  # no taosmd on that port
+
+    @pytest.mark.asyncio
+    async def test_put_strips_trailing_slash(self, client, app):
+        """Trailing slash on the URL should be stripped."""
+        resp = await client.put(
+            "/api/settings/memory-url",
+            json={"url": "http://localhost:7900/"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["url"] == "http://localhost:7900"
+        assert app.state.config.memory_url == "http://localhost:7900"
+
+    @pytest.mark.asyncio
+    async def test_put_rejects_url_without_hostname(self, client):
+        """A URL without a valid hostname must return 400 (netloc check)."""
+        resp = await client.put(
+            "/api/settings/memory-url",
+            json={"url": "http:///path"},
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_put_response_includes_is_local_and_reachable(self, client):
+        """PUT response must include is_local and reachable alongside url."""
+        resp = await client.put(
+            "/api/settings/memory-url",
+            json={"url": "https://remote.example.com:7900"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "url" in data
+        assert "is_local" in data
+        assert "reachable" in data
+        assert data["is_local"] is False  # remote hostname
+
+    @pytest.mark.asyncio
+    async def test_put_rejects_malformed_json(self, client):
+        """Malformed JSON body must return 422 (Pydantic validation), not 500."""
+        resp = await client.put(
+            "/api/settings/memory-url",
+            content=b"not json",
+            headers={"Content-Type": "application/json"},
+        )
+        assert resp.status_code == 422
