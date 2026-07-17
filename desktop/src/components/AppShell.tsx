@@ -17,6 +17,7 @@ import { useEffect, type ReactNode } from "react";
 import { BackendStatusProvider } from "@/contexts/BackendStatusContext";
 import { BackendBanner } from "./BackendBanner";
 import { UpdateAvailableToast } from "./UpdateAvailableToast";
+import { SpaUpdateToast } from "./SpaUpdateToast";
 import { AppErrorBoundary } from "./AppErrorBoundary";
 import { registerServiceWorker } from "@/lib/sw-register";
 
@@ -32,6 +33,7 @@ export function AppShell({ children }: { children: ReactNode }) {
     <BackendStatusProvider>
       <BackendBanner />
       <UpdateAvailableToast buildVersion={BUILD_VERSION} />
+      <SpaUpdateToast />
       <AppErrorBoundary>{children}</AppErrorBoundary>
     </BackendStatusProvider>
   );
