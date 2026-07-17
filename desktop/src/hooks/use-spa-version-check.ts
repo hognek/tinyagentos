@@ -39,7 +39,6 @@ export function useSpaVersionCheck(): {
   deployedVersion: string | null;
 } {
   const [deployedVersion, setDeployedVersion] = useState<string | null>(null);
-  const firedFor = useRef<string | null>(null);
   const mountedRef = useRef(true);
 
   const isDev = DEV_VERSION_PATTERN.test(getBuildVersion());
@@ -47,21 +46,14 @@ export function useSpaVersionCheck(): {
   const check = useCallback(async () => {
     if (isDev) return;
     try {
-      const r = await fetch(`${VERSION_URL}?t=${Date.now()}`, {
-        cache: "no-store",
-      });
+      const r = await fetch(VERSION_URL, { cache: "no-store" });
       if (!r.ok) return;
       const payload = (await r.json()) as VersionPayload;
       const deployed = payload?.version;
       if (!deployed || typeof deployed !== "string") return;
       if (!mountedRef.current) return;
 
-      const buildVer = getBuildVersion();
       setDeployedVersion((prev) => (prev === deployed ? prev : deployed));
-
-      if (deployed !== buildVer && firedFor.current !== deployed) {
-        firedFor.current = deployed;
-      }
     } catch {
       // version.json unreachable — backend may be restarting; the
       // BackendStatusProvider already surfaces that state.
@@ -122,7 +114,6 @@ export function useSpaVersionCheck(): {
   const hasNewBuild =
     !isDev &&
     deployedVersion !== null &&
-    firedFor.current === deployedVersion &&
     deployedVersion !== getBuildVersion();
 
   return { hasNewBuild, deployedVersion };
