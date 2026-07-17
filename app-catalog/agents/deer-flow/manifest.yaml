@@ -14,7 +14,7 @@ requires:
 
 install:
   method: script
-  script: scripts/install-deer-flow.sh
+  script: scripts/install.sh
   note: |
     Clones bytedance/deer-flow into /opt/deer-flow and provisions the backend
     with uv (Python 3.12). The bridge adapter (deer_flow_adapter.py) lives in

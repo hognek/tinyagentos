@@ -13,8 +13,13 @@ requires:
   python: ">=3.10"
 
 install:
-  method: pip
-  package: hermes-agent
+  method: script
+  script: scripts/install.sh
+  note: |
+    Installs hermes-agent from PyPI inside the agent container.
+    Creates a systemd unit (hermes-gateway.service) for the agent gateway.
+    The deployer writes /var/lib/hermes/env with TAOS_BRIDGE_URL and
+    TAOS_AGENT_API_KEY — the gateway connects to TAOS channels via SSE.
 
 config_schema:
   - name: model
