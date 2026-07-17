@@ -285,6 +285,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     agent_scope_requests_store = AgentScopeRequestsStore(data_dir / "agent_scope_requests.db")
     from tinyagentos.agent_grants_store import AgentGrantsStore
     agent_grants_store = AgentGrantsStore(data_dir / "agent_grants.db")
+    from tinyagentos.user_shares_store import UserSharesStore
+    user_shares_store = UserSharesStore(data_dir / "user_shares.db")
     from tinyagentos.app_grants_store import AppGrantsStore
     app_grants_store = AppGrantsStore(data_dir / "app_grants.db")
     from tinyagentos.license_acceptances_store import LicenseAcceptancesStore
@@ -506,6 +508,9 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await auth_requests_store.init()
         await agent_scope_requests_store.init()
         await agent_grants_store.init()
+        app.state.agent_grants = agent_grants_store
+        await user_shares_store.init()
+        app.state.user_shares = user_shares_store
         await app_grants_store.init()
         await license_acceptances_store.init()
         await agent_model_key_store.init()
