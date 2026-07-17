@@ -55,6 +55,7 @@ class AppConfig:
     archived_agents: list[dict] = field(default_factory=list)
     archive: dict = field(default_factory=lambda: DEFAULT_ARCHIVE_CONFIG.copy())
     memory_url: str = "http://localhost:7900"
+    wallhaven_api_key: str | None = None
     config_path: Path | None = None
 
     def to_dict(self) -> dict:
@@ -176,6 +177,9 @@ def load_config(path: Path) -> AppConfig:
         memory_url=data.get("memory_url", "http://localhost:7900"),
         config_path=path,
     )
+    # Wallhaven API key is env-only (never written to config.yaml)
+    import os as _os
+    cfg.wallhaven_api_key = _os.environ.get("WALLHAVEN_API_KEY") or None
     if _pin_applied:
         save_config(cfg, path)
     return cfg
