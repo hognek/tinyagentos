@@ -1191,6 +1191,118 @@ async def cancel_drain(request: Request, name: str):
     return result
 
 
+async def _do_single_worker_update(cluster, worker) -> dict:
+    """Run one worker through the drain→deploy update sequence.
+
+    Shared helper called by both the single-worker ``update_worker`` route
+    and the rolling ``update_all_workers`` route (taOS #1876).
+
+    Returns a dict with at least ``"success": bool``, ``"worker"``, and
+    ``"drain_cancelled": bool`` (whether ``cancel_drain`` was actually called).
+    On success: ``{"success": True, "worker": ..., "status": "updating", ...}``.
+    On failure: ``{"success": False, "worker": ..., "error": "..."}``.
+    Never raises -- all exceptions are caught and converted into error dicts.
+    """
+    name = worker.name
+
+    # Step 1: Begin draining (with exception isolation -- drain_worker
+    # may raise from notification or background-task failures).
+    try:
+        drain_result = await cluster.drain_worker(name, graceful=True)
+    except Exception as exc:
+        logger.exception("drain_worker('%s') raised during update", name)
+        return {
+            "success": False,
+            "worker": name,
+            "error": f"Worker drain failed: {exc}",
+            "drain_cancelled": False,
+        }
+    if "error" in drain_result:
+        return {
+            "success": False,
+            "worker": name,
+            "error": drain_result["error"],
+            "drain_cancelled": False,
+        }
+
+    # Step 2: Trigger the update-worker deploy command on the worker
+    import httpx
+    deploy_result = None
+    try:
+        async with httpx.AsyncClient(timeout=620) as htx_client:
+            resp = await htx_client.post(
+                f"{worker.url}/api/worker/deploy",
+                json={"command": "update-worker"},
+            )
+            resp.raise_for_status()
+            deploy_result = resp.json()
+    except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout):
+        # The deploy request blocks until update-worker restarts the worker
+        # service, which drops the connection mid-response. This is the
+        # EXPECTED happy path: the update was accepted and is running. Keep
+        # the worker draining; the monitor loop auto-completes the drain once
+        # the restarted worker re-registers and heartbeats.
+        return {
+            "success": True,
+            "worker": name,
+            "status": "updating",
+            "previous_status": drain_result["previous_status"],
+            "drain": drain_result,
+            "deploy": None,
+            "drain_cancelled": False,
+            "message": (
+                "Worker accepted the update and is restarting. The connection "
+                "dropped as expected during the restart; the monitor loop will "
+                "auto-complete the drain once it re-registers and heartbeats."
+            ),
+        }
+    except httpx.ConnectError as exc:
+        # Connection refused / DNS failure: the worker is unreachable and the
+        # update was never delivered. Cancel the drain so it keeps serving.
+        drain_cancelled = False
+        try:
+            await cluster.cancel_drain(name)
+            drain_cancelled = True
+        except Exception:
+            logger.exception("cancel_drain('%s') raised after ConnectError", name)
+        return {
+            "success": False,
+            "worker": name,
+            "error": f"Worker unreachable for update: {exc}",
+            "drain_cancelled": drain_cancelled,
+        }
+    except Exception as exc:
+        # Non-2xx worker response (raise_for_status) or any other unexpected
+        # error: real failure, cancel drain so worker can still serve traffic.
+        drain_cancelled = False
+        try:
+            await cluster.cancel_drain(name)
+            drain_cancelled = True
+        except Exception:
+            logger.exception("cancel_drain('%s') raised after deploy failure", name)
+        return {
+            "success": False,
+            "worker": name,
+            "error": f"Worker update deploy failed: {exc}",
+            "drain_cancelled": drain_cancelled,
+        }
+
+    return {
+        "success": True,
+        "worker": name,
+        "status": "updating",
+        "previous_status": drain_result["previous_status"],
+        "drain": drain_result,
+        "deploy": deploy_result,
+        "drain_cancelled": False,
+        "message": (
+            "Worker is draining and updating. It will restart and re-register. "
+            "The controller monitor loop will auto-complete the drain once "
+            "all leases are released and the new worker process heartbeats."
+        ),
+    }
+
+
 @router.post("/api/cluster/workers/{name}/update")
 async def update_worker(request: Request, name: str):
     """Trigger a full auto-update sequence on a worker.
@@ -1215,70 +1327,103 @@ async def update_worker(request: Request, name: str):
             status_code=400,
         )
 
-    # Step 1: Begin draining
-    drain_result = await cluster.drain_worker(name, graceful=True)
-    if "error" in drain_result:
-        return JSONResponse(drain_result, status_code=404)
+    result = await _do_single_worker_update(cluster, worker)
+    if not result["success"]:
+        return JSONResponse(
+            {**result, "drain_cancelled": result.get("drain_cancelled", False)},
+            status_code=502,
+        )
+    return result
 
-    # Step 2: Trigger the update-worker deploy command on the worker
-    import httpx
-    deploy_result = None
-    try:
-        async with httpx.AsyncClient(timeout=620) as client:
-            resp = await client.post(
-                f"{worker.url}/api/worker/deploy",
-                json={"command": "update-worker"},
-            )
-            # Surface a non-2xx worker response as a failure instead of
-            # reporting status:"updating" with the error body as deploy_result.
-            resp.raise_for_status()
-            deploy_result = resp.json()
-    except (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout):
-        # The deploy request blocks until update-worker restarts the worker
-        # service, which drops the connection mid-response. This is the
-        # EXPECTED happy path: the update was accepted and is running. Keep
-        # the worker draining; the monitor loop auto-completes the drain once
-        # the restarted worker re-registers and heartbeats. Reporting this as
-        # a failure (and cancelling the drain) was a regression — the update
-        # actually succeeds and self-heals on re-register.
+
+@router.post("/api/cluster/workers/update-all")
+async def update_all_workers(request: Request):
+    """Rolling update of the entire worker fleet -- one at a time (taOS #1876).
+
+    Updates every online worker sequentially, draining and updating at most
+    one worker at any moment so the fleet never fully drains. Skips the
+    ``local`` worker (the controller itself) and any worker that is not
+    ``online``. Workers already ``draining`` are not counted as skipped -- they
+    are likely mid-update from a prior action.
+
+    If one worker's update fails, the roll continues to the remaining workers.
+    After a successful update, the route waits (with a timeout) for the worker
+    to re-register as ``online`` before proceeding to the next target.
+
+    Returns an aggregate ``{updated: [...], failed: [{name, error}], skipped: [...]}``
+    so the admin can see exactly which workers were touched and which failed.
+    """
+    ok, err = _require_admin(request)
+    if not ok:
+        return err
+    cluster = request.app.state.cluster_manager
+
+    workers = cluster.get_workers()
+    targets = [w for w in workers if w.status == "online" and w.name != "local"]
+    skipped: list[str] = [
+        w.name for w in workers
+        if w.name == "local" or w.status not in ("online", "draining")
+    ]
+    if not targets:
         return {
-            "worker": name,
-            "status": "updating",
-            "previous_status": drain_result["previous_status"],
-            "drain": drain_result,
-            "deploy": None,
-            "message": (
-                "Worker accepted the update and is restarting. The connection "
-                "dropped as expected during the restart; the monitor loop will "
-                "auto-complete the drain once it re-registers and heartbeats."
-            ),
+            "updated": [],
+            "failed": [],
+            "skipped": skipped,
+            "total_targets": 0,
+            "message": "No online remote workers to update",
         }
-    except httpx.ConnectError as exc:
-        # Connection refused / DNS failure: the worker is unreachable and the
-        # update was never delivered. Cancel the drain so it keeps serving.
-        await cluster.cancel_drain(name)
-        return JSONResponse(
-            {"error": f"Worker unreachable for update: {exc}", "drain_cancelled": True},
-            status_code=502,
-        )
-    except Exception as exc:
-        # Non-2xx worker response (raise_for_status) or any other unexpected
-        # error: real failure, cancel drain so worker can still serve traffic.
-        await cluster.cancel_drain(name)
-        return JSONResponse(
-            {"error": f"Worker update deploy failed: {exc}", "drain_cancelled": True},
-            status_code=502,
-        )
+
+    updated: list[str] = []
+    failed: list[dict] = []
+
+    RE_REGISTER_TIMEOUT = 300  # seconds to wait for worker to come back online
+    RE_REGISTER_POLL = 5       # seconds between status checks
+
+    for worker in targets:
+        try:
+            result = await _do_single_worker_update(cluster, worker)
+        except Exception as exc:
+            logger.exception(
+                "update-all: unexpected exception for worker '%s' (continuing roll)",
+                worker.name,
+            )
+            failed.append({"name": worker.name, "error": f"Unexpected error: {type(exc).__name__}: {exc}"})
+            continue
+
+        if result["success"]:
+            updated.append(worker.name)
+            # Wait for the worker to re-register as "online" before proceeding
+            # to the next target. This guarantees at most one worker is actively
+            # updating at any moment (never more than one draining concurrently).
+            waited = 0
+            while waited < RE_REGISTER_TIMEOUT:
+                await asyncio.sleep(RE_REGISTER_POLL)
+                waited += RE_REGISTER_POLL
+                w = cluster.get_worker(worker.name)
+                if w is not None and w.status == "online":
+                    logger.info(
+                        "update-all: worker '%s' re-registered online after %ds",
+                        worker.name, waited,
+                    )
+                    break
+            else:
+                # Timeout: worker didn't come back online in time. Log it but
+                # continue the roll -- the worker's status will resolve on its own.
+                logger.warning(
+                    "update-all: worker '%s' did not re-register within %ds timeout; "
+                    "continuing roll",
+                    worker.name, RE_REGISTER_TIMEOUT,
+                )
+        else:
+            failed.append({"name": worker.name, "error": result.get("error", "unknown")})
+            logger.warning(
+                "update-all: worker '%s' update failed (continuing roll): %s",
+                worker.name, result.get("error", "unknown"),
+            )
 
     return {
-        "worker": name,
-        "status": "updating",
-        "previous_status": drain_result["previous_status"],
-        "drain": drain_result,
-        "deploy": deploy_result,
-        "message": (
-            "Worker is draining and updating. It will restart and re-register. "
-            "The controller monitor loop will auto-complete the drain once "
-            "all leases are released and the new worker process heartbeats."
-        ),
+        "updated": updated,
+        "failed": failed,
+        "skipped": skipped,
+        "total_targets": len(targets),
     }
