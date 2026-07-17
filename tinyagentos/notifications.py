@@ -130,6 +130,14 @@ class NotificationStore(BaseStore):
             await self._db.commit()
         # Create the per-user index if it doesn't exist yet. Cannot live in
         # the SCHEMA because the column is added via guarded ALTER after init.
+        #
+        # NOTE: On first boot after deployment this builds synchronously
+        # inside _post_init (app startup).  On an instance with a large
+        # ``notifications`` table the build takes a write lock on the table
+        # and blocks notification writes for the duration.  This is a
+        # one‑time cost — subsequent starts hit IF NOT EXISTS and return
+        # immediately.  If this becomes a problem at scale, the index can
+        # be built lazily after the server is already serving requests.
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(user_id)"
         )
