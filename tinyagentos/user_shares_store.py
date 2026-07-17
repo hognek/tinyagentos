@@ -85,16 +85,18 @@ class UserSharesStore(BaseStore):
     def _normalise_expiry(expires_at: Optional[str]) -> Optional[str]:
         """Parse *expires_at* to a UTC-aware datetime and return its isoformat.
 
-        If parsing fails the original string is kept unchanged (fail-safe),
-        but lexical string comparisons elsewhere in this module rely on a
-        canonical ``+00:00`` form to match ``datetime.now(UTC).isoformat()``.
+        If parsing fails the original string is discarded and ``None`` is
+        returned — an unparseable expiry is treated as "never expires",
+        which is the safer default compared to keeping a non-ISO string
+        that could miscompare in the ``expires_at > ?`` lexical checks in
+        ``list_active_shares`` and ``user_can_access``.
         """
         if expires_at is None:
             return None
         try:
             dt = datetime.fromisoformat(expires_at)
         except ValueError:
-            return expires_at
+            return None
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         else:
@@ -276,4 +278,3 @@ class UserSharesStore(BaseStore):
         )
         row = await cursor.fetchone()
         return _row_to_dict(row) if row else None
-
