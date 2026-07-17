@@ -454,7 +454,7 @@ function TodoDetailPane({
     );
   }
 
-  if (error || !doc) {
+  if (!doc) {
     return (
       <div className="flex h-full items-center justify-center">
         <p className="text-sm text-red-400" role="alert">
@@ -649,6 +649,7 @@ function CreateTodoForm({
       });
       if (!r.ok) throw new Error("Could not create list.");
       const doc: TodoList = await r.json();
+      setCreating(false);
       onCreated(doc);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not create list.");
