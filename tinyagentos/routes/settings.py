@@ -573,7 +573,11 @@ async def _probe_taosmd(request: Request, url: str) -> bool:
 
 def _taosmd_default_url(request: Request) -> str:
     """Return the configured taOSmd URL, falling back to the local default."""
-    return getattr(request.app.state, "taosmd_url", None) or "http://localhost:7900"
+    return (
+        getattr(request.app.state, "taosmd_url", None)
+        or request.app.state.config.memory_url
+        or "http://localhost:7900"
+    )
 
 
 @router.get("/api/settings/memory-url")
@@ -596,6 +600,11 @@ async def set_memory_url(request: Request):
     if parsed.scheme not in ("http", "https"):
         return JSONResponse(
             {"error": "URL must start with http:// or https://"},
+            status_code=400,
+        )
+    if not parsed.netloc:
+        return JSONResponse(
+            {"error": "URL must include a hostname"},
             status_code=400,
         )
 
