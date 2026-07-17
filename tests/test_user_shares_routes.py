@@ -25,7 +25,11 @@ from httpx import ASGITransport, AsyncClient
 @pytest_asyncio.fixture
 async def shares_client(client, tmp_data_dir):
     """Async client with user_shares store initialised + CSRF tokens, as admin."""
-    from tinyagentos.user_shares_store import UserSharesStore
+    try:
+        from tinyagentos.user_shares_store import UserSharesStore
+    except ImportError:
+        pytest.skip("UserSharesStore not merged yet (depends on #1897)")
+        return  # unreachable; keeps type-checkers happy
 
     app = client._transport.app
 
@@ -56,12 +60,6 @@ async def shares_client(client, tmp_data_dir):
 async def bob_client(shares_client):
     """Async client authenticated as user 'bob' (non-admin, non-owner)."""
     app = shares_client._transport.app
-
-    # Create bob user if not already present.
-    bob = app.state.auth.find_user("bob")
-    if bob is None:
-        invite_code = app.state.auth.add_user_invite("bob", "admin")
-        app.state.auth.complete_invite("bob", invite_code, "Bob", "", "bobpass1")
 
     bob_record = app.state.auth.find_user("bob")
     bob_uid = bob_record["id"]
@@ -146,12 +144,16 @@ class TestShareRoutes:
 
     async def test_create_share_to_self_rejected(self, shares_client):
         """POST /api/shares to yourself returns 400."""
+        app = shares_client._transport.app
+        session_token = shares_client.cookies.get("taos_session")
+        me = app.state.auth.get_user(session_token)
+        my_username = me["username"] if me else "admin"
         resp = await shares_client.post(
             "/api/shares",
             json={
                 "resource_type": "project",
                 "resource_id": "proj-4",
-                "to_username": "admin",
+                "to_username": my_username,
                 "permission": "read",
             },
         )
@@ -160,9 +162,9 @@ class TestShareRoutes:
 
     # -- List ------------------------------------------------------------
 
-    async def test_list_outgoing_shares(self, shares_client):
-        """GET /api/shares?direction=out lists shares owned by the user."""
-        # Create two shares.
+    async def test_list_outgoing_shares(self, shares_client, bob_client):
+        """GET /api/shares?direction=out lists only shares owned by the user."""
+        # Create two outgoing shares (admin → bob).
         for res_id in ("proj-list-out-1", "proj-list-out-2"):
             r = await shares_client.post(
                 "/api/shares",
@@ -175,6 +177,19 @@ class TestShareRoutes:
             )
             assert r.status_code == 200
 
+        # Also create an incoming share (bob → admin) to verify direction
+        # filtering excludes it from the outgoing list.
+        r_in = await bob_client.post(
+            "/api/shares",
+            json={
+                "resource_type": "project",
+                "resource_id": "proj-list-in-from-bob",
+                "to_username": "admin",
+                "permission": "read",
+            },
+        )
+        assert r_in.status_code == 200
+
         resp = await shares_client.get("/api/shares?direction=out")
         assert resp.status_code == 200
         data = resp.json()
@@ -182,6 +197,8 @@ class TestShareRoutes:
         out_ids = [s["resource_id"] for s in data if s["resource_type"] == "project"]
         assert "proj-list-out-1" in out_ids
         assert "proj-list-out-2" in out_ids
+        # Direction filtering must exclude incoming shares.
+        assert "proj-list-in-from-bob" not in out_ids
 
     async def test_list_incoming_shares(self, shares_client, bob_client):
         """GET /api/shares?direction=in lists shares received by the user."""
