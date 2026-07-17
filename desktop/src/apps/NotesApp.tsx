@@ -1,7 +1,6 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import {
   StickyNote,
-  ListChecks,
   Plus,
   Clock,
   Users,
@@ -117,19 +116,6 @@ const NOTES_CONFIG: DocKindConfig = {
   emptyEntries: "Nothing here yet. Add your first note above.",
   selectPrompt: "Select a note to get started.",
   showDone: false,
-};
-
-const TODO_CONFIG: DocKindConfig = {
-  kind: "list",
-  appName: "Todo",
-  icon: ListChecks,
-  noun: "list",
-  titlePlaceholder: "List title...",
-  addPlaceholder: "Add a task...",
-  emptyDocs: "No lists yet.",
-  emptyEntries: "Nothing here yet. Add your first task above.",
-  selectPrompt: "Select a list to get started.",
-  showDone: true,
 };
 
 // ---- Sub-components ----
@@ -1170,8 +1156,4 @@ function DocsApp({ config }: { config: DocKindConfig }) {
 
 export function NotesApp({ windowId: _windowId }: { windowId: string }) {
   return <DocsApp config={NOTES_CONFIG} />;
-}
-
-export function TodoApp({ windowId: _windowId }: { windowId: string }) {
-  return <DocsApp config={TODO_CONFIG} />;
 }
