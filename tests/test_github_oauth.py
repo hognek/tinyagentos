@@ -219,3 +219,101 @@ async def test_token_encrypted_at_rest(store):
     assert "gho_plaintexttoken" not in row[0]
     # And get_token decrypts it back.
     assert await store.get_token(identity["id"]) == "gho_plaintexttoken"
+
+
+# ---------------------------------------------------------------------------
+# GitHub App installation endpoint tests
+# ---------------------------------------------------------------------------
+
+def _build_app_for_app_tests(store, *, config=None, installations=None, post_effects=(), get_effects=()):
+    """Build a FastAPI app with App-specific state for installation tests."""
+    app = FastAPI()
+    app.include_router(github_oauth_router)
+    http = MagicMock()
+    http.post = AsyncMock(side_effect=list(post_effects)) if post_effects else AsyncMock()
+    http.get = AsyncMock(side_effect=list(get_effects)) if get_effects else AsyncMock()
+    app.state.http_client = http
+    app.state.github_identities = store
+    app.state.config = config
+    app.state.github_app_installations = installations
+    return app
+
+
+@pytest_asyncio.fixture
+async def app_client_factory(store):
+    """Factory that returns an AsyncClient wired to a minimal app with App state."""
+    async def _make(**kwargs):
+        app = _build_app_for_app_tests(store, **kwargs)
+        transport = ASGITransport(app=app)
+        return AsyncClient(transport=transport, base_url="http://test")
+    return _make
+
+
+class TestAppInstallationsList:
+    @pytest.mark.asyncio
+    async def test_returns_501_when_app_not_configured(self, app_client_factory):
+        """GET /api/github/app/installations returns 501 if app not configured."""
+        client = await app_client_factory()
+        resp = await client.get(
+            "/api/github/app/installations",
+            headers={"Accept": "application/json"},
+        )
+        assert resp.status_code == 501
+        data = resp.json()
+        assert "error" in data
+        assert "not configured" in data["error"].lower()
+
+
+class TestAppInstall:
+    @pytest.mark.asyncio
+    async def test_returns_501_when_app_not_configured(self, app_client_factory):
+        """POST /api/github/app/install returns 501 if app not configured."""
+        client = await app_client_factory()
+        resp = await client.post(
+            "/api/github/app/install",
+            headers={"Accept": "application/json"},
+        )
+        assert resp.status_code == 501
+        data = resp.json()
+        assert "error" in data
+
+
+class TestAppCallback:
+    @pytest.mark.asyncio
+    async def test_returns_400_without_installation_id(self, app_client_factory):
+        """GET /api/github/app/callback without installation_id returns 400."""
+        client = await app_client_factory()
+        resp = await client.get(
+            "/api/github/app/callback",
+            headers={"Accept": "application/json"},
+        )
+        assert resp.status_code == 400
+        data = resp.json()
+        assert "error" in data
+        assert "installation_id" in data["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_returns_501_with_installation_id_but_no_app_config(self, app_client_factory):
+        """GET /api/github/app/callback?installation_id=1 returns 501 if app missing."""
+        client = await app_client_factory()
+        resp = await client.get(
+            "/api/github/app/callback?installation_id=12345",
+            headers={"Accept": "application/json"},
+        )
+        assert resp.status_code == 501
+        data = resp.json()
+        assert "error" in data
+
+
+class TestAppInstallationDelete:
+    @pytest.mark.asyncio
+    async def test_returns_501_when_app_not_configured(self, app_client_factory):
+        """DELETE /api/github/app/installations/1 returns 501 if app not configured."""
+        client = await app_client_factory()
+        resp = await client.delete(
+            "/api/github/app/installations/12345",
+            headers={"Accept": "application/json"},
+        )
+        assert resp.status_code == 501
+        data = resp.json()
+        assert "error" in data

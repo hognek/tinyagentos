@@ -65,6 +65,7 @@ from tinyagentos.scheduler.gpu_arbiter import GpuArbiter
 from tinyagentos.torrent_settings import TorrentSettingsStore
 from tinyagentos.relationships import RelationshipManager
 from tinyagentos.github_identities import GitHubIdentitiesStore
+from tinyagentos.github_app_installations import GitHubAppInstallations
 from tinyagentos.broker import BrokerService, BrokerStore
 from tinyagentos.broker.store import default_broker_path
 from tinyagentos.secrets import SecretsStore
@@ -289,6 +290,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     broker_service = BrokerService(broker_store)
     mail_store = MailAccountStore(data_dir / "mail.db")
     github_identities_store = GitHubIdentitiesStore(data_dir / "github_identities.db")
+    github_app_installations = GitHubAppInstallations(data_dir)
     relationship_mgr = RelationshipManager(data_dir / "relationships.db")
     channel_store = ChannelStore(data_dir / "channels.db")
     scheduler = TaskScheduler(data_dir / "scheduler.db")
@@ -495,6 +497,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await mail_store.init()
         app.state.mail_store = mail_store
         await github_identities_store.init()
+        await github_app_installations.init()
         await relationship_mgr.init()
         await channel_store.init()
         await scheduler.init()
@@ -760,6 +763,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         app.state.models_root = models_root()
         app.state.models_root.mkdir(parents=True, exist_ok=True)
         app.state.torrent_settings_store = torrent_settings_store
+
         # Ensure the local token file exists before any request can arrive.
         # Logs the path at INFO so the user can find it.
         _local_token_path = auth_manager.local_token_path()
@@ -1388,6 +1392,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await cluster_pairing_store.close()
         await agent_registry_store.close()
         await github_identities_store.close()
+        await github_app_installations.close()
         # Backstop: close any aiosqlite-backed store still open on app.state.
         # An unclosed BaseStore leaves a NON-daemon connection worker thread
         # alive, which blocks Python's threading._shutdown() until systemd
@@ -1474,6 +1479,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.broker = broker_service
     app.state.broker_store = broker_store
     app.state.github_identities = github_identities_store
+    app.state.github_app_installations = github_app_installations
     app.state.relationships = relationship_mgr
     app.state.channels = channel_store
     app.state.fallback = fallback

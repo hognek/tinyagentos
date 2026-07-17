@@ -38,8 +38,17 @@ router = APIRouter()
 async def _get_token(request: Request) -> str | None:
     """Return a GitHub token or None.
 
-    Tries SecretsStore first, then falls back to ``gh auth token``.
+    Resolution order:
+    1. GitHub App installation token (when github_app_id and key are configured)
+    2. SecretsStore key ``github_token`` (PAT from device flow)
+    3. ``gh auth token`` subprocess fallback
     """
+    # 1. Try GitHub App installation token
+    token = await _get_app_installation_token(request)
+    if token:
+        return token
+
+    # 2. Try SecretsStore PAT
     secrets_store = getattr(request.app.state, "secrets", None)
     if secrets_store is not None:
         try:
@@ -49,7 +58,7 @@ async def _get_token(request: Request) -> str | None:
         except Exception as exc:
             logger.warning("SecretsStore lookup for github_token failed: %s", exc)
 
-    # Fallback: gh CLI (uses list form to avoid shell injection)
+    # 3. Fallback: gh CLI
     try:
         proc = await asyncio.create_subprocess_exec(
             "gh", "auth", "token",
@@ -62,6 +71,42 @@ async def _get_token(request: Request) -> str | None:
             return token
     except Exception as exc:
         logger.debug("gh auth token fallback failed: %s", exc)
+
+    return None
+
+
+async def _get_app_installation_token(request: Request) -> str | None:
+    """Mint a short-lived installation token from the configured GitHub App.
+
+    Returns None if GitHub App is not configured or no installations exist.
+    """
+    cfg = getattr(request.app.state, "config", None)
+    if not cfg or not cfg.github_app_id or not cfg.github_app_private_key:
+        return None
+
+    installs = getattr(request.app.state, "github_app_installations", None)
+    if installs is None:
+        return None
+
+    active = installs.list_all()
+    if not active:
+        return None
+
+    http_client = request.app.state.http_client
+    from tinyagentos.github_app import get_installation_token
+
+    # Use the first active installation. In the future, the caller could
+    # pass a repo hint to select the right installation.
+    for inst in active:
+        iid = inst.get("installation_id")
+        if not iid:
+            continue
+        token = await get_installation_token(
+            cfg.github_app_id, cfg.github_app_private_key, iid, http_client,
+        )
+        if token:
+            logger.debug("Using GitHub App installation token (installation %s)", iid)
+            return token
 
     return None
 
