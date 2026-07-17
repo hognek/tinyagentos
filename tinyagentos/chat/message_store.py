@@ -208,21 +208,14 @@ class ChatMessageStore(BaseStore):
         per-message delete events."""
         now = time.time()
         cursor = await self._db.execute(
-            """SELECT id FROM chat_messages
-               WHERE channel_id = ? AND created_at > ? AND deleted_at IS NULL""",
-            (channel_id, after_timestamp),
+            """UPDATE chat_messages SET deleted_at = ?
+               WHERE channel_id = ? AND created_at > ? AND deleted_at IS NULL
+               RETURNING id""",
+            (now, channel_id, after_timestamp),
         )
         rows = await cursor.fetchall()
-        ids = [r[0] for r in rows]
-        if not ids:
-            return []
-        placeholders = ",".join("?" for _ in ids)
-        await self._db.execute(
-            f"UPDATE chat_messages SET deleted_at = ? WHERE id IN ({placeholders})",
-            (now, *ids),
-        )
         await self._db.commit()
-        return ids
+        return [r[0] for r in rows]
 
     async def add_reaction(self, message_id: str, emoji: str, user_id: str) -> None:
         async with self._reaction_lock:

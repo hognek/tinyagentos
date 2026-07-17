@@ -216,6 +216,11 @@ async def chat_ws(websocket: WebSocket):
 
             elif msg_type == "edit":
                 msg_store = websocket.app.state.chat_messages
+                msg = await msg_store.get_message(data["message_id"])
+                if msg is None or msg.get("deleted_at"):
+                    continue
+                if msg["author_id"] != user_id:
+                    continue
                 await msg_store.edit_message(data["message_id"], data["content"])
                 msg = await msg_store.get_message(data["message_id"])
                 if msg:
