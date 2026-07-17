@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { X, Bell, BellOff, CheckCheck, Trash2, Archive } from "lucide-react";
 import { useNotificationStore, type Notification } from "@/stores/notification-store";
 import { useProcessStore } from "@/stores/process-store";
@@ -172,7 +172,10 @@ export function NotificationCentre() {
   const [checklistDismissed, setChecklistDismissed] = useState(false);
 
   const active = notifications.filter((n) => !n.archived);
-  const archived = useNotificationStore((s) => s.archivedNotifications());
+  const archived = useMemo(
+    () => notifications.filter((n) => n.archived).sort((a, b) => b.timestamp - a.timestamp),
+    [notifications],
+  );
 
   // Optimistic local mark-read, plus a best-effort backend write for server
   // items so the read state persists across reloads. Network never blocks the UI.

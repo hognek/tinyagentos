@@ -128,9 +128,10 @@ describe("NotificationCentre click routing", () => {
   });
 
   it("renders a View archive button that opens the notification-archive window", () => {
-    archivedNotifications.mockReturnValue([
-      { ...notif({ id: "srv-x", title: "Old note", archived: true }), archived: true } as Notification,
-    ]);
+    notifications = [
+      notif({ id: "srv-1", title: "Active note" }),
+      { ...notif({ id: "srv-x", title: "Old note" }), archived: true } as Notification,
+    ];
     render(<NotificationCentre />);
 
     const viewArchive = screen.getByRole("button", { name: /view archive/i });
@@ -146,7 +147,7 @@ describe("NotificationCentre click routing", () => {
   });
 
   it("shows no archive count when there are no archived items", () => {
-    archivedNotifications.mockReturnValue([]);
+    notifications = [notif({ id: "srv-1", title: "Only active" })];
     render(<NotificationCentre />);
 
     const viewArchive = screen.getByRole("button", { name: /view archive/i });

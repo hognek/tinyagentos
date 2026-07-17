@@ -80,7 +80,7 @@ export function NotificationArchiveApp({ windowId }: { windowId: string }) {
   }, [archived, filters]);
 
   const clearFilters = () => setFilters({ search: "", source: "", level: "" });
-  const activeFilterCount = [filters.source, filters.level].filter(Boolean).length;
+  const activeFilterCount = [filters.source, filters.level, filters.search].filter(Boolean).length;
 
   return (
     <div className="flex flex-col h-full bg-shell-bg text-shell-text">
