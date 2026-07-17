@@ -265,5 +265,8 @@ class TestWithRetry:
         assert len(set(round(d, 4) for d in first_delays)) > 1, (
             "jitter should produce varied delays, got all identical"
         )
+        # With the max_delay cap applied after jitter, all jittered delays
+        # must stay within [0.5*base, max_delay] — never exceed the documented bound.
         for d in sleep_calls:
-            assert d >= 0.0, f"delay should be non-negative, got {d}"
+            assert d > 0, f"delay should be positive, got {d}"
+            assert d <= 5.0, f"delay {d} should not exceed max_delay"
