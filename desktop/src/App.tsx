@@ -33,6 +33,7 @@ import { useTaosAgentStore } from "@/stores/taos-agent-store";
 import { InstallPromptBanner } from "@/shell/InstallPromptBanner";
 import { EffectsLayer } from "@/theme/effects/EffectsLayer";
 import { SafetyFloor } from "@/components/SafetyFloor";
+import { withCsrf } from "@/lib/csrf";
 
 interface SystemShortcutsProps {
   toggleSearch: () => void;
@@ -109,6 +110,21 @@ function SystemShortcuts({ toggleSearch, toggleLaunchpad, toggleAssistant }: Sys
   useShortcut("Ctrl+7", useCallback(() => openPinned(6), [openPinned]), "Open pinned app 7", "system");
   useShortcut("Ctrl+8", useCallback(() => openPinned(7), [openPinned]), "Open pinned app 8", "system");
   useShortcut("Ctrl+9", useCallback(() => openPinned(8), [openPinned]), "Open pinned app 9", "system");
+
+  // Ctrl+Shift+K — emergency kill switch: stops all running agents
+  const killAllAgents = useCallback(async () => {
+    try {
+      await fetch("/api/agents/bulk/stop", {
+        method: "POST",
+        credentials: "include",
+        headers: withCsrf({ method: "POST" })?.headers,
+      });
+      window.dispatchEvent(new CustomEvent("taos:agents-changed"));
+    } catch {
+      // best-effort
+    }
+  }, []);
+  useShortcut("Ctrl+Shift+K", killAllAgents, "Stop all agents", "system");
 
   return null;
 }

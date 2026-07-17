@@ -796,15 +796,46 @@ async def bulk_start_agents(request: Request):
 
 @router.post("/api/agents/bulk/stop")
 async def bulk_stop_agents(request: Request):
-    """Stop all agent containers, running graceful prepare first."""
-    from tinyagentos.containers import stop_container
+    """Stop all agent containers with graceful prepare, then force-kill after 2s grace.
+
+    SIGTERM is sent first via incus stop. After a 2-second grace window,
+    any containers still running are force-killed with SIGKILL (incus stop --force).
+    In-flight agent framework work is cancelled by the prepare step;
+    LLM calls and tool invocations are terminated when the container dies.
+    """
+    from tinyagentos.containers import stop_container, container_exists
+
     config = request.app.state.config
     orchestrator = getattr(request.app.state, "orchestrator", None)
     report = {}
     if orchestrator is not None:
         report = await orchestrator.prepare("all", "stop")
+
+    # Phase 1: SIGTERM every agent container
     results = await _bulk_container_op(config, stop_container)
-    return {"action": "stop", "prepare_report": report, "results": results}
+
+    # Phase 2: 2-second grace window, then SIGKILL any stragglers
+    await asyncio.sleep(2)
+    force_results = {}
+    for agent in config.agents:
+        name = agent["name"]
+        container_name = f"taos-agent-{name}"
+        try:
+            if await container_exists(container_name):
+                force_result = await stop_container(container_name, force=True)
+                force_results[name] = {
+                    "force_killed": force_result.get("success", False),
+                    "output": force_result.get("output", ""),
+                }
+        except Exception as e:
+            force_results[name] = {"force_killed": False, "error": str(e)}
+
+    return {
+        "action": "stop",
+        "prepare_report": report,
+        "results": results,
+        "force_kill_results": force_results,
+    }
 
 
 @router.post("/api/agents/bulk/restart")
@@ -839,8 +870,13 @@ async def pause_agent(request: Request, name: str):
 
 @router.post("/api/agents/{name}/stop")
 async def stop_agent(request: Request, name: str):
-    """Gracefully prepare then stop an agent's LXC container."""
-    from tinyagentos.containers import stop_container
+    """Gracefully prepare, then stop an agent's LXC container with force-kill after 2s.
+
+    Sends SIGTERM via incus stop. After a 2-second grace window, if the container
+    is still running, sends SIGKILL (incus stop --force) to guarantee termination.
+    """
+    from tinyagentos.containers import stop_container, container_exists
+
     config = request.app.state.config
     agent = find_agent(config, name)
     if not agent:
@@ -849,8 +885,22 @@ async def stop_agent(request: Request, name: str):
     report = {}
     if orchestrator is not None:
         report = await orchestrator.prepare([name], "stop")
-    stop_result = await stop_container(f"taos-agent-{name}")
-    return {"prepare_report": report, "stop_result": stop_result}
+
+    container_name = f"taos-agent-{name}"
+    stop_result = await stop_container(container_name)
+
+    # 2-second grace window, then SIGKILL
+    await asyncio.sleep(2)
+    force_killed = False
+    if await container_exists(container_name):
+        force_result = await stop_container(container_name, force=True)
+        force_killed = force_result.get("success", False)
+
+    return {
+        "prepare_report": report,
+        "stop_result": stop_result,
+        "force_killed": force_killed,
+    }
 
 
 @router.post("/api/agents/{name}/restart")
