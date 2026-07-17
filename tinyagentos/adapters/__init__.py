@@ -128,6 +128,12 @@ _REGISTRY: list[dict] = [
 
 _VALID_STATUSES = {"tested", "beta", "experimental", "broken"}
 
+# Validate the registry at import time so a typo in a status field is
+# caught immediately rather than silently propagating.
+assert all(
+    e["verification_status"] in _VALID_STATUSES for e in _REGISTRY
+), f"Invalid verification_status in _REGISTRY: {[e for e in _REGISTRY if e['verification_status'] not in _VALID_STATUSES]}"
+
 
 def list_frameworks() -> list[dict]:
     """Return every registered adapter with id, name, description, and verification_status.

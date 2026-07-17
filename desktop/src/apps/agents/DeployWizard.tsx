@@ -30,6 +30,9 @@ const MEMORY_TIER_INFO: Record<string, { label: string; description: string; min
   heavy:    { label: "Heavy",    description: "Best quality. bge-m3 + qwen3-reranker-0.6b (~3.5GB). Needs GPU/NPU.",   min_ram_mb: 8192,  needs_accel: true  },
 };
 
+/** Whitelist of known verification_status values (mirrors Framework type union). */
+const VALID_STATUSES = new Set(["tested", "beta", "experimental", "broken"]);
+
 /** Parse a tier_id like "arm-vulkan-8gb" and return RAM in MB. */
 function tierIdRamMb(tierId: string): number {
   const m = tierId.match(/(\d+)gb/i);
@@ -461,7 +464,11 @@ export function DeployWizard({
               id: String(a.id),
               name: String(a.name ?? a.id),
               description: String(a.description ?? ""),
-              verification_status: (a.verification_status as Framework["verification_status"]) ?? "experimental",
+              verification_status: (
+                VALID_STATUSES.has(String(a.verification_status))
+                  ? (a.verification_status as Framework["verification_status"])
+                  : "experimental"
+              ),
               tracking_issue: typeof a.tracking_issue === "string" ? a.tracking_issue : undefined,
             }));
             // Hermes is the recommended default and shows first; OpenClaw
@@ -475,7 +482,7 @@ export function DeployWizard({
               if (cur) return cur;
               const preferred = mapped.find((f) => f.id === "hermes")
                 ?? mapped.find((f) => f.verification_status === "tested" || f.verification_status === "beta")
-                ?? mapped[0];
+                ?? (mapped[0]?.verification_status !== "experimental" ? mapped[0] : undefined);
               return preferred?.id ?? "";
             });
           }
@@ -1153,7 +1160,7 @@ export function DeployWizard({
                           >
                             {fw.description}
                           </div>
-                          {fw.tracking_issue && isExperimental && (
+                          {fw.tracking_issue && (
                             <a
                               href={fw.tracking_issue}
                               target="_blank"
