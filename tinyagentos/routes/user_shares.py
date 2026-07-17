@@ -62,18 +62,20 @@ async def user_can_access(
 
 
 async def _find_share_by_id(request: Request, share_id: int) -> dict | None:
-    """Look up a share by id across active shares and the caller's owned shares.
+    """Look up a share by id via a direct index lookup on the primary key.
 
-    Active-shares-first avoids scanning expired shares in the common case
-    where the share is still alive.
+    Falls back to the caller's owned-shares list for expired shares the
+    owner might still want to delete — get_share covers the common case
+    with a single indexed query instead of a full table scan.
     """
     store = _get_user_shares_store(request)
-    # Active shares first (covers the common case for both owner and admin).
-    for s in await store.list_active_shares():
-        if s["id"] == share_id:
-            return s
+    share = await store.get_share(share_id)
+    if share is not None:
+        return share
     # Fall back to caller's owned shares (includes expired shares the owner
-    # might still want to delete).
+    # might still want to delete via revoke, which get_share also covers,
+    # but list_shares is here for cases where the share has been physically
+    # deleted and the caller still sees it in their list through caching).
     user_id: str = getattr(request.state, "user_id", "")
     if user_id:
         for s in await store.list_shares(user_id):

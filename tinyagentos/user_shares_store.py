@@ -81,6 +81,26 @@ class UserSharesStore(BaseStore):
     # Write
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _normalise_expiry(expires_at: Optional[str]) -> Optional[str]:
+        """Parse *expires_at* to a UTC-aware datetime and return its isoformat.
+
+        If parsing fails the original string is kept unchanged (fail-safe),
+        but lexical string comparisons elsewhere in this module rely on a
+        canonical ``+00:00`` form to match ``datetime.now(UTC).isoformat()``.
+        """
+        if expires_at is None:
+            return None
+        try:
+            dt = datetime.fromisoformat(expires_at)
+        except ValueError:
+            return expires_at
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        else:
+            dt = dt.astimezone(timezone.utc)
+        return dt.isoformat()
+
     async def add_share(
         self,
         owner_user_id: str,
@@ -103,6 +123,7 @@ class UserSharesStore(BaseStore):
         if self._db is None:
             raise RuntimeError("UserSharesStore not initialised — call init() first")
 
+        expires_at = self._normalise_expiry(expires_at)
         now = datetime.now(timezone.utc).isoformat()
         async with self._write_lock:
             # Remove any existing row for the exact key first.
@@ -177,6 +198,16 @@ class UserSharesStore(BaseStore):
             (now,),
         )
         return [_row_to_dict(r) for r in await cursor.fetchall()]
+
+    async def get_share(self, share_id: int) -> dict | None:
+        """Return a single share by its id, or None if not found."""
+        if self._db is None:
+            raise RuntimeError("UserSharesStore not initialised")
+        cursor = await self._db.execute(
+            "SELECT * FROM user_shares WHERE id = ?", (share_id,)
+        )
+        row = await cursor.fetchone()
+        return _row_to_dict(row) if row else None
 
     async def revoke_share(self, share_id: int) -> None:
         """Delete a share by its id.
