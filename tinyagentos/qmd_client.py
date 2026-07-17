@@ -21,13 +21,23 @@ class QmdClient:
         if self._client:
             await self._client.aclose()
 
-    async def embed(self, text: str) -> list[float]:
-        """Get embedding vector for text via qmd serve /embed."""
+    async def embed(self, text: str, *, timeout: float | None = None) -> list[float]:
+        """Get embedding vector for text via qmd serve /embed.
+
+        Parameters
+        ----------
+        text:
+            The text to embed.
+        timeout:
+            Per-call timeout in seconds.  Overrides the client's default
+            (60 s) for this single request.  Useful when one slow model load
+            should not block the whole chain.
+        """
         url = f"{self.base_url}/embed"
         client = self._client
 
         async def _call():
-            resp = await client.post(url, json={"text": text})
+            resp = await client.post(url, json={"text": text}, timeout=timeout)
             resp.raise_for_status()
             return resp
 
@@ -40,8 +50,17 @@ class QmdClient:
         collection: str | None = None,
         tags: list[str] | None = None,
         limit: int = 10,
+        *,
+        timeout: float | None = None,
     ) -> list[dict]:
-        """Search documents via qmd serve /search."""
+        """Search documents via qmd serve /search.
+
+        Parameters
+        ----------
+        timeout:
+            Per-call timeout in seconds.  Overrides the client's default
+            (60 s) for this single request.
+        """
         url = f"{self.base_url}/search"
         client = self._client
         payload: dict = {"query": query, "limit": limit}
@@ -51,7 +70,7 @@ class QmdClient:
             payload["tags"] = tags
 
         async def _call():
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, json=payload, timeout=timeout)
             resp.raise_for_status()
             return resp
 
