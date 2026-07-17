@@ -290,8 +290,14 @@ describe("TodoApp", () => {
       expect(screen.getByText(/completed/i)).toBeDefined();
     });
 
-    // Completed item should show
-    expect(screen.getByText("Pick up laundry")).toBeDefined();
+    // Completed item should show in completed section
+    const completedSection = screen.getByLabelText("Completed tasks");
+    expect(completedSection).toBeDefined();
+    // "Already done" has done:true — should be in the completed section
+    expect(screen.getByText("Already done")).toBeDefined();
+    // "Pick up laundry" has done:false — should be in the incomplete section
+    const incompleteSection = screen.getByLabelText("Incomplete tasks");
+    expect(incompleteSection.textContent).toContain("Pick up laundry");
   });
 
   // ---- Toggle done (optimistic) ----
