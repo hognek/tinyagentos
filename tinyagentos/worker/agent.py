@@ -608,14 +608,33 @@ class WorkerAgent:
             )
             return 0
 
+        from tinyagentos.hardware import detect_hardware
+        from dataclasses import asdict
+
         try:
             from tinyagentos.worker.pairing import sign_request_headers
+            # Re-resolve host_lan_ip, url, and hardware on every heartbeat
+            # so the controller stays in sync with container reality after
+            # DHCP moves or LXC restarts (taOS #1538).
+            # Note: the function call asdict(detect_hardware()) remains inside
+            # the try so a probe failure degrades gracefully (heartbeat skips
+            # this update) rather than crashing the run loop.
             load = psutil.cpu_percent() / 100.0
             backends = await self.detect_backends()
             caps = sorted(set(self.detect_capabilities(backends)) | set(self.extra_capabilities))
             kv_quant = self.detect_kv_quant_support(backends)
             snap = capacity_snapshot()
             vram = gpu_vram_snapshot()
+            adv_ip = os.environ.get("TAOS_ADVERTISE_IP", "").strip()
+            live_url = (
+                self.advertise_url
+                or (f"http://{adv_ip}:{self.worker_port}" if adv_ip and self.worker_port
+                    else f"http://{adv_ip}" if adv_ip
+                    else None)
+                or (backends[0]["url"] if backends else self.get_worker_url())
+            )
+            live_host_lan_ip = adv_ip or _detect_lan_ip(self.controller_url)
+            live_hardware = asdict(detect_hardware())
             path = "/api/cluster/heartbeat"
             payload = {
                 "name": self.name,
@@ -633,6 +652,12 @@ class WorkerAgent:
                 # controller can tell "unknown" apart from "no VRAM free".
                 "free_vram_mb": vram["free_vram_mb"] if vram else None,
                 "used_vram_mb": vram["used_vram_mb"] if vram else None,
+                # Registration-drift refresh (taOS #1538): send live
+                # host_lan_ip, url, and hardware on every heartbeat
+                # so IP/subnet moves are reflected immediately.
+                "host_lan_ip": live_host_lan_ip,
+                "url": live_url,
+                "hardware": live_hardware,
             }
             body = _json.dumps(payload).encode()
             auth_headers = sign_request_headers(self._signing_key, self.name, "POST", path, body)

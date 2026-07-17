@@ -195,6 +195,16 @@ class ClusterManager:
         kv_cache_quant_boundary_layer_protect: bool | None = None,
         free_vram_mb: int | None = None,
         used_vram_mb: int | None = None,
+        # Registration-drift refresh (taOS #1538): live values from worker
+        # heartbeat to keep cluster manager in sync with container reality.
+        host_lan_ip: str | None = None,
+        url: str | None = None,
+        hardware: dict | None = None,
+        # LXC storage byte counters (taOS #1538): forwarded from worker
+        # heartbeat so capacity reports stay current.
+        storage_cap_bytes: int | None = None,
+        storage_used_bytes: int | None = None,
+        bytes_deduped_total: int | None = None,
     ) -> bool:
         """Accept a worker heartbeat.
 
@@ -255,6 +265,31 @@ class ClusterManager:
             worker.free_vram_mb = int(free_vram_mb)
         if used_vram_mb is not None:
             worker.used_vram_mb = int(used_vram_mb)
+        # Registration-drift refresh (taOS #1538): update cached host_lan_ip,
+        # url, and hardware from every heartbeat so the cluster manager stays
+        # in sync with container reality. Optional — None leaves stale values
+        # untouched for legacy workers that don't send these fields.
+        if host_lan_ip is not None:
+            # Reject empty string — a buggy/malicious heartbeat carrying
+            # "" would pass `is not None` and break find_worker_by_host_lan_ip().
+            if host_lan_ip:
+                worker.host_lan_ip = host_lan_ip
+        if url is not None:
+            # Reject empty string — same guard as host_lan_ip above.
+            if url:
+                worker.url = url
+        if hardware is not None:
+            # Reject empty dict — same guard as host_lan_ip above.
+            if hardware:
+                worker.hardware = hardware
+        # LXC storage byte counters (taOS #1538): forward from worker
+        # heartbeat so capacity reports stay current across restarts.
+        if storage_cap_bytes is not None:
+            worker.storage_cap_bytes = int(storage_cap_bytes)
+        if storage_used_bytes is not None:
+            worker.storage_used_bytes = int(storage_used_bytes)
+        if bytes_deduped_total is not None:
+            worker.bytes_deduped_total = int(bytes_deduped_total)
         # Fire worker.online notification when a previously-offline worker recovers.
         # heartbeat() is sync, so schedule the async emit as a background task.
         if self._notifications and prev_status in ("offline", "stale"):
