@@ -17,7 +17,7 @@
  *
  * Guards:
  *  - fires at most once per unique deployed version (persisted via useRef)
- *  - `no-cache` fetch mode prevents browser HTTP caching of version.json
+ *  - `no-store` fetch mode prevents browser HTTP caching of version.json
  */
 import { useState, useEffect, useRef, useCallback } from "react";
 

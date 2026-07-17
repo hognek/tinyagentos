@@ -11,7 +11,7 @@ function spaVersionPlugin() {
   let outDir = "";
   return {
     name: "taos-spa-version",
-    configResolved(config: any) {
+    configResolved(config: import("vite").ResolvedConfig) {
       outDir = path.resolve(config.root, config.build.outDir);
     },
     writeBundle() {

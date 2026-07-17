@@ -20,7 +20,7 @@ function readPackageVersion() {
 
 function readBuildId() {
   // Include both the git short SHA (reproducible anchored identifier) and
-  // a nanosecond-resolution timestamp so every build — even back-to-back
+  // a high-resolution timestamp so every build — even back-to-back
   // builds on the same commit — produces a unique identifier.  The SPA
   // version-check poll relies on this to detect redeployed bundles.
   //
@@ -37,6 +37,10 @@ function readBuildId() {
   }
   const ms = Date.now().toString(36);
   const hr = process.hrtime.bigint().toString(36);
+  // Take the last 6 base-36 chars of the nanosecond counter — combined
+  // with the ms component this yields ~2.1B unique values per ms tick,
+  // which is plenty for sub-millisecond build differentiation while
+  // keeping the stamp compact.
   const stamp = `${ms}${hr.slice(-6)}`;
   return sha ? `${sha}.${stamp}` : stamp;
 }
