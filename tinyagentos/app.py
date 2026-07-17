@@ -299,6 +299,12 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     cluster_pairing_store = ClusterPairingStore(data_dir / "cluster_pairing.db")
     from tinyagentos.cluster.capability_map import CapabilityMap
     capability_map_store = CapabilityMap(data_dir / "capability_map.db")
+    # taOS #640: worker registry persistence + generation counter
+    from tinyagentos.cluster.worker_registry_store import WorkerRegistryStore
+    worker_registry_store = WorkerRegistryStore(data_dir / "cluster_workers.db")
+    # taOS #640: circuit breaker for failing workers
+    from tinyagentos.cluster.failure_tracker import FailureTracker
+    failure_tracker = FailureTracker()
 
     metrics_store = MetricsStore(data_dir / "metrics.db")
     notif_store = NotificationStore(data_dir / "notifications.db")
@@ -335,7 +341,11 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         interval_seconds=30.0,
     )
     fallback = BackendFallback(config.backends, http_client)
-    cluster_manager = ClusterManager(notifications=notif_store)
+    cluster_manager = ClusterManager(
+        notifications=notif_store,
+        worker_registry_store=worker_registry_store,
+        failure_tracker=failure_tracker,
+    )
     task_router = TaskRouter(cluster_manager, http_client)
     cap_checker = CapabilityChecker(hardware_profile, cluster_manager)
     cluster_manager._capabilities = cap_checker  # wire after creation (circular dep)
@@ -556,6 +566,10 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await license_acceptances_store.init()
         await agent_model_key_store.init()
         await cluster_pairing_store.init()
+        app.state.cluster_pairing = cluster_pairing_store
+        # taOS #640: worker registry store (persistence + generation counter)
+        await worker_registry_store.init()
+        app.state.worker_registry = worker_registry_store
         await capability_map_store.init()
         await metrics_store.init()
         await notif_store.init()
