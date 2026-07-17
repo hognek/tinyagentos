@@ -82,6 +82,15 @@ _AGENT_DECISIONS_ROUTES = (
     ("POST", re.compile(r"^/api/decisions$")),
 )
 
+# Scope-request CREATE an agent may reach with its own registry JWT to ask for
+# MORE scopes on its own identity. Only the create endpoint; the approve/deny
+# subactions have extra path segments and are NOT matched here, so they stay
+# owner/admin session-only. The route verifies the JWT identity == the path
+# canonical_id (an agent may only self-request).
+_AGENT_SCOPE_REQUEST_ROUTES = (
+    ("POST", re.compile(rf"^/api/agents/registry/{_SEG}/scope-requests$")),
+)
+
 
 def _is_agent_task_path(method: str, path: str) -> bool:
     """True only for the exact subset of task routes a project_tasks token may
@@ -101,6 +110,14 @@ def _is_agent_decisions_path(method: str, path: str) -> bool:
     """True only for POST /api/decisions, which a decisions_write-bound agent
     token may reach.  The route verifies the JWT + grant."""
     return any(m == method and rx.match(path) for m, rx in _AGENT_DECISIONS_ROUTES)
+
+
+def _is_agent_scope_request_path(method: str, path: str) -> bool:
+    """True only for POST /api/agents/registry/{cid}/scope-requests, which an
+    agent may reach with its own registry JWT to self-request more scopes. The
+    route verifies the JWT identity == canonical_id; approve/deny are excluded
+    (extra path segments) and stay owner/admin session-only."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_SCOPE_REQUEST_ROUTES)
 # Bundle assets and the SPA shell HTML must be reachable without auth so:
 #   1. The browser can install and cache the shell for offline / PWA use.
 #   2. After a backend restart the cached shell loads immediately without
@@ -343,6 +360,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             or _is_agent_task_path(request.method, path)
             or _is_agent_canvas_path(request.method, path)
             or _is_agent_decisions_path(request.method, path)
+            or _is_agent_scope_request_path(request.method, path)
         ) and auth_header.lower().startswith("bearer "):
             request.state.user_id = None
             request.state.is_admin = False
