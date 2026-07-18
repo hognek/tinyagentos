@@ -205,7 +205,6 @@ def load_config(path: Path) -> AppConfig:
                 "next startup. To configure manually, add a secret named "
                 "'github-app-private-key' in the Secrets page."
             )
-
     if _pin_applied:
         save_config(cfg, path)
     return cfg

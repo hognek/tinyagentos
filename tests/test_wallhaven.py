@@ -9,8 +9,8 @@ MOCK_SEARCH_RESPONSE = {
     "data": [
         {
             "id": "abc123",
-            "url": "https://w.wallhaven.cc/full/abc/wallhaven-abc123.jpg",
-            "path": "https://wallhaven.cc/w/abc123",
+            "url": "https://wallhaven.cc/w/abc123",
+            "path": "https://w.wallhaven.cc/full/abc/wallhaven-abc123.jpg",
             "thumbs": {
                 "small": "https://th.wallhaven.cc/small/ab/abc123.jpg",
                 "original": "https://th.wallhaven.cc/original/ab/abc123.jpg",
@@ -22,8 +22,8 @@ MOCK_SEARCH_RESPONSE = {
         },
         {
             "id": "def456",
-            "url": "https://w.wallhaven.cc/full/de/wallhaven-def456.jpg",
-            "path": "https://wallhaven.cc/w/def456",
+            "url": "https://wallhaven.cc/w/def456",
+            "path": "https://w.wallhaven.cc/full/de/wallhaven-def456.jpg",
             "thumbs": {
                 "small": "https://th.wallhaven.cc/small/de/def456.jpg",
                 "original": "https://th.wallhaven.cc/original/de/def456.jpg",
@@ -209,3 +209,46 @@ async def test_no_api_key_when_not_configured(client):
 
     await client.get("/api/wallhaven/search?q=nature")
     assert "X-API-Key" not in route.calls.last.request.headers
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_invalid_sorting_rejected(client):
+    """Non-whitelisted sorting value should return 400."""
+    resp = await client.get("/api/wallhaven/search?q=nature&sorting=invalid_sort")
+    assert resp.status_code == 400
+    data = resp.json()
+    assert "sorting" in data["error"].lower()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_valid_sorting_forwarded(client):
+    """Known sorting value should be forwarded to Wallhaven."""
+    route = respx.get("https://wallhaven.cc/api/v1/search").mock(
+        return_value=httpx.Response(200, json=MOCK_SEARCH_RESPONSE),
+    )
+
+    await client.get("/api/wallhaven/search?q=nature&sorting=toplist")
+    assert route.calls.last.request.url.params["sorting"] == "toplist"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_query_max_length_enforced(client):
+    """q param longer than 200 chars should be rejected."""
+    long_q = "x" * 201
+    resp = await client.get(f"/api/wallhaven/search?q={long_q}")
+    assert resp.status_code == 422  # FastAPI validation error
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_empty_query_allowed(client):
+    """Empty q (default) should pass through to Wallhaven for unfiltered feed."""
+    route = respx.get("https://wallhaven.cc/api/v1/search").mock(
+        return_value=httpx.Response(200, json=MOCK_SEARCH_RESPONSE),
+    )
+
+    await client.get("/api/wallhaven/search")
+    assert route.calls.last.request.url.params["q"] == ""

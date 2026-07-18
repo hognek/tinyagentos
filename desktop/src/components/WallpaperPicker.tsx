@@ -251,13 +251,30 @@ export function WallpaperPicker({ open, onClose }: Props) {
             <div className="px-4 pb-3">
               <WallhavenBrowser
                 onSelect={(url, label) => {
-                  // Apply remote wallpaper directly — set background-image to the full URL
-                  useThemeStore.setState({
-                    wallpaperId: `wallhaven-${Date.now()}`,
-                    wallpaperImage: `url('${url}')`,
+                  // Escape single-quotes and backslashes to prevent CSS injection
+                  // and render breakage from special characters in remote URLs.
+                  const safeUrl = url.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+                  const id = `wallhaven-${Date.now()}`;
+                  const image = `url('${safeUrl}')`;
+                  // Route through a state updater so wallpaperIdByTheme is set for
+                  // the active theme — otherwise a theme switch loses the pick.
+                  // Also set light/mobile/fallback variants so the remote wallpaper
+                  // works in every scheme.
+                  useThemeStore.setState((s) => ({
+                    wallpaperId: id,
+                    wallpaperImage: image,
+                    wallpaperMobileImage: image,
+                    wallpaperFallback: "#1d1d1f",
+                    wallpaperLightImage: image,
+                    wallpaperLightMobileImage: image,
+                    wallpaperLightFallback: "#f0f0f0",
                     wallpaperKind: "image",
-                    wallpaperOverlayText: null,
-                  });
+                    wallpaperOverlayText: label,
+                    wallpaperIdByTheme: {
+                      ...s.wallpaperIdByTheme,
+                      [s.activeThemeId]: id,
+                    },
+                  }));
                 }}
               />
             </div>
