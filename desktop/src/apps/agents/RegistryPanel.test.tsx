@@ -337,7 +337,7 @@ describe("RegistryPanel collapsed retired", () => {
     // visibility)
     const retiredPanel = document.getElementById("retired-registry-panel");
     expect(retiredPanel).toBeInTheDocument();
-    expect(retiredPanel!.className).toContain("hidden");
+    expect(retiredPanel!).toHaveClass("hidden");
 
     // Revoked + suspended agents are IN the DOM but inside a hidden container
     expect(screen.getByText("RevokedAgent")).toBeInTheDocument();
@@ -350,6 +350,6 @@ describe("RegistryPanel collapsed retired", () => {
 
     // Retired toggle is now expanded, panel class loses "hidden"
     expect(retiredToggle).toHaveAttribute("aria-expanded", "true");
-    expect(retiredPanel!.className).not.toContain("hidden");
+    expect(retiredPanel!).not.toHaveClass("hidden");
   }, 10_000);
 });
