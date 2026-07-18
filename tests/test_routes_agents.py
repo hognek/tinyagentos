@@ -66,7 +66,12 @@ class TestAgentsPage:
 
 @pytest.mark.asyncio
 class TestBulkOperations:
-    async def test_bulk_start(self, client):
+    async def test_bulk_start(self, client, monkeypatch):
+        async def fake_start(name):
+            return {"success": True, "output": ""}
+
+        monkeypatch.setattr("tinyagentos.containers.start_container", fake_start)
+
         resp = await client.post("/api/agents/bulk/start")
         assert resp.status_code == 200
         data = resp.json()
@@ -74,12 +79,26 @@ class TestBulkOperations:
         assert "results" in data
         assert "test-agent" in data["results"]
 
-    async def test_bulk_stop(self, client):
+    async def test_bulk_stop(self, client, monkeypatch):
+        async def fake_stop(name, force=False):
+            return {"success": True, "output": ""}
+
+        async def fake_list_containers(prefix="taos-agent-"):
+            return []
+
+        monkeypatch.setattr("tinyagentos.containers.stop_container", fake_stop)
+        monkeypatch.setattr("tinyagentos.containers.list_containers", fake_list_containers)
+
         resp = await client.post("/api/agents/bulk/stop")
         assert resp.status_code == 200
         assert resp.json()["action"] == "stop"
 
-    async def test_bulk_restart(self, client):
+    async def test_bulk_restart(self, client, monkeypatch):
+        async def fake_restart(name):
+            return {"success": True, "output": ""}
+
+        monkeypatch.setattr("tinyagentos.containers.restart_container", fake_restart)
+
         resp = await client.post("/api/agents/bulk/restart")
         assert resp.status_code == 200
         assert resp.json()["action"] == "restart"
