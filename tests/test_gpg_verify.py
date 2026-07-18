@@ -102,6 +102,33 @@ class TestParseKeyId:
     def test_returns_none_when_no_key(self):
         assert _parse_key_id("some random output") is None
 
+    def test_parses_key_id_from_validsig_primary_key_signs_directly(self):
+        """When primary key signs directly (11 fields), extract from parts[2]."""
+        output = (
+            "[GNUPG:] NEWSIG\n"
+            "[GNUPG:] VALIDSIG AAAABBBBCCCCDDDDEEEEFFFF0000111122223333 2024-01-01 1704067200 0 4 0 1 8 00\n"
+        )
+        # 11 fields → parts[2] IS the primary key
+        assert _parse_key_id(output) == "0000111122223333"
+
+    def test_parses_key_id_from_validsig_subkey_signs(self):
+        """When subkey signs (12 fields), extract from primary-key fpr for consistency."""
+        output = (
+            "[GNUPG:] NEWSIG\n"
+            "[GNUPG:] VALIDSIG 9999888877776666555544443333222211110000 2024-01-01 1704067200 0 4 0 1 8 00 AAAABBBBCCCCDDDDEEEEFFFF0000111122223333\n"
+        )
+        # 12 fields → primary-key fpr is in parts[-1], key_id from primary key
+        assert _parse_key_id(output) == "0000111122223333"
+
+    def test_validsig_fallback_does_not_overwrite_human_readable(self):
+        """Human-readable 'using RSA key' takes priority over VALIDSIG fallback."""
+        output = (
+            "gpg: Signature made … using RSA key ABCDEF1234567890\n"
+            "[GNUPG:] NEWSIG\n"
+            "[GNUPG:] VALIDSIG AAAABBBBCCCCDDDDEEEEFFFF0000111122223333 2024-01-01 1704067200 0 4 0 1 8 00\n"
+        )
+        assert _parse_key_id(output) == "ABCDEF1234567890"
+
 
 # ── verify_commit tests (mocked subprocess) ────────────────────────────────
 

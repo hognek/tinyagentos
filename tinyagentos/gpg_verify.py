@@ -156,6 +156,12 @@ def _parse_key_id(output: str) -> Optional[str]:
     """Extract the short key id from ``git verify-*`` output.
 
     Returns the 16-char key id (e.g. ``1234567890ABCDEF``) or None.
+
+    Parses both human-readable ``gpg:`` lines (available without ``--raw``)
+    and machine-readable ``[GNUPG:] VALIDSIG`` status lines (available with
+    ``--raw``).  When ``--raw`` is used, the human-readable lines are
+    suppressed; in that case the long key id is extracted from the signing-key
+    fingerprint in the VALIDSIG line (last 16 hex chars of the fingerprint).
     """
     for line in output.splitlines():
         stripped = line.strip()
@@ -171,6 +177,29 @@ def _parse_key_id(output: str) -> Optional[str]:
                 candidates = [w.rstrip(",…") for w in after_key[1].split() if len(w.rstrip(",…")) >= 8]
                 if candidates:
                     return candidates[0]
+
+    # Fallback for --raw mode: extract the long key id from the VALIDSIG line.
+    # The VALIDSIG line has the form:
+    #   [GNUPG:] VALIDSIG <signing-fpr> <date> <ts> ... [<primary-fpr>]
+    # When a subkey signs, the 10th field carries the primary-key fingerprint
+    # (len(parts) >= 12).  Prefer it so `key_id` is consistent with the
+    # fingerprint returned by `_parse_fingerprint` (which also returns the
+    # primary-key fpr).  Otherwise the signing key IS the primary key.
+    # The standard GPG long key id is the last 16 hex chars of the fingerprint.
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[GNUPG:] VALIDSIG"):
+            parts = stripped.split()
+            if len(parts) >= 3:
+                # When the primary-key fingerprint is present (subkey signing),
+                # derive the key ID from it for consistency with _parse_fingerprint.
+                if len(parts) >= 12 and len(parts[-1]) >= 16:
+                    return parts[-1][-16:].upper()
+                # Otherwise the signing key is the primary key.
+                signing_fpr = parts[2]
+                if len(signing_fpr) >= 16:
+                    return signing_fpr[-16:].upper()
+
     return None
 
 
