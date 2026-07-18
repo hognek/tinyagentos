@@ -796,15 +796,85 @@ async def bulk_start_agents(request: Request):
 
 @router.post("/api/agents/bulk/stop")
 async def bulk_stop_agents(request: Request):
-    """Stop all agent containers, running graceful prepare first."""
-    from tinyagentos.containers import stop_container
+    """Stop all agent containers with graceful prepare, then force-kill after 2s grace.
+
+    SIGTERM is sent first via incus stop. After a 2-second grace window,
+    any containers still running are force-killed with SIGKILL (incus stop --force).
+    In-flight agent framework work is cancelled by the prepare step;
+    LLM calls and tool invocations are terminated when the container dies.
+    """
+    from tinyagentos.containers import stop_container, list_containers
+
     config = request.app.state.config
     orchestrator = getattr(request.app.state, "orchestrator", None)
     report = {}
     if orchestrator is not None:
         report = await orchestrator.prepare("all", "stop")
+
+    # Phase 2: 2-second grace window, then SIGKILL any stragglers
+    # (shielded from cancellation; the sleep+force is bounded)
+    async def _grace_kill():
+        await asyncio.sleep(2)
+        containers = await list_containers(prefix="taos-agent-")
+        if not containers and config.agents:
+            logger.warning(
+                "list_containers returned empty; incus may be unhealthy. "
+                "Attempting force-kill on all configured agents."
+            )
+        running = {
+            c.name
+            for c in containers
+            if c.status not in ("Stopped",)
+        }
+        incus_unhealthy = not containers and bool(config.agents)
+
+        async def _force_kill_one(agent):
+            agent_name = agent["name"]
+            container_name = f"taos-agent-{agent_name}"
+            try:
+                if container_name in running or incus_unhealthy:
+                    force_result = await stop_container(container_name, force=True)
+                    result = {
+                        "force_killed": force_result.get("success", False),
+                        "output": force_result.get("output", ""),
+                    }
+                    if not force_result.get("success", False):
+                        logger.warning(
+                            "Force-kill of %s failed: %s",
+                            container_name,
+                            force_result.get("output", "unknown"),
+                        )
+                    return (agent_name, result)
+            except Exception as e:
+                return (agent_name, {"force_killed": False, "error": str(e)})
+            return (agent_name, {"force_killed": False, "output": ""})
+
+        gathered = await asyncio.gather(
+            *(_force_kill_one(agent) for agent in config.agents)
+        )
+        return dict(gathered)
+
+    task = asyncio.create_task(_grace_kill())
+    # Phase 1: SIGTERM every agent container (concurrent with grace window)
     results = await _bulk_container_op(config, stop_container)
-    return {"action": "stop", "prepare_report": report, "results": results}
+
+    force_results = {}
+    try:
+        force_results = await asyncio.wait_for(asyncio.shield(task), timeout=30)
+    except asyncio.CancelledError:
+        await task
+        raise
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Grace-kill timed out after 30s; force-kill may still complete in background"
+        )
+
+    return {
+        "action": "stop",
+        "prepare_report": report,
+        "results": results,
+        "force_kill_results": force_results,
+    }
 
 
 @router.post("/api/agents/bulk/restart")
@@ -839,8 +909,13 @@ async def pause_agent(request: Request, name: str):
 
 @router.post("/api/agents/{name}/stop")
 async def stop_agent(request: Request, name: str):
-    """Gracefully prepare then stop an agent's LXC container."""
-    from tinyagentos.containers import stop_container
+    """Gracefully prepare, then stop an agent's LXC container with force-kill after 2s.
+
+    Sends SIGTERM via incus stop. After a 2-second grace window, if the container
+    is still running, sends SIGKILL (incus stop --force) to guarantee termination.
+    """
+    from tinyagentos.containers import stop_container, list_containers
+
     config = request.app.state.config
     agent = find_agent(config, name)
     if not agent:
@@ -849,8 +924,59 @@ async def stop_agent(request: Request, name: str):
     report = {}
     if orchestrator is not None:
         report = await orchestrator.prepare([name], "stop")
-    stop_result = await stop_container(f"taos-agent-{name}")
-    return {"prepare_report": report, "stop_result": stop_result}
+
+    container_name = f"taos-agent-{name}"
+
+    # 2-second grace window, then SIGKILL
+    # (shielded from cancellation; the sleep+force is bounded)
+    async def _grace_kill():
+        await asyncio.sleep(2)
+        containers = await list_containers(prefix="taos-agent-")
+        if not containers:
+            logger.warning(
+                "list_containers returned empty; incus may be unhealthy. "
+                "Attempting force-kill anyway."
+            )
+        running = {
+            c.name
+            for c in containers
+            if c.status not in ("Stopped",)
+        }
+        if container_name in running or not containers:
+            force_result = await stop_container(container_name, force=True)
+            success = force_result.get("success", False)
+            if not success:
+                logger.warning(
+                    "Force-kill of %s failed: %s",
+                    container_name,
+                    force_result.get("output", "unknown"),
+                )
+            return (success, force_result.get("output", ""))
+        return (False, "")
+
+    task = asyncio.create_task(_grace_kill())
+    stop_result = await stop_container(container_name)
+
+    try:
+        force_killed, force_output = await asyncio.wait_for(
+            asyncio.shield(task), timeout=30
+        )
+    except asyncio.CancelledError:
+        await task
+        raise
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Grace-kill timed out after 30s for %s; force-kill may still complete",
+            container_name,
+        )
+        force_killed, force_output = False, ""
+
+    return {
+        "prepare_report": report,
+        "stop_result": stop_result,
+        "force_killed": force_killed,
+        "force_output": force_output,
+    }
 
 
 @router.post("/api/agents/{name}/restart")

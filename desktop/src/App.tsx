@@ -33,6 +33,7 @@ import { useTaosAgentStore } from "@/stores/taos-agent-store";
 import { InstallPromptBanner } from "@/shell/InstallPromptBanner";
 import { EffectsLayer } from "@/theme/effects/EffectsLayer";
 import { SafetyFloor } from "@/components/SafetyFloor";
+import { withCsrf, getCsrfToken } from "@/lib/csrf";
 
 interface SystemShortcutsProps {
   toggleSearch: () => void;
@@ -109,6 +110,78 @@ function SystemShortcuts({ toggleSearch, toggleLaunchpad, toggleAssistant }: Sys
   useShortcut("Ctrl+7", useCallback(() => openPinned(6), [openPinned]), "Open pinned app 7", "system");
   useShortcut("Ctrl+8", useCallback(() => openPinned(7), [openPinned]), "Open pinned app 8", "system");
   useShortcut("Ctrl+9", useCallback(() => openPinned(8), [openPinned]), "Open pinned app 9", "system");
+
+  // Ctrl+Shift+K — emergency kill switch: stops all running agents
+  const addNotification = useNotificationStore((s) => s.addNotification);
+
+  const killAllAgents = useCallback(async () => {
+    if (!getCsrfToken()) {
+      addNotification({
+        source: "system",
+        title: "Kill switch blocked",
+        body: "CSRF token missing — refresh the page and try again.",
+        level: "error",
+      });
+      return;
+    }
+    try {
+      const resp = await fetch("/api/agents/bulk/stop", {
+        method: "POST",
+        credentials: "include",
+        headers: withCsrf({ method: "POST" })!.headers,
+      });
+      if (!resp.ok) {
+        throw new Error(`Server returned ${resp.status}`);
+      }
+      const data = await resp.json();
+      // Check for individual agent failures in both results and force_kill_results
+      const results = data.results ?? {};
+      const forceKillResults = data.force_kill_results ?? {};
+      const stopFailures = Object.entries(results).filter(
+        ([, r]: [string, unknown]) =>
+          r && typeof r === "object" && !(r as Record<string, unknown>).success
+      ).length > 0;
+      const forceFailures = Object.entries(forceKillResults).filter(
+        ([, r]: [string, unknown]) =>
+          r && typeof r === "object" && !(r as Record<string, unknown>).force_killed
+      ).length > 0;
+      if (!stopFailures && !forceFailures) {
+        window.dispatchEvent(new CustomEvent("taos:agents-changed"));
+        addNotification({
+          source: "system",
+          title: "Agents stopped",
+          body: "Emergency kill switch activated — all agents stopped.",
+          level: "success",
+        });
+      } else {
+        const failCount = [
+          ...Object.entries(results).filter(
+            ([, r]: [string, unknown]) =>
+              r && typeof r === "object" && !(r as Record<string, unknown>).success
+          ),
+          ...Object.entries(forceKillResults).filter(
+            ([, r]: [string, unknown]) =>
+              r && typeof r === "object" && !(r as Record<string, unknown>).force_killed
+          ),
+        ].length;
+        window.dispatchEvent(new CustomEvent("taos:agents-changed"));
+        addNotification({
+          source: "system",
+          title: "Agents stopped with failures",
+          body: `${failCount} agent(s) failed to stop — check individual agent status.`,
+          level: "warning",
+        });
+      }
+    } catch (err) {
+      addNotification({
+        source: "system",
+        title: "Kill switch failed",
+        body: `Could not stop agents: ${err instanceof Error ? err.message : "unknown error"}`,
+        level: "error",
+      });
+    }
+  }, [addNotification]);
+  useShortcut("Ctrl+Shift+K", killAllAgents, "Stop all agents", "system");
 
   return null;
 }

@@ -1,6 +1,7 @@
 import pytest
 from tinyagentos.config import load_config
 from tinyagentos.cluster.worker_protocol import WorkerInfo
+from tinyagentos.containers.backend import ContainerInfo
 
 
 @pytest.fixture(autouse=True)
@@ -65,7 +66,12 @@ class TestAgentsPage:
 
 @pytest.mark.asyncio
 class TestBulkOperations:
-    async def test_bulk_start(self, client):
+    async def test_bulk_start(self, client, monkeypatch):
+        async def fake_start(name):
+            return {"success": True, "output": ""}
+
+        monkeypatch.setattr("tinyagentos.containers.start_container", fake_start)
+
         resp = await client.post("/api/agents/bulk/start")
         assert resp.status_code == 200
         data = resp.json()
@@ -73,15 +79,196 @@ class TestBulkOperations:
         assert "results" in data
         assert "test-agent" in data["results"]
 
-    async def test_bulk_stop(self, client):
+    async def test_bulk_stop(self, client, monkeypatch):
+        async def fake_stop(name, force=False):
+            return {"success": True, "output": ""}
+
+        async def fake_list_containers(prefix="taos-agent-"):
+            return [
+                ContainerInfo(
+                    name="taos-agent-test-agent",
+                    status="Running",
+                    ip="10.0.0.5",
+                    memory_mb=1024,
+                    cpu_cores=2,
+                )
+            ]
+
+        monkeypatch.setattr("tinyagentos.containers.stop_container", fake_stop)
+        monkeypatch.setattr("tinyagentos.containers.list_containers", fake_list_containers)
+
         resp = await client.post("/api/agents/bulk/stop")
         assert resp.status_code == 200
-        assert resp.json()["action"] == "stop"
+        data = resp.json()
+        assert data["action"] == "stop"
+        assert "force_kill_results" in data
 
-    async def test_bulk_restart(self, client):
+    async def test_bulk_restart(self, client, monkeypatch):
+        async def fake_restart(name):
+            return {"success": True, "output": ""}
+
+        monkeypatch.setattr("tinyagentos.containers.restart_container", fake_restart)
+
         resp = await client.post("/api/agents/bulk/restart")
         assert resp.status_code == 200
         assert resp.json()["action"] == "restart"
+
+
+@pytest.mark.asyncio
+class TestKillSwitchRunStateGate:
+    """Verify that force-kill is gated on container run-state, not just existence."""
+
+    async def test_bulk_stop_skips_force_kill_for_stopped_container(
+        self, client, monkeypatch
+    ):
+        """A stopped container must NOT receive incus stop --force."""
+        stopped = ContainerInfo(
+            name="taos-agent-test-agent",
+            status="Stopped",
+            ip=None,
+            memory_mb=0,
+            cpu_cores=0,
+        )
+
+        async def fake_list_containers(prefix="taos-agent-"):
+            return [stopped]
+
+        monkeypatch.setattr(
+            "tinyagentos.containers.list_containers", fake_list_containers
+        )
+
+        force_calls = []
+
+        async def fake_stop(name, force=False):
+            if force:
+                force_calls.append(name)
+            return {"success": True, "output": ""}
+
+        monkeypatch.setattr("tinyagentos.containers.stop_container", fake_stop)
+
+        resp = await client.post("/api/agents/bulk/stop")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["action"] == "stop"
+        # The stopped container should not receive a force kill
+        assert "taos-agent-test-agent" not in force_calls, (
+            f"force-kill should NOT be called on a Stopped container, "
+            f"but stop_container(force=True) was called {force_calls}"
+        )
+
+    async def test_stop_agent_skips_force_kill_for_stopped_container(
+        self, client, monkeypatch
+    ):
+        """A single stopped agent container must NOT receive incus stop --force."""
+        stopped = ContainerInfo(
+            name="taos-agent-test-agent",
+            status="Stopped",
+            ip=None,
+            memory_mb=0,
+            cpu_cores=0,
+        )
+
+        async def fake_list_containers(prefix="taos-agent-"):
+            return [stopped]
+
+        monkeypatch.setattr(
+            "tinyagentos.containers.list_containers", fake_list_containers
+        )
+
+        force_calls = []
+
+        async def fake_stop(name, force=False):
+            if force:
+                force_calls.append(name)
+            return {"success": True, "output": ""}
+
+        monkeypatch.setattr("tinyagentos.containers.stop_container", fake_stop)
+
+        resp = await client.post("/api/agents/test-agent/stop")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "force_killed" in data
+        assert data["force_killed"] is False, (
+            "force_killed should be False for a Stopped container"
+        )
+        assert len(force_calls) == 0, (
+            f"stop_container(force=True) should NOT be called on a Stopped container, "
+            f"but it was called {len(force_calls)} times"
+        )
+
+    async def test_bulk_stop_force_kills_running_container(
+        self, client, monkeypatch
+    ):
+        """A running container MUST receive incus stop --force."""
+        running = ContainerInfo(
+            name="taos-agent-test-agent",
+            status="Running",
+            ip="10.0.0.5",
+            memory_mb=1024,
+            cpu_cores=2,
+        )
+
+        async def fake_list_containers(prefix="taos-agent-"):
+            return [running]
+
+        monkeypatch.setattr(
+            "tinyagentos.containers.list_containers", fake_list_containers
+        )
+
+        force_calls = []
+
+        async def fake_stop(name, force=False):
+            if force:
+                force_calls.append(name)
+            return {"success": True, "output": ""}
+
+        monkeypatch.setattr("tinyagentos.containers.stop_container", fake_stop)
+
+        resp = await client.post("/api/agents/bulk/stop")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["action"] == "stop"
+        assert "taos-agent-test-agent" in force_calls, (
+            "force-kill should be called on a Running container"
+        )
+
+    async def test_stop_agent_force_kills_running_container(
+        self, client, monkeypatch
+    ):
+        """A single running agent container MUST receive incus stop --force."""
+        running = ContainerInfo(
+            name="taos-agent-test-agent",
+            status="Running",
+            ip="10.0.0.5",
+            memory_mb=1024,
+            cpu_cores=2,
+        )
+
+        async def fake_list_containers(prefix="taos-agent-"):
+            return [running]
+
+        monkeypatch.setattr(
+            "tinyagentos.containers.list_containers", fake_list_containers
+        )
+
+        force_calls = []
+
+        async def fake_stop(name, force=False):
+            if force:
+                force_calls.append(name)
+            return {"success": True, "output": ""}
+
+        monkeypatch.setattr("tinyagentos.containers.stop_container", fake_stop)
+
+        resp = await client.post("/api/agents/test-agent/stop")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["force_killed"] is True, (
+            f"force_killed should be True for a Running container, got {data}"
+        )
+        assert "taos-agent-test-agent" in force_calls, (
+            "stop_container(force=True) should be called on a Running container"
+        )
 
 
 def _seed_worker(app, name, model_names, status="online"):
