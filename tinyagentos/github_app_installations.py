@@ -49,7 +49,7 @@ class GitHubAppInstallations:
             self._installations = {
                 int(k): v for k, v in data.get("installations", {}).items()
             }
-        except (json.JSONDecodeError, ValueError, KeyError) as exc:
+        except (json.JSONDecodeError, ValueError, KeyError, AttributeError, TypeError) as exc:
             logger.warning(
                 "Corrupt %s, starting fresh: %s", self._path.name, exc
             )

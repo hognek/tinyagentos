@@ -9,6 +9,9 @@ vi.mock("@/lib/github", () => ({
   pollDeviceFlow: vi.fn(),
   listIdentities: vi.fn().mockResolvedValue([]),
   deleteIdentity: vi.fn(),
+  listAppInstallations: vi.fn().mockResolvedValue([]),
+  beginAppInstallation: vi.fn(),
+  deleteAppInstallation: vi.fn(),
 }));
 
 function mockFetch(
