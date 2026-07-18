@@ -233,6 +233,63 @@ class TestKillSwitchRunStateGate:
             "force-kill should be called on a Running container"
         )
 
+    async def test_bulk_stop_skips_force_kill_when_no_containers(
+        self, client, monkeypatch
+    ):
+        """Empty container list (healthy host, no agents) must NOT trigger force-kill."""
+        async def fake_list_containers(prefix="taos-agent-"):
+            return []
+
+        monkeypatch.setattr(
+            "tinyagentos.containers.list_containers", fake_list_containers
+        )
+
+        force_calls = []
+
+        async def fake_stop(name, force=False):
+            if force:
+                force_calls.append(name)
+            return {"success": True, "output": ""}
+
+        monkeypatch.setattr("tinyagentos.containers.stop_container", fake_stop)
+
+        resp = await client.post("/api/agents/bulk/stop")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["action"] == "stop"
+        assert len(force_calls) == 0, (
+            f"force-kill should NOT be called when no containers exist, "
+            f"but stop_container(force=True) was called {force_calls}"
+        )
+
+    async def test_bulk_stop_force_kills_when_incus_down(
+        self, client, monkeypatch
+    ):
+        """When incus is unreachable (RuntimeError), force-kill all configured agents."""
+        async def fake_list_containers(prefix="taos-agent-"):
+            raise RuntimeError("incus list failed")
+
+        monkeypatch.setattr(
+            "tinyagentos.containers.list_containers", fake_list_containers
+        )
+
+        force_calls = []
+
+        async def fake_stop(name, force=False):
+            if force:
+                force_calls.append(name)
+            return {"success": True, "output": ""}
+
+        monkeypatch.setattr("tinyagentos.containers.stop_container", fake_stop)
+
+        resp = await client.post("/api/agents/bulk/stop")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["action"] == "stop"
+        assert "taos-agent-test-agent" in force_calls, (
+            "force-kill should be attempted on configured agents when incus is down"
+        )
+
 
     async def test_stop_agent_force_kills_running_container(
         self, client, monkeypatch
