@@ -200,7 +200,7 @@ def _parse_key_id(output: str) -> Optional[str]:
                     return parts[-1][-16:].upper()
                 # Otherwise the signing key IS the primary key.
                 signing_fpr = parts[2]
-                if len(signing_fpr) >= 16:
+                if len(signing_fpr) == 40 and _FINGERPRINT_RE.match(signing_fpr):
                     return signing_fpr[-16:].upper()
 
     return None
