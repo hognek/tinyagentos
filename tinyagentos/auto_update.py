@@ -374,9 +374,9 @@ class AutoUpdateService:
                     return
 
                 # ── GPG signature verification ──────────────────────────
-                gpg_result = await self._verify_gpg(new_commit)
+                gpg_result, gpg_prefs = await self._verify_gpg(new_commit)
                 if not gpg_result.ok:
-                    if prefs.get("gpg_required", False):
+                    if gpg_prefs.required:
                         logger.warning(
                             "auto-update: blocking update — GPG verification "
                             "failed (required): %s", gpg_result.status,
@@ -440,24 +440,30 @@ class AutoUpdateService:
                 cache=_fw_cache,
             )
 
-    async def _verify_gpg(self, commit_sha: str) -> "GpgVerificationResult":
-        """Verify GPG signature on *commit_sha* according to user prefs."""
+    async def _verify_gpg(self, commit_sha: str) -> tuple["GpgVerificationResult", "GpgPrefs"]:
+        """Verify GPG signature on *commit_sha* according to user prefs.
+
+        Returns (result, gpg_prefs) so the caller can read gpg_prefs.required
+        from the correct (GPG) namespace rather than the auto-update namespace.
+        """
         from tinyagentos.gpg_verify import (
             verify_remote_commit,
             resolve_gpg_prefs,
             GpgVerificationResult,
+            GpgPrefs,
         )
         try:
             gpg_prefs = await resolve_gpg_prefs(self._settings)
-            return await verify_remote_commit(
+            result = await verify_remote_commit(
                 self._project_dir, commit_sha, gpg_prefs,
             )
+            return result, gpg_prefs
         except Exception:
             logger.exception("auto-update: GPG verification crashed")
             return GpgVerificationResult(
                 ok=False,
                 status="GPG verification raised an exception — check server logs",
-            )
+            ), GpgPrefs()
 
     async def _probe_remote(self) -> Optional[str]:
         """Return the tip of the tracked remote branch (the branch this install

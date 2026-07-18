@@ -91,6 +91,7 @@ async def update_to_master(
         )
 
     # ── GPG signature verification (defence-in-depth) ──────────────────
+    merge_target = "origin/master"
     if gpg_fingerprint:
         from tinyagentos.gpg_verify import verify_commit
         rc_verify, verify_out = await _run(
@@ -109,6 +110,20 @@ async def update_to_master(
                         message=f"GPG signature verification failed — update blocked. {gpg_result.status}",
                     )
                 logger.warning("update_runner: GPG verification failed (warn-only) — proceeding")
+            else:
+                # Pin to the verified SHA so origin/master cannot change
+                # between verification and merge (no TOCTOU).
+                merge_target = remote_sha
+        elif gpg_required:
+            # Could not resolve origin/master — required GPG check is impossible,
+            # abort rather than falling through to an unverified merge.
+            logger.warning("update_runner: could not resolve origin/master for GPG check (required)")
+            return UpdateResult(
+                previous_sha="",
+                new_sha="",
+                ok=False,
+                message="GPG verification required but could not resolve origin/master — update blocked.",
+            )
         else:
             logger.warning("update_runner: could not resolve origin/master for GPG check")
 
@@ -153,9 +168,9 @@ async def update_to_master(
         result.stash_ref = "stash@{0}"
 
     # 5. Attempt fast-forward merge
-    logger.info("update_runner: attempting ff-only merge")
+    logger.info("update_runner: attempting ff-only merge to %s", merge_target)
     rc_merge, merge_out = await _run(
-        ["git", "merge", "--ff-only", "origin/master"], project_dir
+        ["git", "merge", "--ff-only", merge_target], project_dir
     )
 
     # 6. Diverged — tag local HEAD then hard-reset
@@ -167,7 +182,7 @@ async def update_to_master(
             recovery_tag,
         )
         await _run(["git", "tag", recovery_tag, "HEAD"], project_dir)
-        await _run(["git", "reset", "--hard", "origin/master"], project_dir)
+        await _run(["git", "reset", "--hard", merge_target], project_dir)
         result.recovery_tag = recovery_tag
 
     # 7. Stash restore (best-effort)
@@ -243,6 +258,7 @@ async def switch_to_branch(
                             message=f"Fetch failed — no changes applied. ({out.strip()[:200]})")
 
     # ── GPG signature verification (defence-in-depth) ──────────────────
+    merge_target = f"origin/{branch}"
     if gpg_fingerprint:
         from tinyagentos.gpg_verify import verify_commit
         rc_gpg, gpg_out = await _run(
@@ -261,6 +277,20 @@ async def switch_to_branch(
                         message=f"GPG signature verification failed — switch blocked. {gpg_result.status}",
                     )
                 logger.warning("update_runner: GPG verification failed (warn-only) — proceeding")
+            else:
+                # Pin to the verified SHA so origin/<branch> cannot change
+                # between verification and merge (no TOCTOU).
+                merge_target = remote_sha
+        elif gpg_required:
+            # Could not resolve origin/<branch> — required GPG check is impossible,
+            # abort rather than falling through to an unverified switch.
+            logger.warning("update_runner: could not resolve origin/%s for GPG check (required)", branch)
+            return UpdateResult(
+                previous_sha="",
+                new_sha="",
+                ok=False,
+                message=f"GPG verification required but could not resolve origin/{branch} — switch blocked.",
+            )
         else:
             logger.warning("update_runner: could not resolve origin/%s for GPG check", branch)
 
@@ -318,9 +348,9 @@ async def switch_to_branch(
         )
         return result
 
-    rc_merge, _ = await _run(["git", "merge", "--ff-only", f"origin/{branch}"], project_dir)
+    rc_merge, _ = await _run(["git", "merge", "--ff-only", merge_target], project_dir)
     if rc_merge != 0:
-        await _run(["git", "reset", "--hard", f"origin/{branch}"], project_dir)
+        await _run(["git", "reset", "--hard", merge_target], project_dir)
 
     if result.stash_ref:
         rc_pop, pop_out = await _run(["git", "stash", "pop"], project_dir)

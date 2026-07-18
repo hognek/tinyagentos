@@ -18,11 +18,40 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# ── input validation ──────────────────────────────────────────────────────
+
+# A valid GPG key fingerprint is 40 hex characters, optionally with spaces.
+# We strip spaces before validating because gpg accepts both forms.
+import re as _re
+_FINGERPRINT_RE = _re.compile(r'^[0-9A-Fa-f]{40}$')
+
+
+def _validate_fingerprint(fp: str) -> str | None:
+    """Return the normalised (uppercase, no spaces) fingerprint if valid, else None."""
+    if not fp or not isinstance(fp, str):
+        return None
+    cleaned = fp.replace(" ", "").upper()
+    if _FINGERPRINT_RE.match(cleaned):
+        return cleaned
+    return None
+
+
+def _validate_keyserver(url: str) -> bool:
+    """True when *url* looks like an hkps:// or hkp:// keyserver URL."""
+    if not url or not isinstance(url, str):
+        return False
+    if not (url.startswith("hkps://") or url.startswith("hkp://")):
+        return False
+    # Reject anything that looks like shell injection / flag injection.
+    if any(c in url for c in ("\n", "\r", "\t", ";", "|", "&", "$", "`", "'", '"')):
+        return False
+    return True
 
 # ── preferences ────────────────────────────────────────────────────────────
 
@@ -266,10 +295,21 @@ async def import_key(fingerprint: str, keyserver: str = "hkps://keys.openpgp.org
 
     Returns True if the import succeeded (or the key was already present).
     This is a best-effort operation — failures are logged and return False.
+
+    The *fingerprint* and *keyserver* are validated before reaching gpg argv
+    to prevent shell / flag injection through user-controlled preference values.
     """
+    # Validate inputs before they touch gpg argv.
+    clean_fp = _validate_fingerprint(fingerprint)
+    if not clean_fp:
+        logger.warning("gpg_verify: refusing to import — invalid fingerprint %r", fingerprint)
+        return False
+    if not _validate_keyserver(keyserver):
+        logger.warning("gpg_verify: refusing to import — invalid keyserver %r", keyserver)
+        return False
     try:
         rc, out = await _run(
-            ["gpg", "--keyserver", keyserver, "--recv-keys", fingerprint],
+            ["gpg", "--keyserver", keyserver, "--recv-keys", clean_fp],
             Path.cwd(),
         )
         if rc == 0:
@@ -293,14 +333,20 @@ async def ensure_key_available(fingerprint: str) -> bool:
     """Ensure a GPG key is available in the local keyring.
 
     Returns True if the key is available or was successfully imported.
+
+    The *fingerprint* is validated before reaching gpg argv.
     """
+    clean_fp = _validate_fingerprint(fingerprint)
+    if not clean_fp:
+        logger.warning("gpg_verify: refusing to list/import — invalid fingerprint %r", fingerprint)
+        return False
     try:
-        rc, _ = await _run(["gpg", "--list-keys", fingerprint], Path.cwd())
+        rc, _ = await _run(["gpg", "--list-keys", clean_fp], Path.cwd())
         if rc == 0:
             return True
     except Exception:
         pass
-    return await import_key(fingerprint)
+    return await import_key(clean_fp)
 
 
 async def resolve_gpg_prefs(settings_store) -> GpgPrefs:
@@ -334,15 +380,23 @@ async def verify_remote_commit(
         return GpgVerificationResult(ok=True, status="GPG verification disabled — skipped")
 
     fingerprint = prefs.key_fingerprint
-    if fingerprint:
-        key_ok = await ensure_key_available(fingerprint)
-        if not key_ok:
-            return GpgVerificationResult(
-                ok=False,
-                status=(
-                    f"cannot verify: failed to import GPG key "
-                    f"{fingerprint[:16]}…"
-                ),
-            )
+    # Require a pinned fingerprint when verification is enabled. Without one,
+    # any valid signature from any key in the server keyring would be accepted,
+    # collapsing trust to "some key present".
+    if not fingerprint:
+        return GpgVerificationResult(
+            ok=False,
+            status="GPG verification enabled but no key fingerprint configured — cannot verify",
+        )
+
+    key_ok = await ensure_key_available(fingerprint)
+    if not key_ok:
+        return GpgVerificationResult(
+            ok=False,
+            status=(
+                f"cannot verify: failed to import GPG key "
+                f"{fingerprint[:16]}…"
+            ),
+        )
 
     return await verify_commit(project_dir, commit_sha, fingerprint)

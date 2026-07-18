@@ -254,16 +254,13 @@ async def test_verify_remote_disabled():
 
 
 @pytest.mark.asyncio
-async def test_verify_remote_enabled_no_fingerprint(monkeypatch):
-    """When enabled but no fingerprint, verifies any valid signature."""
-    monkeypatch.setattr(
-        "asyncio.create_subprocess_exec",
-        AsyncMock(return_value=_fake_proc(returncode=0, stdout=SAMPLE_GOOD_OUTPUT)),
-    )
-
+async def test_verify_remote_enabled_no_fingerprint():
+    """When enabled but no fingerprint, verification fails — a pinned
+    fingerprint is required to prevent accepting any key in the keyring."""
     prefs = GpgPrefs(enabled=True, key_fingerprint=None)
     result = await verify_remote_commit(Path("/tmp"), "abc1234", prefs)
-    assert result.ok is True
+    assert result.ok is False
+    assert "no key fingerprint" in result.status.lower()
 
 
 @pytest.mark.asyncio

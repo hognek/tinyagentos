@@ -948,6 +948,13 @@ async def apply_update(request: Request):
                         )
                     # Warn but proceed.
                     logger.warning("apply_update: GPG verification failed (warn-only): %s", gpg_result.status)
+            elif gpg_prefs.required:
+                # Could not resolve the remote ref — if GPG is required, abort
+                # rather than falling through to an unverified merge.
+                return JSONResponse(
+                    {"error": "GPG verification required but could not resolve remote commit — update blocked."},
+                    status_code=400,
+                )
         except Exception:
             logger.exception("apply_update: GPG verification crashed")
             if gpg_prefs.required:
