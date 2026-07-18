@@ -92,6 +92,13 @@ async def update_to_master(
 
     # ── GPG signature verification (defence-in-depth) ──────────────────
     merge_target = "origin/master"
+    if gpg_required and not gpg_fingerprint:
+        return UpdateResult(
+            previous_sha="",
+            new_sha="",
+            ok=False,
+            message="GPG verification required but no key fingerprint configured — update blocked.",
+        )
     if gpg_fingerprint:
         from tinyagentos.gpg_verify import verify_commit
         rc_verify, verify_out = await _run(
@@ -259,6 +266,13 @@ async def switch_to_branch(
 
     # ── GPG signature verification (defence-in-depth) ──────────────────
     merge_target = f"origin/{branch}"
+    if gpg_required and not gpg_fingerprint:
+        return UpdateResult(
+            previous_sha="",
+            new_sha="",
+            ok=False,
+            message=f"GPG verification required but no key fingerprint configured — switch blocked.",
+        )
     if gpg_fingerprint:
         from tinyagentos.gpg_verify import verify_commit
         rc_gpg, gpg_out = await _run(
