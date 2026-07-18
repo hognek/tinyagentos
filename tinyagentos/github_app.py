@@ -17,6 +17,32 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# Simple in-memory token cache with TTL (avoids minting a new JWT + token
+# on every API call when the same installation is used repeatedly).
+_token_cache: dict[str, tuple[str, float]] = {}  # key -> (token, expiry)
+_CACHE_TTL = 300  # 5 minutes (token lifetime is 1 hour, so this is conservative)
+
+
+def _cache_key(app_id: str, installation_id: int) -> str:
+    """Return a cache key for an app_id + installation_id pair."""
+    return f"{app_id}:{installation_id}"
+
+
+def _cached_token(key: str) -> str | None:
+    """Return a cached token if valid, or None."""
+    entry = _token_cache.get(key)
+    if entry:
+        token, expiry = entry
+        if time.time() < expiry:
+            return token
+        del _token_cache[key]
+    return None
+
+
+def _cache_token(key: str, token: str) -> None:
+    """Store a token in the cache with the default TTL."""
+    _token_cache[key] = (token, time.time() + _CACHE_TTL)
+
 # ---------------------------------------------------------------------------
 # GitHub App API endpoints
 # ---------------------------------------------------------------------------
@@ -102,7 +128,14 @@ async def get_installation_token(
 
     Returns the token string or None on failure. The token is scoped to the
     repositories the installation has access to and expires after 1 hour.
+    Results are cached for 5 minutes to avoid minting a new JWT + token
+    on every API call.
     """
+    key = _cache_key(app_id, installation_id)
+    cached = _cached_token(key)
+    if cached:
+        return cached
+
     jwt = generate_jwt(app_id, private_key)
     url = _INSTALL_TOKEN_URL.format(installation_id=installation_id)
     try:
@@ -113,7 +146,10 @@ async def get_installation_token(
         )
         resp.raise_for_status()
         data = resp.json()
-        return data.get("token")
+        token = data.get("token")
+        if token:
+            _cache_token(key, token)
+        return token
     except Exception as exc:
         logger.exception(
             "Failed to get installation token for installation %s: %s",
@@ -128,7 +164,7 @@ async def list_installations(
     private_key: str,
     http_client: httpx.AsyncClient,
 ) -> list[dict]:
-    """List all installations of the GitHub App.
+    """List all installations of the GitHub App (follows pagination).
 
     Returns a list of installation dicts, each containing:
       - id (int): installation ID
@@ -137,18 +173,28 @@ async def list_installations(
       - created_at, updated_at
     """
     jwt = generate_jwt(app_id, private_key)
-    try:
-        resp = await http_client.get(
-            _GH_APP_INSTALLATIONS,
-            headers=_auth_headers(jwt),
-            params={"per_page": 100},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as exc:
-        logger.exception("Failed to list installations: %s", exc)
-        return []
+    all_installations: list[dict] = []
+    page = 1
+    while True:
+        try:
+            resp = await http_client.get(
+                _GH_APP_INSTALLATIONS,
+                headers=_auth_headers(jwt),
+                params={"per_page": 100, "page": page},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            installations = resp.json()
+            if not installations:
+                break
+            all_installations.extend(installations)
+            if len(installations) < 100:
+                break
+            page += 1
+        except Exception as exc:
+            logger.exception("Failed to list installations: %s", exc)
+            break
+    return all_installations
 
 
 async def list_installation_repos(

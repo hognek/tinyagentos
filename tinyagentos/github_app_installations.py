@@ -6,6 +6,7 @@ small, infrequently written, and referenced at startup time.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -54,7 +55,7 @@ class GitHubAppInstallations:
             )
             self._installations = {}
 
-    def _save(self) -> None:
+    def _save_sync(self) -> None:
         data = {
             "installations": {str(k): v for k, v in self._installations.items()},
             "updated_at": int(time.time()),
@@ -62,6 +63,10 @@ class GitHubAppInstallations:
         tmp = self._path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2))
         tmp.replace(self._path)
+
+    async def _save(self) -> None:
+        """Persist installations to disk without blocking the event loop."""
+        await asyncio.to_thread(self._save_sync)
 
     # -- public API ---------------------------------------------------------
 
@@ -76,7 +81,7 @@ class GitHubAppInstallations:
             for iid, meta in self._installations.items()
         ]
 
-    def add(
+    async def add(
         self,
         installation_id: int,
         account_login: str = "",
@@ -92,7 +97,7 @@ class GitHubAppInstallations:
             "repository_selection": repository_selection,
             "installed_at": int(time.time()),
         }
-        self._save()
+        await self._save()
         logger.info(
             "GitHub App installation %s added (%s/%s)",
             installation_id,
@@ -100,11 +105,11 @@ class GitHubAppInstallations:
             account_type,
         )
 
-    def remove(self, installation_id: int) -> bool:
+    async def remove(self, installation_id: int) -> bool:
         """Remove an installation. Returns False if not found."""
         if installation_id not in self._installations:
             return False
         del self._installations[installation_id]
-        self._save()
+        await self._save()
         logger.info("GitHub App installation %s removed", installation_id)
         return True

@@ -307,6 +307,8 @@ export async function beginAppInstallation(): Promise<string | null> {
       }),
     );
     if (!res.ok) return null;
+    const ct = res.headers.get("content-type") ?? "";
+    if (!ct.includes("application/json")) return null;
     const data: AppInstallUrl = await res.json();
     return data.install_url || null;
   } catch {
