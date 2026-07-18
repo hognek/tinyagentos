@@ -637,8 +637,8 @@ class GpuArbiter:
 
     async def _process_queue(self) -> None:
         try:
-            consecutive_failures = 0
             MAX_CONSECUTIVE_FAILURES = 10
+            COOLDOWN_BACKOFF = 300  # seconds to wait before restarting the processor
             while True:
                 try:
                     await asyncio.wait_for(self._wake.wait(),
@@ -646,6 +646,7 @@ class GpuArbiter:
                 except asyncio.TimeoutError:
                     pass
                 self._wake.clear()
+                consecutive_failures = 0  # reset per inner drain cycle
                 if not self._paused:  # taOS #796: skip drain while paused
                     try:
                         await self._drain_queue()
@@ -661,11 +662,16 @@ class GpuArbiter:
                         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                             logger.critical(
                                 "gpu-arbiter: _drain_queue failed %d consecutive "
-                                "times — stopping queue processor",
-                                consecutive_failures,
+                                "times — restarting queue processor after %ds cooldown",
+                                consecutive_failures, COOLDOWN_BACKOFF,
                             )
-                            return
+                            break
                         await asyncio.sleep(backoff)
+                # Outer restart loop: wait cooldown, then restart the inner loop
+                await asyncio.sleep(COOLDOWN_BACKOFF)
+                logger.warning(
+                    "gpu-arbiter: restarting queue processor after cooldown"
+                )
         except asyncio.CancelledError:
             raise
 
