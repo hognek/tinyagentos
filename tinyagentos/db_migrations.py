@@ -123,21 +123,32 @@ def _ensure_namespace_column(conn: sqlite3.Connection) -> None:
         col_info = conn.execute("PRAGMA table_info(schema_migrations)").fetchall()
 
     # Rebuild with composite PK if still using legacy version-only PK.
+    # Wrapped in explicit BEGIN/COMMIT so DROP→RENAME is atomic — a crash
+    # mid-rebuild cannot leave the DB with no schema_migrations table.
     pk_cols = [row[1] for row in col_info if row[5]]
     if "store_name" not in pk_cols:
-        conn.executescript(
-            "CREATE TABLE schema_migrations_new ("
-            "    store_name  TEXT    NOT NULL,"
-            "    version     INTEGER NOT NULL,"
-            "    applied_at  REAL    NOT NULL,"
-            "    PRIMARY KEY (store_name, version)"
-            ");"
-            "INSERT INTO schema_migrations_new "
-            "SELECT store_name, version, applied_at FROM schema_migrations;"
-            "DROP TABLE schema_migrations;"
-            "ALTER TABLE schema_migrations_new RENAME TO schema_migrations;"
-        )
-        conn.commit()
+        conn.execute("BEGIN")
+        try:
+            conn.execute(
+                "CREATE TABLE schema_migrations_new ("
+                "    store_name  TEXT    NOT NULL,"
+                "    version     INTEGER NOT NULL,"
+                "    applied_at  REAL    NOT NULL,"
+                "    PRIMARY KEY (store_name, version)"
+                ")"
+            )
+            conn.execute(
+                "INSERT INTO schema_migrations_new "
+                "SELECT store_name, version, applied_at FROM schema_migrations"
+            )
+            conn.execute("DROP TABLE schema_migrations")
+            conn.execute(
+                "ALTER TABLE schema_migrations_new RENAME TO schema_migrations"
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
         logger.debug(
             "db_migrations: rebuilt schema_migrations with composite PK "
             "(store_name, version)"
@@ -264,21 +275,32 @@ async def _ensure_namespace_column_async(conn) -> None:
         col_info = await (await conn.execute("PRAGMA table_info(schema_migrations)")).fetchall()
 
     # Rebuild with composite PK if still using legacy version-only PK.
+    # Wrapped in explicit BEGIN/COMMIT so DROP→RENAME is atomic — a crash
+    # mid-rebuild cannot leave the DB with no schema_migrations table.
     pk_cols = [row[1] for row in col_info if row[5]]
     if "store_name" not in pk_cols:
-        await conn.executescript(
-            "CREATE TABLE schema_migrations_new ("
-            "    store_name  TEXT    NOT NULL,"
-            "    version     INTEGER NOT NULL,"
-            "    applied_at  REAL    NOT NULL,"
-            "    PRIMARY KEY (store_name, version)"
-            ");"
-            "INSERT INTO schema_migrations_new "
-            "SELECT store_name, version, applied_at FROM schema_migrations;"
-            "DROP TABLE schema_migrations;"
-            "ALTER TABLE schema_migrations_new RENAME TO schema_migrations;"
-        )
-        await conn.commit()
+        await conn.execute("BEGIN")
+        try:
+            await conn.execute(
+                "CREATE TABLE schema_migrations_new ("
+                "    store_name  TEXT    NOT NULL,"
+                "    version     INTEGER NOT NULL,"
+                "    applied_at  REAL    NOT NULL,"
+                "    PRIMARY KEY (store_name, version)"
+                ")"
+            )
+            await conn.execute(
+                "INSERT INTO schema_migrations_new "
+                "SELECT store_name, version, applied_at FROM schema_migrations"
+            )
+            await conn.execute("DROP TABLE schema_migrations")
+            await conn.execute(
+                "ALTER TABLE schema_migrations_new RENAME TO schema_migrations"
+            )
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
         logger.debug(
             "db_migrations: rebuilt schema_migrations with composite PK "
             "(store_name, version)"

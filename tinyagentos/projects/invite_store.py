@@ -177,7 +177,9 @@ class ProjectInviteStore(BaseStore):
                 await self._db.commit()
                 break
             except aiosqlite.IntegrityError as exc:
-                if "UNIQUE" not in str(exc):
+                # Only retry on UNIQUE/PRIMARY KEY constraint violations
+                # (invite_id collision).  Other integrity errors re-raise.
+                if getattr(exc, "sqlite_errorcode", 0) not in (19, 1555, 2067):
                     raise
                 if attempt == max_retries - 1:
                     raise RuntimeError(
