@@ -191,12 +191,15 @@ findings **before** surfacing the PR for human maintainer review.
 ### Procedure
 
 1. **Push PR and mark ready.** Wait ~10 minutes for bot reviews to complete.
-2. **Pull bot findings - reviews AND inline comments, all bots.** Bot logins have NO `[bot]`
-   suffix in the JSON (`kilo-code-bot`, `gitar-bot`, `coderabbitai`, `qodo-code-review`):
+2. **Pull bot findings - reviews AND inline comments, all bots.** Bot logins carry a `[bot]`
+   suffix in the JSON (`kilo-code-bot[bot]`, `gitar-bot[bot]`, `coderabbitai[bot]`,
+   `qodo-code-review[bot]`). The jq below uses `?.author.login` (null-safe, survives deleted
+   users) and falls back to `.user.login` for reviews; the regex matches `[bot]`-suffixed
+   and bare logins alike via substring matching:
    ```bash
    # Review summaries + issue comments:
    gh pr view <PR#> --repo jaylfc/taOS --json reviews,comments --jq \
-     '(.reviews[], .comments[]) | select(.author.login | test("kilo-code-bot|gitar-bot|coderabbitai|qodo")) | {login: .author.login, body: .body}'
+     '(.reviews[], .comments[]) | select((.author.login? // .user.login? // "") | test("kilo-code-bot|gitar-bot|coderabbitai|qodo")) | {login: (.author.login? // .user.login? // "unknown"), body: .body}'
    # Inline (line-anchored) review comments - Kilo/CodeRabbit post most findings here:
    gh api repos/jaylfc/taOS/pulls/<PR#>/comments --jq \
      '.[] | {login: .user.login, path, line, body}'
