@@ -819,13 +819,19 @@ async def bulk_stop_agents(request: Request):
     async def _grace_kill():
         await asyncio.sleep(2)
         containers = await list_containers(prefix="taos-agent-")
+        if not containers and config.agents:
+            logger.warning(
+                "list_containers returned empty; incus may be unhealthy. "
+                "Attempting force-kill on all configured agents."
+            )
         running = {c.name for c in containers if c.status == "Running"}
+        incus_unhealthy = not containers and bool(config.agents)
         force_results = {}
         for agent in config.agents:
             name = agent["name"]
             container_name = f"taos-agent-{name}"
             try:
-                if container_name in running:
+                if container_name in running or incus_unhealthy:
                     force_result = await stop_container(container_name, force=True)
                     force_results[name] = {
                         "force_killed": force_result.get("success", False),
@@ -916,8 +922,13 @@ async def stop_agent(request: Request, name: str):
     async def _grace_kill():
         await asyncio.sleep(2)
         containers = await list_containers(prefix="taos-agent-")
+        if not containers:
+            logger.warning(
+                "list_containers returned empty; incus may be unhealthy. "
+                "Attempting force-kill anyway."
+            )
         running = {c.name for c in containers if c.status == "Running"}
-        if container_name in running:
+        if container_name in running or not containers:
             force_result = await stop_container(container_name, force=True)
             success = force_result.get("success", False)
             if not success:
@@ -931,7 +942,7 @@ async def stop_agent(request: Request, name: str):
 
     task = asyncio.create_task(_grace_kill())
     try:
-        force_killed, force_error = await asyncio.shield(task)
+        force_killed, force_output = await asyncio.shield(task)
     except asyncio.CancelledError:
         task.cancel()
         try:
@@ -944,7 +955,7 @@ async def stop_agent(request: Request, name: str):
         "prepare_report": report,
         "stop_result": stop_result,
         "force_killed": force_killed,
-        "force_error": force_error,
+        "force_output": force_output,
     }
 
 
