@@ -58,6 +58,7 @@ class _QueuedGpuTask:
     op: str = field(default="inference", compare=False)
     model: str | None = field(default=None, compare=False)
     backend_name: str | None = field(default=None, compare=False)
+    resource_id: str | None = field(default=None, compare=False)
 
 
 @dataclass
@@ -369,6 +370,7 @@ class GpuArbiter:
                     required_vram_mb=required_vram_mb, evictable=evictable,
                     required_gpu_arch=required_gpu_arch,
                     op=op, model=model, backend_name=backend_name,
+                    resource_id=resource_id,
                 )
                 await self._queue.put(entry)
                 self._queued_entries[task.id] = entry
@@ -402,6 +404,8 @@ class GpuArbiter:
         for worker in self._cluster_manager.get_workers():
             if worker.status != "online":
                 continue
+            if worker.free_vram_mb is None:
+                continue  # non-NVIDIA worker — no VRAM probe
             worker_leases = sum(
                 l.required_vram_mb for l in leases
                 if self._resource_on_worker(l.resource_id, worker.name) and l.required_vram_mb > 0
@@ -418,6 +422,37 @@ class GpuArbiter:
             reason=f"no cluster worker with {required_vram_mb} MiB free VRAM",
         )
 
+    async def _renew_lease_loop(self, lease_id: str, stop_event: asyncio.Event) -> None:
+        """Periodically renew a lease until *stop_event* is set.
+
+        Renews every 200 s so the lease never expires mid-run (the claim
+        TTL is 300 s).  Returns silently when the lease expires or
+        renewal fails — the caller's finally path still releases it.
+        """
+        RENEW_INTERVAL = 200
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=RENEW_INTERVAL)
+                return  # stop_event set — exit cleanly
+            except asyncio.TimeoutError:
+                pass  # it's time to renew
+            try:
+                if self._cluster_manager is not None:
+                    renewed = await self._cluster_manager.renew_lease(
+                        lease_id, ttl_seconds=300,
+                    )
+                    if renewed is None:
+                        logger.warning(
+                            "gpu-arbiter: lease %s expired mid-renewal", lease_id,
+                        )
+                        return
+                    logger.debug("gpu-arbiter: renewed lease %s", lease_id)
+            except Exception:
+                logger.exception(
+                    "gpu-arbiter: failed to renew lease %s", lease_id,
+                )
+                return
+
     async def _run_gpu_task(
         self, task: Task, required_vram_mb: int, evictable: bool, resource_id: str | None,
     ) -> object:
@@ -432,6 +467,8 @@ class GpuArbiter:
         claim_lease fails (taOS #1705 — reservation leak fix).
         """
         lease_id: str | None = None
+        renew_task: asyncio.Task | None = None
+        renew_stop: asyncio.Event | None = None
         try:
             if self._cluster_manager is not None and resource_id is not None:
                 lease = await self._cluster_manager.claim_lease(
@@ -443,6 +480,13 @@ class GpuArbiter:
                         f"GPU lease claim failed for {resource_id} (task {task.id})"
                     )
                 lease_id = lease.lease_id
+                # Start periodic lease renewal so the lease doesn't expire
+                # mid-run (taOS #1864 defect 4 — fixed 300 s TTL).
+                renew_stop = asyncio.Event()
+                renew_task = asyncio.create_task(
+                    self._renew_lease_loop(lease_id, renew_stop),
+                    name=f"gpu-arbiter-renew-{task.id}",
+                )
             current = asyncio.current_task()
             async with self._running_lock:
                 self._running[task.id] = (task, lease_id, int(task.priority), required_vram_mb)
@@ -459,6 +503,15 @@ class GpuArbiter:
                          task.id, task.priority, required_vram_mb)
             raise
         finally:
+            # Stop lease renewal (taOS #1864 defect 4).
+            if renew_stop is not None:
+                renew_stop.set()
+            if renew_task is not None:
+                renew_task.cancel()
+                try:
+                    await renew_task
+                except asyncio.CancelledError:
+                    pass
             # Release the VRAM reservation whether we completed, errored,
             # or were cancelled.  _evict_task handles its own reservation
             # release so idempotency matters.
@@ -579,8 +632,13 @@ class GpuArbiter:
                 except asyncio.TimeoutError:
                     pass
                 self._wake.clear()
-                if not self._paused:
-                    await self._drain_queue()
+                if not self._paused:  # taOS #796: skip drain while paused
+                    try:
+                        await self._drain_queue()
+                    except Exception:
+                        logger.exception(
+                            "gpu-arbiter: _drain_queue raised — continuing loop"
+                        )
         except asyncio.CancelledError:
             raise
 
@@ -629,7 +687,7 @@ class GpuArbiter:
                 # Spawn as background task so drain doesn't block and
                 # eviction-to-make-room stays responsive on subsequent ticks.
                 t = asyncio.create_task(
-                    self._run_gpu_task(entry.task, entry.required_vram_mb, entry.evictable, None),
+                    self._run_gpu_task(entry.task, entry.required_vram_mb, entry.evictable, entry.resource_id),
                     name=f"gpu-arbiter-drain-{entry.task.id}",
                 )
 
