@@ -317,7 +317,7 @@ class ProjectInviteStore(BaseStore):
             """
             UPDATE project_invites
                SET redeemed_by = ?, redeemed_request_id = ?, status = 'redeemed'
-             WHERE invite_id = ?
+             WHERE invite_id = ? AND status = 'claimed'
             """,
             (redeemed_by, redeemed_request_id, invite_id),
         )

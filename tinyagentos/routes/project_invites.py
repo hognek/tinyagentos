@@ -729,6 +729,7 @@ async def mint_os_invite(
     # OS-level invites carry no project, so drop any project-bound scopes rather
     # than granting them against a non-existent project (kilo review #1918).
     os_scopes = [s for s in payload.scopes if s not in _PROJECT_SCOPED]
+    dropped = sorted(set(payload.scopes) & _PROJECT_SCOPED)
     try:
         result = await store.mint(
             project_id=None,
@@ -741,7 +742,7 @@ async def mint_os_invite(
     except InvitePendingCapError as exc:
         return JSONResponse({"error": str(exc)}, status_code=429)
     record = result["record"]
-    return {
+    response = {
         "invite_id": record["invite_id"],
         "pin": result["pin"],
         "expires_ts": record["expires_ts"],
@@ -750,6 +751,11 @@ async def mint_os_invite(
         "check_interval_secs": record["check_interval_secs"],
         "display_name": record["display_name"],
     }
+    if dropped:
+        response["warnings"] = [
+            f"project-scoped scopes dropped (OS invites cannot grant project access): {dropped}"
+        ]
+    return response
 
 
 @router.get("/api/agents/invites")
@@ -871,15 +877,21 @@ async def redeem_invite(request: Request, body: RedeemInviteIn):
     from tinyagentos.routes.agent_auth_requests import approve_request_record
 
     auth_store = request.app.state.auth_requests
-    record = await auth_store.create(
-        identity_claim=handle,
-        framework=body.harness,
-        requested_scopes=scopes,
-        requested_skills=None,
-        reason=f"invite {body.invite_id}",
-        duration_secs=None,
-        project_id=invite["project_id"],
-    )
+    try:
+        record = await auth_store.create(
+            identity_claim=handle,
+            framework=body.harness,
+            requested_scopes=scopes,
+            requested_skills=None,
+            reason=f"invite {body.invite_id}",
+            duration_secs=None,
+            project_id=invite["project_id"],
+        )
+    except Exception as exc:  # noqa: BLE001 - release claimed invite on auth failure
+        await store.rollback_to_pending(body.invite_id)
+        return JSONResponse(
+            {"error": f"failed to create auth request: {exc}"}, status_code=500
+        )
 
     if invite["approval_mode"] == "auto":
         try:
