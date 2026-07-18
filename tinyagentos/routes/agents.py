@@ -811,11 +811,8 @@ async def bulk_stop_agents(request: Request):
     if orchestrator is not None:
         report = await orchestrator.prepare("all", "stop")
 
-    # Phase 1: SIGTERM every agent container
-    results = await _bulk_container_op(config, stop_container)
-
     # Phase 2: 2-second grace window, then SIGKILL any stragglers
-    # (shielded from cancellation; the sleep+force is bounded by the 120s _run cap)
+    # (shielded from cancellation; the sleep+force is bounded)
     async def _grace_kill():
         await asyncio.sleep(2)
         containers = await list_containers(prefix="taos-agent-")
@@ -827,17 +824,17 @@ async def bulk_stop_agents(request: Request):
         running = {
             c.name
             for c in containers
-            if c.status in ("Running", "Stopping", "Freezing", "Frozen")
+            if c.status in ("Running", "Stopping")
         }
         incus_unhealthy = not containers and bool(config.agents)
-        force_results = {}
-        for agent in config.agents:
-            name = agent["name"]
-            container_name = f"taos-agent-{name}"
+
+        async def _force_kill_one(agent):
+            agent_name = agent["name"]
+            container_name = f"taos-agent-{agent_name}"
             try:
                 if container_name in running or incus_unhealthy:
                     force_result = await stop_container(container_name, force=True)
-                    force_results[name] = {
+                    result = {
                         "force_killed": force_result.get("success", False),
                         "output": force_result.get("output", ""),
                     }
@@ -847,11 +844,20 @@ async def bulk_stop_agents(request: Request):
                             container_name,
                             force_result.get("output", "unknown"),
                         )
+                    return (agent_name, result)
             except Exception as e:
-                force_results[name] = {"force_killed": False, "error": str(e)}
-        return force_results
+                return (agent_name, {"force_killed": False, "error": str(e)})
+            return (agent_name, {"force_killed": False, "output": ""})
+
+        gathered = await asyncio.gather(
+            *(_force_kill_one(agent) for agent in config.agents)
+        )
+        return dict(gathered)
 
     task = asyncio.create_task(_grace_kill())
+    # Phase 1: SIGTERM every agent container (concurrent with grace window)
+    results = await _bulk_container_op(config, stop_container)
+
     try:
         force_results = await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -915,10 +921,9 @@ async def stop_agent(request: Request, name: str):
         report = await orchestrator.prepare([name], "stop")
 
     container_name = f"taos-agent-{name}"
-    stop_result = await stop_container(container_name)
 
     # 2-second grace window, then SIGKILL
-    # (shielded from cancellation; the sleep+force is bounded by the 120s _run cap)
+    # (shielded from cancellation; the sleep+force is bounded)
     async def _grace_kill():
         await asyncio.sleep(2)
         containers = await list_containers(prefix="taos-agent-")
@@ -930,7 +935,7 @@ async def stop_agent(request: Request, name: str):
         running = {
             c.name
             for c in containers
-            if c.status in ("Running", "Stopping", "Freezing", "Frozen")
+            if c.status in ("Running", "Stopping")
         }
         if container_name in running or not containers:
             force_result = await stop_container(container_name, force=True)
@@ -945,6 +950,8 @@ async def stop_agent(request: Request, name: str):
         return (False, "")
 
     task = asyncio.create_task(_grace_kill())
+    stop_result = await stop_container(container_name)
+
     try:
         force_killed, force_output = await asyncio.shield(task)
     except asyncio.CancelledError:
