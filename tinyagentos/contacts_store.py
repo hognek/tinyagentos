@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import sqlite3
 import time
 from pathlib import Path
 from typing import Optional
@@ -33,9 +34,11 @@ CREATE TABLE IF NOT EXISTS peer_links (
 );
 
 CREATE TABLE IF NOT EXISTS peer_nonces (
-    nonce                   TEXT PRIMARY KEY,  -- 16-byte hex nonce from envelope
+    nonce                   TEXT NOT NULL,       -- 16-byte hex nonce from envelope
     contact_id              TEXT NOT NULL,
-    seen_at                 REAL NOT NULL
+    kind                    TEXT NOT NULL DEFAULT '',
+    seen_at                 REAL NOT NULL,
+    PRIMARY KEY (contact_id, kind, nonce)
 );
 """
 
@@ -224,7 +227,7 @@ class ContactsStore(BaseStore):
         rec["endpoints"] = _json_loads(rec.get("endpoints", "[]"))
         return rec
 
-    async def record_nonce(self, nonce: str, contact_id: str) -> bool:
+    async def record_nonce(self, nonce: str, contact_id: str, kind: str = "") -> bool:
         """Record a seen nonce for replay protection.
 
         Returns True if the nonce was recorded (first time seen), False if it
@@ -232,6 +235,11 @@ class ContactsStore(BaseStore):
 
         Nonces older than ``NONCE_MAX_AGE_SECS`` are pruned on insert so the
         table does not grow unbounded.
+
+        The uniqueness key is ``(contact_id, kind, nonce)`` — a nonce is only
+        a replay when all three match (per design section 2).  A rejected
+        envelope (bad sig / bad to) must NOT burn its nonce; the caller should
+        only record a nonce AFTER verification passes.
         """
         now = time.time()
         # Prune expired nonces (opportunistic, one DELETE per insert keeps the
@@ -242,13 +250,13 @@ class ContactsStore(BaseStore):
         )
         try:
             await self._db.execute(
-                "INSERT INTO peer_nonces (nonce, contact_id, seen_at) VALUES (?, ?, ?)",
-                (nonce, contact_id, now),
+                "INSERT INTO peer_nonces (nonce, contact_id, kind, seen_at) VALUES (?, ?, ?, ?)",
+                (nonce, contact_id, kind, now),
             )
             await self._db.commit()
             return True
-        except Exception:
-            # Nonce already exists (PRIMARY KEY conflict) — replay detected.
+        except sqlite3.IntegrityError:
+            # Nonce already exists for this (contact_id, kind) — replay detected.
             return False
 
     async def is_nonce_seen(self, nonce: str) -> bool:

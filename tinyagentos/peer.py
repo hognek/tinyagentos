@@ -15,11 +15,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import os
+import sqlite3
 import time
-from typing import Optional
+from pathlib import Path
 
 from tinyagentos.hub.identity import (
     sign as _sign,
+    signing_fingerprint,
     verify_signature,
 )
 
@@ -100,8 +104,14 @@ def verify_envelope(
         if field not in envelope:
             return False, f"missing required field: {field}"
 
-    # Timestamp freshness (with 30s clock-skew grace).
-    age = abs(time.time() - envelope["ts"])
+    # Timestamp freshness: reject non-finite, future-only (past skew), and stale.
+    ts = envelope["ts"]
+    if not isinstance(ts, (int, float)) or not math.isfinite(ts):
+        return False, f"non-finite timestamp: {ts!r}"
+    now = time.time()
+    age = now - ts  # positive = past, negative = future
+    if age < -30.0:
+        return False, f"envelope from the future: {abs(age):.0f}s ahead"
     if age > max_age_seconds + 30.0:
         return False, f"envelope too old: {age:.0f}s > {max_age_seconds}s"
 
@@ -119,8 +129,6 @@ def verify_envelope_signature(
     freshness and structure. Returns True/False (never raises)."""
     sig = envelope.pop("sig", None)
     if sig is None:
-        # Restore and fail.
-        envelope["sig"] = sig
         return False
     try:
         payload = _canonical_json(envelope)
@@ -164,3 +172,44 @@ def mint_peer_token(sub: str) -> tuple[str, str]:
 def _canonical_json(obj: dict) -> bytes:
     """Canonical JSON: sorted keys, compact, UTF-8 bytes (no trailing newline)."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def resolve_local_identity_id(data_dir: str | Path | None = None) -> str | None:
+    """Return this node's local hub identity ID (``"hub:<username>"``), or None.
+
+    Resolved from the hub identity keystore and the hub_authors table in
+    hub.db.  Returns None if the node has not registered a hub identity
+    (no identity keystore, or no matching author row).
+    """
+    try:
+        fp = signing_fingerprint()
+    except Exception:
+        return None
+
+    # Resolve hub.db path the same way hub.store resolves it:
+    # TAOS_DATA_DIR override, else project data dir.
+    if data_dir:
+        hub_dir = Path(data_dir) / "hub"
+    else:
+        env = os.environ.get("TAOS_DATA_DIR")
+        if env:
+            hub_dir = Path(env) / "hub"
+        else:
+            hub_dir = Path(__file__).resolve().parent.parent / "data" / "hub"
+
+    hub_db = hub_dir / "hub.db"
+    if not hub_db.is_file():
+        return None
+
+    try:
+        conn = sqlite3.connect(str(hub_db))
+        row = conn.execute(
+            "SELECT username FROM hub_authors WHERE fingerprint = ?",
+            (fp,),
+        ).fetchone()
+        conn.close()
+        if row and row[0]:
+            return f"hub:{row[0]}"
+    except Exception:
+        pass
+    return None
