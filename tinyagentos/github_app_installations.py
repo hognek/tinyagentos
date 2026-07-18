@@ -55,18 +55,26 @@ class GitHubAppInstallations:
             )
             self._installations = {}
 
-    def _save_sync(self) -> None:
-        data = {
-            "installations": {str(k): v for k, v in self._installations.items()},
-            "updated_at": int(time.time()),
-        }
+    def _save_sync(self, data: dict) -> None:
+        """Write pre-serialised data to disk (called in a thread)."""
         tmp = self._path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=2))
         tmp.replace(self._path)
 
     async def _save(self) -> None:
-        """Persist installations to disk without blocking the event loop."""
-        await asyncio.to_thread(self._save_sync)
+        """Persist installations to disk without blocking the event loop.
+
+        Snapshot the installations dict on the event-loop thread before
+        dispatching to ``asyncio.to_thread`` to avoid a data race: the
+        thread iterates over a local copy, so concurrent ``add()`` /
+        ``remove()`` calls cannot trigger ``RuntimeError`` from dict
+        mutation during iteration.
+        """
+        data = {
+            "installations": {str(k): v for k, v in self._installations.items()},
+            "updated_at": int(time.time()),
+        }
+        await asyncio.to_thread(self._save_sync, data)
 
     # -- public API ---------------------------------------------------------
 
