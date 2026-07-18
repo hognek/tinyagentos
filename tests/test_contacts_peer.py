@@ -14,8 +14,6 @@ from tinyagentos.peer import (
     verify_envelope,
     verify_envelope_signature,
     mint_peer_token,
-    verify_peer_token,
-    hash_peer_token,
 )
 
 
@@ -356,24 +354,17 @@ class TestPeerTokens:
         token, token_hash = mint_peer_token("contact:hogne")
         assert len(token) == 64  # 32 bytes hex
         assert len(token_hash) == 64  # SHA-256 hex
-        assert token_hash != _hash_token(token)  # sub: prefix makes it different
+        # mint_peer_token and _hash_token now use the same plain SHA-256.
+        assert token_hash == _hash_token(token)
 
-    def test_hash_peer_token_deterministic(self):
+    def test_token_hash_deterministic(self):
         token = generate_peer_token()
-        assert hash_peer_token(token) == hash_peer_token(token)
+        assert _hash_token(token) == _hash_token(token)
 
-    def test_verify_peer_token_matches(self):
-        token = generate_peer_token()
-        stored = hash_peer_token(token)
-        assert verify_peer_token(token, stored)
-
-    def test_verify_peer_token_rejects_wrong(self):
-        stored = hash_peer_token(generate_peer_token())
-        assert not verify_peer_token("wrong-token", stored)
-
-    def test_verify_peer_token_rejects_empty(self):
-        stored = hash_peer_token(generate_peer_token())
-        assert not verify_peer_token("", stored)
+    def test_token_hash_different_tokens(self):
+        t1 = generate_peer_token()
+        t2 = generate_peer_token()
+        assert _hash_token(t1) != _hash_token(t2)
 
     def test_mint_peer_token_unique(self):
         t1, _ = mint_peer_token("contact:a")
@@ -518,6 +509,47 @@ class TestPeerRoutes:
             headers={"Authorization": f"Bearer {inbound}"},
         )
         assert resp.status_code == 403, f"expected 403, got {resp.status_code}: {resp.text}"
+
+    async def test_inbox_nonce_replay(self, client_with_contacts, app_with_contacts):
+        """Replaying an envelope with the same nonce must return 409."""
+        from tinyagentos.peer import build_envelope
+
+        store = app_with_contacts.state.contacts_store
+        await store.add_contact(
+            contact_id="hub:nonce-test", hub_username="nonce-test", display_name="N",
+            ed25519_pub="pk", x25519_pub="ek",
+        )
+        inbound = generate_peer_token()
+        await store.establish_peer_link(
+            contact_id="hub:nonce-test",
+            inbound_token=inbound,
+            outbound_token=generate_peer_token(),
+        )
+
+        env = build_envelope(
+            from_username="jaylfc",
+            to_username="nonce-test",
+            kind="handshake",
+        )
+
+        headers = {"Authorization": f"Bearer {inbound}"}
+
+        # First delivery — should succeed (200 or 400 depending on sig check;
+        # the key point is it's not 409).
+        resp1 = await client_with_contacts.post(
+            "/api/peer/inbox",
+            json={"envelope": env},
+            headers=headers,
+        )
+        assert resp1.status_code != 409, f"first send should not be replay: {resp1.status_code}"
+
+        # Replay the same envelope — must be 409 Conflict.
+        resp2 = await client_with_contacts.post(
+            "/api/peer/inbox",
+            json={"envelope": env},
+            headers=headers,
+        )
+        assert resp2.status_code == 409, f"replay should be 409, got {resp2.status_code}: {resp2.text}"
 
     async def test_peer_routes_csrf_exempt(self, client_with_contacts, app_with_contacts):
         """Peer routes should work without a CSRF token (bearer-only auth)."""

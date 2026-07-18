@@ -34,19 +34,38 @@ _RATE_MAX_PER_WINDOW = 60
 _MAX_ENVELOPE_BYTES = 32 * 1024  # 32 KB
 
 # In-memory per-contact rate limiter: contact_id -> (window_start, count).
+# Per-process only — under multi-worker deployments each worker maintains its
+# own counter.  A shared store (Redis or sqlite) is needed for accurate
+# limits across workers.
 _rate_hits: dict[str, tuple[float, int]] = {}
+# Max entries before stale-window cleanup triggers.  Keeps the dict bounded
+# for long-running servers that see many distinct contacts over time.
+_RATE_HITS_MAX_SIZE = 2000
 
 
 def _rate_limit_ok(contact_id: str) -> bool:
     """Fixed-window per-contact rate limiter.
 
     Returns False when the contact has exceeded 60 requests in the current
-    60-second window.
+    60-second window.  Evicts entries with expired windows when the dict
+    grows past ``_RATE_HITS_MAX_SIZE`` to prevent unbounded memory growth.
     """
     now = time.time()
     window_start, count = _rate_hits.get(contact_id, (now, 0))
     if now - window_start >= _RATE_WINDOW_SECS:
         window_start, count = now, 0
+
+    # Opportunistic eviction: when the dict exceeds the max size, sweep out
+    # every entry whose window has expired.  This is O(n) but only runs
+    # occasionally when the dict is full.
+    if len(_rate_hits) >= _RATE_HITS_MAX_SIZE:
+        expired = [
+            cid for cid, (ws, _) in _rate_hits.items()
+            if now - ws >= _RATE_WINDOW_SECS
+        ]
+        for cid in expired:
+            del _rate_hits[cid]
+
     count += 1
     _rate_hits[contact_id] = (window_start, count)
     return count <= _RATE_MAX_PER_WINDOW
@@ -140,6 +159,13 @@ async def peer_inbox(body: PeerEnvelope, request: Request):
     if not ok:
         raise HTTPException(status_code=400, detail=f"invalid envelope: {err}")
 
+    # Nonce replay protection — each envelope must have a unique nonce.
+    nonce = envelope.get("nonce", "")
+    if not nonce:
+        raise HTTPException(status_code=400, detail="missing nonce")
+    if not await store.record_nonce(nonce, contact_id):
+        raise HTTPException(status_code=409, detail="nonce replay detected")
+
     # Verify the "to" field matches this contact's id
     to_field = envelope.get("to", "")
     if to_field != contact_id:
@@ -199,6 +225,13 @@ async def peer_chat(body: PeerEnvelope, request: Request):
     ok, err = verify_envelope(envelope, expected_kind="chat")
     if not ok:
         raise HTTPException(status_code=400, detail=f"invalid envelope: {err}")
+
+    # Nonce replay protection
+    nonce = envelope.get("nonce", "")
+    if not nonce:
+        raise HTTPException(status_code=400, detail="missing nonce")
+    if not await store.record_nonce(nonce, contact_id):
+        raise HTTPException(status_code=409, detail="nonce replay detected")
 
     to_field = envelope.get("to", "")
     if to_field != contact_id:
