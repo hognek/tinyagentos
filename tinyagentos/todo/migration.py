@@ -20,9 +20,10 @@ async def migrate_list_docs(shared_docs_store, todo_store) -> dict:
     the original doc + entries + members from shared_docs.
 
     Idempotent: newly created todo lists record the source document id in a
-    ``migrated_from`` column.  On re-run each source doc is matched by its
-    **exact** id rather than by owner+title alone, so two source docs that
-    happen to share the same title are never conflated.
+    ``migrated_from`` column.  A ``migration_complete`` flag is set only after
+    all entries have been successfully copied.  On re-run a source doc is
+    matched by its **exact** id rather than by owner+title alone, so two
+    source docs that happen to share the same title are never conflated.
 
     Returns:
         dict with ``migrated`` (lists newly created), ``items`` (total items
@@ -42,67 +43,63 @@ async def migrate_list_docs(shared_docs_store, todo_store) -> dict:
             owner, include_archived=True
         )
 
-        # -- primary idempotency check: exact source-doc match -----------
-        # If a todo list already has migrated_from == old_id we know this
-        # exact source was migrated on a previous run.
+        # -- idempotency check: exact source-doc match via migrated_from ---
         migrated_match = [
-            l for l in existing_lists
-            if l.get("migrated_from") == old_id
+            candidate for candidate in existing_lists
+            if candidate.get("migrated_from") == old_id
         ]
 
         if migrated_match:
-            new_id = migrated_match[0]["id"]
-            logger.info(
-                "todo-migration: skipping already-migrated doc %r "
-                "(owner=%r, title=%r) → existing %r",
-                old_id, owner, title, new_id,
-            )
-            result["lists"].append({"old_id": old_id, "new_id": new_id})
-            # Clean up source doc (items already live in the target).
-            await shared_docs_store.delete_doc(old_id)
-            continue
+            target_id = migrated_match[0]["id"]
+            target = await todo_store.get_list(target_id)
 
-        # -- fallback: owner+title match (empty-list guard) ----------------
-        # Handles interrupted migrations from code that predates the
-        # migrated_from column.  The target list exists but was never
-        # stamped.  To avoid conflating a user-created list (which likely
-        # already has items), we only recover into a list that is *empty* —
-        # the hallmark of a migration that created the shell but crashed
-        # before flowing entries.
-        title_match = [
-            l for l in existing_lists
-            if l["title"] == title and l.get("migrated_from") is None
-        ]
-
-        recovered = False
-        if title_match:
-            candidate_id = title_match[0]["id"]
-            target = await todo_store.get_list(candidate_id)
-            if target and not target.get("items"):
-                # Empty list — interrupted migration.  Flow entries in.
-                new_id = candidate_id
+            if target and target.get("migration_complete"):
+                # Migration was fully completed on a previous run —
+                # target is intact, source can be cleaned up.
                 logger.info(
-                    "todo-migration: recovering interrupted migration for "
-                    "doc %r (owner=%r, title=%r) → existing %r",
-                    old_id, owner, title, new_id,
+                    "todo-migration: skipping already-migrated doc %r "
+                    "(owner=%r, title=%r) → existing %r",
+                    old_id, owner, title, target_id,
                 )
-                for entry in entries:
-                    text = entry.get("text", "")
-                    done = bool(entry.get("done", False))
-                    author = entry.get("author", "")
-                    item = await todo_store.add_item(
-                        new_id, text, author=author,
-                    )
-                    if done:
-                        await todo_store.patch_item(item["id"], done=True)
+                result["lists"].append(
+                    {"old_id": old_id, "new_id": target_id}
+                )
+                await shared_docs_store.delete_doc(old_id)
+                continue
 
-                await todo_store.set_migrated_from(new_id, old_id)
-                result["items"] += len(entries)
-                result["lists"].append({"old_id": old_id, "new_id": new_id})
-                recovered = True
+            # Partial migration — target exists with migrated_from stamp
+            # but migration_complete was never set.  Resume by re-copying
+            # all entries.  Delete any partial items already in the target
+            # to avoid duplicates, then re-copy from source.
+            logger.info(
+                "todo-migration: resuming incomplete migration for "
+                "doc %r (owner=%r, title=%r) → existing %r",
+                old_id, owner, title, target_id,
+            )
 
-        if recovered:
-            # Clean up source doc (entries now live in the recovered target).
+            # Clear any partial items already in the target.
+            existing_items = target.get("items", [])
+            for item in existing_items:
+                await todo_store.delete_item(item["id"])
+
+            # Re-copy all entries from source.
+            for entry in entries:
+                text = entry.get("text", "")
+                done = bool(entry.get("done", False))
+                author = entry.get("author", "")
+                item = await todo_store.add_item(
+                    target_id, text, author=author,
+                )
+                if done:
+                    await todo_store.patch_item(item["id"], done=True)
+
+            await todo_store.set_migration_complete(target_id)
+            result["items"] += len(entries)
+            result["lists"].append(
+                {"old_id": old_id, "new_id": target_id}
+            )
+
+            # Source cleanup — all entries now live in the target.
             await shared_docs_store.delete_doc(old_id)
             continue
 
@@ -123,6 +120,7 @@ async def migrate_list_docs(shared_docs_store, todo_store) -> dict:
             if done:
                 await todo_store.patch_item(item["id"], done=True)
 
+        await todo_store.set_migration_complete(new_id)
         result["migrated"] += 1
         result["items"] += len(entries)
         result["lists"].append({"old_id": old_id, "new_id": new_id})

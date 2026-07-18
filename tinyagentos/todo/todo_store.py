@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS todo_lists (
     owner_user_id TEXT NOT NULL,
     title         TEXT NOT NULL DEFAULT '',
     migrated_from TEXT,
+    migration_complete INTEGER NOT NULL DEFAULT 0,
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL,
     archived_at   REAL
@@ -127,6 +128,13 @@ class TodoStore(BaseStore):
         await self._db.execute(
             "UPDATE todo_lists SET migrated_from = ?, updated_at = ? WHERE id = ?",
             (source_doc_id, time.time(), list_id),
+        )
+        await self._db.commit()
+
+    async def set_migration_complete(self, list_id: str) -> None:
+        await self._db.execute(
+            "UPDATE todo_lists SET migration_complete = 1, updated_at = ? WHERE id = ?",
+            (time.time(), list_id),
         )
         await self._db.commit()
 
