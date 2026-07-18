@@ -44,7 +44,8 @@ class BaseStore:
             await self._db.executescript(self.SCHEMA)
             await self._db.commit()
         if self.MIGRATIONS:
-            await run_migrations_async(self._db, self.MIGRATIONS)
+            await run_migrations_async(self._db, self.MIGRATIONS,
+                                       namespace=self.__class__.__name__)
         await self._post_init()
 
     async def _post_init(self) -> None:

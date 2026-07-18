@@ -141,34 +141,48 @@ class ProjectInviteStore(BaseStore):
         if project_id is not None:
             scopes = list(dict.fromkeys(scopes + ["project_tasks"]))
 
-        invite_id = self._generate_invite_id()
         pin = self._generate_pin()
         pin_hash = hashlib.sha256(pin.encode()).hexdigest()
         now = _now()
         expires_ts = now + _EXPIRY_SECS
 
-        await self._db.execute(
-            """
-            INSERT INTO project_invites
-                (invite_id, project_id, pin_hash, scopes, approval_mode,
-                 check_interval_secs, created_by, created_ts, expires_ts, status,
-                 display_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-            """,
-            (
-                invite_id,
-                project_id,
-                pin_hash,
-                json.dumps(scopes),
-                approval_mode,
-                check_interval_secs,
-                created_by,
-                now,
-                expires_ts,
-                display_name,
-            ),
-        )
-        await self._db.commit()
+        # 6-digit invite IDs have a non-trivial collision chance under load
+        # (~12 % at 500 pending).  Retry on UNIQUE constraint violation so a
+        # collision surfaces as a slight latency bump rather than a 500.
+        max_retries = 5
+        for attempt in range(max_retries):
+            invite_id = self._generate_invite_id()
+            try:
+                await self._db.execute(
+                    """
+                    INSERT INTO project_invites
+                        (invite_id, project_id, pin_hash, scopes, approval_mode,
+                         check_interval_secs, created_by, created_ts, expires_ts, status,
+                         display_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                    """,
+                    (
+                        invite_id,
+                        project_id,
+                        pin_hash,
+                        json.dumps(scopes),
+                        approval_mode,
+                        check_interval_secs,
+                        created_by,
+                        now,
+                        expires_ts,
+                        display_name,
+                    ),
+                )
+                await self._db.commit()
+                break
+            except aiosqlite.IntegrityError:
+                if attempt == max_retries - 1:
+                    raise RuntimeError(
+                        "Failed to generate a unique invite ID "
+                        f"after {max_retries} attempts"
+                    ) from None
+                continue
 
         return {
             "record": {

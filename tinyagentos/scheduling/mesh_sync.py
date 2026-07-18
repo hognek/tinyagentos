@@ -176,7 +176,7 @@ class MeshSync:
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         apply_wal_pragmas(self._conn)
-        run_migrations(self._conn, MIGRATIONS)
+        run_migrations(self._conn, MIGRATIONS, namespace="MeshSync")
 
     async def close(self) -> None:
         if self._conn:

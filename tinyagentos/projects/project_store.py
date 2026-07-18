@@ -101,14 +101,15 @@ class ProjectStore(BaseStore):
                     "UPDATE projects SET lead_member_id = ? WHERE id = ?",
                     (flagged[0], pid),
                 )
-                # Clear the legacy per-member is_lead flag so this backfill
-                # runs once. The epic removed the only writer of is_lead, so
-                # without this a Lead the owner deliberately cleared (lead_member_id
-                # set NULL) would be re-promoted from the stale flag on restart.
-                await self._db.execute(
-                    "UPDATE project_members SET is_lead = 0 WHERE project_id = ?",
-                    (pid,),
-                )
+            # Clear the legacy per-member is_lead flag so this backfill runs
+            # once — for 0, 1, or many flagged members alike. The epic removed
+            # the only writer of is_lead, so without this a lead the owner
+            # deliberately cleared (lead_member_id set NULL) would be
+            # re-promoted from the stale flag on restart.
+            await self._db.execute(
+                "UPDATE project_members SET is_lead = 0 WHERE project_id = ?",
+                (pid,),
+            )
         await self._db.commit()
 
     async def set_lead(self, project_id: str, member_id: "str | None") -> None:

@@ -74,8 +74,6 @@ class RedeemInviteIn(BaseModel):
 # until free. The label is the natural first disambiguator, so the numeric
 # suffix is the fallback for same-harness/same-label re-invites.
 
-_CANCEL_SCOPES = {"canvas_read", "canvas_write"}
-
 # Scopes that only mean anything bound to a specific project. An OS-level
 # (project-less) invite has no project to bind them to, so they are stripped
 # before minting rather than granted verbatim: an OS invite must never hand out
