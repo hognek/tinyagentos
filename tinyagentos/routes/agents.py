@@ -803,7 +803,7 @@ async def bulk_stop_agents(request: Request):
     In-flight agent framework work is cancelled by the prepare step;
     LLM calls and tool invocations are terminated when the container dies.
     """
-    from tinyagentos.containers import stop_container, container_exists
+    from tinyagentos.containers import stop_container, list_containers
 
     config = request.app.state.config
     orchestrator = getattr(request.app.state, "orchestrator", None)
@@ -814,15 +814,18 @@ async def bulk_stop_agents(request: Request):
     # Phase 1: SIGTERM every agent container
     results = await _bulk_container_op(config, stop_container)
 
-    # Phase 2: 2-second grace window, then SIGKILL any stragglers (shielded from cancellation)
+    # Phase 2: 2-second grace window, then SIGKILL any stragglers
+    # (shielded from cancellation; the sleep+force is bounded by the 120s _run cap)
     async def _grace_kill():
         await asyncio.sleep(2)
+        containers = await list_containers(prefix="taos-agent-")
+        running = {c.name for c in containers if c.status == "Running"}
         force_results = {}
         for agent in config.agents:
             name = agent["name"]
             container_name = f"taos-agent-{name}"
             try:
-                if await container_exists(container_name):
+                if container_name in running:
                     force_result = await stop_container(container_name, force=True)
                     force_results[name] = {
                         "force_killed": force_result.get("success", False),
@@ -838,7 +841,16 @@ async def bulk_stop_agents(request: Request):
                 force_results[name] = {"force_killed": False, "error": str(e)}
         return force_results
 
-    force_results = await asyncio.shield(_grace_kill())
+    task = asyncio.create_task(_grace_kill())
+    try:
+        force_results = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        raise
 
     return {
         "action": "stop",
@@ -885,7 +897,7 @@ async def stop_agent(request: Request, name: str):
     Sends SIGTERM via incus stop. After a 2-second grace window, if the container
     is still running, sends SIGKILL (incus stop --force) to guarantee termination.
     """
-    from tinyagentos.containers import stop_container, container_exists
+    from tinyagentos.containers import stop_container, list_containers
 
     config = request.app.state.config
     agent = find_agent(config, name)
@@ -899,10 +911,13 @@ async def stop_agent(request: Request, name: str):
     container_name = f"taos-agent-{name}"
     stop_result = await stop_container(container_name)
 
-    # 2-second grace window, then SIGKILL (shielded from cancellation)
+    # 2-second grace window, then SIGKILL
+    # (shielded from cancellation; the sleep+force is bounded by the 120s _run cap)
     async def _grace_kill():
         await asyncio.sleep(2)
-        if await container_exists(container_name):
+        containers = await list_containers(prefix="taos-agent-")
+        running = {c.name for c in containers if c.status == "Running"}
+        if container_name in running:
             force_result = await stop_container(container_name, force=True)
             success = force_result.get("success", False)
             if not success:
@@ -914,7 +929,16 @@ async def stop_agent(request: Request, name: str):
             return (success, force_result.get("output", ""))
         return (False, "")
 
-    force_killed, force_error = await asyncio.shield(_grace_kill())
+    task = asyncio.create_task(_grace_kill())
+    try:
+        force_killed, force_error = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        raise
 
     return {
         "prepare_report": report,
