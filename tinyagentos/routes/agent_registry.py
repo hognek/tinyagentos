@@ -167,11 +167,24 @@ _mint_lock = asyncio.Lock()
 # come up active without a consent round-trip.
 _INTERNAL_ORIGIN = "taos-internal"
 
-# The four internal driver agents and the scopes they need to read/write the
-# coordination bus.  seed-internal mints all four idempotently by handle.
+# Baseline scopes every internal driver agent needs to read/write the
+# coordination bus.  Individual agents may carry additional per-agent scopes
+# (and optional project binding) for their specific roles.
 _INTERNAL_AGENT_SCOPES = ["a2a_send", "a2a_receive"]
 _INTERNAL_AGENTS = (
-    {"handle": "@taOS-dev", "slug": "taos-dev"},
+    {
+        "handle": "@taOS-dev",
+        "slug": "taos-dev",
+        # Lead curator: needs project-task + canvas access on the build fleet project
+        # so it can curate the board (mark cards claimable) and read/write the
+        # project canvas — all via Bearer auth (CSRF-exempt).  Bound to prj-5y722y
+        # (the fleet project) per #1968 C1.
+        "scopes": [
+            "a2a_send", "a2a_receive",
+            "project_tasks", "canvas_read", "canvas_write",
+        ],
+        "project_id": "prj-5y722y",
+    },
     {"handle": "@taOS-website-dev", "slug": "taos-website-dev"},
     {"handle": "@taOSmd-dev", "slug": "taosmd-dev"},
     {"handle": "@Hermes", "slug": "hermes"},
@@ -417,13 +430,16 @@ async def seed_internal_agents(
         )
     seeded = []
     for spec in _INTERNAL_AGENTS:
+        scopes = spec.get("scopes") or list(_INTERNAL_AGENT_SCOPES)
+        project_id = spec.get("project_id")
         seeded.append(
             await _mint_internal_identity(
                 request,
                 user,
                 handle=spec["handle"],
                 slug=spec["slug"],
-                scopes=list(_INTERNAL_AGENT_SCOPES),
+                scopes=scopes,
+                project_id=project_id,
                 adopt=spec["handle"] in adopt_handles,
             )
         )
