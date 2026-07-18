@@ -1146,7 +1146,7 @@ async def set_memory_url(request: Request, body: MemoryUrlUpdate):
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
         return JSONResponse({"error": "URL must use http:// or https:// scheme"}, status_code=400)
-    if not parsed.netloc:
+    if not parsed.hostname:
         return JSONResponse({"error": "URL must include a hostname"}, status_code=400)
 
     is_local = _is_local_url(url)

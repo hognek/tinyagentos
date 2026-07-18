@@ -450,10 +450,18 @@ class TestMemoryUrlSettings:
 
     @pytest.mark.asyncio
     async def test_put_rejects_url_without_hostname(self, client):
-        """A URL without a valid hostname must return 400 (netloc check)."""
+        """A URL without a valid hostname must return 400 (hostname check)."""
+        # path-only: http:///path  (hostname is empty string)
         resp = await client.put(
             "/api/settings/memory-url",
             json={"url": "http:///path"},
+        )
+        assert resp.status_code == 400
+
+        # port-only: http://:7900  (hostname is empty, netloc non-empty — regression for netloc→hostname fix)
+        resp = await client.put(
+            "/api/settings/memory-url",
+            json={"url": "http://:7900"},
         )
         assert resp.status_code == 400
 
