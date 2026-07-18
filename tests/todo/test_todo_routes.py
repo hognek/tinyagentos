@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import secrets
+
 import pytest
 import pytest_asyncio
 import yaml
@@ -41,11 +43,14 @@ async def client(tmp_path):
     token = app.state.auth.create_session(user_id=record["id"], long_lived=True)
     app.state._startup_complete = True
 
+    csrf_token = secrets.token_hex(32)
+
     transport = ASGITransport(app=app)
     async with AsyncClient(
         transport=transport,
         base_url="http://test",
-        cookies={"taos_session": token},
+        cookies={"taos_session": token, "csrf_token": csrf_token},
+        headers={"X-CSRF-Token": csrf_token},
     ) as c:
         yield c
 
@@ -77,12 +82,17 @@ async def two_user_clients(tmp_path):
     app.state._startup_complete = True
     transport = ASGITransport(app=app)
 
+    alice_csrf = secrets.token_hex(32)
+    bob_csrf = secrets.token_hex(32)
+
     async with AsyncClient(
         transport=transport, base_url="http://test",
-        cookies={"taos_session": alice_token},
+        cookies={"taos_session": alice_token, "csrf_token": alice_csrf},
+        headers={"X-CSRF-Token": alice_csrf},
     ) as alice, AsyncClient(
         transport=transport, base_url="http://test",
-        cookies={"taos_session": bob_token},
+        cookies={"taos_session": bob_token, "csrf_token": bob_csrf},
+        headers={"X-CSRF-Token": bob_csrf},
     ) as bob:
         yield alice, bob, app
 
@@ -291,7 +301,7 @@ async def test_add_item_with_due_date(client):
     doc = (await client.post("/api/todo", json={"title": "Deadlines"})).json()
     item = (await client.post(
         f"/api/todo/{doc['id']}/items",
-        json={"text": "Submit report", "due_at": "2026-12-31T23:59:59"},
+        json={"text": "Submit report", "due_at": "2026-12-31T23:59:59+00:00"},
     )).json()
     assert item["due_at"] is not None
     assert item["text"] == "Submit report"
@@ -308,6 +318,18 @@ async def test_add_item_with_invalid_due_date_returns_400(client):
 
 
 @pytest.mark.asyncio
+async def test_add_item_with_naive_due_date_returns_400(client):
+    """Offsetless (naive) datetime strings are rejected."""
+    doc = (await client.post("/api/todo", json={"title": "x"})).json()
+    resp = await client.post(
+        f"/api/todo/{doc['id']}/items",
+        json={"text": "x", "due_at": "2026-12-31T23:59:59"},
+    )
+    assert resp.status_code == 400
+    assert "timezone" in resp.json()["error"].lower()
+
+
+@pytest.mark.asyncio
 async def test_patch_item_due_date(client):
     doc = (await client.post("/api/todo", json={"title": "x"})).json()
     item = (await client.post(
@@ -316,7 +338,7 @@ async def test_patch_item_due_date(client):
 
     resp = await client.patch(
         f"/api/todo/{doc['id']}/items/{item['id']}",
-        json={"due_at": "2026-07-04T12:00:00"},
+        json={"due_at": "2026-07-04T12:00:00+00:00"},
     )
     assert resp.status_code == 200
     assert resp.json()["due_at"] is not None

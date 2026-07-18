@@ -132,19 +132,12 @@ class TodoStore(BaseStore):
         item_id = _new_id("ti")
         now = time.time()
 
-        # Position at the end.
-        cur = await self._db.execute(
-            "SELECT COALESCE(MAX(position), -1) FROM todo_items WHERE list_id = ?",
-            (list_id,),
-        )
-        row = await cur.fetchone()
-        position = row[0] + 1
-
         await self._db.execute(
             "INSERT INTO todo_items "
             "(id, list_id, text, done, position, due_at, remind_at, author, created_at, updated_at) "
-            "VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
-            (item_id, list_id, text, position, due_at, remind_at, author, now, now),
+            "SELECT ?, ?, ?, 0, COALESCE(MAX(position), -1) + 1, ?, ?, ?, ?, ? "
+            "FROM todo_items WHERE list_id = ?",
+            (item_id, list_id, text, due_at, remind_at, author, now, now, list_id),
         )
         await self._db.execute(
             "UPDATE todo_lists SET updated_at = ? WHERE id = ?", (now, list_id)
@@ -153,7 +146,9 @@ class TodoStore(BaseStore):
         cur = await self._db.execute(
             "SELECT * FROM todo_items WHERE id = ?", (item_id,)
         )
-        return _row(cur.description, await cur.fetchone())
+        row = _row(cur.description, await cur.fetchone())
+        row["done"] = bool(row["done"])
+        return row
 
     async def list_items(self, list_id: str) -> list[dict]:
         cur = await self._db.execute(

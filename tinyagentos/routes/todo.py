@@ -51,7 +51,11 @@ class ReorderItemsIn(BaseModel):
 # -------------------------------------------------------------------- helpers
 
 def _get_store(request: Request):
-    return request.app.state.todo_store
+    store = getattr(request.app.state, "todo_store", None)
+    if store is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail="todo_store not available")
+    return store
 
 
 def _check_owner(doc: dict, user: CurrentUser):
@@ -145,24 +149,32 @@ async def add_item(
     if body.due_at:
         try:
             dt = datetime.fromisoformat(body.due_at)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            due_at = dt.timestamp()
+: address 9 bot review findings — atomicity, CSRF, timezone, position, done)
         except ValueError:
             return JSONResponse(
                 {"error": f"invalid due_at: {body.due_at!r}"}, status_code=400
             )
+        if dt.tzinfo is None:
+            return JSONResponse(
+                {"error": f"due_at requires timezone offset: {body.due_at!r}"},
+                status_code=400,
+            )
+        due_at = dt.timestamp()
     remind_at = None
     if body.remind_at:
         try:
             dt = datetime.fromisoformat(body.remind_at)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            remind_at = dt.timestamp()
+: address 9 bot review findings — atomicity, CSRF, timezone, position, done)
         except ValueError:
             return JSONResponse(
                 {"error": f"invalid remind_at: {body.remind_at!r}"}, status_code=400
             )
+        if dt.tzinfo is None:
+            return JSONResponse(
+                {"error": f"remind_at requires timezone offset: {body.remind_at!r}"},
+                status_code=400,
+            )
+        remind_at = dt.timestamp()
 
     return await store.add_item(
         list_id, body.text, author=user.user_id, due_at=due_at, remind_at=remind_at
@@ -196,18 +208,24 @@ async def patch_item(
     _CLEAR_SENTINEL = -1.0
 
     def _parse_ts(val):
-        """None = no change, '' = clear, ISO str = set."""
+        """None = no change, '' = clear, ISO str = set.
+
+        Returns None (not sent), _CLEAR_SENTINEL (clear), a float
+        timestamp (valid aware datetime), or None (error — handled below).
+        Rejects naive (offsetless) datetime strings.
+        """
         if val is None:
             return None  # not sent
         if val == "":
             return _CLEAR_SENTINEL
         try:
             dt = datetime.fromisoformat(val)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.timestamp()
+
         except ValueError:
             return None  # Will be handled below
+        if dt.tzinfo is None:
+            return None  # naive — handled below as error
+        return dt.timestamp()
 
     due_at = _parse_ts(body.due_at)
     if due_at is None and body.due_at is not None and body.due_at != "":

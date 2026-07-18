@@ -195,6 +195,39 @@ async def test_migrate_idempotent(shared_store, todo_store):
 
 
 @pytest.mark.asyncio
+async def test_migrate_recovers_from_interruption(shared_store, todo_store):
+    """If migration was interrupted after target creation but before source
+    deletion, a re-run detects the existing matching list and skips duplicate
+    creation while cleaning up the source."""
+    doc, entries = await _setup_list_doc(
+        shared_store, "user-a", "Interrupted",
+        ["Item 1", "Item 2"],
+        done_mask={0},
+    )
+
+    # Simulate a partial migration: the target list already exists
+    # (as if the first run created it but crashed before deleting source).
+    partial = await todo_store.create_list("user-a", "Interrupted")
+    partial_id = partial["id"]
+
+    # Run migration — it should detect the matching list and skip.
+    result = await migrate_list_docs(shared_store, todo_store)
+    assert result["migrated"] == 0  # No new migration
+    assert result["items"] == 0
+    assert len(result["lists"]) == 1
+    assert result["lists"][0]["old_id"] == doc["id"]
+    assert result["lists"][0]["new_id"] == partial_id
+
+    # Source should be cleaned up.
+    assert await shared_store.get_doc(doc["id"]) is None
+
+    # Exactly one list exists — no duplicate.
+    all_lists = await todo_store.list_lists("user-a", include_archived=True)
+    matching = [l for l in all_lists if l["title"] == "Interrupted"]
+    assert len(matching) == 1
+
+
+@pytest.mark.asyncio
 async def test_migrate_preserves_done_and_order(shared_store, todo_store):
     """Done flags and entry order are faithfully migrated."""
     doc, entries = await _setup_list_doc(
