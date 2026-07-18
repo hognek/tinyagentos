@@ -24,6 +24,9 @@ router = APIRouter()
 
 EVENTS_LOG_PATH = Path.home() / ".taos-gh-events.jsonl"
 
+# Installation event actions that we explicitly handle for store management.
+_HANDLED_INSTALLATION_ACTIONS = frozenset({"created", "deleted", "unsuspend"})
+
 
 def _extract_event_data(event_type: str, payload: dict) -> dict | None:
     """Extract the canonical fields from a payload for the given event type.
@@ -76,6 +79,13 @@ def _extract_event_data(event_type: str, payload: dict) -> dict | None:
 async def _handle_installation_event(request: Request, event_type: str, payload: dict) -> None:
     """Auto-register / auto-remove GitHub App installations from webhook events."""
     action = payload.get("action", "")
+    if action not in _HANDLED_INSTALLATION_ACTIONS:
+        logger.debug(
+            "Webhook: unhandled installation action %r — ignored (handled: %s)",
+            action, sorted(_HANDLED_INSTALLATION_ACTIONS),
+        )
+        return
+
     installation = payload.get("installation", {})
     installation_id = installation.get("id")
     if not installation_id:
@@ -108,11 +118,6 @@ async def _handle_installation_event(request: Request, event_type: str, payload:
             account.get("type", ""),
         )
         return
-
-    logger.debug(
-        "Webhook: unhandled installation action %r for id %s — ignored",
-        action, installation_id,
-    )
 
 
 @router.post("/api/webhooks/github")
