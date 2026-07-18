@@ -1,4 +1,4 @@
-import React, { forwardRef, useImperativeHandle, useRef, useEffect } from "react";
+import React, { forwardRef, useImperativeHandle, useRef } from "react";
 import { createPortal } from "react-dom";
 import {
   Hash,
@@ -197,13 +197,6 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
       messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
     },
   }), []);
-
-  // Expose scroll-to-latest via ref — syncs parent's atBottom/newCount state
-  useEffect(() => {
-    if (messages.length > 0) {
-      onScrollToLatest();
-    }
-  }, []); // eslint-disable-line
 
   if (!selectedChannel) {
     return (
