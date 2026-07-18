@@ -905,6 +905,10 @@ async def redeem_invite(request: Request, body: RedeemInviteIn):
             )
         except Exception as exc:  # noqa: BLE001 - surface as JSON error
             await store.rollback_to_pending(body.invite_id)
+            try:
+                await auth_store.set_decision(record['id'], 'refused', decided_by='system:invite-rollback')
+            except Exception:  # noqa: BLE001 - cleanup best-effort
+                pass
             return JSONResponse({"error": str(exc)}, status_code=400)
     else:
         # manual: leave pending so the consent bell fires (handled by
@@ -984,6 +988,10 @@ async def _redeem_os_level(request: Request, body: RedeemInviteIn, invite: dict,
             )
         except Exception as exc:  # noqa: BLE001 - surface as JSON error
             await store.rollback_to_pending(body.invite_id)
+            try:
+                await auth_store.set_decision(record['id'], 'refused', decided_by='system:invite-rollback')
+            except Exception:  # noqa: BLE001 - cleanup best-effort
+                pass
             return JSONResponse({"error": str(exc)}, status_code=400)
     else:
         _notify_pending_invite(request, record)
