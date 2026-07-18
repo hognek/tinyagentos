@@ -104,6 +104,11 @@ class WorkerAgent:
         self.advertise_url = advertise_url
         self._running = False
         self._registered = False
+        # Worker-initiated lifecycle status (taOS #890 C2).  Persisted across
+        # controller restarts so that periodic status-less heartbeats don't
+        # silently revert a draining/updating worker back to "online".
+        self._lifecycle_status: str | None = None
+        self._lifecycle_reason: str | None = None
 
         from tinyagentos.worker.pairing import default_state_dir, load_signing_key
         self._state_dir = state_dir or default_state_dir()
@@ -698,6 +703,8 @@ class WorkerAgent:
         ready.
         """
         logger.info("worker '%s': reporting update available (reason=%s)", self.name, reason)
+        self._lifecycle_status = "update-available"
+        self._lifecycle_reason = reason
         return await self.heartbeat(status="update-available", drain_reason=reason)
 
     async def initiate_self_drain(self, reason: str = "update") -> int:
@@ -711,6 +718,8 @@ class WorkerAgent:
         Returns the HTTP status code from the controller (200 on success).
         """
         logger.info("worker '%s': initiating self-drain (reason=%s)", self.name, reason)
+        self._lifecycle_status = "draining"
+        self._lifecycle_reason = reason
         return await self.heartbeat(status="draining", drain_reason=reason)
 
     async def notify_drain_complete(self) -> int:
@@ -724,6 +733,8 @@ class WorkerAgent:
         Returns the HTTP status code from the controller.
         """
         logger.info("worker '%s': drain complete, ready for update", self.name)
+        self._lifecycle_status = "updating"
+        self._lifecycle_reason = "drain-complete"
         return await self.heartbeat(status="updating")
 
     def _log_repair_instruction(self) -> None:
@@ -780,7 +791,13 @@ class WorkerAgent:
                 await asyncio.sleep(5)
                 continue
 
-            status = await self.heartbeat()
+            # Include any persisted lifecycle status (taOS #890 C2) so that
+            # a controller restart doesn't silently revert a
+            # draining/updating worker back to "online" after re-registration.
+            status = await self.heartbeat(
+                status=self._lifecycle_status,
+                drain_reason=self._lifecycle_reason,
+            )
             if status == 404:
                 # Controller has forgotten about us (restart, manual
                 # deregister, etc). Drop our registered state and the

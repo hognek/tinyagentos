@@ -485,7 +485,7 @@ class TestRunLoopRepairState:
             agent._registered = True
             return True
 
-        async def fake_heartbeat() -> int:
+        async def fake_heartbeat(**kwargs) -> int:
             heartbeat_called.append(1)
             agent._running = False  # stop after first successful heartbeat
             return 200
@@ -517,7 +517,7 @@ class TestRunLoopRepairState:
             if sleep_count >= 2:
                 agent._running = False
 
-        async def fake_heartbeat() -> int:
+        async def fake_heartbeat(**kwargs) -> int:
             nonlocal hb_count
             hb_count += 1
             return 404
@@ -552,7 +552,7 @@ class TestRunLoopRepairState:
         async def fake_sleep(n: float) -> None:
             agent._running = call_count >= 2
 
-        async def fake_heartbeat() -> int:
+        async def fake_heartbeat(**kwargs) -> int:
             nonlocal call_count
             call_count += 1
             return 0

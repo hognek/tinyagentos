@@ -342,7 +342,10 @@ class ClusterManager:
                 pass
         # Fire worker.online notification when a previously-offline worker recovers.
         # heartbeat() is sync, so schedule the async emit as a background task.
-        if self._notifications and prev_status in ("offline", "stale"):
+        # Only fire for workers that are genuinely "online" — a worker recovering
+        # from a controller restart into "draining" or "updating" should NOT
+        # trigger a false "back online" event (taOS #890 C2).
+        if self._notifications and prev_status in ("offline", "stale") and worker.status == "online":
             try:
                 asyncio.get_running_loop().create_task(
                     self._notifications.emit_event(
@@ -783,6 +786,21 @@ class ClusterManager:
                         for lid in offline_lids:
                             self._leases.pop(lid, None)
                             logger.debug("Lease %s released — worker %s went offline", lid, worker.name)
+                    # Cancel any running GPU arbiter tasks for the
+                    # released leases (taOS #890 C2 — cross-cutting wiring).
+                    # This mirrors the cancellation done for stale-drain and
+                    # stale-update workers; the update-available path was
+                    # previously missing it, leaving orphaned arbiter tasks.
+                    if offline_lids and self._gpu_arbiter is not None:
+                        try:
+                            cancelled, already_done = await self._gpu_arbiter.cancel_running_for_leases(set(offline_lids))
+                            logger.info(
+                                "Worker '%s' stale-update-available: arbiter cancelled %d tasks, %d already done",
+                                worker.name, cancelled, already_done)
+                        except Exception:
+                            logger.exception(
+                                "gpu-arbiter: cancel for stale-update-available of '%s' failed",
+                                worker.name)
 
                 # Handle draining workers: auto-complete if no active leases (taOS #890)
                 elif worker.status == "draining":
