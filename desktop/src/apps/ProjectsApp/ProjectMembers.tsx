@@ -3,6 +3,8 @@ import { projectsApi, type Project, type ProjectMember } from "@/lib/projects";
 import { AddAgentDialog } from "./AddAgentDialog";
 import { InviteAgentDialog } from "./InviteAgentDialog";
 import { canvasApi } from "./canvas/canvas-api";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { withCsrf } from "@/lib/csrf";
 
 interface AgentSummary {
   id: string;
@@ -93,6 +95,40 @@ function MemberRow({
 }) {
   const typeLabel = frameworkLabel(framework);
   const isAgent = member.member_kind === "native" || member.member_kind === "clone";
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  // Registry-backed (external) agents can be renamed: member_id is the canonical
+  // id, and display_name is a registry-wide field, so the new name shows here and
+  // anywhere else the agent appears.
+  const canRename = !!isExternal;
+  const [renaming, setRenaming] = useState(false);
+  const [nameDraft, setNameDraft] = useState(label);
+  const [renameError, setRenameError] = useState("");
+
+  async function saveRename() {
+    const next = nameDraft.trim();
+    if (!next || next === label) {
+      setRenaming(false);
+      return;
+    }
+    setRenameError("");
+    const res = await fetch(
+      `/api/agents/registry/${encodeURIComponent(member.member_id)}`,
+      withCsrf({
+        method: "PATCH",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ display_name: next }),
+      }),
+    );
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setRenameError(data?.error || `Rename failed (${res.status})`);
+      return;
+    }
+    setRenaming(false);
+    onRefresh();
+    onChanged();
+  }
   return (
     <li
       className={
@@ -102,28 +138,83 @@ function MemberRow({
       }
     >
       <div className="min-w-0">
-        <div className="truncate text-sm flex items-center gap-1" title={hint || member.member_id}>
-          {emoji && <span aria-hidden>{emoji}</span>}
-          <span>{label}</span>
-          {isExternal && (
-            <span className="ml-1 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/25">
-              external
-            </span>
-          )}
-          {typeLabel && (
-            <span
-              className="ml-1 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-zinc-700/40 text-zinc-300 border border-zinc-600/40"
-              title="Agent type"
+        {renaming ? (
+          <div className="flex items-center gap-1 text-sm">
+            <input
+              type="text"
+              value={nameDraft}
+              autoFocus
+              maxLength={64}
+              aria-label={`New name for ${label}`}
+              onChange={(e) => setNameDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") saveRename();
+                if (e.key === "Escape") {
+                  setRenaming(false);
+                  setNameDraft(label);
+                  setRenameError("");
+                }
+              }}
+              className="bg-zinc-800 rounded px-2 py-0.5 text-sm w-48"
+            />
+            <button
+              type="button"
+              onClick={saveRename}
+              className="text-xs px-2 py-0.5 bg-blue-600 rounded hover:bg-blue-500 text-white"
             >
-              {typeLabel}
-            </span>
-          )}
-          {isLead && (
-            <span className="ml-1 text-xs text-yellow-400 font-medium" aria-label="Lead agent">
-              ★ Lead
-            </span>
-          )}
-        </div>
+              Save
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setRenaming(false);
+                setNameDraft(label);
+                setRenameError("");
+              }}
+              className="text-xs px-2 py-0.5 bg-zinc-800 rounded hover:bg-zinc-700"
+            >
+              Cancel
+            </button>
+          </div>
+        ) : (
+          <div className="truncate text-sm flex items-center gap-1" title={hint || member.member_id}>
+            {emoji && <span aria-hidden>{emoji}</span>}
+            <span>{label}</span>
+            {canRename && (
+              <button
+                type="button"
+                onClick={() => {
+                  setNameDraft(label);
+                  setRenaming(true);
+                }}
+                className="text-[11px] text-zinc-500 hover:text-zinc-300"
+                aria-label={`Rename ${label}`}
+                title="Rename"
+              >
+                ✎
+              </button>
+            )}
+            {isExternal && (
+              <span className="ml-1 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/25">
+                external
+              </span>
+            )}
+            {typeLabel && (
+              <span
+                className="ml-1 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-zinc-700/40 text-zinc-300 border border-zinc-600/40"
+                title="Agent type"
+              >
+                {typeLabel}
+              </span>
+            )}
+            {isLead && (
+              <span className="ml-1 text-xs text-yellow-400 font-medium" aria-label="Lead agent">
+                ★ Lead
+              </span>
+            )}
+          </div>
+        )}
+        {renameError && <div className="text-xs text-red-400">{renameError}</div>}
         {member.member_kind === "clone" && (
           <div className="text-xs text-zinc-500">clone · {member.memory_seed}</div>
         )}
@@ -167,17 +258,27 @@ function MemberRow({
         )}
         <button
           type="button"
-          onClick={async () => {
-            await projectsApi.members.remove(projectId, member.member_id);
-            onRefresh();
-            onChanged();
-          }}
+          onClick={() => setConfirmRemove(true)}
           className="text-xs text-red-400 hover:underline"
           aria-label={`Remove ${label}`}
         >
           Remove
         </button>
       </div>
+      <ConfirmDialog
+        open={confirmRemove}
+        title="Remove member"
+        message={`Remove ${label} from this project? Their project access is revoked. This does not delete the agent's identity.`}
+        confirmLabel="Remove"
+        danger
+        onCancel={() => setConfirmRemove(false)}
+        onConfirm={async () => {
+          setConfirmRemove(false);
+          await projectsApi.members.remove(projectId, member.member_id);
+          onRefresh();
+          onChanged();
+        }}
+      />
     </li>
   );
 }
