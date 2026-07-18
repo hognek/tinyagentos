@@ -119,7 +119,7 @@ def _is_agent_decisions_path(method: str, path: str) -> bool:
 # wrapping a WS upgrade can cause connection-level issues in some Starlette
 # versions, so /ws/ remains exempt at the middleware layer; the per-endpoint
 # check is the authoritative guard for all WebSocket endpoints.
-EXEMPT_PREFIXES = ("/static/", "/desktop/", "/chat-pwa/", "/ws/", "/shortcut/")
+EXEMPT_PREFIXES = ("/static/", "/desktop/", "/chat-pwa/", "/ws/", "/shortcut/", "/api/peer/")
 
 # Consent-loop status-poll paths are unauthenticated (the opaque request_id is
 # the capability), but the sub-action paths (/approve, /deny) require admin
