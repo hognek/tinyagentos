@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json
+import os
 import time
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -11,10 +13,55 @@ from httpx import ASGITransport, AsyncClient
 from tinyagentos.contacts_store import ContactsStore, generate_peer_token, _hash_token
 from tinyagentos.peer import (
     build_envelope,
+    resolve_local_identity_id,
     verify_envelope,
     verify_envelope_signature,
     mint_peer_token,
 )
+
+# Local hub username used in route integration tests.
+_TEST_HUB_USERNAME = "testnode"
+
+
+# ---------------------------------------------------------------------------
+# Helper — bootstrap a hub identity in the given data dir so
+# ``resolve_local_identity_id()`` returns ``"hub:<username>"``.
+# ---------------------------------------------------------------------------
+
+def _ensure_hub_identity(data_dir: Path, username: str = _TEST_HUB_USERNAME) -> str:
+    """Create a hub identity keystore + author row and return the local id."""
+    import sqlite3
+
+    from tinyagentos.hub import identity as _hub_identity
+
+    hub_dir = data_dir / "hub"
+    hub_dir.mkdir(parents=True, exist_ok=True)
+
+    # Clear any stale identity so we get a fresh fingerprint.
+    _hub_identity.clear()
+    ident = _hub_identity.load_or_create()
+    fp = _hub_identity.signing_fingerprint()
+
+    # Register the local author in hub.db
+    hub_db = hub_dir / "hub.db"
+    conn = sqlite3.connect(str(hub_db))
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS hub_authors (
+            fingerprint TEXT PRIMARY KEY,
+            username TEXT,
+            signing_pubkey TEXT,
+            encryption_pubkey TEXT,
+            updated_at REAL
+        )"""
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO hub_authors (fingerprint, username, signing_pubkey, encryption_pubkey, updated_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (fp, username, ident["signing_public"], ident["encryption_public"], time.time()),
+    )
+    conn.commit()
+    conn.close()
+    return f"hub:{username}"
 
 
 # ---------------------------------------------------------------------------
@@ -280,68 +327,96 @@ class TestPeerEnvelope:
         assert not ok
         assert "too old" in err
 
-    def test_verify_envelope_signature_roundtrip(self):
+    def test_verify_envelope_nan_ts_rejected(self):
+        """NaN timestamp must be rejected (bypass fix)."""
+        env = build_envelope(
+            from_username="jaylfc",
+            to_username="hogne",
+            kind="handshake",
+        )
+        env["ts"] = float("nan")
+        ok, err = verify_envelope(env)
+        assert not ok
+        assert "non-finite" in err
+
+    def test_verify_envelope_future_ts_rejected(self):
+        """Timestamp more than 30s in the future must be rejected."""
+        env = build_envelope(
+            from_username="jaylfc",
+            to_username="hogne",
+            kind="handshake",
+        )
+        env["ts"] = time.time() + 60  # 60s in the future
+        ok, err = verify_envelope(env)
+        assert not ok
+        assert "future" in err
+
+    def test_verify_envelope_signature_roundtrip(self, monkeypatch, tmp_path):
         """Verify that a locally-built envelope's signature passes verification."""
         from tinyagentos.hub.identity import load_or_create, clear as _clear, public_identity
 
-        # Generate a fresh identity for this test
+        # Isolate identity to a temp dir so the real node identity is untouched.
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         _clear()
-        identity = load_or_create()
-        pub = public_identity()
-        signing_pub = pub["signing_pubkey"]
+        try:
+            identity = load_or_create()
+            pub = public_identity()
+            signing_pub = pub["signing_pubkey"]
 
-        env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
-            kind="handshake",
-            body={"hello": "world"},
-        )
+            env = build_envelope(
+                from_username="jaylfc",
+                to_username="hogne",
+                kind="handshake",
+                body={"hello": "world"},
+            )
 
-        # Remove sig to re-verify
-        assert verify_envelope_signature(env, signing_pub), "own signature must verify"
+            assert verify_envelope_signature(env, signing_pub), "own signature must verify"
+        finally:
+            _clear()
 
-        # Clean up
-        _clear()
-
-    def test_verify_envelope_bad_signature(self):
+    def test_verify_envelope_bad_signature(self, monkeypatch, tmp_path):
         """Tempered envelope fails signature verification."""
         from tinyagentos.hub.identity import load_or_create, clear as _clear, public_identity
 
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         _clear()
-        identity = load_or_create()
-        pub = public_identity()
-        signing_pub = pub["signing_pubkey"]
+        try:
+            identity = load_or_create()
+            pub = public_identity()
+            signing_pub = pub["signing_pubkey"]
 
-        env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
-            kind="handshake",
-        )
-        # Tamper with the payload
-        env["kind"] = "evil"
-        assert not verify_envelope_signature(env, signing_pub)
+            env = build_envelope(
+                from_username="jaylfc",
+                to_username="hogne",
+                kind="handshake",
+            )
+            # Tamper with the payload
+            env["kind"] = "evil"
+            assert not verify_envelope_signature(env, signing_pub)
+        finally:
+            _clear()
 
-        _clear()
-
-    def test_verify_envelope_signature_restores_dict(self):
+    def test_verify_envelope_signature_restores_dict(self, monkeypatch, tmp_path):
         """verify_envelope_signature restores the 'sig' field after popping it."""
         from tinyagentos.hub.identity import load_or_create, clear as _clear, public_identity
 
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         _clear()
-        identity = load_or_create()
-        pub = public_identity()
-        signing_pub = pub["signing_pubkey"]
+        try:
+            identity = load_or_create()
+            pub = public_identity()
+            signing_pub = pub["signing_pubkey"]
 
-        env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
-            kind="handshake",
-        )
-        original_sig = env["sig"]
-        verify_envelope_signature(env, signing_pub)
-        assert env["sig"] == original_sig  # restored
-
-        _clear()
+            env = build_envelope(
+                from_username="jaylfc",
+                to_username="hogne",
+                kind="handshake",
+            )
+            original_sig = env["sig"]
+            verify_envelope_signature(env, signing_pub)
+            assert env["sig"] == original_sig  # restored
+        finally:
+            _clear()
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +454,7 @@ class TestPeerTokens:
 
 @pytest_asyncio.fixture
 async def app_with_contacts(tmp_data_dir):
-    """Create an app and initialise the contacts store."""
+    """Create an app, initialise contacts_store, and bootstrap a local hub identity."""
     from tinyagentos.app import create_app
 
     _app = create_app(data_dir=tmp_data_dir)
@@ -389,6 +464,11 @@ async def app_with_contacts(tmp_data_dir):
     if store._db is not None:
         await store.close()
     await store.init()
+
+    # Bootstrap a hub identity so resolve_local_identity_id() works in tests.
+    # Must set TAOS_DATA_DIR so hub.identity module resolves to tmp_data_dir.
+    os.environ["TAOS_DATA_DIR"] = str(tmp_data_dir)
+    _ensure_hub_identity(tmp_data_dir)
 
     return _app
 
@@ -448,7 +528,7 @@ class TestPeerRoutes:
         headers = {"Authorization": f"Bearer {inbound}"}
 
         # The route returns 400 for invalid envelopes but 429 if rate-limited.
-        # Send 61 requests — the 61st should be 429.
+        # Send 65 requests — some should be 429.
         statuses = []
         for _ in range(65):
             resp = await client_with_contacts.post(
@@ -482,10 +562,37 @@ class TestPeerRoutes:
         )
         assert resp.status_code == 413
 
-    async def test_inbox_wrong_to_field(self, client_with_contacts, app_with_contacts):
-        """Envelope addressed to a different contact must be rejected."""
-        from tinyagentos.peer import build_envelope
+    async def test_inbox_spoofed_from_rejected(self, client_with_contacts, app_with_contacts):
+        """An envelope whose 'from' doesn't match the authenticated contact must 403."""
+        local_id = resolve_local_identity_id()
 
+        store = app_with_contacts.state.contacts_store
+        await store.add_contact(
+            contact_id="hub:spoofer", hub_username="spoofer", display_name="S",
+            ed25519_pub="pk", x25519_pub="ek",
+        )
+        inbound = generate_peer_token()
+        await store.establish_peer_link(
+            contact_id="hub:spoofer",
+            inbound_token=inbound,
+            outbound_token=generate_peer_token(),
+        )
+
+        # Envelope claims to be from "jaylfc" but auth token is for "spoofer"
+        env = build_envelope(
+            from_username="jaylfc",  # impersonation!
+            to_username=_TEST_HUB_USERNAME,
+            kind="handshake",
+        )
+        resp = await client_with_contacts.post(
+            "/api/peer/inbox",
+            json={"envelope": env},
+            headers={"Authorization": f"Bearer {inbound}"},
+        )
+        assert resp.status_code == 403, f"expected 403, got {resp.status_code}: {resp.text}"
+
+    async def test_inbox_wrong_to_field(self, client_with_contacts, app_with_contacts):
+        """Envelope addressed to a different identity must be rejected."""
         store = app_with_contacts.state.contacts_store
         await store.add_contact(
             contact_id="hub:wrong-to", hub_username="wrong-to", display_name="W",
@@ -498,8 +605,9 @@ class TestPeerRoutes:
             outbound_token=generate_peer_token(),
         )
 
+        # Envelope addressed to a different hub identity, from the authenticated contact.
         env = build_envelope(
-            from_username="jaylfc",
+            from_username="wrong-to",
             to_username="someone-else",  # wrong recipient
             kind="handshake",
         )
@@ -512,12 +620,21 @@ class TestPeerRoutes:
 
     async def test_inbox_nonce_replay(self, client_with_contacts, app_with_contacts):
         """Replaying an envelope with the same nonce must return 409."""
-        from tinyagentos.peer import build_envelope
+        local_id = resolve_local_identity_id()
+
+        # Use the local hub identity signing pubkey as the contact's pinned
+        # key so that signature verification passes.  In production the
+        # contact is a different node with its own key, but for an
+        # integration test we need the key to match whoever signed the
+        # envelope (which is always the local identity in unit tests since
+        # build_envelope calls hub.identity.sign).
+        from tinyagentos.hub.identity import public_identity as _hub_pub
+        signing_pub = _hub_pub()["signing_pubkey"]
 
         store = app_with_contacts.state.contacts_store
         await store.add_contact(
             contact_id="hub:nonce-test", hub_username="nonce-test", display_name="N",
-            ed25519_pub="pk", x25519_pub="ek",
+            ed25519_pub=signing_pub, x25519_pub="ek",
         )
         inbound = generate_peer_token()
         await store.establish_peer_link(
@@ -526,22 +643,22 @@ class TestPeerRoutes:
             outbound_token=generate_peer_token(),
         )
 
+        # Envelope from the authenticated contact to the local node.
         env = build_envelope(
-            from_username="jaylfc",
-            to_username="nonce-test",
+            from_username="nonce-test",
+            to_username=_TEST_HUB_USERNAME,
             kind="handshake",
         )
 
         headers = {"Authorization": f"Bearer {inbound}"}
 
-        # First delivery — should succeed (200 or 400 depending on sig check;
-        # the key point is it's not 409).
+        # First delivery — should succeed (200).
         resp1 = await client_with_contacts.post(
             "/api/peer/inbox",
             json={"envelope": env},
             headers=headers,
         )
-        assert resp1.status_code != 409, f"first send should not be replay: {resp1.status_code}"
+        assert resp1.status_code == 200, f"first send should be 200, got {resp1.status_code}: {resp1.text}"
 
         # Replay the same envelope — must be 409 Conflict.
         resp2 = await client_with_contacts.post(

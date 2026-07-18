@@ -20,6 +20,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
 from tinyagentos.peer import (
+    resolve_local_identity_id,
     verify_envelope,
     verify_envelope_signature,
 )
@@ -27,6 +28,9 @@ from tinyagentos.peer import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/peer", tags=["peer"])
+# IMPORTANT: every route under this prefix MUST call _authenticate_peer.
+# Do not add a route here without bearer-auth — this is an instance-to-instance
+# surface facing other nodes, not an end-user API.
 
 # Rate limits per spec section 8: 60 req/min/contact, 32KB envelope cap.
 _RATE_WINDOW_SECS = 60.0
@@ -100,9 +104,8 @@ async def _authenticate_peer(request: Request) -> str:
     Raises 401 if the token is missing, invalid, or the contact is not active.
 
     The peer token is stored hashed in peer_links.inbound_token_hash.  We
-    look up the contact by iterating active contacts and comparing token
-    hashes — this is O(n) but n is small (contacts are human-scale, not
-    agent-scale) and avoids adding an index table.
+    look up the contact via an indexed hash lookup on the inbound_token_hash
+    column (JOIN with contacts), so lookup is O(1) regardless of contact count.
     """
     store = request.app.state.contacts_store
     if store is None:
@@ -144,7 +147,18 @@ async def peer_inbox(body: PeerEnvelope, request: Request):
     if not _rate_limit_ok(contact_id):
         raise HTTPException(status_code=429, detail="rate limit exceeded (60/min/contact)")
 
-    # Size limit
+    # Size limit — reject on Content-Length before we re-serialise.
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            cl_int = int(cl)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid Content-Length")
+        if cl_int > _MAX_ENVELOPE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"request too large: {cl_int} bytes > {_MAX_ENVELOPE_BYTES}",
+            )
     raw = json.dumps(body.envelope, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if len(raw) > _MAX_ENVELOPE_BYTES:
         raise HTTPException(
@@ -154,25 +168,29 @@ async def peer_inbox(body: PeerEnvelope, request: Request):
 
     envelope = body.envelope
 
+    # Verify sender binding: envelope["from"] must match the authenticated contact.
+    from_field = envelope.get("from", "")
+    if from_field != contact_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"from field {from_field!r} does not match authenticated contact {contact_id!r}",
+        )
+
+    # Verify recipient: envelope["to"] must match the local hub identity.
+    local_id = resolve_local_identity_id(request.app.state.data_dir)
+    if local_id is None:
+        raise HTTPException(status_code=503, detail="hub identity not configured")
+    to_field = envelope.get("to", "")
+    if to_field != local_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"envelope addressed to {to_field!r}, not {local_id!r}",
+        )
+
     # Verify structure + freshness
     ok, err = verify_envelope(envelope)
     if not ok:
         raise HTTPException(status_code=400, detail=f"invalid envelope: {err}")
-
-    # Nonce replay protection — each envelope must have a unique nonce.
-    nonce = envelope.get("nonce", "")
-    if not nonce:
-        raise HTTPException(status_code=400, detail="missing nonce")
-    if not await store.record_nonce(nonce, contact_id):
-        raise HTTPException(status_code=409, detail="nonce replay detected")
-
-    # Verify the "to" field matches this contact's id
-    to_field = envelope.get("to", "")
-    if to_field != contact_id:
-        raise HTTPException(
-            status_code=403,
-            detail=f"envelope addressed to {to_field}, not {contact_id}",
-        )
 
     # Verify signature against pinned pubkey
     contact_rec = await store.get_contact(contact_id)
@@ -182,6 +200,15 @@ async def peer_inbox(body: PeerEnvelope, request: Request):
     sender_pubkey = contact_rec.get("ed25519_pub", "")
     if not verify_envelope_signature(envelope, sender_pubkey):
         raise HTTPException(status_code=403, detail="invalid signature")
+
+    # Nonce replay protection — record only AFTER all verification passes so
+    # a rejected envelope (bad sig, bad recipient) does not burn its nonce.
+    nonce = envelope.get("nonce", "")
+    if not nonce:
+        raise HTTPException(status_code=400, detail="missing nonce")
+    kind = envelope.get("kind", "")
+    if not await store.record_nonce(nonce, contact_id, kind):
+        raise HTTPException(status_code=409, detail="nonce replay detected")
 
     # Mark peer as seen
     await store.mark_peer_seen(contact_id)
@@ -211,6 +238,18 @@ async def peer_chat(body: PeerEnvelope, request: Request):
     if not _rate_limit_ok(contact_id):
         raise HTTPException(status_code=429, detail="rate limit exceeded")
 
+    # Size limit — reject on Content-Length before we re-serialise.
+    cl = request.headers.get("content-length")
+    if cl is not None:
+        try:
+            cl_int = int(cl)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="invalid Content-Length")
+        if cl_int > _MAX_ENVELOPE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"request too large: {cl_int} bytes > {_MAX_ENVELOPE_BYTES}",
+            )
     raw = json.dumps(body.envelope, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     if len(raw) > _MAX_ENVELOPE_BYTES:
         raise HTTPException(
@@ -222,23 +261,28 @@ async def peer_chat(body: PeerEnvelope, request: Request):
     if envelope.get("kind") != "chat":
         raise HTTPException(status_code=400, detail="kind must be 'chat'")
 
+    # Verify sender binding: envelope["from"] must match the authenticated contact.
+    from_field = envelope.get("from", "")
+    if from_field != contact_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"from field {from_field!r} does not match authenticated contact {contact_id!r}",
+        )
+
+    # Verify recipient: envelope["to"] must match the local hub identity.
+    local_id = resolve_local_identity_id(request.app.state.data_dir)
+    if local_id is None:
+        raise HTTPException(status_code=503, detail="hub identity not configured")
+    to_field = envelope.get("to", "")
+    if to_field != local_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"envelope addressed to {to_field!r}, not {local_id!r}",
+        )
+
     ok, err = verify_envelope(envelope, expected_kind="chat")
     if not ok:
         raise HTTPException(status_code=400, detail=f"invalid envelope: {err}")
-
-    # Nonce replay protection
-    nonce = envelope.get("nonce", "")
-    if not nonce:
-        raise HTTPException(status_code=400, detail="missing nonce")
-    if not await store.record_nonce(nonce, contact_id):
-        raise HTTPException(status_code=409, detail="nonce replay detected")
-
-    to_field = envelope.get("to", "")
-    if to_field != contact_id:
-        raise HTTPException(
-            status_code=403,
-            detail=f"envelope addressed to {to_field}, not {contact_id}",
-        )
 
     contact_rec = await store.get_contact(contact_id)
     if contact_rec is None:
@@ -246,6 +290,14 @@ async def peer_chat(body: PeerEnvelope, request: Request):
 
     if not verify_envelope_signature(envelope, contact_rec.get("ed25519_pub", "")):
         raise HTTPException(status_code=403, detail="invalid signature")
+
+    # Nonce replay protection — record only AFTER all verification passes.
+    nonce = envelope.get("nonce", "")
+    if not nonce:
+        raise HTTPException(status_code=400, detail="missing nonce")
+    kind = envelope.get("kind", "")
+    if not await store.record_nonce(nonce, contact_id, kind):
+        raise HTTPException(status_code=409, detail="nonce replay detected")
 
     await store.mark_peer_seen(contact_id)
 
