@@ -216,39 +216,47 @@ async def chat_ws(websocket: WebSocket):
 
             elif msg_type == "edit":
                 msg_store = websocket.app.state.chat_messages
-                msg = await msg_store.get_message(data["message_id"])
+                edit_msg_id = data.get("message_id")
+                edit_content = data.get("content")
+                if not edit_msg_id or not isinstance(edit_content, str):
+                    continue
+                msg = await msg_store.get_message(edit_msg_id)
                 if msg is None or msg.get("deleted_at"):
                     continue
                 if msg["author_id"] != user_id:
                     continue
-                await msg_store.edit_message(data["message_id"], data["content"])
-                msg = await msg_store.get_message(data["message_id"])
+                await msg_store.edit_message(edit_msg_id, edit_content)
+                msg = await msg_store.get_message(edit_msg_id)
                 if msg:
                     await hub.broadcast(msg["channel_id"], {
                         "type": "message_edit",
                         "seq": hub.next_seq(),
-                        "message_id": data["message_id"],
-                        "content": data["content"],
+                        "message_id": edit_msg_id,
+                        "content": edit_content,
                         "edited_at": msg["edited_at"],
                     })
-                    # Truncate subsequent messages in this channel so the
-                    # agent branch is rewritten.
-                    truncated_ids = await msg_store.soft_delete_messages_after(
-                        msg["channel_id"], msg["created_at"],
-                    )
-                    for tid in truncated_ids:
-                        await hub.broadcast(msg["channel_id"], {
-                            "type": "message_delete",
-                            "seq": hub.next_seq(),
-                            "message_id": tid,
-                            "channel_id": msg["channel_id"],
-                        })
+                    # Truncate subsequent messages in this DM channel and
+                    # thread so the agent branch is rewritten.  Only DM
+                    # channels are truncated — editing in a multi-human group
+                    # must not delete other people's messages.
+                    ch_store = websocket.app.state.chat_channels
+                    channel = await ch_store.get_channel(msg["channel_id"])
+                    if channel is not None and channel.get("type") == "dm":
+                        truncated_ids = await msg_store.soft_delete_messages_after(
+                            msg["channel_id"], msg["created_at"],
+                            thread_id=msg.get("thread_id"),
+                        )
+                        for tid in truncated_ids:
+                            await hub.broadcast(msg["channel_id"], {
+                                "type": "message_delete",
+                                "seq": hub.next_seq(),
+                                "message_id": tid,
+                                "channel_id": msg["channel_id"],
+                            })
                     # Re-trigger the agent.
                     router_svc = getattr(
                         websocket.app.state, "agent_chat_router", None,
                     )
-                    ch_store = websocket.app.state.chat_channels
-                    channel = await ch_store.get_channel(msg["channel_id"])
                     if router_svc is not None and channel is not None:
                         router_svc.dispatch(msg, channel)
 
@@ -591,10 +599,17 @@ async def edit_message_endpoint(message_id: str, request: Request):
         return JSONResponse({"error": "not the author"}, status_code=403)
     await msg_store.edit_message(message_id, body["content"])
     # Truncate: soft-delete every message created after this one in the same
-    # channel so the agent sees the corrected branch on its next turn.
-    truncated_ids = await msg_store.soft_delete_messages_after(
-        msg["channel_id"], msg["created_at"],
-    )
+    # DM channel and thread so the agent sees the corrected branch on its
+    # next turn.  Only DM channels are truncated — in a multi-human group,
+    # editing should not delete other people's messages.
+    truncated_ids: list[str] = []
+    ch_store = request.app.state.chat_channels
+    channel = await ch_store.get_channel(msg["channel_id"])
+    if channel is not None and channel.get("type") == "dm":
+        truncated_ids = await msg_store.soft_delete_messages_after(
+            msg["channel_id"], msg["created_at"],
+            thread_id=msg.get("thread_id"),
+        )
     updated = await msg_store.get_message(message_id)
     hub = request.app.state.chat_hub
     seq = hub.next_seq()
@@ -612,8 +627,6 @@ async def edit_message_endpoint(message_id: str, request: Request):
         })
     # Re-trigger the agent with the updated conversation branch.
     router_svc = getattr(request.app.state, "agent_chat_router", None)
-    ch_store = request.app.state.chat_channels
-    channel = await ch_store.get_channel(msg["channel_id"])
     if router_svc is not None and channel is not None:
         router_svc.dispatch(updated, channel)
     return JSONResponse(updated)

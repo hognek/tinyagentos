@@ -180,13 +180,14 @@ async def test_delete_idempotent(tmp_path):
 
 @pytest.mark.asyncio
 async def test_edit_truncates_subsequent_messages(tmp_path):
-    """Editing a user message soft-deletes every message created after it
-    in the same channel, and broadcasts delete events for each."""
+    """Editing a user message in a DM channel soft-deletes every message
+    created after it in the same channel and thread, and broadcasts delete
+    events for each."""
     app, client, rec = await _authed_client(tmp_path)
     async with client:
         ch_r = await client.post(
             "/api/chat/channels",
-            json={"name": "g", "type": "group", "description": "", "topic": "",
+            json={"name": "dm-chat", "type": "dm", "description": "", "topic": "",
                   "members": ["user", "tom"], "created_by": "user"},
         )
         ch_id = ch_r.json()["id"]
@@ -257,21 +258,22 @@ async def test_soft_delete_messages_after_empty_when_nothing_after(tmp_path):
 
 @pytest.mark.asyncio
 async def test_edit_only_truncates_own_channel(tmp_path):
-    """Editing a message in channel A must not affect messages in channel B."""
+    """Editing a message in DM channel A must not affect messages in
+    DM channel B."""
     app, client, rec = await _authed_client(tmp_path)
     async with client:
         # Channel A
         ch_a = await client.post(
             "/api/chat/channels",
-            json={"name": "a", "type": "group", "description": "", "topic": "",
-                  "members": ["user"], "created_by": "user"},
+            json={"name": "dm-a", "type": "dm", "description": "", "topic": "",
+                  "members": ["user", "alice"], "created_by": "user"},
         )
         a_id = ch_a.json()["id"]
         # Channel B
         ch_b = await client.post(
             "/api/chat/channels",
-            json={"name": "b", "type": "group", "description": "", "topic": "",
-                  "members": ["user"], "created_by": "user"},
+            json={"name": "dm-b", "type": "dm", "description": "", "topic": "",
+                  "members": ["user", "bob"], "created_by": "user"},
         )
         b_id = ch_b.json()["id"]
 
@@ -280,11 +282,12 @@ async def test_edit_only_truncates_own_channel(tmp_path):
             json={"channel_id": a_id, "author_id": rec["id"], "author_type": "user",
                   "content": "a1", "content_type": "text"},
         )
-        await client.post(
+        a2_r = await client.post(
             "/api/chat/messages",
             json={"channel_id": a_id, "author_id": rec["id"], "author_type": "user",
                   "content": "a2", "content_type": "text"},
         )
+        a2_id = a2_r.json()["id"]
         m_b = await client.post(
             "/api/chat/messages",
             json={"channel_id": b_id, "author_id": rec["id"], "author_type": "user",
@@ -296,6 +299,10 @@ async def test_edit_only_truncates_own_channel(tmp_path):
             f"/api/chat/messages/{m_a.json()['id']}", json={"content": "a1-edited"},
         )
         assert r.status_code == 200
+
+        # a2 should be soft-deleted (it came after a1 in the same DM)
+        got_a2 = await app.state.chat_messages.get_message(a2_id)
+        assert got_a2["deleted_at"] is not None
 
         # b1 should still be intact
         got_b = await app.state.chat_messages.get_message(m_b.json()["id"])

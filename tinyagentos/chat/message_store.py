@@ -201,17 +201,31 @@ class ChatMessageStore(BaseStore):
 
     async def soft_delete_messages_after(
         self, channel_id: str, after_timestamp: float,
+        thread_id: str | None = None,
     ) -> list[str]:
         """Soft-delete all non-deleted messages in *channel_id* whose
         ``created_at`` is strictly greater than *after_timestamp*.
+        When *thread_id* is given, only messages within that thread are
+        deleted; when it is ``None``, only main-timeline messages (those
+        with ``thread_id IS NULL``) are deleted.
         Returns the list of affected message ids so callers can broadcast
         per-message delete events."""
         now = time.time()
+        if thread_id is not None:
+            thread_clause = "AND thread_id = ?"
+            params = (now, channel_id, after_timestamp, thread_id)
+        else:
+            thread_clause = "AND thread_id IS NULL"
+            params = (now, channel_id, after_timestamp)
+        # NOTE: strict > means a message sharing the edited message's exact
+        # time.time() survives — at most one stale adjacent message can
+        # slip through a timestamp tie.
         cursor = await self._db.execute(
-            """UPDATE chat_messages SET deleted_at = ?
+            f"""UPDATE chat_messages SET deleted_at = ?
                WHERE channel_id = ? AND created_at > ? AND deleted_at IS NULL
+               {thread_clause}
                RETURNING id""",
-            (now, channel_id, after_timestamp),
+            params,
         )
         rows = await cursor.fetchall()
         await self._db.commit()
