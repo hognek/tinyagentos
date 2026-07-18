@@ -119,8 +119,10 @@ class UserSharesStore(BaseStore):
         Idempotent re-share: calling add_share again with the same
         (owner_user_id, resource_type, resource_id, shared_with_user_id,
         permission) tuple replaces the existing share rather than creating
-        a duplicate.  The delete+insert+select runs under the write lock
-        for atomicity.
+        a duplicate.  The prior row's ``status`` is preserved (e.g. an
+        already-accepted share stays accepted), so re-sharing merely to
+        "ensure the share exists" does not silently revoke consent.
+        The delete+insert+select runs under the write lock for atomicity.
         """
         if self._db is None:
             raise RuntimeError("UserSharesStore not initialised — call init() first")
@@ -128,6 +130,21 @@ class UserSharesStore(BaseStore):
         expires_at = self._normalise_expiry(expires_at)
         now = datetime.now(timezone.utc).isoformat()
         async with self._write_lock:
+            # Fetch the prior status before deleting, so an already-accepted
+            # share is not silently downgraded to 'pending' when the owner
+            # calls add_share again to "ensure the share exists".
+            prior = await (
+                await self._db.execute(
+                    "SELECT status FROM user_shares "
+                    "WHERE owner_user_id = ? AND resource_type = ? "
+                    "AND resource_id = ? AND shared_with_user_id = ? "
+                    "AND permission = ?",
+                    (owner_user_id, resource_type, resource_id,
+                     shared_with_user_id, permission),
+                )
+            ).fetchone()
+            prior_status = prior["status"] if prior else "pending"
+
             # Remove any existing row for the exact key first.
             await self._db.execute(
                 "DELETE FROM user_shares "
@@ -144,7 +161,7 @@ class UserSharesStore(BaseStore):
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (owner_user_id, resource_type, resource_id,
-                 shared_with_user_id, permission, tier, now, expires_at, 'pending'),
+                 shared_with_user_id, permission, tier, now, expires_at, prior_status),
             )
             await self._db.commit()
             row = await (

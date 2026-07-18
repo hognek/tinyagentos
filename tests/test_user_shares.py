@@ -142,6 +142,45 @@ class TestShareRoutes:
         ]
         assert len(matching) == 1
 
+    async def test_re_share_preserves_accepted_status(
+        self, shares_client, shares_client_target
+    ):
+        """Re-sharing an already-accepted share does not downgrade it to 'pending'."""
+        body = {
+            "resource_type": "project",
+            "resource_id": "proj-reshare-accepted",
+            "to_username": "target",
+            "permission": "read",
+        }
+
+        # 1. Owner creates share → status='pending'.
+        r1 = await shares_client.post("/api/shares", json=body)
+        assert r1.status_code == 200
+        share_id = r1.json()["id"]
+        assert r1.json()["status"] == "pending"
+
+        # 2. Target user accepts → status='accepted'.
+        r_accept = await shares_client_target.post(f"/api/shares/{share_id}/accept")
+        assert r_accept.status_code == 200
+        assert r_accept.json()["status"] == "accepted"
+
+        # 3. Owner re-shares (idempotent "ensure it exists").
+        r2 = await shares_client.post("/api/shares", json=body)
+        assert r2.status_code == 200
+        assert r2.json()["status"] == "accepted", (
+            "Re-sharing an accepted share must preserve 'accepted' status, "
+            "not downgrade to 'pending'"
+        )
+
+        # 4. user_can_access still returns True.
+        store = shares_client._transport.app.state.user_shares
+        can = await store.user_can_access(
+            "project", "proj-reshare-accepted", shares_client._target_uid
+        )
+        assert can is True, (
+            "user_can_access must return True after re-share of an accepted share"
+        )
+
     async def test_create_share_unknown_user_returns_404(self, shares_client):
         """Sharing with a non-existent username returns 404."""
         resp = await shares_client.post(
