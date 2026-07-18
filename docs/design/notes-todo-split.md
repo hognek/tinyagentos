@@ -179,7 +179,8 @@ class ReorderEntry(BaseModel):
 **Timestamp conversion:** `due_at` and `remind_at` arrive as ISO-8601
 strings (e.g. `"2026-07-18T14:00:00Z"`) from the API. The route handler
 converts them to SQLite REAL (Unix epoch seconds) via
-`datetime.fromisoformat()` before passing to the store. The store writes
+`datetime.fromisoformat()` (Python ≥ 3.11, which this project requires,
+handles the `Z` suffix natively as UTC). The store writes
 the float timestamp directly into the `REAL` column, matching the existing
 `created_at`/`updated_at` convention used throughout the codebase. On read,
 the store returns the float; the route serializes it back to ISO-8601 for
