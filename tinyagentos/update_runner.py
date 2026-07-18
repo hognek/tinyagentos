@@ -151,6 +151,7 @@ async def update_to_master(
         )
         if rc_reset != 0:
             result.ok = False
+            result.recovery_tag = recovery_tag
             result.message = (
                 f"Merge failed (diverged) and recovery hard-reset also failed. "
                 f"Local state preserved under tag '{recovery_tag}'. "

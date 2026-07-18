@@ -147,7 +147,13 @@ def _parse_fingerprint(output: str) -> Optional[str]:
                 # look like a 40-char hex fingerprint.
                 if len(parts) >= 12 and len(parts[-1]) == 40 and _FINGERPRINT_RE.match(parts[-1]):
                     return parts[-1]
-                # Otherwise the signing key IS the primary key.
+                # Only fall through to parts[2] when we're confident it IS the
+                # primary key (11 fields — primary key signs directly).  If we
+                # have 12+ fields but the last field didn't validate as a
+                # fingerprint, something unexpected happened; return None rather
+                # than guessing.
+                if len(parts) >= 12:
+                    return None
                 return parts[2]
     return None
 
@@ -195,7 +201,12 @@ def _parse_key_id(output: str) -> Optional[str]:
                 # derive the key ID from it for consistency with _parse_fingerprint.
                 if len(parts) >= 12 and len(parts[-1]) >= 16:
                     return parts[-1][-16:].upper()
-                # Otherwise the signing key is the primary key.
+                # Only fall through to parts[2] when we're confident it IS the
+                # primary key (11 fields — primary key signs directly).  If we
+                # have 12+ fields but the last field doesn't look like a key
+                # ID, something unexpected happened; return None.
+                if len(parts) >= 12:
+                    return None
                 signing_fpr = parts[2]
                 if len(signing_fpr) >= 16:
                     return signing_fpr[-16:].upper()
