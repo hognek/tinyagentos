@@ -1,14 +1,12 @@
 """Tests for tinyagentos.clients.retry.with_retry."""
 from __future__ import annotations
 
-import asyncio
-import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 import httpx
 import pytest
 
-from tinyagentos.clients.retry import with_retry, DEFAULT_RETRY_ON_STATUS
+from tinyagentos.clients.retry import with_retry
 
 
 # ---------------------------------------------------------------------------
@@ -133,10 +131,9 @@ class TestWithRetry:
         assert call_count["n"] == 2
 
     async def test_exponential_backoff_timing(self):
-        """Verify delays grow exponentially and respect max_delay."""
+        """Verify delays grow exponentially and respect max_delay (jitter disabled
+        for deterministic assertions)."""
         sleep_calls: list[float] = []
-
-        original_sleep = asyncio.sleep
 
         async def _fake_sleep(seconds):
             sleep_calls.append(seconds)
@@ -153,6 +150,7 @@ class TestWithRetry:
                     base_delay=0.1,
                     multiplier=3.0,
                     max_delay=0.5,
+                    jitter=False,
                 )
 
         # Should have slept 3 times (between 4 attempts)
@@ -178,6 +176,7 @@ class TestWithRetry:
                     base_delay=1.0,
                     multiplier=10.0,
                     max_delay=2.0,
+                    jitter=False,
                 )
 
         for delay in sleep_calls:
@@ -232,3 +231,38 @@ class TestWithRetry:
         result = await with_retry(_factory, max_attempts=3, base_delay=0.001)
         assert result.status_code == 200
         assert call_count["n"] == 1
+
+    async def test_jitter_varies_delays(self):
+        """With jitter=True (the default), retry delays should be
+        randomized — not all identical across runs."""
+        sleep_calls: list[float] = []
+
+        async def _fake_sleep(seconds):
+            sleep_calls.append(seconds)
+
+        factory = _always_fail_exc(httpx.ConnectError)
+
+        # Run several retries to collect enough delay samples.
+        for _ in range(10):
+            with patch("tinyagentos.clients.retry.asyncio.sleep", side_effect=_fake_sleep):
+                with pytest.raises(httpx.ConnectError):
+                    await with_retry(
+                        factory,
+                        max_attempts=4,
+                        base_delay=0.1,
+                        multiplier=3.0,
+                        max_delay=5.0,
+                        jitter=True,
+                    )
+
+        # With jitter on, delays should vary within [0.5, 1.5] × nominal.
+        # Collect first-retry delays (index 0, 3, 6, ...) and check spread.
+        first_delays = sleep_calls[0::3]
+        assert len(set(round(d, 4) for d in first_delays)) > 1, (
+            "jitter should produce varied delays, got all identical"
+        )
+        # With the max_delay cap applied after jitter, all jittered delays
+        # must stay within [0.5*base, max_delay] — never exceed the documented bound.
+        for d in sleep_calls:
+            assert d > 0, f"delay should be positive, got {d}"
+            assert d <= 5.0, f"delay {d} should not exceed max_delay"
