@@ -256,17 +256,16 @@ async def list_app_installations(request: Request):
             continue
         account = inst.get("account", {})
 
-        # If we have a locally stored installation, use its metadata;
-        # otherwise, record it now (it was installed via GitHub web UI).
-        if not installs_store or not installs_store.get(iid):
-            if installs_store:
-                await installs_store.add(
-                    installation_id=iid,
-                    account_login=account.get("login", ""),
-                    account_type=account.get("type", ""),
-                    account_avatar_url=account.get("avatar_url", ""),
-                    repository_selection=inst.get("repository_selection", "selected"),
-                )
+        # Record the installation locally if we haven't seen it yet
+        # (it may have been installed via GitHub web UI).
+        if installs_store and not installs_store.get(iid):
+            await installs_store.add(
+                installation_id=iid,
+                account_login=account.get("login", ""),
+                account_type=account.get("type", ""),
+                account_avatar_url=account.get("avatar_url", ""),
+                repository_selection=inst.get("repository_selection", "selected"),
+            )
 
         repos = []
         token = await get_installation_token(

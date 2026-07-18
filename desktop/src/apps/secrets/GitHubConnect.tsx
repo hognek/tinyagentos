@@ -79,7 +79,15 @@ export function GitHubConnect() {
   useEffect(() => {
     refreshIdentities();
     refreshInstallations();
-  }, [refreshIdentities]);
+
+    // Refresh when the user returns from the external GitHub App install flow
+    const onFocus = () => {
+      refreshIdentities();
+      refreshInstallations();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [refreshIdentities, refreshInstallations]);
 
   const stopPolling = useCallback(() => {
     if (pollTimer.current) clearTimeout(pollTimer.current);

@@ -160,9 +160,9 @@ async def get_installation_token(
     if cached:
         return cached
 
-    jwt = generate_jwt(app_id, private_key)
     url = _INSTALL_TOKEN_URL.format(installation_id=installation_id)
     try:
+        jwt = generate_jwt(app_id, private_key)
         resp = await http_client.post(
             url,
             headers=_auth_headers(jwt),
@@ -196,11 +196,11 @@ async def list_installations(
       - repository_selection: "selected" or "all"
       - created_at, updated_at
     """
-    jwt = generate_jwt(app_id, private_key)
     all_installations: list[dict] = []
     page = 1
     while True:
         try:
+            jwt = generate_jwt(app_id, private_key)
             resp = await http_client.get(
                 _GH_APP_INSTALLATIONS,
                 headers=_auth_headers(jwt),
