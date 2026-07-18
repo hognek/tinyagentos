@@ -171,7 +171,14 @@ async def list_agents(request: Request):
 async def list_agent_containers(request: Request):
     """List live LXC container status for all agent containers."""
     from tinyagentos.containers import list_containers
-    containers = await list_containers(prefix="taos-agent-")
+    try:
+        containers = await list_containers(prefix="taos-agent-")
+    except RuntimeError as e:
+        logger.error("list_agent_containers: incus unreachable: %s", e)
+        return JSONResponse(
+            {"error": "Incus daemon unreachable", "detail": str(e)},
+            status_code=503,
+        )
     return [
         {
             "name": c.name,
@@ -818,26 +825,37 @@ async def bulk_stop_agents(request: Request):
     # (shielded from cancellation; the sleep+force is bounded by the 120s _run cap)
     async def _grace_kill():
         await asyncio.sleep(2)
-        containers = await list_containers(prefix="taos-agent-")
-        if not containers and config.agents:
+        incus_unhealthy = False
+        containers = []
+        try:
+            containers = await list_containers(prefix="taos-agent-")
+        except RuntimeError as e:
             logger.warning(
-                "list_containers returned empty; incus may be unhealthy. "
-                "Attempting force-kill on all configured agents."
+                "list_containers failed; incus may be unhealthy: %s. "
+                "Attempting force-kill on all configured agents.",
+                e,
             )
+            incus_unhealthy = True
+        else:
+            if not containers and config.agents:
+                logger.warning(
+                    "list_containers returned empty; no agent containers found. "
+                    "Skipping force-kill."
+                )
         running = {
             c.name
             for c in containers
             if c.status in ("Running", "Stopping", "Freezing", "Frozen")
         }
-        incus_unhealthy = not containers and bool(config.agents)
-        force_results = {}
-        for agent in config.agents:
+        force_results: dict[str, dict] = {}
+
+        async def _force_kill_one(agent: dict) -> tuple[str, dict]:
             name = agent["name"]
             container_name = f"taos-agent-{name}"
             try:
                 if container_name in running or incus_unhealthy:
                     force_result = await stop_container(container_name, force=True)
-                    force_results[name] = {
+                    result = {
                         "force_killed": force_result.get("success", False),
                         "output": force_result.get("output", ""),
                     }
@@ -847,8 +865,14 @@ async def bulk_stop_agents(request: Request):
                             container_name,
                             force_result.get("output", "unknown"),
                         )
+                    return (name, result)
+                return (name, {"force_killed": False, "output": ""})
             except Exception as e:
-                force_results[name] = {"force_killed": False, "error": str(e)}
+                return (name, {"force_killed": False, "error": str(e)})
+
+        tasks = [_force_kill_one(agent) for agent in config.agents]
+        results_list = await asyncio.gather(*tasks)
+        force_results = dict(results_list)
         return force_results
 
     task = asyncio.create_task(_grace_kill())
@@ -925,18 +949,29 @@ async def stop_agent(request: Request, name: str):
     # (shielded from cancellation; the sleep+force is bounded by the 120s _run cap)
     async def _grace_kill():
         await asyncio.sleep(2)
-        containers = await list_containers(prefix="taos-agent-")
-        if not containers:
+        incus_unhealthy = False
+        containers = []
+        try:
+            containers = await list_containers(prefix="taos-agent-")
+        except RuntimeError as e:
             logger.warning(
-                "list_containers returned empty; incus may be unhealthy. "
-                "Attempting force-kill anyway."
+                "list_containers failed; incus may be unhealthy: %s. "
+                "Attempting force-kill anyway.",
+                e,
             )
+            incus_unhealthy = True
+        else:
+            if not containers:
+                logger.warning(
+                    "list_containers returned empty; no agent containers found. "
+                    "Skipping force-kill."
+                )
         running = {
             c.name
             for c in containers
             if c.status in ("Running", "Stopping", "Freezing", "Frozen")
         }
-        if container_name in running or not containers:
+        if container_name in running or incus_unhealthy:
             force_result = await stop_container(container_name, force=True)
             success = force_result.get("success", False)
             if not success:

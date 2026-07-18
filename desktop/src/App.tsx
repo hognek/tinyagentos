@@ -133,13 +133,31 @@ function SystemShortcuts({ toggleSearch, toggleLaunchpad, toggleAssistant }: Sys
       if (!resp.ok) {
         throw new Error(`Server returned ${resp.status}`);
       }
+      const data = await resp.json();
       window.dispatchEvent(new CustomEvent("taos:agents-changed"));
-      addNotification({
-        source: "system",
-        title: "Agents stopped",
-        body: "Emergency kill switch activated — all agents stopped.",
-        level: "success",
-      });
+
+      // Surface partial failures from force-kill results
+      const forceResults: Record<string, { force_killed?: boolean; error?: string }> =
+        data.force_kill_results ?? {};
+      const failures = Object.entries(forceResults).filter(
+        ([, r]) => !r.force_killed || r.error
+      );
+      if (failures.length > 0) {
+        const names = failures.map(([n]) => n).join(", ");
+        addNotification({
+          source: "system",
+          title: "Agents stopped with warnings",
+          body: `Force-kill failed for: ${names}. Check server logs for details.`,
+          level: "warning",
+        });
+      } else {
+        addNotification({
+          source: "system",
+          title: "Agents stopped",
+          body: "Emergency kill switch activated — all agents stopped.",
+          level: "success",
+        });
+      }
     } catch (err) {
       addNotification({
         source: "system",
