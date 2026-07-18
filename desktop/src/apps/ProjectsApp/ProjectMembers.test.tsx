@@ -188,6 +188,79 @@ describe("ProjectMembers exclusive Lead selector (D7)", () => {
   });
 });
 
+describe("ProjectMembers remove confirmation", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("asks for confirmation before removing a member and only removes on confirm", async () => {
+    const fetchMock = mockFetch({
+      "/api/projects/prj-test/members": { ok: true, body: { items: [memberRow("agent-a")] } },
+      "/api/agents": { ok: true, body: [agentA] },
+      "/api/agents/registry": { ok: true, body: [] },
+      "/api/projects/prj-test/members/agent-a": { ok: true, body: { ok: true } },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<ProjectMembers project={baseProject} onChanged={vi.fn()} />);
+    await flush();
+
+    // Clicking Remove opens a confirm dialog and does NOT delete yet.
+    fireEvent.click(screen.getByLabelText("Remove Alpha"));
+    expect(screen.getByRole("dialog", { name: "Remove member" })).toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/projects/prj-test/members/agent-a",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+
+    // Confirming fires the DELETE.
+    const dialog = screen.getByRole("dialog", { name: "Remove member" });
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Remove" }));
+      await flush();
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/projects/prj-test/members/agent-a",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+  });
+});
+
+describe("ProjectMembers rename external agent", () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("renames an external agent via PATCH /api/agents/registry/{id}", async () => {
+    const fetchMock = mockFetch({
+      "/api/projects/prj-test/members": { ok: true, body: { items: [externalMember] } },
+      "/api/agents": { ok: true, body: [] },
+      "/api/agents/registry": { ok: true, body: [registryEntry] },
+      "/api/agents/registry/grok-taos-20260711-000736": { ok: true, body: { ok: true } },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<ProjectMembers project={project} onChanged={vi.fn()} />);
+    await flush();
+
+    fireEvent.click(screen.getByLabelText("Rename grok-taOS"));
+    const input = screen.getByLabelText("New name for grok-taOS") as HTMLInputElement;
+    fireEvent.change(input, { target: { value: "hy3 (grok)" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      await flush();
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/agents/registry/grok-taos-20260711-000736",
+      expect.objectContaining({
+        method: "PATCH",
+        body: JSON.stringify({ display_name: "hy3 (grok)" }),
+      }),
+    );
+  });
+});
+
 const project = { id: "prj-test", name: "taOS", slug: "taos" } as unknown as Project;
 
 // A consent-flow external agent: the member row keys on the canonical id, and

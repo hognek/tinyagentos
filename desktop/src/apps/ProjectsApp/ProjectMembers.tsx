@@ -3,6 +3,8 @@ import { projectsApi, type Project, type ProjectMember } from "@/lib/projects";
 import { AddAgentDialog } from "./AddAgentDialog";
 import { InviteAgentDialog } from "./InviteAgentDialog";
 import { canvasApi } from "./canvas/canvas-api";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { withCsrf } from "@/lib/csrf";
 
 interface AgentSummary {
   id: string;
@@ -75,9 +77,11 @@ function MemberRow({
   hint,
   isExternal,
   framework,
+  canonicalId,
   projectId,
   isLead,
   onRefresh,
+  onRegistryRefresh,
   onChanged,
 }: {
   member: ProjectMember;
@@ -86,13 +90,61 @@ function MemberRow({
   hint?: string;
   isExternal?: boolean;
   framework?: string;
+  canonicalId?: string;
   projectId: string;
   isLead?: boolean;
   onRefresh: () => void;
+  onRegistryRefresh?: () => void;
   onChanged: () => void;
 }) {
   const typeLabel = frameworkLabel(framework);
   const isAgent = member.member_kind === "native" || member.member_kind === "clone";
+  const [confirmRemove, setConfirmRemove] = useState(false);
+  // Registry-backed (external) agents can be renamed. display_name is a
+  // registry-wide field, so the new name shows here and anywhere the agent
+  // appears. Prefer the canonical id (member_id may be a legacy handle).
+  const canRename = !!isExternal;
+  const renameId = canonicalId || member.member_id;
+  const [renaming, setRenaming] = useState(false);
+  const [nameDraft, setNameDraft] = useState(label);
+  const [renameError, setRenameError] = useState("");
+  const [savingRename, setSavingRename] = useState(false);
+
+  async function saveRename() {
+    const next = nameDraft.trim();
+    if (!next || next === label) {
+      setRenaming(false);
+      return;
+    }
+    setRenameError("");
+    setSavingRename(true);
+    try {
+      const res = await fetch(
+        `/api/agents/registry/${encodeURIComponent(renameId)}`,
+        withCsrf({
+          method: "PATCH",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ display_name: next }),
+        }),
+      );
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setRenameError(data?.error || `Rename failed (${res.status})`);
+        return;
+      }
+      setRenaming(false);
+      // Reload the registry roster so the new display_name is reflected in the
+      // label (the members list alone does not carry display_name).
+      onRegistryRefresh?.();
+      onRefresh();
+      onChanged();
+    } catch {
+      setRenameError("Network error, please try again");
+    } finally {
+      setSavingRename(false);
+    }
+  }
   return (
     <li
       className={
@@ -102,28 +154,84 @@ function MemberRow({
       }
     >
       <div className="min-w-0">
-        <div className="truncate text-sm flex items-center gap-1" title={hint || member.member_id}>
-          {emoji && <span aria-hidden>{emoji}</span>}
-          <span>{label}</span>
-          {isExternal && (
-            <span className="ml-1 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/25">
-              external
-            </span>
-          )}
-          {typeLabel && (
-            <span
-              className="ml-1 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-zinc-700/40 text-zinc-300 border border-zinc-600/40"
-              title="Agent type"
+        {renaming ? (
+          <div className="flex items-center gap-1 text-sm">
+            <input
+              type="text"
+              value={nameDraft}
+              autoFocus
+              maxLength={64}
+              aria-label={`New name for ${label}`}
+              onChange={(e) => setNameDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !savingRename) saveRename();
+                if (e.key === "Escape") {
+                  setRenaming(false);
+                  setNameDraft(label);
+                  setRenameError("");
+                }
+              }}
+              className="bg-zinc-800 rounded px-2 py-0.5 text-sm w-48"
+            />
+            <button
+              type="button"
+              onClick={saveRename}
+              disabled={savingRename}
+              className="text-xs px-2 py-0.5 bg-blue-600 rounded hover:bg-blue-500 text-white disabled:opacity-50"
             >
-              {typeLabel}
-            </span>
-          )}
-          {isLead && (
-            <span className="ml-1 text-xs text-yellow-400 font-medium" aria-label="Lead agent">
-              ★ Lead
-            </span>
-          )}
-        </div>
+              {savingRename ? "Saving..." : "Save"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setRenaming(false);
+                setNameDraft(label);
+                setRenameError("");
+              }}
+              className="text-xs px-2 py-0.5 bg-zinc-800 rounded hover:bg-zinc-700"
+            >
+              Cancel
+            </button>
+          </div>
+        ) : (
+          <div className="truncate text-sm flex items-center gap-1" title={hint || member.member_id}>
+            {emoji && <span aria-hidden>{emoji}</span>}
+            <span>{label}</span>
+            {canRename && (
+              <button
+                type="button"
+                onClick={() => {
+                  setNameDraft(label);
+                  setRenaming(true);
+                }}
+                className="text-[11px] text-zinc-500 hover:text-zinc-300"
+                aria-label={`Rename ${label}`}
+                title="Rename"
+              >
+                ✎
+              </button>
+            )}
+            {isExternal && (
+              <span className="ml-1 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/25">
+                external
+              </span>
+            )}
+            {typeLabel && (
+              <span
+                className="ml-1 text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-zinc-700/40 text-zinc-300 border border-zinc-600/40"
+                title="Agent type"
+              >
+                {typeLabel}
+              </span>
+            )}
+            {isLead && (
+              <span className="ml-1 text-xs text-yellow-400 font-medium" aria-label="Lead agent">
+                ★ Lead
+              </span>
+            )}
+          </div>
+        )}
+        {renameError && <div className="text-xs text-red-400">{renameError}</div>}
         {member.member_kind === "clone" && (
           <div className="text-xs text-zinc-500">clone · {member.memory_seed}</div>
         )}
@@ -167,17 +275,27 @@ function MemberRow({
         )}
         <button
           type="button"
-          onClick={async () => {
-            await projectsApi.members.remove(projectId, member.member_id);
-            onRefresh();
-            onChanged();
-          }}
+          onClick={() => setConfirmRemove(true)}
           className="text-xs text-red-400 hover:underline"
           aria-label={`Remove ${label}`}
         >
           Remove
         </button>
       </div>
+      <ConfirmDialog
+        open={confirmRemove}
+        title="Remove member"
+        message={`Remove ${label} from this project? Their project access is revoked. This does not delete the agent's identity.`}
+        confirmLabel="Remove"
+        danger
+        onCancel={() => setConfirmRemove(false)}
+        onConfirm={async () => {
+          setConfirmRemove(false);
+          await projectsApi.members.remove(projectId, member.member_id);
+          onRefresh();
+          onChanged();
+        }}
+      />
     </li>
   );
 }
@@ -218,6 +336,31 @@ export function ProjectMembers({ project, onChanged }: { project: Project; onCha
 
   const refresh = () =>
     projectsApi.members.list(project.id).then(setMembers).catch(() => setMembers([]));
+
+  // Reload the external registry roster so a rename (which updates a registry
+  // display_name, not a project_members row) is reflected in the label. Members
+  // list alone does not carry the display_name, so onRefresh is not enough.
+  const reloadExternalRegistry = () =>
+    fetch("/api/agents/registry", { credentials: "include" })
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows) => {
+        if (!Array.isArray(rows)) return;
+        const active = rows.filter(
+          (e: { origin?: string; status?: string }) =>
+            e.origin === "external-selfjoin" && e.status === "active",
+        );
+        setExternalAgents(
+          active.map(
+            (e: { handle?: string; canonical_id?: string; display_name?: string; framework?: string }) => ({
+              handle: e.handle || "",
+              canonical_id: e.canonical_id,
+              display_name: e.display_name,
+              framework: e.framework,
+            }),
+          ),
+        );
+      })
+      .catch(() => {});
 
   useEffect(() => {
     let cancelled = false;
@@ -401,8 +544,10 @@ export function ProjectMembers({ project, onChanged }: { project: Project; onCha
                   isLead={m.member_id === leadMemberId}
                   isExternal
                   framework={byHandle.get(m.member_id)?.framework}
+                  canonicalId={byHandle.get(m.member_id)?.canonical_id}
                   projectId={project.id}
                   onRefresh={refresh}
+                  onRegistryRefresh={reloadExternalRegistry}
                   onChanged={onChanged}
                 />
               );
