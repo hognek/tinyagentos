@@ -9,6 +9,7 @@ import os
 import shutil
 import tarfile
 import time
+from collections import OrderedDict
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -1077,7 +1078,7 @@ async def set_update_channel(request: Request, body: UpdateChannel):
 # Memory URL (taOSmd)
 # ---------------------------------------------------------------------------
 
-_MEMORY_URL_PROBE_CACHE: dict = {}  # {url: (timestamp, bool)}
+_MEMORY_URL_PROBE_CACHE: OrderedDict = OrderedDict()  # {url: (timestamp, bool)} — capped at 32 entries via FIFO eviction
 
 
 def _is_local_url(url: str) -> bool:
@@ -1127,6 +1128,8 @@ async def get_memory_url(request: Request):
     else:
         reachable = await _probe_taosmd(request, url)
         _MEMORY_URL_PROBE_CACHE[url] = (now, reachable)
+        if len(_MEMORY_URL_PROBE_CACHE) > 32:
+            _MEMORY_URL_PROBE_CACHE.popitem(last=False)
 
     return {"url": url, "is_local": is_local, "reachable": reachable}
 
@@ -1160,5 +1163,7 @@ async def set_memory_url(request: Request, body: MemoryUrlUpdate):
 
     # Cache the probe result so the next GET is instant.
     _MEMORY_URL_PROBE_CACHE[url] = (time.monotonic(), reachable)
+    if len(_MEMORY_URL_PROBE_CACHE) > 32:
+        _MEMORY_URL_PROBE_CACHE.popitem(last=False)
 
     return {"url": url, "is_local": is_local, "reachable": reachable}
