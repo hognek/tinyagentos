@@ -19,6 +19,7 @@ from tinyagentos.projects.invite_store import (
     InvitePendingCapError,
     InviteRevokedError,
 )
+from tinyagentos.routes.agent_auth_requests import VALID_SCOPES
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -618,6 +619,14 @@ async def mint_invite(
     if project is None:
         return JSONResponse({"error": "project not found"}, status_code=404)
     require_owner_or_admin(user, project["user_id"])
+    # Reject unknown scopes at mint so an owner can never create an auto-invite
+    # whose scopes can never redeem successfully (issue #1993).
+    unknown = sorted(set(payload.scopes) - VALID_SCOPES)
+    if unknown:
+        return JSONResponse(
+            {"error": f"unknown scopes: {unknown}; valid: {sorted(VALID_SCOPES)}"},
+            status_code=400,
+        )
     try:
         result = await store.mint(
             project_id=project_id,
@@ -710,6 +719,13 @@ async def mint_os_invite(
 ):
     _require_admin(user)
     store = request.app.state.project_invites
+    # Reject unknown scopes at mint (issue #1993).
+    unknown = sorted(set(payload.scopes) - VALID_SCOPES)
+    if unknown:
+        return JSONResponse(
+            {"error": f"unknown scopes: {unknown}; valid: {sorted(VALID_SCOPES)}"},
+            status_code=400,
+        )
     # OS-level invites carry no project, so drop any project-bound scopes rather
     # than granting them against a non-existent project (kilo review #1918).
     os_scopes = [s for s in payload.scopes if s not in _PROJECT_SCOPED]
@@ -876,6 +892,7 @@ async def redeem_invite(request: Request, body: RedeemInviteIn):
                 project_id=invite["project_id"],
             )
         except Exception as exc:  # noqa: BLE001 - surface as JSON error
+            await store.rollback_to_pending(body.invite_id)
             return JSONResponse({"error": str(exc)}, status_code=400)
     else:
         # manual: leave pending so the consent bell fires (handled by
@@ -954,6 +971,7 @@ async def _redeem_os_level(request: Request, body: RedeemInviteIn, invite: dict,
                 display_name=display_name,
             )
         except Exception as exc:  # noqa: BLE001 - surface as JSON error
+            await store.rollback_to_pending(body.invite_id)
             return JSONResponse({"error": str(exc)}, status_code=400)
     else:
         _notify_pending_invite(request, record)

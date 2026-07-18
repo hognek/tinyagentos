@@ -289,8 +289,12 @@ class ProjectInviteStore(BaseStore):
                 await self._db.commit()
             raise InvitePinError("invalid invite id or pin")
 
+        # Atomically claim the invite (pending→claimed) rather than immediately
+        # marking it redeemed.  The caller must flip claimed→redeemed on success
+        # or roll back to pending on failure so a failed approve does not burn
+        # the invite unrecoverably (issue #1993).
         cursor = await self._db.execute(
-            "UPDATE project_invites SET status = 'redeemed' WHERE invite_id = ? AND status = 'pending'",
+            "UPDATE project_invites SET status = 'claimed' WHERE invite_id = ? AND status = 'pending'",
             (invite_id,),
         )
         await self._db.commit()
@@ -303,19 +307,30 @@ class ProjectInviteStore(BaseStore):
     async def mark_redeemed(
         self, invite_id: str, redeemed_by: str, redeemed_request_id: str
     ) -> None:
-        """Record who/what redeemed an invite for audit (called by the redeem
-        route after the auth-request has been created/approved). Best-effort
-        from the caller's perspective; the status flip already happened in
+        """Record who/what redeemed an invite for audit and flip claimed→redeemed
+        (called by the redeem route after the auth-request has been created/approved).
+        Best-effort from the caller's perspective; the status flip already happened in
         ``redeem``."""
         if self._db is None:
             raise RuntimeError("ProjectInviteStore not initialised")
         await self._db.execute(
             """
             UPDATE project_invites
-               SET redeemed_by = ?, redeemed_request_id = ?
+               SET redeemed_by = ?, redeemed_request_id = ?, status = 'redeemed'
              WHERE invite_id = ?
             """,
             (redeemed_by, redeemed_request_id, invite_id),
+        )
+        await self._db.commit()
+
+    async def rollback_to_pending(self, invite_id: str) -> None:
+        """Roll back a claimed invite to pending so the caller can retry after a
+        failed approve (issue #1993).  Only touches invites in 'claimed' status."""
+        if self._db is None:
+            raise RuntimeError("ProjectInviteStore not initialised")
+        await self._db.execute(
+            "UPDATE project_invites SET status = 'pending' WHERE invite_id = ? AND status = 'claimed'",
+            (invite_id,),
         )
         await self._db.commit()
 
