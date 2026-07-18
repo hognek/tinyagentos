@@ -88,8 +88,19 @@ async def _get_app_installation_token(
     Returns None if GitHub App is not configured or no installations exist.
     """
     cfg = getattr(request.app.state, "config", None)
-    if not cfg or not cfg.github_app_id or not cfg.github_app_private_key:
+    if not cfg or not cfg.github_app_id:
         return None
+
+    secrets = getattr(request.app.state, "secrets", None)
+    if secrets is None:
+        return None
+    try:
+        rec = await secrets.get("github-app-private-key")
+    except Exception:
+        return None
+    if not rec or not rec.get("value"):
+        return None
+    private_key = rec["value"]
 
     installs = getattr(request.app.state, "github_app_installations", None)
     if installs is None:
@@ -125,7 +136,7 @@ async def _get_app_installation_token(
         if not iid:
             continue
         token = await get_installation_token(
-            cfg.github_app_id, cfg.github_app_private_key, iid, http_client,
+            cfg.github_app_id, private_key, iid, http_client,
         )
         if token:
             logger.debug("Using GitHub App installation token (installation %s)", iid)
