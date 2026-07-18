@@ -134,7 +134,7 @@ class GpuArbiter:
         self._paused_at: float | None = None
 
         # ── taOS #1864 A3: event-driven wakeup ───────────────────────────
-        self._drain_tick_seconds = drain_tick_seconds
+        self._drain_tick_seconds = max(drain_tick_seconds, 0.01)
         self._wake: asyncio.Event = asyncio.Event()
 
     async def start(self) -> None:
@@ -445,7 +445,7 @@ class GpuArbiter:
             async with self._running_lock:
                 entry = self._running.pop(task.id, None)
                 self._running_tasks.pop(task.id, None)
-            self._signal_capacity()  # taOS #1864 A3: wake drain on completion
+            # _release_reservation above calls _signal_capacity (taOS #1864 A3).
             # Release the lease only for normal completion (not eviction).
             # When _evict_task evicts us it pops self._running first and
             # handles the lease — our pop above returns None, so we skip.
