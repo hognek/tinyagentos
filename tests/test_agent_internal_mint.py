@@ -330,7 +330,25 @@ class TestMintInternalRoute:
         for s in seeded:
             assert s["created"] is True
             assert s["token"]
-            assert set(s["scopes"]) == {"a2a_send", "a2a_receive"}
+            if s["handle"] == "@taOS-dev":
+                # Lead curator: gets project_tasks + canvas on prj-5y722y
+                # in addition to the baseline a2a scopes (#1968 C1).
+                assert set(s["scopes"]) == {
+                    "a2a_send", "a2a_receive",
+                    "project_tasks", "canvas_read", "canvas_write",
+                }
+                # Grants should be project-scoped.
+                grants = await mint_client._app.state.agent_grants.list_grants(
+                    s["canonical_id"]
+                )
+                for g in grants:
+                    if g["scope"] in ("project_tasks", "canvas_read", "canvas_write"):
+                        assert g.get("project_id") == "prj-5y722y", (
+                            f"scope {g['scope']!r} not bound to prj-5y722y"
+                        )
+            else:
+                # Baseline agents: only a2a comms.
+                assert set(s["scopes"]) == {"a2a_send", "a2a_receive"}
 
         # Re-run: no duplicate rows, all created=False.
         r2 = await mint_client.post("/api/agents/registry/seed-internal")
