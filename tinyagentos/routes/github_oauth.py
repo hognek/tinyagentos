@@ -265,7 +265,9 @@ async def list_app_installations(request: Request):
                 repository_selection=inst.get("repository_selection", "selected"),
             )
 
-    # Phase 2: mint tokens and fetch repos in parallel across installations
+    # Phase 2: mint tokens and fetch repos in parallel across installations.
+    # get_installation_token has its own 5-min TTL cache (_token_cache), so
+    # subsequent calls within the window reuse cached tokens — no extra POSTs.
     async def _fetch_one(inst: dict) -> tuple[int, dict, list[dict]]:
         iid: int = inst["id"]
         token = await get_installation_token(
@@ -390,12 +392,7 @@ async def app_installation_callback(
         inst_data = install_resp.json()
         account = inst_data.get("account", {})
         store = _app_installations_store(request)
-        if setup_action == "update":
-            logger.info(
-                "GitHub App installation %s updated (%s)",
-                installation_id, account.get("login", ""),
-            )
-        elif store:
+        if store:
             await store.add(
                 installation_id=installation_id,
                 account_login=account.get("login", ""),
@@ -403,6 +400,12 @@ async def app_installation_callback(
                 account_avatar_url=account.get("avatar_url", ""),
                 repository_selection=inst_data.get("repository_selection", "selected"),
             )
+        logger.info(
+            "GitHub App installation %s %s (%s)",
+            installation_id,
+            setup_action,
+            account.get("login", ""),
+        )
     else:
         logger.warning(
             "Failed to fetch installation %s details (HTTP %s), redirecting anyway",
