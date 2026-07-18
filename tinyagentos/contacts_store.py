@@ -25,17 +25,26 @@ CREATE TABLE IF NOT EXISTS contacts (
 CREATE TABLE IF NOT EXISTS peer_links (
     contact_id              TEXT PRIMARY KEY REFERENCES contacts(contact_id),
     inbound_token_hash      TEXT NOT NULL,    -- token WE minted for their instance (SHA-256)
-    outbound_token          TEXT NOT NULL,    -- token THEY minted for us (encrypted at rest)
+    outbound_token          TEXT NOT NULL,    -- token THEY minted for us (stored in plaintext; encryption deferred to post-MVP)
     endpoints               TEXT NOT NULL DEFAULT '[]',  -- JSON list of advertised endpoints
     established_at          REAL NOT NULL,
     last_seen_at            REAL,
     revoked_at              REAL
+);
+
+CREATE TABLE IF NOT EXISTS peer_nonces (
+    nonce                   TEXT PRIMARY KEY,  -- 16-byte hex nonce from envelope
+    contact_id              TEXT NOT NULL,
+    seen_at                 REAL NOT NULL
 );
 """
 
 # Peer tokens are 256-bit opaque strings, SHA-256 hashed at rest (same pattern
 # as registry tokens).  The peer-token sub concept is "contact:{hub_username}".
 _PEER_TOKEN_BYTES = 32
+# Nonces live for the envelope freshness window (300s) + 30s clock-skew grace
+# + 60s buffer.  After this window a nonce is pruned so the table stays small.
+NONCE_MAX_AGE_SECS = 600
 
 
 def _hash_token(token: str) -> str:
@@ -99,14 +108,16 @@ class ContactsStore(BaseStore):
             "SELECT * FROM contacts WHERE contact_id = ?", (contact_id,)
         ) as cursor:
             rows = await cursor.fetchall()
-        return _row_to_dict(cursor, rows[0]) if rows else None
+            columns = [desc[0] for desc in cursor.description]
+        return _row_to_dict(columns, rows[0]) if rows else None
 
     async def get_contact_by_username(self, hub_username: str) -> Optional[dict]:
         async with self._db.execute(
             "SELECT * FROM contacts WHERE hub_username = ?", (hub_username,)
         ) as cursor:
             rows = await cursor.fetchall()
-        return _row_to_dict(cursor, rows[0]) if rows else None
+            columns = [desc[0] for desc in cursor.description]
+        return _row_to_dict(columns, rows[0]) if rows else None
 
     async def set_contact_status(self, contact_id: str, status: str) -> None:
         now = time.time()
@@ -132,12 +143,14 @@ class ContactsStore(BaseStore):
                 (status,),
             ) as cursor:
                 rows = await cursor.fetchall()
+                columns = [desc[0] for desc in cursor.description]
         else:
             async with self._db.execute(
                 "SELECT * FROM contacts ORDER BY created_at"
             ) as cursor:
                 rows = await cursor.fetchall()
-        return [_row_to_dict(cursor, r) for r in rows]
+                columns = [desc[0] for desc in cursor.description]
+        return [_row_to_dict(columns, r) for r in rows]
 
     # ------------------------------------------------------------------
     # peer_links
@@ -178,9 +191,10 @@ class ContactsStore(BaseStore):
             "SELECT * FROM peer_links WHERE contact_id = ?", (contact_id,)
         ) as cursor:
             rows = await cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
         if not rows:
             return None
-        rec = _row_to_dict(cursor, rows[0])
+        rec = _row_to_dict(columns, rows[0])
         # Deserialise endpoints for the caller.
         rec["endpoints"] = _json_loads(rec.get("endpoints", "[]"))
         return rec
@@ -203,11 +217,47 @@ class ContactsStore(BaseStore):
             (token_hash,),
         ) as cursor:
             rows = await cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
         if not rows:
             return None
-        rec = _row_to_dict(cursor, rows[0])
+        rec = _row_to_dict(columns, rows[0])
         rec["endpoints"] = _json_loads(rec.get("endpoints", "[]"))
         return rec
+
+    async def record_nonce(self, nonce: str, contact_id: str) -> bool:
+        """Record a seen nonce for replay protection.
+
+        Returns True if the nonce was recorded (first time seen), False if it
+        was already present (replay detected).
+
+        Nonces older than ``NONCE_MAX_AGE_SECS`` are pruned on insert so the
+        table does not grow unbounded.
+        """
+        now = time.time()
+        # Prune expired nonces (opportunistic, one DELETE per insert keeps the
+        # table small without a separate vacuum job).
+        cutoff = now - NONCE_MAX_AGE_SECS
+        await self._db.execute(
+            "DELETE FROM peer_nonces WHERE seen_at < ?", (cutoff,)
+        )
+        try:
+            await self._db.execute(
+                "INSERT INTO peer_nonces (nonce, contact_id, seen_at) VALUES (?, ?, ?)",
+                (nonce, contact_id, now),
+            )
+            await self._db.commit()
+            return True
+        except Exception:
+            # Nonce already exists (PRIMARY KEY conflict) — replay detected.
+            return False
+
+    async def is_nonce_seen(self, nonce: str) -> bool:
+        """Return True if this nonce has already been recorded."""
+        async with self._db.execute(
+            "SELECT 1 FROM peer_nonces WHERE nonce = ?", (nonce,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row is not None
 
     async def mark_peer_seen(self, contact_id: str) -> None:
         """Update last_seen_at for the peer link (called on every valid request)."""
@@ -235,12 +285,11 @@ class ContactsStore(BaseStore):
 # helpers
 # ---------------------------------------------------------------------------
 
-def _row_to_dict(cursor, row) -> dict:
-    """Convert an aiosqlite result row to a dict using cursor.description."""
+def _row_to_dict(columns: list[str], row) -> dict:
+    """Convert a result row to a dict using pre-captured column names."""
     if row is None:
         return {}
-    cols = [desc[0] for desc in cursor.description]
-    return dict(zip(cols, row))
+    return dict(zip(columns, row))
 
 
 def _json_dumps(obj) -> str:

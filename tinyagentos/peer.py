@@ -14,13 +14,11 @@ and peer tokens grant *only* the peer route family — never the general API.
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import time
 from typing import Optional
 
 from tinyagentos.hub.identity import (
-    fingerprint,
     sign as _sign,
     verify_signature,
 )
@@ -147,30 +145,15 @@ def mint_peer_token(sub: str) -> tuple[str, str]:
     remote instance; the hash is stored in ``peer_links.inbound_token_hash``.
 
     ``sub`` is the token subject, e.g. ``"contact:hogne"``.
+
+    Uses the same plain SHA-256 as ``ContactsStore._hash_token`` so that
+    minting and verification are consistent.
     """
     import secrets
 
     raw = secrets.token_hex(_PEER_TOKEN_BYTES)
-    # Include the sub in the hash so two contacts can never share a hash even
-    # if (astronomically unlikely) token collision occurs.
-    token_hash = hashlib.sha256(
-        f"{sub}:{raw}".encode("utf-8")
-    ).hexdigest()
+    token_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return raw, token_hash
-
-
-def hash_peer_token(token: str) -> str:
-    """Return the SHA-256 hash of a peer token (for at-rest storage)."""
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def verify_peer_token(
-    presented: str,
-    stored_hash: str,
-) -> bool:
-    """Constant-time comparison of a presented peer token against stored hash."""
-    computed = hash_peer_token(presented)
-    return hmac.compare_digest(computed, stored_hash)
 
 
 # ---------------------------------------------------------------------------
