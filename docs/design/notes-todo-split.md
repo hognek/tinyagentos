@@ -75,8 +75,9 @@ Keep `tinyagentos/notes/shared_docs_store.py` but rename/refactor:
 - Remove `kind` column from `shared_docs` — all docs are notes now
 - Remove `done` from `shared_doc_entries` — notes don't have completion
 - Rename `shared_doc_entries` → `note_blocks` (optional; can defer)
-- The existing entry revision history is preserved as-is — it's useful for
-  both apps
+- The existing entry revision history is preserved **via the shared
+  collaboration module** (see 1c) — it's useful for both apps without
+  duplication
 
 Schema (existing, minus `kind` and `done`):
 
@@ -175,6 +176,15 @@ class ReorderEntry(BaseModel):
     position: int
 ```
 
+**Timestamp conversion:** `due_at` and `remind_at` arrive as ISO-8601
+strings (e.g. `"2026-07-18T14:00:00Z"`) from the API. The route handler
+converts them to SQLite REAL (Unix epoch seconds) via
+`datetime.fromisoformat()` before passing to the store. The store writes
+the float timestamp directly into the `REAL` column, matching the existing
+`created_at`/`updated_at` convention used throughout the codebase. On read,
+the store returns the float; the route serializes it back to ISO-8601 for
+the response model.
+
 ### 2b. Notes API (`/api/notes`)
 
 Keep existing routes at `/api/notes` with minimal changes:
@@ -197,7 +207,7 @@ class EditEntryTextIn(BaseModel):  # unchanged
 
 ### 2c. Agent tools
 
-| Tool | Current | After |
+| Current Tool | After (rename) | Purpose |
 |------|---------|-------|
 | `notes_list_shared_docs` | → `notes_list_docs` | Lists the agent's notes |
 | `notes_add_entry` | → `notes_add_entry` | Appends to a note |
@@ -224,9 +234,6 @@ desktop/src/apps/
     NotesApp.test.tsx
     TodoApp.tsx           ← checklist-oriented todo component
     TodoApp.test.tsx
-    apps/__tests__/
-        NotesApp.test.tsx
-        TodoApp.test.tsx
 ```
 
 **Shared UI primitives extracted to `desktop/src/apps/notes-shared/`:**
