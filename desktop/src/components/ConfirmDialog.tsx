@@ -15,8 +15,8 @@ interface ConfirmDialogProps {
 /**
  * A small modal that asks the user to confirm before a destructive or
  * hard-to-undo action. Matches the app dialog style (overlay + zinc panel),
- * focuses the confirm button, closes on Escape or backdrop click, and traps the
- * click inside the panel so a stray click does not dismiss it.
+ * focuses the confirm button, closes on Escape or backdrop click, and keeps
+ * keyboard focus inside the panel (Tab cycles within the dialog).
  */
 export function ConfirmDialog({
   open,
@@ -29,6 +29,7 @@ export function ConfirmDialog({
   onCancel,
 }: ConfirmDialogProps) {
   const confirmRef = useRef<HTMLButtonElement>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (open) confirmRef.current?.focus();
@@ -37,7 +38,28 @@ export function ConfirmDialog({
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCancel();
+      if (e.key === "Escape") {
+        onCancel();
+        return;
+      }
+      if (e.key !== "Tab" || !panelRef.current) return;
+      // Trap Tab focus inside the panel so it cannot reach controls behind the
+      // modal.
+      const focusable = panelRef.current.querySelectorAll<HTMLElement>("button");
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (!first || !last) return;
+      const active = document.activeElement;
+      if (e.shiftKey && active === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && active === last) {
+        e.preventDefault();
+        first.focus();
+      } else if (!panelRef.current.contains(active)) {
+        e.preventDefault();
+        first.focus();
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -54,6 +76,7 @@ export function ConfirmDialog({
       onClick={onCancel}
     >
       <div
+        ref={panelRef}
         className="bg-zinc-900 p-4 rounded shadow w-full max-w-sm space-y-3"
         onClick={(e) => e.stopPropagation()}
       >

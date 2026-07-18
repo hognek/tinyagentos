@@ -77,9 +77,11 @@ function MemberRow({
   hint,
   isExternal,
   framework,
+  canonicalId,
   projectId,
   isLead,
   onRefresh,
+  onRegistryRefresh,
   onChanged,
 }: {
   member: ProjectMember;
@@ -88,21 +90,25 @@ function MemberRow({
   hint?: string;
   isExternal?: boolean;
   framework?: string;
+  canonicalId?: string;
   projectId: string;
   isLead?: boolean;
   onRefresh: () => void;
+  onRegistryRefresh?: () => void;
   onChanged: () => void;
 }) {
   const typeLabel = frameworkLabel(framework);
   const isAgent = member.member_kind === "native" || member.member_kind === "clone";
   const [confirmRemove, setConfirmRemove] = useState(false);
-  // Registry-backed (external) agents can be renamed: member_id is the canonical
-  // id, and display_name is a registry-wide field, so the new name shows here and
-  // anywhere else the agent appears.
+  // Registry-backed (external) agents can be renamed. display_name is a
+  // registry-wide field, so the new name shows here and anywhere the agent
+  // appears. Prefer the canonical id (member_id may be a legacy handle).
   const canRename = !!isExternal;
+  const renameId = canonicalId || member.member_id;
   const [renaming, setRenaming] = useState(false);
   const [nameDraft, setNameDraft] = useState(label);
   const [renameError, setRenameError] = useState("");
+  const [savingRename, setSavingRename] = useState(false);
 
   async function saveRename() {
     const next = nameDraft.trim();
@@ -111,23 +117,33 @@ function MemberRow({
       return;
     }
     setRenameError("");
-    const res = await fetch(
-      `/api/agents/registry/${encodeURIComponent(member.member_id)}`,
-      withCsrf({
-        method: "PATCH",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ display_name: next }),
-      }),
-    );
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      setRenameError(data?.error || `Rename failed (${res.status})`);
-      return;
+    setSavingRename(true);
+    try {
+      const res = await fetch(
+        `/api/agents/registry/${encodeURIComponent(renameId)}`,
+        withCsrf({
+          method: "PATCH",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ display_name: next }),
+        }),
+      );
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        setRenameError(data?.error || `Rename failed (${res.status})`);
+        return;
+      }
+      setRenaming(false);
+      // Reload the registry roster so the new display_name is reflected in the
+      // label (the members list alone does not carry display_name).
+      onRegistryRefresh?.();
+      onRefresh();
+      onChanged();
+    } catch {
+      setRenameError("Network error, please try again");
+    } finally {
+      setSavingRename(false);
     }
-    setRenaming(false);
-    onRefresh();
-    onChanged();
   }
   return (
     <li
@@ -148,7 +164,7 @@ function MemberRow({
               aria-label={`New name for ${label}`}
               onChange={(e) => setNameDraft(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") saveRename();
+                if (e.key === "Enter" && !savingRename) saveRename();
                 if (e.key === "Escape") {
                   setRenaming(false);
                   setNameDraft(label);
@@ -160,9 +176,10 @@ function MemberRow({
             <button
               type="button"
               onClick={saveRename}
-              className="text-xs px-2 py-0.5 bg-blue-600 rounded hover:bg-blue-500 text-white"
+              disabled={savingRename}
+              className="text-xs px-2 py-0.5 bg-blue-600 rounded hover:bg-blue-500 text-white disabled:opacity-50"
             >
-              Save
+              {savingRename ? "Saving..." : "Save"}
             </button>
             <button
               type="button"
@@ -319,6 +336,31 @@ export function ProjectMembers({ project, onChanged }: { project: Project; onCha
 
   const refresh = () =>
     projectsApi.members.list(project.id).then(setMembers).catch(() => setMembers([]));
+
+  // Reload the external registry roster so a rename (which updates a registry
+  // display_name, not a project_members row) is reflected in the label. Members
+  // list alone does not carry the display_name, so onRefresh is not enough.
+  const reloadExternalRegistry = () =>
+    fetch("/api/agents/registry", { credentials: "include" })
+      .then((r) => (r.ok ? r.json() : []))
+      .then((rows) => {
+        if (!Array.isArray(rows)) return;
+        const active = rows.filter(
+          (e: { origin?: string; status?: string }) =>
+            e.origin === "external-selfjoin" && e.status === "active",
+        );
+        setExternalAgents(
+          active.map(
+            (e: { handle?: string; canonical_id?: string; display_name?: string; framework?: string }) => ({
+              handle: e.handle || "",
+              canonical_id: e.canonical_id,
+              display_name: e.display_name,
+              framework: e.framework,
+            }),
+          ),
+        );
+      })
+      .catch(() => {});
 
   useEffect(() => {
     let cancelled = false;
@@ -502,8 +544,10 @@ export function ProjectMembers({ project, onChanged }: { project: Project; onCha
                   isLead={m.member_id === leadMemberId}
                   isExternal
                   framework={byHandle.get(m.member_id)?.framework}
+                  canonicalId={byHandle.get(m.member_id)?.canonical_id}
                   projectId={project.id}
                   onRefresh={refresh}
+                  onRegistryRefresh={reloadExternalRegistry}
                   onChanged={onChanged}
                 />
               );
