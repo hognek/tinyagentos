@@ -814,21 +814,31 @@ async def bulk_stop_agents(request: Request):
     # Phase 1: SIGTERM every agent container
     results = await _bulk_container_op(config, stop_container)
 
-    # Phase 2: 2-second grace window, then SIGKILL any stragglers
-    await asyncio.sleep(2)
-    force_results = {}
-    for agent in config.agents:
-        name = agent["name"]
-        container_name = f"taos-agent-{name}"
-        try:
-            if await container_exists(container_name):
-                force_result = await stop_container(container_name, force=True)
-                force_results[name] = {
-                    "force_killed": force_result.get("success", False),
-                    "output": force_result.get("output", ""),
-                }
-        except Exception as e:
-            force_results[name] = {"force_killed": False, "error": str(e)}
+    # Phase 2: 2-second grace window, then SIGKILL any stragglers (shielded from cancellation)
+    async def _grace_kill():
+        await asyncio.sleep(2)
+        force_results = {}
+        for agent in config.agents:
+            name = agent["name"]
+            container_name = f"taos-agent-{name}"
+            try:
+                if await container_exists(container_name):
+                    force_result = await stop_container(container_name, force=True)
+                    force_results[name] = {
+                        "force_killed": force_result.get("success", False),
+                        "output": force_result.get("output", ""),
+                    }
+                    if not force_result.get("success", False):
+                        logger.warning(
+                            "Force-kill of %s failed: %s",
+                            container_name,
+                            force_result.get("output", "unknown"),
+                        )
+            except Exception as e:
+                force_results[name] = {"force_killed": False, "error": str(e)}
+        return force_results
+
+    force_results = await asyncio.shield(_grace_kill())
 
     return {
         "action": "stop",
@@ -889,17 +899,28 @@ async def stop_agent(request: Request, name: str):
     container_name = f"taos-agent-{name}"
     stop_result = await stop_container(container_name)
 
-    # 2-second grace window, then SIGKILL
-    await asyncio.sleep(2)
-    force_killed = False
-    if await container_exists(container_name):
-        force_result = await stop_container(container_name, force=True)
-        force_killed = force_result.get("success", False)
+    # 2-second grace window, then SIGKILL (shielded from cancellation)
+    async def _grace_kill():
+        await asyncio.sleep(2)
+        if await container_exists(container_name):
+            force_result = await stop_container(container_name, force=True)
+            success = force_result.get("success", False)
+            if not success:
+                logger.warning(
+                    "Force-kill of %s failed: %s",
+                    container_name,
+                    force_result.get("output", "unknown"),
+                )
+            return (success, force_result.get("output", ""))
+        return (False, "")
+
+    force_killed, force_error = await asyncio.shield(_grace_kill())
 
     return {
         "prepare_report": report,
         "stop_result": stop_result,
         "force_killed": force_killed,
+        "force_error": force_error,
     }
 
 
