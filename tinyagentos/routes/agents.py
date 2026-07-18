@@ -824,7 +824,7 @@ async def bulk_stop_agents(request: Request):
         running = {
             c.name
             for c in containers
-            if c.status in ("Running", "Stopping")
+            if c.status not in ("Stopped",)
         }
         incus_unhealthy = not containers and bool(config.agents)
 
@@ -858,11 +858,16 @@ async def bulk_stop_agents(request: Request):
     # Phase 1: SIGTERM every agent container (concurrent with grace window)
     results = await _bulk_container_op(config, stop_container)
 
+    force_results = {}
     try:
-        force_results = await asyncio.shield(task)
+        force_results = await asyncio.wait_for(asyncio.shield(task), timeout=30)
     except asyncio.CancelledError:
         await task
         raise
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Grace-kill timed out after 30s; force-kill may still complete in background"
+        )
 
     return {
         "action": "stop",
@@ -935,7 +940,7 @@ async def stop_agent(request: Request, name: str):
         running = {
             c.name
             for c in containers
-            if c.status in ("Running", "Stopping")
+            if c.status not in ("Stopped",)
         }
         if container_name in running or not containers:
             force_result = await stop_container(container_name, force=True)
@@ -953,10 +958,18 @@ async def stop_agent(request: Request, name: str):
     stop_result = await stop_container(container_name)
 
     try:
-        force_killed, force_output = await asyncio.shield(task)
+        force_killed, force_output = await asyncio.wait_for(
+            asyncio.shield(task), timeout=30
+        )
     except asyncio.CancelledError:
         await task
         raise
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Grace-kill timed out after 30s for %s; force-kill may still complete",
+            container_name,
+        )
+        force_killed, force_output = False, ""
 
     return {
         "prepare_report": report,
