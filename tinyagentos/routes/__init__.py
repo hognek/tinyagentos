@@ -395,7 +395,7 @@ def register_all_routers(app):
     app.include_router(receipts_router, dependencies=_csrf)
 
     from tinyagentos.routes import wallhaven as wallhaven_routes
-    app.include_router(wallhaven_routes.router)
+    app.include_router(wallhaven_routes.router, dependencies=_csrf)
 
     from tinyagentos.routes.council import router as council_router
     app.include_router(council_router, dependencies=_csrf)

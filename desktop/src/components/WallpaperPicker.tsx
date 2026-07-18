@@ -227,7 +227,8 @@ export function WallpaperPicker({ open, onClose }: Props) {
             </div>
           )}
         </div>
-            </div>
+          )}
+        </div>
           ))}
         </div>
         {wallpaperKind === "animated" && (
