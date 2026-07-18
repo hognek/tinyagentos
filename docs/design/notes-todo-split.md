@@ -176,6 +176,13 @@ class ReorderEntry(BaseModel):
     position: int
 ```
 
+**Reorder contract:** The reorder endpoint receives a complete ordering of
+every item in the list — each `id` must appear exactly once, `position`
+values must be unique (no ties), and the entire batch is applied atomically
+within a single transaction. Partial or invalid payloads (missing items,
+duplicate positions, unknown ids) are rejected with `400 Bad Request` and
+make no changes to the stored order.
+
 **Timestamp conversion:** `due_at` and `remind_at` arrive as ISO-8601
 strings (e.g. `"2026-07-18T14:00:00Z"`) from the API. The route handler
 converts them to SQLite REAL (Unix epoch seconds) via
