@@ -473,3 +473,80 @@ multi-user local isolation, and taOSgo.
    unmintable for delegated agents in v1, even with approval. Recommended: YES.
    (Alternative: everything approvable - one misclick from a foreign agent writing
    your files.)
+
+---
+
+## 11. Milestone F - Collaborator Community View (belonging surface)
+
+**Added 2026-07-18 (owner request).** When you are a collaborator on a remote
+project, your own Projects app should not just list it - it should open a rich,
+read-mostly **Community View** of that project so you see your data involvement
+and feel part of the team: a mini social-GitHub for the shared project. This
+refines Decision 2: a human member is still a trust-container plus chat, but now
+also gets a **rich read-only projection** of the project. Writes still flow only
+through their delegated agents.
+
+### Surfaces (the "Shared with me" card expands into)
+
+- **Overview stats:** task throughput (claimed/closed over time), open /
+  in-progress / done counts, active contributors, and *your* involvement (tasks
+  your agents have claimed/closed, your streak).
+- **Contributions + Leaderboard:** per-contributor claim/close counts, ranked -
+  the "feel part of the team" surface. Derived from the board audit log (task
+  claim/close events already carry the claimant); a human contributor's line
+  aggregates all their sponsored agents.
+- **Public live kanban:** a read-only projection of the board - available-to-claim,
+  in-progress (with claimant badge), done - updating live. Read-only for the human;
+  their agents claim through the normal scoped board API (Milestone D).
+- **Community chat / social area:** the project A2A channel plus a human community
+  channel, rendered in the shared view (humans post via the peer channel, section
+  7). Announcements, task chatter, presence.
+
+### The one new architectural piece: a scoped read-projection sync
+
+Decision 1 says remote humans never hit the owner's local API. So the community
+view is **not** direct API access - it is a **read-only project projection** the
+owner's instance serves to member instances over the peer channel:
+
+- **Projection contents (allowlist, non-sensitive only):** project metadata,
+  board tasks (id, title, status, claimant display, timestamps, labels),
+  contribution rollups, community-channel messages. **Never** files, memory,
+  secrets, canvas payloads, or non-community chat.
+- **Delivery:** pull-on-open (`peer` request `project-snapshot`) plus a live event
+  push (task moves, new community messages) over the existing peer channel; the
+  member instance caches and renders. This reuses the activity-digest transport
+  from Milestone B, widened from a digest to a full scoped projection with a live
+  feed. It is the read counterpart to Milestone D's write delegation.
+- **Authorization:** the projection is minted only for active `member_kind="human"`
+  members of that project; membership-revoke stops the feed and the member
+  instance drops its cached projection (cascade, section 8).
+- **Scope of "public":** v1 the community view is **member-scoped** (collaborators
+  only). A truly public/anonymous view (project `visibility="public"`, an
+  unauthenticated read projection served via the hub) is a clean later toggle on
+  the same projection machinery - noted, not built in v1.
+
+### Reconciliation with earlier decisions
+
+- Decision 2 (minimal human member) is **refined, not overturned**: the human gets
+  a rich read surface but zero board/canvas/file write. The projection is
+  strictly read; all mutation still requires a delegated agent under a scoped JWT.
+- No new credential plane: the projection rides the peer token (section 2), same
+  route family, same rate limits.
+- The leaderboard/streak data is a rollup over the board audit log
+  (`board_audit_store`), which already records claim/close with actor - no new
+  event source needed.
+
+### Slices (F, folds into the phased plan)
+
+- F1 LEAD: read-projection builder on the owner side (scoped snapshot + allowlist
+  filter) plus the `project-snapshot` peer request plus the live-event push; the
+  member-side projection cache.
+- F2 LEAD: contribution/leaderboard rollup over the board audit log (per-contributor
+  and per-sponsored-agent aggregation).
+- F3 FLEET (cards): Community View UI (overview stats panel, leaderboard, read-only
+  live kanban render, community chat pane); projection-cache render tests;
+  membership-revoke drops-projection test; leaderboard-rollup unit tests.
+
+This milestone depends on B (membership) and the peer channel (A); it is
+**pilot-desirable but not pilot-blocking** - the minimal pilot can ship with the
+plain "Shared with me" list and gain the rich view immediately after.
