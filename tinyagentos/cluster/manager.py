@@ -14,6 +14,10 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_TIMEOUT = 30  # seconds before marking worker offline
 
+# Valid worker-initiated status values that gate drain/update protection.
+# Keep in sync with the notification block below and the heartbeat guard.
+_VALID_STATUSES: frozenset[str] = frozenset({"draining", "update-available", "updating"})
+
 
 def _format_hw(hw) -> str:
     """Format hardware info for notification messages."""
@@ -205,6 +209,8 @@ class ClusterManager:
         storage_cap_bytes: int | None = None,
         storage_used_bytes: int | None = None,
         bytes_deduped_total: int | None = None,
+        status: str | None = None,
+        drain_reason: str | None = None,
     ) -> bool:
         """Accept a worker heartbeat.
 
@@ -212,6 +218,13 @@ class ClusterManager:
         (worker agent v2+), overwrite the worker's cached view so the
         cluster-wide catalog stays fresh. Old-style heartbeats that only
         carry load/models still work.
+
+        Worker-initiated state transitions (taOS #890 C2): the worker can
+        report ``status="update-available"`` or ``status="draining"`` to
+        initiate a self-drain. When the worker reports ``"draining"``, the
+        controller treats it identically to a controller-initiated drain:
+        no new tasks are routed, existing leases complete, and the monitor
+        loop auto-completes the drain when all leases are released.
         """
         worker = self._workers.get(name)
         if not worker:
@@ -222,10 +235,18 @@ class ClusterManager:
         # A worker mid graceful-drain keeps heartbeating while it finishes
         # inflight work. Do NOT flip it back to "online" — that would re-enter
         # it into routing/catalog/lease-claims before its leases drain and
-        # defeat the drain (taOS #890). Leave the drain to complete or be
-        # cancelled explicitly; every other status re-onlines as before.
-        if worker.status != "draining":
-            worker.status = "online"
+        # defeat the drain (taOS #890). Similarly, protect "update-available"
+        # so a periodic status-less heartbeat doesn't silently cancel the
+        # update signal before the worker can initiate the drain.
+        # Block status-less heartbeats AND invalid status values for protected
+        # workers. Explicit valid-status transitions (e.g. "update-available"
+        # → "draining") are still honoured.
+        if worker.status not in _VALID_STATUSES or (status is not None and status in _VALID_STATUSES):
+            # Honour worker-initiated status transitions (taOS #890 C2).
+            if status in _VALID_STATUSES:
+                worker.status = status
+            else:
+                worker.status = "online"
         if models is not None:
             worker.models = models
         if backends is not None:
@@ -290,9 +311,41 @@ class ClusterManager:
             worker.storage_used_bytes = int(storage_used_bytes)
         if bytes_deduped_total is not None:
             worker.bytes_deduped_total = int(bytes_deduped_total)
+        # Worker-initiated drain notification (taOS #890 C2).
+        # Emit when the worker transitions into draining/update-available on
+        # its own initiative, so the operator sees it in the activity feed.
+        # Validate: only trusted status values; sanitize drain_reason to
+        # prevent injection into notification UI.
+        if self._notifications and status in _VALID_STATUSES and prev_status not in (status,):
+            reason = (drain_reason or "unspecified").replace("'", "\\'").replace("\\", "\\\\")[:200]
+            event_type = f"worker.{status}" if status != "draining" else "worker.drain"
+            title_map = {
+                "draining": f"Worker '{worker.name}' self-initiated drain",
+                "update-available": f"Worker '{worker.name}' has an update available",
+                "updating": f"Worker '{worker.name}' is updating",
+            }
+            detail_map = {
+                "draining": f"Worker '{worker.name}' is draining for {reason}. Tasks will complete before the update.",
+                "update-available": f"Worker '{worker.name}' reports an update is available (reason: {reason}). It will drain when ready.",
+                "updating": f"Worker '{worker.name}' is applying an update (reason: {reason}). It will restart when done.",
+            }
+            try:
+                asyncio.get_running_loop().create_task(
+                    self._notifications.emit_event(
+                        event_type,
+                        title_map.get(status, f"Worker '{worker.name}' {status}"),
+                        detail_map.get(status, f"Worker '{worker.name}' self-reported {status}: {reason}"),
+                        level="info",
+                    )
+                )
+            except RuntimeError:
+                pass
         # Fire worker.online notification when a previously-offline worker recovers.
         # heartbeat() is sync, so schedule the async emit as a background task.
-        if self._notifications and prev_status in ("offline", "stale"):
+        # Only fire for workers that are genuinely "online" — a worker recovering
+        # from a controller restart into "draining" or "updating" should NOT
+        # trigger a false "back online" event (taOS #890 C2).
+        if self._notifications and prev_status in ("offline", "stale") and worker.status == "online":
             try:
                 asyncio.get_running_loop().create_task(
                     self._notifications.emit_event(
@@ -372,7 +425,7 @@ class ClusterManager:
             return None
         worker_name, _ = parsed
         worker = self._workers.get(worker_name)
-        if worker is None or worker.status not in ("online",):
+        if worker is None or worker.status not in ("online", "update-available"):
             return None
         return worker
 
@@ -611,7 +664,7 @@ class ClusterManager:
         Draining workers are excluded (taOS #890)."""
         eligible = [
             w for w in self._workers.values()
-            if w.status == "online" and capability in w.capabilities
+            if w.status in ("online", "update-available") and capability in w.capabilities
         ]
         return sorted(eligible, key=lambda w: w.load)
 
@@ -654,8 +707,8 @@ class ClusterManager:
         all_capabilities: set[str] = set()
 
         for worker in self._workers.values():
-            if worker.status != "online":
-                continue  # skip offline and draining workers (taOS #890)
+            if worker.status not in ("online", "update-available"):
+                continue  # skip offline, draining, and updating workers (taOS #890)
 
             worker_caps = set(worker.capabilities or [])
             all_capabilities |= worker_caps
@@ -710,8 +763,8 @@ class ClusterManager:
                 # from routing and the aggregate catalog (taOS #1690).
                 if worker.name == "local":
                     continue
-                # Handle online workers that haven't heartbeated
-                if worker.status == "online" and (now - worker.last_heartbeat) > HEARTBEAT_TIMEOUT:
+                # Handle online / update-available workers that haven't heartbeated
+                if worker.status in ("online", "update-available") and (now - worker.last_heartbeat) > HEARTBEAT_TIMEOUT:
                     worker.status = "offline"
                     logger.warning(f"Worker '{worker.name}' marked offline (no heartbeat for {HEARTBEAT_TIMEOUT}s)")
                     if self._notifications:
@@ -733,6 +786,21 @@ class ClusterManager:
                         for lid in offline_lids:
                             self._leases.pop(lid, None)
                             logger.debug("Lease %s released — worker %s went offline", lid, worker.name)
+                    # Cancel any running GPU arbiter tasks for the
+                    # released leases (taOS #890 C2 — cross-cutting wiring).
+                    # This mirrors the cancellation done for stale-drain and
+                    # stale-update workers; the update-available path was
+                    # previously missing it, leaving orphaned arbiter tasks.
+                    if offline_lids and self._gpu_arbiter is not None:
+                        try:
+                            cancelled, already_done = await self._gpu_arbiter.cancel_running_for_leases(set(offline_lids))
+                            logger.info(
+                                "Worker '%s' stale-update-available: arbiter cancelled %d tasks, %d already done",
+                                worker.name, cancelled, already_done)
+                        except Exception:
+                            logger.exception(
+                                "gpu-arbiter: cancel for stale-update-available of '%s' failed",
+                                worker.name)
 
                 # Handle draining workers: auto-complete if no active leases (taOS #890)
                 elif worker.status == "draining":
@@ -783,6 +851,42 @@ class ClusterManager:
                             except Exception:
                                 logger.exception(
                                     "gpu-arbiter: cancel for stale-drain of '%s' failed",
+                                    worker.name)
+                # Handle updating workers: if they stop heartbeating they're
+                # stuck in a bad state — force-offline them so they can re-onboard.
+                elif worker.status == "updating":
+                    if (now - worker.last_heartbeat) > HEARTBEAT_TIMEOUT:
+                        worker.status = "offline"
+                        logger.warning(
+                            "Worker '%s' stuck in 'updating' (no heartbeat for %ds) — marked offline",
+                            worker.name, HEARTBEAT_TIMEOUT,
+                        )
+                        if self._notifications:
+                            await self._notifications.emit_event(
+                                "worker.leave",
+                                f"Worker '{worker.name}' timed out during update",
+                                f"Worker was stuck in 'updating' state. Forced offline to allow re-onboarding.",
+                                level="warning",
+                            )
+                        async with self._lease_lock:
+                            update_lids = [
+                                lid for lid, lease in self._leases.items()
+                                if (parsed := self._parse_resource_id(lease.resource_id))
+                                and parsed[0] == worker.name
+                            ]
+                            for lid in update_lids:
+                                self._leases.pop(lid, None)
+                        # Cancel any running GPU arbiter tasks for the
+                        # released leases (taOS cross-cutting wiring).
+                        if update_lids and self._gpu_arbiter is not None:
+                            try:
+                                cancelled, already_done = await self._gpu_arbiter.cancel_running_for_leases(set(update_lids))
+                                logger.info(
+                                    "Worker '%s' stale-update: arbiter cancelled %d tasks, %d already done",
+                                    worker.name, cancelled, already_done)
+                            except Exception:
+                                logger.exception(
+                                    "gpu-arbiter: cancel for stale-update of '%s' failed",
                                     worker.name)
             async with self._lease_lock:
                 self._sweep_expired_leases()
