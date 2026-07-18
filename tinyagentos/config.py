@@ -81,6 +81,8 @@ class AppConfig:
         if self.github_app_id:
             d["github_app_id"] = self.github_app_id
             d["github_app_private_key"] = self.github_app_private_key
+        elif self.github_app_private_key:
+            d["github_app_private_key"] = self.github_app_private_key
         return d
 
 # rkllama's taOS default port moved from the upstream 8080 to 7833. Installs

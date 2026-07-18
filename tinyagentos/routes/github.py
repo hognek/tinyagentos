@@ -39,16 +39,13 @@ async def _get_token(request: Request) -> str | None:
     """Return a GitHub token or None.
 
     Resolution order:
-    1. GitHub App installation token (when github_app_id and key are configured)
-    2. SecretsStore key ``github_token`` (PAT from device flow)
+    1. SecretsStore key ``github_token`` (PAT from device flow) — user's own
+       identity takes precedence so personal repos and rate limits apply.
+    2. GitHub App installation token (when github_app_id and key are configured)
+       — fallback for repos accessible to the installed app.
     3. ``gh auth token`` subprocess fallback
     """
-    # 1. Try GitHub App installation token
-    token = await _get_app_installation_token(request)
-    if token:
-        return token
-
-    # 2. Try SecretsStore PAT
+    # 1. Try SecretsStore PAT (user's own GitHub identity)
     secrets_store = getattr(request.app.state, "secrets", None)
     if secrets_store is not None:
         try:
@@ -57,6 +54,11 @@ async def _get_token(request: Request) -> str | None:
                 return secret["value"]
         except Exception as exc:
             logger.warning("SecretsStore lookup for github_token failed: %s", exc)
+
+    # 2. Try GitHub App installation token (fallback)
+    token = await _get_app_installation_token(request)
+    if token:
+        return token
 
     # 3. Fallback: gh CLI
     try:

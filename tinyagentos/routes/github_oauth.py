@@ -47,10 +47,12 @@ class DevicePollBody(BaseModel):
 
 
 def _http(request: Request):
+    """Return the shared httpx.AsyncClient from application state."""
     return request.app.state.http_client
 
 
 def _identities_store(request: Request):
+    """Return the GitHubIdentitiesStore from application state."""
     return getattr(request.app.state, "github_identities", None)
 
 
@@ -211,12 +213,12 @@ _INSTALL_PAGE_URL = "https://github.com/apps/{app_slug}/installations/new"
 
 
 def _app_config(request: Request):
-    """Return the AppConfig from app state."""
+    """Return the AppConfig from application state."""
     return getattr(request.app.state, "config", None)
 
 
 def _app_installations_store(request: Request):
-    """Return the GitHubAppInstallations store from app state."""
+    """Return the GitHubAppInstallations store from application state."""
     return getattr(request.app.state, "github_app_installations", None)
 
 
@@ -258,7 +260,7 @@ async def list_app_installations(request: Request):
         # otherwise, record it now (it was installed via GitHub web UI).
         if not installs_store or not installs_store.get(iid):
             if installs_store:
-                installs_store.add(
+                await installs_store.add(
                     installation_id=iid,
                     account_login=account.get("login", ""),
                     account_type=account.get("type", ""),
@@ -304,9 +306,9 @@ async def begin_app_installation(request: Request):
     back to /api/github/app/callback after installation completes.
     """
     cfg = _app_config(request)
-    if not cfg or not cfg.github_app_id:
+    if not cfg or not cfg.github_app_id or not cfg.github_app_private_key:
         return JSONResponse(
-            {"error": "GitHub App not configured"},
+            {"error": "GitHub App not configured (set github_app_id and github_app_private_key in config)"},
             status_code=501,
         )
 
@@ -363,23 +365,8 @@ async def app_installation_callback(
             status_code=502,
         )
 
-    # Fetch account info from the token's scoped API call
-    try:
-        user_resp = await http.get(
-            "https://api.github.com/user",
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
-            },
-            timeout=10,
-        )
-        user_resp.raise_for_status()
-        # For installations, the "user" endpoint returns the GitHub App bot user.
-        # We need the actual installing account. Use /app/installations/{id} instead.
-    except Exception:
-        pass
-
-    # Fetch full installation details with JWT
+    # Fetch installation details with JWT (the /user endpoint returns the bot
+    # user, not the installing account, so we use /app/installations/{id}).
     from tinyagentos.github_app import generate_jwt
     jwt = generate_jwt(cfg.github_app_id, cfg.github_app_private_key)
     install_resp = await http.get(
@@ -395,13 +382,18 @@ async def app_installation_callback(
         account = inst_data.get("account", {})
         store = _app_installations_store(request)
         if store:
-            store.add(
+            await store.add(
                 installation_id=installation_id,
                 account_login=account.get("login", ""),
                 account_type=account.get("type", ""),
                 account_avatar_url=account.get("avatar_url", ""),
                 repository_selection=inst_data.get("repository_selection", "selected"),
             )
+    else:
+        logger.warning(
+            "Failed to fetch installation %s details (HTTP %s), redirecting anyway",
+            installation_id, install_resp.status_code,
+        )
 
     # Redirect to the secrets page so the user sees their installation
     from fastapi.responses import RedirectResponse
@@ -425,13 +417,14 @@ async def delete_app_installation(request: Request, installation_id: int):
         cfg.github_app_id, cfg.github_app_private_key, installation_id, http
     )
 
-    store = _app_installations_store(request)
-    if store:
-        store.remove(installation_id)
-
     if not deleted:
         return JSONResponse(
             {"error": "Installation not found or could not be deleted"},
             status_code=404,
         )
+
+    store = _app_installations_store(request)
+    if store:
+        await store.remove(installation_id)
+
     return {"status": "deleted"}
