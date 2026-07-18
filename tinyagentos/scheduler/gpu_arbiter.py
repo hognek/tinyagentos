@@ -422,12 +422,17 @@ class GpuArbiter:
             reason=f"no cluster worker with {required_vram_mb} MiB free VRAM",
         )
 
-    async def _renew_lease_loop(self, lease_id: str, stop_event: asyncio.Event) -> None:
+    async def _renew_lease_loop(
+        self, lease_id: str, stop_event: asyncio.Event,
+        task_to_cancel: asyncio.Task | None = None,
+    ) -> None:
         """Periodically renew a lease until *stop_event* is set.
 
         Renews every 200 s so the lease never expires mid-run (the claim
-        TTL is 300 s).  Returns silently when the lease expires or
-        renewal fails — the caller's finally path still releases it.
+        TTL is 300 s).  When *task_to_cancel* is provided and a renewal
+        failure or expiry is detected the referenced task is cancelled so
+        it doesn't keep executing GPU work without a valid lease (taOS
+        #1984 — lease-loss detection).
         """
         RENEW_INTERVAL = 200
         while not stop_event.is_set():
@@ -443,14 +448,20 @@ class GpuArbiter:
                     )
                     if renewed is None:
                         logger.warning(
-                            "gpu-arbiter: lease %s expired mid-renewal", lease_id,
+                            "gpu-arbiter: lease %s expired mid-renewal — "
+                            "cancelling running task", lease_id,
                         )
+                        if task_to_cancel is not None and not task_to_cancel.done():
+                            task_to_cancel.cancel()
                         return
                     logger.debug("gpu-arbiter: renewed lease %s", lease_id)
             except Exception:
                 logger.exception(
-                    "gpu-arbiter: failed to renew lease %s", lease_id,
+                    "gpu-arbiter: failed to renew lease %s — "
+                    "cancelling running task", lease_id,
                 )
+                if task_to_cancel is not None and not task_to_cancel.done():
+                    task_to_cancel.cancel()
                 return
 
     async def _run_gpu_task(
@@ -483,8 +494,9 @@ class GpuArbiter:
                 # Start periodic lease renewal so the lease doesn't expire
                 # mid-run (taOS #1864 defect 4 — fixed 300 s TTL).
                 renew_stop = asyncio.Event()
+                current = asyncio.current_task()
                 renew_task = asyncio.create_task(
-                    self._renew_lease_loop(lease_id, renew_stop),
+                    self._renew_lease_loop(lease_id, renew_stop, current),
                     name=f"gpu-arbiter-renew-{task.id}",
                 )
             current = asyncio.current_task()
@@ -625,6 +637,8 @@ class GpuArbiter:
 
     async def _process_queue(self) -> None:
         try:
+            consecutive_failures = 0
+            MAX_CONSECUTIVE_FAILURES = 10
             while True:
                 try:
                     await asyncio.wait_for(self._wake.wait(),
@@ -635,10 +649,23 @@ class GpuArbiter:
                 if not self._paused:  # taOS #796: skip drain while paused
                     try:
                         await self._drain_queue()
-                    except Exception:
+                        consecutive_failures = 0  # reset on success
+                    except (NoResourceAvailableError, asyncio.TimeoutError, OSError):
+                        consecutive_failures += 1
+                        backoff = min(2 * (2 ** consecutive_failures), 60)
                         logger.exception(
-                            "gpu-arbiter: _drain_queue raised — continuing loop"
+                            "gpu-arbiter: _drain_queue raised (consecutive=%d/%d) — "
+                            "backing off %ds",
+                            consecutive_failures, MAX_CONSECUTIVE_FAILURES, backoff,
                         )
+                        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                            logger.critical(
+                                "gpu-arbiter: _drain_queue failed %d consecutive "
+                                "times — stopping queue processor",
+                                consecutive_failures,
+                            )
+                            return
+                        await asyncio.sleep(backoff)
         except asyncio.CancelledError:
             raise
 
