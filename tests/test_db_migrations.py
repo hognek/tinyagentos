@@ -33,10 +33,11 @@ def _open(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def _applied_versions(conn: sqlite3.Connection) -> list[int]:
+def _applied_versions(conn: sqlite3.Connection, namespace: str = "legacy") -> list[int]:
     try:
         rows = conn.execute(
-            "SELECT version FROM schema_migrations ORDER BY version"
+            "SELECT version FROM schema_migrations WHERE store_name = ? ORDER BY version",
+            (namespace,),
         ).fetchall()
         return [r[0] for r in rows]
     except sqlite3.OperationalError:
@@ -126,6 +127,56 @@ class TestRunMigrationsSync:
         assert _applied_versions(conn) == []
         conn.close()
 
+    def test_namespace_isolation(self, tmp_path):
+        """Two namespaces can share a DB file without version collisions."""
+        conn = _open(tmp_path / "ns.db")
+        run_migrations(conn, [(1, V1_SQL)], namespace="StoreA")
+        run_migrations(conn, [(1, V1_SQL)], namespace="StoreB")
+        assert _applied_versions(conn, namespace="StoreA") == [1]
+        assert _applied_versions(conn, namespace="StoreB") == [1]
+        conn.close()
+
+    def test_namespace_backfill_legacy(self, tmp_path):
+        """Pre-namespace DB rows are backfilled with 'legacy' and PK rebuilt."""
+        db_path = tmp_path / "legacy.db"
+        # Create a pre-namespace schema_migrations table with
+        # the table needed by V2_SQL already in place (mimicking a real
+        # legacy DB that already went through v1).
+        conn = _open(db_path)
+        conn.executescript(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "    version INTEGER PRIMARY KEY,"
+            "    applied_at REAL NOT NULL"
+            ");"
+        )
+        conn.executescript(V1_SQL)
+        conn.execute(
+            "INSERT INTO schema_migrations (version, applied_at) VALUES (1, 0.0)"
+        )
+        conn.commit()
+        conn.close()
+
+        # Now run with the new migration runner — should backfill, rebuild
+        # the PK to composite, and apply the pending v2 migration.
+        conn = _open(db_path)
+        run_migrations(conn, [(2, V2_SQL)], namespace="legacy")
+        assert _applied_versions(conn, namespace="legacy") == [1, 2]
+
+        # PK should now be composite (store_name, version).
+        pk_cols = [
+            row[1]
+            for row in conn.execute(
+                "PRAGMA table_info(schema_migrations)"
+            ).fetchall()
+            if row[5]
+        ]
+        assert pk_cols == ["store_name", "version"]
+
+        # A second namespace can record the same version number.
+        run_migrations(conn, [(1, V1_SQL)], namespace="OtherStore")
+        assert _applied_versions(conn, namespace="OtherStore") == [1]
+        conn.close()
+
 
 class TestApplyWalPragmasSync:
     def test_wal_mode_set(self, tmp_path):
@@ -158,7 +209,7 @@ class TestRunMigrationsAsync:
         await run_migrations_async(conn, [(1, V1_SQL), (2, V2_SQL)])
 
         cur = await conn.execute(
-            "SELECT version FROM schema_migrations ORDER BY version"
+            "SELECT version FROM schema_migrations WHERE store_name = 'legacy' ORDER BY version"
         )
         versions = [r[0] for r in await cur.fetchall()]
         assert versions == [1, 2]
@@ -178,7 +229,7 @@ class TestRunMigrationsAsync:
         await run_migrations_async(conn, [(1, V1_SQL)])
 
         cur = await conn.execute(
-            "SELECT version FROM schema_migrations ORDER BY version"
+            "SELECT version FROM schema_migrations WHERE store_name = 'legacy' ORDER BY version"
         )
         versions = [r[0] for r in await cur.fetchall()]
         assert versions == [1]
@@ -190,7 +241,7 @@ class TestRunMigrationsAsync:
         await run_migrations_async(conn, [(1, V1_SQL)])
         await run_migrations_async(conn, [(1, V1_SQL)])
         cur = await conn.execute(
-            "SELECT version FROM schema_migrations ORDER BY version"
+            "SELECT version FROM schema_migrations WHERE store_name = 'legacy' ORDER BY version"
         )
         versions = [r[0] for r in await cur.fetchall()]
         assert versions == [1]
