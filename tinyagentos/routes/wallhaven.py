@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import httpx
 from fastapi import APIRouter, Request, Query
 from fastapi.responses import JSONResponse
@@ -7,6 +9,8 @@ from fastapi.responses import JSONResponse
 router = APIRouter()
 
 WALLHAVEN_BASE = "https://wallhaven.cc/api/v1"
+CATEGORY_PURITY_RE = re.compile(r"^[01]{3}$")
+_MAX_RESPONSE_BYTES = 1_000_000  # 1 MB cap
 
 
 @router.get("/api/wallhaven/search")
@@ -23,6 +27,16 @@ async def wallhaven_search(
     Keyless by default (~45 req/min). Pass WALLHAVEN_API_KEY env var for higher
     rate limits and NSFW access.
     """
+    if not CATEGORY_PURITY_RE.match(categories):
+        return JSONResponse(
+            {"error": "categories must be 3 characters of 0 or 1"},
+            status_code=400,
+        )
+    if not CATEGORY_PURITY_RE.match(purity):
+        return JSONResponse(
+            {"error": "purity must be 3 characters of 0 or 1"},
+            status_code=400,
+        )
     config = request.app.state.config
     api_key: str | None = getattr(config, "wallhaven_api_key", None)
 
@@ -68,4 +82,17 @@ async def wallhaven_search(
             status_code=502,
         )
 
-    return JSONResponse(resp.json())
+    content = resp.content
+    if len(content) > _MAX_RESPONSE_BYTES:
+        return JSONResponse(
+            {"error": "Wallhaven response too large"},
+            status_code=502,
+        )
+    try:
+        data = resp.json()
+    except ValueError:
+        return JSONResponse(
+            {"error": "Wallhaven returned invalid JSON"},
+            status_code=502,
+        )
+    return JSONResponse(data)

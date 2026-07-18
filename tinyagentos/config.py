@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os as _os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -178,7 +179,6 @@ def load_config(path: Path) -> AppConfig:
         config_path=path,
     )
     # Wallhaven API key is env-only (never written to config.yaml)
-    import os as _os
     cfg.wallhaven_api_key = _os.environ.get("WALLHAVEN_API_KEY") or None
     if _pin_applied:
         save_config(cfg, path)
