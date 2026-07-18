@@ -178,7 +178,7 @@ class TestBackendToMethodMapping:
 
     @pytest.mark.asyncio
     async def test_unknown_backend_returns_500_not_exception(self, client, fake_registry):
-        """A backend_id absent from _BACKEND_TO_METHOD returns HTTP 500, not a traceback."""
+        """A backend_id absent from _BACKEND_TO_METHOD returns HTTP 422, not a traceback."""
         # Construct a manifest whose variant declares an unmapped backend.
         unknown_manifest = MagicMock()
         unknown_manifest.id = "test-model"
@@ -224,7 +224,7 @@ class TestBackendToMethodMapping:
                 "manifest_id": "test-model",
                 "variant_id": "v1",
             })
-        assert r.status_code == 500
+        assert r.status_code == 422
         assert "_BACKEND_TO_METHOD" in r.json()["error"]
 
 
