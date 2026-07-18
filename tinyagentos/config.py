@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os as _os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,6 +56,7 @@ class AppConfig:
     archived_agents: list[dict] = field(default_factory=list)
     archive: dict = field(default_factory=lambda: DEFAULT_ARCHIVE_CONFIG.copy())
     memory_url: str = "http://localhost:7900"
+    wallhaven_api_key: str | None = None
     config_path: Path | None = None
 
     def to_dict(self) -> dict:
@@ -125,10 +127,18 @@ def _migrate_legacy_rkllama_backend_name(backends: list[dict]) -> None:
 
 
 def load_config(path: Path) -> AppConfig:
+    # Wallhaven API key is env-only (never written to config.yaml).
+    # Read it once before any branching so both fresh-install and
+    # existing-config paths pick it up.
+    wallhaven_api_key: str | None = _os.environ.get("WALLHAVEN_API_KEY") or None
+
     if not path.exists():
         # Fresh install: build defaults with litellm_port explicitly recorded
         # so the choice is durable and never falls back to a hardcoded default.
-        cfg = AppConfig(config_path=path)
+        cfg = AppConfig(
+            config_path=path,
+            wallhaven_api_key=wallhaven_api_key,
+        )
         cfg.server.setdefault("litellm_port", _LITELLM_PORT_NEW)
         return cfg
     text = path.read_text()
@@ -175,6 +185,7 @@ def load_config(path: Path) -> AppConfig:
         archive=archive_cfg,
         memory_url=data.get("memory_url", "http://localhost:7900"),
         config_path=path,
+        wallhaven_api_key=wallhaven_api_key,
     )
     if _pin_applied:
         save_config(cfg, path)
