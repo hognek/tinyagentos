@@ -6,8 +6,8 @@ const MOCK_SEARCH_RESPONSE = {
   data: [
     {
       id: "abc123",
-      url: "https://w.wallhaven.cc/full/ab/wallhaven-abc123.jpg",
-      path: "https://wallhaven.cc/w/abc123",
+      url: "https://wallhaven.cc/w/abc123",
+      path: "https://w.wallhaven.cc/full/ab/wallhaven-abc123.jpg",
       thumbs: {
         small: "https://th.wallhaven.cc/small/ab/abc123.jpg",
         original: "https://th.wallhaven.cc/original/ab/abc123.jpg",
@@ -19,8 +19,8 @@ const MOCK_SEARCH_RESPONSE = {
     },
     {
       id: "def456",
-      url: "https://w.wallhaven.cc/full/de/wallhaven-def456.jpg",
-      path: "https://wallhaven.cc/w/def456",
+      url: "https://wallhaven.cc/w/def456",
+      path: "https://w.wallhaven.cc/full/de/wallhaven-def456.jpg",
       thumbs: {
         small: "https://th.wallhaven.cc/small/de/def456.jpg",
         original: "https://th.wallhaven.cc/original/de/def456.jpg",

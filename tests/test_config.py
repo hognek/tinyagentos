@@ -20,6 +20,22 @@ class TestLoadConfig:
         assert config.backends == []
         assert config.agents == []
 
+    def test_wallhaven_api_key_picked_up_on_fresh_install(self, tmp_path, monkeypatch):
+        """WALLHAVEN_API_KEY env var is read before branching, so fresh
+        installs (missing config file) also get the key."""
+        monkeypatch.setenv("WALLHAVEN_API_KEY", "test-fresh-key")
+        config = load_config(tmp_path / "nonexistent.yaml")
+        assert config.wallhaven_api_key == "test-fresh-key"
+
+    def test_wallhaven_api_key_picked_up_on_existing_config(
+        self, tmp_data_dir, monkeypatch
+    ):
+        """WALLHAVEN_API_KEY env var is read before branching when config
+        file exists too."""
+        monkeypatch.setenv("WALLHAVEN_API_KEY", "test-existing-key")
+        config = load_config(tmp_data_dir / "config.yaml")
+        assert config.wallhaven_api_key == "test-existing-key"
+
     def test_rejects_invalid_yaml(self, tmp_path):
         bad = tmp_path / "config.yaml"
         bad.write_text(": : : not valid yaml [[[")
