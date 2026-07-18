@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS todo_lists (
     id            TEXT PRIMARY KEY,
     owner_user_id TEXT NOT NULL,
     title         TEXT NOT NULL DEFAULT '',
+    migrated_from TEXT,
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL,
     archived_at   REAL
@@ -62,13 +63,16 @@ class TodoStore(BaseStore):
 
     # ------------------------------------------------------------------ lists
 
-    async def create_list(self, owner_user_id: str, title: str = "") -> dict:
+    async def create_list(
+        self, owner_user_id: str, title: str = "", migrated_from: str | None = None,
+    ) -> dict:
         list_id = _new_id("tl")
         now = time.time()
         await self._db.execute(
-            "INSERT INTO todo_lists (id, owner_user_id, title, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (list_id, owner_user_id, title, now, now),
+            "INSERT INTO todo_lists "
+            "(id, owner_user_id, title, migrated_from, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (list_id, owner_user_id, title, migrated_from, now, now),
         )
         await self._db.commit()
         return await self.get_list(list_id)
@@ -116,6 +120,13 @@ class TodoStore(BaseStore):
         await self._db.execute(
             "UPDATE todo_lists SET archived_at = NULL, updated_at = ? WHERE id = ?",
             (time.time(), list_id),
+        )
+        await self._db.commit()
+
+    async def set_migrated_from(self, list_id: str, source_doc_id: str) -> None:
+        await self._db.execute(
+            "UPDATE todo_lists SET migrated_from = ?, updated_at = ? WHERE id = ?",
+            (source_doc_id, time.time(), list_id),
         )
         await self._db.commit()
 
