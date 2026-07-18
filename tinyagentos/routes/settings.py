@@ -1105,7 +1105,7 @@ async def _probe_taosmd(request: Request, url: str) -> bool:
             timeout=httpx.Timeout(3.0, connect=2.0),
         )
         return resp.status_code == 200
-    except Exception:
+    except (httpx.RequestError, httpx.InvalidURL):
         return False
 
 
