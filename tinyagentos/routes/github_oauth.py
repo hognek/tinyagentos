@@ -306,7 +306,9 @@ async def list_app_installations(request: Request):
         )
         repos: list[dict] = []
         if token:
-            repos = await list_installation_repos_cached(iid, token, http)
+            repos = await list_installation_repos_cached(
+                iid, token, http, app_id=cfg.github_app_id, private_key=private_key
+            )
         return iid, inst, repos
 
     valid = [inst for inst in raw_installations if inst.get("id")]
@@ -451,10 +453,20 @@ async def app_installation_callback(
         )
     else:
         logger.warning(
-            "Failed to fetch installation %s details (HTTP %s), redirecting anyway",
+            "Failed to fetch installation %s details (HTTP %s), saving minimal "
+            "record — the install itself succeeded",
             installation_id, install_resp.status_code,
         )
-        return RedirectResponse(url="/app/secrets?install_error=1", status_code=302)
+        store = _app_installations_store(request)
+        if store and not store.get(installation_id):
+            await store.add(
+                installation_id=installation_id,
+                account_login="",
+                account_type="",
+                account_avatar_url="",
+                repository_selection="selected",
+            )
+        return RedirectResponse(url="/app/secrets?install_warning=1", status_code=302)
 
     return RedirectResponse(url="/app/secrets", status_code=302)
 
