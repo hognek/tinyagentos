@@ -20,7 +20,22 @@
  * - Idempotent install — calling installAuthGuard() twice is a no-op.
  */
 
+import { withCsrf, getCsrfToken } from "./csrf";
+
 const SESSION_EXPIRED_EVENT = "taos-session-expired";
+const CSRF_MUTATING = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+
+// Same-origin iff the resolved URL origin matches this page's. Parse the URL
+// (not a string prefix, which a protocol-relative //evil.example or a lookalike
+// host <origin>.evil.com would defeat, leaking the token).
+function isSameOrigin(u: string): boolean {
+  try {
+    if (typeof window === "undefined" || !window.location) return false;
+    return new URL(u, window.location.href).origin === window.location.origin;
+  } catch {
+    return false;
+  }
+}
 
 // API prefixes whose 401s do NOT mean the controller session expired.
 // /api/account/* proxies to the taos.my cloud account, a separate auth
@@ -46,7 +61,36 @@ export function installAuthGuard(): void {
     input: RequestInfo | URL,
     init?: RequestInit,
   ): Promise<Response> {
-    const response = await originalFetch(input, init);
+    // Attach the CSRF double-submit header to same-origin mutating requests so
+    // the backend's router-wide verify_csrf gate is satisfied at every call
+    // site, not only the handful that wrap withCsrf() by hand. Covers both
+    // string/URL inputs (via withCsrf on init) and Request-object inputs (by
+    // rebuilding the Request with the header). Gated to same-origin so the token
+    // never leaks off-site; never overwrites an X-CSRF-Token a caller already set.
+    let effectiveInput: RequestInfo | URL = input;
+    let effectiveInit = init;
+    if (typeof input === "string" || input instanceof URL) {
+      if (isSameOrigin(input.toString())) effectiveInit = withCsrf(init);
+    } else if (typeof Request !== "undefined" && input instanceof Request) {
+      try {
+        const method = (input.method || "GET").toUpperCase();
+        if (
+          CSRF_MUTATING.has(method) &&
+          isSameOrigin(input.url) &&
+          !input.headers.has("X-CSRF-Token")
+        ) {
+          const token = getCsrfToken();
+          if (token) {
+            const headers = new Headers(input.headers);
+            headers.set("X-CSRF-Token", token);
+            effectiveInput = new Request(input, { headers });
+          }
+        }
+      } catch {
+        effectiveInput = input;
+      }
+    }
+    const response = await originalFetch(effectiveInput, effectiveInit);
     if (response.status === 401) {
       let url = "";
       if (typeof input === "string") url = input;
