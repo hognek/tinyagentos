@@ -4,6 +4,10 @@
 **Task:** taOS #1937 C0
 **Purpose:** Scoping document — no file changes, just counting and mapping.
 
+> **Note on search scope:** This document contains many `tinyagentos` occurrences.
+> All search/count commands in this audit exclude `docs/audit/tinyagentos-rename-blast-radius.md`
+> so the audit file itself does not inflate totals.
+
 ---
 
 ## 1. Executive Summary
@@ -43,7 +47,7 @@ The package **directory** is `tinyagentos/` and the package **name** in `pyproje
 - **pyproject.toml `[project] name`** field
 
 **Optimistic note:** The `[project.scripts]` section already has `taos` aliases registered:
-```
+```toml
 taos = "tinyagentos.app:main"        # already exists
 taos-gui = "tinyagentos.app:gui"
 taos-worker-ctl = "tinyagentos.cli.worker:main"
@@ -54,7 +58,7 @@ The entry points `tinyagentos` and `tinyagentos-worker` would need migration, bu
 ### 2.2 pyproject.toml
 
 **Critical fields:**
-```
+```toml
 [project]
 name = "tinyagentos"                              # → "taos"
 
@@ -269,7 +273,10 @@ These are path triggers — must be updated to `taos/` equivalents.
 | #1877 hognek | feat(desktop): MessagesApp extract | Desktop | MED |
 | #1875 hognek | ci: ruff + npm audit | CI | LOW — CI config only |
 
-**Finding:** Nearly every open PR (28/30) has HIGH conflict risk because they touch files inside `tinyagentos/` that would need import/path updates. The only LOW-risk PRs are #1935 (design doc) and #1875 (CI config).
+**Finding:** The majority of open PRs (23/30) have HIGH conflict risk because they touch files
+inside `tinyagentos/` that would need import/path updates. 5 have MEDIUM risk (desktop,
+browser, update, and CI changes touching fewer Python files), and 2 have LOW risk
+(#1935 design doc, #1875 CI config).
 
 **Strategy:** The rename is so pervasive that it MUST be done in a coordinated "flag day" where all open PRs are either merged or rebased first. There's no practical way to do it incrementally without merge conflicts on every open branch.
 
@@ -278,7 +285,11 @@ These are path triggers — must be updated to `taos/` equivalents.
 ## 5. Execution Plan Notes
 
 ### Phase 0: Merge or close all open PRs
-The rename touches 1,183 files. Any open PR touching ANY Python file will conflict.
+The rename touches 1,183 files. Any open PR that touches a path being renamed
+(`tinyagentos/` → `taos/`) or references `tinyagentos` in strings, imports, or
+configuration will conflict. PRs that only touch completely new files or files
+with no `tinyagentos` references (like CI-only changes) are lower risk — but
+given the package's pervasive import footprint, most open PRs will conflict.
 
 ### Phase 1: Directory rename + imports
 1. `git mv tinyagentos/ taos/`
@@ -303,7 +314,7 @@ The rename touches 1,183 files. Any open PR touching ANY Python file will confli
 
 ### Phase 4: Cleanup
 1. Remove legacy `tinyagentos`/`tinyagentos-worker` entry points
-2. Verify no stale references with `grep -r "tinyagentos" --exclude-dir=.git`
+2. Verify no stale references with `grep -r "tinyagentos" --exclude-dir=.git --exclude="docs/audit/tinyagentos-rename-blast-radius.md"`
 3. Update PyPI package (new `taos` package, deprecate `tinyagentos`)
 
 ---
