@@ -6,11 +6,11 @@ from tinyagentos.userspace import container_deploy as cd
 @pytest.mark.asyncio
 async def test_deploy_publishes_first_port_bound_to_localhost_and_applies_caps():
     with patch.object(cd.shutil, "which", return_value="/usr/bin/docker"), \
-         patch.object(cd, "_find_free_port", return_value=13042), \
+         patch.object(cd, "allocate_host_port", return_value=30421), \
          patch.object(cd.DockerBackend, "create_container", new_callable=AsyncMock) as create:
         create.return_value = {"success": True, "name": "taos-app-echo"}
         out = await cd.deploy_app_container("echo", {"image": "hashicorp/http-echo:latest", "ports": [5678]})
-        assert out == {"success": True, "host": "127.0.0.1", "port": 13042}
+        assert out == {"success": True, "host": "127.0.0.1", "port": 30421}
         kwargs = create.call_args.kwargs
         args = create.call_args.args
         assert args[0] == "taos-app-echo"
@@ -18,7 +18,7 @@ async def test_deploy_publishes_first_port_bound_to_localhost_and_applies_caps()
         # (host_port, container_port) tuple reached the backend -- the actual
         # 127.0.0.1-only binding is enforced inside DockerBackend.create_container
         # (see test_docker_backend.py), not re-verified here.
-        assert kwargs["ports"] == [(13042, 5678)]
+        assert kwargs["ports"] == [(30421, 5678)]
         # untrusted app backend gets a conservative, fixed resource cap
         assert kwargs["memory_limit"] == "512m"
         assert kwargs["cpu_limit"] == 1
@@ -35,7 +35,7 @@ async def test_deploy_fails_cleanly_without_docker():
 @pytest.mark.asyncio
 async def test_deploy_propagates_backend_error():
     with patch.object(cd.shutil, "which", return_value="/usr/bin/docker"), \
-         patch.object(cd, "_find_free_port", return_value=13042), \
+         patch.object(cd, "allocate_host_port", return_value=30421), \
          patch.object(cd.DockerBackend, "create_container", new_callable=AsyncMock) as create:
         create.return_value = {"success": False, "error": "image not found"}
         out = await cd.deploy_app_container("echo", {"image": "nope", "ports": [5678]})
@@ -45,14 +45,14 @@ async def test_deploy_propagates_backend_error():
 @pytest.mark.asyncio
 async def test_deploy_retries_on_port_race():
     with patch.object(cd.shutil, "which", return_value="/usr/bin/docker"), \
-         patch.object(cd, "_find_free_port", side_effect=[13042, 13043]), \
+         patch.object(cd, "allocate_host_port", side_effect=[30421, 30422]), \
          patch.object(cd.DockerBackend, "create_container", new_callable=AsyncMock) as create:
         create.side_effect = [
             {"success": False, "error": "port is already allocated"},
             {"success": True, "name": "taos-app-echo"},
         ]
         out = await cd.deploy_app_container("echo", {"image": "x", "ports": [5678]})
-        assert out == {"success": True, "host": "127.0.0.1", "port": 13043}
+        assert out == {"success": True, "host": "127.0.0.1", "port": 30422}
         assert create.await_count == 2
 
 

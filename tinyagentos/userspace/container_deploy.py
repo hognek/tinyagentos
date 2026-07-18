@@ -8,27 +8,15 @@ low-level tinyagentos.containers Docker primitive. The agent deploy path
 from __future__ import annotations
 
 import shutil
-import socket
-from contextlib import closing
 
 from tinyagentos.containers.docker import DockerBackend
+from tinyagentos.installers.port_allocator import allocate_host_port
 
 # Untrusted third-party app backends get a conservative, fixed resource cap --
 # there is no per-app config for this today and these apps are not vetted the
 # way agent containers are.
 _MEMORY_LIMIT = "512m"
 _CPU_LIMIT = 1
-
-
-def _find_free_port(start: int = 13000, end: int = 14000) -> int:
-    for port in range(start, end):
-        with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-            try:
-                s.bind(("127.0.0.1", port))
-                return port
-            except OSError:
-                continue
-    raise RuntimeError("no free port available in range")
 
 
 def _app_container_name(app_id: str) -> str:
@@ -57,8 +45,9 @@ async def deploy_app_container(app_id: str, container_spec: dict) -> dict:
     # on the narrow TOCTOU window where the chosen port gets taken before
     # docker binds.
     last_error = "deploy failed"
+    tried: set[int] = set()
     for _ in range(3):
-        host_port = _find_free_port()
+        host_port = allocate_host_port(app_id, exclude=tried)
         result = await backend.create_container(
             name,
             image=image,
@@ -69,6 +58,7 @@ async def deploy_app_container(app_id: str, container_spec: dict) -> dict:
         if result.get("success"):
             return {"success": True, "host": "127.0.0.1", "port": host_port}
         last_error = result.get("error", "container create failed")
+        tried.add(host_port)
         if "port is already allocated" not in last_error and "address already in use" not in last_error:
             break  # a non-port error won't be fixed by retrying
     return {"success": False, "error": last_error}
