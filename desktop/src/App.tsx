@@ -33,7 +33,7 @@ import { useTaosAgentStore } from "@/stores/taos-agent-store";
 import { InstallPromptBanner } from "@/shell/InstallPromptBanner";
 import { EffectsLayer } from "@/theme/effects/EffectsLayer";
 import { SafetyFloor } from "@/components/SafetyFloor";
-import { withCsrf } from "@/lib/csrf";
+import { withCsrf, getCsrfToken } from "@/lib/csrf";
 
 interface SystemShortcutsProps {
   toggleSearch: () => void;
@@ -112,18 +112,43 @@ function SystemShortcuts({ toggleSearch, toggleLaunchpad, toggleAssistant }: Sys
   useShortcut("Ctrl+9", useCallback(() => openPinned(8), [openPinned]), "Open pinned app 9", "system");
 
   // Ctrl+Shift+K — emergency kill switch: stops all running agents
+  const addNotification = useNotificationStore((s) => s.addNotification);
+
   const killAllAgents = useCallback(async () => {
+    if (!getCsrfToken()) {
+      addNotification({
+        source: "system",
+        title: "Kill switch blocked",
+        body: "CSRF token missing — refresh the page and try again.",
+        level: "error",
+      });
+      return;
+    }
     try {
-      await fetch("/api/agents/bulk/stop", {
+      const resp = await fetch("/api/agents/bulk/stop", {
         method: "POST",
         credentials: "include",
-        headers: withCsrf({ method: "POST" })?.headers,
+        headers: withCsrf({ method: "POST" }).headers,
       });
+      if (!resp.ok) {
+        throw new Error(`Server returned ${resp.status}`);
+      }
       window.dispatchEvent(new CustomEvent("taos:agents-changed"));
-    } catch {
-      // best-effort
+      addNotification({
+        source: "system",
+        title: "Agents stopped",
+        body: "Emergency kill switch activated — all agents stopped.",
+        level: "success",
+      });
+    } catch (err) {
+      addNotification({
+        source: "system",
+        title: "Kill switch failed",
+        body: `Could not stop agents: ${err instanceof Error ? err.message : "unknown error"}`,
+        level: "error",
+      });
     }
-  }, []);
+  }, [addNotification]);
   useShortcut("Ctrl+Shift+K", killAllAgents, "Stop all agents", "system");
 
   return null;
