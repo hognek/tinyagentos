@@ -97,25 +97,51 @@ def apply_wal_pragmas(conn: sqlite3.Connection) -> None:
 
 
 def _ensure_namespace_column(conn: sqlite3.Connection) -> None:
-    """Add ``store_name`` column to a pre-namespace ``schema_migrations``
-    table and backfill existing rows with ``'legacy'``.
+    """Add ``store_name`` column and rebuild PK on legacy ``schema_migrations``.
 
-    This is a best-effort migration: if the column already exists the
-    ALTER TABLE is silently skipped (SQLite does not support IF NOT EXISTS
-    on ALTER TABLE, so we catch the OperationalError).
+    Legacy databases have a ``schema_migrations`` table with
+    ``PRIMARY KEY(version)``.  This function adds the missing ``store_name``
+    column and rebuilds the table with ``PRIMARY KEY(store_name, version)``
+    so that namespace isolation works correctly.
     """
-    try:
-        conn.execute(
-            "ALTER TABLE schema_migrations ADD COLUMN store_name TEXT NOT NULL DEFAULT 'legacy'"
+    col_info = conn.execute("PRAGMA table_info(schema_migrations)").fetchall()
+    col_names = [row[1] for row in col_info]
+
+    if "store_name" not in col_names:
+        try:
+            conn.execute(
+                "ALTER TABLE schema_migrations ADD COLUMN store_name TEXT NOT NULL DEFAULT 'legacy'"
+            )
+            conn.commit()
+            logger.debug(
+                "db_migrations: added store_name column to schema_migrations, "
+                "backfilled existing rows with 'legacy'"
+            )
+        except sqlite3.OperationalError:
+            pass
+        # Re-fetch column info after ALTER TABLE.
+        col_info = conn.execute("PRAGMA table_info(schema_migrations)").fetchall()
+
+    # Rebuild with composite PK if still using legacy version-only PK.
+    pk_cols = [row[1] for row in col_info if row[5]]
+    if "store_name" not in pk_cols:
+        conn.executescript(
+            "CREATE TABLE schema_migrations_new ("
+            "    store_name  TEXT    NOT NULL,"
+            "    version     INTEGER NOT NULL,"
+            "    applied_at  REAL    NOT NULL,"
+            "    PRIMARY KEY (store_name, version)"
+            ");"
+            "INSERT INTO schema_migrations_new "
+            "SELECT store_name, version, applied_at FROM schema_migrations;"
+            "DROP TABLE schema_migrations;"
+            "ALTER TABLE schema_migrations_new RENAME TO schema_migrations;"
         )
         conn.commit()
         logger.debug(
-            "db_migrations: added store_name column to schema_migrations, "
-            "backfilled existing rows with 'legacy'"
+            "db_migrations: rebuilt schema_migrations with composite PK "
+            "(store_name, version)"
         )
-    except sqlite3.OperationalError:
-        # Column already exists — nothing to do.
-        pass
 
 
 def run_migrations(
@@ -215,24 +241,48 @@ async def apply_wal_pragmas_async(conn) -> None:
 
 
 async def _ensure_namespace_column_async(conn) -> None:
-    """Add ``store_name`` column to a pre-namespace ``schema_migrations``
-    table and backfill existing rows with ``'legacy'``.
+    """Add ``store_name`` column and rebuild PK on legacy ``schema_migrations``.
 
     Async variant of ``_ensure_namespace_column``.
     """
-    try:
-        await conn.execute(
-            "ALTER TABLE schema_migrations ADD COLUMN store_name TEXT NOT NULL DEFAULT 'legacy'"
+    col_info = await (await conn.execute("PRAGMA table_info(schema_migrations)")).fetchall()
+    col_names = [row[1] for row in col_info]
+
+    if "store_name" not in col_names:
+        try:
+            await conn.execute(
+                "ALTER TABLE schema_migrations ADD COLUMN store_name TEXT NOT NULL DEFAULT 'legacy'"
+            )
+            await conn.commit()
+            logger.debug(
+                "db_migrations: added store_name column to schema_migrations, "
+                "backfilled existing rows with 'legacy'"
+            )
+        except sqlite3.OperationalError:
+            pass
+        # Re-fetch column info after ALTER TABLE.
+        col_info = await (await conn.execute("PRAGMA table_info(schema_migrations)")).fetchall()
+
+    # Rebuild with composite PK if still using legacy version-only PK.
+    pk_cols = [row[1] for row in col_info if row[5]]
+    if "store_name" not in pk_cols:
+        await conn.executescript(
+            "CREATE TABLE schema_migrations_new ("
+            "    store_name  TEXT    NOT NULL,"
+            "    version     INTEGER NOT NULL,"
+            "    applied_at  REAL    NOT NULL,"
+            "    PRIMARY KEY (store_name, version)"
+            ");"
+            "INSERT INTO schema_migrations_new "
+            "SELECT store_name, version, applied_at FROM schema_migrations;"
+            "DROP TABLE schema_migrations;"
+            "ALTER TABLE schema_migrations_new RENAME TO schema_migrations;"
         )
         await conn.commit()
         logger.debug(
-            "db_migrations: added store_name column to schema_migrations, "
-            "backfilled existing rows with 'legacy'"
+            "db_migrations: rebuilt schema_migrations with composite PK "
+            "(store_name, version)"
         )
-    except Exception:
-        # Column already exists (aiosqlite may raise a different exception
-        # type) — nothing to do.
-        pass
 
 
 async def run_migrations_async(

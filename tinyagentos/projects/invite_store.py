@@ -176,12 +176,14 @@ class ProjectInviteStore(BaseStore):
                 )
                 await self._db.commit()
                 break
-            except aiosqlite.IntegrityError:
+            except aiosqlite.IntegrityError as exc:
+                if "UNIQUE" not in str(exc):
+                    raise
                 if attempt == max_retries - 1:
                     raise RuntimeError(
                         "Failed to generate a unique invite ID "
                         f"after {max_retries} attempts"
-                    ) from None
+                    ) from exc
                 continue
 
         return {
