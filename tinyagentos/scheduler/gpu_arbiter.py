@@ -55,6 +55,9 @@ class _QueuedGpuTask:
     evictable: bool = field(compare=False)
     required_gpu_arch: str | None = field(default=None, compare=False)
     queued_at: float = field(default_factory=time.time, compare=False)
+    op: str = field(default="inference", compare=False)
+    model: str | None = field(default=None, compare=False)
+    backend_name: str | None = field(default=None, compare=False)
 
 
 @dataclass
@@ -97,6 +100,8 @@ class GpuArbiter:
         self._running: dict[str, tuple[Task, str | None, int, int]] = {}
         self._running_tasks: dict[str, asyncio.Task] = {}
         self._running_lock = asyncio.Lock()
+        self._queued_entries: dict[str, _QueuedGpuTask] = {}
+        self._cancelled_ids: set[str] = set()
 
         # --- Single VRAM authority (taOS #185) ---
         # The arbiter does NOT keep its own VRAM ledger. It reserves against a
@@ -311,6 +316,9 @@ class GpuArbiter:
         self, task: Task, required_vram_mb: int = 0,
         evictable: bool = False, resource_id: str | None = None,
         required_gpu_arch: str | None = None,
+        op: str = "inference",
+        model: str | None = None,
+        backend_name: str | None = None,
     ) -> object:
         """Submit a GPU task with optional hardware-architecture requirements.
 
@@ -320,6 +328,9 @@ class GpuArbiter:
             evictable: Whether lower-priority tasks can be evicted for this.
             resource_id: Specific cluster resource to target.
             required_gpu_arch: CUDA compute capability required (e.g. ``"sm_86"``).
+            op: Operation kind — ``"inference"`` or ``"load"``.
+            model: Backend model name (e.g. ``"qwen2.5:7b"``).
+            backend_name: Config backend name (e.g. ``"local-ollama"``).
         """
         self._submitted += 1
 
@@ -351,8 +362,10 @@ class GpuArbiter:
                     priority=int(task.priority), seq=self._seq, task=task,
                     required_vram_mb=required_vram_mb, evictable=evictable,
                     required_gpu_arch=required_gpu_arch,
+                    op=op, model=model, backend_name=backend_name,
                 )
                 await self._queue.put(entry)
+                self._queued_entries[task.id] = entry
                 self._queued += 1
                 loop = asyncio.get_running_loop()
                 done: asyncio.Future = loop.create_future()
@@ -360,6 +373,7 @@ class GpuArbiter:
                 try:
                     return await done
                 except asyncio.CancelledError:
+                    self._queued_entries.pop(task.id, None)
                     self._evicted += 1
                     raise
             # Admitted — reservation already held by _reserve_and_check, so
@@ -580,6 +594,10 @@ class GpuArbiter:
         drained = False
         while not self._queue.empty() and not drained:
             entry = self._queue.get_nowait()
+            if entry.task.id in self._cancelled_ids:
+                self._cancelled_ids.discard(entry.task.id)
+                continue
+            self._queued_entries.pop(entry.task.id, None)
             admission = await self._reserve_and_check(entry.task.id, entry.required_vram_mb)
             if not admission.admitted:
                 # Try eviction-to-make-room for higher-priority queued tasks.
@@ -624,6 +642,7 @@ class GpuArbiter:
         for entry in retry:
             if not self._queue.full():
                 self._queue.put_nowait(entry)
+                self._queued_entries[entry.task.id] = entry
             else:
                 self._dropped += 1
                 future = getattr(entry.task, "_arbiter_future", None)
@@ -652,20 +671,46 @@ class GpuArbiter:
                 for tid, (task, lid, pri, vram) in self._running.items()
             ]
 
-    def queue_snapshot(self) -> list[dict]:
-        items: list[_QueuedGpuTask] = []
-        while not self._queue.empty():
-            try:
-                items.append(self._queue.get_nowait())
-            except asyncio.QueueEmpty:
+    def _ordered_queued(self) -> list[_QueuedGpuTask]:
+        return sorted(self._queued_entries.values(), key=lambda e: (e.priority, e.seq))
+
+    def queue_position(self, task_id: str) -> int | None:
+        entry = self._queued_entries.get(task_id)
+        if entry is None:
+            return None
+        ahead = 0
+        for other in self._ordered_queued():
+            if other.task.id == task_id:
                 break
-        result = [
+            if entry.op == "inference":
+                if other.model == entry.model:
+                    ahead += 1
+            else:
+                ahead += 1
+        return ahead + 1
+
+    async def cancel_op(self, task_id: str) -> bool:
+        entry = self._queued_entries.pop(task_id, None)
+        if entry is not None:
+            self._cancelled_ids.add(task_id)
+            future = getattr(entry.task, "_arbiter_future", None)
+            if future is not None and not future.done():
+                future.cancel()
+            return True
+        async with self._running_lock:
+            running = task_id in self._running
+        if running:
+            return bool(await self._evict_task(task_id))
+        return False
+
+    def queue_snapshot(self) -> list[dict]:
+        now = time.time()
+        return [
             {"task_id": e.task.id, "capability": e.task.capability.value,
-             "priority": e.priority, "vram_mb": e.required_vram_mb,
-             "queued_seconds": time.time() - e.queued_at}
-            for e in items
+             "op": e.op, "model": e.model, "backend_name": e.backend_name,
+             "submitter": e.task.submitter, "priority": e.priority,
+             "vram_mb": e.required_vram_mb,
+             "queued_seconds": now - e.queued_at,
+             "position": self.queue_position(e.task.id)}
+            for e in self._ordered_queued()
         ]
-        for e in items:
-            if not self._queue.full():
-                self._queue.put_nowait(e)
-        return result
