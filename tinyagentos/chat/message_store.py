@@ -231,6 +231,78 @@ class ChatMessageStore(BaseStore):
         await self._db.commit()
         return [r[0] for r in rows]
 
+    async def edit_and_truncate_branch(
+        self,
+        message_id: str,
+        content: str,
+        *,
+        channel_type: str | None = None,
+        thread_id: str | None = None,
+    ) -> tuple[dict | None, list[str]]:
+        """Edit a message and, if *channel_type* is ``"dm"``, soft-delete
+        every subsequent message in the same channel and thread so the
+        agent branch is rewritten on the next turn.
+
+        All writes happen inside a single transaction so the edit +
+        truncation are atomic.  Timestamp-tie rows are handled
+        deterministically: messages with a strictly later ``created_at``
+        are deleted; messages sharing the exact same timestamp are only
+        deleted when their stable ``id`` sorts after *message_id*.
+
+        Returns ``(updated_message, deleted_ids)``.
+        """
+        now = time.time()
+        deleted_ids: list[str] = []
+
+        await self._db.execute("BEGIN")
+        try:
+            # 1. Edit the message
+            await self._db.execute(
+                "UPDATE chat_messages SET content = ?, edited_at = ? WHERE id = ?",
+                (content, now, message_id),
+            )
+
+            # 2. Truncate subsequent messages in DM channels
+            if channel_type == "dm":
+                cursor = await self._db.execute(
+                    "SELECT channel_id, created_at FROM chat_messages WHERE id = ?",
+                    (message_id,),
+                )
+                row = await cursor.fetchone()
+                if row is not None:
+                    ch_id, created_at = row[0], row[1]
+                    if thread_id is not None:
+                        thread_clause = "AND thread_id = ?"
+                        params = (now, ch_id, created_at, created_at,
+                                  message_id, thread_id)
+                    else:
+                        thread_clause = "AND thread_id IS NULL"
+                        params = (now, ch_id, created_at, created_at,
+                                  message_id)
+                    # Deterministic tie-breaking:
+                    #   created_at > msg.created_at  → later → delete
+                    #   created_at = msg.created_at AND id > msg.id → same time,
+                    #   later row in stable-id order → delete
+                    cursor = await self._db.execute(
+                        f"""UPDATE chat_messages SET deleted_at = ?
+                           WHERE channel_id = ? AND deleted_at IS NULL
+                           AND (created_at > ? OR (created_at = ? AND id > ?))
+                           {thread_clause}
+                           RETURNING id""",
+                        params,
+                    )
+                    rows = await cursor.fetchall()
+                    deleted_ids = [r[0] for r in rows]
+
+            await self._db.commit()
+        except Exception:
+            await self._db.execute("ROLLBACK")
+            raise
+
+        # Fetch the updated message outside the transaction
+        updated = await self.get_message(message_id)
+        return updated, deleted_ids
+
     async def add_reaction(self, message_id: str, emoji: str, user_id: str) -> None:
         async with self._reaction_lock:
             async with self._db.execute(
