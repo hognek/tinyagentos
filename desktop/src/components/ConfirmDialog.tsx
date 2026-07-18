@@ -30,9 +30,13 @@ export function ConfirmDialog({
 }: ConfirmDialogProps) {
   const confirmRef = useRef<HTMLButtonElement>(null);
   const panelRef = useRef<HTMLDivElement>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
-    if (open) confirmRef.current?.focus();
+    if (open) {
+      previousFocusRef.current = document.activeElement as HTMLElement | null;
+      confirmRef.current?.focus();
+    }
   }, [open]);
 
   useEffect(() => {
@@ -62,7 +66,10 @@ export function ConfirmDialog({
       }
     };
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      previousFocusRef.current?.focus();
+    };
   }, [open, onCancel]);
 
   if (!open) return null;
