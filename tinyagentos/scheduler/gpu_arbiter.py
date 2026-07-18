@@ -334,6 +334,12 @@ class GpuArbiter:
         """
         self._submitted += 1
 
+        # Validate op kind — only 'inference' and 'load' are known.
+        if op not in ("inference", "load"):
+            raise ValueError(
+                f"unknown gpu_op: {op!r} (expected 'inference' or 'load')"
+            )
+
         # Hardware architecture check (taOS #796)
         if required_gpu_arch:
             arch_ok, arch_reason = self._check_gpu_arch_compatibility(
@@ -374,6 +380,7 @@ class GpuArbiter:
                     return await done
                 except asyncio.CancelledError:
                     self._queued_entries.pop(task.id, None)
+                    self._cancelled_ids.add(task.id)
                     self._evicted += 1
                     raise
             # Admitted — reservation already held by _reserve_and_check, so
@@ -597,7 +604,6 @@ class GpuArbiter:
             if entry.task.id in self._cancelled_ids:
                 self._cancelled_ids.discard(entry.task.id)
                 continue
-            self._queued_entries.pop(entry.task.id, None)
             admission = await self._reserve_and_check(entry.task.id, entry.required_vram_mb)
             if not admission.admitted:
                 # Try eviction-to-make-room for higher-priority queued tasks.
@@ -633,6 +639,7 @@ class GpuArbiter:
 
                     t.add_done_callback(_propagate)
 
+                self._queued_entries.pop(entry.task.id, None)  # promoted → _running
                 drained = True
             else:
                 # Not admitted — release reservation (idempotent) and retry later.
