@@ -2,7 +2,27 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "path";
+import { writeFileSync } from "node:fs";
 import { readBackendVersion } from "./scripts/read-version.mjs";
+
+/** Writes version.json to the build output so the running SPA can poll it and
+ *  detect when a new build has been deployed. */
+function spaVersionPlugin() {
+  let outDir = "";
+  return {
+    name: "taos-spa-version",
+    configResolved(config: import("vite").ResolvedConfig) {
+      outDir = path.resolve(config.root, config.build.outDir);
+    },
+    writeBundle() {
+      const version = readBackendVersion();
+      writeFileSync(
+        path.join(outDir, "version.json"),
+        JSON.stringify({ version }) + "\n",
+      );
+    },
+  };
+}
 
 export default defineConfig({
   test: {
@@ -47,7 +67,7 @@ export default defineConfig({
   define: {
     __TAOS_VERSION__: JSON.stringify(readBackendVersion()),
   },
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), spaVersionPlugin()],
   base: "/desktop/",
   resolve: {
     alias: { "@": path.resolve(__dirname, "src") },

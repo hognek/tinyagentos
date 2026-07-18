@@ -28,6 +28,7 @@ interface TaosAgentActions {
   setMessages: (messages: AssistantMessage[]) => void;
   appendMessage: (msg: AssistantMessage) => void;
   appendDelta: (delta: string) => void;
+  updateMessage: (index: number, content: string) => void;
   setModel: (model: string | null) => void;
   setStreaming: (streaming: boolean) => void;
   setSettingsOpen: (open: boolean) => void;
@@ -59,6 +60,15 @@ export const useTaosAgentStore = create<TaosAgentStore>((set) => ({
       if (last && last.role === "assistant") {
         msgs[msgs.length - 1] = { ...last, content: last.content + delta };
       }
+      return { messages: msgs };
+    }),
+
+  updateMessage: (index, content) =>
+    set((s) => {
+      const existing = s.messages[index];
+      if (!existing) return s;
+      const msgs = [...s.messages];
+      msgs[index] = { ...existing, content };
       return { messages: msgs };
     }),
 

@@ -21,13 +21,24 @@ class QmdClient:
         if self._client:
             await self._client.aclose()
 
-    async def embed(self, text: str) -> list[float]:
-        """Get embedding vector for text via qmd serve /embed."""
+    async def embed(self, text: str, *, timeout=httpx.USE_CLIENT_DEFAULT) -> list[float]:
+        """Get embedding vector for text via qmd serve /embed.
+
+        Parameters
+        ----------
+        text:
+            The text to embed.
+        timeout:
+            Per-call timeout in seconds, or httpx.USE_CLIENT_DEFAULT to keep
+            the client's default (60 s).  Pass a float to override for this
+            single request — useful when one slow model load should not block
+            the whole chain.
+        """
         url = f"{self.base_url}/embed"
         client = self._client
 
         async def _call():
-            resp = await client.post(url, json={"text": text})
+            resp = await client.post(url, json={"text": text}, timeout=timeout)
             resp.raise_for_status()
             return resp
 
@@ -40,8 +51,18 @@ class QmdClient:
         collection: str | None = None,
         tags: list[str] | None = None,
         limit: int = 10,
+        *,
+        timeout=httpx.USE_CLIENT_DEFAULT,
     ) -> list[dict]:
-        """Search documents via qmd serve /search."""
+        """Search documents via qmd serve /search.
+
+        Parameters
+        ----------
+        timeout:
+            Per-call timeout in seconds, or httpx.USE_CLIENT_DEFAULT to keep
+            the client's default (60 s).  Pass a float to override for this
+            single request.
+        """
         url = f"{self.base_url}/search"
         client = self._client
         payload: dict = {"query": query, "limit": limit}
@@ -51,7 +72,7 @@ class QmdClient:
             payload["tags"] = tags
 
         async def _call():
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, json=payload, timeout=timeout)
             resp.raise_for_status()
             return resp
 

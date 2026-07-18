@@ -386,3 +386,98 @@ class TestHeartbeatAvailableModels:
         w = mgr.get_worker("w1")
         assert len(w.available_models) == 1
         assert w.available_models[0]["model_id"] == "x"
+
+
+# ---------------------------------------------------------------------------
+# Heartbeat-driven registration refresh (taOS #1538)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestHeartbeatRegistrationRefresh:
+    async def _register(self, mgr: ClusterManager, name: str) -> WorkerInfo:
+        w = WorkerInfo(
+            name=name,
+            url=f"http://10.0.0.1:{9000 + int(name[-1])}",
+            host_lan_ip="10.0.0.1",
+            hardware={"cpu": "arm", "ram_mb": 4096},
+        )
+        await mgr.register_worker(w)
+        return w
+
+    async def test_heartbeat_updates_host_lan_ip(self):
+        """Heartbeat with host_lan_ip updates the cached value (taOS #1538)."""
+        mgr = ClusterManager()
+        await self._register(mgr, "w1")
+        assert mgr.get_worker("w1").host_lan_ip == "10.0.0.1"
+
+        # Worker comes up on a new IP (DHCP move / LXC restart)
+        mgr.heartbeat("w1", host_lan_ip="192.168.7.5")
+        w = mgr.get_worker("w1")
+        assert w.host_lan_ip == "192.168.7.5"
+
+    async def test_heartbeat_updates_url(self):
+        """Heartbeat with url updates the cached worker URL (taOS #1538)."""
+        mgr = ClusterManager()
+        await self._register(mgr, "w1")
+        assert mgr.get_worker("w1").url == "http://10.0.0.1:9001"
+
+        mgr.heartbeat("w1", url="http://192.168.7.5:9001")
+        w = mgr.get_worker("w1")
+        assert w.url == "http://192.168.7.5:9001"
+
+    async def test_heartbeat_updates_hardware(self):
+        """Heartbeat with hardware updates the cached hardware dict (taOS #1538)."""
+        mgr = ClusterManager()
+        await self._register(mgr, "w1")
+        assert mgr.get_worker("w1").hardware == {"cpu": "arm", "ram_mb": 4096}
+
+        new_hw = {"cpu": "x86_64", "ram_mb": 8192, "gpu": {"type": "cuda"}}
+        mgr.heartbeat("w1", hardware=new_hw)
+        w = mgr.get_worker("w1")
+        assert w.hardware == new_hw
+
+    async def test_heartbeat_omitting_host_lan_ip_preserves_prior(self):
+        """Legacy heartbeat without host_lan_ip leaves stored value unchanged."""
+        mgr = ClusterManager()
+        await self._register(mgr, "w1")
+        mgr.heartbeat("w1", host_lan_ip="192.168.7.5")
+
+        # Sparse heartbeat — only load, no host_lan_ip
+        mgr.heartbeat("w1", load=0.5)
+        w = mgr.get_worker("w1")
+        assert w.host_lan_ip == "192.168.7.5"
+
+    async def test_heartbeat_stores_storage_counters(self):
+        """Heartbeat with storage counters updates the cached values."""
+        mgr = ClusterManager()
+        await self._register(mgr, "w1")
+
+        mgr.heartbeat(
+            "w1",
+            storage_cap_bytes=50_000_000_000,
+            storage_used_bytes=12_000_000_000,
+            bytes_deduped_total=2_000_000_000,
+        )
+        w = mgr.get_worker("w1")
+        assert w.storage_cap_bytes == 50_000_000_000
+        assert w.storage_used_bytes == 12_000_000_000
+        assert w.bytes_deduped_total == 2_000_000_000
+
+    async def test_heartbeat_omitting_storage_preserves_prior(self):
+        """Legacy heartbeat without storage fields leaves stored values unchanged."""
+        mgr = ClusterManager()
+        await self._register(mgr, "w1")
+        mgr.heartbeat(
+            "w1",
+            storage_cap_bytes=50_000_000_000,
+            storage_used_bytes=12_000_000_000,
+            bytes_deduped_total=2_000_000_000,
+        )
+
+        # Sparse heartbeat — only load
+        mgr.heartbeat("w1", load=0.5)
+        w = mgr.get_worker("w1")
+        assert w.storage_cap_bytes == 50_000_000_000
+        assert w.storage_used_bytes == 12_000_000_000
+        assert w.bytes_deduped_total == 2_000_000_000

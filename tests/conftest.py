@@ -5,6 +5,7 @@ import os
 import sqlite3
 import sys
 import time
+from unittest.mock import patch
 
 import pytest
 import pytest_asyncio
@@ -13,6 +14,44 @@ from httpx import ASGITransport, AsyncClient
 
 from tinyagentos.app import create_app
 from tinyagentos.routes.desktop import SPA_DIR
+
+
+# ---------------------------------------------------------------------------
+# Test-mode CSRF bypass — the verify_csrf dependency is enforced globally
+# on all routers via register_all_routers().  Existing tests were written
+# before CSRF was enforced and do not include CSRF tokens.  Rather than
+# updating every test fixture, we monkey-patch verify_csrf to a no-op
+# during test runs.  The dedicated CSRF tests (test_csrf.py) import the
+# real function directly and test it in isolation.
+# ---------------------------------------------------------------------------
+
+from starlette.requests import HTTPConnection as _HTTPConnection
+
+
+def _noop_verify_csrf(conn: _HTTPConnection) -> None:
+    # Typed as HTTPConnection (base of Request + WebSocket) so this override is
+    # FastAPI-injectable on both http and websocket routes, matching the real
+    # verify_csrf. A `Request` param TypeErrors on a websocket scope and
+    # `Request | None` is not a valid injectable type at all.
+    return
+
+
+@pytest.fixture(autouse=True)
+def _bypass_csrf_in_tests(request):
+    """Replace verify_csrf with a no-op in the module under test.
+
+    Skips patching when the test file is test_csrf.py so those tests
+    exercise the real implementation.
+    """
+    if "test_csrf" in str(request.node.fspath):
+        yield
+        return
+
+    with patch(
+        "tinyagentos.middleware.csrf.verify_csrf",
+        _noop_verify_csrf,
+    ):
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +344,10 @@ async def client(app, tmp_data_dir):
     if project_store._db is not None:
         await project_store.close()
     await project_store.init()
+    project_invites = app.state.project_invites
+    if project_invites._db is not None:
+        await project_invites.close()
+    await project_invites.init()
     board_audit = app.state.board_audit
     if board_audit._db is not None:
         await board_audit.close()
@@ -426,6 +469,7 @@ async def client(app, tmp_data_dir):
     await routine_store.close()
     await board_audit.close()
     await project_store.close()
+    await project_invites.close()
     await chat_channels.close()
     await chat_messages.close()
     await expert_agents.close()
