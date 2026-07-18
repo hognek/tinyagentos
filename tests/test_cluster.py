@@ -520,19 +520,29 @@ class TestWorkerDrain:
         assert mgr.get_worker("gpu-box").status == "draining"
         assert mgr.get_worker("gpu-box").load == 0.5
 
-    async def test_heartbeat_without_status_reonlines_update_available(self):
-        """A normal heartbeat without status should transition
-        update-available back to online (it's not a drain)."""
+    async def test_heartbeat_without_status_preserves_update_available(self):
+        """A status-less heartbeat preserves update-available (taOS #890 C2).
+
+        The periodic ~15s heartbeat carries no status; when combined with the
+        old manager.py:226-231 logic that flipped any non-draining worker back
+        to "online", this silently cancelled the update signal before the
+        worker could initiate its drain.  Now "update-available" is protected
+        in the same way "draining" is: only an explicit status transition
+        (e.g. "draining" or "updating") changes it."""
         mgr = ClusterManager()
         await mgr.register_worker(_make_worker("gpu-box", capabilities=["chat"]))
 
         mgr.heartbeat("gpu-box", status="update-available")
         assert mgr.get_worker("gpu-box").status == "update-available"
 
-        # Normal heartbeat without explicit status
+        # Normal heartbeat without explicit status — should stay update-available
         mgr.heartbeat("gpu-box", load=0.2)
-        # Should go back to online because update-available is not draining
-        assert mgr.get_worker("gpu-box").status == "online"
+        assert mgr.get_worker("gpu-box").status == "update-available"
+        assert mgr.get_worker("gpu-box").load == 0.2
+
+        # Explicit transition to draining still works
+        mgr.heartbeat("gpu-box", status="draining", drain_reason="update")
+        assert mgr.get_worker("gpu-box").status == "draining"
 
     async def test_monitor_loop_offlines_stale_update_available_worker(self):
         """An update-available worker that stops heartbeating is marked offline."""

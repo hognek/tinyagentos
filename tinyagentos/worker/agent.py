@@ -717,13 +717,14 @@ class WorkerAgent:
         """Notify the controller that the worker's drain is complete.
 
         After in-flight work finishes, the worker sends one final
-        heartbeat to confirm readiness for the update. The controller
-        can then proceed with the update deploy.
+        heartbeat with status="updating" to signal readiness for
+        the update. The controller can then proceed with the update
+        deploy.
 
         Returns the HTTP status code from the controller.
         """
         logger.info("worker '%s': drain complete, ready for update", self.name)
-        return await self.heartbeat()
+        return await self.heartbeat(status="updating")
 
     def _log_repair_instruction(self) -> None:
         logger.error(

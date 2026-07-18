@@ -231,9 +231,12 @@ class ClusterManager:
         # A worker mid graceful-drain keeps heartbeating while it finishes
         # inflight work. Do NOT flip it back to "online" — that would re-enter
         # it into routing/catalog/lease-claims before its leases drain and
-        # defeat the drain (taOS #890). Leave the drain to complete or be
-        # cancelled explicitly; every other status re-onlines as before.
-        if worker.status != "draining":
+        # defeat the drain (taOS #890). Similarly, protect "update-available"
+        # so a periodic status-less heartbeat doesn't silently cancel the
+        # update signal before the worker can initiate the drain.
+        # Only block status-less heartbeats; explicit status transitions
+        # (e.g. "update-available" → "draining") are still honoured.
+        if worker.status not in ("draining", "update-available") or status is not None:
             # Honour worker-initiated status transitions (taOS #890 C2).
             if status in ("draining", "update-available", "updating"):
                 worker.status = status
@@ -306,8 +309,11 @@ class ClusterManager:
         # Worker-initiated drain notification (taOS #890 C2).
         # Emit when the worker transitions into draining/update-available on
         # its own initiative, so the operator sees it in the activity feed.
-        if self._notifications and status in ("draining", "update-available", "updating") and prev_status not in (status,):
-            reason = drain_reason or "unspecified"
+        # Validate: only trusted status values; sanitize drain_reason to
+        # prevent injection into notification UI.
+        _VALID_STATUSES = frozenset({"draining", "update-available", "updating"})
+        if self._notifications and status in _VALID_STATUSES and prev_status not in (status,):
+            reason = (drain_reason or "unspecified").replace("'", "\\'").replace("\\", "\\\\")[:200]
             event_type = f"worker.{status}" if status != "draining" else "worker.drain"
             title_map = {
                 "draining": f"Worker '{worker.name}' self-initiated drain",
@@ -824,6 +830,30 @@ class ClusterManager:
                                 logger.exception(
                                     "gpu-arbiter: cancel for stale-drain of '%s' failed",
                                     worker.name)
+                # Handle updating workers: if they stop heartbeating they're
+                # stuck in a bad state — force-offline them so they can re-onboard.
+                elif worker.status == "updating":
+                    if (now - worker.last_heartbeat) > HEARTBEAT_TIMEOUT:
+                        worker.status = "offline"
+                        logger.warning(
+                            "Worker '%s' stuck in 'updating' (no heartbeat for %ds) — marked offline",
+                            worker.name, HEARTBEAT_TIMEOUT,
+                        )
+                        if self._notifications:
+                            await self._notifications.emit_event(
+                                "worker.leave",
+                                f"Worker '{worker.name}' timed out during update",
+                                f"Worker was stuck in 'updating' state. Forced offline to allow re-onboarding.",
+                                level="warning",
+                            )
+                        async with self._lease_lock:
+                            update_lids = [
+                                lid for lid, lease in self._leases.items()
+                                if (parsed := self._parse_resource_id(lease.resource_id))
+                                and parsed[0] == worker.name
+                            ]
+                            for lid in update_lids:
+                                self._leases.pop(lid, None)
             async with self._lease_lock:
                 self._sweep_expired_leases()
             await asyncio.sleep(5)
