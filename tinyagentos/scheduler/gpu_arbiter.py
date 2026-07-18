@@ -657,6 +657,11 @@ class GpuArbiter:
                 retry.append(entry)
         # Re-queue tasks that still can't be admitted
         for entry in retry:
+            # Skip entries cancelled during the admission-await window
+            # (same race: cancel_op fired while we awaited reserve_and_check).
+            if entry.task.id in self._cancelled_ids:
+                self._cancelled_ids.discard(entry.task.id)
+                continue
             if not self._queue.full():
                 self._queue.put_nowait(entry)
                 self._queued_entries[entry.task.id] = entry
