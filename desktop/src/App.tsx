@@ -128,7 +128,7 @@ function SystemShortcuts({ toggleSearch, toggleLaunchpad, toggleAssistant }: Sys
       const resp = await fetch("/api/agents/bulk/stop", {
         method: "POST",
         credentials: "include",
-        headers: withCsrf({ method: "POST" }).headers,
+        headers: withCsrf({ method: "POST" })!.headers,
       });
       if (!resp.ok) {
         throw new Error(`Server returned ${resp.status}`);

@@ -824,7 +824,11 @@ async def bulk_stop_agents(request: Request):
                 "list_containers returned empty; incus may be unhealthy. "
                 "Attempting force-kill on all configured agents."
             )
-        running = {c.name for c in containers if c.status == "Running"}
+        running = {
+            c.name
+            for c in containers
+            if c.status in ("Running", "Stopping", "Freezing", "Frozen")
+        }
         incus_unhealthy = not containers and bool(config.agents)
         force_results = {}
         for agent in config.agents:
@@ -927,7 +931,11 @@ async def stop_agent(request: Request, name: str):
                 "list_containers returned empty; incus may be unhealthy. "
                 "Attempting force-kill anyway."
             )
-        running = {c.name for c in containers if c.status == "Running"}
+        running = {
+            c.name
+            for c in containers
+            if c.status in ("Running", "Stopping", "Freezing", "Frozen")
+        }
         if container_name in running or not containers:
             force_result = await stop_container(container_name, force=True)
             success = force_result.get("success", False)
