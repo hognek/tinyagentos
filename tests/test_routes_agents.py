@@ -232,6 +232,7 @@ class TestKillSwitchRunStateGate:
             "force-kill should be called on a Running container"
         )
 
+
     async def test_stop_agent_force_kills_running_container(
         self, client, monkeypatch
     ):
@@ -269,7 +270,6 @@ class TestKillSwitchRunStateGate:
         assert "taos-agent-test-agent" in force_calls, (
             "stop_container(force=True) should be called on a Running container"
         )
-
 
 def _seed_worker(app, name, model_names, status="online"):
     info = WorkerInfo(
