@@ -278,7 +278,7 @@ def test_all_ids_are_unique():
 
 
 def test_all_verification_statuses_valid():
-    valid = {"alpha", "beta", "stable"}
+    valid = {"tested", "beta", "experimental", "broken"}
     for fw_id, entry in FRAMEWORKS.items():
         status = entry.get("verification_status")
         assert status in valid, f"{fw_id}: unexpected verification_status {status!r}"

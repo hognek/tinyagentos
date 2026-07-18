@@ -39,7 +39,7 @@ async def execute_list_frameworks(args: dict, request: Request) -> dict:
     frameworks = list_frameworks()
     if verified_only:
         # tested and beta are the two verified tiers (tested is the most verified);
-        # experimental and broken are not recommended.
+        # experimental is functional but unverified; broken is known-failing and blocked.
         frameworks = [
             f for f in frameworks if f.get("verification_status") in ("tested", "beta")
         ]

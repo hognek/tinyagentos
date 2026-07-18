@@ -67,7 +67,7 @@ FRAMEWORKS: dict[str, dict] = {
         "id": "generic",
         "name": "Generic",
         "description": "Fallback adapter — echos messages; use as a starting point",
-        "verification_status": "alpha",
+        "verification_status": "experimental",
         "slash_commands": [
             {"name": "help", "description": "Show Generic adapter help"},
         ],
@@ -159,7 +159,7 @@ FRAMEWORKS: dict[str, dict] = {
         "id": "agent_zero",
         "name": "Agent Zero",
         "description": "Proxies messages to the Agent Zero HTTP API (agent0ai/agent-zero)",
-        "verification_status": "alpha",
+        "verification_status": "experimental",
         "slash_commands": [
             {"name": "help", "description": "Show Agent Zero help"},
         ],
@@ -168,7 +168,7 @@ FRAMEWORKS: dict[str, dict] = {
         "id": "ironclaw",
         "name": "IronClaw",
         "description": "OpenClaw-inspired Rust agent focused on privacy and security (nearai/ironclaw)",
-        "verification_status": "alpha",
+        "verification_status": "experimental",
         "slash_commands": [
             {"name": "help", "description": "Show IronClaw help"},
         ],
@@ -177,7 +177,7 @@ FRAMEWORKS: dict[str, dict] = {
         "id": "microclaw",
         "name": "MicroClaw",
         "description": "Agentic AI assistant in Rust, inspired by NanoClaw (microclaw/microclaw)",
-        "verification_status": "alpha",
+        "verification_status": "experimental",
         "slash_commands": [
             {"name": "help", "description": "Show MicroClaw help"},
         ],
@@ -186,7 +186,7 @@ FRAMEWORKS: dict[str, dict] = {
         "id": "moltis",
         "name": "Moltis",
         "description": "Secure persistent personal agent server in Rust (moltis-org/moltis)",
-        "verification_status": "alpha",
+        "verification_status": "experimental",
         "slash_commands": [
             {"name": "help", "description": "Show Moltis help"},
         ],
@@ -195,7 +195,7 @@ FRAMEWORKS: dict[str, dict] = {
         "id": "nanoclaw",
         "name": "NanoClaw",
         "description": "Lightweight container-based OpenClaw alternative on Anthropic Agents SDK (qwibitai/nanoclaw)",
-        "verification_status": "alpha",
+        "verification_status": "experimental",
         "slash_commands": [
             {"name": "help", "description": "Show NanoClaw help"},
         ],
@@ -204,7 +204,7 @@ FRAMEWORKS: dict[str, dict] = {
         "id": "nullclaw",
         "name": "NullClaw",
         "description": "Fully autonomous AI assistant infrastructure in Zig (nullclaw/nullclaw)",
-        "verification_status": "alpha",
+        "verification_status": "experimental",
         "slash_commands": [
             {"name": "help", "description": "Show NullClaw help"},
         ],
@@ -213,7 +213,7 @@ FRAMEWORKS: dict[str, dict] = {
         "id": "picoclaw",
         "name": "PicoClaw",
         "description": "Tiny, fast, and deployable anywhere — automate the mundane, unleash creativity (sipeed/picoclaw)",
-        "verification_status": "alpha",
+        "verification_status": "experimental",
         "slash_commands": [
             {"name": "help", "description": "Show PicoClaw help"},
         ],
@@ -222,7 +222,7 @@ FRAMEWORKS: dict[str, dict] = {
         "id": "shibaclaw",
         "name": "ShibaClaw",
         "description": "Self-hosted AI agent with 5-layer prompt injection protection (RikyZ90/ShibaClaw)",
-        "verification_status": "alpha",
+        "verification_status": "experimental",
         "slash_commands": [
             {"name": "help", "description": "Show ShibaClaw help"},
         ],
@@ -231,7 +231,7 @@ FRAMEWORKS: dict[str, dict] = {
         "id": "zeroclaw",
         "name": "ZeroClaw",
         "description": "Fast, small, fully autonomous AI personal assistant in Rust (zeroclaw-labs/zeroclaw)",
-        "verification_status": "alpha",
+        "verification_status": "experimental",
         "slash_commands": [
             {"name": "help", "description": "Show ZeroClaw help"},
         ],
