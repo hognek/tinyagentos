@@ -665,6 +665,14 @@ class GpuArbiter:
             if not self._queue.full():
                 self._queue.put_nowait(entry)
                 self._queued_entries[entry.task.id] = entry
+                # Re-check _cancelled_ids after insertion — cancel_op may have
+                # fired between the check above and the put_nowait+dict insert,
+                # which would resurrect the shadow entry and leak a queue slot.
+                if entry.task.id in self._cancelled_ids:
+                    self._queued_entries.pop(entry.task.id, None)
+                    self._cancelled_ids.discard(entry.task.id)
+                    # The physical PriorityQueue entry can't be removed but
+                    # _drain_queue skips cancelled entries at dequeue time.
             else:
                 self._dropped += 1
                 future = getattr(entry.task, "_arbiter_future", None)
@@ -715,6 +723,10 @@ class GpuArbiter:
         entry = self._queued_entries.pop(task_id, None)
         if entry is not None:
             self._cancelled_ids.add(task_id)
+            # Release the VRAM reservation immediately so capacity is freed
+            # rather than leaking until _drain_queue eventually skips the entry.
+            # _release_reservation is idempotent — safe if no reservation exists.
+            self._release_reservation(task_id)
             future = getattr(entry.task, "_arbiter_future", None)
             if future is not None and not future.done():
                 future.cancel()
