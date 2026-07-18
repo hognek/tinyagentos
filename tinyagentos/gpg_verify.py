@@ -142,19 +142,17 @@ def _parse_fingerprint(output: str) -> Optional[str]:
             parts = stripped.split()
             # parts[0] = "[GNUPG:]", parts[1] = "VALIDSIG", parts[2] = signing-fpr
             if len(parts) >= 3:
-                # When there are 12+ fields the last field is the primary-key
-                # fingerprint (subkey signing).  Heuristic: the last field must
-                # look like a 40-char hex fingerprint.
-                if len(parts) >= 12 and len(parts[-1]) == 40 and _FINGERPRINT_RE.match(parts[-1]):
+                # When the last field is a 40-char hex fingerprint, a subkey
+                # signed and the last field is the primary-key fingerprint.
+                # GPG can also append fprlen + pubkey-algo-name after the
+                # primary fpr, so 12+ fields alone is not a reliable subkey
+                # signal — only the fingerprint shape of parts[-1] matters.
+                if len(parts[-1]) == 40 and _FINGERPRINT_RE.match(parts[-1]):
                     return parts[-1]
-                # Only fall through to parts[2] when we're confident it IS the
-                # primary key (11 fields — primary key signs directly).  If we
-                # have 12+ fields but the last field didn't validate as a
-                # fingerprint, something unexpected happened; return None rather
-                # than guessing.
-                if len(parts) >= 12:
-                    return None
-                return parts[2]
+                # Otherwise the signing key IS the primary key (whether or
+                # not extra fields like fprlen / algo name are present).
+                if len(parts[2]) == 40 and _FINGERPRINT_RE.match(parts[2]):
+                    return parts[2]
     return None
 
 
@@ -187,26 +185,20 @@ def _parse_key_id(output: str) -> Optional[str]:
     # Fallback for --raw mode: extract the long key id from the VALIDSIG line.
     # The VALIDSIG line has the form:
     #   [GNUPG:] VALIDSIG <signing-fpr> <date> <ts> ... [<primary-fpr>]
-    # When a subkey signs, the 10th field carries the primary-key fingerprint
-    # (len(parts) >= 12).  Prefer it so `key_id` is consistent with the
-    # fingerprint returned by `_parse_fingerprint` (which also returns the
-    # primary-key fpr).  Otherwise the signing key IS the primary key.
+    # When a subkey signs, the last field carries the primary-key fingerprint.
+    # Derive the key ID from it for consistency with _parse_fingerprint.
+    # Otherwise the signing key IS the primary key; derive from parts[2].
     # The standard GPG long key id is the last 16 hex chars of the fingerprint.
     for line in output.splitlines():
         stripped = line.strip()
         if stripped.startswith("[GNUPG:] VALIDSIG"):
             parts = stripped.split()
             if len(parts) >= 3:
-                # When the primary-key fingerprint is present (subkey signing),
-                # derive the key ID from it for consistency with _parse_fingerprint.
-                if len(parts) >= 12 and len(parts[-1]) >= 16:
+                # When the last field is a valid fingerprint, a subkey signed.
+                # Derive key ID from the primary-key fingerprint for consistency.
+                if len(parts[-1]) == 40 and _FINGERPRINT_RE.match(parts[-1]):
                     return parts[-1][-16:].upper()
-                # Only fall through to parts[2] when we're confident it IS the
-                # primary key (11 fields — primary key signs directly).  If we
-                # have 12+ fields but the last field doesn't look like a key
-                # ID, something unexpected happened; return None.
-                if len(parts) >= 12:
-                    return None
+                # Otherwise the signing key IS the primary key.
                 signing_fpr = parts[2]
                 if len(signing_fpr) >= 16:
                     return signing_fpr[-16:].upper()

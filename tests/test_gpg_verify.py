@@ -89,6 +89,17 @@ class TestParseFingerprint:
     def test_returns_none_for_empty(self):
         assert _parse_fingerprint("") is None
 
+    def test_parses_fingerprint_when_primary_key_signs_with_extra_fields(self):
+        """When primary key signs but GPG emits fprlen + algo name (13 fields),
+        parts[-1] is not a fingerprint but parts[2] IS the primary key."""
+        output = (
+            "[GNUPG:] NEWSIG\n"
+            "[GNUPG:] VALIDSIG AAAABBBBCCCCDDDDEEEEFFFF0000111122223333 2024-01-01 1704067200 0 4 0 1 8 00 20 EDDSA\n"
+        )
+        fp = _parse_fingerprint(output)
+        # parts[-1] = "EDDSA" (not a fingerprint), parts[2] = primary key fpr
+        assert fp == "AAAABBBBCCCCDDDDEEEEFFFF0000111122223333"
+
 
 class TestParseKeyId:
     def test_parses_rsa_key(self):
@@ -128,6 +139,16 @@ class TestParseKeyId:
             "[GNUPG:] VALIDSIG AAAABBBBCCCCDDDDEEEEFFFF0000111122223333 2024-01-01 1704067200 0 4 0 1 8 00\n"
         )
         assert _parse_key_id(output) == "ABCDEF1234567890"
+
+    def test_parses_key_id_from_validsig_primary_key_with_extra_fields(self):
+        """When primary key signs with extra GPG fields (fprlen+algo), derive
+        key ID from parts[2] (primary key)."""
+        output = (
+            "[GNUPG:] NEWSIG\n"
+            "[GNUPG:] VALIDSIG AAAABBBBCCCCDDDDEEEEFFFF0000111122223333 2024-01-01 1704067200 0 4 0 1 8 00 20 EDDSA\n"
+        )
+        # parts[-1] = "EDDSA", parts[2] = primary key fpr
+        assert _parse_key_id(output) == "0000111122223333"
 
 
 # ── verify_commit tests (mocked subprocess) ────────────────────────────────
