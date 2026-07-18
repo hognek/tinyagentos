@@ -240,7 +240,7 @@ async def list_app_installations(request: Request):
 
     from tinyagentos.github_app import (
         list_installations,
-        list_installation_repos,
+        list_installation_repos_cached,
         get_installation_token,
     )
 
@@ -273,7 +273,7 @@ async def list_app_installations(request: Request):
             cfg.github_app_id, cfg.github_app_private_key, iid, http
         )
         if token:
-            repos = await list_installation_repos(token, http)
+            repos = await list_installation_repos_cached(iid, token, http)
 
         result.append({
             "id": iid,
@@ -353,6 +353,7 @@ async def app_installation_callback(
         )
 
     http = _http(request)
+    from fastapi.responses import RedirectResponse
     from tinyagentos.github_app import get_installation_token
 
     # Verify the installation works by minting a token
@@ -394,9 +395,8 @@ async def app_installation_callback(
             "Failed to fetch installation %s details (HTTP %s), redirecting anyway",
             installation_id, install_resp.status_code,
         )
+        return RedirectResponse(url="/app/secrets?install_error=1", status_code=302)
 
-    # Redirect to the secrets page so the user sees their installation
-    from fastapi.responses import RedirectResponse
     return RedirectResponse(url="/app/secrets", status_code=302)
 
 

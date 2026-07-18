@@ -17,9 +17,10 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Simple in-memory token cache with TTL (avoids minting a new JWT + token
-# on every API call when the same installation is used repeatedly).
+# Simple in-memory caches with TTL (avoids extra API calls when the same
+# installation is used repeatedly within a short window).
 _token_cache: dict[str, tuple[str, float]] = {}  # key -> (token, expiry)
+_repo_cache: dict[int, tuple[list[dict], float]] = {}  # installation_id -> (repos, expiry)
 _CACHE_TTL = 300  # 5 minutes (token lifetime is 1 hour, so this is conservative)
 
 
@@ -42,6 +43,22 @@ def _cached_token(key: str) -> str | None:
 def _cache_token(key: str, token: str) -> None:
     """Store a token in the cache with the default TTL."""
     _token_cache[key] = (token, time.time() + _CACHE_TTL)
+
+
+def _cached_repos(installation_id: int) -> list[dict] | None:
+    """Return cached repo list if valid, or None."""
+    entry = _repo_cache.get(installation_id)
+    if entry:
+        repos, expiry = entry
+        if time.time() < expiry:
+            return repos
+        del _repo_cache[installation_id]
+    return None
+
+
+def _cache_repos(installation_id: int, repos: list[dict]) -> None:
+    """Store a repo list in the cache with the default TTL."""
+    _repo_cache[installation_id] = (repos, time.time() + _CACHE_TTL)
 
 # ---------------------------------------------------------------------------
 # GitHub App API endpoints
@@ -233,6 +250,24 @@ async def list_installation_repos(
             logger.exception("Failed to list installation repos: %s", exc)
             break
     return all_repos
+
+
+async def list_installation_repos_cached(
+    installation_id: int,
+    installation_token: str,
+    http_client: httpx.AsyncClient,
+) -> list[dict]:
+    """Cache-aware wrapper around list_installation_repos.
+
+    Returns cached repo lists when available (5-min TTL), avoiding N
+    sequential GitHub API round-trips on repeated page loads.
+    """
+    cached = _cached_repos(installation_id)
+    if cached is not None:
+        return cached
+    repos = await list_installation_repos(installation_token, http_client)
+    _cache_repos(installation_id, repos)
+    return repos
 
 
 async def delete_installation(
