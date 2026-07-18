@@ -860,6 +860,7 @@ async def bulk_stop_agents(request: Request):
                         "output": force_result.get("output", ""),
                     }
                     if not force_result.get("success", False):
+                        result["error"] = force_result.get("output") or "Force-kill command failed"
                         logger.warning(
                             "Force-kill of %s failed: %s",
                             container_name,

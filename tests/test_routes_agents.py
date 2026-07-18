@@ -290,6 +290,44 @@ class TestKillSwitchRunStateGate:
             "force-kill should be attempted on configured agents when incus is down"
         )
 
+    async def test_bulk_stop_populates_error_on_force_kill_failure(
+        self, client, monkeypatch
+    ):
+        """When force-kill fails, the result must include an error field for the UI."""
+        running = ContainerInfo(
+            name="taos-agent-test-agent",
+            status="Running",
+            ip="10.0.0.5",
+            memory_mb=1024,
+            cpu_cores=2,
+        )
+
+        async def fake_list_containers(prefix="taos-agent-"):
+            return [running]
+
+        monkeypatch.setattr(
+            "tinyagentos.containers.list_containers", fake_list_containers
+        )
+
+        async def fake_stop(name, force=False):
+            if force:
+                return {"success": False, "output": "Container is frozen"}
+            return {"success": True, "output": ""}
+
+        monkeypatch.setattr("tinyagentos.containers.stop_container", fake_stop)
+
+        resp = await client.post("/api/agents/bulk/stop")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["action"] == "stop"
+        fr = data["force_kill_results"].get("test-agent", {})
+        assert fr.get("force_killed") is False
+        assert "error" in fr, (
+            "error field must be present when force-kill fails, "
+            f"got: {fr}"
+        )
+        assert "frozen" in fr["error"].lower()
+
 
     async def test_stop_agent_force_kills_running_container(
         self, client, monkeypatch
