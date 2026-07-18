@@ -304,3 +304,48 @@ async def test_migrate_same_title_different_docs_no_data_loss(
     # Each todo list should be stamped with its source doc id.
     stamped = {l["id"]: l.get("migrated_from") for l in matching}
     assert set(stamped.values()) == {doc_a["id"], doc_b["id"]}
+
+
+@pytest.mark.asyncio
+async def test_migrate_skips_nonempty_user_created_list(
+    shared_store, todo_store,
+):
+    """A user-created todo list (non-empty) with the same title must not be
+    used as a recovery target — a new list is created instead."""
+    # User has an existing non-empty todo list named "Tasks".
+    user_list = await todo_store.create_list("user-a", "Tasks")
+    user_list_id = user_list["id"]
+    await todo_store.add_item(user_list_id, "Existing item", author="user-a")
+
+    # Now there's a source doc with the same title.
+    doc, _ = await _setup_list_doc(
+        shared_store, "user-a", "Tasks",
+        ["Migrated item 1", "Migrated item 2"],
+    )
+
+    result = await migrate_list_docs(shared_store, todo_store)
+
+    # A NEW list should be created (not merged into the user's list).
+    assert result["migrated"] == 1
+    assert result["items"] == 2
+
+    # Source doc deleted.
+    assert await shared_store.get_doc(doc["id"]) is None
+
+    # User's existing list untouched (still has its one item).
+    user_list_after = await todo_store.get_list(user_list_id)
+    assert user_list_after is not None
+    assert len(user_list_after["items"]) == 1
+    assert user_list_after["items"][0]["text"] == "Existing item"
+    assert user_list_after.get("migrated_from") is None
+
+    # New list has the migrated items + stamp.
+    new_id = result["lists"][0]["new_id"]
+    new_list = await todo_store.get_list(new_id)
+    assert new_list is not None
+    assert new_list["title"] == "Tasks"
+    assert new_list.get("migrated_from") == doc["id"]
+    assert [i["text"] for i in new_list["items"]] == [
+        "Migrated item 1", "Migrated item 2",
+    ]
+    assert new_list["id"] != user_list_id
