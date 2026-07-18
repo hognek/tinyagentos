@@ -460,10 +460,17 @@ class AutoUpdateService:
             return result, gpg_prefs
         except Exception:
             logger.exception("auto-update: GPG verification crashed")
+            # Resolve prefs outside the try so we have the real required flag
+            # even on crash — otherwise a crash with required=True would
+            # return GpgPrefs() (required=False) and fail open.
+            try:
+                gpg_prefs = await resolve_gpg_prefs(self._settings)
+            except Exception:
+                gpg_prefs = GpgPrefs()
             return GpgVerificationResult(
                 ok=False,
                 status="GPG verification raised an exception — check server logs",
-            ), GpgPrefs()
+            ), gpg_prefs
 
     async def _probe_remote(self) -> Optional[str]:
         """Return the tip of the tracked remote branch (the branch this install

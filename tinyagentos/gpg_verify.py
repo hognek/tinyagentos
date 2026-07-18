@@ -43,10 +43,14 @@ def _validate_fingerprint(fp: str) -> str | None:
 
 
 def _validate_keyserver(url: str) -> bool:
-    """True when *url* looks like an hkps:// or hkp:// keyserver URL."""
+    """True when *url* looks like an hkps:// keyserver URL.
+
+    Only TLS (hkps://) is accepted — plaintext hkp:// would allow MITM of
+    imported keys.
+    """
     if not url or not isinstance(url, str):
         return False
-    if not (url.startswith("hkps://") or url.startswith("hkp://")):
+    if not url.startswith("hkps://"):
         return False
     # Reject anything that looks like shell injection / flag injection.
     if any(c in url for c in ("\n", "\r", "\t", ";", "|", "&", "$", "`", "'", '"')):
@@ -144,8 +148,6 @@ def _parse_key_id(output: str) -> Optional[str]:
             parts = stripped.split()
             for i, p in enumerate(parts):
                 if p in ("key", "key-ID") and i + 1 < len(parts):
-                    return parts[i + 1].rstrip(",…")
-                if p == "key" and i + 1 < len(parts):
                     return parts[i + 1].rstrip(",…")
             # Fallback: find the longest hex chunk after "key"
             after_key = stripped.split("key", 1)
