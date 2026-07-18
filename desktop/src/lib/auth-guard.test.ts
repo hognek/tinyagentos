@@ -37,10 +37,11 @@ describe("installAuthGuard CSRF wiring", () => {
     const lookalike = spy.mock.calls.at(-1)?.[1] as RequestInit;
     expect(new Headers(lookalike.headers).get("X-CSRF-Token")).toBeNull();
 
-    // Request-object input for a same-origin mutating call: the wrapper rebuilds
-    // the Request with the header attached (first arg is the Request).
+    // Request-object input for a same-origin mutating call: the wrapper merges
+    // the CSRF token into effectiveInit so native fetch respects any
+    // init-provided method/headers and preserves the original body stream.
     await window.fetch(new Request(`${window.location.origin}/api/x`, { method: "POST" }));
-    const reqArg = spy.mock.calls.at(-1)?.[0] as Request;
-    expect(reqArg.headers.get("X-CSRF-Token")).toBe("tok123");
+    const reqInit = spy.mock.calls.at(-1)?.[1] as RequestInit;
+    expect(new Headers(reqInit.headers).get("X-CSRF-Token")).toBe("tok123");
   });
 });
