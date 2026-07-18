@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 _token_cache: dict[str, tuple[str, float]] = {}  # key -> (token, expiry)
 _repo_cache: dict[int, tuple[list[dict], float]] = {}  # installation_id -> (repos, expiry)
 _CACHE_TTL = 300  # 5 minutes (token lifetime is 1 hour, so this is conservative)
+_MAX_CACHE_SIZE = 100  # max entries per cache; evict oldest (insertion order) when exceeded
 
 
 def _cache_key(app_id: str, installation_id: int) -> str:
@@ -42,6 +43,9 @@ def _cached_token(key: str) -> str | None:
 
 def _cache_token(key: str, token: str) -> None:
     """Store a token in the cache with the default TTL."""
+    if len(_token_cache) >= _MAX_CACHE_SIZE:
+        oldest = next(iter(_token_cache))
+        del _token_cache[oldest]
     _token_cache[key] = (token, time.time() + _CACHE_TTL)
 
 
@@ -58,6 +62,9 @@ def _cached_repos(installation_id: int) -> list[dict] | None:
 
 def _cache_repos(installation_id: int, repos: list[dict]) -> None:
     """Store a repo list in the cache with the default TTL."""
+    if len(_repo_cache) >= _MAX_CACHE_SIZE:
+        oldest = next(iter(_repo_cache))
+        del _repo_cache[oldest]
     _repo_cache[installation_id] = (repos, time.time() + _CACHE_TTL)
 
 # ---------------------------------------------------------------------------
@@ -266,7 +273,10 @@ async def list_installation_repos_cached(
     if cached is not None:
         return cached
     repos = await list_installation_repos(installation_token, http_client)
-    _cache_repos(installation_id, repos)
+    # Only cache non-empty results — empty lists usually mean a transient
+    # API/network error, and we don't want to mask those behind the TTL.
+    if repos:
+        _cache_repos(installation_id, repos)
     return repos
 
 
