@@ -100,7 +100,13 @@ async def update_to_master(
             message="GPG verification required but no key fingerprint configured — update blocked.",
         )
     if gpg_fingerprint:
-        from tinyagentos.gpg_verify import verify_commit
+        from tinyagentos.gpg_verify import verify_commit, ensure_key_available
+        key_ok = await ensure_key_available(gpg_fingerprint)
+        if not key_ok:
+            logger.warning(
+                "update_runner: cannot import GPG key %s — verification will fail",
+                gpg_fingerprint[:16],
+            )
         rc_verify, verify_out = await _run(
             ["git", "rev-parse", "origin/master"], project_dir,
         )
@@ -189,7 +195,17 @@ async def update_to_master(
             recovery_tag,
         )
         await _run(["git", "tag", recovery_tag, "HEAD"], project_dir)
-        await _run(["git", "reset", "--hard", merge_target], project_dir)
+        rc_reset, reset_out = await _run(
+            ["git", "reset", "--hard", merge_target], project_dir,
+        )
+        if rc_reset != 0:
+            result.ok = False
+            result.message = (
+                f"Merge failed (diverged) and recovery hard-reset also failed. "
+                f"Local state preserved under tag '{recovery_tag}'. "
+                f"({reset_out.strip()[:200]})"
+            )
+            return result
         result.recovery_tag = recovery_tag
 
     # 7. Stash restore (best-effort)
@@ -274,7 +290,13 @@ async def switch_to_branch(
             message=f"GPG verification required but no key fingerprint configured — switch blocked.",
         )
     if gpg_fingerprint:
-        from tinyagentos.gpg_verify import verify_commit
+        from tinyagentos.gpg_verify import verify_commit, ensure_key_available
+        key_ok = await ensure_key_available(gpg_fingerprint)
+        if not key_ok:
+            logger.warning(
+                "update_runner: cannot import GPG key %s — verification will fail",
+                gpg_fingerprint[:16],
+            )
         rc_gpg, gpg_out = await _run(
             ["git", "rev-parse", f"origin/{branch}"], project_dir,
         )
@@ -364,7 +386,21 @@ async def switch_to_branch(
 
     rc_merge, _ = await _run(["git", "merge", "--ff-only", merge_target], project_dir)
     if rc_merge != 0:
-        await _run(["git", "reset", "--hard", merge_target], project_dir)
+        rc_reset, reset_out = await _run(
+            ["git", "reset", "--hard", merge_target], project_dir,
+        )
+        if rc_reset != 0:
+            logger.warning("update_runner: hard-reset also failed: %s", reset_out[:300])
+            if result.stash_ref:
+                rc_pop, _ = await _run(["git", "stash", "pop"], project_dir)
+                result.stash_restored = rc_pop == 0
+            result.ok = False
+            result.message = (
+                f"Merge to {merge_target[:7]} failed and recovery hard-reset also failed. "
+                f"Previous tip saved as tag '{result.recovery_tag}'. "
+                f"({reset_out.strip()[:200]})"
+            )
+            return result
 
     if result.stash_ref:
         rc_pop, pop_out = await _run(["git", "stash", "pop"], project_dir)

@@ -929,6 +929,7 @@ async def apply_update(request: Request):
     # ── GPG signature verification (defence-in-depth) ──────────────────
     from tinyagentos.gpg_verify import verify_remote_commit, resolve_gpg_prefs
     gpg_prefs = await resolve_gpg_prefs(request.app.state.desktop_settings)
+    remote_sha = ""
     if gpg_prefs.enabled:
         try:
             remote_proc = await asyncio.create_subprocess_exec(
@@ -963,9 +964,12 @@ async def apply_update(request: Request):
                     status_code=500,
                 )
 
-    # Merge the fetched branch (fast-forward only).
+    # Merge — pin to the verified SHA when GPG check succeeded so a
+    # concurrent remote ref update cannot install a different commit
+    # after verification (TOCTOU).
+    merge_target = remote_sha if remote_sha else f"origin/{branch}"
     proc = await asyncio.create_subprocess_exec(
-        "git", "merge", "--ff-only", f"origin/{branch}",
+        "git", "merge", "--ff-only", merge_target,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         cwd=str(project_dir),
     )
@@ -1096,7 +1100,7 @@ async def set_update_channel(request: Request, body: UpdateChannel):
     result = await switch_to_branch(
         branch, project_dir,
         gpg_fingerprint=gpg_prefs.key_fingerprint if gpg_prefs.enabled else None,
-        gpg_required=gpg_prefs.required,
+        gpg_required=gpg_prefs.required and gpg_prefs.enabled,
     )
     # switch_to_branch sets ok=False (and performs no destructive change) on any
     # failed step — fetch, stash, checkout. Surface it rather than proceeding to

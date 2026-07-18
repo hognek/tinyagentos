@@ -118,21 +118,37 @@ async def _run(args: list[str], cwd: Path) -> tuple[int, str]:
 
 
 def _parse_fingerprint(output: str) -> Optional[str]:
-    """Extract the primary key fingerprint from ``git verify-*`` output.
+    """Extract the primary-key fingerprint from ``git verify-*`` output.
 
-    Parses lines like::
+    Parses the machine-readable ``[GNUPG:] VALIDSIG`` status line (emitted
+    when ``git verify-commit --raw`` passes ``--status-fd=1`` to gpg).  This
+    status output is locale-independent, unlike the human-readable ``Primary
+    key fingerprint:`` line that can be translated.
 
-        gpg: Signature made … using RSA key 1234567890ABCDEF…
-        gpg: Good signature from "Jay LFC <jay@…>" [ultimate]
-        Primary key fingerprint: AAAA BBBB CCCC DDDD EEEE  FFFF 0000 1111 2222 3333
+    The VALIDSIG line has the form::
 
-    Returns the fingerprint with spaces removed, or None.
+        [GNUPG:] VALIDSIG <fpr> <date> <ts> <expire> <sigver> <reserved> <pkalgo> <hashalgo> <sigclass> [<primary-key-fpr>]
+
+    When the signing key is a **subkey**, an extra 40-char hex field
+    (the primary-key fingerprint) is appended at the end.  When the
+    primary key signs directly there are exactly 11 fields and
+    ``<fpr>`` *is* the primary key.
+
+    Returns the primary-key fingerprint (no spaces), or None.
     """
     for line in output.splitlines():
         stripped = line.strip()
-        if stripped.lower().startswith("primary key fingerprint:"):
-            fp = stripped.split(":", 1)[1].strip()
-            return fp.replace(" ", "")
+        if stripped.startswith("[GNUPG:] VALIDSIG"):
+            parts = stripped.split()
+            # parts[0] = "[GNUPG:]", parts[1] = "VALIDSIG", parts[2] = signing-fpr
+            if len(parts) >= 3:
+                # When there are 12+ fields the last field is the primary-key
+                # fingerprint (subkey signing).  Heuristic: the last field must
+                # look like a 40-char hex fingerprint.
+                if len(parts) >= 12 and len(parts[-1]) == 40 and _FINGERPRINT_RE.match(parts[-1]):
+                    return parts[-1]
+                # Otherwise the signing key IS the primary key.
+                return parts[2]
     return None
 
 
@@ -178,7 +194,7 @@ async def verify_commit(
     if not commit_sha or not commit_sha.strip():
         return GpgVerificationResult(ok=False, status="no commit SHA provided")
 
-    rc, out = await _run(["git", "verify-commit", commit_sha.strip()], project_dir)
+    rc, out = await _run(["git", "verify-commit", "--raw", commit_sha.strip()], project_dir)
 
     fingerprint = _parse_fingerprint(out)
     key_id = _parse_key_id(out)
@@ -195,7 +211,12 @@ async def verify_commit(
 
     # Signature is valid — check fingerprint if configured
     if expected_fingerprint:
-        expected = expected_fingerprint.replace(" ", "").upper()
+        expected = _validate_fingerprint(expected_fingerprint)
+        if not expected:
+            return GpgVerificationResult(
+                ok=False,
+                status=f"commit {commit_sha[:7]}: invalid expected fingerprint",
+            )
         actual = (fingerprint or "").upper()
         if not actual:
             return GpgVerificationResult(
@@ -242,7 +263,7 @@ async def verify_tag(
     if not tag_name or not tag_name.strip():
         return GpgVerificationResult(ok=False, status="no tag name provided")
 
-    rc, out = await _run(["git", "verify-tag", tag_name.strip()], project_dir)
+    rc, out = await _run(["git", "verify-tag", "--raw", tag_name.strip()], project_dir)
 
     fingerprint = _parse_fingerprint(out)
     key_id = _parse_key_id(out)
@@ -258,7 +279,12 @@ async def verify_tag(
         )
 
     if expected_fingerprint:
-        expected = expected_fingerprint.replace(" ", "").upper()
+        expected = _validate_fingerprint(expected_fingerprint)
+        if not expected:
+            return GpgVerificationResult(
+                ok=False,
+                status=f"tag {tag_name}: invalid expected fingerprint",
+            )
         actual = (fingerprint or "").upper()
         if not actual:
             return GpgVerificationResult(

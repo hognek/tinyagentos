@@ -59,16 +59,27 @@ class TestGpgPrefs:
 
 
 class TestParseFingerprint:
-    def test_parses_primary_key_line(self):
+    def test_parses_primary_key_from_subkey_signature(self):
+        """When a subkey signs, the last VALIDSIG field is the primary key fpr."""
         output = (
-            "gpg: Signature made Mon 01 Jan 2024 using RSA key ABCDEF1234567890\n"
-            'gpg: Good signature from "Test User <test@example.com>" [ultimate]\n'
-            "Primary key fingerprint: AAAA BBBB CCCC DDDD EEEE  FFFF 0000 1111 2222 3333\n"
+            "[GNUPG:] NEWSIG\n"
+            "[GNUPG:] VALIDSIG 9999888877776666555544443333222211110000 2024-01-01 1704067200 0 4 0 1 8 00 AAAABBBBCCCCDDDDEEEEFFFF0000111122223333\n"
         )
         fp = _parse_fingerprint(output)
+        # Should return the primary key (last field), not the subkey
         assert fp == "AAAABBBBCCCCDDDDEEEEFFFF0000111122223333"
 
-    def test_returns_none_when_no_fingerprint(self):
+    def test_parses_fingerprint_when_primary_key_signs_directly(self):
+        """When the primary key signs, there are only 11 fields — use parts[2]."""
+        output = (
+            "[GNUPG:] NEWSIG\n"
+            "[GNUPG:] VALIDSIG AAAABBBBCCCCDDDDEEEEFFFF0000111122223333 2024-01-01 1704067200 0 4 0 1 8 00\n"
+        )
+        fp = _parse_fingerprint(output)
+        # 11 fields → parts[2] IS the primary key
+        assert fp == "AAAABBBBCCCCDDDDEEEEFFFF0000111122223333"
+
+    def test_returns_none_when_no_validsig(self):
         output = (
             "gpg: Can't check signature: No public key\n"
             "gpg: Signature made Mon 01 Jan 2024 using RSA key ABCDEF1234567890\n"
@@ -77,11 +88,6 @@ class TestParseFingerprint:
 
     def test_returns_none_for_empty(self):
         assert _parse_fingerprint("") is None
-
-    def test_handles_case_insensitive(self):
-        output = "PRIMARY KEY FINGERPRINT: AAAA BBBB CCCC DDDD\n"
-        fp = _parse_fingerprint(output)
-        assert fp == "AAAABBBBCCCCDDDD"
 
 
 class TestParseKeyId:
@@ -105,6 +111,9 @@ SAMPLE_GOOD_OUTPUT = (
     'gpg:                using RSA key ABCDEF1234567890\n'
     'gpg: Good signature from "Test User <test@example.com>" [ultimate]\n'
     "Primary key fingerprint: AAAA BBBB CCCC DDDD EEEE  FFFF 0000 1111 2222 3333\n"
+    "[GNUPG:] NEWSIG\n"
+    # Subkey signing — last field is the primary-key fingerprint
+    "[GNUPG:] VALIDSIG 9999888877776666555544443333222211110000 2024-01-01 1704067200 0 4 0 1 8 00 AAAABBBBCCCCDDDDEEEEFFFF0000111122223333\n"
 )
 
 SAMPLE_BAD_OUTPUT = (
@@ -118,6 +127,9 @@ SAMPLE_MISMATCH_OUTPUT = (
     'gpg:                using RSA key ABCDEF1234567890\n'
     'gpg: Good signature from "Other User <other@example.com>" [unknown]\n'
     "Primary key fingerprint: 9999 8888 7777 6666 5555  4444 3333 2222 1111 0000\n"
+    "[GNUPG:] NEWSIG\n"
+    # Subkey signing — primary key is 9999…, which differs from expected
+    "[GNUPG:] VALIDSIG FFFFEEEEDDDDCCCCBBBBAAAA9999888877776666 2024-01-01 1704067200 0 4 0 1 8 00 9999888877776666555544443333222211110000\n"
 )
 
 
