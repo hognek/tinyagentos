@@ -16,6 +16,7 @@ import {
   Palette,
   UserCircle,
   ScrollText,
+  Save,
 } from "lucide-react";
 import {
   Button,
@@ -29,6 +30,7 @@ import { useThemeStore } from "@/stores/theme-store";
 import { useDockStore } from "@/stores/dock-store";
 import { ThemesPanel } from "@/apps/SettingsApp/ThemesPanel";
 import { safeFetch, ProgressBar, RestartProgressModal } from "@/apps/SettingsApp/_shared";
+import { WallpaperPicker } from "@/components/WallpaperPicker";
 import { UpdatesSection } from "@/apps/SettingsApp/UpdatesPanel";
 import { UsersSection } from "@/apps/SettingsApp/UsersPanel";
 import { AccountSection } from "@/apps/SettingsApp/AccountPanel";
@@ -294,6 +296,10 @@ function MemorySection() {
   const [settings, setSettings] = useState<MemorySettings | null>(null);
   const [stats, setStats] = useState<{ total: number; collections: Record<string, number> } | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [memoryUrl, setMemoryUrl] = useState("http://localhost:7900");
+  const [memoryUrlDirty, setMemoryUrlDirty] = useState(false);
+  const [memoryUrlSaving, setMemoryUrlSaving] = useState(false);
+  const [memoryUrlError, setMemoryUrlError] = useState<string | null>(null);
 
   useEffect(() => {
     fetch("/api/user-memory/settings")
@@ -313,6 +319,13 @@ function MemorySection() {
         if (data) setStats(data);
       })
       .catch(() => {});
+
+    fetch("/api/settings/memory-url")
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (data?.url) setMemoryUrl(data.url);
+      })
+      .catch(() => {});
   }, []);
 
   const update = (key: keyof MemorySettings, value: boolean) => {
@@ -328,6 +341,27 @@ function MemorySection() {
         else setError(null);
       })
       .catch(() => setError("Could not reach backend."));
+  };
+
+  const saveMemoryUrl = async () => {
+    setMemoryUrlSaving(true);
+    setMemoryUrlError(null);
+    try {
+      const res = await fetch("/api/settings/memory-url", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: memoryUrl }),
+      });
+      if (res.ok) {
+        setMemoryUrlDirty(false);
+      } else {
+        const data = await res.json();
+        setMemoryUrlError(data.error || `Failed to save (${res.status})`);
+      }
+    } catch {
+      setMemoryUrlError("Could not reach backend.");
+    }
+    setMemoryUrlSaving(false);
   };
 
   if (!settings) {
@@ -374,6 +408,36 @@ function MemorySection() {
           );
         })}
       </div>
+
+      {/* --- Memory URL (taOSmd) --- */}
+      <h3 className="text-sm font-medium mt-6 mb-2">taOSmd Server URL</h3>
+      <p className="text-xs text-shell-text-tertiary mb-3">
+        URL of the taOSmd memory server. Change this to point to a remote instance.
+      </p>
+      <div className="flex items-start gap-2">
+        <input
+          type="text"
+          value={memoryUrl}
+          onChange={(e) => { setMemoryUrl(e.target.value); setMemoryUrlDirty(true); }}
+          className="flex-1 px-3 py-2 text-sm rounded bg-white/5 border border-white/10 text-shell-text focus:outline-none focus:border-sky-500/50"
+          placeholder="http://localhost:7900"
+          aria-label="taOSmd memory server URL"
+        />
+        <Button
+          size="sm"
+          onClick={saveMemoryUrl}
+          disabled={!memoryUrlDirty || memoryUrlSaving}
+          aria-label="Save memory URL"
+        >
+          <Save size={14} />
+          {memoryUrlSaving ? "Saving..." : "Save"}
+        </Button>
+      </div>
+      {memoryUrlError && (
+        <p className="mt-2 text-xs text-amber-400 flex items-center gap-1.5">
+          <AlertCircle size={12} /> {memoryUrlError}
+        </p>
+      )}
 
       {stats && (
         <Card className="mt-6 p-4">
@@ -692,11 +756,59 @@ export function DesktopDockSection() {
   const applyDockSize = useDockStore((s) => s.setIconSize);
   const applyDockPosition = useDockStore((s) => s.setPosition);
 
+  const wallpaperId = useThemeStore((s) => s.wallpaperId);
+  const wallpaperImage = useThemeStore((s) => s.wallpaperImage);
+  const wallpaperFallback = useThemeStore((s) => s.wallpaperFallback);
+  const wallpaperLightImage = useThemeStore((s) => s.wallpaperLightImage);
+  const wallpaperLightFallback = useThemeStore((s) => s.wallpaperLightFallback);
+  const scheme = useThemeStore((s) => s.scheme);
+  const getWallpapers = useThemeStore((s) => s.getWallpapers);
+  const [showPicker, setShowPicker] = useState(false);
+
+  const wallpapers = getWallpapers();
+  const currentWallpaper = wallpapers.find((w) => w.id === wallpaperId);
+  const wallpaperLabel = currentWallpaper?.label ?? "Unknown";
+
+  const isLight = scheme === "light";
+  const thumbImage = isLight && wallpaperLightImage ? wallpaperLightImage : wallpaperImage;
+  const thumbFallback = isLight && wallpaperLightFallback ? wallpaperLightFallback : wallpaperFallback;
+
+  const thumbnailStyle: React.CSSProperties =
+    currentWallpaper && currentWallpaper.kind === "animated"
+      ? { background: "radial-gradient(120% 120% at 50% 46%, #2a2a2e 0%, #1d1d1f 45%, #101011 100%)" }
+      : {
+          backgroundImage: thumbImage,
+          backgroundSize: "cover",
+          backgroundPosition: "center",
+          backgroundColor: thumbFallback,
+        };
+
   return (
     <section aria-label="Desktop and dock settings">
       <h2 className="text-lg font-semibold mb-5">Desktop & Dock</h2>
 
       <div className="space-y-3">
+        <Card className="p-4">
+          <p className="text-sm font-medium mb-3">Wallpaper</p>
+          <div className="flex items-center gap-3">
+            <div
+              className="w-12 h-8 rounded-md shrink-0 border border-white/10"
+              style={thumbnailStyle}
+              aria-hidden="true"
+            />
+            <span className="text-sm text-shell-text-secondary flex-1 min-w-0 truncate">
+              {wallpaperLabel}
+            </span>
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShowPicker(true)}
+            >
+              Change…
+            </Button>
+          </div>
+        </Card>
+
         <Card className="p-4">
           <p className="text-sm font-medium mb-3">Dock icon size</p>
           <div className="flex gap-2" role="group" aria-label="Dock icon size">
@@ -736,6 +848,13 @@ export function DesktopDockSection() {
           </div>
         </Card>
       </div>
+
+      {showPicker && (
+        <WallpaperPicker
+          open={showPicker}
+          onClose={() => setShowPicker(false)}
+        />
+      )}
     </section>
   );
 }

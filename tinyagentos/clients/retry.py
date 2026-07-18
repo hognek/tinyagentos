@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from typing import Callable, Awaitable, Tuple, Type
 
 import httpx
@@ -43,6 +44,7 @@ async def with_retry(
     base_delay: float = 0.1,
     multiplier: float = 3.0,
     max_delay: float = 3.0,
+    jitter: bool = True,
     retry_on: Tuple[Type[Exception], ...] = DEFAULT_RETRY_ON,
     retry_on_status: frozenset[int] | set[int] = DEFAULT_RETRY_ON_STATUS,
 ):
@@ -63,6 +65,10 @@ async def with_retry(
         Multiplicative factor applied after each retry.
     max_delay:
         Upper bound on the per-retry delay in seconds.
+    jitter:
+        If True (default), multiply each delay by a random factor in
+        [0.5, 1.5] to avoid thundering-herd effects.  Set to False for
+        deterministic timing in tests.
     retry_on:
         Tuple of exception types that warrant a retry.
     retry_on_status:
@@ -94,22 +100,26 @@ async def with_retry(
         except _StatusError as exc:
             last_exc = exc
             if attempt < max_attempts:
+                sleep_time = delay * random.uniform(0.5, 1.5) if jitter else delay
+                sleep_time = min(sleep_time, max_delay)
                 logger.warning(
                     "retry: attempt %d/%d failed with status %d, retrying in %.1fs",
-                    attempt, max_attempts, exc.status_code, delay,
+                    attempt, max_attempts, exc.status_code, sleep_time,
                 )
-                await asyncio.sleep(delay)
+                await asyncio.sleep(sleep_time)
                 delay = min(delay * multiplier, max_delay)
         except httpx.HTTPStatusError as exc:
             # Only retry on server errors (5xx), never on client errors (4xx).
             if exc.response.status_code in retry_on_status and exc.response.status_code >= 500:
                 last_exc = exc
                 if attempt < max_attempts:
+                    sleep_time = delay * random.uniform(0.5, 1.5) if jitter else delay
+                    sleep_time = min(sleep_time, max_delay)
                     logger.warning(
                         "retry: attempt %d/%d failed with HTTP %d, retrying in %.1fs",
-                        attempt, max_attempts, exc.response.status_code, delay,
+                        attempt, max_attempts, exc.response.status_code, sleep_time,
                     )
-                    await asyncio.sleep(delay)
+                    await asyncio.sleep(sleep_time)
                     delay = min(delay * multiplier, max_delay)
             else:
                 # 4xx or unexpected: do not retry, propagate immediately.
@@ -117,11 +127,13 @@ async def with_retry(
         except retry_on as exc:  # type: ignore[misc]
             last_exc = exc
             if attempt < max_attempts:
+                sleep_time = delay * random.uniform(0.5, 1.5) if jitter else delay
+                sleep_time = min(sleep_time, max_delay)
                 logger.warning(
                     "retry: attempt %d/%d failed with %s, retrying in %.1fs",
-                    attempt, max_attempts, type(exc).__name__, delay,
+                    attempt, max_attempts, type(exc).__name__, sleep_time,
                 )
-                await asyncio.sleep(delay)
+                await asyncio.sleep(sleep_time)
                 delay = min(delay * multiplier, max_delay)
             else:
                 break

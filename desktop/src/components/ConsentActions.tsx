@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { CheckCircle, XCircle } from "lucide-react";
+import { withCsrf } from "@/lib/csrf";
 
 /**
  * Inline Allow / Deny actions for an external-agent access request.
@@ -89,12 +90,12 @@ export function ConsentActions({
   async function createProject(): Promise<string | null> {
     const name = newName.trim();
     if (!name) return null;
-    const res = await fetch("/api/projects", {
+    const res = await fetch("/api/projects", withCsrf({
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "include",
       body: JSON.stringify({ name, slug: slugify(name) }),
-    });
+    }));
     if (!res.ok) {
       const d = await res.json().catch(() => ({}));
       setError((d as { error?: string }).error ?? `Could not create project (${res.status})`);
@@ -142,12 +143,12 @@ export function ConsentActions({
       body = JSON.stringify(payload);
     }
     try {
-      const res = await fetch(url, {
+      const res = await fetch(url, withCsrf({
         method: "POST",
         headers: body ? { "Content-Type": "application/json" } : {},
         body,
         credentials: "include",
-      });
+      }));
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         setError((data as { detail?: string }).detail ?? `Request failed (${res.status})`);

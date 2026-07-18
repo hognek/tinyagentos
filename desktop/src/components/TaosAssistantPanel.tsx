@@ -10,6 +10,7 @@ import {
   ExternalLink,
   Copy,
   Check,
+  Pencil,
 } from "lucide-react";
 import { CodeBlock } from "@/components/CodeBlock";
 import { useTaosAgentStore } from "@/stores/taos-agent-store";
@@ -43,6 +44,7 @@ export function TaosAssistantPanelInner({ embedded = false }: { embedded?: boole
     messages,
     appendMessage,
     appendDelta,
+    updateMessage,
     model,
     setModel,
     streaming,
@@ -287,7 +289,14 @@ export function TaosAssistantPanelInner({ embedded = false }: { embedded?: boole
             key={i}
             role={msg.role}
             content={msg.content}
-            streaming={streaming && i === messages.length - 1 && msg.role === "assistant"}
+            streaming={!!(streaming && i === messages.length - 1 && msg.role === "assistant")}
+            editable={
+              !streaming
+              && msg.role === "assistant"
+              && !!msg.content
+              && i === messages.length - 1
+            }
+            onSave={(newContent) => updateMessage(i, newContent)}
           />
         ))}
         <div ref={messagesEndRef} />
@@ -578,16 +587,32 @@ function MessageBubble({
   role,
   content,
   streaming,
+  onSave,
+  editable,
 }: {
   role: "user" | "assistant" | "system";
   content: string;
   streaming?: boolean;
+  onSave?: (content: string) => void;
+  editable?: boolean;
 }) {
   const [copied, setCopied] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draftValue, setDraftValue] = useState("");
+
+  // Reset editing state when the bubble stops being editable (e.g. new message
+  // appended mid-edit, or streaming restarts).  Without this the editor stays
+  // open on a now-stale message.
+  useEffect(() => {
+    if (!editable || streaming) {
+      setEditing(false);
+    }
+  }, [editable, streaming]);
 
   if (role === "system") return null;
 
   const isUser = role === "user";
+  const canEdit = editable && !streaming && content && onSave;
 
   const handleCopy = async () => {
     try {
@@ -599,6 +624,67 @@ function MessageBubble({
     }
   };
 
+  const startEdit = () => {
+    if (!canEdit) return;
+    setDraftValue(content);
+    setEditing(true);
+  };
+
+  const saveEdit = () => {
+    const trimmed = draftValue.trim();
+    if (trimmed && onSave) onSave(trimmed);
+    setEditing(false);
+  };
+
+  const cancelEdit = () => {
+    setEditing(false);
+  };
+
+  if (editing) {
+    return (
+      <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+        <div className={`max-w-[85%] rounded-xl px-3 py-2 text-sm ${
+          isUser ? "bg-accent text-white" : "bg-shell-surface-hover text-shell-text"
+        }`}>
+          <textarea
+            autoFocus
+            value={draftValue}
+            onChange={(e) => setDraftValue(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") { e.preventDefault(); cancelEdit(); }
+              else if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                saveEdit();
+              }
+            }}
+            aria-label="Edit agent message"
+            rows={3}
+            className="w-full bg-white/5 border border-white/10 rounded px-2 py-1 text-sm resize-none focus:outline-none focus:border-accent/50"
+          />
+          <div className="flex gap-1 mt-1 justify-end">
+            <button
+              onClick={cancelEdit}
+              className="px-2 py-0.5 text-xs rounded text-shell-text-tertiary hover:text-shell-text"
+              aria-label="Cancel edit"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={saveEdit}
+              disabled={!draftValue.trim()}
+              className="px-2 py-0.5 text-xs rounded bg-accent text-white disabled:opacity-30"
+              aria-label="Save edit"
+            >
+              Save
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Edit affordance: show an explicit Edit button on hover instead of making
+  // the whole bubble click-to-edit (avoids accidental entry while copying).
   return (
     <div className={`flex ${isUser ? "justify-end" : "justify-start"} group`}>
       <div
@@ -616,13 +702,24 @@ function MessageBubble({
           <span className="inline-block w-1.5 h-3 bg-current opacity-60 animate-pulse ml-0.5 rounded-sm" />
         )}
         {!streaming && content && (
-          <button
-            onClick={handleCopy}
-            aria-label={copied ? "Copied" : "Copy message"}
-            className="absolute -top-2 -right-2 p-1 rounded opacity-0 group-hover:opacity-100 focus:opacity-100 bg-shell-surface border border-white/10 text-shell-text-secondary hover:text-shell-text transition-opacity select-none"
-          >
-            {copied ? <Check size={10} /> : <Copy size={10} />}
-          </button>
+          <div className="absolute -top-2 -right-2 flex gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity select-none">
+            {canEdit && (
+              <button
+                onClick={startEdit}
+                aria-label="Edit message"
+                className="p-1 rounded bg-shell-surface border border-white/10 text-shell-text-secondary hover:text-shell-text"
+              >
+                <Pencil size={10} />
+              </button>
+            )}
+            <button
+              onClick={handleCopy}
+              aria-label={copied ? "Copied" : "Copy message"}
+              className="p-1 rounded bg-shell-surface border border-white/10 text-shell-text-secondary hover:text-shell-text"
+            >
+              {copied ? <Check size={10} /> : <Copy size={10} />}
+            </button>
+          </div>
         )}
       </div>
     </div>

@@ -30,10 +30,14 @@ class _PersistentSessions:
     Session entries are dicts: {user_id, expires_at, long_lived}.
     Old float entries (single-user legacy) are tolerated and treated as the
     first user's session.
+
+    Thread-safe: all mutating operations (set, delete, pop) are protected by a
+    lock to prevent lost updates from concurrent read-modify-write cycles.
     """
 
     def __init__(self, path: Path):
         self._path = path
+        self._lock = threading.Lock()
 
     def _load(self) -> dict:
         if not self._path.exists():
@@ -51,14 +55,16 @@ class _PersistentSessions:
         return self._load()[key]
 
     def __setitem__(self, key: str, value) -> None:
-        data = self._load()
-        data[key] = value
-        self._save(data)
+        with self._lock:
+            data = self._load()
+            data[key] = value
+            self._save(data)
 
     def __delitem__(self, key: str) -> None:
-        data = self._load()
-        del data[key]
-        self._save(data)
+        with self._lock:
+            data = self._load()
+            del data[key]
+            self._save(data)
 
     def __contains__(self, key: object) -> bool:
         return key in self._load()
@@ -70,10 +76,11 @@ class _PersistentSessions:
         return self._load().get(key, default)
 
     def pop(self, key: str, *args):
-        data = self._load()
-        result = data.pop(key, *args)
-        self._save(data)
-        return result
+        with self._lock:
+            data = self._load()
+            result = data.pop(key, *args)
+            self._save(data)
+            return result
 
     def items(self):
         return list(self._load().items())
@@ -597,14 +604,17 @@ class AuthManager:
     #  Sessions                                                            #
     # ------------------------------------------------------------------ #
 
-    def create_session(self, user_id: str = "", long_lived: bool = False) -> str:
+    def create_session(self, user_id: str = "", long_lived: bool = False, user_agent: str | None = None) -> str:
         token = secrets.token_urlsafe(32)
         ttl = self.long_session_ttl if long_lived else self.session_ttl
-        self._sessions[token] = {
+        entry: dict = {
             "user_id": user_id,
             "expires_at": time.time() + ttl,
             "long_lived": long_lived,
         }
+        if user_agent:
+            entry["user_agent_hash"] = hashlib.sha256(user_agent.encode()).hexdigest()
+        self._sessions[token] = entry
         return token
 
     def session_ttl_for(self, long_lived: bool = False) -> int:
@@ -619,8 +629,14 @@ class AuthManager:
             return {"user_id": "", "expires_at": float(entry), "long_lived": False}
         return entry
 
-    def validate_session(self, token: str) -> str | None:
-        """Return user_id if the session is valid, else None."""
+    def validate_session(self, token: str, user_agent: str | None = None) -> str | None:
+        """Return user_id if the session is valid, else None.
+
+        When *user_agent* is provided and the session was created with a
+        User-Agent hash, the hash is verified as a basic stolen-cookie check.
+        Sessions created without a User-Agent hash (legacy) continue to
+        validate regardless.
+        """
         entry = self._get_session_entry(token)
         if entry is None:
             return None
@@ -630,6 +646,14 @@ class AuthManager:
             except (KeyError, Exception):
                 pass
             return None
+        # Client-binding check: only when the session was created with a
+        # user_agent_hash AND the caller supplies a user_agent for comparison.
+        stored_ua = entry.get("user_agent_hash")
+        if stored_ua and user_agent:
+            if not secrets.compare_digest(
+                stored_ua, hashlib.sha256(user_agent.encode()).hexdigest()
+            ):
+                return None
         return entry.get("user_id", "") or ""
 
     def revoke_session(self, token: str) -> None:

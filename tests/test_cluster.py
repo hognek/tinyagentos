@@ -43,9 +43,9 @@ class TestClusterManager:
     async def test_unregister_worker(self):
         mgr = ClusterManager()
         await mgr.register_worker(_make_worker("gpu-box"))
-        assert mgr.unregister_worker("gpu-box") is True
+        assert await mgr.unregister_worker("gpu-box") is True
         assert mgr.get_workers() == []
-        assert mgr.unregister_worker("gpu-box") is False
+        assert await mgr.unregister_worker("gpu-box") is False
 
     async def test_heartbeat_updates_load_and_status(self):
         mgr = ClusterManager()
@@ -72,6 +72,22 @@ class TestClusterManager:
         mgr.heartbeat("gpu-box", load=0.1)
         assert mgr.get_worker("gpu-box").status == "online"
 
+    async def test_heartbeat_does_not_reonline_draining_worker(self):
+        """A worker mid graceful-drain keeps heartbeating; heartbeat must NOT
+        flip it back to online or it re-enters routing before leases finish
+        (taOS #890)."""
+        mgr = ClusterManager()
+        w = _make_worker("gpu-box")
+        await mgr.register_worker(w)
+        w.status = "draining"
+
+        ok = mgr.heartbeat("gpu-box", load=0.1)
+        assert ok is True
+        # Load/last_heartbeat still update, but status stays draining.
+        updated = mgr.get_worker("gpu-box")
+        assert updated.status == "draining"
+        assert updated.load == 0.1
+
     async def test_heartbeat_timeout_marks_offline(self):
         mgr = ClusterManager()
         w = _make_worker("gpu-box")
@@ -86,6 +102,33 @@ class TestClusterManager:
                 worker.status = "offline"
 
         assert mgr.get_worker("gpu-box").status == "offline"
+
+    async def test_monitor_loop_never_offlines_local_worker(self):
+        """The controller's own 'local' worker is kept alive by
+        local_heartbeat_loop, not remote heartbeats. The monitor loop must
+        skip it so a heartbeat gap never marks the controller offline (which
+        would drop its own leases and remove local backends from routing).
+        A regular stale worker in the same pass is still marked offline
+        (taOS #1690)."""
+        mgr = ClusterManager()
+        await mgr.register_worker(_make_worker("local"))
+        await mgr.register_worker(_make_worker("gpu-box"))
+        stale = time.time() - HEARTBEAT_TIMEOUT - 5
+        mgr.get_worker("local").last_heartbeat = stale
+        mgr.get_worker("gpu-box").last_heartbeat = stale
+
+        task = asyncio.create_task(mgr._monitor_loop())
+        try:
+            await asyncio.sleep(0.05)  # let one iteration run
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert mgr.get_worker("local").status == "online"    # guard held
+        assert mgr.get_worker("gpu-box").status == "offline"  # normal path
 
     async def test_get_workers_for_capability_filters_and_sorts(self):
         mgr = ClusterManager()
@@ -259,3 +302,121 @@ class TestTaskRouter:
         data, worker_name = await router.route_request("chat", "POST", "/v1/chat/completions", {})
         assert data is None
         assert worker_name is None
+
+
+@pytest.mark.asyncio
+class TestWorkerDrain:
+    """Tests for taOS #890 — worker auto-update with graceful drain."""
+
+    async def test_drain_worker_graceful_sets_draining_status(self):
+        """Graceful drain sets status to 'draining', leaves leases intact."""
+        mgr = ClusterManager()
+        await mgr.register_worker(_make_worker("gpu-box", capabilities=["chat"]))
+
+        result = await mgr.drain_worker("gpu-box", graceful=True)
+        assert result["worker"] == "gpu-box"
+        assert result["previous_status"] == "online"
+        assert result["status"] == "draining"
+        assert result["released_leases"] == 0
+        assert mgr.get_worker("gpu-box").status == "draining"
+
+    async def test_drain_worker_force_releases_leases_and_marks_offline(self):
+        """Force drain releases all leases and marks worker offline."""
+        mgr = ClusterManager()
+        await mgr.register_worker(_make_worker("gpu-box", capabilities=["chat"]))
+
+        # Add a lease for this worker
+        from tinyagentos.cluster.worker_protocol import GpuLease
+        import time
+        lease = GpuLease(
+            lease_id="l_test1",
+            resource_id="gpu-box:gpu-cuda-0",
+            caller="test",
+            expires_at=time.time() + 60,
+            required_vram_mb=0,
+        )
+        mgr._leases["l_test1"] = lease
+
+        result = await mgr.drain_worker("gpu-box", graceful=False)
+        assert result["released_leases"] == 1
+        assert result["status"] == "offline"
+        assert mgr.get_worker("gpu-box").status == "offline"
+        assert "l_test1" not in mgr._leases
+
+    async def test_drain_worker_unknown_returns_error(self):
+        """Draining a non-existent worker returns error dict."""
+        mgr = ClusterManager()
+        result = await mgr.drain_worker("nonexistent")
+        assert "error" in result
+        assert result["worker"] == "nonexistent"
+
+    async def test_cancel_drain_returns_worker_to_online(self):
+        """Cancel drain returns a draining worker back to online."""
+        mgr = ClusterManager()
+        await mgr.register_worker(_make_worker("gpu-box", capabilities=["chat"]))
+        await mgr.drain_worker("gpu-box", graceful=True)
+        assert mgr.get_worker("gpu-box").status == "draining"
+
+        result = await mgr.cancel_drain("gpu-box")
+        assert result["worker"] == "gpu-box"
+        assert result["status"] == "online"
+        assert mgr.get_worker("gpu-box").status == "online"
+
+    async def test_cancel_drain_only_works_on_draining(self):
+        """Cancel drain returns error for non-draining workers."""
+        mgr = ClusterManager()
+        await mgr.register_worker(_make_worker("gpu-box"))
+
+        result = await mgr.cancel_drain("gpu-box")
+        assert "error" in result
+        assert "not draining" in result["error"]
+
+    async def test_cancel_drain_unknown_returns_error(self):
+        """Cancel drain on unknown worker returns error."""
+        mgr = ClusterManager()
+        result = await mgr.cancel_drain("nonexistent")
+        assert "error" in result
+
+    async def test_draining_workers_excluded_from_routing(self):
+        """Draining workers should not receive new tasks."""
+        mgr = ClusterManager()
+        await mgr.register_worker(_make_worker("online-gpu", capabilities=["chat"], load=0.1))
+        await mgr.register_worker(_make_worker("draining-gpu", capabilities=["chat"], load=0.0))
+        await mgr.drain_worker("draining-gpu", graceful=True)
+
+        result = mgr.get_workers_for_capability("chat")
+        assert len(result) == 1
+        assert result[0].name == "online-gpu"
+
+    async def test_draining_workers_excluded_from_catalog(self):
+        """Draining workers are excluded from the aggregate catalog."""
+        mgr = ClusterManager()
+        online = _make_worker("online", capabilities=["chat"])
+        online.backends = [{"name": "b1", "type": "ollama", "url": "u", "capabilities": ["chat"], "models": [{"name": "m1"}]}]
+        draining = _make_worker("draining", capabilities=["chat"])
+        draining.backends = [{"name": "b2", "type": "ollama", "url": "u", "capabilities": ["chat"], "models": [{"name": "m2"}]}]
+        await mgr.register_worker(online)
+        await mgr.register_worker(draining)
+        await mgr.drain_worker("draining", graceful=True)
+
+        out = mgr.aggregate_catalog()
+        assert [w["name"] for w in out["workers"]] == ["online"]
+        assert [m["name"] for m in out["models"]] == ["m1"]
+
+    async def test_draining_workers_excluded_from_lease_claim(self):
+        """Lease claims should fail for draining workers."""
+        mgr = ClusterManager()
+        await mgr.register_worker(_make_worker("draining-gpu", url="http://draining:9000"))
+
+        # Set up worker with VRAM info
+        worker = mgr.get_worker("draining-gpu")
+        worker.free_vram_mb = 8000
+
+        await mgr.drain_worker("draining-gpu", graceful=True)
+
+        lease = await mgr.claim_lease(
+            resource_id="draining-gpu:gpu-cuda-0",
+            caller="test",
+            ttl_seconds=30,
+        )
+        assert lease is None

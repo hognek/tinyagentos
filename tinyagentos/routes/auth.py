@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import threading
 import time
 from collections import OrderedDict
@@ -204,7 +205,7 @@ button[type="submit"]:disabled { opacity: 0.4; cursor: not-allowed; }
 
 
 def _login_page(error: str = "", multi_user: bool = False, next_url: str = "") -> str:
-    err = f'<p class="error" role="alert">{error}</p>' if error else ""
+    err = f'<p class="error" role="alert">{html.escape(error)}</p>' if error else ""
     pwd_placeholder = "Password or invite code" if multi_user else "Password"
     autologin_default = "" if multi_user else "checked"
     username_field = '''
@@ -213,7 +214,7 @@ def _login_page(error: str = "", multi_user: bool = False, next_url: str = "") -
           <input type="text" name="username" autocomplete="username" autofocus required>
         </label>
         ''' if multi_user else ""
-    next_field = f'<input type="hidden" name="next" value="{next_url}">' if next_url else ""
+    next_field = f'<input type="hidden" name="next" value="{html.escape(next_url)}">' if next_url else ""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -248,7 +249,7 @@ def _login_page(error: str = "", multi_user: bool = False, next_url: str = "") -
 
 
 def _setup_page(error: str = "") -> str:
-    err = f'<p class="error" role="alert">{error}</p>' if error else ""
+    err = f'<p class="error" role="alert">{html.escape(error)}</p>' if error else ""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -369,6 +370,7 @@ async def login(request: Request):
     """
     auth_mgr = request.app.state.auth
     client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "")
 
     content_type = request.headers.get("content-type", "")
 
@@ -407,7 +409,7 @@ async def login(request: Request):
 
         # Pending user: invite code accepted as password
         if user_record and user_record.get("pending_invite"):
-            token = auth_mgr.create_session(user_id=user_record["id"], long_lived=long_lived)
+            token = auth_mgr.create_session(user_id=user_record["id"], long_lived=long_lived, user_agent=user_agent)
             resp = JSONResponse({
                 "ok": True,
                 "needs_onboarding": True,
@@ -425,7 +427,7 @@ async def login(request: Request):
         user_id = user_record["id"] if user_record else ""
         if user_record:
             auth_mgr.update_last_login(user_id)
-        token = auth_mgr.create_session(user_id=user_id, long_lived=long_lived)
+        token = auth_mgr.create_session(user_id=user_id, long_lived=long_lived, user_agent=user_agent)
         pub = auth_mgr._public_user(user_record) if user_record else auth_mgr.get_user()
         resp = JSONResponse({"ok": True, "user": pub})
         if long_lived:
@@ -460,12 +462,12 @@ async def login(request: Request):
         # Pending user — create their session, then send to /desktop. The
         # SPA's LoginGate will see needs_onboarding via /auth/status and
         # render the invite-completion screen.
-        token = auth_mgr.create_session(user_id=user_record["id"], long_lived=long_lived)
+        token = auth_mgr.create_session(user_id=user_record["id"], long_lived=long_lived, user_agent=user_agent)
     else:
         user_id = user_record["id"] if user_record else ""
         if user_record:
             auth_mgr.update_last_login(user_id)
-        token = auth_mgr.create_session(user_id=user_id, long_lived=long_lived)
+        token = auth_mgr.create_session(user_id=user_id, long_lived=long_lived, user_agent=user_agent)
 
     destination = next_url or "/desktop"
     response = RedirectResponse(destination, status_code=303)
@@ -516,6 +518,7 @@ async def auth_setup(request: Request):
     auth_mgr = request.app.state.auth
 
     content_type = request.headers.get("content-type", "")
+    user_agent = request.headers.get("user-agent", "")
     if "application/json" in content_type:
         try:
             body = await request.json()
@@ -540,7 +543,7 @@ async def auth_setup(request: Request):
         record = auth_mgr.find_user(username)
         user_id = record["id"] if record else ""
         auth_mgr.update_last_login(user_id)
-        token = auth_mgr.create_session(user_id=user_id, long_lived=long_lived)
+        token = auth_mgr.create_session(user_id=user_id, long_lived=long_lived, user_agent=user_agent)
         resp = JSONResponse({"ok": True, "user": user})
         if long_lived:
             resp.set_cookie(
@@ -573,7 +576,7 @@ async def auth_setup(request: Request):
     record = auth_mgr.find_user(username)
     user_id = record["id"] if record else ""
     auth_mgr.update_last_login(user_id)
-    token = auth_mgr.create_session(user_id=user_id, long_lived=long_lived)
+    token = auth_mgr.create_session(user_id=user_id, long_lived=long_lived, user_agent=user_agent)
     response = RedirectResponse("/desktop", status_code=303)
     if long_lived:
         response.set_cookie(
@@ -593,6 +596,7 @@ async def complete_invite(request: Request):
     """
     auth_mgr = request.app.state.auth
     client_ip = request.client.host if request.client else "unknown"
+    user_agent = request.headers.get("user-agent", "")
 
     if _complete_limiter.is_limited(client_ip):
         return JSONResponse(
@@ -629,7 +633,7 @@ async def complete_invite(request: Request):
     auth_mgr.update_last_login(user_id)
     # Revoke any existing invite-phase sessions and create a fresh one
     auth_mgr.revoke_user_sessions(user_id)
-    token = auth_mgr.create_session(user_id=user_id, long_lived=long_lived)
+    token = auth_mgr.create_session(user_id=user_id, long_lived=long_lived, user_agent=user_agent)
     resp = JSONResponse({"ok": True, "user": user})
     if long_lived:
         resp.set_cookie(

@@ -76,6 +76,9 @@ VALID_KINDS = frozenset({
     # Registry governance audit events (PR1 — lifecycle state machine).
     # Payload shape: {action, canonical_id, actor_user_id, before_status, after_status}
     "governance",
+    # GPU work queue per-op audit record (taOS #1864). One per op on
+    # completion, plus one on eviction/cancel.
+    "gpu_op",
 })
 
 # Documented envelope schema — the librarian parses against this.
@@ -107,6 +110,19 @@ ENVELOPE_V1_SCHEMA = {
             "actor_user_id": "str",
             "before_status": "str",
             "after_status": "str",
+        },
+        # GPU work queue per-op audit record (taOS #1864). One per op on
+        # completion, plus one on eviction/cancel. model/backend_name/
+        # duration_ms ride the first-class columns.
+        "gpu_op": {
+            "op": "inference|load|unload|evict",
+            "outcome": "ok|error|cancelled|evicted|shadow_denied",
+            "wait_ms": "int", "queue_position_at_enqueue": "int",
+            "queue_depth_at_admit": "int", "required_vram_mb": "int",
+            "free_vram_mb_at_admit": "int", "reserved_vram_mb_at_admit": "int",
+            "resident_models_at_admit": "int",
+            "evictions_triggered": "list[str]", "priority": "int",
+            "submitter": "str",
         },
     },
 }

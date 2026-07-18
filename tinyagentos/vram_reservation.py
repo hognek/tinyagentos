@@ -74,11 +74,16 @@ class VramReservationManager:
     def __init__(
         self,
         ttl_seconds: float = DEFAULT_RESERVATION_TTL_SECONDS,
+        probe: "Callable[[], tuple[int, int] | None] | None" = None,
     ) -> None:
         self._lock = asyncio.Lock()
         self._reserved_vram_mb: int = 0
         self._pending: dict[str, VramReservation] = {}
         self._ttl_seconds = float(ttl_seconds)
+        # An injectable probe overrides nvidia-smi (used by the GPU arbiter to
+        # share one ledger with a test-supplied probe, taOS #185/#894). It must
+        # return ``(free_mb, total_mb)`` or ``None`` when VRAM cannot be read.
+        self._probe_override = probe
 
     # ── public API ──────────────────────────────────────────────────
 
@@ -264,15 +269,16 @@ class VramReservationManager:
             self._reserved_vram_mb = 0
         return len(stale_ids)
 
-    @staticmethod
-    def _probe_vram() -> tuple[int, int] | None:
-        """Probe real-time free/total VRAM via nvidia-smi.
+    def _probe_vram(self) -> tuple[int, int] | None:
+        """Probe real-time free/total VRAM via nvidia-smi (or an injected probe).
 
         Returns ``(free_mb, total_mb)``, or ``None`` when no nvidia-smi
         is available or the probe fails. ``None`` (cannot know) is
         deliberately distinct from ``(0, 0)`` (known-full): admission
         fails open on ``None``, matching cluster claim_lease semantics.
         """
+        if self._probe_override is not None:
+            return self._probe_override()
         try:
             from tinyagentos.system_stats import read_nvidia_vram
 

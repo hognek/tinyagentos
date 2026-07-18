@@ -549,3 +549,26 @@ async def test_list_dedup_by_id_primary_wins(tmp_path):
     if isinstance(payload, str):
         payload = json.loads(payload)
     assert payload.get("source") == "db", "DB version should win over late version"
+
+
+# ---------------------------------------------------------------------------
+# GPU work queue per-op audit record (taOS #1864 Slice A1)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_record_gpu_op_kind_accepted(tmp_path):
+    store = AgentTraceStore(tmp_path, "_system_")
+    env = await store.record(
+        "gpu_op", model="qwen2.5:7b", backend_name="local-ollama",
+        duration_ms=1200,
+        payload={"op": "load", "outcome": "ok", "wait_ms": 0,
+                 "queue_position_at_enqueue": 0, "queue_depth_at_admit": 0,
+                 "required_vram_mb": 2048, "free_vram_mb_at_admit": 8192,
+                 "reserved_vram_mb_at_admit": 0, "resident_models_at_admit": 0,
+                 "evictions_triggered": [], "priority": 20,
+                 "submitter": "_system_"},
+    )
+    assert env["kind"] == "gpu_op"
+    rows = await store.list(kind="gpu_op")
+    assert rows and rows[0]["payload"]["outcome"] == "ok"
+    await store.close()

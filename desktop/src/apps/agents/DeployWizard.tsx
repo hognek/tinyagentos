@@ -30,6 +30,9 @@ const MEMORY_TIER_INFO: Record<string, { label: string; description: string; min
   heavy:    { label: "Heavy",    description: "Best quality. bge-m3 + qwen3-reranker-0.6b (~3.5GB). Needs GPU/NPU.",   min_ram_mb: 8192,  needs_accel: true  },
 };
 
+/** Whitelist of known verification_status values (mirrors Framework type union). */
+const VALID_STATUSES = new Set(["tested", "beta", "experimental", "broken"]);
+
 /** Parse a tier_id like "arm-vulkan-8gb" and return RAM in MB. */
 function tierIdRamMb(tierId: string): number {
   const m = tierId.match(/(\d+)gb/i);
@@ -369,7 +372,16 @@ export function DeployWizard({
   // Step 2
   const [frameworks, setFrameworks] = useState<Framework[]>([]);
   const [selectedFramework, setSelectedFramework] = useState<string>("");
-  const [showExperimental, setShowExperimental] = useState(false);
+  const [experimentalAcknowledged, setExperimentalAcknowledged] = useState(false);
+
+  // Dev mode — loaded from localStorage on mount, bypasses experimental click-through
+  const [devMode, setDevMode] = useState(() => {
+    try {
+      return localStorage.getItem("taos-dev-mode") === "1";
+    } catch {
+      return false;
+    }
+  });
 
   // Step 3
   const [models, setModels] = useState<Model[]>([]);
@@ -452,20 +464,25 @@ export function DeployWizard({
               id: String(a.id),
               name: String(a.name ?? a.id),
               description: String(a.description ?? ""),
-              verification_status: (a.verification_status as Framework["verification_status"]) ?? "alpha",
+              verification_status: (
+                VALID_STATUSES.has(String(a.verification_status))
+                  ? (a.verification_status as Framework["verification_status"])
+                  : "experimental"
+              ),
+              tracking_issue: typeof a.tracking_issue === "string" ? a.tracking_issue : undefined,
             }));
             // Hermes is the recommended default and shows first; OpenClaw
             // second; the rest preserve API order.
             const rank = (id: string) => (id === "hermes" ? 0 : id === "openclaw" ? 1 : 2);
             mapped.sort((a, b) => rank(a.id) - rank(b.id));
             setFrameworks(mapped);
-            // Default-select Hermes (or the first visible framework) so the
+            // Default-select Hermes (or the first tested/beta framework) so the
             // wizard opens on a working choice instead of nothing selected.
             setSelectedFramework((cur) => {
               if (cur) return cur;
               const preferred = mapped.find((f) => f.id === "hermes")
-                ?? mapped.find((f) => f.verification_status !== "alpha")
-                ?? mapped[0];
+                ?? mapped.find((f) => f.verification_status === "tested" || f.verification_status === "beta")
+                ?? (mapped[0]?.verification_status !== "experimental" ? mapped[0] : undefined);
               return preferred?.id ?? "";
             });
           }
@@ -762,7 +779,7 @@ export function DeployWizard({
       setColor(COLORS[0]);
       setEmoji("");
       setSelectedFramework("");
-      setShowExperimental(false);
+      setExperimentalAcknowledged(false);
       setSelectedModel("");
       setModels([]);
       setModelsLoaded(false);
@@ -1068,15 +1085,19 @@ export function DeployWizard({
             <div className="space-y-2">
               <span className="block text-xs text-shell-text-secondary mb-2">Select Framework</span>
               {frameworks
-                .filter((fw) => fw.verification_status !== "alpha" || showExperimental)
                 .map((fw) => {
-                  const isAlpha = fw.verification_status === "alpha";
-                  const selectable = !isAlpha || showExperimental;
+                  const isExperimental = fw.verification_status === "experimental";
+                  const isTested = fw.verification_status === "tested";
+                  const isBeta = fw.verification_status === "beta";
+                  const selectable =
+                    !isExperimental || experimentalAcknowledged || devMode;
                   const isSelected = selectedFramework === fw.id;
                   return (
                     <button
                       key={fw.id}
-                      onClick={() => selectable ? setSelectedFramework(fw.id) : undefined}
+                      onClick={() =>
+                        selectable ? setSelectedFramework(fw.id) : undefined
+                      }
                       disabled={!selectable}
                       aria-disabled={!selectable}
                       className={`group w-full text-left px-3.5 py-3 rounded-lg border transition-colors ${
@@ -1100,52 +1121,117 @@ export function DeployWizard({
                         </div>
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center gap-2">
-                            <span className={`text-sm font-medium ${isAlpha ? "text-shell-text-tertiary" : ""}`}>
+                            <span
+                              className={`text-sm font-medium ${
+                                isExperimental ? "text-shell-text-tertiary" : ""
+                              }`}
+                            >
                               {fw.name}
                             </span>
-                            {fw.verification_status === "beta" && (
+                            {isBeta && (
                               <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/20 text-amber-400 leading-none">
                                 Beta
                               </span>
                             )}
-                            {fw.verification_status === "alpha" && (
+                            {isExperimental && (
                               <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-zinc-500/20 text-zinc-400 leading-none">
-                                Alpha · Testing
+                                Experimental
+                              </span>
+                            )}
+                            {isTested && (
+                              <span className="px-1.5 py-0.5 rounded text-[10px] font-medium bg-emerald-500/20 text-emerald-400 leading-none">
+                                Tested
                               </span>
                             )}
                             {isSelected && (
-                              <Check size={14} className="ml-auto shrink-0 text-accent" aria-hidden="true" />
+                              <Check
+                                size={14}
+                                className="ml-auto shrink-0 text-accent"
+                                aria-hidden="true"
+                              />
                             )}
                           </div>
-                          <div className={`text-xs mt-0.5 ${isAlpha ? "text-shell-text-tertiary" : "text-shell-text-secondary"}`}>
+                          <div
+                            className={`text-xs mt-0.5 ${
+                              isExperimental
+                                ? "text-shell-text-tertiary"
+                                : "text-shell-text-secondary"
+                            }`}
+                          >
                             {fw.description}
                           </div>
+                          {fw.tracking_issue && (
+                            <a
+                              href={fw.tracking_issue}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              onClick={(e) => e.stopPropagation()}
+                              className="inline-block mt-1 text-[10px] text-accent/70 hover:text-accent underline"
+                            >
+                              Tracking issue →
+                            </a>
+                          )}
                         </div>
                       </div>
                     </button>
                   );
                 })}
-              {/* Alpha toggle */}
-              <label
-                htmlFor="show-experimental-frameworks"
-                className="flex items-center gap-2 mt-3 cursor-pointer select-none"
-              >
-                <input
-                  id="show-experimental-frameworks"
-                  type="checkbox"
-                  checked={showExperimental}
-                  onChange={(e) => {
-                    setShowExperimental(e.target.checked);
-                    // Deselect if currently selected framework becomes hidden
-                    if (!e.target.checked) {
-                      const fw = frameworks.find((f) => f.id === selectedFramework);
-                      if (fw?.verification_status === "alpha") setSelectedFramework("");
-                    }
-                  }}
-                  className="accent-accent"
-                />
-                <span className="text-xs text-shell-text-secondary">Show alpha / in testing frameworks</span>
-              </label>
+              {/* Experimental: "I understand" acknowledge + dev-mode toggle */}
+              {frameworks.some((fw) => fw.verification_status === "experimental") && (
+                <div className="flex flex-col gap-2 mt-3">
+                  <label
+                    htmlFor="experimental-acknowledge"
+                    className="flex items-center gap-2 cursor-pointer select-none"
+                  >
+                    <input
+                      id="experimental-acknowledge"
+                      type="checkbox"
+                      checked={experimentalAcknowledged}
+                      onChange={(e) => {
+                        setExperimentalAcknowledged(e.target.checked);
+                        if (!e.target.checked) {
+                          const fw = frameworks.find(
+                            (f) => f.id === selectedFramework
+                          );
+                          if (
+                            fw?.verification_status === "experimental"
+                          )
+                            setSelectedFramework("");
+                        }
+                      }}
+                      className="accent-accent"
+                    />
+                    <span className="text-xs text-shell-text-secondary">
+                      I understand — enable experimental frameworks
+                    </span>
+                  </label>
+                  <label
+                    htmlFor="dev-mode-toggle"
+                    className="flex items-center gap-2 cursor-pointer select-none"
+                  >
+                    <input
+                      id="dev-mode-toggle"
+                      type="checkbox"
+                      checked={devMode}
+                      onChange={(e) => {
+                        setDevMode(e.target.checked);
+                        try {
+                          localStorage.setItem(
+                            "taos-dev-mode",
+                            e.target.checked ? "1" : ""
+                          );
+                        } catch {
+                          /* localStorage unavailable */
+                        }
+                      }}
+                      className="accent-accent"
+                    />
+                    <span className="text-xs text-shell-text-tertiary">
+                      Developer mode (skip experimental click-through)
+                    </span>
+                  </label>
+                </div>
+              )}
             </div>
           )}
 

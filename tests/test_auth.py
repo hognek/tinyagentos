@@ -1009,3 +1009,122 @@ class TestConcurrentHashUpgrade:
         stored = json.loads(mgr._user_file.read_text())
         final_hash = stored["users"][0]["password_hash"]
         assert final_hash.startswith("$argon2"), f"Hash was not upgraded: {final_hash[:40]}"
+
+
+class TestXSSHardening:
+    """html.escape() is applied to error and next_url in auth page templates."""
+
+    def test_login_page_escapes_error_param(self):
+        from tinyagentos.routes.auth import _login_page
+        html = _login_page(error='<script>alert(1)</script>')
+        assert "<script>" not in html
+        assert "&lt;script&gt;" in html
+
+    def test_login_page_escapes_next_url(self):
+        from tinyagentos.routes.auth import _login_page
+        html = _login_page(next_url='"/><script>alert(1)</script>')
+        assert "<script>" not in html
+        assert "&lt;script&gt;" in html
+
+    def test_setup_page_escapes_error_param(self):
+        from tinyagentos.routes.auth import _setup_page
+        html = _setup_page(error='<img src=x onerror=alert(1)>')
+        assert "<img" not in html
+        assert "&lt;img" in html
+
+
+class TestPersistentSessionsLock:
+    """_PersistentSessions lock prevents lost updates from concurrent writes."""
+
+    def test_concurrent_writes_dont_lose_data(self, tmp_path):
+        import threading
+        from tinyagentos.auth import _PersistentSessions
+        session_path = tmp_path / "sessions.json"
+        store = _PersistentSessions(session_path)
+
+        results_a = []
+        results_b = []
+
+        def writer_a():
+            for i in range(50):
+                store[f"key_a_{i}"] = {"v": i}
+                results_a.append(store.get(f"key_a_{i}"))
+
+        def writer_b():
+            for i in range(50):
+                store[f"key_b_{i}"] = {"v": i}
+                results_b.append(store.get(f"key_b_{i}"))
+
+        ta = threading.Thread(target=writer_a)
+        tb = threading.Thread(target=writer_b)
+        ta.start()
+        tb.start()
+        ta.join()
+        tb.join()
+
+        # All writes must be visible in final state
+        data = store._load()
+        for i in range(50):
+            assert f"key_a_{i}" in data, f"key_a_{i} missing after concurrent writes"
+            assert f"key_b_{i}" in data, f"key_b_{i} missing after concurrent writes"
+
+
+class TestSessionClientBinding:
+    """Sessions store a User-Agent hash and validate against it."""
+
+    def test_session_stores_user_agent_hash(self, tmp_path):
+        mgr = AuthManager(tmp_path)
+        mgr.setup_user("alice", "Alice", "", "alicepwd1")
+        rec = mgr.find_user("alice")
+        token = mgr.create_session(
+            user_id=rec["id"], user_agent="TestAgent/1.0"
+        )
+        entry = mgr._sessions.get(token)
+        assert entry is not None
+        assert "user_agent_hash" in entry
+        assert isinstance(entry["user_agent_hash"], str)
+
+    def test_session_validates_with_matching_user_agent(self, tmp_path):
+        mgr = AuthManager(tmp_path)
+        mgr.setup_user("alice", "Alice", "", "alicepwd1")
+        rec = mgr.find_user("alice")
+        token = mgr.create_session(
+            user_id=rec["id"], user_agent="TestAgent/1.0"
+        )
+        user_id = mgr.validate_session(token, user_agent="TestAgent/1.0")
+        assert user_id == rec["id"]
+
+    def test_session_rejects_mismatched_user_agent(self, tmp_path):
+        mgr = AuthManager(tmp_path)
+        mgr.setup_user("alice", "Alice", "", "alicepwd1")
+        rec = mgr.find_user("alice")
+        token = mgr.create_session(
+            user_id=rec["id"], user_agent="Chrome/100"
+        )
+        user_id = mgr.validate_session(token, user_agent="Firefox/200")
+        assert user_id is None
+
+    def test_session_without_ua_hash_still_validates(self, tmp_path):
+        """Backward compat: sessions created without user_agent still work."""
+        mgr = AuthManager(tmp_path)
+        mgr.setup_user("alice", "Alice", "", "alicepwd1")
+        rec = mgr.find_user("alice")
+        token = mgr.create_session(user_id=rec["id"])
+        # Should validate even without user_agent param
+        user_id = mgr.validate_session(token)
+        assert user_id == rec["id"]
+        # Should also validate with a user_agent param (no hash to compare)
+        user_id = mgr.validate_session(token, user_agent="Anything/1.0")
+        assert user_id == rec["id"]
+
+    def test_session_with_ua_hash_validates_without_ua_param(self, tmp_path):
+        """When caller doesn't supply user_agent, hash check is skipped."""
+        mgr = AuthManager(tmp_path)
+        mgr.setup_user("alice", "Alice", "", "alicepwd1")
+        rec = mgr.find_user("alice")
+        token = mgr.create_session(
+            user_id=rec["id"], user_agent="TestAgent/1.0"
+        )
+        # No user_agent param => skip check
+        user_id = mgr.validate_session(token)
+        assert user_id == rec["id"]

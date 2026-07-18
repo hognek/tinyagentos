@@ -61,6 +61,7 @@ from tinyagentos.benchmark import BenchmarkStore
 from tinyagentos.installation_state import InstallationState
 from tinyagentos.scheduler import BackendCatalog, HistoryStore, ScoreCache, TaskScheduler
 from tinyagentos.scheduler.discovery import build_scheduler as build_resource_scheduler
+from tinyagentos.scheduler.gpu_arbiter import GpuArbiter
 from tinyagentos.torrent_settings import TorrentSettingsStore
 from tinyagentos.relationships import RelationshipManager
 from tinyagentos.github_identities import GitHubIdentitiesStore
@@ -376,7 +377,9 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     from tinyagentos.projects.canvas.store import ProjectCanvasStore as ProjectCanvasStoreImpl
     from tinyagentos.projects.canvas.snapshotter import CanvasSnapshotter
     from tinyagentos.projects.doc_review_store import DocReviewStore
+    from tinyagentos.projects.invite_store import ProjectInviteStore
     project_store = ProjectStore(data_dir / "projects.db")
+    project_invite_store = ProjectInviteStore(data_dir / "project_invites.db")
     project_event_broker = ProjectEventBroker()
     from tinyagentos.desktop_control import DesktopCommandBroker
     desktop_command_broker = DesktopCommandBroker()
@@ -478,22 +481,13 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         # Arm the startup guard: block non-exempt requests until init completes.
         app.state._startup_complete = False
         await agent_registry_store.init()
-        app.state.agent_registry = agent_registry_store
-        app.state.agent_registry_keypair = agent_registry_keypair
         await auth_requests_store.init()
-        app.state.auth_requests = auth_requests_store
         await agent_grants_store.init()
-        app.state.agent_grants = agent_grants_store
         await app_grants_store.init()
-        app.state.app_grants = app_grants_store
         await license_acceptances_store.init()
-        app.state.license_acceptances = license_acceptances_store
         await agent_model_key_store.init()
-        app.state.agent_model_keys = agent_model_key_store
         await cluster_pairing_store.init()
-        app.state.cluster_pairing = cluster_pairing_store
         await capability_map_store.init()
-        app.state.capability_map = capability_map_store
         await metrics_store.init()
         await notif_store.init()
         await notif_push_store.init()
@@ -515,24 +509,18 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await chat_messages.init()
         await chat_channels.init()
         await project_store.init()
+        await project_invite_store.init()
         await board_audit_store.init()
-        app.state.board_audit = board_audit_store
         await receipt_store.init()
-        app.state.receipt_store = receipt_store
         await project_task_store.init()
         await project_element_store.init()
         await routine_store.init()
-        app.state.routine_store = routine_store
         await project_canvas_store.init()
         await doc_review_store.init()
         await decision_store.init()
-        app.state.decision_store = decision_store
         await execution_policy_store.init()
-        app.state.execution_policies = execution_policy_store
         await shared_docs_store.init()
-        app.state.shared_docs_store = shared_docs_store
         await coding_session_store.init()
-        app.state.coding_session_store = coding_session_store
         app.state.coding_launcher = coding_launcher
         projects_root.mkdir(parents=True, exist_ok=True)
         await canvas_store.init()
@@ -541,27 +529,16 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await user_memory.init()
         await installed_apps.init()
         await feedback_store.init()
-        app.state.feedback_store = feedback_store
         await client_log_store.init()
-        app.state.client_log_store = client_log_store
         await userspace_apps.init()
-        app.state.userspace_apps = userspace_apps
         await userspace_data.init()
-        app.state.userspace_data = userspace_data
         await office_docs.init()
-        app.state.office_docs = office_docs
         await web_sites.init()
-        app.state.web_sites = web_sites
         await song_store.init()
-        app.state.song_store = song_store
         await design_docs.init()
-        app.state.design_docs = design_docs
         await coding_workspaces_store.init()
-        app.state.coding_workspaces = coding_workspaces_store
         await install_registry_store.init()
-        app.state.install_registry = install_registry_store
         await store_submissions.init()
-        app.state.store_submissions = store_submissions
         try:
             from tinyagentos.userspace.seed import seed_bundled_apps
             await seed_bundled_apps(userspace_apps, data_dir / "apps")
@@ -569,15 +546,10 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
             logger.warning("bundled app seeding failed", exc_info=True)
         await skills.init()
         await themes.init()
-        app.state.themes = themes
         await knowledge_store.init()
         await mcp_store.init()
         mcp_supervisor = MCPSupervisor(mcp_store, catalog=registry, notif_store=notif_store, secrets_store=secrets_store)
-        app.state.mcp_store = mcp_store
         app.state.mcp_supervisor = mcp_supervisor
-        app.state.knowledge_store = knowledge_store
-        app.state.ingest_pipeline = knowledge_ingest
-        app.state.knowledge_monitor = knowledge_monitor
         await knowledge_monitor.start()
         await agent_browsers.init()
         app.state.agent_browsers = agent_browsers
@@ -641,9 +613,6 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await scheduler_history_store.init()
         await council_role_registry.init()
         await council_member_store.init()
-        app.state.config = config
-        app.state.config_path = config_path
-        app.state.data_dir = data_dir
 
         # Backfill all agents to the v2 persona shape and register each with
         # taosmd.  Idempotent — safe to run on every startup.
@@ -782,8 +751,6 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
 
         # Per-agent state lives on the host and is mounted into containers.
         # See docs/design/framework-agnostic-runtime.md.
-        app.state.agent_workspaces_dir = data_dir / "agent-workspaces"
-        app.state.agent_memory_dir = data_dir / "agent-memory"
         app.state.agent_workspaces_dir.mkdir(parents=True, exist_ok=True)
         app.state.agent_memory_dir.mkdir(parents=True, exist_ok=True)
         app.state.models_dir = data_dir / "models"
@@ -795,61 +762,15 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         from tinyagentos.installers.model_paths import models_root
         app.state.models_root = models_root()
         app.state.models_root.mkdir(parents=True, exist_ok=True)
-        app.state.metrics = metrics_store
-        app.state.notifications = notif_store
-        app.state.notif_push_store = notif_push_store
-        app.state.qmd_client = qmd_client
-        app.state.http_client = http_client
-        app.state.download_manager = download_manager
         app.state.torrent_settings_store = torrent_settings_store
-        app.state.secrets = secrets_store
-        app.state.broker = broker_service
-        app.state.broker_store = broker_store
-        app.state.github_identities = github_identities_store
-        app.state.relationships = relationship_mgr
-        app.state.channels = channel_store
-        app.state.fallback = fallback
-        app.state.scheduler = scheduler
-        app.state.cluster_manager = cluster_manager
-        app.state.task_router = task_router
-        app.state.capabilities = cap_checker
-        app.state.training = training_manager
-        app.state.conversion = conversion_manager
-        app.state.agent_messages = agent_messages
-        app.state.shared_folders = shared_folders
-        app.state.streaming_sessions = streaming_sessions
-        app.state.expert_agents = expert_agents
-        app.state.app_orchestrator = app_orchestrator
-        app.state.computer_use = computer_use
-        app.state.auth = auth_manager
         # Ensure the local token file exists before any request can arrive.
         # Logs the path at INFO so the user can find it.
         _local_token_path = auth_manager.local_token_path()
         auth_manager.get_local_token()
         logger.info("local auth token path: %s", _local_token_path)
-        app.state.webhook_notifier = webhook_notifier
-        app.state.llm_proxy = llm_proxy
-        app.state.channel_hub_router = channel_hub_router
         channel_hub_router.set_archive(archive)  # Wire archive for zero-loss channel message capture
-        app.state.adapter_manager = adapter_manager
-        app.state.channel_hub_connectors = {}
-        app.state.deploy_tasks = {}
-        from tinyagentos.routes.agents import IdempotencyCache
-        app.state.idempotency_cache = IdempotencyCache()
-        app.state.chat_messages = chat_messages
-        app.state.chat_channels = chat_channels
-        app.state.project_store = project_store
-        app.state.project_task_store = project_task_store
-        app.state.project_element_store = project_element_store
-        app.state.project_event_broker = project_event_broker
-        app.state.desktop_command_broker = desktop_command_broker
-        app.state.project_canvas_store = project_canvas_store
-        app.state.doc_review_store = doc_review_store
-        app.state.decision_store = decision_store
-        app.state.shared_docs_store = shared_docs_store
-        app.state.coding_session_store = coding_session_store
-        app.state.projects_root = projects_root
-        app.state.chat_hub = chat_hub
+        # channel_hub_connectors, deploy_tasks, and idempotency_cache are
+        # already set by the eager section; do not create new instances here.
         from tinyagentos.chat.group_policy import GroupPolicy
         app.state.group_policy = GroupPolicy()
         from tinyagentos.chat.reactions import WantsReplyRegistry
@@ -858,28 +779,9 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         app.state.typing = TypingRegistry()
         from tinyagentos.agent_chat_router import AgentChatRouter
         app.state.agent_chat_router = AgentChatRouter(app.state)
-        app.state.canvas_store = canvas_store
-        app.state.desktop_settings = desktop_settings
-        app.state.device_store = device_store
-        app.state.apns_sender = apns_sender
-        app.state.user_memory = user_memory
-        app.state.user_personas = user_personas
-        app.state.installed_apps = installed_apps
-        app.state.userspace_apps = userspace_apps
-        app.state.userspace_data = userspace_data
-        app.state.office_docs = office_docs
-        app.state.web_sites = web_sites
-        app.state.song_store = song_store
-        app.state.design_docs = design_docs
-        app.state.coding_workspaces = coding_workspaces_store
-        app.state.install_registry = install_registry_store
-        app.state.store_submissions = store_submissions
-        app.state.skills = skills
         app.state.benchmark_store = benchmark_store
         app.state.score_cache = score_cache
         app.state.scheduler_history_store = scheduler_history_store
-        app.state.council_roles = council_role_registry
-        app.state.council_members = council_member_store
         orchestrator = RestartOrchestrator(app.state)
         app.state.orchestrator = orchestrator
         # Boot-time: check if a pending restart was applied successfully
@@ -940,8 +842,6 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         # Start background health monitor
         from tinyagentos.health import HealthMonitor
         monitor = HealthMonitor(config, metrics_store, qmd_client, http_client, notif_store)
-        app.state.registry = registry
-        app.state.hardware_profile = hardware_profile
         app.state.health_monitor = monitor
         await monitor.start()
 
@@ -1146,6 +1046,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         # Build the resource scheduler from hardware profile + live catalog.
         # Phase 1: local resources only (NPU + CPU), capability-based routing
         # with fallback and priority. Cluster-aware dispatch is Phase 3.
+        resource_scheduler = None
         try:
             resource_scheduler = build_resource_scheduler(
                 hardware_profile,
@@ -1163,10 +1064,35 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
             logger.exception("resource scheduler failed to build — routes will use static config")
             app.state.resource_scheduler = None
 
-        # VRAM reservation manager — atomic check-and-reserve so two
-        # concurrent model loads cannot both pass a VRAM check before
-        # either consumes physical VRAM (TOCTOU race, taOS #1706).
-        app.state.vram_reservation = VramReservationManager()
+        # Single VRAM authority (taOS #185). One VramReservationManager is the
+        # sole ledger: it does atomic check-and-reserve so two concurrent model
+        # loads cannot both pass a VRAM check before either consumes physical
+        # VRAM (TOCTOU, #1706). The GPU arbiter reserves against THIS SAME
+        # instance for scheduler tasks, and the model-load path
+        # (routes/models.py) reserves against it too, so there is exactly one
+        # ledger and no double-counting.
+        vram_reservation = VramReservationManager()
+        app.state.vram_reservation = vram_reservation
+
+        # Build the GPU arbiter — VRAM-accounted admission control, queuing, and
+        # eviction for GPU-bound scheduler workloads, layered on the resource
+        # scheduler. It shares the reservation ledger above (does not keep its
+        # own), so admission for tasks and model loads draws from one authority.
+        try:
+            gpu_arbiter = GpuArbiter(
+                scheduler=resource_scheduler if resource_scheduler is not None else None,
+                cluster_manager=cluster_manager,
+                vram_reservation=vram_reservation,
+                max_queue_size=100,
+                eviction_enabled=True,
+            )
+            await gpu_arbiter.start()
+            app.state.gpu_arbiter = gpu_arbiter
+            cluster_manager._gpu_arbiter = gpu_arbiter
+            logger.info("GPU arbiter ready (queue size=100, eviction=enabled, shared VRAM ledger)")
+        except Exception:
+            logger.exception("GPU arbiter failed to start — GPU tasks will use vanilla scheduler")
+            app.state.gpu_arbiter = None
 
         # Detect and set container runtime
         from tinyagentos.containers.backend import configure_container_runtime
@@ -1347,6 +1273,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         # local_heartbeat_task is cancelled+awaited above under the bounded
         # cancel_and_wait budget alongside the supervised background tasks.
         await cluster_manager.stop()
+        if app.state.gpu_arbiter is not None:
+            await app.state.gpu_arbiter.stop()
         llm_proxy.stop()
         try:
             from tinyagentos.taos_agent_runtime import stop_taos_opencode_server
@@ -1429,6 +1357,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
                 logger.exception("canvas snapshotter stop failed")
         await project_canvas_store.close()
         await doc_review_store.close()
+        await project_invite_store.close()
         await project_task_store.close()
         await project_element_store.close()
         await routine_store.close()
@@ -1578,6 +1507,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.chat_messages = chat_messages
     app.state.chat_channels = chat_channels
     app.state.project_store = project_store
+    app.state.project_invites = project_invite_store
     app.state.board_audit = board_audit_store
     app.state.receipt_store = receipt_store
     app.state.project_task_store = project_task_store

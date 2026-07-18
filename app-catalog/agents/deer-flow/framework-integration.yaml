@@ -10,6 +10,10 @@ framework: deer-flow
 display_name: DeerFlow SuperAgent
 version: "2.1.0"
 
+# -- Verification status (see docs/…/§Framework verification model) ------------
+# tested / beta / experimental / broken
+verification_status: experimental
+
 # -- Protocol endpoints the adapter speaks -----------------------------------
 endpoints:
   llm: openai-chat              # DeerFlow calls the taOS LiteLLM proxy (OpenAI-compatible)

@@ -16,18 +16,22 @@ const clearArchived = vi.fn();
 let notifications: Notification[] = [];
 
 vi.mock("@/stores/notification-store", () => ({
-  useNotificationStore: () => ({
-    notifications,
-    centreOpen: true,
-    closeCentre,
-    markRead,
-    markAllRead,
-    clearAll,
-    dismiss,
-    archiveRead,
-    archivedNotifications,
-    clearArchived,
-  }),
+  useNotificationStore: (sel?: (s: unknown) => unknown) => {
+    const state = {
+      notifications,
+      centreOpen: true,
+      closeCentre,
+      markRead,
+      markAllRead,
+      clearAll,
+      dismiss,
+      archiveRead,
+      archivedNotifications,
+      clearArchived,
+    };
+    if (typeof sel === "function") return sel(state);
+    return state;
+  },
 }));
 
 vi.mock("@/stores/process-store", () => ({
@@ -100,7 +104,7 @@ describe("NotificationCentre click routing", () => {
     expect(markRead).toHaveBeenCalledWith("srv-2");
   });
 
-  it("caps the inbox at 10 items and shows a 'Show more' button that opens History", () => {
+  it("caps the inbox at 10 items and shows overflow indicator", () => {
     notifications = Array.from({ length: 12 }, (_, i) =>
       notif({ id: `srv-${i}`, title: `Note ${i}` }),
     );
@@ -111,19 +115,44 @@ describe("NotificationCentre click routing", () => {
     expect(screen.getByText("Note 9")).toBeInTheDocument();
     expect(screen.queryByText("Note 10")).not.toBeInTheDocument();
 
-    const showMore = screen.getByRole("button", { name: /show more/i });
-    fireEvent.click(showMore);
-
-    // Switching to History (archive is empty here) shows its empty state.
-    expect(screen.getByText(/no archived notifications/i)).toBeInTheDocument();
+    // Shows overflow indicator text.
+    expect(screen.getByText(/\+2 more in archive/)).toBeInTheDocument();
   });
 
-  it("does not show 'Show more' when there are 10 or fewer items", () => {
+  it("does not show overflow indicator when there are 10 or fewer items", () => {
     notifications = Array.from({ length: 10 }, (_, i) =>
       notif({ id: `srv-${i}`, title: `Note ${i}` }),
     );
     render(<NotificationCentre />);
-    expect(screen.queryByRole("button", { name: /show more/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/more in archive/)).not.toBeInTheDocument();
+  });
+
+  it("renders a View archive button that opens the notification-archive window", () => {
+    notifications = [
+      notif({ id: "srv-1", title: "Active note" }),
+      { ...notif({ id: "srv-x", title: "Old note" }), archived: true } as Notification,
+    ];
+    render(<NotificationCentre />);
+
+    const viewArchive = screen.getByRole("button", { name: /view archive/i });
+    expect(viewArchive).toBeInTheDocument();
+    expect(viewArchive.textContent).toContain("(1)");
+
+    fireEvent.click(viewArchive);
+
+    expect(openWindow).toHaveBeenCalledWith(
+      "notification-archive",
+      expect.objectContaining({ w: 800, h: 600 }),
+    );
+  });
+
+  it("shows no archive count when there are no archived items", () => {
+    notifications = [notif({ id: "srv-1", title: "Only active" })];
+    render(<NotificationCentre />);
+
+    const viewArchive = screen.getByRole("button", { name: /view archive/i });
+    expect(viewArchive).toBeInTheDocument();
+    expect(viewArchive.textContent).not.toContain("(");
   });
 
   it("renders inline consent actions for an auth_requests notification", () => {

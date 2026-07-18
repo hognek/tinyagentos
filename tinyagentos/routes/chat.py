@@ -216,16 +216,49 @@ async def chat_ws(websocket: WebSocket):
 
             elif msg_type == "edit":
                 msg_store = websocket.app.state.chat_messages
-                await msg_store.edit_message(data["message_id"], data["content"])
-                msg = await msg_store.get_message(data["message_id"])
-                if msg:
-                    await hub.broadcast(msg["channel_id"], {
+                edit_msg_id = data.get("message_id")
+                edit_content = data.get("content")
+                if not edit_msg_id or not isinstance(edit_content, str):
+                    continue
+                msg = await msg_store.get_message(edit_msg_id)
+                if msg is None or msg.get("deleted_at"):
+                    continue
+                if msg["author_id"] != user_id:
+                    continue
+                # Only truncate subsequent messages in DM channels —
+                # editing in a multi-human group must not delete other
+                # people's messages.  The agent is only re-triggered in
+                # DM channels for the same reason.
+                ch_store = websocket.app.state.chat_channels
+                channel = await ch_store.get_channel(msg["channel_id"])
+                channel_type = channel.get("type") if channel else None
+                updated, truncated_ids = await msg_store.edit_and_truncate_branch(
+                    edit_msg_id, edit_content,
+                    channel_type=channel_type,
+                    thread_id=msg.get("thread_id"),
+                )
+                if updated:
+                    await hub.broadcast(updated["channel_id"], {
                         "type": "message_edit",
                         "seq": hub.next_seq(),
-                        "message_id": data["message_id"],
-                        "content": data["content"],
-                        "edited_at": msg["edited_at"],
+                        "message_id": edit_msg_id,
+                        "content": edit_content,
+                        "edited_at": updated["edited_at"],
                     })
+                    for tid in truncated_ids:
+                        await hub.broadcast(msg["channel_id"], {
+                            "type": "message_delete",
+                            "seq": hub.next_seq(),
+                            "message_id": tid,
+                            "channel_id": msg["channel_id"],
+                        })
+                    # Re-trigger the agent only in DM channels.
+                    if channel_type == "dm":
+                        router_svc = getattr(
+                            websocket.app.state, "agent_chat_router", None,
+                        )
+                        if router_svc is not None and channel is not None:
+                            router_svc.dispatch(updated, channel)
 
             elif msg_type == "delete":
                 msg_store = websocket.app.state.chat_messages
@@ -564,15 +597,38 @@ async def edit_message_endpoint(message_id: str, request: Request):
     caller_id = session_user["id"] if session_user else None
     if msg["author_id"] != caller_id:
         return JSONResponse({"error": "not the author"}, status_code=403)
-    await msg_store.edit_message(message_id, body["content"])
-    updated = await msg_store.get_message(message_id)
+    # Only truncate subsequent messages in DM channels — editing in a
+    # multi-human group must not delete other people's messages.  The
+    # agent is only re-triggered in DM channels for the same reason.
+    ch_store = request.app.state.chat_channels
+    channel = await ch_store.get_channel(msg["channel_id"])
+    channel_type = channel.get("type") if channel else None
+    updated, truncated_ids = await msg_store.edit_and_truncate_branch(
+        message_id, body["content"],
+        channel_type=channel_type,
+        thread_id=msg.get("thread_id"),
+    )
+    if not updated:
+        return JSONResponse({"error": "message not found"}, status_code=404)
     hub = request.app.state.chat_hub
+    seq = hub.next_seq()
     await hub.broadcast(msg["channel_id"], {
-        "type": "message_edit", "seq": hub.next_seq(),
+        "type": "message_edit", "seq": seq,
         "message_id": message_id,
         "content": updated["content"],
         "edited_at": updated["edited_at"],
     })
+    for tid in truncated_ids:
+        seq = hub.next_seq()
+        await hub.broadcast(msg["channel_id"], {
+            "type": "message_delete", "seq": seq,
+            "channel_id": msg["channel_id"], "message_id": tid,
+        })
+    # Re-trigger the agent only in DM channels.
+    if channel_type == "dm":
+        router_svc = getattr(request.app.state, "agent_chat_router", None)
+        if router_svc is not None and channel is not None:
+            router_svc.dispatch(updated, channel)
     return JSONResponse(updated)
 
 
