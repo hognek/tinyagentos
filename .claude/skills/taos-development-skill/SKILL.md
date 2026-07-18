@@ -22,7 +22,7 @@ Procedures and architecture for contributing to
     routes/                    ← one APIRouter module per feature area (~127 modules)
     templates/                 ← minimal: agent_debugger.html only (frontend is React SPA)
     channel_hub/               ← framework-agnostic messaging: connectors + MessageRouter
-    adapters/                  ← thin per-framework agent adapters (~25 lines each)
+    adapters/                  ← per-framework agent adapters (generic ~20 lines, acp ~500); each declares verification_status
     cluster/                   ← distributed compute: worker registry, task routing, GPU lease
     worker/                    ← cross-platform worker apps (system tray, Android, iOS)
     *_store.py, base_store.py  ← data layer: top-level BaseStore subclasses (aiosqlite); one SQLite file per store; no stores/ dir
@@ -30,8 +30,8 @@ Procedures and architecture for contributing to
     installers/ containers/    ← model/app installers; Docker + LXC backends
     migrations/                ← DB migrations
   desktop/                     ← React + TypeScript SPA (Vite)
-  app-catalog/                 ← YAML app manifests + catalog.yaml (~108 apps)
-  tests/                       ← pytest suite (~4,845 tests)
+  app-catalog/                 ← YAML app manifests + catalog.yaml
+  tests/                       ← pytest suite (large; counts rot - trust the tree)
   docs/                        ← documentation; agent manual compiled from docs/agent-manual/
 ```
 
@@ -47,10 +47,8 @@ Procedures and architecture for contributing to
   lifespan (`app.state.secrets`, …). Never reference a migration-added column inside `SCHEMA`.
 - **Config** - `AppConfig` dataclass in `config.py`; YAML serialisation; async-locked saves via
   `save_config_locked()`; typed backends (`rkllama`, `ollama`, `openai`, `anthropic`, …).
-- **Templates** - all real UI work goes in the `desktop/` React SPA. The Pico CSS + htmx guidance
-  applies **only** to the single legacy Jinja template (`agent_debugger.html`): **Pico CSS utility
-  classes only** (no other CSS framework), htmx (`hx-get`, `hx-target`, `hx-swap`) for dynamic
-  partials, semantic HTML, ARIA labels on interactive elements without visible text.
+- **Templates** - all real UI work goes in the `desktop/` React SPA. One legacy Jinja template
+  exists (`agent_debugger.html`); if you must touch it, match its existing Pico CSS + htmx style.
 - **Frontend** - React + TypeScript SPA in `desktop/`. Built with Vite: `npm run build` outputs
   to `static/desktop/` (gitignored). For development: `npm run dev` serves with hot reload on
   port 5173. One concern per component; API calls in dedicated hooks or service files.
@@ -92,10 +90,11 @@ Procedures and architecture for contributing to
      --title "feat(scope): description" --body "Fixes #<issue>. Tests: N/N pass."
    gh pr ready <PR#>
    ```
-   Do NOT wait for CI to *start* - fork PRs are gated behind maintainer workflow approval, so a
-   fresh fork PR's matrix run may never begin on its own; mark ready once the CODE is done and
-   local tests pass. This does NOT mean ignore red CI: once the matrix runs you own making it
-   green - re-check `gh pr checks <PR#>` and fix any red matrix job before considering the task done.
+   Fork CI approval is per-contributor: a FIRST-TIME contributor's workflow runs sit in
+   `action_required` until a maintainer approves (mark ready once the CODE is done and local tests
+   pass, then surface the approval need); a RETURNING contributor's CI runs automatically - no
+   approval wait, and you own making it green (`gh pr checks <PR#>`: test 3.12/3.13 + lint +
+   spa-build all pass) before considering the task done.
 
 6. **Never commit directly to `dev` or `master`.** All work happens on branches.
    Main only receives merges via upstream PR approval.
@@ -147,6 +146,9 @@ uv run pytest tests/ --ignore=tests/e2e -n auto
 - Python 3.12 + 3.13 on every PR/push; 3.11 on nightly cron only
 - GitHub Actions: `.github/workflows/ci.yml` in upstream repo
 - Uses `uv sync --frozen` and `pytest -n auto`
+- Also required: `spa-build` (npm build + tsc + **vitest** - a desktop type error or failing
+  component test fails CI), a "Verify app starts" `create_app` import smoke, `lint`
+  (`compileall`), and `cla`. The doc-gate is a separate workflow.
 
 ## CLA - HUMAN signs
 
@@ -180,24 +182,33 @@ I have read the CLA Document and I hereby sign the CLA
 
 ## Post-Push Bot Review Cycle
 
-After pushing a PR and marking it ready, automated bots (Kilo, CodeRabbit) run reviews.
-Address their findings **before** surfacing the PR for human maintainer review - this
-eliminates the wasteful push→block→manual-check→unblock→re-dispatch cycle.
+After pushing a PR and marking it ready, automated bots review it. The reliable gate is
+**Kilo Code Review + Gitar**. CodeRabbit is unreliable - a "pass" check can be a rate-limited
+no-op, so never treat a CodeRabbit pass alone as evidence of review (its findings, when it does
+run, still get folded). Qodo (`qodo-code-review`) appears on old PRs but is paused. Address all
+findings **before** surfacing the PR for human maintainer review.
 
 ### Procedure
 
 1. **Push PR and mark ready.** Wait ~10 minutes for bot reviews to complete.
-2. **Pull bot comments:**
+2. **Pull bot findings - reviews AND inline comments, all bots.** Bot logins have NO `[bot]`
+   suffix in the JSON (`kilo-code-bot`, `gitar-bot`, `coderabbitai`, `qodo-code-review`):
    ```bash
-   gh pr view <PR#> --repo jaylfc/taOS --json comments --jq \
-     '.comments[] | select(.author.login == "kilo-code-bot" or .author.login == "coderabbitai[bot]")'
+   # Review summaries + issue comments:
+   gh pr view <PR#> --repo jaylfc/taOS --json reviews,comments --jq \
+     '(.reviews[], .comments[]) | select(.author.login | test("kilo-code-bot|gitar-bot|coderabbitai|qodo")) | {login: .author.login, body: .body}'
+   # Inline (line-anchored) review comments - Kilo/CodeRabbit post most findings here:
+   gh api repos/jaylfc/taOS/pulls/<PR#>/comments --jq \
+     '.[] | {login: .user.login, path, line, body}'
    ```
+   Check which commit SHA each bot actually reviewed - a "pass" on a stale commit is not a pass
+   on your head.
 3. **If issues found:** fix all findings in a single commit, re-run local tests, push,
    then go back to step 1 (max 2 cycles). If findings still persist after 2 cycles, stop -
    do not loop further; surface the remaining findings to the human.
-4. **Only block for maintainer review when bots are clean** - 0 CRITICAL, 0 WARNING.
-   If a SUGGESTION-only finding is genuinely not applicable, note the rationale in a
-   PR comment before blocking.
+4. **Only block for maintainer review when bots are clean** - 0 CRITICAL, 0 WARNING - and fold
+   EVERY finding, nits and suggestions included. If a SUGGESTION is genuinely not applicable,
+   note the rationale in a PR comment before blocking.
 
 ### Severity tiers
 
@@ -206,15 +217,6 @@ eliminates the wasteful push→block→manual-check→unblock→re-dispatch cycl
 | CRITICAL | Must fix before blocking for review |
 | WARNING | Must fix before blocking for review |
 | SUGGESTION | Fix or explain why not applicable |
-
-### Time estimates
-
-| Phase | Duration |
-|-------|----------|
-| First bot pass (Kilo + CodeRabbit) | ~10 min |
-| Fix cycle (if needed) | ~5–10 min |
-| Second bot pass (if re-pushed) | ~10 min |
-| **Worst case (2 cycles)** | **~30 min** |
 
 ## Common fix patterns
 
@@ -232,6 +234,41 @@ eliminates the wasteful push→block→manual-check→unblock→re-dispatch cycl
   `pytest tests/test_catalog_sync.py`.
 - **Debugging a test:** confirm it uses the async `client` fixture and that `tmp_data_dir` setup is
   complete; check the store's `init()`; isolate with `pytest <path>::<test> -v`.
+
+## Frontend CSRF contract (session-authenticated SPA calls)
+
+Every mutating route requires `X-CSRF-Token` on cookie-session requests (`verify_csrf` is attached
+router-wide). Any SPA `fetch` that POSTs/PUTs/PATCHes/DELETEs must attach the double-submit header:
+use `withCsrf(init)` from `desktop/src/lib/csrf.ts`, or the `taosFetch` wrapper
+(`desktop/src/lib/taos-fetch.ts`) which applies it automatically. **A raw
+`fetch("/api/...", {method:"POST"})` passes vitest AND pytest (tests bypass CSRF) but 403s
+"CSRF token missing" in production** - this exact class shipped as a bug (#1977). Bearer-token
+(agent JWT) calls are CSRF-exempt; only cookie sessions need the header.
+
+## Agent auth model (Bearer JWT vs session)
+
+Agents authenticate with grant-gated registry JWTs (`Authorization: Bearer ...`), which are
+**CSRF-exempt**; human sessions use cookies + the CSRF header. Access derives from an ACTIVE grant
+per `(agent, project)` - not from token claims - and no-grant yields an existence-hiding 404.
+Agent-facing routes must ALSO be allowlisted in `tinyagentos/auth_middleware.py` (see Pitfalls).
+Onboarding surfaces: project invites (`routes/project_invites.py`, URL + PIN), OS-level agent
+invites (`/api/agents/invites`), and the auth-request consent flow. Source of truth:
+`docs/agent-coordination.md` section "Agent API surface (scoped registry JWT)".
+
+## Adapter verification vocabulary
+
+Every adapter in `tinyagentos/adapters/__init__.py` declares
+`verification_status: tested | beta | experimental | broken` (plus `tracking_issue`, required for
+`broken`). `tested` and `beta` are the verified tiers (`verified_only` filtering returns both);
+`broken` blocks the deploy wizard. A new or edited adapter must set this correctly - defaulting a
+new framework to `experimental` is the norm until it passes round-trip verification.
+
+## Version sync (release bumps)
+
+Four files carry the version and must stay identical: `pyproject.toml`, `tinyagentos/__init__.py`,
+`desktop/package.json` (all `1.0.0-beta.N`), and `uv.lock`'s `tinyagentos` entry in PEP 440
+normalized form (`1.0.0bN`). Only pyproject vs uv.lock is test-gated
+(`tests/test_version_lock_sync.py`); the other two drift silently, so check all four on any bump.
 
 ## Documentation gate
 
@@ -293,10 +330,11 @@ controls which hardware profiles see the app as recommended.
 
 - **Full test suite is too large to run locally without `-n auto`.** Use the canonical
   gate: `uv run pytest tests/ --ignore=tests/e2e -n auto`. CI handles the full matrix.
-- **CI may show `action_required` on every PR from a fork.** GitHub requires maintainer approval
-  for workflow runs from first-time contributor forks. This can re-trigger on each new PR even after
-  previous PRs were approved - it's per-workflow-run, not per-contributor. Surface to the human;
-  do NOT poll or re-push.
+- **Fork CI approval is first-time-only.** The repo's policy requires maintainer approval only for
+  a contributor's FIRST fork PR (`action_required` on the CI run - surface to the human, do NOT
+  poll or re-push). A returning contributor's CI runs automatically; if your checks show only bots
+  green but no test/spa-build jobs at all, check `gh api "repos/jaylfc/taOS/actions/runs?head_sha=<sha>"`
+  for `action_required` before assuming CI passed - bot-only green is NOT CI green.
 - **No formatter/linter *config* yet, but CI is not silent.** There is no `.ruff.toml` and no
   `[tool.ruff]`/`[tool.black]`/`[tool.mypy]` section in `pyproject.toml` (ruff may land soon -
   check `pyproject.toml` before assuming). CI does run a `lint` job (`python -m compileall
@@ -342,21 +380,8 @@ controls which hardware profiles see the app as recommended.
 
 ## Issue triage
 
-### Finding actionable issues
-1. Filter GitHub issues by `good first issue` or `help wanted` labels
-2. Check issue age - fresh issues (< 2 weeks) have highest chance of being unclaimed
-3. Read the issue body carefully - look for clear reproduction steps
-4. Check if anyone is already assigned
-
-### Difficulty estimation
-- **Catalog app addition** (~30 min): New manifest.yaml + catalog.yaml entry
-- **Bug fix** (1–3 hours): Reproduce → find root cause → fix + regression test
-- **Feature** (3+ hours): Design → implement → tests → documentation
-
-### Before starting work
-1. Sync from upstream: `git fetch upstream dev`
-2. Verify the issue is still open and unassigned
-3. Comment on the issue: "Working on this - will open a draft PR"
+taOS-specific rules only: verify the issue is still open and **unassigned**, comment
+"Working on this - will open a draft PR" before starting, and sync from upstream `dev` first.
 
 ## First-run setup
 
