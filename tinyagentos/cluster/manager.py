@@ -236,7 +236,7 @@ class ClusterManager:
         # update signal before the worker can initiate the drain.
         # Only block status-less heartbeats; explicit status transitions
         # (e.g. "update-available" → "draining") are still honoured.
-        if worker.status not in ("draining", "update-available") or status is not None:
+        if worker.status not in ("draining", "update-available", "updating") or status is not None:
             # Honour worker-initiated status transitions (taOS #890 C2).
             if status in ("draining", "update-available", "updating"):
                 worker.status = status
@@ -854,6 +854,18 @@ class ClusterManager:
                             ]
                             for lid in update_lids:
                                 self._leases.pop(lid, None)
+                        # Cancel any running GPU arbiter tasks for the
+                        # released leases (taOS cross-cutting wiring).
+                        if update_lids and self._gpu_arbiter is not None:
+                            try:
+                                cancelled, already_done = await self._gpu_arbiter.cancel_running_for_leases(set(update_lids))
+                                logger.info(
+                                    "Worker '%s' stale-update: arbiter cancelled %d tasks, %d already done",
+                                    worker.name, cancelled, already_done)
+                            except Exception:
+                                logger.exception(
+                                    "gpu-arbiter: cancel for stale-update of '%s' failed",
+                                    worker.name)
             async with self._lease_lock:
                 self._sweep_expired_leases()
             await asyncio.sleep(5)
