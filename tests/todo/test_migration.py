@@ -197,8 +197,8 @@ async def test_migrate_idempotent(shared_store, todo_store):
 @pytest.mark.asyncio
 async def test_migrate_recovers_from_interruption(shared_store, todo_store):
     """If migration was interrupted after target creation but before source
-    deletion, a re-run detects the existing matching list and skips duplicate
-    creation while cleaning up the source."""
+    deletion, a re-run detects the existing matching list, flows entries into
+    it, and stamps ``migrated_from`` so future re-runs skip by exact id."""
     doc, entries = await _setup_list_doc(
         shared_store, "user-a", "Interrupted",
         ["Item 1", "Item 2"],
@@ -210,10 +210,11 @@ async def test_migrate_recovers_from_interruption(shared_store, todo_store):
     partial = await todo_store.create_list("user-a", "Interrupted")
     partial_id = partial["id"]
 
-    # Run migration — it should detect the matching list and skip.
+    # Run migration — it should detect the matching list, migrate entries
+    # into it (data-loss prevention), and stamp migrated_from.
     result = await migrate_list_docs(shared_store, todo_store)
-    assert result["migrated"] == 0  # No new migration
-    assert result["items"] == 0
+    assert result["migrated"] == 0  # No new list created
+    assert result["items"] == 2     # Entries flowed into existing list
     assert len(result["lists"]) == 1
     assert result["lists"][0]["old_id"] == doc["id"]
     assert result["lists"][0]["new_id"] == partial_id
@@ -225,6 +226,19 @@ async def test_migrate_recovers_from_interruption(shared_store, todo_store):
     all_lists = await todo_store.list_lists("user-a", include_archived=True)
     matching = [l for l in all_lists if l["title"] == "Interrupted"]
     assert len(matching) == 1
+
+    # Target list now has the items + the migrated_from stamp.
+    target = await todo_store.get_list(partial_id)
+    assert target is not None
+    assert target.get("migrated_from") == doc["id"]
+    assert len(target["items"]) == 2
+    assert [i["text"] for i in target["items"]] == ["Item 1", "Item 2"]
+
+    # Idempotent re-run — migrated_from matches, so no duplicate items.
+    result2 = await migrate_list_docs(shared_store, todo_store)
+    assert result2["items"] == 0
+    target2 = await todo_store.get_list(partial_id)
+    assert len(target2["items"]) == 2  # still only 2 items
 
 
 @pytest.mark.asyncio
@@ -244,3 +258,49 @@ async def test_migrate_preserves_done_and_order(shared_store, todo_store):
     assert [i["text"] for i in items] == ["First", "Second", "Third", "Fourth"]
     assert [i["done"] for i in items] == [True, False, False, True]
     assert [i["author"] for i in items] == ["user-a"] * 4
+
+
+@pytest.mark.asyncio
+async def test_migrate_same_title_different_docs_no_data_loss(
+    shared_store, todo_store,
+):
+    """Two source docs with the same owner+title must both be fully migrated.
+
+    Regression test for the Kilo finding: matching by owner+title alone can
+    match the second source doc to the first doc's target, silently deleting
+    the second source without migrating its entries.
+    """
+    # Two distinct list docs with same owner and same title.
+    doc_a, _ = await _setup_list_doc(
+        shared_store, "user-a", "Shopping",
+        ["Milk", "Eggs"],
+    )
+    doc_b, _ = await _setup_list_doc(
+        shared_store, "user-a", "Shopping",
+        ["Bread", "Butter"],
+    )
+
+    result = await migrate_list_docs(shared_store, todo_store)
+
+    # Both should be migrated.
+    assert result["migrated"] == 2
+    assert result["items"] == 4
+    assert len(result["lists"]) == 2
+
+    # Both source docs deleted.
+    assert await shared_store.get_doc(doc_a["id"]) is None
+    assert await shared_store.get_doc(doc_b["id"]) is None
+
+    # Two distinct todo lists, each with correct items.
+    all_lists = await todo_store.list_lists("user-a", include_archived=True)
+    matching = [l for l in all_lists if l["title"] == "Shopping"]
+    assert len(matching) == 2
+
+    items_a = (await todo_store.get_list(matching[0]["id"]))["items"]
+    items_b = (await todo_store.get_list(matching[1]["id"]))["items"]
+    all_texts = {i["text"] for i in items_a} | {i["text"] for i in items_b}
+    assert all_texts == {"Milk", "Eggs", "Bread", "Butter"}
+
+    # Each todo list should be stamped with its source doc id.
+    stamped = {l["id"]: l.get("migrated_from") for l in matching}
+    assert set(stamped.values()) == {doc_a["id"], doc_b["id"]}
