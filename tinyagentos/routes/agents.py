@@ -855,11 +855,7 @@ async def bulk_stop_agents(request: Request):
     try:
         force_results = await asyncio.shield(task)
     except asyncio.CancelledError:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        await task
         raise
 
     return {
@@ -952,11 +948,7 @@ async def stop_agent(request: Request, name: str):
     try:
         force_killed, force_output = await asyncio.shield(task)
     except asyncio.CancelledError:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+        await task
         raise
 
     return {
