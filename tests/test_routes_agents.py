@@ -109,6 +109,7 @@ class TestBulkOperations:
 
         monkeypatch.setattr("tinyagentos.containers.restart_container", fake_restart)
 
+
         resp = await client.post("/api/agents/bulk/restart")
         assert resp.status_code == 200
         assert resp.json()["action"] == "restart"
