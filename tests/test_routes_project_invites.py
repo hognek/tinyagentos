@@ -67,6 +67,30 @@ async def test_mint_11th_pending_returns_429(client, app):
 
 
 @pytest.mark.asyncio
+async def test_mint_rejects_unknown_scopes(client, app):
+    """Mint must reject scopes not in the closed vocabulary (#1993)."""
+    pid = await _create_project(client)
+    resp = await client.post(
+        f"/api/projects/{pid}/invites",
+        json={"scopes": ["a2a_send", "garbage_scope"], "approval_mode": "auto"},
+    )
+    assert resp.status_code == 400, resp.text
+    data = resp.json()
+    assert "garbage_scope" in data["error"]
+
+
+@pytest.mark.asyncio
+async def test_mint_accepts_known_scopes(client, app):
+    """Known scopes that are not project-scoped should mint just fine."""
+    pid = await _create_project(client)
+    resp = await client.post(
+        f"/api/projects/{pid}/invites",
+        json={"scopes": ["a2a_send", "memory_read"], "approval_mode": "auto"},
+    )
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
 async def test_list_invites_excludes_pin_hash(client, app):
     pid = await _create_project(client)
     await client.post(

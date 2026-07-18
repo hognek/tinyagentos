@@ -211,7 +211,9 @@ async def test_os_level_redeem_single_use(store):
     )
     iid = result["record"]["invite_id"]
     record = await store.redeem(iid, result["pin"])
-    assert record["status"] == "redeemed"
+    # After redeem the invite is claimed (not yet redeemed — the route flips
+    # claimed→redeemed via mark_redeemed after approve succeeds, #1993).
+    assert record["status"] == "claimed"
     assert record["project_id"] is None
     with pytest.raises(InviteAlreadyRedeemedError):
         await store.redeem(iid, result["pin"])
@@ -367,7 +369,9 @@ async def test_redeem_correct_pin_single_use(store):
     iid = result["record"]["invite_id"]
     pin = result["pin"]
     record = await store.redeem(iid, pin)
-    assert record["status"] == "redeemed"
+    # After redeem the invite is claimed (not yet redeemed — the route flips
+    # claimed→redeemed via mark_redeemed after approve succeeds, #1993).
+    assert record["status"] == "claimed"
     with pytest.raises(InviteAlreadyRedeemedError):
         await store.redeem(iid, pin)
 
@@ -457,3 +461,81 @@ async def test_boot_migration_adds_missing_column(tmp_path):
     # The display_name column is added by the boot migration for legacy DBs.
     assert row.get("display_name") is None
     await store.close()
+
+
+# ---------------------------------------------------------------------------
+# mark_redeemed + rollback_to_pending (issue #1993)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mark_redeemed_flips_claimed_to_redeemed(store):
+    result = await store.mint(
+        project_id="prj-1",
+        scopes=["a2a_send"],
+        approval_mode="auto",
+        check_interval_secs=1800,
+        created_by="u",
+    )
+    iid = result["record"]["invite_id"]
+    # Claim it
+    record = await store.redeem(iid, result["pin"])
+    assert record["status"] == "claimed"
+
+    # mark_redeemed should flip claimed → redeemed
+    await store.mark_redeemed(iid, "agent-x", "req-1")
+    row = await store.get(iid)
+    assert row["status"] == "redeemed"
+    assert row["redeemed_by"] == "agent-x"
+    assert row["redeemed_request_id"] == "req-1"
+
+
+@pytest.mark.asyncio
+async def test_rollback_to_pending_after_claim(store):
+    result = await store.mint(
+        project_id="prj-1",
+        scopes=["a2a_send"],
+        approval_mode="auto",
+        check_interval_secs=1800,
+        created_by="u",
+    )
+    iid = result["record"]["invite_id"]
+    # Claim it
+    record = await store.redeem(iid, result["pin"])
+    assert record["status"] == "claimed"
+
+    # Roll back — simulate approve failure
+    await store.rollback_to_pending(iid)
+    row = await store.get(iid)
+    assert row["status"] == "pending"
+
+    # Can redeem again (re-claim)
+    record2 = await store.redeem(iid, result["pin"])
+    assert record2["status"] == "claimed"
+
+
+@pytest.mark.asyncio
+async def test_rollback_only_touches_claimed(store):
+    result = await store.mint(
+        project_id="prj-1",
+        scopes=["a2a_send"],
+        approval_mode="auto",
+        check_interval_secs=1800,
+        created_by="u",
+    )
+    iid = result["record"]["invite_id"]
+    # Still pending — rollback should be a no-op, not revert anything else
+    await store.rollback_to_pending(iid)
+    row = await store.get(iid)
+    assert row["status"] == "pending"
+
+    # Claim and then mark as redeemed
+    await store.redeem(iid, result["pin"])
+    await store.mark_redeemed(iid, "agent-x", "req-1")
+    row = await store.get(iid)
+    assert row["status"] == "redeemed"
+
+    # Rollback on a redeemed invite is a no-op
+    await store.rollback_to_pending(iid)
+    row = await store.get(iid)
+    assert row["status"] == "redeemed"  # stays redeemed
