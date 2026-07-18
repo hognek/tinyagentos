@@ -277,3 +277,34 @@ async def reorder_items(
     items = [{"id": e.id, "position": e.position} for e in body.items]
     await store.reorder_items(list_id, items)
     return JSONResponse({"ok": True})
+
+
+# ------------------------------------------------------------ migration route
+
+
+@router.post("/api/todo/migrate")
+async def migrate_notes_lists(
+    request: Request,
+    user: CurrentUser = Depends(current_user),
+):
+    """Migrate kind=list docs from shared notes into Todo lists.
+
+    Admin-only. Idempotent — safe to run multiple times.
+    Reads all non-archived kind=list docs, converts each to a todo
+    list with items, then deletes the originals from shared_docs.
+    """
+    if not user.is_admin:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    shared = getattr(request.app.state, "shared_docs_store", None)
+    if shared is None:
+        return JSONResponse(
+            {"error": "shared_docs_store not available"}, status_code=500
+        )
+
+    todo = _get_store(request)
+
+    from tinyagentos.todo.migration import migrate_list_docs
+
+    result = await migrate_list_docs(shared, todo)
+    return result
