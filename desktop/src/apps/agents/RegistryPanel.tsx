@@ -12,6 +12,7 @@ import {
   ScrollText,
   ArrowRight,
   UserPlus,
+  Archive,
 } from "lucide-react";
 import { Button, Card } from "@/components/ui";
 import { projectsApi } from "@/lib/projects";
@@ -753,6 +754,12 @@ export function RegistryPanel() {
   }
 
   const pendingCount = entries.filter((e) => e.status === "pending").length;
+  const activeEntries = entries.filter((e) => e.status === "active");
+  const pendingEntries = entries.filter((e) => e.status === "pending");
+  const retiredEntries = entries.filter(
+    (e) => e.status === "revoked" || e.status === "rejected" || e.status === "suspended",
+  );
+  const [retiredExpanded, setRetiredExpanded] = useState(false);
 
   return (
     <section className="mt-4" aria-label="Agent registry">
@@ -798,16 +805,54 @@ export function RegistryPanel() {
             No registered agents yet.
           </p>
         ) : (
-          entries.map((entry) => (
-            <RegistryEntryRow
-              key={entry.canonical_id}
-              entry={entry}
-              isAdmin={isAdmin}
-              currentUserId={currentUserId}
-              onAction={handleAction}
-              onAssign={setAssignEntry}
-            />
-          ))
+          <>
+            {/* Active + Pending: always visible, active first */}
+            {[...activeEntries, ...pendingEntries].map((entry) => (
+              <RegistryEntryRow
+                key={entry.canonical_id}
+                entry={entry}
+                isAdmin={isAdmin}
+                currentUserId={currentUserId}
+                onAction={handleAction}
+                onAssign={setAssignEntry}
+              />
+            ))}
+
+            {/* Retired: collapsed by default */}
+            {retiredEntries.length > 0 && (
+              <section className="mt-2" aria-label="Retired registry entries">
+                <button
+                  onClick={() => setRetiredExpanded((v) => !v)}
+                  className="flex items-center gap-2 text-xs text-shell-text-tertiary hover:text-shell-text-secondary transition-colors mb-2"
+                  aria-expanded={retiredExpanded}
+                  aria-controls="retired-registry-panel"
+                >
+                  <ChevronRight
+                    size={13}
+                    className={`transition-transform shrink-0 ${retiredExpanded ? "rotate-90" : ""}`}
+                    aria-hidden
+                  />
+                  <Archive size={12} aria-hidden />
+                  Retired ({retiredEntries.length})
+                </button>
+                <div
+                  id="retired-registry-panel"
+                  className={`space-y-2 ${retiredExpanded ? "" : "hidden"}`}
+                >
+                  {retiredEntries.map((entry) => (
+                    <RegistryEntryRow
+                      key={entry.canonical_id}
+                      entry={entry}
+                      isAdmin={isAdmin}
+                      currentUserId={currentUserId}
+                      onAction={handleAction}
+                      onAssign={setAssignEntry}
+                    />
+                  ))}
+                </div>
+              </section>
+            )}
+          </>
         )}
         <GovernanceAuditPanel isAdmin={isAdmin} />
       </div>
