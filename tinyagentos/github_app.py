@@ -296,11 +296,21 @@ async def delete_installation(
             timeout=15,
         )
         if resp.status_code == 404:
+            # Invalidate caches even on 404 — the installation is gone.
+            _invalidate_installation_caches(app_id, installation_id)
             return False
         resp.raise_for_status()
+        _invalidate_installation_caches(app_id, installation_id)
         return True
     except Exception as exc:
         logger.exception(
             "Failed to delete installation %s: %s", installation_id, exc
         )
         return False
+
+
+def _invalidate_installation_caches(app_id: str, installation_id: int) -> None:
+    """Remove cached token and repo list for a deleted installation."""
+    key = _cache_key(app_id, installation_id)
+    _token_cache.pop(key, None)
+    _repo_cache.pop(installation_id, None)

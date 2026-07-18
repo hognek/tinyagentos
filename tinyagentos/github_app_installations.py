@@ -24,6 +24,7 @@ class GitHubAppInstallations:
         self._path: Path = data_dir / _INSTALLATIONS_FILE
         self._installations: dict[int, dict] = {}
         self._loaded: bool = False
+        self._lock: asyncio.Lock = asyncio.Lock()
 
     async def init(self) -> None:
         """Load installations from disk. Idempotent."""
@@ -98,14 +99,15 @@ class GitHubAppInstallations:
         repository_selection: str = "selected",
     ) -> None:
         """Record an active installation."""
-        self._installations[installation_id] = {
-            "account_login": account_login,
-            "account_type": account_type,
-            "account_avatar_url": account_avatar_url,
-            "repository_selection": repository_selection,
-            "installed_at": int(time.time()),
-        }
-        await self._save()
+        async with self._lock:
+            self._installations[installation_id] = {
+                "account_login": account_login,
+                "account_type": account_type,
+                "account_avatar_url": account_avatar_url,
+                "repository_selection": repository_selection,
+                "installed_at": int(time.time()),
+            }
+            await self._save()
         logger.info(
             "GitHub App installation %s added (%s/%s)",
             installation_id,
@@ -115,9 +117,10 @@ class GitHubAppInstallations:
 
     async def remove(self, installation_id: int) -> bool:
         """Remove an installation. Returns False if not found."""
-        if installation_id not in self._installations:
-            return False
-        del self._installations[installation_id]
-        await self._save()
+        async with self._lock:
+            if installation_id not in self._installations:
+                return False
+            del self._installations[installation_id]
+            await self._save()
         logger.info("GitHub App installation %s removed", installation_id)
         return True

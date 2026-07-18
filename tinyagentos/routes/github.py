@@ -77,8 +77,13 @@ async def _get_token(request: Request) -> str | None:
     return None
 
 
-async def _get_app_installation_token(request: Request) -> str | None:
+async def _get_app_installation_token(
+    request: Request, installation_id: int | None = None
+) -> str | None:
     """Mint a short-lived installation token from the configured GitHub App.
+
+    If *installation_id* is provided, uses that specific installation.
+    Otherwise, uses the first active installation (backward-compatible default).
 
     Returns None if GitHub App is not configured or no installations exist.
     """
@@ -90,6 +95,22 @@ async def _get_app_installation_token(request: Request) -> str | None:
     if installs is None:
         return None
 
+    if installation_id is not None:
+        inst = installs.get(installation_id)
+        if not inst:
+            return None
+        http_client = request.app.state.http_client
+        from tinyagentos.github_app import get_installation_token
+
+        token = await get_installation_token(
+            cfg.github_app_id, cfg.github_app_private_key, installation_id,
+            http_client,
+        )
+        if token:
+            logger.debug("Using GitHub App installation token (installation %s)", installation_id)
+            return token
+        return None
+
     active = installs.list_all()
     if not active:
         return None
@@ -97,8 +118,8 @@ async def _get_app_installation_token(request: Request) -> str | None:
     http_client = request.app.state.http_client
     from tinyagentos.github_app import get_installation_token
 
-    # Use the first active installation. In the future, the caller could
-    # pass a repo hint to select the right installation.
+    # Use the first active installation. The caller may pass an explicit
+    # installation_id to select a specific installation (e.g. scoped by repo).
     for inst in active:
         iid = inst.get("installation_id")
         if not iid:

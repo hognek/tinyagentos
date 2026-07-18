@@ -14,6 +14,7 @@ NEVER logged or returned by any endpoint.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 
@@ -249,16 +250,13 @@ async def list_app_installations(request: Request):
         cfg.github_app_id, cfg.github_app_private_key, http
     )
 
-    result = []
+    # Phase 1: record new installations locally (sequential — uses lock)
     for inst in raw_installations:
         iid = inst.get("id")
         if not iid:
             continue
-        account = inst.get("account", {})
-
-        # Record the installation locally if we haven't seen it yet
-        # (it may have been installed via GitHub web UI).
         if installs_store and not installs_store.get(iid):
+            account = inst.get("account", {})
             await installs_store.add(
                 installation_id=iid,
                 account_login=account.get("login", ""),
@@ -267,13 +265,24 @@ async def list_app_installations(request: Request):
                 repository_selection=inst.get("repository_selection", "selected"),
             )
 
-        repos = []
+    # Phase 2: mint tokens and fetch repos in parallel across installations
+    async def _fetch_one(inst: dict) -> tuple[int, dict, list[dict]]:
+        iid: int = inst["id"]
         token = await get_installation_token(
             cfg.github_app_id, cfg.github_app_private_key, iid, http
         )
+        repos: list[dict] = []
         if token:
             repos = await list_installation_repos_cached(iid, token, http)
+        return iid, inst, repos
 
+    valid = [inst for inst in raw_installations if inst.get("id")]
+    fetched = await asyncio.gather(*(_fetch_one(inst) for inst in valid))
+
+    # Phase 3: build result list
+    result = []
+    for iid, inst, repos in fetched:
+        account = inst.get("account", {})
         result.append({
             "id": iid,
             "account": {
@@ -381,7 +390,12 @@ async def app_installation_callback(
         inst_data = install_resp.json()
         account = inst_data.get("account", {})
         store = _app_installations_store(request)
-        if store:
+        if setup_action == "update":
+            logger.info(
+                "GitHub App installation %s updated (%s)",
+                installation_id, account.get("login", ""),
+            )
+        elif store:
             await store.add(
                 installation_id=installation_id,
                 account_login=account.get("login", ""),
