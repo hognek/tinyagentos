@@ -14,6 +14,10 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_TIMEOUT = 30  # seconds before marking worker offline
 
+# Valid worker-initiated status values that gate drain/update protection.
+# Keep in sync with the notification block below and the heartbeat guard.
+_VALID_STATUSES: frozenset[str] = frozenset({"draining", "update-available", "updating"})
+
 
 def _format_hw(hw) -> str:
     """Format hardware info for notification messages."""
@@ -234,11 +238,12 @@ class ClusterManager:
         # defeat the drain (taOS #890). Similarly, protect "update-available"
         # so a periodic status-less heartbeat doesn't silently cancel the
         # update signal before the worker can initiate the drain.
-        # Only block status-less heartbeats; explicit status transitions
-        # (e.g. "update-available" → "draining") are still honoured.
-        if worker.status not in ("draining", "update-available", "updating") or status is not None:
+        # Block status-less heartbeats AND invalid status values for protected
+        # workers. Explicit valid-status transitions (e.g. "update-available"
+        # → "draining") are still honoured.
+        if worker.status not in _VALID_STATUSES or (status is not None and status in _VALID_STATUSES):
             # Honour worker-initiated status transitions (taOS #890 C2).
-            if status in ("draining", "update-available", "updating"):
+            if status in _VALID_STATUSES:
                 worker.status = status
             else:
                 worker.status = "online"
@@ -311,7 +316,6 @@ class ClusterManager:
         # its own initiative, so the operator sees it in the activity feed.
         # Validate: only trusted status values; sanitize drain_reason to
         # prevent injection into notification UI.
-        _VALID_STATUSES = frozenset({"draining", "update-available", "updating"})
         if self._notifications and status in _VALID_STATUSES and prev_status not in (status,):
             reason = (drain_reason or "unspecified").replace("'", "\\'").replace("\\", "\\\\")[:200]
             event_type = f"worker.{status}" if status != "draining" else "worker.drain"
