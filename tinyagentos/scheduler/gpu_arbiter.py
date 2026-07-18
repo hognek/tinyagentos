@@ -615,6 +615,16 @@ class GpuArbiter:
                 if evicted > 0:
                     admission = await self._reserve_and_check(entry.task.id, entry.required_vram_mb)
             if admission.admitted:
+                # Re-check cancelled_ids after the await window above
+                # (reserve_and_check / eviction).  cancel_op may have fired
+                # concurrently while we were suspended, removing the entry
+                # from _queued_entries and cancelling its future.  Without
+                # this re-check the cancelled task is still admitted and
+                # runs to completion despite the cancellation.
+                if entry.task.id in self._cancelled_ids:
+                    self._cancelled_ids.discard(entry.task.id)
+                    self._release_reservation(entry.task.id)
+                    continue
                 future = getattr(entry.task, "_arbiter_future", None)
                 # Spawn as background task so drain doesn't block and
                 # eviction-to-make-room stays responsive on subsequent ticks.
