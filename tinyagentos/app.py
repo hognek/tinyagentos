@@ -100,6 +100,7 @@ from tinyagentos.user_personas import UserPersonaStore
 from tinyagentos.installed_apps import InstalledAppsStore
 from tinyagentos.skills import SkillStore
 from tinyagentos.office_docs import OfficeDocStore
+from tinyagentos.contacts_store import ContactsStore
 from tinyagentos.web_sites import WebSiteStore
 from tinyagentos.music_songs import SongStore
 from tinyagentos.design_docs import DesignStore
@@ -445,6 +446,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     web_sites = WebSiteStore(data_dir / "web_sites.db")
     song_store = SongStore(data_dir / "songs.db")
     design_docs = DesignStore(data_dir / "design_docs.db")
+    contacts_store = ContactsStore(data_dir / "contacts.db")
     coding_workspaces_store = CodingWorkspaceStore(
         data_dir / "coding_workspaces.db",
         data_dir / "coding-workspaces",
@@ -554,6 +556,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await web_sites.init()
         await song_store.init()
         await design_docs.init()
+        await contacts_store.init()
         await coding_workspaces_store.init()
         await install_registry_store.init()
         await store_submissions.init()
@@ -1365,6 +1368,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await web_sites.close()
         await song_store.close()
         await design_docs.close()
+        await contacts_store.close()
         await coding_workspaces_store.close()
         await install_registry_store.close()
         await user_memory.close()
@@ -1583,6 +1587,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.web_sites = web_sites
     app.state.song_store = song_store
     app.state.design_docs = design_docs
+    app.state.contacts_store = contacts_store
     app.state.coding_workspaces = coding_workspaces_store
     app.state.install_registry = install_registry_store
     app.state.store_submissions = store_submissions
