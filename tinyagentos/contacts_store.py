@@ -51,6 +51,8 @@ _PEER_TOKEN_BYTES = 32
 # + 60s buffer.  After this window a nonce is pruned so the table stays small.
 NONCE_MAX_AGE_SECS = 600
 
+VALID_CONTACT_STATUSES = frozenset({"pending", "active", "blocked", "revoked"})
+
 
 def _hash_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
@@ -70,6 +72,8 @@ class ContactsStore(BaseStore):
     """
 
     SCHEMA = CONTACTS_SCHEMA
+
+    MIGRATIONS: list = []
 
     # ------------------------------------------------------------------
     # contacts
@@ -91,6 +95,11 @@ class ContactsStore(BaseStore):
         On conflict (same contact_id) the key material is updated — this is
         the trust-on-first-use refresh when a friend re-accepts.
         """
+        if status not in VALID_CONTACT_STATUSES:
+            raise ValueError(
+                f"invalid contact status: {status!r} — "
+                f"must be one of {sorted(VALID_CONTACT_STATUSES)}"
+            )
         now = time.time()
         await self._db.execute(
             """INSERT INTO contacts
@@ -125,6 +134,11 @@ class ContactsStore(BaseStore):
         return _row_to_dict(columns, rows[0]) if rows else None
 
     async def set_contact_status(self, contact_id: str, status: str) -> None:
+        if status not in VALID_CONTACT_STATUSES:
+            raise ValueError(
+                f"invalid contact status: {status!r} — "
+                f"must be one of {sorted(VALID_CONTACT_STATUSES)}"
+            )
         now = time.time()
         if status in ("blocked", "revoked"):
             await self._db.execute(
