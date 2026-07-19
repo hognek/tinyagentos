@@ -415,8 +415,12 @@ async def _apply_delegation_grant(request: Request, decision: dict, value) -> bo
                     "delegate grant write failed for agent %s (decision %s)",
                     from_agent, decision.get("id"), exc_info=True,
                 )
+    if not approved:
+        reply = "delegation denied"
+    elif completed:
+        reply = "delegation approved - the task has been assigned"
     else:
-        reply = f"The delegation to {to_agent} was denied."
+        reply = "delegation approved, but assigning the task failed - please retry"
     await _route_answer_to_agent(decision, reply)
     return True
 
