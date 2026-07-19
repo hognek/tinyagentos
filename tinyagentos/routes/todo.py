@@ -41,7 +41,7 @@ class PatchTodoItemIn(BaseModel):
 
 class ReorderEntry(BaseModel):
     id: str
-    position: int
+    position: int = Field(ge=0)
 
 
 class ReorderItemsIn(BaseModel):
@@ -273,6 +273,24 @@ async def reorder_items(
     err = _check_owner(doc, user)
     if err:
         return err
+
+    # Validate: one entry per item, no duplicates, positions 0..n-1.
+    current_items = await store.list_items(list_id)
+    current_ids = {item["id"] for item in current_items}
+    request_ids = [e.id for e in body.items]
+    if set(request_ids) != current_ids:
+        return JSONResponse(
+            {"error": "reorder must include exactly all items in the list"},
+            status_code=400,
+        )
+    if len(request_ids) != len(set(request_ids)):
+        return JSONResponse({"error": "duplicate item ids in reorder"}, status_code=400)
+    positions = [e.position for e in body.items]
+    if sorted(positions) != list(range(len(current_items))):
+        return JSONResponse(
+            {"error": "positions must be a unique 0..n-1 permutation"},
+            status_code=400,
+        )
 
     items = [{"id": e.id, "position": e.position} for e in body.items]
     await store.reorder_items(list_id, items)

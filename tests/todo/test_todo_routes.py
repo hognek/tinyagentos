@@ -134,6 +134,14 @@ async def test_patch_list_title_and_archive(client):
     listing_all = (await client.get("/api/todo?include_archived=true")).json()
     assert any(d["id"] == list_id for d in listing_all)
 
+    # Unarchive.
+    resp = await client.patch(f"/api/todo/{list_id}", json={"archived": False})
+    assert resp.status_code == 200
+    assert resp.json()["archived_at"] is None
+
+    listing = (await client.get("/api/todo")).json()
+    assert any(d["id"] == list_id for d in listing)
+
 
 # ---------------------------------------------------------------- item tests
 
@@ -296,6 +304,12 @@ async def test_add_item_with_due_date(client):
     assert item["due_at"] is not None
     assert item["text"] == "Submit report"
 
+    # Verify UTC normalization: naive timestamp treated as UTC.
+    from datetime import datetime, timezone
+
+    expected = datetime(2026, 12, 31, 23, 59, 59, tzinfo=timezone.utc).timestamp()
+    assert item["due_at"] == pytest.approx(expected)
+
 
 @pytest.mark.asyncio
 async def test_add_item_with_invalid_due_date_returns_400(client):
@@ -319,7 +333,39 @@ async def test_patch_item_due_date(client):
         json={"due_at": "2026-07-04T12:00:00"},
     )
     assert resp.status_code == 200
-    assert resp.json()["due_at"] is not None
+    result = resp.json()
+    assert result["due_at"] is not None
+
+    # Verify UTC normalization: naive timestamp treated as UTC.
+    from datetime import datetime, timezone
+
+    expected = datetime(2026, 7, 4, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert result["due_at"] == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_add_item_with_remind_at(client):
+    doc = (await client.post("/api/todo", json={"title": "Reminders"})).json()
+    item = (await client.post(
+        f"/api/todo/{doc['id']}/items",
+        json={"text": "Meeting prep", "remind_at": "2026-07-20T09:00:00"},
+    )).json()
+    assert item["remind_at"] is not None
+
+    from datetime import datetime, timezone
+
+    expected = datetime(2026, 7, 20, 9, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert item["remind_at"] == pytest.approx(expected)
+
+
+@pytest.mark.asyncio
+async def test_add_item_with_invalid_remind_at_returns_400(client):
+    doc = (await client.post("/api/todo", json={"title": "x"})).json()
+    resp = await client.post(
+        f"/api/todo/{doc['id']}/items",
+        json={"text": "x", "remind_at": "garbage"},
+    )
+    assert resp.status_code == 400
 
 
 # ------------------------------------------------------------ not-found tests
