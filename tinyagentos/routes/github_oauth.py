@@ -223,16 +223,47 @@ def _app_installations_store(request: Request):
     return getattr(request.app.state, "github_app_installations", None)
 
 
+async def _get_app_private_key(request: Request) -> str | None:
+    """Return the GitHub App private key from SecretsStore, or None.
+
+    The key is stored under the well-known name ``github-app-private-key``
+    in the encrypted SecretsStore (not in plaintext config). Returns the
+    inline PEM string if configured, None otherwise.
+    """
+    secrets = getattr(request.app.state, "secrets", None)
+    if secrets is None:
+        return None
+    try:
+        rec = await secrets.get("github-app-private-key")
+    except Exception:
+        return None
+    if rec and rec.get("value"):
+        return rec["value"]
+    return None
+
+
+def _app_is_configured(request: Request) -> bool:
+    """Check whether the GitHub App is configured at all."""
+    cfg = _app_config(request)
+    return bool(cfg and cfg.github_app_id)
+
+
 @router.get("/api/github/app/installations")
 async def list_app_installations(request: Request):
     """List GitHub App installations with their accessible repositories.
 
-    Requires github_app_id and github_app_private_key to be configured.
+    Requires github_app_id in config and github-app-private-key secret.
     """
     cfg = _app_config(request)
-    if not cfg or not cfg.github_app_id or not cfg.github_app_private_key:
+    if not _app_is_configured(request):
         return JSONResponse(
-            {"error": "GitHub App not configured (set github_app_id and github_app_private_key in config)"},
+            {"error": "GitHub App not configured (set github_app_id in config and add github-app-private-key secret)"},
+            status_code=501,
+        )
+    private_key = await _get_app_private_key(request)
+    if not private_key:
+        return JSONResponse(
+            {"error": "GitHub App not configured (add github-app-private-key secret in Secrets page)"},
             status_code=501,
         )
 
@@ -247,7 +278,7 @@ async def list_app_installations(request: Request):
 
     # Fetch installations from the GitHub API using the JWT
     raw_installations = await list_installations(
-        cfg.github_app_id, cfg.github_app_private_key, http
+        cfg.github_app_id, private_key, http
     )
 
     # Phase 1: record new installations locally (sequential — uses lock)
@@ -271,11 +302,13 @@ async def list_app_installations(request: Request):
     async def _fetch_one(inst: dict) -> tuple[int, dict, list[dict]]:
         iid: int = inst["id"]
         token = await get_installation_token(
-            cfg.github_app_id, cfg.github_app_private_key, iid, http
+            cfg.github_app_id, private_key, iid, http
         )
         repos: list[dict] = []
         if token:
-            repos = await list_installation_repos_cached(iid, token, http)
+            repos = await list_installation_repos_cached(
+                iid, token, http, app_id=cfg.github_app_id, private_key=private_key
+            )
         return iid, inst, repos
 
     valid = [inst for inst in raw_installations if inst.get("id")]
@@ -316,9 +349,15 @@ async def begin_app_installation(request: Request):
     back to /api/github/app/callback after installation completes.
     """
     cfg = _app_config(request)
-    if not cfg or not cfg.github_app_id or not cfg.github_app_private_key:
+    if not _app_is_configured(request):
         return JSONResponse(
-            {"error": "GitHub App not configured (set github_app_id and github_app_private_key in config)"},
+            {"error": "GitHub App not configured (set github_app_id in config and add github-app-private-key secret)"},
+            status_code=501,
+        )
+    private_key = await _get_app_private_key(request)
+    if not private_key:
+        return JSONResponse(
+            {"error": "GitHub App not configured (add github-app-private-key secret in Secrets page)"},
             status_code=501,
         )
 
@@ -326,7 +365,7 @@ async def begin_app_installation(request: Request):
     from tinyagentos.github_app import _get_app_slug
 
     app_slug = await _get_app_slug(
-        cfg.github_app_id, cfg.github_app_private_key, http
+        cfg.github_app_id, private_key, http
     )
     if not app_slug:
         return JSONResponse(
@@ -356,9 +395,15 @@ async def app_installation_callback(
         )
 
     cfg = _app_config(request)
-    if not cfg or not cfg.github_app_id or not cfg.github_app_private_key:
+    if not _app_is_configured(request):
         return JSONResponse(
             {"error": "GitHub App not configured"},
+            status_code=501,
+        )
+    private_key = await _get_app_private_key(request)
+    if not private_key:
+        return JSONResponse(
+            {"error": "GitHub App not configured (add github-app-private-key secret in Secrets page)"},
             status_code=501,
         )
 
@@ -368,7 +413,7 @@ async def app_installation_callback(
 
     # Verify the installation works by minting a token
     token = await get_installation_token(
-        cfg.github_app_id, cfg.github_app_private_key, installation_id, http
+        cfg.github_app_id, private_key, installation_id, http
     )
     if not token:
         return JSONResponse(
@@ -379,16 +424,25 @@ async def app_installation_callback(
     # Fetch installation details with JWT (the /user endpoint returns the bot
     # user, not the installing account, so we use /app/installations/{id}).
     from tinyagentos.github_app import generate_jwt
-    jwt = generate_jwt(cfg.github_app_id, cfg.github_app_private_key)
-    install_resp = await http.get(
-        f"https://api.github.com/app/installations/{installation_id}",
-        headers={
-            "Authorization": f"Bearer {jwt}",
-            "Accept": "application/vnd.github+json",
-        },
-        timeout=10,
-    )
-    if install_resp.status_code == 200:
+    jwt = generate_jwt(cfg.github_app_id, private_key)
+    try:
+        install_resp = await http.get(
+            f"https://api.github.com/app/installations/{installation_id}",
+            headers={
+                "Authorization": f"Bearer {jwt}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=10,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to fetch installation %s details (network/timeout), saving "
+            "minimal record — the install itself succeeded",
+            installation_id,
+        )
+        install_resp = None
+
+    if install_resp is not None and install_resp.status_code == 200:
         inst_data = install_resp.json()
         account = inst_data.get("account", {})
         store = _app_installations_store(request)
@@ -407,11 +461,22 @@ async def app_installation_callback(
             account.get("login", ""),
         )
     else:
+        status_str = str(install_resp.status_code) if install_resp is not None else "exception"
         logger.warning(
-            "Failed to fetch installation %s details (HTTP %s), redirecting anyway",
-            installation_id, install_resp.status_code,
+            "Failed to fetch installation %s details (HTTP %s), saving minimal "
+            "record — the install itself succeeded",
+            installation_id, status_str,
         )
-        return RedirectResponse(url="/app/secrets?install_error=1", status_code=302)
+        store = _app_installations_store(request)
+        if store and not store.get(installation_id):
+            await store.add(
+                installation_id=installation_id,
+                account_login="",
+                account_type="",
+                account_avatar_url="",
+                repository_selection="selected",
+            )
+        return RedirectResponse(url="/app/secrets?install_warning=1", status_code=302)
 
     return RedirectResponse(url="/app/secrets", status_code=302)
 
@@ -420,9 +485,15 @@ async def app_installation_callback(
 async def delete_app_installation(request: Request, installation_id: int):
     """Uninstall the GitHub App from the given installation."""
     cfg = _app_config(request)
-    if not cfg or not cfg.github_app_id or not cfg.github_app_private_key:
+    if not _app_is_configured(request):
         return JSONResponse(
             {"error": "GitHub App not configured"},
+            status_code=501,
+        )
+    private_key = await _get_app_private_key(request)
+    if not private_key:
+        return JSONResponse(
+            {"error": "GitHub App not configured (add github-app-private-key secret in Secrets page)"},
             status_code=501,
         )
 
@@ -430,8 +501,14 @@ async def delete_app_installation(request: Request, installation_id: int):
     from tinyagentos.github_app import delete_installation
 
     deleted = await delete_installation(
-        cfg.github_app_id, cfg.github_app_private_key, installation_id, http
+        cfg.github_app_id, private_key, installation_id, http
     )
+
+    if deleted is None:
+        return JSONResponse(
+            {"error": "Failed to delete installation (upstream error)"},
+            status_code=502,
+        )
 
     if not deleted:
         return JSONResponse(

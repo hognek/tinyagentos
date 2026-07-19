@@ -16,6 +16,10 @@ log = logging.getLogger(__name__)
 
 VALID_ON_WORKER_FAILURE = {"pause", "fallback", "escalate-immediately"}
 
+# Module-level flag to emit the github_app_private_key deprecation warning
+# only once per process, not on every config reload.
+_deprecation_warned_github_key = False
+
 # Port used by LiteLLM on the host side.  Container-internal side is always
 # 4000 (the incus proxy device bridges container:4000 -> host:litellm_port).
 # New installs record 7834; existing installs that predate the #795 port move
@@ -58,7 +62,6 @@ class AppConfig:
     memory_url: str = "http://localhost:7900"
     wallhaven_api_key: str | None = None
     github_app_id: str = ""
-    github_app_private_key: str = ""
     config_path: Path | None = None
 
     def to_dict(self) -> dict:
@@ -80,9 +83,6 @@ class AppConfig:
             d["memory_url"] = self.memory_url
         if self.github_app_id:
             d["github_app_id"] = self.github_app_id
-            d["github_app_private_key"] = self.github_app_private_key
-        elif self.github_app_private_key:
-            d["github_app_private_key"] = self.github_app_private_key
         return d
 
 # rkllama's taOS default port moved from the upstream 8080 to 7833. Installs
@@ -192,10 +192,19 @@ def load_config(path: Path) -> AppConfig:
         archive=archive_cfg,
         memory_url=data.get("memory_url", "http://localhost:7900"),
         github_app_id=str(data.get("github_app_id", "") or ""),
-        github_app_private_key=str(data.get("github_app_private_key", "") or ""),
         config_path=path,
         wallhaven_api_key=wallhaven_api_key,
     )
+    if "github_app_private_key" in data:
+        global _deprecation_warned_github_key
+        if not _deprecation_warned_github_key:
+            _deprecation_warned_github_key = True
+            log.warning(
+                "config.yaml contains github_app_private_key which is no longer "
+                "stored in config. The key will be migrated to SecretsStore on "
+                "next startup. To configure manually, add a secret named "
+                "'github-app-private-key' in the Secrets page."
+            )
     if _pin_applied:
         save_config(cfg, path)
     return cfg

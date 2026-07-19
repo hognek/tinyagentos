@@ -7,6 +7,8 @@ from pathlib import Path
 
 import httpx
 
+import yaml
+
 logger = logging.getLogger(__name__)
 from fastapi import FastAPI
 from fastapi.middleware.gzip import GZipMiddleware
@@ -511,6 +513,42 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await notif_push_store.init()
         await qmd_client.init()
         await secrets_store.init()
+        # -------------------------------------------------------------------
+        # Migrate legacy github_app_private_key from config.yaml → SecretsStore.
+        # The key was previously stored as plaintext in config and re-serialized
+        # on every config save.  Now it lives encrypted in SecretsStore under
+        # the well-known name ``github-app-private-key``.  This one-shot
+        # migration reads the old value, stores it, and strips it from config.
+        # -------------------------------------------------------------------
+        _cfg_raw = yaml.safe_load(config_path.read_text()) if config_path and config_path.exists() else {}
+        if isinstance(_cfg_raw, dict) and "github_app_private_key" in _cfg_raw:
+            _legacy_key = str(_cfg_raw.get("github_app_private_key", "") or "")
+            if _legacy_key:
+                _existing = await secrets_store.get("github-app-private-key")
+                # Treat an existing row with an empty value as missing so the
+                # migration writes the real key instead of silently skipping it.
+                if not _existing or not _existing.get("value"):
+                    if _existing and not _existing.get("value"):
+                        await secrets_store.update(
+                            name="github-app-private-key",
+                            value=_legacy_key,
+                            category="credentials",
+                            description="GitHub App RSA private key (migrated from config.yaml)",
+                        )
+                    else:
+                        await secrets_store.add(
+                            name="github-app-private-key",
+                            value=_legacy_key,
+                            category="credentials",
+                            description="GitHub App RSA private key (migrated from config.yaml)",
+                        )
+                    logger.info(
+                        "migrated github_app_private_key from config.yaml to SecretsStore"
+                    )
+                # save_config uses the AppConfig object (which no longer carries
+                # the field), so the legacy key is stripped from the file on this
+                # next save regardless of _cfg_raw mutations.
+                save_config(config, config_path)
         await broker_store.init()
         await mail_store.init()
         app.state.mail_store = mail_store
