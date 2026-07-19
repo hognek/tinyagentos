@@ -539,3 +539,242 @@ async def test_rollback_only_touches_claimed(store):
     await store.rollback_to_pending(iid)
     row = await store.get(iid)
     assert row["status"] == "redeemed"  # stays redeemed
+
+
+# ---------------------------------------------------------------------------
+# B1: collab invite kind + pin_required + contact_id
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mint_collab_invite(store):
+    result = await store.mint(
+        project_id="prj-1",
+        scopes=[],
+        approval_mode="manual",
+        check_interval_secs=1800,
+        created_by="u",
+        kind="collab",
+        pin_required=True,
+        contact_id="hub:hogne",
+    )
+    assert result["record"]["kind"] == "collab"
+    assert result["record"]["pin_required"] == 1
+    assert result["record"]["contact_id"] == "hub:hogne"
+    assert result["record"]["status"] == "pending"
+    assert len(result["pin"]) == 4
+
+
+@pytest.mark.asyncio
+async def test_mint_collab_invite_no_pin_required(store):
+    result = await store.mint(
+        project_id="prj-1",
+        scopes=[],
+        approval_mode="manual",
+        check_interval_secs=1800,
+        created_by="u",
+        kind="collab",
+        pin_required=False,
+        contact_id="hub:hogne",
+    )
+    assert result["record"]["pin_required"] == 0
+
+
+@pytest.mark.asyncio
+async def test_mint_rejects_invalid_kind(store):
+    with pytest.raises(ValueError, match="invalid invite kind"):
+        await store.mint(
+            project_id="prj-1",
+            scopes=[],
+            approval_mode="auto",
+            check_interval_secs=1800,
+            created_by="u",
+            kind="invalid",
+        )
+
+
+@pytest.mark.asyncio
+async def test_default_kind_is_agent(store):
+    result = await store.mint(
+        project_id="prj-1",
+        scopes=["a2a_send"],
+        approval_mode="auto",
+        check_interval_secs=1800,
+        created_by="u",
+    )
+    assert result["record"]["kind"] == "agent"
+    assert result["record"]["pin_required"] == 1
+    assert result["record"]["contact_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_mint_collab_rejects_scopes(store):
+    with pytest.raises(ValueError, match="collab invites must carry no scopes"):
+        await store.mint(
+            project_id="prj-1",
+            scopes=["a2a_send"],
+            approval_mode="manual",
+            check_interval_secs=1800,
+            created_by="u",
+            kind="collab",
+        )
+
+
+@pytest.mark.asyncio
+async def test_list_pending_collab_for_contact(store):
+    await store.mint(
+        project_id="prj-a",
+        scopes=[],
+        approval_mode="manual",
+        check_interval_secs=1800,
+        created_by="u",
+        kind="collab",
+        contact_id="hub:hogne",
+    )
+    await store.mint(
+        project_id="prj-b",
+        scopes=[],
+        approval_mode="manual",
+        check_interval_secs=1800,
+        created_by="u",
+        kind="collab",
+        contact_id="hub:hogne",
+    )
+    # Agent-kind invite for the same contact — should NOT appear in collab list
+    await store.mint(
+        project_id="prj-c",
+        scopes=["a2a_send"],
+        approval_mode="auto",
+        check_interval_secs=1800,
+        created_by="u",
+        kind="agent",
+        contact_id="hub:hogne",
+    )
+    items = await store.list_pending_collab_for_contact("hub:hogne")
+    assert len(items) == 2
+    for item in items:
+        assert item["kind"] == "collab"
+        assert item["contact_id"] == "hub:hogne"
+        assert "pin_hash" not in item
+
+
+@pytest.mark.asyncio
+async def test_list_pending_collab_for_unknown_contact(store):
+    items = await store.list_pending_collab_for_contact("hub:nobody")
+    assert items == []
+
+
+@pytest.mark.asyncio
+async def test_mark_accepted_flips_to_redeemed(store):
+    result = await store.mint(
+        project_id="prj-1",
+        scopes=[],
+        approval_mode="manual",
+        check_interval_secs=1800,
+        created_by="u",
+        kind="collab",
+        contact_id="hub:hogne",
+    )
+    iid = result["record"]["invite_id"]
+    # mark_accepted works directly from pending for collab invites
+    await store.mark_accepted(iid, "hub:hogne")
+    row = await store.get(iid)
+    assert row["status"] == "redeemed"
+    assert row["redeemed_by"] == "hub:hogne"
+
+
+@pytest.mark.asyncio
+async def test_mark_accepted_from_claimed(store):
+    """mark_accepted also works on claimed invites (agent flow that was claimed first)."""
+    result = await store.mint(
+        project_id="prj-1",
+        scopes=["a2a_send"],
+        approval_mode="auto",
+        check_interval_secs=1800,
+        created_by="u",
+        kind="agent",
+    )
+    iid = result["record"]["invite_id"]
+    # Claim first (agent redeem path)
+    await store.redeem(iid, result["pin"])
+    row = await store.get(iid)
+    assert row["status"] == "claimed"
+    # mark_accepted should still work from claimed
+    await store.mark_accepted(iid, "hub:hogne")
+    row = await store.get(iid)
+    assert row["status"] == "redeemed"
+    assert row["redeemed_by"] == "hub:hogne"
+
+
+@pytest.mark.asyncio
+async def test_mark_expired_pending_invite(store):
+    result = await store.mint(
+        project_id="prj-1",
+        scopes=["a2a_send"],
+        approval_mode="auto",
+        check_interval_secs=1800,
+        created_by="u",
+    )
+    iid = result["record"]["invite_id"]
+    ok = await store.mark_expired(iid)
+    assert ok is True
+    row = await store.get(iid)
+    assert row["status"] == "expired"
+
+
+@pytest.mark.asyncio
+async def test_mark_expired_nonexistent(store):
+    ok = await store.mark_expired("000000")
+    assert ok is False
+
+
+@pytest.mark.asyncio
+async def test_boot_migration_adds_kind_pin_required_contact_id(tmp_path):
+    """A legacy DB without kind/pin_required/contact_id columns must survive init
+    with defaults applied."""
+    db_path = tmp_path / "legacy_invites_b1.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        """
+        CREATE TABLE project_invites (
+            invite_id      TEXT PRIMARY KEY,
+            project_id     TEXT NOT NULL,
+            pin_hash       TEXT NOT NULL,
+            scopes         TEXT NOT NULL,
+            approval_mode  TEXT NOT NULL,
+            check_interval_secs INTEGER,
+            created_by     TEXT NOT NULL,
+            created_ts     REAL NOT NULL,
+            expires_ts     REAL NOT NULL,
+            redeem_attempts INTEGER DEFAULT 0,
+            status         TEXT NOT NULL,
+            redeemed_by    TEXT,
+            redeemed_request_id TEXT,
+            display_name   TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        INSERT INTO project_invites
+            (invite_id, project_id, pin_hash, scopes, approval_mode,
+             check_interval_secs, created_by, created_ts, expires_ts,
+             redeem_attempts, status, redeemed_by)
+        VALUES ('000001', 'prj-1', 'abc', '[]', 'auto', 1800, 'u', 1.0, ?, 0, 'pending', NULL)
+        """,
+        (time.time() + 900,),
+    )
+    conn.commit()
+    conn.close()
+
+    store = ProjectInviteStore(db_path)
+    await store.init()
+    row = await store.get("000001")
+    assert row is not None
+    assert row["status"] == "pending"
+    # Defaults applied by migration
+    assert row.get("kind") == "agent"
+    assert row.get("pin_required") == 1
+    assert row.get("contact_id") is None
+    await store.close()
