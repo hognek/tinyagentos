@@ -35,7 +35,10 @@ router = APIRouter()
 # Token resolution helper
 # ---------------------------------------------------------------------------
 
-async def _get_token(request: Request) -> str | None:
+async def _get_token(
+    request: Request,
+    user_scoped: bool = False,
+) -> str | None:
     """Return a GitHub token or None.
 
     Resolution order:
@@ -43,6 +46,8 @@ async def _get_token(request: Request) -> str | None:
        identity takes precedence so personal repos and rate limits apply.
     2. GitHub App installation token (when github_app_id and key are configured)
        — fallback for repos accessible to the installed app.
+       **Skipped when ``user_scoped=True``** because installation tokens cannot
+       serve user-scoped endpoints (``/user/starred``, ``/notifications``, etc.).
     3. ``gh auth token`` subprocess fallback
     """
     # 1. Try SecretsStore PAT (user's own GitHub identity)
@@ -55,10 +60,11 @@ async def _get_token(request: Request) -> str | None:
         except Exception as exc:
             logger.warning("SecretsStore lookup for github_token failed: %s", exc)
 
-    # 2. Try GitHub App installation token (fallback)
-    token = await _get_app_installation_token(request)
-    if token:
-        return token
+    # 2. Try GitHub App installation token (fallback; skipped for user-scoped endpoints)
+    if not user_scoped:
+        token = await _get_app_installation_token(request)
+        if token:
+            return token
 
     # 3. Fallback: gh CLI
     try:
@@ -158,8 +164,8 @@ def _no_token_response() -> JSONResponse:
 
 @router.get("/api/github/auth/status")
 async def github_auth_status(request: Request):
-    """Return whether a GitHub token is available."""
-    token = await _get_token(request)
+    """Return whether a GitHub token is available for user-scoped API calls."""
+    token = await _get_token(request, user_scoped=True)
     if token:
         return {"authenticated": True, "source": "token"}
     return {"authenticated": False, "source": None}
@@ -172,7 +178,7 @@ async def github_auth_status(request: Request):
 @router.get("/api/github/starred")
 async def github_starred(request: Request, page: int = 1):
     """Return paginated starred repositories for the authenticated user."""
-    token = await _get_token(request)
+    token = await _get_token(request, user_scoped=True)
     if not token:
         return _no_token_response()
 
@@ -192,7 +198,7 @@ async def github_starred(request: Request, page: int = 1):
 @router.get("/api/github/notifications")
 async def github_notifications(request: Request):
     """Return unread notifications for the authenticated user."""
-    token = await _get_token(request)
+    token = await _get_token(request, user_scoped=True)
     if not token:
         return _no_token_response()
 

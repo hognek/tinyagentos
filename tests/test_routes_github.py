@@ -322,3 +322,198 @@ async def test_repo_upstream_error_returns_500():
     assert resp.status_code == 500
     data = resp.json()
     assert "error" in data
+
+
+# ---------------------------------------------------------------------------
+# User-scoped token resolution: App token must NOT serve user endpoints
+# ---------------------------------------------------------------------------
+
+def _build_app_with_app_config(
+    token: str | None = None,
+    http_client=None,
+):
+    """Build a minimal FastAPI app with mock GitHub App configuration.
+
+    - PAT is set via ``token`` (None = no PAT)
+    - Callers should mock ``create_subprocess_exec`` and
+      ``get_installation_token`` directly for gh CLI / App token behaviour
+    """
+    app = FastAPI()
+    app.include_router(github_router)
+
+    # SecretsStore (PAT)
+    mock_secrets = MagicMock()
+    if token:
+        mock_secrets.get = AsyncMock(return_value={"value": token})
+    else:
+        mock_secrets.get = AsyncMock(return_value=None)
+    app.state.secrets = mock_secrets
+
+    # App config
+    mock_config = MagicMock()
+    mock_config.github_app_id = "123456"
+    mock_config.github_app_private_key = "fake-private-key"
+    app.state.config = mock_config
+
+    # App installations store
+    mock_installs = MagicMock()
+    mock_installs.list_all = MagicMock(return_value=[{"installation_id": 42}])
+    app.state.github_app_installations = mock_installs
+
+    app.state.http_client = http_client or MagicMock()
+    return app
+
+
+@pytest.mark.asyncio
+async def test_starred_uses_gh_cli_when_app_configured_no_pat():
+    """When App is configured but no PAT, /starred (user-scoped) skips the
+    App token and falls through to gh CLI."""
+    starred_data = [{
+        "name": "repo1", "owner": {"login": "alice"},
+        "full_name": "alice/repo1", "description": "Repo 1",
+        "stargazers_count": 10, "language": "Python",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "html_url": "https://github.com/alice/repo1",
+    }]
+    http_client = _make_http_client(_make_response(starred_data))
+    app = _build_app_with_app_config(
+        token=None,  # No PAT
+        http_client=http_client,
+    )
+
+    async def _fake_subprocess(*args, **kwargs):
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"gh-cli-token", b""))
+        return proc
+
+    transport = ASGITransport(app=app)
+    with patch(
+        "tinyagentos.routes.github.asyncio.create_subprocess_exec",
+        side_effect=_fake_subprocess,
+    ):
+        # Also ensure get_installation_token is NOT called (user-scoped skips it)
+        with patch(
+            "tinyagentos.github_app.get_installation_token",
+        ) as mock_mint:
+            async with AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as c:
+                resp = await c.get("/api/github/starred?page=1")
+
+    assert resp.status_code == 200
+    # App token minting must NOT have been called for a user-scoped endpoint
+    mock_mint.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_notifications_use_gh_cli_when_app_configured_no_pat():
+    """When App is configured but no PAT, /notifications (user-scoped) skips
+    the App token."""
+    notif_data = [{
+        "id": "1", "reason": "mention", "unread": True,
+        "updated_at": "2026-01-01T00:00:00Z",
+        "subject": {"type": "Issue", "title": "Bug",
+                     "url": "https://api.github.com/repos/owner/repo/issues/1"},
+        "repository": {"full_name": "owner/repo",
+                       "html_url": "https://github.com/owner/repo"},
+    }]
+    http_client = _make_http_client(_make_response(notif_data))
+    app = _build_app_with_app_config(
+        token=None,
+        http_client=http_client,
+    )
+
+    async def _fake_subprocess(*args, **kwargs):
+        proc = MagicMock()
+        proc.communicate = AsyncMock(return_value=(b"gh-cli-token", b""))
+        return proc
+
+    transport = ASGITransport(app=app)
+    with patch(
+        "tinyagentos.routes.github.asyncio.create_subprocess_exec",
+        side_effect=_fake_subprocess,
+    ):
+        with patch(
+            "tinyagentos.github_app.get_installation_token",
+        ) as mock_mint:
+            async with AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as c:
+                resp = await c.get("/api/github/notifications")
+
+    assert resp.status_code == 200
+    mock_mint.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_auth_status_false_when_only_app_token_available():
+    """When only an App token is available (no PAT, no gh CLI),
+    /auth/status (user-scoped) returns authenticated=False."""
+    http_client = MagicMock()
+    http_client.get = AsyncMock(side_effect=Exception("should not be called"))
+    app = _build_app_with_app_config(
+        token=None,  # No PAT
+        http_client=http_client,
+    )
+
+    transport = ASGITransport(app=app)
+    with patch(
+        "tinyagentos.routes.github.asyncio.create_subprocess_exec",
+        side_effect=FileNotFoundError,  # gh CLI not installed
+    ):
+        with patch(
+            "tinyagentos.github_app.get_installation_token",
+        ) as mock_mint:
+            async with AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as c:
+                resp = await c.get("/api/github/auth/status")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["authenticated"] is False
+    # App token minting must NOT have been called
+    mock_mint.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_repo_endpoint_still_uses_app_token():
+    """When App is configured but no PAT, repo-scoped endpoints (/repo/...)
+    SHOULD use the App installation token (not user_scoped)."""
+    meta_data = {
+        "name": "myrepo", "owner": {"login": "bob"},
+        "description": "My repo", "stargazers_count": 100,
+        "forks_count": 5, "language": "Go",
+        "license": {"name": "MIT"}, "topics": ["tool"],
+        "updated_at": "2026-02-01T00:00:00Z",
+    }
+    readme_resp = MagicMock()
+    readme_resp.status_code = 200
+    readme_resp.text = "# MyRepo"
+    readme_resp.raise_for_status = MagicMock()
+
+    http_client = _make_http_client(_make_response(meta_data), readme_resp)
+    app = _build_app_with_app_config(
+        token=None,  # No PAT
+        http_client=http_client,
+    )
+
+    transport = ASGITransport(app=app)
+    with patch(
+        "tinyagentos.routes.github.asyncio.create_subprocess_exec",
+        side_effect=FileNotFoundError,
+    ):
+        # App token IS used for repo-scoped: mock it directly
+        with patch(
+            "tinyagentos.github_app.get_installation_token",
+            new_callable=AsyncMock,
+            return_value="ghs_app-install-token",
+        ):
+            async with AsyncClient(
+                transport=transport, base_url="http://test"
+            ) as c:
+                resp = await c.get("/api/github/repo/bob/myrepo")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["name"] == "myrepo"
