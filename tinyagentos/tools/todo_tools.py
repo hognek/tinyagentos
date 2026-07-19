@@ -36,7 +36,7 @@ async def execute_todo_list_lists(args: dict, request: Request) -> dict:
         lists = await store.list_lists(owner_user_id)
         # Strip internal fields the agent does not need.
         slim = [
-            {k: v for k, v in doc.items() if k not in ("owner_user_id", "archived_at", "created_at")}
+            {k: v for k, v in doc.items() if k in ("id", "title", "updated_at")}
             for doc in lists
         ]
         return {"lists": slim}
