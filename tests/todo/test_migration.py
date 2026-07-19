@@ -58,7 +58,7 @@ async def test_migrate_empty(shared_store, todo_store):
 @pytest.mark.asyncio
 async def test_migrate_single_list(shared_store, todo_store):
     """Single list with entries → migrated, source deleted."""
-    doc, entries = await _setup_list_doc(
+    doc, _entries = await _setup_list_doc(
         shared_store, "user-a", "Groceries",
         ["Milk", "Eggs", "Bread"],
         done_mask={1},
@@ -287,7 +287,7 @@ async def test_migrate_resumes_from_partial_item_copy(
 @pytest.mark.asyncio
 async def test_migrate_preserves_done_and_order(shared_store, todo_store):
     """Done flags and entry order are faithfully migrated."""
-    doc, entries = await _setup_list_doc(
+    _doc, _entries = await _setup_list_doc(
         shared_store, "user-a", "Checklist",
         ["First", "Second", "Third", "Fourth"],
         done_mask={0, 3},  # First and Fourth are done
