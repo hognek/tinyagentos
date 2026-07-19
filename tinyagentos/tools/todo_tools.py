@@ -17,16 +17,13 @@ logger = logging.getLogger(__name__)
 async def execute_todo_list_lists(args: dict, request: Request) -> dict:
     """List non-archived todo lists the calling agent has access to.
 
-    Note: authorization is owner-based — the caller supplies owner_user_id and the
-    store returns lists owned by that user. agent_name is used for attribution and
-    the notification skip-guard only. When TodoStore gains agent membership (#1923
-    follow-up), the agent_name-to-owner binding will move here.
+    Authorization is purely owner-based: the caller supplies owner_user_id and
+    the store returns only lists owned by that user. There is no agent-to-owner
+    binding yet — any caller that knows a user_id can enumerate that user's
+    lists. This will tighten when TodoStore gains agent membership (#1923
+    follow-up).
     """
     args = args or {}
-    agent_name = args.get("agent_name")
-    if not agent_name or not isinstance(agent_name, str):
-        return {"error": "todo_list_lists requires an 'agent_name' string"}
-
     owner_user_id = args.get("owner_user_id")
     if not owner_user_id or not isinstance(owner_user_id, str):
         return {"error": "todo_list_lists requires an 'owner_user_id' string"}
@@ -49,8 +46,9 @@ async def execute_todo_add_item(args: dict, request: Request) -> dict:
 
     Authorization is owner-based: the caller supplies owner_user_id and the
     store verifies it matches the list's owner. agent_name is used for
-    attribution only. When TodoStore gains agent membership (#1923 follow-up),
-    the agent_name-to-owner binding will replace the owner_user_id gate.
+    attribution (author field) and the notification skip-guard only — it is
+    not bound to owner_user_id. This will tighten when TodoStore gains agent
+    membership (#1923 follow-up).
     """
     args = args or {}
     agent_name = args.get("agent_name")
@@ -75,6 +73,9 @@ async def execute_todo_add_item(args: dict, request: Request) -> dict:
             return {"error": "list not found"}
         if doc.get("archived_at") is not None:
             return {"error": "list is archived"}
+        # SECURITY: owner-based auth — only the list owner can add items.
+        # agent_name is NOT bound to owner_user_id here (no agent membership
+        # on TodoStore yet). This tightens with #1923 follow-up.
         if doc.get("owner_user_id") != owner_user_id:
             return {"error": "agent does not have access to this list"}
 
@@ -97,19 +98,17 @@ async def execute_todo_add_item(args: dict, request: Request) -> dict:
 async def execute_todo_set_done(args: dict, request: Request) -> dict:
     """Mark a todo item done (or not done) on a list the agent has access to.
 
-    Authorization is owner-based (same pattern as execute_todo_add_item).
-    The agent must present a matching owner_user_id for the list, and the item
-    must belong to the named list. agent_name is used for attribution only.
+    Authorization is purely owner-based (same pattern as execute_todo_add_item).
+    The caller must present a matching owner_user_id for the list, and the item
+    must belong to the named list. There is no agent-to-owner binding yet
+    (#1923 follow-up).
     """
     args = args or {}
-    agent_name = args.get("agent_name")
     list_id = args.get("list_id")
     item_id = args.get("item_id")
     done = args.get("done")
     owner_user_id = args.get("owner_user_id")
 
-    if not agent_name or not isinstance(agent_name, str):
-        return {"error": "todo_set_done requires an 'agent_name' string"}
     if not list_id or not isinstance(list_id, str):
         return {"error": "todo_set_done requires a 'list_id' string"}
     if not item_id or not isinstance(item_id, str):
@@ -127,6 +126,9 @@ async def execute_todo_set_done(args: dict, request: Request) -> dict:
             return {"error": "list not found"}
         if doc.get("archived_at") is not None:
             return {"error": "list is archived"}
+        # SECURITY: owner-based auth — only the list owner can mark items done.
+        # agent_name is NOT bound to owner_user_id (no agent membership on
+        # TodoStore yet). This tightens with #1923 follow-up.
         if doc.get("owner_user_id") != owner_user_id:
             return {"error": "agent does not have access to this list"}
 
