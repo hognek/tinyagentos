@@ -175,6 +175,84 @@ def _canonical_json(obj: dict) -> bytes:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+def send_handshake(
+    *,
+    to_username: str,
+    inbound_token: str,
+    endpoints: list[str],
+    signing_pubkey: str,
+    encryption_pubkey: str,
+) -> dict:
+    """Build a handshake envelope addressed to a remote contact.
+
+    The handshake envelope carries the inbound peer token (which the remote
+    instance should present as ``Authorization: Bearer <token>`` when calling
+    our ``POST /api/peer/*`` routes), our advertised endpoints, and our public
+    keys so the remote side can pin them in its own contact row.
+
+    Returns the envelope dict (not yet delivered).  The caller is responsible
+    for delivering it to the peer's endpoints.
+    """
+    from tinyagentos.hub import identity as _hub_identity
+
+    local_ident = _hub_identity.public_identity()
+    from_username = resolve_local_identity_id()
+    if from_username is None:
+        raise RuntimeError("cannot send handshake: no local hub identity")
+    # Strip "hub:" prefix to get bare username
+    bare_from = from_username.split(":", 1)[1] if from_username.startswith("hub:") else from_username
+
+    body = {
+        "inbound_token": inbound_token,
+        "endpoints": endpoints,
+        "signing_pubkey": signing_pubkey or local_ident.get("signing_pubkey", ""),
+        "encryption_pubkey": encryption_pubkey or local_ident.get("encryption_pubkey", ""),
+    }
+    return build_envelope(
+        from_username=bare_from,
+        to_username=to_username,
+        kind="handshake",
+        body=body,
+    )
+
+
+async def deliver_handshake(
+    envelope: dict,
+    peer_endpoints: list[str],
+    *,
+    http_client=None,
+) -> bool:
+    """Deliver a handshake envelope to the peer's endpoints (best-effort).
+
+    Tries each endpoint in order; stops on the first 2xx response.  Returns
+    True if at least one endpoint accepted the envelope, False otherwise.
+
+    ``http_client`` should be an ``httpx.AsyncClient``.  If None, a temporary
+    client is created and torn down.
+    """
+    import httpx
+
+    own_client = http_client is None
+    if own_client:
+        http_client = httpx.AsyncClient(timeout=15.0)
+
+    try:
+        for ep in peer_endpoints:
+            url = ep.rstrip("/") + "/api/peer/inbox"
+            try:
+                resp = await http_client.post(
+                    url, json={"envelope": envelope},
+                )
+                if 200 <= resp.status_code < 300:
+                    return True
+            except Exception:
+                continue
+        return False
+    finally:
+        if own_client:
+            await http_client.aclose()
+
+
 def resolve_local_identity_id(data_dir: str | Path | None = None) -> str | None:
     """Return this node's local hub identity ID (``"hub:<username>"``), or None.
 

@@ -275,3 +275,188 @@ class TestPresenceGate:
         assert resp.json()["endpoints"] == ["wss://x", "wss://y"]
         fwd = [c for c in captured if c["url"].endswith("/api/hub/presence?username=alice")]
         assert fwd, "presence was not forwarded to the directory"
+
+
+# ---------------------------------------------------------------------------
+# Milestone A2: friend-accept -> contact row + peer link + block cascade
+# ---------------------------------------------------------------------------
+
+
+class TestFriendAcceptContactCreation:
+    """Friend-accept creates a contact row and peer link."""
+
+    @pytest.mark.asyncio
+    async def test_accept_creates_contact_row(self, client, upstream):
+        """Friend-accept with identity info creates a contact row in contacts_store."""
+        from tinyagentos.hub import identity as idmod
+
+        # Ensure we have a local hub identity so the handler can run.
+        idmod.load_or_create()
+
+        # Initialise contacts_store — the lifespan may not have done this in tests.
+        contacts = client._transport.app.state.contacts_store
+        if contacts._db is not None:
+            await contacts.close()
+        await contacts.init()
+
+        async def handler(method, url, **kw):
+            return _FakeResp(content=json.dumps({
+                "peer": "peerFP",
+                "username": "hogne",
+                "display_name": "Hogne",
+                "signing_pubkey": "ab" * 32,
+                "encryption_pubkey": "cd" * 32,
+                "endpoints": [],
+            }).encode())
+        _set(upstream, handler)
+        resp = await client.post(
+            "/api/hub/friends/requests/rid-9/accept",
+            json={"peer_fingerprint": "peerFP"},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["state"] == "accepted"
+
+        # Verify the contact row was created.
+        contact = await contacts.get_contact("hub:hogne")
+        assert contact is not None
+        assert contact["hub_username"] == "hogne"
+        assert contact["display_name"] == "Hogne"
+        assert contact["ed25519_pub"] == "ab" * 32
+        assert contact["x25519_pub"] == "cd" * 32
+        assert contact["status"] == "active"
+
+    @pytest.mark.asyncio
+    async def test_accept_creates_peer_link(self, client, upstream):
+        """Friend-accept creates a peer_link with inbound token and endpoints."""
+        from tinyagentos.hub import identity as idmod
+
+        idmod.load_or_create()
+
+        # Initialise contacts_store.
+        contacts = client._transport.app.state.contacts_store
+        if contacts._db is not None:
+            await contacts.close()
+        await contacts.init()
+
+        async def handler(method, url, **kw):
+            return _FakeResp(content=json.dumps({
+                "peer": "peerFP",
+                "username": "hogne",
+                "display_name": "Hogne",
+                "signing_pubkey": "ab" * 32,
+                "encryption_pubkey": "cd" * 32,
+                "endpoints": [],
+            }).encode())
+        _set(upstream, handler)
+        resp = await client.post(
+            "/api/hub/friends/requests/rid-9/accept",
+            json={"peer_fingerprint": "peerFP"},
+        )
+        assert resp.status_code == 200
+
+        contacts = client._transport.app.state.contacts_store
+        plink = await contacts.get_peer_link("hub:hogne")
+        assert plink is not None
+        # inbound_token_hash should be set (non-empty)
+        assert plink.get("inbound_token_hash")
+        assert len(plink["inbound_token_hash"]) == 64  # SHA-256 hex
+        # outbound_token starts empty (filled on handshake reply)
+        assert plink["outbound_token"] == ""
+        # endpoints stored as empty list when directory returns none
+        assert plink["endpoints"] == []
+
+    @pytest.mark.asyncio
+    async def test_accept_no_contacts_store_does_not_crash(self, client, upstream):
+        """Friend-accept without a contacts_store (e.g. uninitialised) still succeeds."""
+        from tinyagentos.hub import identity as idmod
+
+        idmod.load_or_create()
+
+        async def handler(method, url, **kw):
+            return _FakeResp(content=json.dumps({
+                "peer": "peerFP",
+                "username": "alice",
+            }).encode())
+        _set(upstream, handler)
+
+        # Temporarily remove contacts_store to simulate missing store.
+        saved = client._transport.app.state.contacts_store
+        client._transport.app.state.contacts_store = None
+        try:
+            resp = await client.post(
+                "/api/hub/friends/requests/rid-9/accept",
+                json={"peer_fingerprint": "peerFP"},
+            )
+            assert resp.status_code == 200
+            assert resp.json()["state"] == "accepted"
+        finally:
+            client._transport.app.state.contacts_store = saved
+
+
+class TestBlockCascade:
+    """Block cascades to revoke the peer link."""
+
+    @pytest.mark.asyncio
+    async def test_block_revokes_peer_link(self, client, upstream):
+        """Blocking a peer whose fingerprint matches a hub author revokes their peer link."""
+        from tinyagentos.hub import identity as idmod
+
+        idmod.load_or_create()
+
+        # Initialise contacts_store.
+        contacts = client._transport.app.state.contacts_store
+        if contacts._db is not None:
+            await contacts.close()
+        await contacts.init()
+
+        # First accept to create the contact + peer link.
+        async def accept_handler(method, url, **kw):
+            return _FakeResp(content=json.dumps({
+                "peer": "peerFP",
+                "username": "hogne",
+                "display_name": "Hogne",
+                "signing_pubkey": "ab" * 32,
+                "encryption_pubkey": "cd" * 32,
+                "endpoints": [],
+            }).encode())
+        _set(upstream, accept_handler)
+        resp = await client.post(
+            "/api/hub/friends/requests/rid-1/accept",
+            json={"peer_fingerprint": "peerFP"},
+        )
+        assert resp.json()["state"] == "accepted"
+
+        # Verify peer link exists before block.
+        contacts = client._transport.app.state.contacts_store
+        plink = await contacts.get_peer_link("hub:hogne")
+        assert plink is not None
+        assert plink.get("revoked_at") is None
+
+        # Register the hub author so get_author() resolves fingerprint → username.
+        # The friend-accept handler only records the local friend edge, not an
+        # author row for the peer.  Register one manually: fingerprint "peerFP"
+        # (the blocked peer) → username "hogne" so the cascade finds the contact.
+        from tinyagentos.hub.store import HubStore
+        hub = HubStore(hub_store.default_db_path())
+        await hub.init()
+        try:
+            await hub.upsert_author("peerFP", username="hogne")
+
+            # Now block — should cascade to revoke_peer_link.
+            captured, calls = upstream
+            resp = await client.post(
+                "/api/hub/friends/block",
+                json={"peer_fingerprint": "peerFP"},
+            )
+            assert resp.json()["state"] == "blocked"
+
+            # Verify the peer link was revoked.
+            plink = await contacts.get_peer_link("hub:hogne")
+            assert plink is not None
+            assert plink.get("revoked_at") is not None
+            # Contact status should also be revoked.
+            contact = await contacts.get_contact("hub:hogne")
+            assert contact is not None
+            assert contact["status"] == "revoked"
+        finally:
+            await hub.close()

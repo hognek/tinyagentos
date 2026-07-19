@@ -25,6 +25,7 @@ dependency (401), exactly like every other local app route.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -35,7 +36,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from tinyagentos.auth_context import CurrentUser, current_user
+from tinyagentos.contacts_store import generate_peer_token
 from tinyagentos.hub import identity, posts, relationships, store as hub_store
+from tinyagentos.peer import send_handshake as _send_handshake
+from tinyagentos.peer import deliver_handshake as _deliver_handshake
+from tinyagentos.peer import resolve_local_identity_id as _resolve_local_identity_id
 from tinyagentos.routes.account_proxy import _forward_to
 
 logger = logging.getLogger(__name__)
@@ -93,6 +98,23 @@ async def _get_store(request: Request) -> hub_store.HubStore:
     await store.init()
     request.app.state.hub_store = store
     return store
+
+
+def _get_local_endpoints(request: Request) -> list[str]:
+    """Return this node's advertised endpoints for the handshake."""
+    config_ep = None
+    try:
+        cfg = getattr(request.app.state, "config", None)
+        if cfg and hasattr(cfg, "server") and cfg.server:
+            host = cfg.server.get("host", "")
+            port = cfg.server.get("port", 6969)
+            if host and host != "0.0.0.0":
+                config_ep = f"https://{host}:{port}" if port == 443 else f"http://{host}:{port}"
+    except Exception:
+        pass
+    if config_ep:
+        return [config_ep]
+    return []
 
 
 # --- slice 2: own profile ---------------------------------------------------
@@ -299,8 +321,12 @@ async def accept_friend_request(
     whose presence / leave hints) and returns the parties' endpoints so the nodes
     complete the handshake directly. On a 2xx we record the mutual ``friend``
     edge locally so this node's own presence gate and sync worker treat the peer as
-    an accepted edge (design: presence requires "an accepted edge"). The peer
-    fingerprint comes from the directory response when present, else the body.
+    an accepted edge (design: presence requires "an accepted edge").
+
+    After the hub edge is recorded, a contact row is created in the contacts store
+    (pinning the peer's Ed25519/X25519 pubkeys), an inbound peer token is minted,
+    a handshake envelope is delivered to the peer's endpoints (best-effort, async),
+    and the peer_link row is recorded.
     """
     upstream = await _forward_to(request, "POST", f"/api/hub/requests/{rid}/accept")
     if upstream.status_code < 200 or upstream.status_code >= 300:
@@ -323,6 +349,65 @@ async def accept_friend_request(
         await store.put_relationship(
             peer, relationships.REL_FRIEND, statement=statement
         )
+
+    # ------------------------------------------------------------------
+    # A2: create contact row + peer link + handshake
+    # ------------------------------------------------------------------
+    contacts = getattr(request.app.state, "contacts_store", None)
+    inbound_token = ""
+    if contacts is not None and peer:
+        # Extract identity info from the directory response.
+        username = resp.get("username") or peer
+        contact_id = f"hub:{username}" if not username.startswith("hub:") else username
+        display_name = resp.get("display_name") or username
+        ed25519_pub = resp.get("signing_pubkey") or resp.get("ed25519_pub") or ""
+        x25519_pub = resp.get("encryption_pubkey") or resp.get("x25519_pub") or ""
+        peer_endpoints = resp.get("endpoints") or []
+
+        try:
+            await contacts.add_contact(
+                contact_id=contact_id,
+                hub_username=username,
+                display_name=display_name,
+                ed25519_pub=ed25519_pub,
+                x25519_pub=x25519_pub,
+                status="active",
+            )
+        except Exception:
+            logger.exception("friend-accept: contact row creation failed for %s", contact_id)
+
+        # Mint the inbound peer token and record the peer link.
+        try:
+            inbound_token = generate_peer_token()
+            await contacts.establish_peer_link(
+                contact_id=contact_id,
+                inbound_token=inbound_token,
+                outbound_token="",  # filled when the peer handshakes back
+                endpoints=list(peer_endpoints),
+            )
+        except Exception:
+            logger.exception("friend-accept: peer link creation failed for %s", contact_id)
+
+        # Fire-and-forget handshake delivery to the peer.
+        if peer_endpoints and ed25519_pub and x25519_pub:
+            try:
+                if _resolve_local_identity_id(request.app.state.data_dir):
+                    envelope = _send_handshake(
+                        to_username=username,
+                        inbound_token=inbound_token,
+                        endpoints=_get_local_endpoints(request),
+                        signing_pubkey=ed25519_pub,
+                        encryption_pubkey=x25519_pub,
+                    )
+                    # Deliver the handshake in the background; failures are non-fatal.
+                    asyncio.create_task(
+                        _deliver_handshake(envelope, peer_endpoints)
+                    )
+            except Exception:
+                logger.exception(
+                    "friend-accept: handshake delivery failed for %s", contact_id
+                )
+
     return {"state": "accepted", "peer": peer, "directory": resp}
 
 
@@ -367,6 +452,9 @@ async def block_peer(
     so nothing about them is rendered or cached. It also asks the hub to sever the
     server-side accepted edge (no more presence visibility or hints either way);
     that directory call is best-effort and its result never blocks the local op.
+
+    When a contact row exists for this peer, the peer link is revoked (cascade
+    per design section 8: contact block kills the peer link).
     """
     store = await _get_store(request)
     # A social action implies this node has an identity (its fingerprint is the
@@ -387,6 +475,20 @@ async def block_peer(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("hub block: directory edge revoke failed: %s", exc)
+
+    # Cascade to contacts/peer_link: revoke the peer link if this peer is a contact.
+    contacts = getattr(request.app.state, "contacts_store", None)
+    if contacts is not None:
+        try:
+            # Resolve fingerprint → hub_username via the local hub_authors table.
+            author = await store.get_author(peer)
+            if author and author.get("username"):
+                contact_id = f"hub:{author['username']}"
+                await contacts.revoke_peer_link(contact_id)
+                logger.info("hub block: revoked peer link for %s", contact_id)
+        except Exception:
+            logger.exception("hub block: cascade to peer_link failed for %s", peer)
+
     return {"state": "blocked", "peer": peer, "severed": severed}
 
 
