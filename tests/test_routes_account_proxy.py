@@ -757,6 +757,28 @@ async def test_hub_relay_poll_forwards_recipient(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_hub_relay_drop_rejects_invalid_recipient(client, monkeypatch):
+    """An invalid recipient in the body is rejected 400 before forwarding."""
+    monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
+
+    async def handler(method, url, **kw):
+        pytest.fail("must not be called for invalid recipient")
+
+    _patch_upstream(monkeypatch, handler)
+    r = await client.post(
+        "/api/account/hub/relay/drop",
+        json={
+            "recipient": "../admin",
+            "sender_ephemeral_pub": "aa",
+            "nonce": "bb",
+            "ciphertext": "cc",
+        },
+    )
+    assert r.status_code == 400
+    assert "invalid recipient" in r.json()["error"].lower()
+
+
+@pytest.mark.asyncio
 async def test_hub_relay_poll_rejects_invalid_recipient(client, monkeypatch):
     """An invalid recipient (path injection) is rejected 400 before forwarding."""
     monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")

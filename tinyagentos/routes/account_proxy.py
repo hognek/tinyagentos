@@ -236,6 +236,16 @@ def _valid_rid(rid: str) -> bool:
     return bool(_RID_RE.match(rid))
 
 
+# Hub recipient usernames carry a "hub:" prefix (e.g. "hub:hogne") so they
+# are distinguishable from other identity namespaces.  The prefix is fixed;
+# the suffix is the same alphanumeric + hyphen/underscore token shape as _RID_RE.
+_HUB_RECIPIENT_RE = re.compile(r"^hub:[A-Za-z0-9_-]{1,64}$")
+
+
+def _valid_hub_recipient(recipient: str) -> bool:
+    return bool(_HUB_RECIPIENT_RE.match(recipient))
+
+
 # --- Account subdomain actions (account model slice 3) ---
 # Proxy to the taos.my subdomain claims service (slices 1 and 2 of the account
 # model). The client calls same-origin /api/account/subdomains/*; we forward to
@@ -368,7 +378,15 @@ async def hub_edge_revoke(request: Request):
 
 @router.post("/api/account/hub/relay/drop")
 async def hub_relay_drop(request: Request):
-    return await _forward(request, "hub_relay_drop")
+    body = await request.body()
+    try:
+        payload = json.loads(body)
+        recipient = str(payload.get("recipient", ""))
+    except (json.JSONDecodeError, TypeError):
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+    if not _valid_hub_recipient(recipient):
+        return JSONResponse({"error": "invalid recipient"}, status_code=400)
+    return await _forward_to(request, "POST", _ACTIONS["hub_relay_drop"][1], body=body)
 
 
 @router.get("/api/account/hub/relay/poll")
@@ -380,7 +398,7 @@ async def hub_relay_poll(request: Request):
     unseals locally with its X25519 private key.
     """
     recipient = request.query_params.get("recipient", "")
-    if not _valid_rid(str(recipient)):
+    if not _valid_hub_recipient(str(recipient)):
         return JSONResponse({"error": "invalid recipient"}, status_code=400)
     _method, path = _ACTIONS["hub_relay_poll"]
     return await _forward_to(request, "GET",
