@@ -51,7 +51,11 @@ class ReorderItemsIn(BaseModel):
 # -------------------------------------------------------------------- helpers
 
 def _get_store(request: Request):
-    return request.app.state.todo_store
+    store = getattr(request.app.state, "todo_store", None)
+    if store is None:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail="todo_store not available")
+    return store
 
 
 def _check_owner(doc: dict, user: CurrentUser):
@@ -145,24 +149,30 @@ async def add_item(
     if body.due_at:
         try:
             dt = datetime.fromisoformat(body.due_at)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            due_at = dt.timestamp()
         except ValueError:
             return JSONResponse(
                 {"error": f"invalid due_at: {body.due_at!r}"}, status_code=400
             )
+        if dt.tzinfo is None:
+            return JSONResponse(
+                {"error": f"due_at requires timezone offset: {body.due_at!r}"},
+                status_code=400,
+            )
+        due_at = dt.timestamp()
     remind_at = None
     if body.remind_at:
         try:
             dt = datetime.fromisoformat(body.remind_at)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            remind_at = dt.timestamp()
         except ValueError:
             return JSONResponse(
                 {"error": f"invalid remind_at: {body.remind_at!r}"}, status_code=400
             )
+        if dt.tzinfo is None:
+            return JSONResponse(
+                {"error": f"remind_at requires timezone offset: {body.remind_at!r}"},
+                status_code=400,
+            )
+        remind_at = dt.timestamp()
 
     return await store.add_item(
         list_id, body.text, author=user.user_id, due_at=due_at, remind_at=remind_at
@@ -196,18 +206,24 @@ async def patch_item(
     _CLEAR_SENTINEL = -1.0
 
     def _parse_ts(val):
-        """None = no change, '' = clear, ISO str = set."""
+        """None = no change, '' = clear, ISO str = set.
+
+        Returns None (not sent), _CLEAR_SENTINEL (clear), a float
+        timestamp (valid aware datetime), or None (error — handled below).
+        Rejects naive (offsetless) datetime strings.
+        """
         if val is None:
             return None  # not sent
         if val == "":
             return _CLEAR_SENTINEL
         try:
             dt = datetime.fromisoformat(val)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            return dt.timestamp()
+
         except ValueError:
             return None  # Will be handled below
+        if dt.tzinfo is None:
+            return None  # naive — handled below as error
+        return dt.timestamp()
 
     due_at = _parse_ts(body.due_at)
     if due_at is None and body.due_at is not None and body.due_at != "":
@@ -277,3 +293,34 @@ async def reorder_items(
     items = [{"id": e.id, "position": e.position} for e in body.items]
     await store.reorder_items(list_id, items)
     return JSONResponse({"ok": True})
+
+
+# ------------------------------------------------------------ migration route
+
+
+@router.post("/api/todo/migrate")
+async def migrate_notes_lists(
+    request: Request,
+    user: CurrentUser = Depends(current_user),
+):
+    """Migrate kind=list docs from shared notes into Todo lists.
+
+    Admin-only. Idempotent — safe to run multiple times.
+    Reads all non-archived kind=list docs, converts each to a todo
+    list with items, then deletes the originals from shared_docs.
+    """
+    if not user.is_admin:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+
+    shared = getattr(request.app.state, "shared_docs_store", None)
+    if shared is None:
+        return JSONResponse(
+            {"error": "shared_docs_store not available"}, status_code=500
+        )
+
+    todo = _get_store(request)
+
+    from tinyagentos.todo.migration import migrate_list_docs
+
+    result = await migrate_list_docs(shared, todo)
+    return result

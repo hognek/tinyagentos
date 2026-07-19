@@ -454,3 +454,37 @@ class SharedDocsStore(BaseStore):
         )
         rows = await cur.fetchall()
         return [_row(cur.description, r) for r in rows]
+
+    async def list_docs_by_kind(self, kind: str) -> list[dict]:
+        """Return all non-archived docs of a given kind, newest-updated first."""
+        cur = await self._db.execute(
+            "SELECT * FROM shared_docs WHERE kind = ? AND archived_at IS NULL "
+            "ORDER BY updated_at DESC",
+            (kind,),
+        )
+        rows = await cur.fetchall()
+        docs = []
+        for r in rows:
+            doc = _row(cur.description, r)
+            doc["entries"] = await self.list_entries(doc["id"])
+            doc["members"] = await self.list_members(doc["id"])
+            docs.append(doc)
+        return docs
+
+    async def delete_doc(self, doc_id: str) -> None:
+        """Delete a doc, its entries, and its members."""
+        await self._db.execute(
+            "DELETE FROM shared_doc_entry_revisions WHERE entry_id IN "
+            "(SELECT id FROM shared_doc_entries WHERE doc_id = ?)",
+            (doc_id,),
+        )
+        await self._db.execute(
+            "DELETE FROM shared_doc_entries WHERE doc_id = ?", (doc_id,)
+        )
+        await self._db.execute(
+            "DELETE FROM shared_doc_members WHERE doc_id = ?", (doc_id,)
+        )
+        await self._db.execute(
+            "DELETE FROM shared_docs WHERE id = ?", (doc_id,)
+        )
+        await self._db.commit()

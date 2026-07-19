@@ -26,6 +26,8 @@ CREATE TABLE IF NOT EXISTS todo_lists (
     id            TEXT PRIMARY KEY,
     owner_user_id TEXT NOT NULL,
     title         TEXT NOT NULL DEFAULT '',
+    migrated_from TEXT,
+    migration_complete INTEGER NOT NULL DEFAULT 0,
     created_at    REAL NOT NULL,
     updated_at    REAL NOT NULL,
     archived_at   REAL
@@ -47,6 +49,8 @@ CREATE TABLE IF NOT EXISTS todo_items (
 );
 CREATE INDEX IF NOT EXISTS idx_todo_items_list
     ON todo_items(list_id, position);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_todo_lists_migrated_from
+    ON todo_lists(migrated_from);
 """
 
 
@@ -62,13 +66,16 @@ class TodoStore(BaseStore):
 
     # ------------------------------------------------------------------ lists
 
-    async def create_list(self, owner_user_id: str, title: str = "") -> dict:
+    async def create_list(
+        self, owner_user_id: str, title: str = "", migrated_from: str | None = None,
+    ) -> dict:
         list_id = _new_id("tl")
         now = time.time()
         await self._db.execute(
-            "INSERT INTO todo_lists (id, owner_user_id, title, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (list_id, owner_user_id, title, now, now),
+            "INSERT INTO todo_lists "
+            "(id, owner_user_id, title, migrated_from, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (list_id, owner_user_id, title, migrated_from, now, now),
         )
         await self._db.commit()
         return await self.get_list(list_id)
@@ -119,6 +126,20 @@ class TodoStore(BaseStore):
         )
         await self._db.commit()
 
+    async def set_migrated_from(self, list_id: str, source_doc_id: str) -> None:
+        await self._db.execute(
+            "UPDATE todo_lists SET migrated_from = ?, updated_at = ? WHERE id = ?",
+            (source_doc_id, time.time(), list_id),
+        )
+        await self._db.commit()
+
+    async def set_migration_complete(self, list_id: str) -> None:
+        await self._db.execute(
+            "UPDATE todo_lists SET migration_complete = 1, updated_at = ? WHERE id = ?",
+            (time.time(), list_id),
+        )
+        await self._db.commit()
+
     # ------------------------------------------------------------------ items
 
     async def add_item(
@@ -132,19 +153,12 @@ class TodoStore(BaseStore):
         item_id = _new_id("ti")
         now = time.time()
 
-        # Position at the end.
-        cur = await self._db.execute(
-            "SELECT COALESCE(MAX(position), -1) FROM todo_items WHERE list_id = ?",
-            (list_id,),
-        )
-        row = await cur.fetchone()
-        position = row[0] + 1
-
         await self._db.execute(
             "INSERT INTO todo_items "
             "(id, list_id, text, done, position, due_at, remind_at, author, created_at, updated_at) "
-            "VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
-            (item_id, list_id, text, position, due_at, remind_at, author, now, now),
+            "SELECT ?, ?, ?, 0, COALESCE(MAX(position), -1) + 1, ?, ?, ?, ?, ? "
+            "FROM todo_items WHERE list_id = ?",
+            (item_id, list_id, text, due_at, remind_at, author, now, now, list_id),
         )
         await self._db.execute(
             "UPDATE todo_lists SET updated_at = ? WHERE id = ?", (now, list_id)
@@ -153,7 +167,9 @@ class TodoStore(BaseStore):
         cur = await self._db.execute(
             "SELECT * FROM todo_items WHERE id = ?", (item_id,)
         )
-        return _row(cur.description, await cur.fetchone())
+        row = _row(cur.description, await cur.fetchone())
+        row["done"] = bool(row["done"])
+        return row
 
     async def list_items(self, list_id: str) -> list[dict]:
         cur = await self._db.execute(
