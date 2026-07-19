@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,14 @@ async def _migrate_list_docs(shared_docs_store, todo_store) -> dict:
                 old_id, owner, title, target_id,
             )
 
+            if target is None:
+                logger.warning(
+                    "todo-migration: target %r for doc %r vanished; "
+                    "skipping this run",
+                    target_id, old_id,
+                )
+                continue
+
             # Clear any partial items already in the target.
             existing_items = target.get("items", [])
             for item in existing_items:
@@ -113,9 +122,18 @@ async def _migrate_list_docs(shared_docs_store, todo_store) -> dict:
             continue
 
         # -- normal path: create a fresh todo list ------------------------
-        todo_list = await todo_store.create_list(
-            owner, title, migrated_from=old_id,
-        )
+        try:
+            todo_list = await todo_store.create_list(
+                owner, title, migrated_from=old_id,
+            )
+        except sqlite3.IntegrityError:
+            logger.warning(
+                "todo-migration: concurrent migration detected for "
+                "doc %r (owner=%r, title=%r); another process already "
+                "claimed it",
+                old_id, owner, title,
+            )
+            continue
         new_id = todo_list["id"]
 
         # Convert entries to todo items in original order.

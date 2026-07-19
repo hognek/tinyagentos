@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS todo_items (
 );
 CREATE INDEX IF NOT EXISTS idx_todo_items_list
     ON todo_items(list_id, position);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_todo_lists_migrated_from
+    ON todo_lists(migrated_from);
 """
 
 
