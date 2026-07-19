@@ -69,6 +69,11 @@ _ACTIONS: dict[str, tuple[str, str]] = {
     "hub_presence_get": ("GET", "/api/hub/presence"),
     # Block asks the hub to sever the accepted edge (no more presence/hints).
     "hub_edge_revoke": ("POST", "/api/hub/edges/revoke"),
+    # Hub sealed-envelope relay (cross-user collab A3): store-and-forward
+    # through taos.my.  The node seals with the recipient's X25519 public key;
+    # the hub never sees plaintext.  Recipients poll via the account proxy.
+    "hub_relay_drop": ("POST", "/api/hub/relay/drop"),
+    "hub_relay_poll": ("GET", "/api/hub/relay/poll"),
 }
 
 _TIMEOUT = httpx.Timeout(15.0)
@@ -354,6 +359,32 @@ async def hub_presence_get(request: Request):
 @router.post("/api/account/hub/edges/revoke")
 async def hub_edge_revoke(request: Request):
     return await _forward(request, "hub_edge_revoke")
+
+
+# --- Hub sealed-envelope relay (cross-user collab A3) ---
+# The node seals an inner payload to the recipient's X25519 public key and
+# drops it at the hub; the recipient polls for queued envelopes.  The hub
+# never sees plaintext — it only inspects ``recipient`` for routing.
+
+@router.post("/api/account/hub/relay/drop")
+async def hub_relay_drop(request: Request):
+    return await _forward(request, "hub_relay_drop")
+
+
+@router.get("/api/account/hub/relay/poll")
+async def hub_relay_poll(request: Request):
+    """Poll for queued envelopes addressed to ``recipient``.
+
+    The ``recipient`` query param is a validated hub username (e.g.
+    ``hub:hogne``).  The hub returns the sealed envelopes; the caller
+    unseals locally with its X25519 private key.
+    """
+    recipient = request.query_params.get("recipient", "")
+    if not _valid_rid(str(recipient)):
+        return JSONResponse({"error": "invalid recipient"}, status_code=400)
+    _method, path = _ACTIONS["hub_relay_poll"]
+    return await _forward_to(request, "GET",
+                             f"{path}?recipient={recipient}")
 
 
 @router.get("/api/account/me")
