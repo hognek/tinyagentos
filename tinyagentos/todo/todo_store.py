@@ -150,6 +150,10 @@ class TodoStore(BaseStore):
         due_at: float | None = None,
         remind_at: float | None = None,
     ) -> dict:
+        text = text.strip()
+        if not text:
+            raise ValueError("Item text cannot be empty or whitespace-only")
+
         item_id = _new_id("ti")
         now = time.time()
 
@@ -206,6 +210,9 @@ class TodoStore(BaseStore):
     ) -> dict:
         now = time.time()
         if text is not _UNSET:
+            text = str(text).strip()
+            if not text:
+                raise ValueError("Item text cannot be empty or whitespace-only")
             await self._db.execute(
                 "UPDATE todo_items SET text = ?, updated_at = ? WHERE id = ?",
                 (text, now, item_id),
