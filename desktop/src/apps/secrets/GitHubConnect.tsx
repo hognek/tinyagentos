@@ -104,7 +104,7 @@ export function GitHubConnect() {
   }, []);
 
   const handleSaveGrants = useCallback(
-    async (repoFullName: string, installationId: number, permissions: Record<string, string>) => {
+    async (repoFullName: string, installationId: number, permissions: string[]) => {
       setSavingGrants((prev) => new Set(prev).add(repoFullName));
       try {
         const agentsStr = repoAgents[repoFullName] || "";
@@ -460,7 +460,7 @@ export function GitHubConnect() {
                               size="icon"
                               className="h-8 w-8 shrink-0"
                               onClick={() =>
-                                handleSaveGrants(repo.full_name, inst.id, inst.permissions ?? {})
+                                handleSaveGrants(repo.full_name, inst.id, inst.permissions ?? [])
                               }
                               aria-label={`Save agent grants for ${repo.full_name}`}
                               title={`Save agent grants for ${repo.full_name}`}
