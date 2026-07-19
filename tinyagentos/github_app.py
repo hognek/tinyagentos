@@ -303,8 +303,14 @@ async def delete_installation(
     private_key: str,
     installation_id: int,
     http_client: httpx.AsyncClient,
-) -> bool:
-    """Delete (uninstall) a GitHub App installation."""
+) -> bool | None:
+    """Delete (uninstall) a GitHub App installation.
+
+    Returns:
+        True  — successfully deleted
+        False — installation not found (GitHub 404)
+        None  — network error, permission error, or other upstream failure
+    """
     jwt = generate_jwt(app_id, private_key)
     url = f"{_GH_APP_INSTALLATIONS}/{installation_id}"
     try:
@@ -324,11 +330,4 @@ async def delete_installation(
         logger.exception(
             "Failed to delete installation %s: %s", installation_id, exc
         )
-        return False
-
-
-def _invalidate_installation_caches(app_id: str, installation_id: int) -> None:
-    """Remove cached token and repo list for a deleted installation."""
-    key = _cache_key(app_id, installation_id)
-    _token_cache.pop(key, None)
-    _repo_cache.pop(installation_id, None)
+        return None
