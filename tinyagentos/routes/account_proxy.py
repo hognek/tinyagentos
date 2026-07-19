@@ -33,8 +33,10 @@ router = APIRouter()
 _JOIN_SERVICE_TOKENS = ("controller_token", "sites_token")
 # Everything stripped from the browser body: the service tokens plus the
 # single-use Headscale preauth key, which the controller consumes server-side to
-# join the mesh (Slice 2). None of these should ever reach browser JavaScript.
-_STRIP_KEYS = _JOIN_SERVICE_TOKENS + ("headscale_preauth_key",)
+# join the mesh (Slice 2). ``headscale_preauth_key`` is the host join key;
+# ``preauth_key`` is the guest preauth key (C2 cross-user transport). None of
+# these should ever reach browser JavaScript.
+_STRIP_KEYS = _JOIN_SERVICE_TOKENS + ("headscale_preauth_key", "preauth_key", "guest_preauth_key")
 
 # Only these account actions are proxied. The upstream base is operator config
 # (env), never user input, so there is no open-proxy / SSRF surface.
@@ -417,15 +419,35 @@ async def cluster_guest_preauth(request: Request):
 
     Called by the host at delegation-accept time (D1). Forwards to taos.my's
     ``POST /api/cluster/join/guest-preauth``, which creates an ACL-pinned
-    (``tag:guest``) single-use preauth key via the Headscale admin API. The
-    forwarded body carries the guest contact identity; the response carries
-    the preauth key + hostname for the guest instance to join with.
+    (``tag:guest``) single-use preauth key via the Headscale admin API.
 
-    The preauth key is stripped from any browser-facing response (same security
-    pattern as the host join poll) — the caller (peer channel, D1) delivers it
-    directly to the guest instance out-of-band.
+    **Security:** validates the ``contact_id`` body field before forwarding,
+    and strips every preauth key from the response so no credential reaches
+    browser JavaScript. The caller (peer channel, D1) must extract the key
+    server-side before the response is sent to the browser, or use an
+    alternative internal delivery path.
     """
-    return await _forward(request, "cluster_guest_preauth")
+    # Validate contact_id before forwarding (defense-in-depth: the upstream also
+    # validates, but we reject garbage at the edge to avoid wasted API calls).
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+    if not isinstance(body, dict) or not isinstance(body.get("contact_id"), str):
+        return JSONResponse({"error": "missing contact_id"}, status_code=400)
+    cid: str = body["contact_id"].strip()
+    if not cid.startswith("hub:") or len(cid) < 5 or len(cid) > 256:
+        return JSONResponse({"error": "invalid contact_id"}, status_code=400)
+
+    # Forward to taos.my with the validated body.
+    resp = await _forward_to(request, "POST", f"{_JOIN_BASE}/guest-preauth",
+                             body=json.dumps({"contact_id": cid}).encode("utf-8"))
+
+    # Strip the preauth key from the response so it never reaches the browser.
+    # The caller (peer channel / delegation-accept handler) must capture the key
+    # from the stripped response upstream before returning to the browser.
+    stripped, _ = _persist_join_credentials(resp)
+    return stripped
 
 
 def _persist_join_credentials(resp: Response) -> tuple[Response, dict | None]:

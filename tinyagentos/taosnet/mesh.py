@@ -110,7 +110,14 @@ def _is_guest_node(node: dict) -> bool:
 
 
 def _guest_peer_entry(node: dict) -> dict:
-    """Extract the standard guest-peer summary from a tailscale peer dict."""
+    """Extract the standard guest-peer summary from a tailscale peer dict.
+
+    ``node_ip`` uses ``TailscaleIPs[0]`` (the first address reported), which
+    is consistent with the host's own ``mesh_status`` output. For multi-homed
+    peers this may be an IPv4 or IPv6 address (or ``None`` when the list is
+    empty). Callers that need a specific address family should resolve the
+    hostname, not rely on this field as the sole network identifier.
+    """
     ips = node.get("TailscaleIPs") or []
     return {
         "hostname": node.get("HostName"),
