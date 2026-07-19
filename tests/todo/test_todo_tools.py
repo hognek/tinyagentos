@@ -45,7 +45,7 @@ async def test_list_returns_owned_lists(store):
 
     req = _make_request(store)
     res = await execute_todo_list_lists(
-        {"agent_name": "atlas", "owner_user_id": "user-1"}, req
+        {"owner_user_id": "user-1"}, req
     )
     assert "lists" in res
     assert any(d["id"] == doc["id"] for d in res["lists"])
@@ -58,7 +58,7 @@ async def test_list_excludes_other_users_lists(store):
 
     req = _make_request(store)
     res = await execute_todo_list_lists(
-        {"agent_name": "atlas", "owner_user_id": "user-1"}, req
+        {"owner_user_id": "user-1"}, req
     )
     assert res["lists"] == []
 
@@ -70,22 +70,15 @@ async def test_list_excludes_archived_lists(store):
 
     req = _make_request(store)
     res = await execute_todo_list_lists(
-        {"agent_name": "atlas", "owner_user_id": "user-1"}, req
+        {"owner_user_id": "user-1"}, req
     )
     assert res["lists"] == []
 
 
 @pytest.mark.asyncio
-async def test_list_missing_agent_name_returns_error(store):
-    req = _make_request(store)
-    res = await execute_todo_list_lists({}, req)
-    assert "error" in res
-
-
-@pytest.mark.asyncio
 async def test_list_missing_owner_user_id_returns_error(store):
     req = _make_request(store)
-    res = await execute_todo_list_lists({"agent_name": "atlas"}, req)
+    res = await execute_todo_list_lists({}, req)
     assert "error" in res
 
 
@@ -214,7 +207,7 @@ async def test_owner_can_mark_item_done(store):
 
     req = _make_request(store)
     res = await execute_todo_set_done(
-        {"agent_name": "atlas", "list_id": doc["id"], "item_id": item["id"],
+        {"list_id": doc["id"], "item_id": item["id"],
          "done": True, "owner_user_id": "user-1"},
         req,
     )
@@ -226,7 +219,7 @@ async def test_owner_can_mark_item_done(store):
 
     # And it can be reopened.
     res = await execute_todo_set_done(
-        {"agent_name": "atlas", "list_id": doc["id"], "item_id": item["id"],
+        {"list_id": doc["id"], "item_id": item["id"],
          "done": False, "owner_user_id": "user-1"},
         req,
     )
@@ -242,7 +235,7 @@ async def test_non_owner_cannot_mark_done(store):
 
     req = _make_request(store)
     res = await execute_todo_set_done(
-        {"agent_name": "atlas", "list_id": doc["id"], "item_id": item["id"],
+        {"list_id": doc["id"], "item_id": item["id"],
          "done": True, "owner_user_id": "user-2"},
         req,
     )
@@ -261,7 +254,7 @@ async def test_set_done_rejects_item_from_another_list(store):
 
     req = _make_request(store)
     res = await execute_todo_set_done(
-        {"agent_name": "atlas", "list_id": doc_a["id"], "item_id": foreign["id"],
+        {"list_id": doc_a["id"], "item_id": foreign["id"],
          "done": True, "owner_user_id": "user-1"},
         req,
     )
@@ -280,7 +273,7 @@ async def test_set_done_archived_list_rejected(store):
 
     req = _make_request(store)
     res = await execute_todo_set_done(
-        {"agent_name": "atlas", "list_id": doc["id"], "item_id": item["id"],
+        {"list_id": doc["id"], "item_id": item["id"],
          "done": True, "owner_user_id": "user-1"},
         req,
     )
@@ -294,24 +287,24 @@ async def test_set_done_missing_or_bad_fields_returns_error(store):
 
     # missing done
     res = await execute_todo_set_done(
-        {"agent_name": "atlas", "list_id": "d", "item_id": "i",
+        {"list_id": "d", "item_id": "i",
          "owner_user_id": "user-1"}, req
     )
     assert "error" in res
     # non-boolean done
     res = await execute_todo_set_done(
-        {"agent_name": "atlas", "list_id": "d", "item_id": "i",
+        {"list_id": "d", "item_id": "i",
          "done": "yes", "owner_user_id": "user-1"}, req
     )
     assert "error" in res
     # missing item_id
     res = await execute_todo_set_done(
-        {"agent_name": "atlas", "list_id": "d", "done": True,
+        {"list_id": "d", "done": True,
          "owner_user_id": "user-1"}, req
     )
     assert "error" in res
     # missing owner_user_id
     res = await execute_todo_set_done(
-        {"agent_name": "atlas", "list_id": "d", "item_id": "i", "done": True}, req
+        {"list_id": "d", "item_id": "i", "done": True}, req
     )
     assert "error" in res
