@@ -1,6 +1,6 @@
-import { render, screen, act, waitFor, within, fireEvent } from "@testing-library/react";
+import { render, screen, act, waitFor, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { NotesApp, TodoApp } from "./NotesApp";
+import { NotesApp } from "./NotesApp";
 
 function mockFetch(
   resolver: (url: string, init?: RequestInit) => { ok: boolean; status?: number; body: unknown },
@@ -175,30 +175,5 @@ describe("NotesApp", () => {
       method: "POST",
       body: JSON.stringify({ kind: "note", title: "Standup notes" }),
     }));
-  });
-});
-
-describe("TodoApp", () => {
-  beforeEach(() => {
-    vi.restoreAllMocks();
-  });
-
-  it("renders only lists, filtering out notes that share the same API", async () => {
-    vi.stubGlobal(
-      "fetch",
-      mockFetch(() => ({ ok: true, body: [noteDoc, listDoc] })),
-    );
-    render(<TodoApp windowId="w2" />);
-    await flush();
-
-    await waitFor(() => expect(screen.getByText("Sprint backlog")).toBeTruthy());
-    expect(screen.queryByText("Project kickoff")).toBeNull();
-  });
-
-  it("shows the todo empty state when there are no lists", async () => {
-    vi.stubGlobal("fetch", mockFetch(() => ({ ok: true, body: [] })));
-    render(<TodoApp windowId="w2" />);
-    await flush();
-    await waitFor(() => expect(screen.getByText(/no lists yet/i)).toBeTruthy());
   });
 });

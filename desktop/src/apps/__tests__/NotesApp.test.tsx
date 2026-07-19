@@ -23,7 +23,8 @@ vi.mock("@/components/ui", () => ({
   ),
 }));
 
-import { NotesApp, TodoApp } from "../NotesApp";
+import { NotesApp } from "../NotesApp";
+import { TodoApp } from "../TodoApp";
 
 const NOTE_LIST = [
   { id: "note-1", kind: "note", title: "My First Note", updated_at: new Date().toISOString(), archived_at: null },
@@ -208,35 +209,35 @@ describe("NotesApp", () => {
 });
 
 // ---- Todo (list) variant ----
+// The standalone TodoApp uses /api/todo directly.
 
-const MIXED_LIST = [
-  { id: "note-1", kind: "note", title: "My First Note", updated_at: new Date().toISOString(), archived_at: null },
-  { id: "list-1", kind: "list", title: "Groceries", updated_at: new Date().toISOString(), archived_at: null },
+const TODO_LIST_DATA = [
+  { id: "list-1", owner_user_id: "u1", title: "Groceries", created_at: new Date().toISOString(), updated_at: new Date().toISOString(), archived_at: null },
 ];
 
-const LIST_DETAIL = {
+const TODO_DETAIL = {
   id: "list-1",
-  kind: "list",
+  owner_user_id: "u1",
   title: "Groceries",
+  created_at: new Date().toISOString(),
   updated_at: new Date().toISOString(),
-  entries: [
-    { id: "task-1", text: "Buy milk", done: false, author: null, created_at: new Date().toISOString() },
+  items: [
+    { id: "task-1", list_id: "list-1", text: "Buy milk", done: false, position: 0, due_at: null, remind_at: null, author: null, created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
   ],
-  members: [],
 };
 
-function makeListFetch() {
+function makeTodoFetch() {
   return vi.fn(async (url: string, init?: RequestInit) => {
     const u = String(url);
     const method = (init?.method ?? "GET").toUpperCase();
 
-    if (u === "/api/notes" && method === "GET") {
-      return { ok: true, json: async () => MIXED_LIST };
+    if (u === "/api/todo" && method === "GET") {
+      return { ok: true, json: async () => TODO_LIST_DATA };
     }
-    if (u === "/api/notes/list-1" && method === "GET") {
-      return { ok: true, json: async () => LIST_DETAIL };
+    if (u === "/api/todo/list-1" && method === "GET") {
+      return { ok: true, json: async () => TODO_DETAIL };
     }
-    if (u.startsWith("/api/notes/list-1/entries/task-1") && method === "PATCH") {
+    if (u.startsWith("/api/todo/list-1/items/task-1") && method === "PATCH") {
       return { ok: true, json: async () => ({ ok: true }) };
     }
     return { ok: true, json: async () => ({}) };
@@ -248,19 +249,17 @@ describe("TodoApp", () => {
     vi.clearAllMocks();
   });
 
-  it("shows the Todo header and only list-kind docs", async () => {
-    global.fetch = makeListFetch() as typeof fetch;
+  it("shows the Todo header and lists from /api/todo", async () => {
+    global.fetch = makeTodoFetch() as typeof fetch;
     render(<TodoApp windowId="w1" />);
 
     await waitFor(() => expect(screen.getByText("Todo")).toBeDefined());
-    // A list doc shows; a note doc is filtered out.
     await waitFor(() => expect(screen.getByText("Groceries")).toBeDefined());
-    expect(screen.queryByText("My First Note")).toBeNull();
     expect(screen.getByLabelText("New list")).toBeDefined();
   });
 
-  it("toggles a task done via PATCH /entries/{id}", async () => {
-    const fetchMock = makeListFetch();
+  it("toggles a task done via PATCH /api/todo/{listId}/items/{itemId}", async () => {
+    const fetchMock = makeTodoFetch();
     global.fetch = fetchMock as typeof fetch;
     render(<TodoApp windowId="w1" />);
 
@@ -273,12 +272,23 @@ describe("TodoApp", () => {
     await waitFor(() => {
       const patch = (fetchMock.mock.calls as [string, RequestInit?][]).filter(
         ([u, init]) =>
-          String(u) === "/api/notes/list-1/entries/task-1" &&
+          String(u) === "/api/todo/list-1/items/task-1" &&
           (init?.method ?? "GET").toUpperCase() === "PATCH",
       );
       expect(patch.length).toBeGreaterThan(0);
       const body = JSON.parse(patch[0]![1]!.body as string);
       expect(body.done).toBe(true);
     });
+  });
+
+  it("shows the todo empty state when there are no lists", async () => {
+    const fetchMock = vi.fn(async (url: string) => {
+      if (url === "/api/todo") return { ok: true, json: async () => [] };
+      return { ok: true, json: async () => ({}) };
+    });
+    global.fetch = fetchMock as typeof fetch;
+    render(<TodoApp windowId="w1" />);
+
+    await waitFor(() => expect(screen.getByText(/no lists yet/i)).toBeDefined());
   });
 });
