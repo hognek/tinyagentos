@@ -93,29 +93,38 @@ class PeerOutboxStore(BaseStore):
 
         Returns ``True`` if the row is still pending, ``False`` if it was
         deleted (terminal failure after ``_MAX_ATTEMPTS`` retries).
+
+        Wrapped in a transaction to avoid a read-then-write race on
+        ``attempts``.
         """
-        async with self._db.execute(
-            "SELECT attempts FROM peer_outbox WHERE id = ?", (outbox_id,)
-        ) as cursor:
-            row = await cursor.fetchone()
-        if row is None:
-            return False
-        new_attempts = row[0] + 1
-        if new_attempts >= _MAX_ATTEMPTS:
-            # Terminal failure — drop the row so it never retries again.
+        await self._db.execute("BEGIN")
+        try:
+            async with self._db.execute(
+                "SELECT attempts FROM peer_outbox WHERE id = ?", (outbox_id,)
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                await self._db.execute("ROLLBACK")
+                return False
+            new_attempts = row[0] + 1
+            if new_attempts >= _MAX_ATTEMPTS:
+                # Terminal failure — drop the row so it never retries again.
+                await self._db.execute(
+                    "DELETE FROM peer_outbox WHERE id = ?", (outbox_id,)
+                )
+                await self._db.commit()
+                return False
+            delay = _BACKOFF_SECONDS[min(new_attempts, len(_BACKOFF_SECONDS) - 1)]
+            next_at = time.time() + delay
             await self._db.execute(
-                "DELETE FROM peer_outbox WHERE id = ?", (outbox_id,)
+                "UPDATE peer_outbox SET attempts = ?, next_retry_at = ? WHERE id = ?",
+                (new_attempts, next_at, outbox_id),
             )
             await self._db.commit()
-            return False
-        delay = _BACKOFF_SECONDS[min(new_attempts, len(_BACKOFF_SECONDS) - 1)]
-        next_at = time.time() + delay
-        await self._db.execute(
-            "UPDATE peer_outbox SET attempts = ?, next_retry_at = ? WHERE id = ?",
-            (new_attempts, next_at, outbox_id),
-        )
-        await self._db.commit()
-        return True
+            return True
+        except Exception:
+            await self._db.execute("ROLLBACK")
+            raise
 
     async def purge_for_contact(self, contact_id: str) -> int:
         """Delete all outbox rows for a contact (used on revoke)."""

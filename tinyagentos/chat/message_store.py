@@ -215,7 +215,7 @@ class ChatMessageStore(BaseStore):
                     json.dumps(merged_meta),
                     now,
                     remote_msg_id,
-                    now,  # delivered_at — mark delivered on receipt
+                    time.time(),  # delivered_at — actual receipt time, not sender's created_at
                 ),
             )
             await self._db.commit()
@@ -223,7 +223,7 @@ class ChatMessageStore(BaseStore):
         except sqlite3.IntegrityError as exc:
             # Re-raise on structural integrity violations (e.g. NOT NULL on
             # channel_id) — only the dedup index violation is benign.
-            if "remote_msg_id" not in str(exc):
+            if "UNIQUE" not in str(exc) or "remote_msg_id" not in str(exc):
                 await self._db.rollback()
                 raise
             # Duplicate — the (channel_id, remote_msg_id) unique constraint
