@@ -76,6 +76,19 @@ class TestGitHubInstallationCategory:
         assert resp.json() == []
 
     @pytest.mark.asyncio
+    async def test_github_grants_requires_auth(self, client, app):
+        """Unauthenticated request to the GitHub grants endpoint returns 401."""
+        from httpx import ASGITransport, AsyncClient
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            # No taos_session cookie — simulate unauthenticated caller.
+        ) as unauth_client:
+            resp = await unauth_client.get("/api/secrets/agent/test-agent/github")
+            assert resp.status_code == 401
+
+    @pytest.mark.asyncio
     async def test_duplicate_secret_rejected(self, client):
         """Creating a secret with a duplicate name returns 409."""
         await client.post("/api/secrets", json={
@@ -105,6 +118,7 @@ class TestGitHubInstallationCategory:
             "agents": [],
         })
 
+        # Names containing / are now supported via {name:path} route converters.
         resp = await client.put("/api/secrets/update-test/repo", json={
             "agents": ["agent-1", "agent-2"],
         })
