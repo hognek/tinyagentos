@@ -96,13 +96,13 @@ def _enforce_permissions(keyfile: Path) -> None:
     try:
         mode = keyfile.stat().st_mode & 0o777
     except OSError as exc:
-        raise PermissionError(f"cannot stat keyfile {keyfile}: {exc}")
+        raise PermissionError(f"cannot stat keyfile {keyfile}: {exc}") from exc
     if mode != 0o600:
         os.chmod(keyfile, 0o600)
     try:
         mode_after = keyfile.stat().st_mode & 0o777
     except OSError as exc:
-        raise PermissionError(f"cannot stat keyfile {keyfile}: {exc}")
+        raise PermissionError(f"cannot stat keyfile {keyfile}: {exc}") from exc
     if mode_after != 0o600:
         raise PermissionError(f"cannot enforce 0600 permissions on {keyfile}")
 
@@ -138,6 +138,7 @@ def load_or_create_signing_keypair(data_dir: Path) -> tuple[bytes, bytes]:
             logger.warning(
                 "store signing keyfile corrupt (%s), regenerating", exc,
             )
+            keyfile.unlink(missing_ok=True)
 
     priv, pub = generate_signing_keypair()
     keyfile.parent.mkdir(parents=True, exist_ok=True)

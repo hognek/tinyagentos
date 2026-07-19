@@ -495,14 +495,21 @@ class TestInstallV2:
 
     @pytest.mark.asyncio
     async def test_real_registry_detects_post_load_tampering(self, client):
-        """End-to-end test: a real AppRegistry re-reads the manifest from
-        disk at install time and rejects a manifest that was tampered with
-        after catalog load with 403.
+        """End-to-end test: a real AppRegistry detects post-load tampering.
 
-        Unlike the mocked tests above that stub verify_manifest_signature,
-        this exercises the full path: sign-at-load, mutate-the-file,
-        verify-at-install.
+        Exercises BOTH the initial signing gate AND the install-time TOCTOU
+        re-verification guard independently:
+
+        1. First request: passes the initial gate (manifest unchanged).
+        2. Tamper the manifest on disk.
+        3. Monkeypatch the initial gate to return success, so the TOCTOU
+           re-verification is what catches the tampering.
+        4. The TOCTOU guard re-reads the manifest from disk, re-verifies the
+           stored Ed25519 signature against the now-tampered bytes, and returns
+           403 — proving the secondary guard works independently of the initial
+           gate.
         """
+        import os
         import tempfile
         from pathlib import Path
 
@@ -525,7 +532,9 @@ class TestInstallV2:
 
         # 2. Build a real AppRegistry with a signing key.
         priv, pub = generate_signing_keypair()
-        installed_path = Path(tempfile.mkstemp(suffix=".json")[1])
+        fd, installed_name = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        installed_path = Path(installed_name)
         installed_path.write_text("[]")  # initialise with valid JSON
         reg = AppRegistry(
             catalog_dir=catalog_dir,
@@ -563,7 +572,20 @@ class TestInstallV2:
             "  method: download\n",
         )
 
-        # 6. Now the install MUST be rejected with 403.
+        # 6. Monkeypatch the initial signing gate to return success so the
+        # install-time TOCTOU re-verification is what actually catches the
+        # tampering.  This proves the secondary guard works independently of
+        # the initial gate — a manifest modified between the two checks is
+        # still rejected.
+        original_verify = reg.verify_manifest_signature
+
+        def _mock_verify(app_id: str, public_pem: bytes) -> bool:
+            return True
+
+        reg.verify_manifest_signature = _mock_verify  # type: ignore[method-assign]
+
+        # 7. Now the install MUST be rejected with 403 by the TOCTOU
+        # re-verification guard, even though the initial gate was bypassed.
         resp = await client.post("/api/store/install-v2", json={
             "manifest_id": "test-svc",
         })
@@ -571,8 +593,11 @@ class TestInstallV2:
             f"expected 403 after tampering, got {resp.status_code}: {resp.json()}"
         )
         body = resp.json()
-        assert body["error"] == "manifest signature verification failed"
+        assert body["error"] == "manifest modified between signature verification and install"
         assert "install_id" in body
+
+        # Restore the original so teardown is clean.
+        reg.verify_manifest_signature = original_verify  # type: ignore[method-assign]
 
     @pytest.mark.asyncio
     async def test_no_signing_key_skips_verification(self, client):
