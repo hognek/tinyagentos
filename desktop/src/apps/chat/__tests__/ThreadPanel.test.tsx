@@ -28,6 +28,7 @@ const stubReply2 = {
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 afterEach(() => {
@@ -40,11 +41,12 @@ function stubFetch(responses: Record<string, unknown>) {
   vi.stubGlobal(
     "fetch",
     vi.fn().mockImplementation((url: string) => {
-      // Match on the LAST path segment that distinguishes the endpoints:
+      // Match on the path segment that distinguishes the endpoints:
       //   GET /api/chat/messages/{id}              → "messages"
       //   GET /api/chat/channels/{ch}/threads/{id}/messages → "threads"
-      // We check url.endsWith so ".../threads/p1/messages" matches "threads"
-      // and "messages/p1" matches "messages".
+      // We check url.includes so ".../threads/p1/messages" matches "threads"
+      // and ".../messages/p1" matches "messages". Order matters: /threads/
+      // is checked first because a thread-messages URL also contains /messages/.
       let key: string | undefined;
       if (url.includes("/threads/")) {
         key = "threads";
@@ -294,7 +296,7 @@ describe("ThreadPanel", () => {
 
   it("scrolls to bottom when a new liveReply arrives", async () => {
     stubFetchOk();
-    const { rerender } = render(
+    const { rerender, container } = render(
       <ThreadPanel
         channelId="ch1"
         parentId="p1"
@@ -306,8 +308,16 @@ describe("ThreadPanel", () => {
       expect(screen.getByText(stubReply1.content)).toBeInTheDocument(),
     );
     // The component sets scrollTop = scrollHeight in a useEffect that watches
-    // liveReplies.length. We verify the effect ran correctly by confirming the
-    // new reply is rendered after a re-render with an additional liveReply.
+    // liveReplies.length. In JSDOM both default to 0, so we pin a non-zero
+    // scrollHeight on the scroll container to verify the assignment.
+    const scroller = container.querySelector('[class*="overflow-y-auto"]')!;
+    expect(scroller).toBeTruthy();
+    Object.defineProperty(scroller, "scrollHeight", {
+      value: 400,
+      writable: true,
+      configurable: true,
+    });
+    scroller.scrollTop = 0;
     rerender(
       <ThreadPanel
         channelId="ch1"
@@ -328,6 +338,8 @@ describe("ThreadPanel", () => {
     await waitFor(() =>
       expect(screen.getByText("fresh reply")).toBeInTheDocument(),
     );
+    // The scrollToBottom useEffect should have set scrollTop = scrollHeight (400).
+    expect(scroller.scrollTop).toBe(400);
   });
 
   /* ── error handling ──────────────────────────────────────────── */
@@ -566,6 +578,33 @@ describe("ThreadPanel", () => {
     fireEvent.keyDown(ta, { key: "Enter" });
     // Mid-send: textarea should be disabled.
     await waitFor(() => expect(ta).toBeDisabled());
+    resolveSend();
+    await waitFor(() => expect(ta).not.toBeDisabled());
+  });
+
+  it("ignores a second Enter while a send is still in-flight", async () => {
+    stubFetchOk();
+    let resolveSend!: (v: void) => void;
+    const onSend = vi
+      .fn()
+      .mockImplementation(
+        () => new Promise<void>((r) => { resolveSend = r; }),
+      );
+    render(
+      <ThreadPanel
+        channelId="ch1"
+        parentId="p1"
+        onClose={vi.fn()}
+        onSend={onSend}
+      />,
+    );
+    const ta = screen.getByRole("textbox", { name: "Thread reply" });
+    fireEvent.change(ta, { target: { value: "first attempt" } });
+    fireEvent.keyDown(ta, { key: "Enter" });
+    await waitFor(() => expect(ta).toBeDisabled());
+    // Fire a second Enter while sending is still true — should be ignored.
+    fireEvent.keyDown(ta, { key: "Enter" });
+    expect(onSend).toHaveBeenCalledTimes(1);
     resolveSend();
     await waitFor(() => expect(ta).not.toBeDisabled());
   });
