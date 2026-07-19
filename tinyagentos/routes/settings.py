@@ -668,10 +668,22 @@ async def update_status(request: Request):
         except Exception:
             pass
 
+    # GPG preferences for signature verification.
+    from tinyagentos.gpg_verify import GPG_PREF_NAMESPACE, DEFAULT_GPG_PREFS
+    gpg_prefs = dict(DEFAULT_GPG_PREFS)
+    if settings:
+        try:
+            saved_gpg = await settings.get_preference("user", GPG_PREF_NAMESPACE)
+            if saved_gpg:
+                gpg_prefs.update(saved_gpg)
+        except Exception:
+            pass
+
     return {
         "current_sha": current_sha,
         "pending_restart_sha": pending_sha,
         "auto_check": prefs.get("check_enabled", True),
+        "gpg": gpg_prefs,
     }
 
 
@@ -911,10 +923,64 @@ async def apply_update(request: Request):
     # a dev/test box). Pulling a hard-coded master onto a dev box fails ff-only
     # (dev is ahead of master) and the update silently never applies.
     branch = await resolve_tracked_branch(request.app.state.desktop_settings, project_dir)
+
+    # Fetch first so we can verify GPG signature before merging.
+    fetch_proc = await asyncio.create_subprocess_exec(
+        "git", "fetch", "--quiet", "origin", "--", branch,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        cwd=str(project_dir),
+    )
+    fetch_out, _ = await fetch_proc.communicate()
+    if fetch_proc.returncode != 0:
+        return JSONResponse(
+            {"error": f"Fetch failed: {(fetch_out.decode() if fetch_out else 'unknown error').strip()[:300]}"},
+            status_code=500,
+        )
+
+    # ── GPG signature verification (defence-in-depth) ──────────────────
+    from tinyagentos.gpg_verify import verify_remote_commit, resolve_gpg_prefs
+    gpg_prefs = await resolve_gpg_prefs(request.app.state.desktop_settings)
+    remote_sha = ""
+    if gpg_prefs.enabled:
+        try:
+            remote_proc = await asyncio.create_subprocess_exec(
+                "git", "rev-parse", f"origin/{branch}",
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                cwd=str(project_dir),
+            )
+            remote_out, _ = await remote_proc.communicate()
+            remote_sha = remote_out.decode().strip() if remote_out else ""
+            if remote_sha:
+                gpg_result = await verify_remote_commit(project_dir, remote_sha, gpg_prefs)
+                if not gpg_result.ok:
+                    if gpg_prefs.required:
+                        return JSONResponse(
+                            {"error": f"GPG signature verification failed — update blocked. {gpg_result.status}"},
+                            status_code=400,
+                        )
+                    # Warn but proceed.
+                    logger.warning("apply_update: GPG verification failed (warn-only): %s", gpg_result.status)
+            elif gpg_prefs.required:
+                # Could not resolve the remote ref — if GPG is required, abort
+                # rather than falling through to an unverified merge.
+                return JSONResponse(
+                    {"error": "GPG verification required but could not resolve remote commit — update blocked."},
+                    status_code=400,
+                )
+        except Exception:
+            logger.exception("apply_update: GPG verification crashed")
+            if gpg_prefs.required:
+                return JSONResponse(
+                    {"error": "GPG verification raised an exception — update blocked."},
+                    status_code=500,
+                )
+
+    # Merge — pin to the verified SHA when GPG check succeeded so a
+    # concurrent remote ref update cannot install a different commit
+    # after verification (TOCTOU).
+    merge_target = remote_sha if remote_sha else f"origin/{branch}"
     proc = await asyncio.create_subprocess_exec(
-        # `--` forces `branch` to be a refspec, never an option (flag-injection
-        # defence); resolve_tracked_branch also validates it.
-        "git", "pull", "--ff-only", "origin", "--", branch,
+        "git", "merge", "--ff-only", merge_target,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         cwd=str(project_dir),
     )
@@ -1039,7 +1105,14 @@ async def set_update_channel(request: Request, body: UpdateChannel):
     data_dir = request.app.state.config_path.parent
     snapshot_path = snapshot_data_dir(data_dir)
 
-    result = await switch_to_branch(branch, project_dir)
+    # Resolve GPG prefs for switch_to_branch verification.
+    from tinyagentos.gpg_verify import resolve_gpg_prefs
+    gpg_prefs = await resolve_gpg_prefs(store)
+    result = await switch_to_branch(
+        branch, project_dir,
+        gpg_fingerprint=gpg_prefs.key_fingerprint if gpg_prefs.enabled else None,
+        gpg_required=gpg_prefs.required and gpg_prefs.enabled,
+    )
     # switch_to_branch sets ok=False (and performs no destructive change) on any
     # failed step — fetch, stash, checkout. Surface it rather than proceeding to
     # rebuild/restart on a branch that never actually switched.

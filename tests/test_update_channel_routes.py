@@ -71,7 +71,7 @@ class TestUpdateChannelRoute:
         async def fake_resolve(store, project_dir):
             return "master"
 
-        async def fake_switch(branch, project_dir):
+        async def fake_switch(branch, project_dir, gpg_fingerprint=None, gpg_required=False):
             switch_called.append(branch)
             return UpdateResult(previous_sha="aaa", new_sha="bbb", recovery_tag="tag1", message="ok")
 
@@ -109,7 +109,7 @@ class TestUpdateChannelRoute:
             snapshot_args.append(data_dir)
             return fake_snapshot_path
 
-        async def fake_switch(branch, project_dir):
+        async def fake_switch(branch, project_dir, gpg_fingerprint=None, gpg_required=False):
             switch_args.append(branch)
             return UpdateResult(previous_sha="aaa", new_sha="bbb", recovery_tag="tag1", message="ok")
 
