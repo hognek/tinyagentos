@@ -608,6 +608,19 @@ async def test_default_kind_is_agent(store):
 
 
 @pytest.mark.asyncio
+async def test_mint_collab_rejects_scopes(store):
+    with pytest.raises(ValueError, match="collab invites must carry no scopes"):
+        await store.mint(
+            project_id="prj-1",
+            scopes=["a2a_send"],
+            approval_mode="manual",
+            check_interval_secs=1800,
+            created_by="u",
+            kind="collab",
+        )
+
+
+@pytest.mark.asyncio
 async def test_list_pending_collab_for_contact(store):
     await store.mint(
         project_id="prj-a",

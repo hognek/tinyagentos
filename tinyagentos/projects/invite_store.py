@@ -140,6 +140,13 @@ class ProjectInviteStore(BaseStore):
                 f"invalid invite kind: {kind!r} — must be one of {sorted(_VALID_KINDS)}"
             )
 
+        # Human-collaborator invites carry no agent scopes — delegation arrives
+        # later via the D-milestone handshake, never on the human invite.
+        if kind == "collab" and scopes:
+            raise ValueError(
+                "collab invites must carry no scopes"
+            )
+
         # The pending cap is per-scope: project-scoped invites are capped per
         # project, OS-level (project_id IS NULL) invites are capped as a group.
         # SQL ``= NULL`` never matches, so branch on IS NULL to keep the cap live
