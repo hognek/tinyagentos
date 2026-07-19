@@ -41,19 +41,6 @@ def _sanitize_task(task: dict) -> dict:
     return {k: v for k, v in task.items() if k in _TASK_ALLOWLIST}
 
 
-def _parse_labels(task: dict) -> list[str]:
-    """Return labels as a list, handling both str and list storage forms."""
-    import json
-
-    raw = task.get("labels", "[]")
-    if isinstance(raw, list):
-        return raw
-    try:
-        return json.loads(raw)
-    except (json.JSONDecodeError, TypeError):
-        return []
-
-
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -74,7 +61,7 @@ async def community_snapshot(
       - project metadata (name, slug, description, status)
       - board tasks (id, title, status, claimant, labels, timestamps)
       - contribution stats (per-contributor claim/close counts, leaderboard)
-      - recent activity feed (last 50 board-audit events)
+      - recent activity feed (last 500 board-audit events, rendered as most-recent 20)
     """
     project_store = request.app.state.project_store
     task_store = request.app.state.task_store
