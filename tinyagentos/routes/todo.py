@@ -149,7 +149,6 @@ async def add_item(
     if body.due_at:
         try:
             dt = datetime.fromisoformat(body.due_at)
-: address 9 bot review findings — atomicity, CSRF, timezone, position, done)
         except ValueError:
             return JSONResponse(
                 {"error": f"invalid due_at: {body.due_at!r}"}, status_code=400
@@ -164,7 +163,6 @@ async def add_item(
     if body.remind_at:
         try:
             dt = datetime.fromisoformat(body.remind_at)
-: address 9 bot review findings — atomicity, CSRF, timezone, position, done)
         except ValueError:
             return JSONResponse(
                 {"error": f"invalid remind_at: {body.remind_at!r}"}, status_code=400

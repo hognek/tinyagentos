@@ -6,9 +6,12 @@ One-shot, idempotent migration. Run via the /api/todo/migrate endpoint
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
+
+_migration_lock = asyncio.Lock()
 
 
 async def migrate_list_docs(shared_docs_store, todo_store) -> dict:
@@ -29,6 +32,12 @@ async def migrate_list_docs(shared_docs_store, todo_store) -> dict:
         dict with ``migrated`` (lists newly created), ``items`` (total items
         moved), and ``lists`` (list of {old_id, new_id} pairs) for verification.
     """
+    async with _migration_lock:
+        return await _migrate_list_docs(shared_docs_store, todo_store)
+
+
+async def _migrate_list_docs(shared_docs_store, todo_store) -> dict:
+    """Internal implementation — callers should use migrate_list_docs."""
     list_docs = await shared_docs_store.list_docs_by_kind("list")
 
     result = {"migrated": 0, "items": 0, "lists": []}
