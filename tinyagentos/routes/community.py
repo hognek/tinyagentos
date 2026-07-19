@@ -64,7 +64,7 @@ async def community_snapshot(
       - recent activity feed (last 500 board-audit events, rendered as most-recent 20)
     """
     project_store = request.app.state.project_store
-    task_store = request.app.state.task_store
+    task_store = request.app.state.project_task_store
     board_audit = request.app.state.board_audit
 
     # Authorize: must be the project owner.
@@ -129,7 +129,7 @@ async def community_stats(
     and feed that the snapshot endpoint includes.
     """
     project_store = request.app.state.project_store
-    task_store = request.app.state.task_store
+    task_store = request.app.state.project_task_store
     board_audit = request.app.state.board_audit
 
     project = await project_store.get(project_id)
