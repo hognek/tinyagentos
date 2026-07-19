@@ -206,6 +206,45 @@ async def test_patch_item_text(client):
 
 
 @pytest.mark.asyncio
+async def test_add_item_rejects_whitespace_only_text(client):
+    doc = (await client.post("/api/todo", json={"title": "x"})).json()
+    resp = await client.post(
+        f"/api/todo/{doc['id']}/items", json={"text": "   "}
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_add_item_rejects_empty_text(client):
+    doc = (await client.post("/api/todo", json={"title": "x"})).json()
+    resp = await client.post(
+        f"/api/todo/{doc['id']}/items", json={"text": ""}
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_add_item_strips_whitespace(client):
+    doc = (await client.post("/api/todo", json={"title": "x"})).json()
+    item = (await client.post(
+        f"/api/todo/{doc['id']}/items", json={"text": "  buy milk  "}
+    )).json()
+    assert item["text"] == "buy milk"
+
+
+@pytest.mark.asyncio
+async def test_patch_item_rejects_whitespace_only_text(client):
+    doc = (await client.post("/api/todo", json={"title": "x"})).json()
+    item = (await client.post(
+        f"/api/todo/{doc['id']}/items", json={"text": "task"}
+    )).json()
+    resp = await client.patch(
+        f"/api/todo/{doc['id']}/items/{item['id']}", json={"text": "   "}
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
 async def test_delete_item(client):
     doc = (await client.post("/api/todo", json={"title": "x"})).json()
     item = (await client.post(

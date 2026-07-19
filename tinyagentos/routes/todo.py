@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from tinyagentos.auth_context import CurrentUser, current_user
 
@@ -31,12 +31,29 @@ class AddTodoItemIn(BaseModel):
     due_at: str | None = None
     remind_at: str | None = None
 
+    @field_validator("text")
+    @classmethod
+    def _strip_text(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("text must not be empty or whitespace-only")
+        return v
+
 
 class PatchTodoItemIn(BaseModel):
     text: str | None = None
     done: bool | None = None
     due_at: str | None = None
     remind_at: str | None = None
+
+    @field_validator("text")
+    @classmethod
+    def _validate_text(cls, v: str | None) -> str | None:
+        if v is not None:
+            v = v.strip()
+            if not v:
+                raise ValueError("text must not be empty or whitespace-only")
+        return v
 
 
 class ReorderEntry(BaseModel):
