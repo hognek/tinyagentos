@@ -140,7 +140,7 @@ function SystemShortcuts({ toggleSearch, toggleLaunchpad, toggleAssistant }: Sys
       const forceResults: Record<string, { force_killed?: boolean; error?: string }> =
         data.force_kill_results ?? {};
       const failures = Object.entries(forceResults).filter(
-        ([, r]) => r.error
+        ([, r]) => !r.force_killed
       );
       if (failures.length > 0) {
         const names = failures.map(([n]) => n).join(", ");
