@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS contacts (
 
 CREATE TABLE IF NOT EXISTS peer_links (
     contact_id              TEXT PRIMARY KEY REFERENCES contacts(contact_id),
-    inbound_token_hash      TEXT NOT NULL UNIQUE,  -- token WE minted for their instance (SHA-256); indexed for lookup
+    inbound_token_hash      TEXT NOT NULL,    -- token WE minted for their instance (SHA-256); indexed for lookup
     outbound_token          TEXT NOT NULL,    -- token THEY minted for us (stored in plaintext; encryption deferred to post-MVP)
     endpoints               TEXT NOT NULL DEFAULT '[]',  -- JSON list of advertised endpoints
     established_at          REAL NOT NULL,
