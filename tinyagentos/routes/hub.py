@@ -162,6 +162,12 @@ async def _try_handshake(
         )
 
         # Mint the inbound token WE give to the remote instance.
+        # NOTE: A2 intentionally stores the inbound token locally but does NOT
+        # deliver it to the remote peer — the token exchange channel doesn't
+        # exist yet.  A3 (the first handshake reply containing the remote's
+        # outbound token) completes the two-way exchange.  Until then, the
+        # inbound auth channel is inert (no remote request will carry this
+        # token) and find_contact_by_inbound_token() will never match.
         inbound_token = generate_peer_token()
         # The outbound_token is the token THEY mint for us — we don't have it
         # until the first handshake reply arrives.  Store an empty placeholder
@@ -488,13 +494,30 @@ async def block_peer(
     # Cascade to contacts: revoke the peer link so the blocked contact can no
     # longer authenticate on the peer channel (A2 subscribe-to-block).
     # The peer fingerprint is a hub signing key fingerprint; resolve it to a
-    # contact_id (hub:username) via the hub_authors cache.
+    # contact_id (hub:username) via the hub_authors cache, falling back to a
+    # contact-table scan when the author row is missing or stale.
     contacts_store = getattr(request.app.state, "contacts_store", None)
     if contacts_store is not None:
         try:
             author = await store.get_author(peer)
             if author and author.get("username"):
                 await contacts_store.revoke_peer_link(f"hub:{author['username']}")
+            else:
+                # Fallback: scan contacts for a matching ed25519 fingerprint.
+                all_contacts = await contacts_store.list_contacts()
+                for contact in all_contacts:
+                    if contact.get("ed25519_pub") == peer:
+                        await contacts_store.revoke_peer_link(contact["contact_id"])
+                        logger.warning(
+                            "hub block: revoke via contact scan (author missing) "
+                            "for %s", peer,
+                        )
+                        break
+                else:
+                    logger.warning(
+                        "hub block: could not resolve peer %s to a contact; "
+                        "peer link may still be active", peer,
+                    )
         except Exception:
             logger.exception("hub block: contacts-store cascade failed for %s", peer)
 

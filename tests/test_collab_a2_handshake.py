@@ -204,16 +204,6 @@ class TestFriendAcceptHandshake:
         # outbound_token is empty placeholder until A3 handshake reply
         assert link["outbound_token"] == ""
 
-        # The contact should be findable by the inbound token.
-        # We can't read the plaintext token, but the hash lookup works.
-        inbound_contact = await store.find_contact_by_inbound_token(
-            # Generate a new token and use its hash — we can't read the stored plaintext
-            # but we can verify the hash is deterministic.
-            "placeholder-not-testable-directly"
-        )
-        # Actually, we should test the token flow differently.
-        # Let's just verify the link exists and the hash is consistent.
-
     async def test_accept_falls_back_to_hub_authors(
         self, client_with_contacts, app_with_contacts, monkeypatch
     ):
