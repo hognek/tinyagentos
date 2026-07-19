@@ -473,6 +473,11 @@ async def _apply_collab_delegation_grant(request: Request, decision: dict, value
             "collab delegation completion failed for decision %s",
             decision.get("id"), exc_info=True,
         )
+        error_msg = (
+            f"Delegation approval failed: an internal error occurred while "
+            f"setting up the sponsored agent. Please retry or check the logs."
+        )
+        await _route_answer_to_agent(decision, error_msg)
     return True
 
 
