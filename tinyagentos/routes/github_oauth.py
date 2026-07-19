@@ -414,15 +414,24 @@ async def app_installation_callback(
     # user, not the installing account, so we use /app/installations/{id}).
     from tinyagentos.github_app import generate_jwt
     jwt = generate_jwt(cfg.github_app_id, private_key)
-    install_resp = await http.get(
-        f"https://api.github.com/app/installations/{installation_id}",
-        headers={
-            "Authorization": f"Bearer {jwt}",
-            "Accept": "application/vnd.github+json",
-        },
-        timeout=10,
-    )
-    if install_resp.status_code == 200:
+    try:
+        install_resp = await http.get(
+            f"https://api.github.com/app/installations/{installation_id}",
+            headers={
+                "Authorization": f"Bearer {jwt}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=10,
+        )
+    except Exception:
+        logger.warning(
+            "Failed to fetch installation %s details (network/timeout), saving "
+            "minimal record — the install itself succeeded",
+            installation_id,
+        )
+        install_resp = None
+
+    if install_resp is not None and install_resp.status_code == 200:
         inst_data = install_resp.json()
         account = inst_data.get("account", {})
         store = _app_installations_store(request)
@@ -435,10 +444,11 @@ async def app_installation_callback(
                 repository_selection=inst_data.get("repository_selection", "selected"),
             )
     else:
+        status_str = str(install_resp.status_code) if install_resp is not None else "exception"
         logger.warning(
             "Failed to fetch installation %s details (HTTP %s), saving minimal "
             "record — the install itself succeeded",
-            installation_id, install_resp.status_code,
+            installation_id, status_str,
         )
         store = _app_installations_store(request)
         if store and not store.get(installation_id):
@@ -476,6 +486,12 @@ async def delete_app_installation(request: Request, installation_id: int):
     deleted = await delete_installation(
         cfg.github_app_id, private_key, installation_id, http
     )
+
+    if deleted is None:
+        return JSONResponse(
+            {"error": "Failed to delete installation (upstream error)"},
+            status_code=502,
+        )
 
     if not deleted:
         return JSONResponse(

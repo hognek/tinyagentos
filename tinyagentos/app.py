@@ -507,17 +507,29 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
             _legacy_key = str(_cfg_raw.get("github_app_private_key", "") or "")
             if _legacy_key:
                 _existing = await secrets_store.get("github-app-private-key")
-                if not _existing:
-                    await secrets_store.add(
-                        name="github-app-private-key",
-                        value=_legacy_key,
-                        category="credentials",
-                        description="GitHub App RSA private key (migrated from config.yaml)",
-                    )
+                # Treat an existing row with an empty value as missing so the
+                # migration writes the real key instead of silently skipping it.
+                if not _existing or not _existing.get("value"):
+                    if _existing and not _existing.get("value"):
+                        await secrets_store.update(
+                            name="github-app-private-key",
+                            value=_legacy_key,
+                            category="credentials",
+                            description="GitHub App RSA private key (migrated from config.yaml)",
+                        )
+                    else:
+                        await secrets_store.add(
+                            name="github-app-private-key",
+                            value=_legacy_key,
+                            category="credentials",
+                            description="GitHub App RSA private key (migrated from config.yaml)",
+                        )
                     logger.info(
                         "migrated github_app_private_key from config.yaml to SecretsStore"
                     )
-                del _cfg_raw["github_app_private_key"]
+                # save_config uses the AppConfig object (which no longer carries
+                # the field), so the legacy key is stripped from the file on this
+                # next save regardless of _cfg_raw mutations.
                 save_config(config, config_path)
         await broker_store.init()
         await mail_store.init()
