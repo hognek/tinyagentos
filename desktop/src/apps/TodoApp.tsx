@@ -15,6 +15,7 @@ import {
   AlertCircle,
 } from "lucide-react";
 import { Button } from "@/components/ui";
+import { withCsrf } from "@/lib/csrf";
 
 // ---- Types ----
 
@@ -329,11 +330,14 @@ function TodoDetailPane({
     if (!newText.trim() || !doc || adding) return;
     setAdding(true);
     try {
-      const r = await fetch(`/api/todo/${doc.id}/items`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: newText.trim() }),
-      });
+      const r = await fetch(
+        `/api/todo/${doc.id}/items`,
+        withCsrf({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text: newText.trim() }),
+        }),
+      );
       if (!r.ok) throw new Error("Could not add task.");
       setNewText("");
       await loadDoc();
@@ -347,9 +351,10 @@ function TodoDetailPane({
   async function deleteItem(itemId: string) {
     if (!doc) return;
     try {
-      const r = await fetch(`/api/todo/${doc.id}/items/${itemId}`, {
-        method: "DELETE",
-      });
+      const r = await fetch(
+        `/api/todo/${doc.id}/items/${itemId}`,
+        withCsrf({ method: "DELETE" }),
+      );
       if (!r.ok) throw new Error("Could not delete task.");
       setDoc((prev) =>
         prev
@@ -363,11 +368,14 @@ function TodoDetailPane({
 
   async function editItem(itemId: string, text: string) {
     if (!doc) return;
-    const r = await fetch(`/api/todo/${doc.id}/items/${itemId}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
+    const r = await fetch(
+      `/api/todo/${doc.id}/items/${itemId}`,
+      withCsrf({
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      }),
+    );
     if (!r.ok) throw new Error("Could not edit task.");
     setDoc((prev) =>
       prev
@@ -396,11 +404,14 @@ function TodoDetailPane({
         : prev,
     );
     try {
-      const r = await fetch(`/api/todo/${doc.id}/items/${itemId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ done }),
-      });
+      const r = await fetch(
+        `/api/todo/${doc.id}/items/${itemId}`,
+        withCsrf({
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ done }),
+        }),
+      );
       if (!r.ok) throw new Error("Could not update task.");
     } catch (e) {
       // Revert on failure
@@ -446,13 +457,16 @@ function TodoDetailPane({
     setDoc((prev) => (prev ? { ...prev, items: reordered } : prev));
 
     try {
-      const r = await fetch(`/api/todo/${doc.id}/items/reorder`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          items: reordered.map((i) => ({ id: i.id, position: i.position })),
+      const r = await fetch(
+        `/api/todo/${doc.id}/items/reorder`,
+        withCsrf({
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            items: reordered.map((i) => ({ id: i.id, position: i.position })),
+          }),
         }),
-      });
+      );
       if (!r.ok) throw new Error("Could not reorder tasks.");
     } catch (e) {
       // Revert
@@ -668,11 +682,14 @@ function CreateTodoForm({
     setCreating(true);
     setError(null);
     try {
-      const r = await fetch("/api/todo", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ title: title.trim() }),
-      });
+      const r = await fetch(
+        "/api/todo",
+        withCsrf({
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: title.trim() }),
+        }),
+      );
       if (!r.ok) throw new Error("Could not create list.");
       const doc: TodoList = await r.json();
       setCreating(false);
