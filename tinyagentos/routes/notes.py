@@ -38,7 +38,6 @@ _ACTION_DIRECTIVE = {
 # --------------------------------------------------------------------- models
 
 class CreateDocIn(BaseModel):
-    kind: str
     title: str = ""
 
 
@@ -130,7 +129,7 @@ async def create_doc(
 ):
     store = _get_store(request)
     try:
-        doc = await store.create_doc(user.user_id, body.kind, body.title)
+        doc = await store.create_doc(user.user_id, "note", body.title)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
     return doc

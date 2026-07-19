@@ -310,7 +310,10 @@ function TodoDetailPane({
         ...raw,
         items: Array.isArray(raw.items) ? raw.items : [],
       };
-      if (loadReqRef.current === myReq) setDoc(data);
+      if (loadReqRef.current === myReq) {
+        setDoc(data);
+        setError(null);
+      }
     } catch (e) {
       if (loadReqRef.current === myReq)
         setError(e instanceof Error ? e.message : "Could not load list.");
@@ -340,6 +343,7 @@ function TodoDetailPane({
       );
       if (!r.ok) throw new Error("Could not add task.");
       setNewText("");
+      setError(null);
       await loadDoc();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not add task.");
@@ -356,6 +360,7 @@ function TodoDetailPane({
         withCsrf({ method: "DELETE" }),
       );
       if (!r.ok) throw new Error("Could not delete task.");
+      setError(null);
       setDoc((prev) =>
         prev
           ? { ...prev, items: prev.items.filter((i) => i.id !== itemId) }
@@ -413,6 +418,7 @@ function TodoDetailPane({
         }),
       );
       if (!r.ok) throw new Error("Could not update task.");
+      setError(null);
     } catch (e) {
       // Revert on failure
       setDoc((prev) =>
@@ -468,6 +474,7 @@ function TodoDetailPane({
         }),
       );
       if (!r.ok) throw new Error("Could not reorder tasks.");
+      setError(null);
     } catch (e) {
       // Revert
       await loadDoc();
