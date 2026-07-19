@@ -15,7 +15,13 @@ logger = logging.getLogger(__name__)
 
 
 async def execute_todo_list_lists(args: dict, request: Request) -> dict:
-    """List non-archived todo lists the calling agent has access to."""
+    """List non-archived todo lists the calling agent has access to.
+
+    Note: authorization is owner-based — the caller supplies owner_user_id and the
+    store returns lists owned by that user. agent_name is used for attribution and
+    the notification skip-guard only. When TodoStore gains agent membership (#1923
+    follow-up), the agent_name-to-owner binding will move here.
+    """
     args = args or {}
     agent_name = args.get("agent_name")
     if not agent_name or not isinstance(agent_name, str):
@@ -28,7 +34,12 @@ async def execute_todo_list_lists(args: dict, request: Request) -> dict:
     try:
         store = request.app.state.todo_store
         lists = await store.list_lists(owner_user_id)
-        return {"lists": lists}
+        # Strip internal fields the agent does not need.
+        slim = [
+            {k: v for k, v in doc.items() if k not in ("owner_user_id", "archived_at", "created_at")}
+            for doc in lists
+        ]
+        return {"lists": slim}
     except Exception as exc:
         return {"error": str(exc)}
 
@@ -36,7 +47,10 @@ async def execute_todo_list_lists(args: dict, request: Request) -> dict:
 async def execute_todo_add_item(args: dict, request: Request) -> dict:
     """Append an item to a todo list the calling agent has access to.
 
-    The agent must have access to the list (owner match).
+    Authorization is owner-based: the caller supplies owner_user_id and the
+    store verifies it matches the list's owner. agent_name is used for
+    attribution only. When TodoStore gains agent membership (#1923 follow-up),
+    the agent_name-to-owner binding will replace the owner_user_id gate.
     """
     args = args or {}
     agent_name = args.get("agent_name")
@@ -83,8 +97,9 @@ async def execute_todo_add_item(args: dict, request: Request) -> dict:
 async def execute_todo_set_done(args: dict, request: Request) -> dict:
     """Mark a todo item done (or not done) on a list the agent has access to.
 
-    The agent must have access to the list (owner match) and the item must
-    belong to the named list.
+    Authorization is owner-based (same pattern as execute_todo_add_item).
+    The agent must present a matching owner_user_id for the list, and the item
+    must belong to the named list. agent_name is used for attribution only.
     """
     args = args or {}
     agent_name = args.get("agent_name")
