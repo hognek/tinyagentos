@@ -99,13 +99,14 @@ async def execute_todo_add_item(args: dict, request: Request) -> dict:
         doc = await store.get_list(list_id)
         if doc is None:
             return {"error": "list not found"}
-        if doc.get("archived_at") is not None:
-            return {"error": "list is archived"}
         # SECURITY: owner-based auth — only the list owner can add items.
         # owner_user_id is resolved from the agent registry (when available)
-        # rather than trusted from the caller.
+        # rather than trusted from the caller. Owner check runs BEFORE the
+        # archived check so non-owners cannot learn list state.
         if doc.get("owner_user_id") != owner_user_id:
             return {"error": "agent does not have access to this list"}
+        if doc.get("archived_at") is not None:
+            return {"error": "list is archived"}
 
         item = await store.add_item(list_id, text, author=agent_name)
 
@@ -156,13 +157,14 @@ async def execute_todo_set_done(args: dict, request: Request) -> dict:
         doc = await store.get_list(list_id)
         if doc is None:
             return {"error": "list not found"}
-        if doc.get("archived_at") is not None:
-            return {"error": "list is archived"}
         # SECURITY: owner-based auth — only the list owner can mark items done.
         # owner_user_id is resolved from the agent registry (when available)
-        # rather than trusted from the caller.
+        # rather than trusted from the caller. Owner check runs BEFORE the
+        # archived check so non-owners cannot learn list state.
         if doc.get("owner_user_id") != owner_user_id:
             return {"error": "agent does not have access to this list"}
+        if doc.get("archived_at") is not None:
+            return {"error": "list is archived"}
 
         # Confine the agent to items of the list it actually belongs to.
         if not any(i.get("id") == item_id for i in doc.get("items", [])):
