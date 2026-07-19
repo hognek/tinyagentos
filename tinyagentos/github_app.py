@@ -331,3 +331,10 @@ async def delete_installation(
             "Failed to delete installation %s: %s", installation_id, exc
         )
         return None
+
+
+def _invalidate_installation_caches(app_id: str, installation_id: int) -> None:
+    """Remove cached token and repo list for a deleted installation."""
+    key = _cache_key(app_id, installation_id)
+    _token_cache.pop(key, None)
+    _repo_cache.pop(key, None)
