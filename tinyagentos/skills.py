@@ -687,21 +687,19 @@ class SkillStore(BaseStore):
                 "install_target": "tinyagentos.tools.notes_tools",
             },
             {
-                "id": "notes_set_done",
-                "name": "Set Notes Task Done",
-                "category": "notes",
-                "description": "Mark a task done or not done on a shared list the agent is a member of",
+                "id": "todo_list_lists",
+                "name": "List Todo Lists",
+                "category": "todo",
+                "description": "List the non-archived todo lists the agent has access to",
                 "tool_schema": {
-                    "name": "notes_set_done",
-                    "description": "Mark a task on a shared list done or not done. Use notes_list_shared_docs to find the doc_id and read the entry ids. The agent needs contributor or editor permission.",
+                    "name": "todo_list_lists",
+                    "description": "List the non-archived todo lists this agent has access to. Returns id, title, and updated_at for each list.",
                     "input_schema": {
                         "type": "object",
                         "properties": {
-                            "doc_id": {"type": "string", "description": "Id of the shared list (from notes_list_shared_docs)."},
-                            "entry_id": {"type": "string", "description": "Id of the task entry to mark."},
-                            "done": {"type": "boolean", "description": "True to mark done, false to reopen."},
+                            "owner_user_id": {"type": "string", "description": "The user whose todo lists to list."},
                         },
-                        "required": ["doc_id", "entry_id", "done"],
+                        "required": ["owner_user_id"],
                     },
                 },
                 "frameworks": {
@@ -710,7 +708,60 @@ class SkillStore(BaseStore):
                     "openai-agents-sdk": "adapter", "generic": "adapter",
                 },
                 "install_method": "builtin",
-                "install_target": "tinyagentos.tools.notes_tools",
+                "install_target": "tinyagentos.tools.todo_tools",
+            },
+            {
+                "id": "todo_add_item",
+                "name": "Add Todo Item",
+                "category": "todo",
+                "description": "Append a new item to a todo list the agent has access to",
+                "tool_schema": {
+                    "name": "todo_add_item",
+                    "description": "Append a new item to a todo list this agent has access to. Use todo_list_lists first to get the list_id.",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "list_id": {"type": "string", "description": "Id of the todo list (from todo_list_lists)."},
+                            "text": {"type": "string", "description": "The item text to append."},
+                            "owner_user_id": {"type": "string", "description": "The user who owns the list."},
+                        },
+                        "required": ["list_id", "text", "owner_user_id"],
+                    },
+                },
+                "frameworks": {
+                    "smolagents": "adapter", "openclaw": "adapter", "pocketflow": "adapter",
+                    "langroid": "adapter", "hermes": "adapter", "agent-zero": "adapter",
+                    "openai-agents-sdk": "adapter", "generic": "adapter",
+                },
+                "install_method": "builtin",
+                "install_target": "tinyagentos.tools.todo_tools",
+            },
+            {
+                "id": "todo_set_done",
+                "name": "Set Todo Item Done",
+                "category": "todo",
+                "description": "Mark a todo item done or not done on a list the agent has access to",
+                "tool_schema": {
+                    "name": "todo_set_done",
+                    "description": "Mark a todo item done or not done. Use todo_list_lists to find the list_id and read the item ids. The agent needs access to the list (owner match).",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {
+                            "list_id": {"type": "string", "description": "Id of the todo list (from todo_list_lists)."},
+                            "item_id": {"type": "string", "description": "Id of the todo item to mark."},
+                            "done": {"type": "boolean", "description": "True to mark done, false to reopen."},
+                            "owner_user_id": {"type": "string", "description": "The user who owns the list."},
+                        },
+                        "required": ["list_id", "item_id", "done", "owner_user_id"],
+                    },
+                },
+                "frameworks": {
+                    "smolagents": "adapter", "openclaw": "adapter", "pocketflow": "adapter",
+                    "langroid": "adapter", "hermes": "adapter", "agent-zero": "adapter",
+                    "openai-agents-sdk": "adapter", "generic": "adapter",
+                },
+                "install_method": "builtin",
+                "install_target": "tinyagentos.tools.todo_tools",
             },
 
         ]
