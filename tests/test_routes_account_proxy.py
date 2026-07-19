@@ -235,6 +235,36 @@ async def test_cluster_join_503_when_explicitly_blanked(client, monkeypatch):
     assert r.status_code == 503
 
 
+# --- Guest preauth key minting (cross-user C2) ---
+@pytest.mark.asyncio
+async def test_cluster_guest_preauth_forwards_to_upstream(client, monkeypatch):
+    """POST /api/account/cluster/join/guest-preauth forwards to
+    {base}/api/cluster/join/guest-preauth with the session cookie relayed."""
+    monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
+    captured: dict[str, str] = {}
+
+    async def handler(method, url, **kw):
+        captured["method"] = method
+        captured["url"] = url
+        captured["cookie"] = kw.get("headers", {}).get("Cookie", "")
+        captured["body"] = (kw.get("content") or b"").decode("utf-8")
+        return _FakeResp(
+            content=b'{"preauth_key":"guest-key-1","hostname":"guest-node"}',
+            headers={"content-type": "application/json"},
+        )
+
+    _patch_upstream(monkeypatch, handler)
+    r = await client.post(
+        "/api/account/cluster/join/guest-preauth",
+        json={"contact_id": "hub:hogne"},
+    )
+    assert r.status_code == 200
+    assert r.json()["preauth_key"] == "guest-key-1"
+    assert captured["url"] == "https://taos.my/api/cluster/join/guest-preauth"
+    assert captured["method"] == "POST"
+    assert "taos_session" not in captured["cookie"]
+
+
 # --- Account subdomain actions (account model slice 3) ---
 @pytest.mark.asyncio
 async def test_subdomains_check_forwards_name(client, monkeypatch):

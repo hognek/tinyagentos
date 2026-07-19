@@ -100,11 +100,32 @@ async def mesh_up(
     return {"ok": False, "detail": detail}
 
 
+_GUEST_TAG = "tag:guest"
+
+
+def _is_guest_node(node: dict) -> bool:
+    """True when a peer node carries the ``tag:guest`` tag (ACL-pinned guest)."""
+    tags: list[str] = node.get("Tags") or []
+    return _GUEST_TAG in tags
+
+
+def _guest_peer_entry(node: dict) -> dict:
+    """Extract the standard guest-peer summary from a tailscale peer dict."""
+    ips = node.get("TailscaleIPs") or []
+    return {
+        "hostname": node.get("HostName"),
+        "node_ip": ips[0] if ips else None,
+        "online": bool(node.get("Online")),
+    }
+
+
 async def mesh_status() -> dict:
     """Report mesh membership from ``tailscale status --json``. On success:
-    ``{joined, online, tailnet, node_ip, hostname}``. On the not-available /
-    error path: ``{joined: False, detail}``. Fail-soft: not-installed / not-up
-    returns ``joined=False`` with a detail, never raises."""
+    ``{joined, online, tailnet, node_ip, hostname, guests}`` where ``guests``
+    is a list of peer nodes tagged ``tag:guest`` (ACL-pinned guest instances that
+    joined this host's mesh). On the not-available / error path:
+    ``{joined: False, detail}``. Fail-soft: not-installed / not-up returns
+    ``joined=False`` with a detail, never raises."""
     if not is_tailscale_installed():
         return {"joined": False, "detail": "tailscale not installed"}
     rc, out, err = await _run(["tailscale", "status", "--json"], timeout=10.0)
@@ -119,12 +140,25 @@ async def mesh_status() -> dict:
     ips = self_node.get("TailscaleIPs") or []
     # BackendState "Running" + a Self node means we are up on the tailnet.
     joined = data.get("BackendState") == "Running" and bool(self_node)
+
+    # --- guest peer nodes (C2: cross-user guest preauth) -------------------
+    guests: list[dict] = []
+    peers = data.get("Peer") or {}
+    if isinstance(peers, dict):
+        for peer in peers.values():
+            if not isinstance(peer, dict):
+                continue
+            if _is_guest_node(peer):
+                guests.append(_guest_peer_entry(peer))
+    # ------------------------------------------------------------------------
+
     return {
         "joined": joined,
         "online": online,
         "tailnet": (data.get("CurrentTailnet") or {}).get("Name"),
         "node_ip": ips[0] if ips else None,
         "hostname": self_node.get("HostName"),
+        "guests": guests,
     }
 
 

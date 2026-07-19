@@ -66,6 +66,11 @@ _ACTIONS: dict[str, tuple[str, str]] = {
     "hub_presence_get": ("GET", "/api/hub/presence"),
     # Block asks the hub to sever the accepted edge (no more presence/hints).
     "hub_edge_revoke": ("POST", "/api/hub/edges/revoke"),
+    # Guest preauth key minting (cross-user C2). The host calls same-origin
+    # /api/account/cluster/join/guest-preauth at delegation-accept time to mint
+    # a scoped, ACL-pinned preauth key the guest instance will use to join the
+    # host's mesh. The taos.my side creates the key via the Headscale admin API.
+    "cluster_guest_preauth": ("POST", "/api/cluster/join/guest-preauth"),
 }
 
 _TIMEOUT = httpx.Timeout(15.0)
@@ -404,6 +409,23 @@ async def cluster_join_deny(request: Request, rid: str):
     if not _valid_rid(rid):
         return JSONResponse({"error": "invalid request id"}, status_code=400)
     return await _forward_to(request, "POST", f"{_JOIN_BASE}/requests/{rid}/deny")
+
+
+@router.post("/api/account/cluster/join/guest-preauth")
+async def cluster_guest_preauth(request: Request):
+    """Mint a scoped guest preauth key for a cross-user collaborator instance.
+
+    Called by the host at delegation-accept time (D1). Forwards to taos.my's
+    ``POST /api/cluster/join/guest-preauth``, which creates an ACL-pinned
+    (``tag:guest``) single-use preauth key via the Headscale admin API. The
+    forwarded body carries the guest contact identity; the response carries
+    the preauth key + hostname for the guest instance to join with.
+
+    The preauth key is stripped from any browser-facing response (same security
+    pattern as the host join poll) — the caller (peer channel, D1) delivers it
+    directly to the guest instance out-of-band.
+    """
+    return await _forward(request, "cluster_guest_preauth")
 
 
 def _persist_join_credentials(resp: Response) -> tuple[Response, dict | None]:
