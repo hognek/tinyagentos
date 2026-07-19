@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import time
 from pathlib import Path
@@ -34,7 +35,7 @@ CREATE TABLE IF NOT EXISTS secret_categories (
 );
 """
 
-DEFAULT_CATEGORIES = ["api-keys", "tokens", "credentials", "webhooks", "general", "ssh-keys"]
+DEFAULT_CATEGORIES = ["api-keys", "tokens", "credentials", "webhooks", "general", "ssh-keys", "github-installation"]
 
 # Prefix written into every Fernet-encrypted value so decrypt can distinguish
 # new (Fernet) from old (XOR) ciphertext and migrate transparently.
@@ -314,6 +315,41 @@ class SecretsStore(BaseStore):
                 "category": r[2],
                 "value": await self._dec(r[3], name=r[1], secret_id=r[0]),
                 "description": r[4],
+            })
+        return result
+
+    async def get_agent_github_installations(self, agent_name: str) -> list[dict]:
+        """Get all GitHub App installations an agent has access to.
+
+        Queries ``secret_access`` joined with ``secrets``, filtered to
+        ``category='github-installation'``.  Each returned dict contains
+        ``installation_id``, ``repo_full_name``, and ``permissions``
+        extracted from the encrypted secret value (JSON blob).
+        """
+        async with self._db.execute(
+            """
+            SELECT s.id, s.name, s.value, s.description
+            FROM secrets s
+            JOIN secret_access sa ON sa.secret_id = s.id
+            WHERE sa.agent_name = ? AND s.category = 'github-installation'
+            ORDER BY s.name
+            """,
+            (agent_name,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+
+        result = []
+        for r in rows:
+            plaintext = await self._dec(r[2], name=r[1], secret_id=r[0])
+            try:
+                meta = json.loads(plaintext)
+            except (json.JSONDecodeError, TypeError):
+                meta = {}
+            result.append({
+                "installation_id": meta.get("installation_id"),
+                "repo_full_name": meta.get("repo_full_name", ""),
+                "permissions": meta.get("permissions", []),
+                "description": r[3],
             })
         return result
 

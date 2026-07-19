@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Github, Copy, Check, ExternalLink, Trash2, Plus, Loader2, Settings, X } from "lucide-react";
+import { Github, Copy, Check, ExternalLink, Trash2, Plus, Loader2, Settings, X, Save } from "lucide-react";
 import { Button, Card, CardContent } from "@/components/ui";
 import {
   startDeviceFlow,
@@ -76,18 +76,95 @@ export function GitHubConnect() {
     [refreshInstallations],
   );
 
+  // -- Per-agent GitHub repo grants ----------------------------------
+
+  const [repoAgents, setRepoAgents] = useState<Record<string, string>>({});
+  const [savingGrants, setSavingGrants] = useState(false);
+
+  const fetchAgentGrants = useCallback(async () => {
+    // Fetch existing github-installation secrets for all known repos.
+    try {
+      const res = await fetch("/api/secrets?category=github-installation", {
+        headers: { Accept: "application/json" },
+      });
+      if (!res.ok) return;
+      const ct = res.headers.get("content-type") ?? "";
+      if (!ct.includes("application/json")) return;
+      const data = await res.json();
+      if (Array.isArray(data)) {
+        const grants: Record<string, string> = {};
+        for (const s of data) {
+          if (s.name && s.agents && s.agents.length > 0) {
+            grants[s.name] = s.agents.join(", ");
+          }
+        }
+        setRepoAgents(grants);
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  const handleSaveGrants = useCallback(
+    async (repoFullName: string, installationId: number, permissions: string[]) => {
+      setSavingGrants(true);
+      try {
+        const agentsStr = repoAgents[repoFullName] || "";
+        const agents = agentsStr
+          .split(",")
+          .map((a) => a.trim())
+          .filter(Boolean);
+
+        const body = JSON.stringify({
+          name: repoFullName,
+          category: "github-installation",
+          value: JSON.stringify({
+            installation_id: installationId,
+            repo_full_name: repoFullName,
+            permissions,
+          }),
+          description: `GitHub App installation for ${repoFullName}`,
+          agents,
+        });
+
+        // Try create first; if exists, update.
+        let res = await fetch("/api/secrets", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Accept: "application/json" },
+          body,
+        });
+        if (res.status === 409) {
+          // Already exists — update instead
+          res = await fetch(`/api/secrets/${encodeURIComponent(repoFullName)}`, {
+            method: "PUT",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify({ agents, value: JSON.stringify({
+              installation_id: installationId,
+              repo_full_name: repoFullName,
+              permissions,
+            }) }),
+          });
+        }
+      } catch { /* ignore */ }
+      finally {
+        setSavingGrants(false);
+      }
+    },
+    [repoAgents],
+  );
+
   useEffect(() => {
     refreshIdentities();
     refreshInstallations();
+    fetchAgentGrants();
 
     // Refresh when the user returns from the external GitHub App install flow
     const onFocus = () => {
       refreshIdentities();
       refreshInstallations();
+      fetchAgentGrants();
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
-  }, [refreshIdentities, refreshInstallations]);
+  }, [refreshIdentities, refreshInstallations, fetchAgentGrants]);
 
   const stopPolling = useCallback(() => {
     if (pollTimer.current) clearTimeout(pollTimer.current);
@@ -351,16 +428,47 @@ export function GitHubConnect() {
                     </Button>
                   </div>
                   {inst.repositories.length > 0 && (
-                    <div className="ml-7 space-y-1">
+                    <div className="ml-7 space-y-3">
                       {inst.repositories.map((repo) => (
-                        <div
-                          key={repo.full_name}
-                          className="flex items-center gap-1.5 text-xs text-shell-text-secondary"
-                        >
-                          <span className="text-shell-text-tertiary">
-                            {repo.private ? "🔒" : "📁"}
-                          </span>
-                          <span className="font-mono">{repo.full_name}</span>
+                        <div key={repo.full_name} className="space-y-1.5">
+                          <div className="flex items-center gap-1.5 text-xs text-shell-text-secondary">
+                            <span className="text-shell-text-tertiary">
+                              {repo.private ? "🔒" : "📁"}
+                            </span>
+                            <span className="font-mono">{repo.full_name}</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="text"
+                              placeholder="agent names, comma-separated"
+                              className="flex-1 h-8 rounded-lg border border-white/10 bg-shell-bg-deep px-2.5 text-xs text-shell-text placeholder:text-shell-text-tertiary focus:outline-none focus:border-accent/40 focus:ring-2 focus:ring-accent/20"
+                              value={repoAgents[repo.full_name] || ""}
+                              onChange={(e) =>
+                                setRepoAgents((prev) => ({
+                                  ...prev,
+                                  [repo.full_name]: e.target.value,
+                                }))
+                              }
+                              aria-label={`Agents for ${repo.full_name}`}
+                            />
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8 shrink-0"
+                              onClick={() =>
+                                handleSaveGrants(repo.full_name, inst.id, [])
+                              }
+                              aria-label={`Save agent grants for ${repo.full_name}`}
+                              title={`Save agent grants for ${repo.full_name}`}
+                              disabled={savingGrants}
+                            >
+                              {savingGrants ? (
+                                <Loader2 size={14} className="animate-spin" />
+                              ) : (
+                                <Save size={14} />
+                              )}
+                            </Button>
+                          </div>
                         </div>
                       ))}
                     </div>

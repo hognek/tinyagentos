@@ -38,6 +38,18 @@ async def get_agent_secrets(request: Request, agent_name: str):
     return secrets
 
 
+@router.get("/api/secrets/agent/{agent_name}/github")
+async def get_agent_github_grants(request: Request, agent_name: str):
+    """Return GitHub App installations granted to *agent_name*.
+
+    Each entry includes the installation_id, repo_full_name, and
+    permissions extracted from the encrypted secret value.
+    """
+    store = request.app.state.secrets
+    installations = await store.get_agent_github_installations(agent_name)
+    return installations
+
+
 @router.get("/api/secrets/{name}")
 async def get_secret(request: Request, name: str):
     store = request.app.state.secrets
