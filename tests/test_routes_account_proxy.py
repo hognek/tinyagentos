@@ -271,12 +271,15 @@ async def test_cluster_guest_preauth_forwards_and_strips_key(client, monkeypatch
     assert captured["method"] == "POST"
     assert "taos_session" not in captured["cookie"]
     # The preauth key was captured server-side for out-of-band delivery
-    # to the guest instance (D1 delegation-accept handler).
+    # to the guest instance (D1 delegation-accept handler consumes via
+    # _pop_guest_preauth_intent, which is the pop-and-evict accessor).
     from tinyagentos.routes import account_proxy
-    intent = account_proxy._guest_preauth_intents.get("hub:hogne")
+    intent = account_proxy._pop_guest_preauth_intent("hub:hogne")
     assert intent is not None, "guest preauth key was not captured server-side"
     assert intent["preauth_key"] == "guest-key-1"
     assert intent["hostname"] == "guest-node"
+    # Consumed once — a second pop returns None.
+    assert account_proxy._pop_guest_preauth_intent("hub:hogne") is None
 
 
 @pytest.mark.asyncio

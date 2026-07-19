@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import time
 
 import httpx
 from fastapi import APIRouter, Request, Response
@@ -445,10 +446,11 @@ async def cluster_guest_preauth(request: Request):
 
     # Strip the preauth key from the response so it never reaches the browser.
     # Capture the join_intent for out-of-band delivery to the guest instance
-    # via the peer channel (D1 delegation-accept handler).
+    # via the peer channel (D1 delegation-accept handler calls
+    # _pop_guest_preauth_intent to consume-and-delete).
     stripped, join_intent = _persist_join_credentials(resp)
     if join_intent:
-        _guest_preauth_intents[cid] = join_intent
+        _guest_preauth_intents[cid] = (time.monotonic(), join_intent)
     return stripped
 
 
@@ -517,7 +519,24 @@ _attempted_preauth: set[str] = set()
 # cluster_guest_preauth when taos.my mints a guest preauth key; consumed
 # by the D1 delegation-accept handler for out-of-band delivery to the guest
 # instance via the peer channel.
-_guest_preauth_intents: dict[str, dict] = {}
+#
+# Single-use keys are stale after a short window (Headscale rejects them
+# once expired), so entries auto-evict after _GUEST_PREAUTH_TTL_SECONDS.
+_GUEST_PREAUTH_TTL_SECONDS = 300  # 5 min — Headscale default expiry window
+_guest_preauth_intents: dict[str, tuple[float, dict]] = {}
+
+
+def _pop_guest_preauth_intent(cid: str) -> dict | None:
+    """Consume-and-delete a guest preauth intent. Also sweeps stale entries."""
+    now = time.monotonic()
+    # Sweep: delete all expired entries on any access.
+    expired = [k for k, (ts, _) in _guest_preauth_intents.items() if now - ts > _GUEST_PREAUTH_TTL_SECONDS]
+    for k in expired:
+        _guest_preauth_intents.pop(k, None)
+    entry = _guest_preauth_intents.pop(cid, None)
+    if entry is None or now - entry[0] > _GUEST_PREAUTH_TTL_SECONDS:
+        return None
+    return entry[1]
 
 # Keep a strong reference to in-flight background tasks so they are not
 # garbage-collected mid-run (a bare create_task() can be dropped -> "coroutine
