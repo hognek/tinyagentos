@@ -21,8 +21,10 @@ import { ElementGrid } from "./elements/ElementGrid";
 import { ElementCreateDialog } from "./elements/ElementCreateDialog";
 import styles from "./ProjectsApp.module.css";
 
-export type Tab = "workspace" | "board" | "canvas" | "tasks" | "files" | "messages" | "members" | "activity" | "decisions" | "routines";
-const TABS: Tab[] = ["workspace", "board", "canvas", "tasks", "files", "messages", "members", "activity", "decisions", "routines"];
+import { CommunityView } from "./CommunityView";
+
+export type Tab = "workspace" | "board" | "canvas" | "tasks" | "files" | "messages" | "members" | "activity" | "decisions" | "routines" | "community";
+const TABS: Tab[] = ["workspace", "board", "canvas", "tasks", "files", "messages", "members", "activity", "decisions", "routines", "community"];
 
 function isTab(value: string | undefined): value is Tab {
   return value != null && (TABS as string[]).includes(value);
@@ -387,6 +389,7 @@ export function ProjectWorkspace({ project, onChanged, initialTab, filePath }: {
         {tab === "activity" && <ProjectActivity projectId={project.id} />}
         {tab === "decisions" && <ProjectDecisions projectId={project.id} />}
         {tab === "routines" && <ProjectRoutines project={project} />}
+        {tab === "community" && <CommunityView projectId={project.id} />}
       </div>
 
       {isMobile && (tab === "tasks" || tab === "board") && (

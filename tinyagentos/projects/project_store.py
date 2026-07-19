@@ -261,8 +261,12 @@ class ProjectStore(BaseStore):
         source_agent_id: str | None = None,
         memory_seed: str = "none",
     ) -> None:
-        if member_kind not in ("native", "clone"):
+        if member_kind not in ("native", "clone", "human"):
             raise ValueError(f"invalid member_kind: {member_kind}")
+        if member_kind == "human":
+            # Human members are remote collaborators — no agent lifecycle fields.
+            memory_seed = "none"
+            source_agent_id = None
         if memory_seed not in ("none", "snapshot", "empty"):
             raise ValueError(f"invalid memory_seed: {memory_seed}")
         await self._db.execute(
