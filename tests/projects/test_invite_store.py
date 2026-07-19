@@ -663,13 +663,56 @@ async def test_mark_accepted_flips_to_redeemed(store):
         contact_id="hub:hogne",
     )
     iid = result["record"]["invite_id"]
-    # Claim it
-    await store.redeem(iid, result["pin"])
-    # mark_accepted should flip claimed → redeemed
+    # mark_accepted works directly from pending for collab invites
     await store.mark_accepted(iid, "hub:hogne")
     row = await store.get(iid)
     assert row["status"] == "redeemed"
     assert row["redeemed_by"] == "hub:hogne"
+
+
+@pytest.mark.asyncio
+async def test_mark_accepted_from_claimed(store):
+    """mark_accepted also works on claimed invites (agent flow that was claimed first)."""
+    result = await store.mint(
+        project_id="prj-1",
+        scopes=["a2a_send"],
+        approval_mode="auto",
+        check_interval_secs=1800,
+        created_by="u",
+        kind="agent",
+    )
+    iid = result["record"]["invite_id"]
+    # Claim first (agent redeem path)
+    await store.redeem(iid, result["pin"])
+    row = await store.get(iid)
+    assert row["status"] == "claimed"
+    # mark_accepted should still work from claimed
+    await store.mark_accepted(iid, "hub:hogne")
+    row = await store.get(iid)
+    assert row["status"] == "redeemed"
+    assert row["redeemed_by"] == "hub:hogne"
+
+
+@pytest.mark.asyncio
+async def test_mark_expired_pending_invite(store):
+    result = await store.mint(
+        project_id="prj-1",
+        scopes=["a2a_send"],
+        approval_mode="auto",
+        check_interval_secs=1800,
+        created_by="u",
+    )
+    iid = result["record"]["invite_id"]
+    ok = await store.mark_expired(iid)
+    assert ok is True
+    row = await store.get(iid)
+    assert row["status"] == "expired"
+
+
+@pytest.mark.asyncio
+async def test_mark_expired_nonexistent(store):
+    ok = await store.mark_expired("000000")
+    assert ok is False
 
 
 @pytest.mark.asyncio

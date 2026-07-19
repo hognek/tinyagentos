@@ -905,11 +905,13 @@ async def mint_collab_invite(
         from tinyagentos.peer import build_envelope, resolve_local_identity_id
 
         # Resolve the local hub identity and the contact's hub username.
-        contact_username = contact.get("hub_username", "")
+        contact_username = (contact.get("hub_username") or "").strip()
+        if not contact_username:
+            delivery_error = "contact has no hub_username"
         local_id = resolve_local_identity_id(request.app.state.data_dir)
         if local_id is None:
             delivery_error = "hub identity not configured"
-        else:
+        if delivery_error is None and contact_username and local_id:
             local_username = local_id.removeprefix("hub:")
             envelope_body = {
                 "invite_id": record["invite_id"],
@@ -952,7 +954,7 @@ async def mint_collab_invite(
                                     "Content-Type": "application/json",
                                 },
                             )
-                            if resp.status_code < 500:
+                            if 200 <= resp.status_code < 300:
                                 delivered = True
                                 break
                     except Exception:

@@ -397,11 +397,12 @@ class ProjectInviteStore(BaseStore):
         await self._db.commit()
 
     async def mark_accepted(self, invite_id: str, accepted_by: str) -> None:
-        """Record who accepted a collab invite and flip claimed→redeemed.
+        """Record who accepted a collab invite and flip pending→redeemed.
 
-        Same pattern as ``mark_redeemed`` but carried on the acceptance response
-        envelope rather than a redeem route call.  Only touches invites in
-        'claimed' status.
+        Collab invites are minted as 'pending' (no redeem/PIN step on the inviter
+        side — the PIN is delivered out of band to the invitee). This method
+        transitions the invite directly from 'pending' to 'redeemed', or from
+        'claimed' to 'redeemed' for invites that went through the claim flow first.
         """
         if self._db is None:
             raise RuntimeError("ProjectInviteStore not initialised")
@@ -409,7 +410,7 @@ class ProjectInviteStore(BaseStore):
             """
             UPDATE project_invites
                SET redeemed_by = ?, status = 'redeemed'
-             WHERE invite_id = ? AND status = 'claimed'
+             WHERE invite_id = ? AND status IN ('pending', 'claimed')
             """,
             (accepted_by, invite_id),
         )
@@ -425,6 +426,17 @@ class ProjectInviteStore(BaseStore):
             (invite_id,),
         )
         await self._db.commit()
+
+    async def mark_expired(self, invite_id: str) -> bool:
+        """Mark a pending invite as expired. Returns True if a row was updated."""
+        if self._db is None:
+            raise RuntimeError("ProjectInviteStore not initialised")
+        cursor = await self._db.execute(
+            "UPDATE project_invites SET status = 'expired' WHERE invite_id = ? AND status = 'pending'",
+            (invite_id,),
+        )
+        await self._db.commit()
+        return cursor.rowcount > 0
 
     async def _fetch_row(self, invite_id: str) -> aiosqlite.Row | None:
         cursor = await self._db.execute(

@@ -469,6 +469,23 @@ async def _handle_collab_response(
             return {"status": "received", "kind": kind, "dispatched": False,
                     "error": "project_store not available"}
 
+        # Verify the invite exists, is pending, and matches the project + contact.
+        if invite_store is not None:
+            invite = await invite_store.get(invite_id)
+            if invite is None:
+                return {"status": "received", "kind": kind, "dispatched": False,
+                        "error": f"invite {invite_id} not found"}
+            if invite.get("status") != "pending":
+                return {"status": "received", "kind": kind, "dispatched": False,
+                        "error": f"invite {invite_id} is not pending (status={invite.get('status')})"}
+            if invite.get("project_id") != project_id:
+                return {"status": "received", "kind": kind, "dispatched": False,
+                        "error": f"invite {invite_id} project mismatch"}
+            if invite.get("contact_id") != contact_id:
+                return {"status": "received", "kind": kind, "dispatched": False,
+                        "error": f"invite {invite_id} contact mismatch: "
+                                 f"expected {invite.get('contact_id')}, got {contact_id}"}
+
         try:
             await project_store.add_member(
                 project_id=project_id,
@@ -503,13 +520,7 @@ async def _handle_collab_response(
         # ---- Decline: mark invite as expired ----
         if invite_store is not None:
             try:
-                row = await invite_store.get(invite_id)
-                if row and row.get("status") == "pending":
-                    await invite_store._db.execute(
-                        "UPDATE project_invites SET status = 'expired' WHERE invite_id = ?",
-                        (invite_id,),
-                    )
-                    await invite_store._db.commit()
+                await invite_store.mark_expired(invite_id)
             except Exception:
                 pass  # audit best-effort
         logger.info(
