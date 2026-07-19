@@ -337,8 +337,8 @@ class TestInstallV2:
         assert "model install failed" in body["error"]
 
     @pytest.mark.asyncio
-    async def test_unknown_backend_returns_500(self, client):
-        """A backend not in _BACKEND_TO_METHOD returns 500, not an exception."""
+    async def test_unknown_backend_returns_422(self, client):
+        """A backend not in _BACKEND_TO_METHOD returns 422, not an exception."""
         manifest = _make_model_manifest(backend_id="totally-unknown-backend")
         reg = _make_registry(manifest)
         client._transport.app.state.registry = reg
@@ -353,7 +353,7 @@ class TestInstallV2:
                 "manifest_id": "test-model",
                 "variant_id": "v1",
             })
-        assert resp.status_code == 500
+        assert resp.status_code == 422
         assert "_BACKEND_TO_METHOD" in resp.json()["error"]
 
     @pytest.mark.asyncio
@@ -429,6 +429,230 @@ class TestInstallV2:
         body = resp.json()
         assert "compat" in body
         assert "chain" in body
+
+    # ------------------------------------------------------------------
+    # Code-signing tests (#647)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_tampered_manifest_rejected_403(self, client):
+        """When registry.verify_manifest_signature returns False, the
+        install is rejected with 403."""
+        from tinyagentos.store_signing import generate_signing_keypair
+
+        manifest = _make_model_manifest()
+        reg = _make_registry(manifest)
+        reg.verify_manifest_signature = MagicMock(return_value=False)
+        client._transport.app.state.registry = reg
+
+        # Provide a signing keypair so the code-signing gate is active.
+        _, pub = generate_signing_keypair()
+        client._transport.app.state.store_signing_pubkey = pub
+
+        resp = await client.post("/api/store/install-v2", json={
+            "manifest_id": "test-model",
+            "variant_id": "v1",
+        })
+        assert resp.status_code == 403
+        body = resp.json()
+        assert "manifest signature verification failed" == body["error"]
+        assert "install_id" in body
+
+    @pytest.mark.asyncio
+    async def test_valid_signature_allows_install(self, client):
+        """When registry.verify_manifest_signature returns True, the
+        install proceeds past the signing gate."""
+        from tinyagentos.store_signing import generate_signing_keypair
+
+        manifest = _make_model_manifest()
+        reg = _make_registry(manifest)
+        reg.verify_manifest_signature = MagicMock(return_value=True)
+        reg.mark_installed = MagicMock()
+        client._transport.app.state.registry = reg
+        client._transport.app.state.installed_apps = _make_installed_apps()
+
+        _, pub = generate_signing_keypair()
+        client._transport.app.state.store_signing_pubkey = pub
+
+        cap = _cpu_cap(installed_backends=("llama-cpp",))
+        with patch(
+            "tinyagentos.routes.store_install.get_device_capability",
+            new=AsyncMock(return_value=cap),
+        ), patch(
+            "tinyagentos.routes.store_install.get_installer",
+        ) as mock_get:
+            model_inst = MagicMock()
+            model_inst.install = AsyncMock(return_value={"success": True})
+            mock_get.return_value = model_inst
+
+            resp = await client.post("/api/store/install-v2", json={
+                "manifest_id": "test-model",
+                "variant_id": "v1",
+            })
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "chain" in body
+
+    @pytest.mark.asyncio
+    async def test_real_registry_detects_post_load_tampering(self, client, tmp_path):
+        """End-to-end test: a real AppRegistry detects post-load tampering.
+
+        Exercises BOTH the initial signing gate AND the install-time TOCTOU
+        re-verification guard independently:
+
+        1. First request: passes the initial gate (manifest unchanged).
+        2. Tamper the manifest on disk.
+        3. Monkeypatch the initial gate to return success, so the TOCTOU
+           re-verification is what catches the tampering.
+        4. The TOCTOU guard re-reads the manifest from disk, re-verifies the
+           stored Ed25519 signature against the now-tampered bytes, and returns
+           403 — proving the secondary guard works independently of the initial
+           gate.
+        """
+
+        from tinyagentos.registry import AppRegistry
+        from tinyagentos.store_signing import generate_signing_keypair
+
+        # 1. Create a catalog directory with one service manifest on disk.
+        catalog_dir = tmp_path / "catalog"
+        svc_dir = catalog_dir / "services" / "test-svc"
+        svc_dir.mkdir(parents=True)
+        manifest_path = svc_dir / "manifest.yaml"
+        manifest_path.write_text(
+            "id: test-svc\n"
+            "name: Test Service\n"
+            "type: service\n"
+            "version: \"1.0\"\n"
+            "install:\n"
+            "  method: download\n",
+        )
+
+        # 2. Build a real AppRegistry with a signing key.
+        priv, pub = generate_signing_keypair()
+        installed_path = tmp_path / "installed.json"
+        installed_path.write_text("[]")  # initialise with valid JSON
+        reg = AppRegistry(
+            catalog_dir=catalog_dir,
+            installed_path=installed_path,
+            signing_key=priv,
+        )
+        # Load the catalog to populate _signatures.
+        reg._ensure_loaded()
+        assert reg.get_signature("test-svc") is not None, (
+            "expected a stored signature for test-svc"
+        )
+
+        # 3. Wire the real registry into the app state.
+        client._transport.app.state.registry = reg
+        client._transport.app.state.store_signing_pubkey = pub
+        client._transport.app.state.installed_apps = _make_installed_apps()
+
+        # 4. Before tampering: the signature should verify and the install
+        # proceeds past the gate.  (The legacy installer may fail because
+        # there is no real download URL, but the HTTP status is NOT 403.)
+        resp = await client.post("/api/store/install-v2", json={
+            "manifest_id": "test-svc",
+        })
+        assert resp.status_code != 403, (
+            f"expected install to pass the signing gate, got 403: {resp.json()}"
+        )
+
+        # 5. Tamper with the manifest on disk.
+        manifest_path.write_text(
+            "id: test-svc\n"
+            "name: EVIL Service\n"
+            "type: service\n"
+            "version: \"1.0\"\n"
+            "install:\n"
+            "  method: download\n",
+        )
+
+        # 6. Monkeypatch the initial signing gate to return success so the
+        # install-time TOCTOU re-verification is what actually catches the
+        # tampering.  This proves the secondary guard works independently of
+        # the initial gate — a manifest modified between the two checks is
+        # still rejected.
+        original_verify = reg.verify_manifest_signature
+
+        def _mock_verify(app_id: str, public_pem: bytes) -> bool:
+            return True
+
+        reg.verify_manifest_signature = _mock_verify  # type: ignore[method-assign]
+
+        # 7. Now the install MUST be rejected with 403 by the TOCTOU
+        # re-verification guard, even though the initial gate was bypassed.
+        resp = await client.post("/api/store/install-v2", json={
+            "manifest_id": "test-svc",
+        })
+        assert resp.status_code == 403, (
+            f"expected 403 after tampering, got {resp.status_code}: {resp.json()}"
+        )
+        body = resp.json()
+        assert body["error"] == "manifest modified between signature verification and install"
+        assert "install_id" in body
+
+        # Restore the original so teardown is clean.
+        reg.verify_manifest_signature = original_verify  # type: ignore[method-assign]
+
+    @pytest.mark.asyncio
+    async def test_no_signing_key_skips_verification(self, client):
+        """When store_signing_pubkey is not set, the signing gate is
+        skipped and the install proceeds normally."""
+        manifest = _make_model_manifest()
+        reg = _make_registry(manifest)
+        reg.mark_installed = MagicMock()
+        client._transport.app.state.registry = reg
+        client._transport.app.state.installed_apps = _make_installed_apps()
+
+        # No store_signing_pubkey — simulates a taOS instance without
+        # signing configured (graceful degradation).
+        client._transport.app.state.store_signing_pubkey = None
+
+        cap = _cpu_cap(installed_backends=("llama-cpp",))
+        with patch(
+            "tinyagentos.routes.store_install.get_device_capability",
+            new=AsyncMock(return_value=cap),
+        ), patch(
+            "tinyagentos.routes.store_install.get_installer",
+        ) as mock_get:
+            model_inst = MagicMock()
+            model_inst.install = AsyncMock(return_value={"success": True})
+            mock_get.return_value = model_inst
+
+            resp = await client.post("/api/store/install-v2", json={
+                "manifest_id": "test-model",
+                "variant_id": "v1",
+            })
+        assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# GET /api/store/signing-pubkey
+# ---------------------------------------------------------------------------
+
+
+class TestSigningPubkey:
+    @pytest.mark.asyncio
+    async def test_returns_public_key_when_configured(self, client):
+        from tinyagentos.store_signing import generate_signing_keypair
+
+        _, pub = generate_signing_keypair()
+        client._transport.app.state.store_signing_pubkey = pub
+
+        resp = await client.get("/api/store/signing-pubkey")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "public_key_pem" in body
+        assert body["public_key_pem"] == pub.decode()
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_not_configured(self, client):
+        client._transport.app.state.store_signing_pubkey = None
+
+        resp = await client.get("/api/store/signing-pubkey")
+        assert resp.status_code == 404
+        body = resp.json()
+        assert "error" in body
 
 
 # ---------------------------------------------------------------------------

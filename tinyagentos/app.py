@@ -256,9 +256,23 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     # hardware_path / hardware_profile already loaded above before the
     # auto-register loop; don't re-probe.
     installed_path = data_dir / "installed.json"
-    registry = AppRegistry(catalog_dir=catalog_dir, installed_path=installed_path)
+
+    from tinyagentos.store_signing import (
+        load_or_create_signing_keypair as load_or_create_store_signing_keypair,
+    )
+
+    # Keypair loading is deferred to the lifespan so a read-only data_dir
+    # does not block create_app().  The registry starts with signing_key=None;
+    # the lifespan will attempt to load the keypair and call
+    # registry.set_signing_key() if it succeeds.
+    _store_priv: bytes | None = None
+    _store_pub: bytes | None = None
+    registry = AppRegistry(
+        catalog_dir=catalog_dir, installed_path=installed_path, signing_key=None,
+    )
 
     from tinyagentos.agent_registry_store import AgentRegistryStore, load_or_create_signing_keypair
+
     agent_registry_store = AgentRegistryStore(data_dir / "agent_registry.db")
     agent_registry_keypair = load_or_create_signing_keypair(data_dir)
 
@@ -1241,6 +1255,22 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
             app.state.notif_vapid_keypair = None
             logger.warning("notif web-push disabled: VAPID keypair unavailable", exc_info=True)
 
+        # Load the store signing keypair — deferred to the lifespan so a
+        # read-only data_dir does not brick startup.  When the keypair
+        # cannot be loaded, signing is silently disabled and the install
+        # gate skips signature verification.
+        try:
+            _store_priv, _store_pub = load_or_create_store_signing_keypair(data_dir)
+            if _store_priv is not None:
+                registry.set_signing_key(_store_priv)
+                app.state.store_signing_pubkey = _store_pub
+        except (OSError, PermissionError):
+            logger.warning(
+                "store signing keypair could not be created (data_dir=%s may be "
+                "read-only) — catalog signatures will not be available",
+                data_dir,
+            )
+
         # All startup init complete — allow requests through.
         app.state._startup_complete = True
         logger.info("startup complete — accepting requests")
@@ -1490,6 +1520,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.fallback = fallback
     app.state.scheduler = scheduler
     app.state.registry = registry
+    app.state.store_signing_pubkey = None  # set by lifespan
     app.state.hardware_profile = hardware_profile
     app.state.cluster_manager = cluster_manager
     app.state.task_router = task_router
