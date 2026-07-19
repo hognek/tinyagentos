@@ -270,6 +270,13 @@ async def test_cluster_guest_preauth_forwards_and_strips_key(client, monkeypatch
     assert captured["url"] == "https://taos.my/api/cluster/join/guest-preauth"
     assert captured["method"] == "POST"
     assert "taos_session" not in captured["cookie"]
+    # The preauth key was captured server-side for out-of-band delivery
+    # to the guest instance (D1 delegation-accept handler).
+    from tinyagentos.routes import account_proxy
+    intent = account_proxy._guest_preauth_intents.get("hub:hogne")
+    assert intent is not None, "guest preauth key was not captured server-side"
+    assert intent["preauth_key"] == "guest-key-1"
+    assert intent["hostname"] == "guest-node"
 
 
 @pytest.mark.asyncio

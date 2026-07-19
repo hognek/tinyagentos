@@ -444,9 +444,11 @@ async def cluster_guest_preauth(request: Request):
                              body=json.dumps({"contact_id": cid}).encode("utf-8"))
 
     # Strip the preauth key from the response so it never reaches the browser.
-    # The caller (peer channel / delegation-accept handler) must capture the key
-    # from the stripped response upstream before returning to the browser.
-    stripped, _ = _persist_join_credentials(resp)
+    # Capture the join_intent for out-of-band delivery to the guest instance
+    # via the peer channel (D1 delegation-accept handler).
+    stripped, join_intent = _persist_join_credentials(resp)
+    if join_intent:
+        _guest_preauth_intents[cid] = join_intent
     return stripped
 
 
@@ -485,7 +487,7 @@ def _persist_join_credentials(resp: Response) -> tuple[Response, dict | None]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("cluster-join: could not persist mesh credentials: %s", exc)
 
-    preauth = body.get("headscale_preauth_key")
+    preauth = body.get("preauth_key") or body.get("headscale_preauth_key")
     join_intent = None
     if preauth:
         # The Headscale node hostname; the exact value taos.my routes on is the
@@ -510,6 +512,12 @@ def _persist_join_credentials(resp: Response) -> tuple[Response, dict | None]:
 # sufficient (a process restart that loses this simply means a fresh join
 # opportunity, and the key is stale by then anyway).
 _attempted_preauth: set[str] = set()
+
+# Guest preauth keys (C2 cross-user transport). Populated by
+# cluster_guest_preauth when taos.my mints a guest preauth key; consumed
+# by the D1 delegation-accept handler for out-of-band delivery to the guest
+# instance via the peer channel.
+_guest_preauth_intents: dict[str, dict] = {}
 
 # Keep a strong reference to in-flight background tasks so they are not
 # garbage-collected mid-run (a bare create_task() can be dropped -> "coroutine
