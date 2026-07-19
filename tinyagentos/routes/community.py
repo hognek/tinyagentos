@@ -68,7 +68,7 @@ async def community_snapshot(
     board_audit = request.app.state.board_audit
 
     # Authorize: must be the project owner.
-    project = await project_store.get(project_id)
+    project = await project_store.get_project(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     if project.get("user_id") != user.user_id:
@@ -132,7 +132,7 @@ async def community_stats(
     task_store = request.app.state.project_task_store
     board_audit = request.app.state.board_audit
 
-    project = await project_store.get(project_id)
+    project = await project_store.get_project(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
     if project.get("user_id") != user.user_id:
