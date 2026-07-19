@@ -217,11 +217,12 @@ async def delete_project(
 
 
 class AddMemberIn(BaseModel):
-    mode: str  # "native" | "clone"
+    mode: str  # "native" | "clone" | "human"
     agent_id: str | None = None
     source_agent_id: str | None = None
     clone_memory: bool = True
     role: str = "member"
+    contact_id: str | None = None  # for mode="human": the contact's hub id
 
 
 @router.post("/api/projects/{project_id}/members")
@@ -251,8 +252,15 @@ async def add_member(
         member_kind = "clone"
         source_agent_id = payload.source_agent_id
         memory_seed = "snapshot" if payload.clone_memory else "empty"
+    elif payload.mode == "human":
+        if not payload.contact_id:
+            return JSONResponse({"error": "contact_id required for human members"}, status_code=400)
+        member_id = payload.contact_id
+        member_kind = "human"
+        source_agent_id = None
+        memory_seed = "none"
     else:
-        return JSONResponse({"error": "mode must be native|clone"}, status_code=400)
+        return JSONResponse({"error": "mode must be native|clone|human"}, status_code=400)
 
     await store.add_member(
         project_id=project_id,

@@ -214,11 +214,19 @@ async def peer_inbox(body: PeerEnvelope, request: Request):
     # Mark peer as seen
     await store.mark_peer_seen(contact_id)
 
-    # Log the envelope kind for debugging; the real dispatch (collab invites,
-    # chat messages, etc.) happens in later milestones.
+    # Dispatch the envelope by kind.
     kind = envelope.get("kind", "unknown")
+    body_data = envelope.get("body", {})
+
+    if kind == "collab_invite":
+        return await _handle_collab_invite(request, contact_id, envelope, body_data)
+
+    if kind in ("collab_invite_accept", "collab_invite_decline"):
+        return await _handle_collab_response(request, contact_id, envelope, body_data, kind)
+
+    # Log unrecognised kinds for debugging; they are accepted but not dispatched.
     logger.info(
-        "peer_inbox: contact=%s kind=%s nonce=%s",
+        "peer_inbox: contact=%s kind=%s nonce=%s (unrecognised kind — accepted, no dispatch)",
         contact_id, kind, envelope.get("nonce", "?"),
     )
 
@@ -338,3 +346,175 @@ async def peer_ack(body: PeerAck, request: Request):
     )
 
     return {"status": "acked", "envelope_id": body.envelope_id}
+
+
+# ---------------------------------------------------------------------------
+# Collab invite dispatch handlers
+# ---------------------------------------------------------------------------
+
+
+async def _handle_collab_invite(
+    request: Request,
+    contact_id: str,
+    envelope: dict,
+    body_data: dict,
+) -> dict:
+    """Handle an incoming collab_invite envelope — create a Decisions card
+    so the local human can accept or decline the invitation.
+
+    The envelope body is expected to contain:
+      invite_id, project_id, project_name, project_slug, inviter,
+      pin_required, display_name
+    """
+    decision_store = getattr(request.app.state, "decision_store", None)
+    if decision_store is None:
+        logger.warning(
+            "peer_inbox: collab_invite received but decision_store not available"
+        )
+        return {"status": "received", "kind": "collab_invite", "dispatched": False}
+
+    invite_id = body_data.get("invite_id", "unknown")
+    project_name = body_data.get("project_name", "unknown project")
+    inviter = body_data.get("inviter", contact_id)
+    pin_required = body_data.get("pin_required", True)
+
+    question = (
+        f"{inviter} invites you to collaborate on project "
+        f"\"{project_name}\" as a human member. "
+        "You will appear in the members list, can chat in the project, "
+        "and can later delegate agents to work on it."
+    )
+
+    options = [
+        {"label": "Accept", "value": "accept", "recommended": True,
+         "rationale": "Join the project as a collaborator"},
+        {"label": "Decline", "value": "decline",
+         "rationale": "Decline the invitation"},
+    ]
+
+    metadata: dict = {
+        "envelope_kind": "collab_invite",
+        "invite_id": invite_id,
+        "inviter": inviter,
+        "contact_id": contact_id,
+    }
+    for k in ("project_id", "project_slug", "pin_required", "display_name"):
+        if k in body_data:
+            metadata[k] = body_data[k]
+
+    try:
+        decision = await decision_store.create(
+            from_agent=f"peer:{contact_id}",
+            question=question,
+            type="approve_deny",
+            options=options,
+            priority="blocking",
+            metadata=metadata,
+        )
+        logger.info(
+            "peer_inbox: collab_invite → decision %s created for contact=%s",
+            decision["id"], contact_id,
+        )
+    except Exception as exc:
+        logger.error(
+            "peer_inbox: failed to create decision for collab_invite: %s", exc
+        )
+        return {
+            "status": "received",
+            "kind": "collab_invite",
+            "dispatched": False,
+            "error": str(exc),
+        }
+
+    return {
+        "status": "received",
+        "kind": "collab_invite",
+        "decision_id": decision["id"],
+        "dispatched": True,
+    }
+
+
+async def _handle_collab_response(
+    request: Request,
+    contact_id: str,
+    envelope: dict,
+    body_data: dict,
+    kind: str,
+) -> dict:
+    """Handle a collab invite response envelope (accept or decline).
+
+    On accept: add the contact as member_kind=\"human\" to the project.
+    On decline: mark the invite as expired.
+
+    The envelope body is expected to contain:
+      invite_id, project_id, accepted (bool)
+    """
+    invite_id = body_data.get("invite_id", "")
+    project_id = body_data.get("project_id", "")
+    accepted = body_data.get("accepted", kind == "collab_invite_accept")
+
+    if not invite_id or not project_id:
+        logger.warning(
+            "peer_inbox: %s missing invite_id or project_id from contact=%s",
+            kind, contact_id,
+        )
+        return {"status": "received", "kind": kind, "dispatched": False}
+
+    project_store = getattr(request.app.state, "project_store", None)
+    invite_store = getattr(request.app.state, "project_invites", None)
+
+    if accepted:
+        # ---- Accept: add the contact as member_kind="human" ----
+        if project_store is None:
+            return {"status": "received", "kind": kind, "dispatched": False,
+                    "error": "project_store not available"}
+
+        try:
+            await project_store.add_member(
+                project_id=project_id,
+                member_id=contact_id,
+                member_kind="human",
+                role="member",
+            )
+            await project_store.log_activity(
+                project_id, contact_id, "member.added",
+                {"member_id": contact_id, "kind": "human", "via": "collab_invite"},
+            )
+            logger.info(
+                "peer_inbox: %s → added %s as human member to project %s",
+                kind, contact_id, project_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "peer_inbox: failed to add member for %s: %s", kind, exc
+            )
+            return {
+                "status": "received", "kind": kind, "dispatched": False,
+                "error": str(exc),
+            }
+
+        # Mark the invite as redeemed.
+        if invite_store is not None:
+            try:
+                await invite_store.mark_accepted(invite_id, contact_id)
+            except Exception:
+                pass  # audit best-effort
+    else:
+        # ---- Decline: mark invite as expired ----
+        if invite_store is not None:
+            try:
+                row = await invite_store.get(invite_id)
+                if row and row.get("status") == "pending":
+                    await invite_store._db.execute(
+                        "UPDATE project_invites SET status = 'expired' WHERE invite_id = ?",
+                        (invite_id,),
+                    )
+                    await invite_store._db.commit()
+            except Exception:
+                pass  # audit best-effort
+        logger.info(
+            "peer_inbox: %s → invite %s declined by %s",
+            kind, invite_id, contact_id,
+        )
+
+    return {"status": "received", "kind": kind, "dispatched": True}

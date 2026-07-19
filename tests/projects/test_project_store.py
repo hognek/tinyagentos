@@ -165,3 +165,52 @@ async def test_backfill_only_runs_for_null_lead(tmp_path):
         assert (await s.get_project(p2["id"]))["lead_member_id"] is None
     finally:
         await s.close()
+
+
+# ---------------------------------------------------------------------------
+# B1: member_kind="human"
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_add_human_member(store):
+    p = await store.create_project(name="Shared", slug="shared", created_by="u")
+    await store.add_member(
+        p["id"],
+        member_id="hub:hogne",
+        member_kind="human",
+        role="member",
+    )
+    members = await store.list_members(p["id"])
+    assert len(members) == 1
+    assert members[0]["member_id"] == "hub:hogne"
+    assert members[0]["member_kind"] == "human"
+    assert members[0]["source_agent_id"] is None
+    assert members[0]["memory_seed"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_add_member_rejects_invalid_kind(store):
+    p = await store.create_project(name="A", slug="a", created_by="u")
+    with pytest.raises(ValueError):
+        await store.add_member(p["id"], member_id="x", member_kind="bot")
+
+
+@pytest.mark.asyncio
+async def test_human_member_can_coexist_with_native(store):
+    p = await store.create_project(name="Mixed", slug="mixed", created_by="u")
+    await store.add_member(p["id"], member_id="agent-1", member_kind="native")
+    await store.add_member(p["id"], member_id="hub:hogne", member_kind="human")
+    members = await store.list_members(p["id"])
+    assert len(members) == 2
+    kinds = {m["member_kind"] for m in members}
+    assert kinds == {"native", "human"}
+
+
+@pytest.mark.asyncio
+async def test_remove_human_member(store):
+    p = await store.create_project(name="A", slug="a", created_by="u")
+    await store.add_member(p["id"], member_id="hub:hogne", member_kind="human")
+    await store.remove_member(p["id"], "hub:hogne")
+    members = await store.list_members(p["id"])
+    assert len(members) == 0

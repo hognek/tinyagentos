@@ -261,7 +261,7 @@ class ProjectStore(BaseStore):
         source_agent_id: str | None = None,
         memory_seed: str = "none",
     ) -> None:
-        if member_kind not in ("native", "clone"):
+        if member_kind not in ("native", "clone", "human"):
             raise ValueError(f"invalid member_kind: {member_kind}")
         if memory_seed not in ("none", "snapshot", "empty"):
             raise ValueError(f"invalid memory_seed: {memory_seed}")
