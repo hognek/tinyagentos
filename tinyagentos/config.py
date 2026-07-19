@@ -57,6 +57,8 @@ class AppConfig:
     archive: dict = field(default_factory=lambda: DEFAULT_ARCHIVE_CONFIG.copy())
     memory_url: str = "http://localhost:7900"
     wallhaven_api_key: str | None = None
+    github_app_id: str = ""
+    github_app_private_key: str = ""
     config_path: Path | None = None
 
     def to_dict(self) -> dict:
@@ -76,6 +78,11 @@ class AppConfig:
             d["archive"] = self.archive
         if self.memory_url != "http://localhost:7900":
             d["memory_url"] = self.memory_url
+        if self.github_app_id:
+            d["github_app_id"] = self.github_app_id
+            d["github_app_private_key"] = self.github_app_private_key
+        elif self.github_app_private_key:
+            d["github_app_private_key"] = self.github_app_private_key
         return d
 
 # rkllama's taOS default port moved from the upstream 8080 to 7833. Installs
@@ -184,6 +191,8 @@ def load_config(path: Path) -> AppConfig:
         archived_agents=data.get("archived_agents", []),
         archive=archive_cfg,
         memory_url=data.get("memory_url", "http://localhost:7900"),
+        github_app_id=str(data.get("github_app_id", "") or ""),
+        github_app_private_key=str(data.get("github_app_private_key", "") or ""),
         config_path=path,
         wallhaven_api_key=wallhaven_api_key,
     )

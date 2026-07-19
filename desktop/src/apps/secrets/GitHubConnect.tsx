@@ -1,12 +1,16 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Github, Copy, Check, ExternalLink, Trash2, Plus, Loader2 } from "lucide-react";
+import { Github, Copy, Check, ExternalLink, Trash2, Plus, Loader2, Settings, X } from "lucide-react";
 import { Button, Card, CardContent } from "@/components/ui";
 import {
   startDeviceFlow,
   pollDeviceFlow,
   listIdentities,
   deleteIdentity,
+  listAppInstallations,
+  beginAppInstallation,
+  deleteAppInstallation,
   type GitHubIdentity,
+  type GitHubAppInstallation,
 } from "@/lib/github";
 
 type FlowState =
@@ -29,6 +33,11 @@ export function GitHubConnect() {
   const [flow, setFlow] = useState<FlowState>({ phase: "idle" });
   const [copied, setCopied] = useState(false);
 
+  // GitHub App installations state
+  const [installations, setInstallations] = useState<GitHubAppInstallation[]>([]);
+  const [installsLoading, setInstallsLoading] = useState(false);
+  const [installing, setInstalling] = useState(false);
+
   // Refs so the polling loop can be cancelled cleanly on unmount / restart.
   const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const expiryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -37,9 +46,48 @@ export function GitHubConnect() {
     setIdentities(await listIdentities());
   }, []);
 
+  const refreshInstallations = useCallback(async () => {
+    setInstallsLoading(true);
+    try {
+      setInstallations(await listAppInstallations());
+    } finally {
+      setInstallsLoading(false);
+    }
+  }, []);
+
+  const handleAppInstall = useCallback(async () => {
+    setInstalling(true);
+    try {
+      const url = await beginAppInstallation();
+      if (url) {
+        window.open(url, "_blank");
+      }
+    } finally {
+      setInstalling(false);
+    }
+  }, []);
+
+  const handleAppUninstall = useCallback(
+    async (installationId: number) => {
+      if (await deleteAppInstallation(installationId)) {
+        await refreshInstallations();
+      }
+    },
+    [refreshInstallations],
+  );
+
   useEffect(() => {
     refreshIdentities();
-  }, [refreshIdentities]);
+    refreshInstallations();
+
+    // Refresh when the user returns from the external GitHub App install flow
+    const onFocus = () => {
+      refreshIdentities();
+      refreshInstallations();
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
+  }, [refreshIdentities, refreshInstallations]);
 
   const stopPolling = useCallback(() => {
     if (pollTimer.current) clearTimeout(pollTimer.current);
@@ -241,6 +289,92 @@ export function GitHubConnect() {
             ))}
           </ul>
         )}
+
+        {/* GitHub App Installations */}
+        <div className="rounded-lg border border-white/10 bg-shell-bg-deep p-4 space-y-3">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Settings size={16} className="text-shell-text-secondary" />
+              <h3 className="text-sm font-medium text-shell-text">GitHub App</h3>
+            </div>
+            <Button
+              size="sm"
+              onClick={handleAppInstall}
+              disabled={installing}
+              aria-label="Install GitHub App on repos"
+            >
+              {installing ? (
+                <Loader2 size={14} className="animate-spin" />
+              ) : (
+                <Plus size={14} />
+              )}
+              {installing ? "Opening..." : "Install on repos"}
+            </Button>
+          </div>
+
+          {installsLoading ? (
+            <div className="flex items-center gap-2 text-sm text-shell-text-secondary">
+              <Loader2 size={14} className="animate-spin" />
+              Loading installations...
+            </div>
+          ) : installations.length > 0 ? (
+            <ul className="space-y-3" aria-label="GitHub App installations">
+              {installations.map((inst) => (
+                <li key={inst.id} className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      {inst.account.avatar_url ? (
+                        <img
+                          src={inst.account.avatar_url}
+                          alt=""
+                          className="h-5 w-5 rounded-full shrink-0"
+                        />
+                      ) : (
+                        <div className="h-5 w-5 rounded-full bg-white/10 shrink-0" />
+                      )}
+                      <span className="text-sm font-medium text-shell-text">
+                        {inst.account.login}
+                      </span>
+                      <span className="text-xs text-shell-text-tertiary capitalize">
+                        ({inst.account.type})
+                      </span>
+                    </div>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => handleAppUninstall(inst.id)}
+                      className="h-7 w-7 hover:text-red-400 hover:bg-red-500/15"
+                      aria-label={`Uninstall ${inst.account.login}`}
+                      title="Uninstall"
+                    >
+                      <X size={14} />
+                    </Button>
+                  </div>
+                  {inst.repositories.length > 0 && (
+                    <div className="ml-7 space-y-1">
+                      {inst.repositories.map((repo) => (
+                        <div
+                          key={repo.full_name}
+                          className="flex items-center gap-1.5 text-xs text-shell-text-secondary"
+                        >
+                          <span className="text-shell-text-tertiary">
+                            {repo.private ? "🔒" : "📁"}
+                          </span>
+                          <span className="font-mono">{repo.full_name}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="text-xs text-shell-text-tertiary">
+              No GitHub App installations yet. Click "Install on repos" to give
+              taOS access to your repositories.
+            </p>
+          )}
+        </div>
       </CardContent>
     </Card>
   );

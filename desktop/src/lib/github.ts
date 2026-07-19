@@ -257,3 +257,69 @@ export async function deleteIdentity(id: string): Promise<boolean> {
   );
   return res.ok;
 }
+
+/* ------------------------------------------------------------------ */
+/*  GitHub App Installations                                           */
+/* ------------------------------------------------------------------ */
+
+export interface GitHubAppRepo {
+  full_name: string;
+  name: string;
+  private: boolean;
+  description: string;
+}
+
+export interface GitHubAppInstallation {
+  id: number;
+  account: {
+    login: string;
+    type: string;
+    avatar_url: string;
+  };
+  repository_selection: string;
+  repositories: GitHubAppRepo[];
+  created_at: string;
+}
+
+export interface AppInstallationList {
+  installations: GitHubAppInstallation[];
+}
+
+export interface AppInstallUrl {
+  install_url: string;
+}
+
+export async function listAppInstallations(): Promise<GitHubAppInstallation[]> {
+  const data = await fetchJson<AppInstallationList>(
+    "/api/github/app/installations",
+    { installations: [] },
+  );
+  return Array.isArray(data.installations) ? data.installations : [];
+}
+
+export async function beginAppInstallation(): Promise<string | null> {
+  try {
+    const res = await fetch(
+      "/api/github/app/install",
+      withCsrf({
+        method: "POST",
+        headers: { Accept: "application/json" },
+      }),
+    );
+    if (!res.ok) return null;
+    const ct = res.headers.get("content-type") ?? "";
+    if (!ct.includes("application/json")) return null;
+    const data: AppInstallUrl = await res.json();
+    return data.install_url || null;
+  } catch {
+    return null;
+  }
+}
+
+export async function deleteAppInstallation(installationId: number): Promise<boolean> {
+  const res = await fetch(
+    `/api/github/app/installations/${installationId}`,
+    withCsrf({ method: "DELETE", headers: { Accept: "application/json" } }),
+  );
+  return res.ok;
+}
