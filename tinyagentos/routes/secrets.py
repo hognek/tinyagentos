@@ -44,7 +44,16 @@ async def get_agent_github_grants(request: Request, agent_name: str):
 
     Each entry includes the installation_id, repo_full_name, and
     permissions extracted from the encrypted secret value.
+
+    The caller is authenticated by the CSRF middleware applied to the
+    entire secrets router (see ``routes/__init__.py``).  The *agent_name*
+    path parameter is validated to reject path-traversal characters.
     """
+    # Reject agent names that contain path separators or traversal sequences
+    if not agent_name or "/" in agent_name or "\\" in agent_name or ".." in agent_name:
+        return JSONResponse(
+            {"error": "Invalid agent name"}, status_code=400
+        )
     store = request.app.state.secrets
     installations = await store.get_agent_github_installations(agent_name)
     return installations

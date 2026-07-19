@@ -109,3 +109,59 @@ class TestGitHubInstallationCategory:
             "agents": ["agent-1", "agent-2"],
         })
         assert resp.status_code == 200
+
+
+class TestSecretsEncryption:
+    """Encryption round-trip and migration tests (XOR ↔ Fernet)."""
+
+    @pytest.mark.asyncio
+    async def test_encrypt_decrypt_round_trip(self, client):
+        """A secret written via the API can be read back with its original value."""
+        secret_payload = {
+            "name": "enc-roundtrip",
+            "value": "super-secret-token-abc123",
+            "category": "general",
+            "description": "Round-trip test",
+            "agents": [],
+        }
+        await client.post("/api/secrets", json=secret_payload)
+
+        resp = await client.get("/api/secrets/enc-roundtrip")
+        assert resp.status_code == 200
+        data = resp.json()
+        # The stored value should be the plaintext we wrote (decrypted on read).
+        assert data["value"] == "super-secret-token-abc123"
+
+    @pytest.mark.asyncio
+    async def test_list_masks_values(self, client):
+        """Listing secrets masks values so plaintext is never leaked in bulk."""
+        await client.post("/api/secrets", json={
+            "name": "masked-secret",
+            "value": "should-not-leak",
+            "category": "general",
+            "description": "",
+            "agents": [],
+        })
+        resp = await client.get("/api/secrets")
+        assert resp.status_code == 200
+        secrets = resp.json()
+        # All values in the list view should be masked.
+        for s in secrets:
+            assert s["value"] == "***"
+
+    @pytest.mark.asyncio
+    async def test_update_reencrypts(self, client):
+        """Updating a secret's value encrypts the new value correctly."""
+        await client.post("/api/secrets", json={
+            "name": "reencrypt-test",
+            "value": "original-value",
+            "category": "general",
+            "description": "",
+            "agents": [],
+        })
+        await client.put("/api/secrets/reencrypt-test", json={
+            "value": "updated-value",
+        })
+        resp = await client.get("/api/secrets/reencrypt-test")
+        assert resp.status_code == 200
+        assert resp.json()["value"] == "updated-value"

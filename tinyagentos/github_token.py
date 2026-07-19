@@ -40,8 +40,9 @@ def _cache_key(app_id: str, installation_id: int) -> str:
 
 def _evict_if_full() -> None:
     if len(_lifetime_cache) >= _MAX_CACHE_SIZE:
-        oldest = next(iter(_lifetime_cache))
-        del _lifetime_cache[oldest]
+        # Evict the entry with the oldest expiry timestamp (LRU by deadline)
+        oldest_key = min(_lifetime_cache, key=lambda k: _lifetime_cache[k][1])
+        del _lifetime_cache[oldest_key]
 
 
 def _cached_token_lifetime(key: str) -> str | None:
@@ -131,11 +132,18 @@ async def get_agent_github_token(
     """Return a short-lived GitHub token for *agent_name*, or None.
 
     Looks up all ``github-installation`` secrets the agent is granted
-    access to via ``SecretsStore.get_agent_github_installations()``,
-    picks the first active installation, and mints a token.
+    access to via ``SecretsStore.get_agent_github_installations()`` and
+    tries each installation in turn until a token is successfully minted.
+
+    The minted token is scoped to the **entire** installation (all repos
+    the installation can access), not to individual repos.  Per-repo
+    grants in the UI reflect which agents can *request* a token; the
+    backend does not currently enforce per-repo token scoping via GitHub's
+    ``repository_ids`` parameter — that is tracked as a future enhancement.
 
     Returns None if the agent has no GitHub App access grants, the
-    GitHub App is not configured, or token minting fails.
+    GitHub App is not configured, or token minting fails for all
+    installations.
     """
     if not config.github_app_id or not config.github_app_private_key:
         return None
@@ -144,18 +152,22 @@ async def get_agent_github_token(
     if not installations:
         return None
 
-    # Use the first granted installation.
-    inst = installations[0]
-    iid = inst.get("installation_id")
-    repo = inst.get("repo_full_name", "")
+    # Try each granted installation until we mint a valid token.
+    for inst in installations:
+        iid = inst.get("installation_id")
+        repo = inst.get("repo_full_name", "")
 
-    if not iid:
-        return None
+        if not iid:
+            continue
 
-    return await mint_installation_token(
-        installation_id=iid,
-        repo=repo,
-        app_id=config.github_app_id,
-        private_key=config.github_app_private_key,
-        http_client=http_client,
-    )
+        token = await mint_installation_token(
+            installation_id=iid,
+            repo=repo,
+            app_id=config.github_app_id,
+            private_key=config.github_app_private_key,
+            http_client=http_client,
+        )
+        if token:
+            return token
+
+    return None

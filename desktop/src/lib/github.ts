@@ -277,6 +277,7 @@ export interface GitHubAppInstallation {
     avatar_url: string;
   };
   repository_selection: string;
+  permissions: Record<string, string>;
   repositories: GitHubAppRepo[];
   created_at: string;
 }

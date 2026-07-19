@@ -326,6 +326,7 @@ async def list_app_installations(request: Request):
                 "avatar_url": account.get("avatar_url", ""),
             },
             "repository_selection": inst.get("repository_selection", "selected"),
+            "permissions": inst.get("permissions", {}),
             "repositories": [
                 {
                     "full_name": r.get("full_name", ""),

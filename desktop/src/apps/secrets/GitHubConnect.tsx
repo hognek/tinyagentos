@@ -79,7 +79,7 @@ export function GitHubConnect() {
   // -- Per-agent GitHub repo grants ----------------------------------
 
   const [repoAgents, setRepoAgents] = useState<Record<string, string>>({});
-  const [savingGrants, setSavingGrants] = useState(false);
+  const [savingGrants, setSavingGrants] = useState<Set<string>>(new Set());
 
   const fetchAgentGrants = useCallback(async () => {
     // Fetch existing github-installation secrets for all known repos.
@@ -104,8 +104,8 @@ export function GitHubConnect() {
   }, []);
 
   const handleSaveGrants = useCallback(
-    async (repoFullName: string, installationId: number, permissions: string[]) => {
-      setSavingGrants(true);
+    async (repoFullName: string, installationId: number, permissions: Record<string, string>) => {
+      setSavingGrants((prev) => new Set(prev).add(repoFullName));
       try {
         const agentsStr = repoAgents[repoFullName] || "";
         const agents = agentsStr
@@ -145,7 +145,11 @@ export function GitHubConnect() {
         }
       } catch { /* ignore */ }
       finally {
-        setSavingGrants(false);
+        setSavingGrants((prev) => {
+          const next = new Set(prev);
+          next.delete(repoFullName);
+          return next;
+        });
       }
     },
     [repoAgents],
@@ -456,13 +460,13 @@ export function GitHubConnect() {
                               size="icon"
                               className="h-8 w-8 shrink-0"
                               onClick={() =>
-                                handleSaveGrants(repo.full_name, inst.id, [])
+                                handleSaveGrants(repo.full_name, inst.id, inst.permissions ?? {})
                               }
                               aria-label={`Save agent grants for ${repo.full_name}`}
                               title={`Save agent grants for ${repo.full_name}`}
-                              disabled={savingGrants}
+                              disabled={savingGrants.has(repo.full_name)}
                             >
-                              {savingGrants ? (
+                              {savingGrants.has(repo.full_name) ? (
                                 <Loader2 size={14} className="animate-spin" />
                               ) : (
                                 <Save size={14} />
