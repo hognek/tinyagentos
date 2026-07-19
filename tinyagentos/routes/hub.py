@@ -35,6 +35,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from tinyagentos.auth_context import CurrentUser, current_user
+from tinyagentos.contacts_store import generate_peer_token
 from tinyagentos.hub import identity, posts, relationships, store as hub_store
 from tinyagentos.routes.account_proxy import _forward_to
 
@@ -93,6 +94,93 @@ async def _get_store(request: Request) -> hub_store.HubStore:
     await store.init()
     request.app.state.hub_store = store
     return store
+
+
+async def _try_handshake(
+    request: Request,
+    directory_resp: dict,
+    peer_fingerprint: str,
+) -> None:
+    """Establish a peer channel on friend-accept (collab A2).
+
+    Extracts the peer's Ed25519/X25519 pubkeys and advertised endpoints
+    from the directory response.  Falls back to the local hub_authors
+    table for pubkeys when the directory omits them.
+
+    On success a contact row is created (or refreshed) and a peer link is
+    established with a freshly minted inbound token.  Failures are
+    logged but never block the accept — the accept always succeeds even
+    when the handshake side-effect temporarily can't complete.
+    """
+    contacts_store = getattr(request.app.state, "contacts_store", None)
+    if contacts_store is None:
+        return
+
+    username = directory_resp.get("username") or directory_resp.get("target") or ""
+    if not username:
+        # Can't form a contact_id without a username.
+        return
+
+    contact_id = f"hub:{username}"
+
+    # Pubkeys: directory first, then local hub_authors cache.
+    ed25519_pub = directory_resp.get("signing_pubkey") or ""
+    x25519_pub = directory_resp.get("encryption_pubkey") or ""
+
+    if not ed25519_pub or not x25519_pub:
+        # Fall back to hub_authors (populated during friend-request flow).
+        hub_store = await _get_store(request)
+        author = await hub_store.get_author(peer_fingerprint) if peer_fingerprint else None
+        if author:
+            ed25519_pub = ed25519_pub or author.get("signing_pubkey", "")
+            x25519_pub = x25519_pub or author.get("encryption_pubkey", "")
+
+    if not ed25519_pub or not x25519_pub:
+        logger.warning(
+            "friend-accept handshake skipped: no pubkeys for %s", contact_id
+        )
+        return
+
+    display_name = directory_resp.get("display_name") or username
+    endpoints = directory_resp.get("endpoints")
+    if isinstance(endpoints, str):
+        try:
+            endpoints = json.loads(endpoints)
+        except (ValueError, TypeError):
+            endpoints = []
+    if not isinstance(endpoints, list):
+        endpoints = []
+
+    try:
+        # Create/refresh the contact row (trust-on-first-use key pinning).
+        await contacts_store.add_contact(
+            contact_id=contact_id,
+            hub_username=username,
+            display_name=display_name,
+            ed25519_pub=ed25519_pub,
+            x25519_pub=x25519_pub,
+        )
+
+        # Mint the inbound token WE give to the remote instance.
+        inbound_token = generate_peer_token()
+        # The outbound_token is the token THEY mint for us — we don't have it
+        # until the first handshake reply arrives.  Store an empty placeholder
+        # so the peer link row exists; the first handshake reply (future A3)
+        # updates this field.
+        outbound_token = ""
+
+        await contacts_store.establish_peer_link(
+            contact_id=contact_id,
+            inbound_token=inbound_token,
+            outbound_token=outbound_token,
+            endpoints=endpoints,
+        )
+        logger.info(
+            "friend-accept handshake: contact=%s endpoints=%s",
+            contact_id, endpoints,
+        )
+    except Exception:
+        logger.exception("friend-accept handshake failed for %s", contact_id)
 
 
 # --- slice 2: own profile ---------------------------------------------------
@@ -323,6 +411,15 @@ async def accept_friend_request(
         await store.put_relationship(
             peer, relationships.REL_FRIEND, statement=statement
         )
+
+    # --- A2: friend-accept -> contact row + peer-link handshake ---
+    # The directory response carries the peer's identity material (pubkeys,
+    # endpoints) so we can establish the peer channel immediately on accept.
+    # When the directory omits these fields, we fall back to the locally cached
+    # hub_authors record (populated during the friend-request flow).
+    if peer:
+        await _try_handshake(request, resp, peer)
+
     return {"state": "accepted", "peer": peer, "directory": resp}
 
 
@@ -387,6 +484,20 @@ async def block_peer(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("hub block: directory edge revoke failed: %s", exc)
+
+    # Cascade to contacts: revoke the peer link so the blocked contact can no
+    # longer authenticate on the peer channel (A2 subscribe-to-block).
+    # The peer fingerprint is a hub signing key fingerprint; resolve it to a
+    # contact_id (hub:username) via the hub_authors cache.
+    contacts_store = getattr(request.app.state, "contacts_store", None)
+    if contacts_store is not None:
+        try:
+            author = await store.get_author(peer)
+            if author and author.get("username"):
+                await contacts_store.revoke_peer_link(f"hub:{author['username']}")
+        except Exception:
+            logger.exception("hub block: contacts-store cascade failed for %s", peer)
+
     return {"state": "blocked", "peer": peer, "severed": severed}
 
 
