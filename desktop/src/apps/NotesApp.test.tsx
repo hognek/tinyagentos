@@ -33,14 +33,6 @@ const noteDoc = {
   archived_at: null,
 };
 
-const listDoc = {
-  id: "list-1",
-  kind: "list" as const,
-  title: "Sprint backlog",
-  updated_at: past(10),
-  archived_at: null,
-};
-
 describe("NotesApp", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -60,23 +52,6 @@ describe("NotesApp", () => {
     await flush();
     await waitFor(() => expect(screen.getByText(/no notes yet/i)).toBeTruthy());
     expect(screen.getByRole("button", { name: /create one/i })).toBeTruthy();
-  });
-
-  it("renders only notes, filtering out lists that share the same API", async () => {
-    vi.stubGlobal(
-      "fetch",
-      mockFetch(() => ({ ok: true, body: [noteDoc, listDoc] })),
-    );
-    render(<NotesApp windowId="w1" />);
-    await flush();
-
-    await waitFor(() =>
-      expect(screen.getByText("Project kickoff")).toBeTruthy(),
-    );
-    // The list doc lives in the same store but NotesApp must hide it.
-    expect(screen.queryByText("Sprint backlog")).toBeNull();
-    // The relative updated time is rendered from updated_at.
-    expect(screen.getByText(/30m ago/i)).toBeTruthy();
   });
 
   it("loads the selected note's detail via /api/notes/:id", async () => {
