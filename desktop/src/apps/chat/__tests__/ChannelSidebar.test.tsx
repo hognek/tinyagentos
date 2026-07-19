@@ -50,11 +50,6 @@ function makeSection(label: string, channels: Channel[]): SectionDef {
   return { label, icon: <span data-testid={`icon-${label}`} />, items: channels };
 }
 
-function noop(): void {}
-function noopFn() {
-  return noop;
-}
-
 function buildProps(overrides: Partial<ChannelSidebarProps> = {}): ChannelSidebarProps {
   return {
     isMobile: false,
@@ -155,8 +150,6 @@ describe("ChannelSidebar — desktop", () => {
       />,
     );
     // The text "None yet" should NOT be visible because the section body is hidden
-    const body = container.querySelector(".flex.flex-col.gap-px");
-    // "None yet" text is inside a div sibling of the button row container, not inside .flex.flex-col.gap-px
     expect(screen.queryByText("None yet")).not.toBeInTheDocument();
   });
 
@@ -234,16 +227,28 @@ describe("ChannelSidebar — channel type icons", () => {
   it("renders Hash icon for topic channels", () => {
     const ch = makeChannel({ type: "topic" });
     const sections = [makeSection("Topics", [ch])];
-    render(<ChannelSidebar {...buildProps({ sections })} />);
+    const { container } = render(
+      <ChannelSidebar {...buildProps({ sections })} />,
+    );
     expect(screen.getByText(ch.name)).toBeInTheDocument();
+    // Verify the lucide Hash SVG icon is rendered inside the channel row
+    const channelRow = screen.getByLabelText(`Channel ${ch.name}`);
+    expect(channelRow.querySelector("svg")).toBeTruthy();
   });
 
   it("renders MessageAvatar for DM channels with an agent member", () => {
     const ch = makeDmChannel();
     const sections = [makeSection("DMs", [ch])];
-    render(<ChannelSidebar {...buildProps({ sections })} />);
-    // MessageAvatar renders an img with alt text matching the agent name
+    const { container } = render(
+      <ChannelSidebar {...buildProps({ sections })} />,
+    );
     expect(screen.getByText(ch.name)).toBeInTheDocument();
+    // Verify the MessageAvatar is rendered inside the DM channel row
+    // (it renders a div with aria-hidden="true")
+    const channelRow = screen.getByLabelText(`Channel ${ch.name}`);
+    expect(
+      channelRow.querySelector("[aria-hidden]"),
+    ).toBeTruthy();
   });
 
   it("renders Bot icon for A2A channels", () => {
@@ -269,9 +274,12 @@ describe("ChannelSidebar — mobile", () => {
       <ChannelSidebar {...buildProps({ isMobile: true, wsStatus: "connected" })} />,
     );
     expect(screen.getByText("Connected")).toBeInTheDocument();
-    // Mobile uses inline styles — verify the wrapper div style
+    // Mobile uses inline styles — verify the wrapper div padding via longhands
+    // (jsdom re-serialises shorthands; asserting longhands is stable across versions)
     const mobileContainer = container.firstChild as HTMLElement;
-    expect(mobileContainer.style.padding).toBe("8px 0px 16px");
+    expect(mobileContainer.style.paddingTop).toBe("8px");
+    expect(mobileContainer.style.paddingRight).toBe("0px");
+    expect(mobileContainer.style.paddingBottom).toBe("16px");
   });
 
   it("renders empty state on mobile", () => {
