@@ -381,9 +381,11 @@ async def hub_relay_drop(request: Request):
     body = await request.body()
     try:
         payload = json.loads(body)
-        recipient = str(payload.get("recipient", ""))
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return JSONResponse({"error": "invalid body"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+    recipient = str(payload.get("recipient", ""))
     if not _valid_hub_recipient(recipient):
         return JSONResponse({"error": "invalid recipient"}, status_code=400)
     return await _forward_to(request, "POST", _ACTIONS["hub_relay_drop"][1], body=body)

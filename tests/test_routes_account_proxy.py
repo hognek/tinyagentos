@@ -779,6 +779,23 @@ async def test_hub_relay_drop_rejects_invalid_recipient(client, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_hub_relay_drop_rejects_non_dict_body(client, monkeypatch):
+    """A JSON array (or any non-dict) body is rejected 400 before forwarding."""
+    monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
+
+    async def handler(method, url, **kw):
+        pytest.fail("must not be called for non-dict body")
+
+    _patch_upstream(monkeypatch, handler)
+    r = await client.post(
+        "/api/account/hub/relay/drop",
+        json=[1, 2, 3],
+    )
+    assert r.status_code == 400
+    assert "invalid body" in r.json()["error"].lower()
+
+
+@pytest.mark.asyncio
 async def test_hub_relay_poll_rejects_invalid_recipient(client, monkeypatch):
     """An invalid recipient (path injection) is rejected 400 before forwarding."""
     monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
