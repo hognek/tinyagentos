@@ -25,13 +25,15 @@ CREATE TABLE IF NOT EXISTS contacts (
 
 CREATE TABLE IF NOT EXISTS peer_links (
     contact_id              TEXT PRIMARY KEY REFERENCES contacts(contact_id),
-    inbound_token_hash      TEXT NOT NULL,    -- token WE minted for their instance (SHA-256)
+    inbound_token_hash      TEXT NOT NULL UNIQUE,  -- token WE minted for their instance (SHA-256); indexed for lookup
     outbound_token          TEXT NOT NULL,    -- token THEY minted for us (stored in plaintext; encryption deferred to post-MVP)
     endpoints               TEXT NOT NULL DEFAULT '[]',  -- JSON list of advertised endpoints
     established_at          REAL NOT NULL,
     last_seen_at            REAL,
     revoked_at              REAL
 );
+
+CREATE INDEX IF NOT EXISTS idx_peer_links_token_hash ON peer_links(inbound_token_hash);
 
 CREATE TABLE IF NOT EXISTS peer_nonces (
     nonce                   TEXT NOT NULL,       -- 16-byte hex nonce from envelope
@@ -257,15 +259,8 @@ class ContactsStore(BaseStore):
             return True
         except sqlite3.IntegrityError:
             # Nonce already exists for this (contact_id, kind) — replay detected.
+            await self._db.rollback()
             return False
-
-    async def is_nonce_seen(self, nonce: str) -> bool:
-        """Return True if this nonce has already been recorded."""
-        async with self._db.execute(
-            "SELECT 1 FROM peer_nonces WHERE nonce = ?", (nonce,)
-        ) as cursor:
-            row = await cursor.fetchone()
-        return row is not None
 
     async def mark_peer_seen(self, contact_id: str) -> None:
         """Update last_seen_at for the peer link (called on every valid request)."""

@@ -672,12 +672,12 @@ class TestPeerRoutes:
         """Peer routes should work without a CSRF token (bearer-only auth)."""
         store = app_with_contacts.state.contacts_store
         await store.add_contact(
-            contact_id="hub:hogne", hub_username="hogne", display_name="H",
+            contact_id="hub:csrf-test", hub_username="csrf-test", display_name="C",
             ed25519_pub="pk", x25519_pub="ek",
         )
         inbound = generate_peer_token()
         await store.establish_peer_link(
-            contact_id="hub:hogne",
+            contact_id="hub:csrf-test",
             inbound_token=inbound,
             outbound_token=generate_peer_token(),
         )
@@ -685,11 +685,11 @@ class TestPeerRoutes:
         # POST without CSRF header — should NOT get 403 CSRF error
         resp = await client_with_contacts.post(
             "/api/peer/ack",
-            json={"envelope_id": "test-nonce", "contact_id": "hub:hogne"},
+            json={"envelope_id": "test-nonce", "contact_id": "hub:csrf-test"},
             headers={"Authorization": f"Bearer {inbound}"},
         )
         # Won't be 403 CSRF — auth passes even without CSRF header
-        assert resp.status_code != 403
+        assert resp.status_code == 200
 
     async def test_ack_endpoint(self, client_with_contacts, app_with_contacts):
         store = app_with_contacts.state.contacts_store

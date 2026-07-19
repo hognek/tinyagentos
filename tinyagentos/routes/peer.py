@@ -12,6 +12,7 @@ POST /api/peer/ack     — acknowledge delivery of an envelope
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -177,7 +178,7 @@ async def peer_inbox(body: PeerEnvelope, request: Request):
         )
 
     # Verify recipient: envelope["to"] must match the local hub identity.
-    local_id = resolve_local_identity_id(request.app.state.data_dir)
+    local_id = await asyncio.to_thread(resolve_local_identity_id, request.app.state.data_dir)
     if local_id is None:
         raise HTTPException(status_code=503, detail="hub identity not configured")
     to_field = envelope.get("to", "")
@@ -270,7 +271,7 @@ async def peer_chat(body: PeerEnvelope, request: Request):
         )
 
     # Verify recipient: envelope["to"] must match the local hub identity.
-    local_id = resolve_local_identity_id(request.app.state.data_dir)
+    local_id = await asyncio.to_thread(resolve_local_identity_id, request.app.state.data_dir)
     if local_id is None:
         raise HTTPException(status_code=503, detail="hub identity not configured")
     to_field = envelope.get("to", "")
@@ -318,6 +319,13 @@ async def peer_ack(body: PeerAck, request: Request):
     """
     contact_id = await _authenticate_peer(request)
     store = request.app.state.contacts_store
+
+    # The ack must come from the contact named in the body.
+    if body.contact_id != contact_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"contact_id {body.contact_id!r} does not match authenticated contact {contact_id!r}",
+        )
 
     if not _rate_limit_ok(contact_id):
         raise HTTPException(status_code=429, detail="rate limit exceeded")

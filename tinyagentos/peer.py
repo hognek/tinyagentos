@@ -97,7 +97,8 @@ def verify_envelope(
     1. Required fields present (from, to, kind, ts, nonce, sig).
     2. Timestamp is within ``max_age_seconds`` of now (replay window).
     3. ``expected_kind`` matches if provided.
-    4. Signature verifies against the sender's pubkey.
+    (The caller must separately verify the Ed25519 signature against the
+     sender's pinned pubkey via ``verify_envelope_signature``.)
     """
     required = ("from", "to", "kind", "ts", "nonce", "sig")
     for field in required:
@@ -201,15 +202,18 @@ def resolve_local_identity_id(data_dir: str | Path | None = None) -> str | None:
     if not hub_db.is_file():
         return None
 
+    conn = None
     try:
         conn = sqlite3.connect(str(hub_db))
         row = conn.execute(
             "SELECT username FROM hub_authors WHERE fingerprint = ?",
             (fp,),
         ).fetchone()
-        conn.close()
         if row and row[0]:
             return f"hub:{row[0]}"
-    except Exception:
+    except (sqlite3.OperationalError, sqlite3.DatabaseError):
         pass
+    finally:
+        if conn is not None:
+            conn.close()
     return None
