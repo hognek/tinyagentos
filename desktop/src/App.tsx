@@ -134,42 +134,28 @@ function SystemShortcuts({ toggleSearch, toggleLaunchpad, toggleAssistant }: Sys
         throw new Error(`Server returned ${resp.status}`);
       }
       const data = await resp.json();
-      // Check for individual agent failures in both results and force_kill_results
-      const results = data.results ?? {};
-      const forceKillResults = data.force_kill_results ?? {};
-      const stopFailures = Object.entries(results).filter(
-        ([, r]: [string, unknown]) =>
-          r && typeof r === "object" && !(r as Record<string, unknown>).success
-      ).length > 0;
-      const forceFailures = Object.entries(forceKillResults).filter(
-        ([, r]: [string, unknown]) =>
-          r && typeof r === "object" && !(r as Record<string, unknown>).force_killed
-      ).length > 0;
-      if (!stopFailures && !forceFailures) {
-        window.dispatchEvent(new CustomEvent("taos:agents-changed"));
+      window.dispatchEvent(new CustomEvent("taos:agents-changed"));
+
+      // Surface partial failures from force-kill results
+      const forceResults: Record<string, { force_killed?: boolean; error?: string }> =
+        data.force_kill_results ?? {};
+      const failures = Object.entries(forceResults).filter(
+        ([, r]) => !r.force_killed
+      );
+      if (failures.length > 0) {
+        const names = failures.map(([n]) => n).join(", ");
+        addNotification({
+          source: "system",
+          title: "Agents stopped with warnings",
+          body: `Force-kill failed for: ${names}. Check server logs for details.`,
+          level: "warning",
+        });
+      } else {
         addNotification({
           source: "system",
           title: "Agents stopped",
           body: "Emergency kill switch activated — all agents stopped.",
           level: "success",
-        });
-      } else {
-        const failCount = [
-          ...Object.entries(results).filter(
-            ([, r]: [string, unknown]) =>
-              r && typeof r === "object" && !(r as Record<string, unknown>).success
-          ),
-          ...Object.entries(forceKillResults).filter(
-            ([, r]: [string, unknown]) =>
-              r && typeof r === "object" && !(r as Record<string, unknown>).force_killed
-          ),
-        ].length;
-        window.dispatchEvent(new CustomEvent("taos:agents-changed"));
-        addNotification({
-          source: "system",
-          title: "Agents stopped with failures",
-          body: `${failCount} agent(s) failed to stop — check individual agent status.`,
-          level: "warning",
         });
       }
     } catch (err) {
