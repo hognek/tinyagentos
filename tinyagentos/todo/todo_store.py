@@ -257,10 +257,15 @@ class TodoStore(BaseStore):
                 "Reorder payload must include exactly every item in the list"
             )
 
-        # Validate unique positions
+        # Validate unique, contiguous positions
         positions = [item["position"] for item in items]
         if len(set(positions)) != len(positions):
             raise ValueError("Positions must be unique")
+        sorted_positions = sorted(positions)
+        if sorted_positions != list(range(len(items))):
+            raise ValueError(
+                "Positions must be contiguous starting from 0"
+            )
 
         now = time.time()
         await self._db.execute("BEGIN")
