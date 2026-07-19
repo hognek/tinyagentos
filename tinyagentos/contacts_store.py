@@ -111,7 +111,8 @@ class ContactsStore(BaseStore):
                  x25519_pub = excluded.x25519_pub,
                  display_name = excluded.display_name,
                  status = excluded.status,
-                 local_crm_id = excluded.local_crm_id""",
+                 local_crm_id = excluded.local_crm_id,
+                 revoked_at = NULL""",
             (contact_id, hub_username, display_name, ed25519_pub, x25519_pub,
              status, local_crm_id, now),
         )
@@ -147,7 +148,7 @@ class ContactsStore(BaseStore):
             )
         else:
             await self._db.execute(
-                "UPDATE contacts SET status = ? WHERE contact_id = ?",
+                "UPDATE contacts SET status = ?, revoked_at = NULL WHERE contact_id = ?",
                 (status, contact_id),
             )
         await self._db.commit()

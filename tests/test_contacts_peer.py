@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import time
 from pathlib import Path
 
@@ -453,7 +452,7 @@ class TestPeerTokens:
 
 
 @pytest_asyncio.fixture
-async def app_with_contacts(tmp_data_dir):
+async def app_with_contacts(tmp_data_dir, monkeypatch):
     """Create an app, initialise contacts_store, and bootstrap a local hub identity."""
     from tinyagentos.app import create_app
 
@@ -467,7 +466,7 @@ async def app_with_contacts(tmp_data_dir):
 
     # Bootstrap a hub identity so resolve_local_identity_id() works in tests.
     # Must set TAOS_DATA_DIR so hub.identity module resolves to tmp_data_dir.
-    os.environ["TAOS_DATA_DIR"] = str(tmp_data_dir)
+    monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_data_dir))
     _ensure_hub_identity(tmp_data_dir)
 
     return _app
