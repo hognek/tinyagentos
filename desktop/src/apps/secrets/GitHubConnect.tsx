@@ -80,6 +80,7 @@ export function GitHubConnect() {
 
   const [repoAgents, setRepoAgents] = useState<Record<string, string>>({});
   const [savingGrants, setSavingGrants] = useState<Set<string>>(new Set());
+  const [saveErrors, setSaveErrors] = useState<Record<string, string>>({});
 
   const fetchAgentGrants = useCallback(async () => {
     // Fetch existing github-installation secrets for all known repos.
@@ -106,6 +107,11 @@ export function GitHubConnect() {
   const handleSaveGrants = useCallback(
     async (repoFullName: string, installationId: number, permissions: string[]) => {
       setSavingGrants((prev) => new Set(prev).add(repoFullName));
+      setSaveErrors((prev) => {
+        const next = { ...prev };
+        delete next[repoFullName];
+        return next;
+      });
       try {
         const agentsStr = repoAgents[repoFullName] || "";
         const agents = agentsStr
@@ -143,8 +149,12 @@ export function GitHubConnect() {
             }) }),
           });
         }
-      } catch { /* ignore */ }
-      finally {
+      } catch {
+        setSaveErrors((prev) => ({
+          ...prev,
+          [repoFullName]: "Save failed — please try again.",
+        }));
+      } finally {
         setSavingGrants((prev) => {
           const next = new Set(prev);
           next.delete(repoFullName);
@@ -473,6 +483,11 @@ export function GitHubConnect() {
                               )}
                             </Button>
                           </div>
+                          {saveErrors[repo.full_name] && (
+                            <p className="text-xs text-red-400" role="alert">
+                              {saveErrors[repo.full_name]}
+                            </p>
+                          )}
                         </div>
                       ))}
                     </div>

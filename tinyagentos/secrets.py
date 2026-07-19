@@ -345,6 +345,8 @@ class SecretsStore(BaseStore):
                 meta = json.loads(plaintext)
             except (json.JSONDecodeError, TypeError):
                 meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
             result.append({
                 "installation_id": meta.get("installation_id"),
                 "repo_full_name": meta.get("repo_full_name", ""),
