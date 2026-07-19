@@ -26,8 +26,11 @@ CREATE INDEX IF NOT EXISTS idx_peer_outbox_retry ON peer_outbox(next_retry_at);
 CREATE INDEX IF NOT EXISTS idx_peer_outbox_contact ON peer_outbox(contact_id);
 """
 
-# Exponential backoff schedule: 60, 120, 300, 600, 1800 (cap)
+# Exponential backoff schedule (seconds): 60, 120, 300, 600, 1800 (cap).
+# Index 0 is a sentinel so ``attempts=1`` maps to ``_BACKOFF_SECONDS[1]``
+# without an off-by-one adjustment.
 _BACKOFF_SECONDS = (0, 60, 120, 300, 600, 1800)
+_MAX_ATTEMPTS = 10  # terminal failure after 10 retries (~6 hours total)
 
 
 class PeerOutboxStore(BaseStore):
@@ -85,15 +88,26 @@ class PeerOutboxStore(BaseStore):
         await self._db.commit()
         return cursor.rowcount > 0
 
-    async def mark_failed(self, outbox_id: str) -> None:
-        """Increment attempts and push ``next_retry_at`` with exponential backoff."""
+    async def mark_failed(self, outbox_id: str) -> bool:
+        """Increment attempts and push ``next_retry_at`` with exponential backoff.
+
+        Returns ``True`` if the row is still pending, ``False`` if it was
+        deleted (terminal failure after ``_MAX_ATTEMPTS`` retries).
+        """
         async with self._db.execute(
             "SELECT attempts FROM peer_outbox WHERE id = ?", (outbox_id,)
         ) as cursor:
             row = await cursor.fetchone()
         if row is None:
-            return
+            return False
         new_attempts = row[0] + 1
+        if new_attempts >= _MAX_ATTEMPTS:
+            # Terminal failure — drop the row so it never retries again.
+            await self._db.execute(
+                "DELETE FROM peer_outbox WHERE id = ?", (outbox_id,)
+            )
+            await self._db.commit()
+            return False
         delay = _BACKOFF_SECONDS[min(new_attempts, len(_BACKOFF_SECONDS) - 1)]
         next_at = time.time() + delay
         await self._db.execute(
@@ -101,6 +115,7 @@ class PeerOutboxStore(BaseStore):
             (new_attempts, next_at, outbox_id),
         )
         await self._db.commit()
+        return True
 
     async def purge_for_contact(self, contact_id: str) -> int:
         """Delete all outbox rows for a contact (used on revoke)."""

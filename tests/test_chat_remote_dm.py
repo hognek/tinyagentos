@@ -227,6 +227,37 @@ class TestSendRemoteMessage:
             metadata={"hops_since_user": 0, "delivered_via": "peer"},
         )
         assert msg["metadata"]["delivered_via"] == "peer"
+        assert msg["metadata"]["contact_id"] == "hub:hogne"
+
+    async def test_contact_id_stored_in_metadata(self, msg_store):
+        msg = await msg_store.send_remote_message(
+            channel_id="dm-remote-1",
+            author_id="hub:jaylfc",
+            contact_id="hub:jaylfc",
+            remote_msg_id="rm-contact-test",
+            content="contact id test",
+        )
+        assert msg["metadata"]["contact_id"] == "hub:jaylfc"
+
+    async def test_empty_remote_msg_id_rejected(self, msg_store):
+        with pytest.raises(ValueError, match="remote_msg_id must be a non-empty string"):
+            await msg_store.send_remote_message(
+                channel_id="dm-remote-1",
+                author_id="hub:hogne",
+                contact_id="hub:hogne",
+                remote_msg_id="",
+                content="empty remote_msg_id",
+            )
+
+    async def test_null_like_remote_msg_id_rejected(self, msg_store):
+        with pytest.raises(ValueError, match="remote_msg_id must be a non-empty string"):
+            await msg_store.send_remote_message(
+                channel_id="dm-remote-1",
+                author_id="hub:hogne",
+                contact_id="hub:hogne",
+                remote_msg_id=None,
+                content="None remote_msg_id",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +362,31 @@ class TestPeerOutboxStore:
         )
         due = await outbox.dequeue_due("hub:hogne")
         assert due == []
+
+    async def test_mark_failed_returns_true_while_pending(self, outbox):
+        rid = await outbox.enqueue(
+            contact_id="hub:hogne",
+            envelope={"kind": "chat"},
+        )
+        # First failure — still pending
+        ok = await outbox.mark_failed(rid)
+        assert ok is True
+        assert await outbox.count_for_contact("hub:hogne") == 1
+
+    async def test_mark_failed_terminal_after_max_attempts(self, outbox):
+        rid = await outbox.enqueue(
+            contact_id="hub:hogne",
+            envelope={"kind": "chat"},
+        )
+        # Retry up to _MAX_ATTEMPTS (10)
+        for attempt in range(10):
+            ok = await outbox.mark_failed(rid)
+            if attempt < 9:
+                assert ok is True, f"attempt {attempt+1} should still be pending"
+            else:
+                # 10th mark_failed should hit max attempts and delete
+                assert ok is False, f"attempt {attempt+1} should be terminal"
+        assert await outbox.count_for_contact("hub:hogne") == 0
 
 
 # ---------------------------------------------------------------------------

@@ -113,7 +113,10 @@ class ChatMessageStore(BaseStore):
             )
             await self._db.commit()
         except Exception:
-            pass
+            import logging
+            _log = logging.getLogger(__name__)
+            _log.warning("chat_messages: could not create remote dedup index — "
+                         "pre-existing data may violate uniqueness constraint")
 
     async def send_message(
         self,
@@ -181,8 +184,17 @@ class ChatMessageStore(BaseStore):
         """
         import sqlite3
 
+        if not remote_msg_id or not isinstance(remote_msg_id, str):
+            raise ValueError("remote_msg_id must be a non-empty string")
+
         msg_id = uuid.uuid4().hex[:12]
         now = created_at if created_at is not None else time.time()
+
+        # Stash the contact_id in metadata so downstream consumers can
+        # resolve the sender without parsing author_id.
+        merged_meta = dict(metadata or {})
+        merged_meta.setdefault("contact_id", contact_id)
+
         try:
             await self._db.execute(
                 """INSERT INTO chat_messages
@@ -200,7 +212,7 @@ class ChatMessageStore(BaseStore):
                     json.dumps([]),  # attachments
                     json.dumps({}),  # reactions
                     "complete",
-                    json.dumps(metadata or {}),
+                    json.dumps(merged_meta),
                     now,
                     remote_msg_id,
                     now,  # delivered_at — mark delivered on receipt
@@ -208,7 +220,12 @@ class ChatMessageStore(BaseStore):
             )
             await self._db.commit()
             return await self.get_message(msg_id)
-        except sqlite3.IntegrityError:
+        except sqlite3.IntegrityError as exc:
+            # Re-raise on structural integrity violations (e.g. NOT NULL on
+            # channel_id) — only the dedup index violation is benign.
+            if "remote_msg_id" not in str(exc):
+                await self._db.rollback()
+                raise
             # Duplicate — the (channel_id, remote_msg_id) unique constraint
             # caught a replay.  Treat as successful delivery.
             await self._db.rollback()
