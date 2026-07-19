@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from tinyagentos.auth_context import CurrentUser, current_user
 
@@ -27,7 +27,7 @@ class PatchTodoListIn(BaseModel):
 
 
 class AddTodoItemIn(BaseModel):
-    text: str
+    text: str = Field(..., min_length=1)
     due_at: str | None = None
     remind_at: str | None = None
 
@@ -139,12 +139,15 @@ async def add_item(
     if err:
         return err
 
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     due_at = None
     if body.due_at:
         try:
-            due_at = datetime.fromisoformat(body.due_at).timestamp()
+            dt = datetime.fromisoformat(body.due_at)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            due_at = dt.timestamp()
         except ValueError:
             return JSONResponse(
                 {"error": f"invalid due_at: {body.due_at!r}"}, status_code=400
@@ -152,7 +155,10 @@ async def add_item(
     remind_at = None
     if body.remind_at:
         try:
-            remind_at = datetime.fromisoformat(body.remind_at).timestamp()
+            dt = datetime.fromisoformat(body.remind_at)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            remind_at = dt.timestamp()
         except ValueError:
             return JSONResponse(
                 {"error": f"invalid remind_at: {body.remind_at!r}"}, status_code=400
@@ -185,7 +191,7 @@ async def patch_item(
     if item["list_id"] != list_id:
         return JSONResponse({"error": "item not in list"}, status_code=404)
 
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     _CLEAR_SENTINEL = -1.0
 
@@ -196,7 +202,10 @@ async def patch_item(
         if val == "":
             return _CLEAR_SENTINEL
         try:
-            return datetime.fromisoformat(val).timestamp()
+            dt = datetime.fromisoformat(val)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
         except ValueError:
             return None  # Will be handled below
 
