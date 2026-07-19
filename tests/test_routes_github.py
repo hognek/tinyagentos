@@ -341,12 +341,17 @@ def _build_app_with_app_config(
     app = FastAPI()
     app.include_router(github_router)
 
-    # SecretsStore (PAT)
+    # SecretsStore (PAT + App private key)
     mock_secrets = MagicMock()
-    if token:
-        mock_secrets.get = AsyncMock(return_value={"value": token})
-    else:
-        mock_secrets.get = AsyncMock(return_value=None)
+
+    async def _secrets_get(key: str):
+        if key == "github_token":
+            return {"value": token} if token else None
+        if key == "github-app-private-key":
+            return {"value": "fake-private-key"}
+        return None
+
+    mock_secrets.get = AsyncMock(side_effect=_secrets_get)
     app.state.secrets = mock_secrets
 
     # App config
