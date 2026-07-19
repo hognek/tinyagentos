@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -908,7 +909,9 @@ async def mint_collab_invite(
         contact_username = (contact.get("hub_username") or "").strip()
         if not contact_username:
             delivery_error = "contact has no hub_username"
-        local_id = resolve_local_identity_id(request.app.state.data_dir)
+        local_id = await asyncio.to_thread(
+            resolve_local_identity_id, request.app.state.data_dir
+        )
         if local_id is None:
             delivery_error = "hub identity not configured"
         if delivery_error is None and contact_username and local_id:
