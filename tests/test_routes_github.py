@@ -331,14 +331,12 @@ async def test_repo_upstream_error_returns_500():
 def _build_app_with_app_config(
     token: str | None = None,
     http_client=None,
-    gh_cli_token: str | None = None,
-    install_token: str | None = "ghs_app-token",
 ):
     """Build a minimal FastAPI app with mock GitHub App configuration.
 
-    - PAT is set via `token` (None = no PAT)
-    - gh CLI subprocess returns `gh_cli_token` (None = fails)
-    - App installation token returns `install_token` (None = fails)
+    - PAT is set via ``token`` (None = no PAT)
+    - Callers should mock ``create_subprocess_exec`` and
+      ``get_installation_token`` directly for gh CLI / App token behaviour
     """
     app = FastAPI()
     app.include_router(github_router)
@@ -381,7 +379,6 @@ async def test_starred_uses_gh_cli_when_app_configured_no_pat():
     app = _build_app_with_app_config(
         token=None,  # No PAT
         http_client=http_client,
-        gh_cli_token="gh-cli-token",
     )
 
     async def _fake_subprocess(*args, **kwargs):
@@ -424,7 +421,6 @@ async def test_notifications_use_gh_cli_when_app_configured_no_pat():
     app = _build_app_with_app_config(
         token=None,
         http_client=http_client,
-        gh_cli_token="gh-cli-token",
     )
 
     async def _fake_subprocess(*args, **kwargs):
@@ -458,7 +454,6 @@ async def test_auth_status_false_when_only_app_token_available():
     app = _build_app_with_app_config(
         token=None,  # No PAT
         http_client=http_client,
-        gh_cli_token=None,  # gh CLI fails
     )
 
     transport = ASGITransport(app=app)
@@ -501,7 +496,6 @@ async def test_repo_endpoint_still_uses_app_token():
     app = _build_app_with_app_config(
         token=None,  # No PAT
         http_client=http_client,
-        gh_cli_token=None,  # gh CLI not available
     )
 
     transport = ASGITransport(app=app)
