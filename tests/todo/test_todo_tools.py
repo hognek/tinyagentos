@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import types
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
@@ -18,11 +18,12 @@ from tinyagentos.tools.todo_tools import (
 
 # --------------------------------------------------------------------- helpers
 
-def _make_request(store, config=None, msg_store=None):
+def _make_request(store, config=None, msg_store=None, agent_registry=None):
     state = types.SimpleNamespace(
         todo_store=store,
         config=config,
         chat_messages=msg_store,
+        agent_registry=agent_registry,
     )
     app = types.SimpleNamespace(state=state)
     return types.SimpleNamespace(app=app)
@@ -45,7 +46,7 @@ async def test_list_returns_owned_lists(store):
 
     req = _make_request(store)
     res = await execute_todo_list_lists(
-        {"owner_user_id": "user-1"}, req
+        {"agent_name": "atlas", "owner_user_id": "user-1"}, req
     )
     assert "lists" in res
     assert any(d["id"] == doc["id"] for d in res["lists"])
@@ -58,7 +59,7 @@ async def test_list_excludes_other_users_lists(store):
 
     req = _make_request(store)
     res = await execute_todo_list_lists(
-        {"owner_user_id": "user-1"}, req
+        {"agent_name": "atlas", "owner_user_id": "user-1"}, req
     )
     assert res["lists"] == []
 
@@ -70,16 +71,17 @@ async def test_list_excludes_archived_lists(store):
 
     req = _make_request(store)
     res = await execute_todo_list_lists(
-        {"owner_user_id": "user-1"}, req
+        {"agent_name": "atlas", "owner_user_id": "user-1"}, req
     )
     assert res["lists"] == []
 
 
 @pytest.mark.asyncio
-async def test_list_missing_owner_user_id_returns_error(store):
+async def test_list_missing_agent_name_returns_error(store):
     req = _make_request(store)
     res = await execute_todo_list_lists({}, req)
     assert "error" in res
+    assert "agent_name" in res["error"]
 
 
 # ------------------------------------------------------------------- add tests
@@ -207,7 +209,7 @@ async def test_owner_can_mark_item_done(store):
 
     req = _make_request(store)
     res = await execute_todo_set_done(
-        {"list_id": doc["id"], "item_id": item["id"],
+        {"agent_name": "atlas", "list_id": doc["id"], "item_id": item["id"],
          "done": True, "owner_user_id": "user-1"},
         req,
     )
@@ -219,7 +221,7 @@ async def test_owner_can_mark_item_done(store):
 
     # And it can be reopened.
     res = await execute_todo_set_done(
-        {"list_id": doc["id"], "item_id": item["id"],
+        {"agent_name": "atlas", "list_id": doc["id"], "item_id": item["id"],
          "done": False, "owner_user_id": "user-1"},
         req,
     )
@@ -235,7 +237,7 @@ async def test_non_owner_cannot_mark_done(store):
 
     req = _make_request(store)
     res = await execute_todo_set_done(
-        {"list_id": doc["id"], "item_id": item["id"],
+        {"agent_name": "atlas", "list_id": doc["id"], "item_id": item["id"],
          "done": True, "owner_user_id": "user-2"},
         req,
     )
@@ -254,7 +256,7 @@ async def test_set_done_rejects_item_from_another_list(store):
 
     req = _make_request(store)
     res = await execute_todo_set_done(
-        {"list_id": doc_a["id"], "item_id": foreign["id"],
+        {"agent_name": "atlas", "list_id": doc_a["id"], "item_id": foreign["id"],
          "done": True, "owner_user_id": "user-1"},
         req,
     )
@@ -273,7 +275,7 @@ async def test_set_done_archived_list_rejected(store):
 
     req = _make_request(store)
     res = await execute_todo_set_done(
-        {"list_id": doc["id"], "item_id": item["id"],
+        {"agent_name": "atlas", "list_id": doc["id"], "item_id": item["id"],
          "done": True, "owner_user_id": "user-1"},
         req,
     )
@@ -287,24 +289,120 @@ async def test_set_done_missing_or_bad_fields_returns_error(store):
 
     # missing done
     res = await execute_todo_set_done(
-        {"list_id": "d", "item_id": "i",
+        {"agent_name": "atlas", "list_id": "d", "item_id": "i",
          "owner_user_id": "user-1"}, req
     )
     assert "error" in res
     # non-boolean done
     res = await execute_todo_set_done(
-        {"list_id": "d", "item_id": "i",
+        {"agent_name": "atlas", "list_id": "d", "item_id": "i",
          "done": "yes", "owner_user_id": "user-1"}, req
     )
     assert "error" in res
     # missing item_id
     res = await execute_todo_set_done(
-        {"list_id": "d", "done": True,
+        {"agent_name": "atlas", "list_id": "d", "done": True,
          "owner_user_id": "user-1"}, req
     )
     assert "error" in res
-    # missing owner_user_id
+    # missing agent_name
     res = await execute_todo_set_done(
-        {"list_id": "d", "item_id": "i", "done": True}, req
+        {"list_id": "d", "item_id": "i", "done": True,
+         "owner_user_id": "user-1"}, req
     )
     assert "error" in res
+    assert "agent_name" in res["error"]
+
+
+# ---------------------------------------------------- registry-enforced tests
+
+@pytest.mark.asyncio
+async def test_list_lists_binds_agent_to_owner_via_registry(store):
+    """When agent_registry is present, owner_user_id is derived from the agent."""
+    doc = await store.create_list("user-1", "Shopping")
+
+    # Mock registry: atlas → user-1
+    registry = MagicMock()
+    registry.get_by_handle = AsyncMock(
+        return_value={"user_id": "user-1", "handle": "atlas"}
+    )
+
+    req = _make_request(store, agent_registry=registry)
+    res = await execute_todo_list_lists(
+        {"agent_name": "atlas", "owner_user_id": "user-1"}, req
+    )
+    assert "lists" in res
+    assert any(d["id"] == doc["id"] for d in res["lists"])
+    registry.get_by_handle.assert_called_once_with("atlas")
+
+
+@pytest.mark.asyncio
+async def test_list_lists_rejects_unregistered_agent(store):
+    """When agent_registry is present, an unknown agent gets an error."""
+    registry = MagicMock()
+    registry.get_by_handle = AsyncMock(return_value=None)
+
+    req = _make_request(store, agent_registry=registry)
+    res = await execute_todo_list_lists(
+        {"agent_name": "unknown", "owner_user_id": "user-1"}, req
+    )
+    assert "error" in res
+    assert "not found" in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_add_item_binds_agent_to_owner_via_registry(store):
+    """Registry-resolved user_id is used for the access check, overriding args."""
+    doc = await store.create_list("user-1", "Private")
+
+    # Mock registry: atlas → user-1 (even though args claim user-2)
+    registry = MagicMock()
+    registry.get_by_handle = AsyncMock(
+        return_value={"user_id": "user-1", "handle": "atlas"}
+    )
+
+    req = _make_request(store, agent_registry=registry)
+    # Agent tries to claim user-2 but registry says they're user-1
+    res = await execute_todo_add_item(
+        {"agent_name": "atlas", "list_id": doc["id"], "text": "Should work",
+         "owner_user_id": "user-2"},
+        req,
+    )
+    # The registry overrides owner_user_id to user-1 → access granted
+    assert res.get("ok") is True
+
+
+@pytest.mark.asyncio
+async def test_set_done_binds_agent_to_owner_via_registry(store):
+    """Registry-resolved user_id gates set_done access."""
+    doc = await store.create_list("user-1", "Tasks")
+    item = await store.add_item(doc["id"], "A task", author="user-1")
+
+    # Mock registry: atlas → user-2 (different owner → denied)
+    registry = MagicMock()
+    registry.get_by_handle = AsyncMock(
+        return_value={"user_id": "user-2", "handle": "atlas"}
+    )
+
+    req = _make_request(store, agent_registry=registry)
+    res = await execute_todo_set_done(
+        {"agent_name": "atlas", "list_id": doc["id"], "item_id": item["id"],
+         "done": True, "owner_user_id": "user-1"},
+        req,
+    )
+    # Registry says atlas → user-2, but list owner is user-1 → denied
+    assert "error" in res
+    assert "access" in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_resolve_falls_back_without_registry(store):
+    """No agent_registry on state → falls back to args-supplied owner_user_id."""
+    doc = await store.create_list("user-1", "Fallback")
+
+    req = _make_request(store)  # no agent_registry
+    res = await execute_todo_list_lists(
+        {"agent_name": "atlas", "owner_user_id": "user-1"}, req
+    )
+    assert "lists" in res
+    assert any(d["id"] == doc["id"] for d in res["lists"])
