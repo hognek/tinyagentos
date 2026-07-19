@@ -494,7 +494,7 @@ class TestInstallV2:
         assert "chain" in body
 
     @pytest.mark.asyncio
-    async def test_real_registry_detects_post_load_tampering(self, client):
+    async def test_real_registry_detects_post_load_tampering(self, client, tmp_path):
         """End-to-end test: a real AppRegistry detects post-load tampering.
 
         Exercises BOTH the initial signing gate AND the install-time TOCTOU
@@ -509,15 +509,12 @@ class TestInstallV2:
            403 — proving the secondary guard works independently of the initial
            gate.
         """
-        import os
-        import tempfile
-        from pathlib import Path
 
         from tinyagentos.registry import AppRegistry
         from tinyagentos.store_signing import generate_signing_keypair
 
         # 1. Create a catalog directory with one service manifest on disk.
-        catalog_dir = Path(tempfile.mkdtemp())
+        catalog_dir = tmp_path / "catalog"
         svc_dir = catalog_dir / "services" / "test-svc"
         svc_dir.mkdir(parents=True)
         manifest_path = svc_dir / "manifest.yaml"
@@ -532,9 +529,7 @@ class TestInstallV2:
 
         # 2. Build a real AppRegistry with a signing key.
         priv, pub = generate_signing_keypair()
-        fd, installed_name = tempfile.mkstemp(suffix=".json")
-        os.close(fd)
-        installed_path = Path(installed_name)
+        installed_path = tmp_path / "installed.json"
         installed_path.write_text("[]")  # initialise with valid JSON
         reg = AppRegistry(
             catalog_dir=catalog_dir,
