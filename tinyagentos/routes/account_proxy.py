@@ -449,7 +449,12 @@ async def cluster_guest_preauth(request: Request):
     # _pop_guest_preauth_intent to consume-and-delete).
     stripped, join_intent = _persist_join_credentials(resp)
     if join_intent:
-        _guest_preauth_intents[cid] = (time.monotonic(), join_intent)
+        now = time.monotonic()
+        # Sweep stale entries to bound dict growth even when consumer is inactive.
+        expired = [k for k, (ts, _) in _guest_preauth_intents.items() if now - ts > _GUEST_PREAUTH_TTL_SECONDS]
+        for k in expired:
+            _guest_preauth_intents.pop(k, None)
+        _guest_preauth_intents[cid] = (now, join_intent)
     return stripped
 
 
@@ -533,7 +538,7 @@ def _pop_guest_preauth_intent(cid: str) -> dict | None:
     for k in expired:
         _guest_preauth_intents.pop(k, None)
     entry = _guest_preauth_intents.pop(cid, None)
-    if entry is None or now - entry[0] > _GUEST_PREAUTH_TTL_SECONDS:
+    if entry is None:
         return None
     return entry[1]
 
