@@ -277,21 +277,16 @@ class YouTubeProcessor(Processor):
         if not source_url:
             return artifacts
 
-        try:
-            from tinyagentos.knowledge_fetchers.youtube import (
-                fetch,
-                format_timestamp,
-            )
+        # Only catch ImportError (missing yt-dlp).  Let fetch errors
+        # propagate so run_pipeline marks the item as "error" — a failed
+        # yt-dlp invocation must not silently look successful.
+        from tinyagentos.knowledge_fetchers.youtube import (
+            fetch,
+            format_timestamp,
+        )
 
-            media_dir = self.storage_dir / "youtube"
-            result = await fetch(source_url, media_dir=media_dir)
-        except ImportError:
-            logger.warning("YouTube fetcher not available — skipping %s",
-                           source_url)
-            return artifacts
-        except Exception:
-            logger.exception("YouTube fetch failed for %s", source_url)
-            return artifacts
+        media_dir = self.storage_dir / "youtube"
+        result = await fetch(source_url, media_dir=media_dir)
 
         title = result.get("title", "")
         if title and not item.get("title"):
@@ -401,28 +396,23 @@ class WebProcessor(Processor):
             return artifacts
 
         # Fetch the page (SSRF-guarded)
-        try:
-            import httpx
-            from tinyagentos.routes.desktop_browser.ssrf import (
-                validate_url_or_raise,
-            )
+        # Only catch ImportError (missing deps).  Let fetch/network errors
+        # propagate so run_pipeline marks the item as "error" — a failed
+        # URL fetch must not silently look successful.
+        import httpx
+        from tinyagentos.routes.desktop_browser.ssrf import (
+            validate_url_or_raise,
+        )
 
-            validate_url_or_raise(source_url)
+        validate_url_or_raise(source_url)
 
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(30),
-                follow_redirects=True,
-            ) as client:
-                resp = await client.get(source_url)
-                resp.raise_for_status()
-                html = resp.text
-        except ImportError:
-            logger.warning("httpx not available — skipping web fetch for %s",
-                           source_url)
-            return artifacts
-        except Exception:
-            logger.exception("Web fetch failed for %s", source_url)
-            return artifacts
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(30),
+            follow_redirects=True,
+        ) as client:
+            resp = await client.get(source_url)
+            resp.raise_for_status()
+            html = resp.text
 
         if not html:
             return artifacts
@@ -431,6 +421,7 @@ class WebProcessor(Processor):
         content = _extract_readable_text(html, source_url)
 
         # Extract title from <title> tag if item has no title
+        import html as _html_mod
         title = item.get("title", "")
         if not title or title == source_url:
             import re
@@ -438,7 +429,7 @@ class WebProcessor(Processor):
                 r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE,
             )
             if m:
-                title = m.group(1).strip()[:200]
+                title = _html_mod.unescape(m.group(1)).strip()[:200]
                 await self.store.update_item(item_id, title=title)
 
         # Artifact: metadata
