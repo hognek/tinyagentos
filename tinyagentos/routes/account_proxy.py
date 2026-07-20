@@ -69,11 +69,6 @@ _ACTIONS: dict[str, tuple[str, str]] = {
     "hub_presence_get": ("GET", "/api/hub/presence"),
     # Block asks the hub to sever the accepted edge (no more presence/hints).
     "hub_edge_revoke": ("POST", "/api/hub/edges/revoke"),
-    # Guest preauth key minting (cross-user C2). The host calls same-origin
-    # /api/account/cluster/join/guest-preauth at delegation-accept time to mint
-    # a scoped, ACL-pinned preauth key the guest instance will use to join the
-    # host's mesh. The taos.my side creates the key via the Headscale admin API.
-    "cluster_guest_preauth": ("POST", "/api/cluster/join/guest-preauth"),
 }
 
 _TIMEOUT = httpx.Timeout(15.0)
