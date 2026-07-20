@@ -71,8 +71,8 @@ async def community_snapshot(
     project = await project_store.get_project(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    if project.get("user_id") != user.user_id:
-        raise HTTPException(status_code=403, detail="not authorized")
+    if not user.is_admin and project.get("user_id") != user.user_id:
+        raise HTTPException(status_code=404, detail="project not found")
 
     # Project metadata (allowlisted subset).
     meta = {
@@ -135,8 +135,8 @@ async def community_stats(
     project = await project_store.get_project(project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project not found")
-    if project.get("user_id") != user.user_id:
-        raise HTTPException(status_code=403, detail="not authorized")
+    if not user.is_admin and project.get("user_id") != user.user_id:
+        raise HTTPException(status_code=404, detail="project not found")
 
     # Status counts.
     all_tasks = await task_store.list_tasks(project_id=project_id)

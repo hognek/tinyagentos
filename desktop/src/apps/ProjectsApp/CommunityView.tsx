@@ -1,16 +1,16 @@
 import { useEffect, useState } from "react";
-import { projectsApi, type CommunitySnapshot, type CommunityTask, type ContributorStat, type ActivityFeedItem } from "@/lib/projects";
+import { projectsApi, type CommunitySnapshot, type CommunityTask, type ContributorStat, type ActivityFeedItem, type CommunityStats } from "@/lib/projects";
 import styles from "./ProjectsApp.module.css";
 
 function StatusBadge({ status }: { status: string }) {
   const colorMap: Record<string, string> = {
-    open: "var(--pico-color-blue-500, #3b82f6)",
-    claimed: "var(--pico-color-amber-500, #f59e0b)",
-    "in-progress": "var(--pico-color-amber-500, #f59e0b)",
-    closed: "var(--pico-color-green-500, #22c55e)",
-    cancelled: "var(--pico-color-red-500, #ef4444)",
+    open: "var(--board-status-ready, #64d2ff)",
+    claimed: "var(--board-status-claimed, #ffb340)",
+    "in-progress": "var(--board-status-claimed, #ffb340)",
+    closed: "var(--board-status-closed, #30d158)",
+    cancelled: "var(--color-traffic-close, #ff5f57)",
   };
-  const color = colorMap[status] ?? "var(--pico-muted-color, #6b7280)";
+  const color = colorMap[status] ?? "var(--color-shell-text-secondary, #6b7280)";
   return (
     <span
       className={styles.statusBadge}
@@ -144,6 +144,34 @@ export function CommunityView({ projectId }: { projectId: string }) {
     };
   }, [projectId]);
 
+  // Poll /community/stats every 30 s for live leaderboard + status counts.
+  useEffect(() => {
+    let cancelled = false;
+    const poll = () => {
+      projectsApi.community
+        .stats(projectId)
+        .then((stats: CommunityStats) => {
+          if (cancelled) return;
+          setData((prev) => {
+            if (!prev) return prev;
+            return {
+              ...prev,
+              status_counts: stats.status_counts,
+              contributors: stats.leaderboard,
+            };
+          });
+        })
+        .catch(() => {
+          // silent — keep last good snapshot
+        });
+    };
+    const interval = setInterval(poll, 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(interval);
+    };
+  }, [projectId]);
+
   if (loading) {
     return <div className="text-sm text-shell-text-secondary p-4">Loading community view…</div>;
   }
@@ -162,7 +190,9 @@ export function CommunityView({ projectId }: { projectId: string }) {
   }
 
   const statusOrder = ["open", "claimed", "in-progress", "closed", "cancelled"];
-  const columns = statusOrder.filter((s) => tasksByStatus[s]?.length);
+  const knownColumns = statusOrder.filter((s) => tasksByStatus[s]?.length);
+  const otherColumns = Object.keys(tasksByStatus).filter((s) => !statusOrder.includes(s));
+  const columns = [...knownColumns, ...otherColumns];
 
   return (
     <div className={styles.communityView}>

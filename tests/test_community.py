@@ -1,6 +1,65 @@
 """Tests for Community View endpoints (Milestone F)."""
 
 import pytest
+import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+def _add_member_user(app, username: str = "member", password: str = "memberpass1") -> str:
+    """Inject a non-admin user into the auth store and return their user_id."""
+    auth = app.state.auth
+    invite_code = auth.add_user_invite(username, invited_by_username="admin")
+    auth.complete_invite(
+        username=username,
+        invite_code=invite_code,
+        full_name="Member User",
+        email=f"{username}@test.local",
+        password=password,
+    )
+    record = auth.find_user(username)
+    return record["id"]
+
+
+async def _init_project_stores(app):
+    for attr in ("project_store", "project_task_store", "board_audit", "channels"):
+        store = getattr(app.state, attr, None)
+        if store is not None and store._db is None:
+            await store.init()
+    app.state.projects_root.mkdir(parents=True, exist_ok=True)
+
+
+@pytest_asyncio.fixture
+async def two_member_clients(app, tmp_data_dir):
+    """Two separate non-admin member clients (alice and bob) sharing one app."""
+    await _init_project_stores(app)
+    alice_uid = _add_member_user(app, username="alice", password="alicepass1")
+    bob_uid = _add_member_user(app, username="bob", password="bobspass1")
+    alice_token = app.state.auth.create_session(user_id=alice_uid, long_lived=True)
+    bob_token = app.state.auth.create_session(user_id=bob_uid, long_lived=True)
+    app.state._startup_complete = True
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport, base_url="http://test",
+        cookies={"taos_session": alice_token},
+    ) as alice_c:
+        async with AsyncClient(
+            transport=transport, base_url="http://test",
+            cookies={"taos_session": bob_token},
+        ) as bob_c:
+            alice_c._test_uid = alice_uid
+            alice_c._test_app = app
+            bob_c._test_uid = bob_uid
+            bob_c._test_app = app
+            yield alice_c, bob_c
+
+    await app.state.project_store.close()
+    await app.state.project_task_store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +158,26 @@ async def test_community_snapshot_not_found(client):
     assert resp.status_code == 404
 
 
+@pytest.mark.asyncio
+async def test_community_snapshot_cross_user_404(two_member_clients):
+    """Non-owner gets masked 404, not 403, on another user's community snapshot."""
+    alice, bob = two_member_clients
+    # Alice creates a project.
+    resp = await alice.post(
+        "/api/projects",
+        json={"name": "Alice Project", "slug": "alice-comm"},
+    )
+    pid = resp.json()["id"]
+
+    # Alice can access her own snapshot.
+    resp = await alice.get(f"/api/projects/{pid}/community/snapshot")
+    assert resp.status_code == 200
+
+    # Bob gets a masked 404 (project existence is not leaked).
+    resp = await bob.get(f"/api/projects/{pid}/community/snapshot")
+    assert resp.status_code == 404
+
+
 # ---------------------------------------------------------------------------
 # community/stats
 # ---------------------------------------------------------------------------
@@ -142,18 +221,37 @@ async def test_community_stats(client):
     assert "tasks" not in body
 
     # Leaderboard should have at least one contributor.
-    if len(body["leaderboard"]) > 0:
-        lb = body["leaderboard"][0]
-        assert "actor" in lb
-        assert "claims" in lb
-        assert "closes" in lb
-        assert "total" in lb
+    assert len(body["leaderboard"]) > 0
+    lb = body["leaderboard"][0]
+    assert "actor" in lb
+    assert "claims" in lb
+    assert "closes" in lb
+    assert "total" in lb
 
 
 @pytest.mark.asyncio
 async def test_community_stats_not_found(client):
     """404 for a nonexistent project."""
     resp = await client.get("/api/projects/nonexistent/community/stats")
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_community_stats_cross_user_404(two_member_clients):
+    """Non-owner gets masked 404 on another user's community stats."""
+    alice, bob = two_member_clients
+    resp = await alice.post(
+        "/api/projects",
+        json={"name": "Alice Stats", "slug": "alice-stats"},
+    )
+    pid = resp.json()["id"]
+
+    # Alice can access her own stats.
+    resp = await alice.get(f"/api/projects/{pid}/community/stats")
+    assert resp.status_code == 200
+
+    # Bob gets masked 404.
+    resp = await bob.get(f"/api/projects/{pid}/community/stats")
     assert resp.status_code == 404
 
 

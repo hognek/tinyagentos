@@ -105,7 +105,7 @@ export function ProjectWorkspace({ project, onChanged, initialTab, filePath }: {
   // Mobile pill order: surface Messages right after Workspace so it is reachable
   // without scrolling (on mobile Messages is its own full page, not a squeezed
   // pane inside Workspace).
-  const mobileTabOrder: Tab[] = ["workspace", "messages", "board", "tasks", "canvas", "files", "members", "activity", "decisions", "routines"];
+  const mobileTabOrder: Tab[] = ["workspace", "messages", "board", "tasks", "canvas", "files", "members", "activity", "decisions", "routines", "community"];
   const tabPills = mobileTabOrder.map((t) => ({
     id: t,
     label: t.charAt(0).toUpperCase() + t.slice(1),
