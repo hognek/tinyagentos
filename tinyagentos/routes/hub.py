@@ -121,6 +121,12 @@ async def _try_handshake(
         # Can't form a contact_id without a username.
         return
 
+    # NOTE: contact_id is derived from the directory-supplied username, not the
+    # verified fingerprint.  This means TOFU key-pinning is bound to a
+    # peer-controllable name — a peer that changes its username between the
+    # request and accept flows could create a shadow contact.  Future designs
+    # should consider binding to a canonical fingerprint-based identifier
+    # (e.g. hub:{fingerprint}) with username as a display column.
     contact_id = f"hub:{username}"
 
     # Pubkeys: directory first, then local hub_authors cache.
@@ -503,21 +509,13 @@ async def block_peer(
             if author and author.get("username"):
                 await contacts_store.revoke_peer_link(f"hub:{author['username']}")
             else:
-                # Fallback: scan contacts for a matching ed25519 fingerprint.
-                all_contacts = await contacts_store.list_contacts()
-                for contact in all_contacts:
-                    if contact.get("ed25519_pub") == peer:
-                        await contacts_store.revoke_peer_link(contact["contact_id"])
-                        logger.warning(
-                            "hub block: revoke via contact scan (author missing) "
-                            "for %s", peer,
-                        )
-                        break
-                else:
-                    logger.warning(
-                        "hub block: could not resolve peer %s to a contact; "
-                        "peer link may still be active", peer,
-                    )
+                # Author row is missing from hub_authors cache (may have been
+                # pruned or never populated).  We cannot resolve fingerprint →
+                # contact_id without the author record, so log and skip.
+                logger.warning(
+                    "hub block: author missing from hub_authors for %s; "
+                    "peer link may still be active", peer,
+                )
         except Exception:
             logger.exception("hub block: contacts-store cascade failed for %s", peer)
 
