@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 def apply_wal_pragmas(conn: sqlite3.Connection) -> None:
     """Enable WAL journal mode and NORMAL synchronous on *conn*."""
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA synchronous = NORMAL")
 

@@ -15,6 +15,7 @@ Syncs: KG triples, vector memories, archive index entries, crystals, insights.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import ipaddress
 import json
@@ -158,7 +159,15 @@ def is_safe_url(url: str, allow_private: bool = False) -> bool:
 
 
 class MeshSync:
-    """Memory mesh synchronization manager."""
+    """Memory mesh synchronization manager.
+
+    All public methods are async.  Blocking sqlite3 calls on self._conn are
+    dispatched to a thread via asyncio.to_thread so they never stall the
+    event loop.  Methods that operate on caller-supplied connections
+    (export_delta, import_delta, prepare_agent_bundle) perform synchronous
+    I/O on the *caller's* connections — the caller is responsible for thread
+    safety of those handles.
+    """
 
     def __init__(
         self,
@@ -170,13 +179,18 @@ class MeshSync:
         self._node_id = node_id or hashlib.sha256(str(time.time()).encode()).hexdigest()[:12]
         self._is_controller = is_controller
         self._conn: sqlite3.Connection | None = None
+        self._lock = asyncio.Lock()
 
-    async def init(self) -> None:
-        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+    def _sync_init(self) -> None:
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         apply_wal_pragmas(self._conn)
         run_migrations(self._conn, MIGRATIONS, namespace="MeshSync")
+
+    async def init(self) -> None:
+        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+        async with self._lock:
+            await asyncio.to_thread(self._sync_init)
 
     async def close(self) -> None:
         if self._conn:
@@ -187,8 +201,7 @@ class MeshSync:
     # Peer management
     # ------------------------------------------------------------------
 
-    async def add_peer(self, peer_id: str, url: str) -> dict:
-        """Register a sync peer (worker or controller)."""
+    def _sync_add_peer(self, peer_id: str, url: str) -> dict:
         now = time.time()
         self._conn.execute(
             """INSERT INTO sync_peers (peer_id, url, created_at) VALUES (?, ?, ?)
@@ -198,14 +211,27 @@ class MeshSync:
         self._conn.commit()
         return {"peer_id": peer_id, "url": url}
 
-    async def remove_peer(self, peer_id: str) -> bool:
+    async def add_peer(self, peer_id: str, url: str) -> dict:
+        """Register a sync peer (worker or controller)."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_add_peer, peer_id, url)
+
+    def _sync_remove_peer(self, peer_id: str) -> bool:
         cursor = self._conn.execute("DELETE FROM sync_peers WHERE peer_id = ?", (peer_id,))
         self._conn.commit()
         return cursor.rowcount > 0
 
-    async def list_peers(self) -> list[dict]:
+    async def remove_peer(self, peer_id: str) -> bool:
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_remove_peer, peer_id)
+
+    def _sync_list_peers(self) -> list[dict]:
         rows = self._conn.execute("SELECT * FROM sync_peers ORDER BY created_at").fetchall()
         return [dict(r) for r in rows]
+
+    async def list_peers(self) -> list[dict]:
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_list_peers)
 
     # ------------------------------------------------------------------
     # Delta export (controller → worker)
@@ -312,24 +338,13 @@ class MeshSync:
     # Full sync cycle
     # ------------------------------------------------------------------
 
-    async def pull_from_peer(
+    def _sync_pull_from_peer(
         self,
         peer_id: str,
         source_dbs: dict[str, sqlite3.Connection],
         target_dbs: dict[str, sqlite3.Connection],
-        allow_private: bool = True,
+        allow_private: bool,
     ) -> dict:
-        """Pull deltas from a peer for all syncable tables.
-
-        Args:
-            peer_id: The peer to pull from.
-            source_dbs: Map of table_name → source connection (on peer).
-            target_dbs: Map of table_name → target connection (local).
-            allow_private: Allow private IPs (True for LAN workers).
-
-        Returns:
-            {tables_synced, total_records, errors}.
-        """
         peer = self._conn.execute(
             "SELECT * FROM sync_peers WHERE peer_id = ?", (peer_id,)
         ).fetchone()
@@ -347,9 +362,9 @@ class MeshSync:
             if table not in source_dbs or table not in target_dbs:
                 continue
             try:
-                delta = await self.export_delta(source_dbs[table], table, last_sync)
+                delta = _export_delta_sync(source_dbs[table], table, last_sync)
                 if delta:
-                    imported = await self.import_delta(target_dbs[table], table, delta)
+                    imported = _import_delta_sync(target_dbs[table], table, delta)
                     results["tables_synced"] += 1
                     results["total_records"] += imported
 
@@ -369,6 +384,30 @@ class MeshSync:
         self._conn.commit()
 
         return results
+
+    async def pull_from_peer(
+        self,
+        peer_id: str,
+        source_dbs: dict[str, sqlite3.Connection],
+        target_dbs: dict[str, sqlite3.Connection],
+        allow_private: bool = True,
+    ) -> dict:
+        """Pull deltas from a peer for all syncable tables.
+
+        Args:
+            peer_id: The peer to pull from.
+            source_dbs: Map of table_name → source connection (on peer).
+            target_dbs: Map of table_name → target connection (local).
+            allow_private: Allow private IPs (True for LAN workers).
+
+        Returns:
+            {tables_synced, total_records, errors}.
+        """
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_pull_from_peer,
+                peer_id, source_dbs, target_dbs, allow_private,
+            )
 
     async def push_to_peer(
         self,
@@ -438,7 +477,7 @@ class MeshSync:
     # Stats
     # ------------------------------------------------------------------
 
-    async def stats(self) -> dict:
+    def _sync_stats(self) -> dict:
         peers = self._conn.execute("SELECT COUNT(*) as n FROM sync_peers").fetchone()["n"]
         syncs = self._conn.execute("SELECT COUNT(*) as n FROM sync_log").fetchone()["n"]
         last = self._conn.execute("SELECT MAX(timestamp) as ts FROM sync_log").fetchone()["ts"]
@@ -449,3 +488,62 @@ class MeshSync:
             "total_syncs": syncs,
             "last_sync": last,
         }
+
+    async def stats(self) -> dict:
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_stats)
+
+
+# ---------------------------------------------------------------------------
+# Standalone sync helpers (used by _sync_pull_from_peer inside a thread)
+# ---------------------------------------------------------------------------
+
+def _export_delta_sync(
+    source_db: sqlite3.Connection,
+    table: str,
+    since: float,
+) -> list[dict]:
+    """Sync version of export_delta for use inside asyncio.to_thread."""
+    if table not in SYNCABLE_TABLES:
+        return []
+    ts_col = SYNCABLE_TABLES[table]
+    rows = source_db.execute(
+        f"SELECT * FROM {table} WHERE {ts_col} > ? ORDER BY {ts_col}",
+        (since,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _import_delta_sync(
+    target_db: sqlite3.Connection,
+    table: str,
+    records: list[dict],
+) -> int:
+    """Sync version of import_delta for use inside asyncio.to_thread."""
+    if not records or table not in SYNCABLE_TABLES:
+        return 0
+
+    rows = target_db.execute(f"PRAGMA table_info({table})").fetchall()
+    known_columns = frozenset(r[1] for r in rows)
+    if not known_columns:
+        return 0
+
+    imported = 0
+    for record in records:
+        peer_cols = list(record.keys())
+        if not all(col in known_columns for col in peer_cols):
+            continue
+        placeholders = ", ".join(["?"] * len(peer_cols))
+        col_names = ", ".join(peer_cols)
+        try:
+            target_db.execute(
+                f"INSERT OR REPLACE INTO {table} ({col_names}) VALUES ({placeholders})",
+                tuple(record[c] for c in peer_cols),
+            )
+            imported += 1
+        except Exception as e:
+            logger.warning("Import failed for %s record: %s", table, e)
+
+    if imported:
+        target_db.commit()
+    return imported
