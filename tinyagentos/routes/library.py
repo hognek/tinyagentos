@@ -9,7 +9,6 @@ POST /api/library/items/{item_id}/reprocess — re-run the pipeline
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
 from pathlib import Path
@@ -30,6 +29,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 LIBRARY_DIR_NAME = "library"
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024  # 100 MB — reject larger uploads to prevent DoS
 
 
 # ---------------------------------------------------------------------------
@@ -108,6 +108,12 @@ async def ingest(
         dest = file_dir / f"{uuid.uuid4().hex[:8]}_{safe_name}"
 
         content = await file.read()
+        if len(content) > MAX_UPLOAD_BYTES:
+            return JSONResponse(
+                {"error": f"File exceeds maximum upload size of "
+                 f"{MAX_UPLOAD_BYTES // (1024 * 1024)} MB"},
+                status_code=413,
+            )
         dest.write_bytes(content)
 
         item_id = await store.create_item(
@@ -131,13 +137,12 @@ async def ingest(
             status_code=400,
         )
 
-    # Run pipeline in background
+    # Run pipeline in background (always supervised — avoid GC of orphaned tasks)
     task_set = getattr(request.app.state, "_background_tasks", None)
-    coro = _ingest_task(request.app, item_id, store, storage_dir)
     if task_set is None:
-        asyncio.create_task(coro)
-    else:
-        _create_supervised_task(coro, task_set)
+        task_set = set()
+        request.app.state._background_tasks = task_set
+    _create_supervised_task(_ingest_task(request.app, item_id, store, storage_dir), task_set)
 
     return JSONResponse({"item_id": item_id, "status": "pending"}, status_code=202)
 
@@ -265,10 +270,9 @@ async def reprocess_item(request: Request, item_id: str):
     storage_dir = _library_dir(request)
 
     task_set = getattr(request.app.state, "_background_tasks", None)
-    coro = _ingest_task(request.app, item_id, store, storage_dir)
     if task_set is None:
-        asyncio.create_task(coro)
-    else:
-        _create_supervised_task(coro, task_set)
+        task_set = set()
+        request.app.state._background_tasks = task_set
+    _create_supervised_task(_ingest_task(request.app, item_id, store, storage_dir), task_set)
 
     return JSONResponse({"item_id": item_id, "status": "reprocessing"}, status_code=202)

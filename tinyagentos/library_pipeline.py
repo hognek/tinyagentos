@@ -366,6 +366,30 @@ async def run_pipeline(
         if not isinstance(proc, FileProcessor):
             await proc.process(item)
 
+        # Verify source file still exists for file-based items
+        storage_path = item.get("storage_path", "")
+        if storage_path and not Path(storage_path).exists():
+            await store.update_item_status(item_id, "error")
+            await store.update_item(
+                item_id,
+                meta_json={
+                    **json.loads(item.get("meta_json", "{}")),
+                    "error": f"Source file not found: {storage_path}",
+                },
+            )
+            return
+
+        # Warn on URL items that produced no artifacts
+        if kind.startswith("url:") and not storage_path:
+            artifacts = await store.get_artifacts(item_id)
+            if not artifacts:
+                logger.warning(
+                    "Library item %s (kind=%s) has no artifacts after pipeline — "
+                    "URL content was not fetched. Add a fetcher for this kind "
+                    "or mark the item as a reference placeholder.",
+                    item_id, kind,
+                )
+
         await store.update_item_status(item_id, "ready")
     except Exception:
         logger.exception("Library pipeline failed for item %s (kind=%s)",

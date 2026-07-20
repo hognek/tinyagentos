@@ -90,9 +90,9 @@ async def handoff_to_collections(
             logger.debug("Library item %s artifact %s ingested into taosmd",
                          item_id, art["kind"])
         except ImportError:
-            logger.debug("taosmd not available — collection indexing skipped")
-            # Still count as handed off since file is in place
-            handed_off += 1
+            logger.warning("taosmd not available — collection indexing skipped for item %s",
+                           item_id)
+            # Do NOT count as handed off — the artifact was not ingested into any index
         except Exception:
             logger.warning(
                 "taosmd ingest failed for item %s artifact %s",
