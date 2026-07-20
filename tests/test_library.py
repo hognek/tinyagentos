@@ -621,6 +621,28 @@ class TestLibraryRoutes:
         resp = await client.post(f"/api/library/items/{item_id}/reprocess")
         assert resp.status_code == 202
 
+    @pytest.mark.asyncio
+    async def test_reprocess_while_processing_returns_409(self, client, app):
+        """Reprocessing an item that is already pending/processing returns 409."""
+        # Ingest normally and wait for pipeline to finish
+        import asyncio
+
+        resp = await client.post(
+            "/api/library/ingest",
+            data={"url": "https://example.com"},
+        )
+        assert resp.status_code == 202
+        item_id = resp.json()["item_id"]
+        await asyncio.sleep(0.5)
+
+        # Force status to "processing" to simulate an in-flight pipeline
+        store = app.state.library_store
+        await store.update_item_status(item_id, "processing")
+
+        # Reprocess should be rejected
+        resp = await client.post(f"/api/library/items/{item_id}/reprocess")
+        assert resp.status_code == 409
+
 
 # ---------------------------------------------------------------------------
 # Helpers

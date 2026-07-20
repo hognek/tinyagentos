@@ -145,7 +145,11 @@ async def handoff_to_collections(
                             collection_id, item_id,
                         )
                 except Exception:
-                    pass
+                    logger.warning(
+                        "qmd GET /collections/%s failed — cannot verify "
+                        "existing collection, falling through to create",
+                        existing_coll_id,
+                    )
 
             if not collection_id:
                 create_resp = await http_client.post(
@@ -179,7 +183,9 @@ async def handoff_to_collections(
                 item_meta["collection_id"] = collection_id
                 await store.update_item(item_id, meta_json=item_meta)
 
-            # 2. Index each text artifact into the collection
+            # 2. Index each text artifact into the collection.
+            #    Pass a stable key derived from the source path so qmd can
+            #    upsert rather than append — reprocess is idempotent.
             for file_path, text_content in indexed_paths:
                 if not text_content.strip():
                     continue
@@ -189,6 +195,7 @@ async def handoff_to_collections(
                         json={
                             "dbPath": db_path,
                             "text": text_content,
+                            "key": f"library:{item_id}:{Path(file_path).name}",
                             "metadata": {
                                 "source_path": file_path,
                                 "library_item_id": item_id,
