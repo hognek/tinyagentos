@@ -867,7 +867,15 @@ async def bulk_stop_agents(request: Request):
     grace_task = asyncio.create_task(_grace_kill())
 
     # Phase 2: SIGTERM every agent container
-    results = await _bulk_container_op(config, stop_container)
+    try:
+        results = await _bulk_container_op(config, stop_container)
+    except BaseException:
+        grace_task.cancel()
+        try:
+            await grace_task
+        except asyncio.CancelledError:
+            pass
+        raise
 
     try:
         force_results = await asyncio.shield(grace_task)
@@ -968,7 +976,15 @@ async def stop_agent(request: Request, name: str):
 
     grace_task = asyncio.create_task(_grace_kill())
 
-    stop_result = await stop_container(container_name)
+    try:
+        stop_result = await stop_container(container_name)
+    except BaseException:
+        grace_task.cancel()
+        try:
+            await grace_task
+        except asyncio.CancelledError:
+            pass
+        raise
 
     try:
         force_killed, force_output = await asyncio.shield(grace_task)
