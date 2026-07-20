@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+
+from tinyagentos.auth_context import CurrentUser, current_user, require_owner_or_admin
 
 router = APIRouter()
 
@@ -38,7 +40,34 @@ async def get_agent_secrets(request: Request, agent_name: str):
     return secrets
 
 
-@router.get("/api/secrets/{name}")
+@router.get("/api/secrets/agent/{agent_name}/github")
+async def get_agent_github_grants(
+    request: Request,
+    agent_name: str,
+    user: CurrentUser = Depends(current_user),
+):
+    """Return GitHub App installations granted to *agent_name*.
+
+    Each entry includes the installation_id, repo_full_name, and
+    permissions extracted from the encrypted secret value.
+
+    Requires a valid session cookie — unauthenticated callers receive 401.
+    Only the agent's owner or an admin may read its grants (403 otherwise).
+    """
+    registry = getattr(request.app.state, "agent_registry", None)
+    if registry is not None:
+        try:
+            agent = await registry.get_by_handle(agent_name)
+        except RuntimeError:
+            agent = None
+        if agent is not None:
+            require_owner_or_admin(user, agent["user_id"])
+    store = request.app.state.secrets
+    installations = await store.get_agent_github_installations(agent_name)
+    return installations
+
+
+@router.get("/api/secrets/{name:path}")
 async def get_secret(request: Request, name: str):
     store = request.app.state.secrets
     secret = await store.get(name)
@@ -74,7 +103,7 @@ async def add_secret(request: Request, body: SecretCreate):
     return {"id": secret_id, "status": "created"}
 
 
-@router.put("/api/secrets/{name}")
+@router.put("/api/secrets/{name:path}")
 async def update_secret(request: Request, name: str, body: SecretUpdate):
     store = request.app.state.secrets
     updated = await store.update(
@@ -89,7 +118,7 @@ async def update_secret(request: Request, name: str, body: SecretUpdate):
     return {"status": "updated"}
 
 
-@router.delete("/api/secrets/{name}")
+@router.delete("/api/secrets/{name:path}")
 async def delete_secret(request: Request, name: str):
     store = request.app.state.secrets
     deleted = await store.delete(name)
