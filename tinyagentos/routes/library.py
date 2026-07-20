@@ -190,10 +190,11 @@ async def _ingest_task(app, item_id: str, store, storage_dir: Path) -> None:
         await store.update_item_status(item_id, "error")
         return
 
-    # Auto-download: check matching rules with auto_download=True
+    # Auto-download: check matching rules with auto_download=True.
+    # Only trigger when the pipeline left the item in ready state.
     try:
         item = await store.get_item(item_id)
-        if item and item.get("source_url"):
+        if item and item.get("status") == "ready" and item.get("source_url"):
             rules = await store.match_rules(item["source_url"])
             for rule in rules:
                 if rule.get("auto_download"):
@@ -284,9 +285,9 @@ def _render_item_card(item: dict) -> str:
 
     parts = [
         f'<div class="item-card" id="item-{item_id}">',
-        f'<div class="info">',
+        '<div class="info">',
         f'<h3>{title}</h3>',
-        f'<div class="meta">',
+        '<div class="meta">',
         f'<span class="status-badge {css}">{html.escape(status)}</span>',
         f" {kind}",
     ]
@@ -534,8 +535,10 @@ async def _heavy_download_task(
         if result:
             logger.info("Heavy download complete for item %s: %s", item_id, result)
     except Exception:
+        # run_heavy_pipeline already records failures on the job entry;
+        # do NOT overwrite the item's ready status — cheap-tier
+        # artifacts remain valid even when the heavy download fails.
         logger.exception("Heavy download crashed for item %s", item_id)
-        await store.update_item_status(item_id, "error")
 
 
 @router.get("/api/library/items/{item_id}/download/status")

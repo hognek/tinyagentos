@@ -32,7 +32,12 @@ CREATE TABLE IF NOT EXISTS library_items (
     bytes INTEGER NOT NULL DEFAULT 0,
     meta_json TEXT NOT NULL DEFAULT '{}',
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    quality TEXT NOT NULL DEFAULT '',
+    auto_download INTEGER NOT NULL DEFAULT 0,
+    downloaded_at REAL,
+    download_path TEXT NOT NULL DEFAULT '',
+    download_bytes INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_li_kind ON library_items(kind);
 CREATE INDEX IF NOT EXISTS idx_li_status ON library_items(status);
@@ -86,6 +91,7 @@ class LibraryStore(BaseStore):
         # if they don't exist yet (existing databases from P1/P2).
         cols = await self._db.execute_fetchall("PRAGMA table_info(library_items)")
         col_names = {row[1] for row in cols}
+        migrated = False
         for col, col_def in [
             ("quality", "TEXT NOT NULL DEFAULT ''"),
             ("auto_download", "INTEGER NOT NULL DEFAULT 0"),
@@ -97,7 +103,8 @@ class LibraryStore(BaseStore):
                 await self._db.execute(
                     f"ALTER TABLE library_items ADD COLUMN {col} {col_def}"
                 )
-        if col_names:
+                migrated = True
+        if migrated:
             await self._db.commit()
 
     # -- items ------------------------------------------------------------

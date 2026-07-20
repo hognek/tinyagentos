@@ -414,9 +414,9 @@ class TestYouTubeProcessor:
         assert "preview" in meta
 
         updated_title = updated.get("title", "")
-        # If item had no title, processor should set it from video
-        # (but our update_item may not set title if it was initially empty - that depends)
-        # At minimum, verify the title field exists
+        # Processor should set the title from video metadata since
+        # the item was created with an empty title.
+        assert updated_title, f"Expected non-empty title, got {updated_title!r}"
 
     @pytest.mark.asyncio
     async def test_process_youtube_url_no_source(self, lib_store, storage_dir):
@@ -526,9 +526,7 @@ class TestWebProcessor:
                 "tinyagentos.routes.desktop_browser.ssrf.validate_url_or_raise",
             ),
         ):
-            mock_client_cls.return_value.__aenter__.return_value.get = (
-                _async_return(mock_resp)
-            )
+            _mock_httpx_client(mock_client_cls, mock_resp)
             artifacts = await proc.process(item)
 
         kinds = {a["kind"] for a in artifacts}
@@ -584,9 +582,7 @@ class TestWebProcessor:
                 "tinyagentos.routes.desktop_browser.ssrf.validate_url_or_raise",
             ),
         ):
-            mock_client_cls.return_value.__aenter__.return_value.get = (
-                _async_return(mock_resp)
-            )
+            _mock_httpx_client(mock_client_cls, mock_resp)
             await proc.process(item)
 
         updated = await lib_store.get_item(item_id)
@@ -614,9 +610,7 @@ class TestWebProcessor:
                 "tinyagentos.routes.desktop_browser.ssrf.validate_url_or_raise",
             ),
         ):
-            mock_client_cls.return_value.__aenter__.return_value.get = (
-                _async_return(mock_resp)
-            )
+            _mock_httpx_client(mock_client_cls, mock_resp)
             await run_pipeline(lib_store, item_id, storage_dir)
 
         item = await lib_store.get_item(item_id)
@@ -1092,9 +1086,14 @@ class TestLibraryRoutesP3:
         assert resp.status_code == 202
         item_id = resp.json()["item_id"]
 
-        # Allow pipeline to finish
+        # Wait for pipeline to reach a terminal status with bounded polling.
         import asyncio as _asyncio
-        await _asyncio.sleep(0.5)
+        for _ in range(20):
+            item_resp = await client.get(f"/api/library/items/{item_id}")
+            if item_resp.status_code == 200:
+                if item_resp.json().get("status") in ("ready", "error"):
+                    break
+            await _asyncio.sleep(0.25)
 
         resp = await client.post(
             f"/api/library/items/{item_id}/download",
@@ -1120,7 +1119,12 @@ class TestLibraryRoutesP3:
         item_id = resp.json()["item_id"]
 
         import asyncio as _asyncio
-        await _asyncio.sleep(0.5)
+        for _ in range(20):
+            item_resp = await client.get(f"/api/library/items/{item_id}")
+            if item_resp.status_code == 200:
+                if item_resp.json().get("status") in ("ready", "error"):
+                    break
+            await _asyncio.sleep(0.25)
 
         resp = await client.post(f"/api/library/items/{item_id}/download")
         assert resp.status_code == 400
@@ -1133,7 +1137,12 @@ class TestLibraryRoutesP3:
         item_id = resp.json()["item_id"]
 
         import asyncio as _asyncio
-        await _asyncio.sleep(0.5)
+        for _ in range(20):
+            item_resp = await client.get(f"/api/library/items/{item_id}")
+            if item_resp.status_code == 200:
+                if item_resp.json().get("status") in ("ready", "error"):
+                    break
+            await _asyncio.sleep(0.25)
 
         resp = await client.get(f"/api/library/items/{item_id}/download/status")
         assert resp.status_code == 200
@@ -1227,6 +1236,25 @@ def _async_return(value):
     async def _inner(*args, **kwargs):
         return value
     return _inner
+
+
+def _mock_httpx_client(mock_client_cls, mock_resp):
+    """Configure a patched httpx.AsyncClient to support both .get() and .stream().
+
+    .get() is used for redirect resolution (Phase 1); .stream() is used for
+    the final body download with in-stream size capping (Phase 2).
+    """
+    from unittest.mock import MagicMock
+
+    stream_ctx = MagicMock()
+    stream_ctx.__aenter__ = _async_return(mock_resp)
+    stream_ctx.__aexit__ = _async_return(None)
+
+    client = MagicMock()
+    client.get = _async_return(mock_resp)
+    client.stream = MagicMock(return_value=stream_ctx)
+
+    mock_client_cls.return_value.__aenter__.return_value = client
 
 
 def _mock_httpx_response(html: str, status_code: int = 200):

@@ -6,6 +6,21 @@
   <title>Library — TinyAgentOS</title>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
   <script src="https://unpkg.com/htmx.org@2"></script>
+  <meta name="csrf-token" content="">
+  <script>
+    // Inject X-CSRF-Token header for every HTMX request so library write
+    // actions pass verify_csrf when the session cookie is present.
+    document.addEventListener('DOMContentLoaded', () => {
+      const token = document.cookie
+        .split('; ')
+        .find(row => row.startsWith('csrf_token='))
+        ?.split('=')[1];
+      if (token) {
+        document.body.setAttribute('hx-headers',
+          JSON.stringify({'X-CSRF-Token': token}));
+      }
+    });
+  </script>
   <style>
     :root { --library-header-height: 3.5rem; }
     body { margin: 0; min-height: 100vh; display: flex; flex-direction: column; }

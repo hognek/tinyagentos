@@ -401,8 +401,8 @@ class WebProcessor(Processor):
         _MAX_WEB_REDIRECTS = 5
         _MAX_WEB_BYTES = 10 * 1024 * 1024  # 10 MB
 
+        # Phase 1: resolve redirects (bodies are tiny for 3xx responses).
         current_url = source_url
-        resp = None
         for _hop in range(_MAX_WEB_REDIRECTS + 1):
             validate_url_or_raise(current_url)
 
@@ -421,22 +421,26 @@ class WebProcessor(Processor):
                 f"too many redirects fetching {source_url!r}"
             )
 
-        resp.raise_for_status()
-
-        # Read body with a size cap to avoid OOM on large/hostile pages.
+        # Phase 2: stream the final URL, enforcing _MAX_WEB_BYTES during
+        # download rather than after the full body is buffered in memory.
         body_chunks: list[bytes] = []
         total = 0
-        async for chunk in resp.aiter_bytes(8192):
-            total += len(chunk)
-            if total > _MAX_WEB_BYTES:
-                raise ValueError(
-                    f"Response body exceeds {_MAX_WEB_BYTES} bytes "
-                    f"for {source_url!r}"
-                )
-            body_chunks.append(chunk)
-        html = b"".join(body_chunks).decode(
-            resp.encoding or "utf-8", errors="replace"
-        )
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(30),
+            follow_redirects=False,
+        ) as client:
+            async with client.stream("GET", current_url) as stream_resp:
+                stream_resp.raise_for_status()
+                async for chunk in stream_resp.aiter_bytes(8192):
+                    total += len(chunk)
+                    if total > _MAX_WEB_BYTES:
+                        raise ValueError(
+                            f"Response body exceeds {_MAX_WEB_BYTES} bytes "
+                            f"for {source_url!r}"
+                        )
+                    body_chunks.append(chunk)
+                encoding = stream_resp.encoding or "utf-8"
+        html = b"".join(body_chunks).decode(encoding, errors="replace")
 
         if not html:
             return artifacts
@@ -666,9 +670,16 @@ class HeavyDownloadProcessor(Processor):
 
         p = Path(path)
         if not p.exists():
-            # Try to find the downloaded file
+            # Try to find the downloaded file matching the expected stem.
+            # Exclude in-progress .part files and prefer the expected output.
+            expected_stem = p.stem
             candidates = sorted(
-                download_dir.glob("*"), key=lambda x: x.stat().st_mtime, reverse=True
+                [
+                    f for f in download_dir.glob("*")
+                    if expected_stem in f.name and not f.suffix == ".part"
+                ],
+                key=lambda x: x.stat().st_mtime,
+                reverse=True,
             )
             if candidates:
                 p = candidates[0]
@@ -742,8 +753,8 @@ async def run_heavy_pipeline(
     if not quality:
         quality = item.get("quality", "") or "720"
 
-    # Create a job entry
-    await store.create_job(item_id, "heavy_download")
+    # Create a job entry and capture its id for targeted updates.
+    job_id = await store.create_job(item_id, "heavy_download")
 
     try:
         proc = HeavyDownloadProcessor(store, storage_dir)
@@ -752,21 +763,20 @@ async def run_heavy_pipeline(
         artifacts = await proc.process(item_with_quality)
 
         if artifacts:
-            await store.update_job(
-                (await store.get_item_jobs(item_id))[-1]["id"],
-                state="done",
-            )
+            await store.update_job(job_id, state="done")
             return artifacts[0].get("meta", {})
         else:
             await store.update_job(
-                (await store.get_item_jobs(item_id))[-1]["id"],
-                state="error",
-                error="Download produced no artifacts",
+                job_id, state="error", error="Download produced no artifacts",
             )
             return None
     except Exception:
         logger.exception("Heavy pipeline failed for item %s", item_id)
-        await store.update_item_status(item_id, "error")
+        # Record the failure on the job rather than overwriting the item's
+        # ready status — the cheap-tier artifacts are still valid.
+        await store.update_job(
+            job_id, state="error", error="Heavy download failed unexpectedly",
+        )
         return None
 
 
