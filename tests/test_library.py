@@ -397,7 +397,7 @@ class TestRunPipeline:
         )
         await run_pipeline(lib_store, item_id, storage_dir)
         item = await lib_store.get_item(item_id)
-        assert item["status"] == "ready"
+        assert item["status"] == "error"
 
 
 # ---------------------------------------------------------------------------

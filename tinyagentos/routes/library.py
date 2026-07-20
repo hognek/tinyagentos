@@ -15,7 +15,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Request, UploadFile, File, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.templating import Jinja2Templates
 
 _TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
@@ -30,6 +30,22 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 LIBRARY_DIR_NAME = "library"
+
+# Module-level background task tracking so unreferenced tasks are not
+# garbage-collected when request.app.state._background_tasks is absent.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _track_background_task(coro) -> asyncio.Task:
+    """Create a task, store it in ``_background_tasks``, and auto-discard on done."""
+    task = asyncio.create_task(coro)
+
+    def _on_done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+
+    task.add_done_callback(_on_done)
+    _background_tasks.add(task)
+    return task
 
 
 # ---------------------------------------------------------------------------
@@ -107,14 +123,30 @@ async def ingest(
         safe_name = _sanitise_filename(file.filename)
         dest = file_dir / f"{uuid.uuid4().hex[:8]}_{safe_name}"
 
-        content = await file.read()
-        dest.write_bytes(content)
+        # Stream file in bounded chunks to avoid loading it entirely into
+        # memory.  Reject uploads exceeding 100 MB with HTTP 413.
+        MAX_SIZE = 100 * 1024 * 1024  # 100 MB
+        if file.size and file.size > MAX_SIZE:
+            return JSONResponse(
+                {"error": "Payload Too Large"}, status_code=413,
+            )
+
+        size = 0
+        with dest.open("wb") as f:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_SIZE:
+                    dest.unlink(missing_ok=True)
+                    return JSONResponse(
+                        {"error": "Payload Too Large"}, status_code=413,
+                    )
+                f.write(chunk)
 
         item_id = await store.create_item(
             kind=kind,
             title=title or file.filename,
             storage_path=str(dest),
-            size_bytes=len(content),
+            size_bytes=size,
             source_url="",
         )
     elif url:
@@ -135,9 +167,13 @@ async def ingest(
     task_set = getattr(request.app.state, "_background_tasks", None)
     coro = _ingest_task(request.app, item_id, store, storage_dir)
     if task_set is None:
-        asyncio.create_task(coro)
+        _track_background_task(coro)
     else:
         _create_supervised_task(coro, task_set)
+
+    if _is_htmx(request):
+        item = await store.get_item(item_id) or {}
+        return HTMLResponse(_render_item_card(item), status_code=202)
 
     return JSONResponse({"item_id": item_id, "status": "pending"}, status_code=202)
 
@@ -183,6 +219,59 @@ def _detect_kind_from_url(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# HTMX helpers -- return HTML fragments when the HX-Request header is present
+# ---------------------------------------------------------------------------
+
+
+def _is_htmx(request: Request) -> bool:
+    """Return True when the request is from an HTMX component."""
+    return request.headers.get("HX-Request", "").lower() == "true"
+
+
+_STATUS_CSS: dict[str, str] = {
+    "pending": "status-pending",
+    "processing": "status-processing",
+    "ready": "status-ready",
+    "error": "status-error",
+}
+
+
+def _render_item_card(item: dict) -> str:
+    """Return an HTML .item-card <div> for *item*."""
+    status = item.get("status", "pending")
+    css = _STATUS_CSS.get(status, "status-pending")
+    title = item.get("title", "Untitled")
+    kind = item.get("kind", "file")
+    size = item.get("size_bytes") or 0
+    size_str = f"{size:,} B" if size else ""
+    item_id = item.get("id", "")
+
+    return (
+        f'<div class="item-card" id="item-{item_id}">'
+        f'<div class="info">'
+        f'<h3>{title}</h3>'
+        f'<div class="meta">'
+        f'<span class="status-badge {css}">{status}</span>'
+        f" {kind}"
+        f'{f" &middot; {size_str}" if size_str else ""}'
+        f"</div>"
+        f"</div>"
+        f"</div>"
+    )
+
+
+def _render_item_list(items: list[dict]) -> str:
+    """Return an HTML fragment wrapping .item-card elements or an empty state."""
+    if not items:
+        return (
+            '<div class="empty-state">'
+            "<p>No items yet. Drop a file or paste a URL above.</p>"
+            "</div>"
+        )
+    return "".join(_render_item_card(item) for item in items)
+
+
+# ---------------------------------------------------------------------------
 # List / Get / Delete
 # ---------------------------------------------------------------------------
 
@@ -198,6 +287,10 @@ async def list_items(
     """List library items, optionally filtered by kind or status."""
     store = await _get_library_store(request)
     items = await store.list_items(kind=kind, status=status, limit=limit, offset=offset)
+
+    if _is_htmx(request):
+        return HTMLResponse(_render_item_list(items))
+
     return {"items": items, "count": len(items)}
 
 
@@ -267,7 +360,7 @@ async def reprocess_item(request: Request, item_id: str):
     task_set = getattr(request.app.state, "_background_tasks", None)
     coro = _ingest_task(request.app, item_id, store, storage_dir)
     if task_set is None:
-        asyncio.create_task(coro)
+        _track_background_task(coro)
     else:
         _create_supervised_task(coro, task_set)
 

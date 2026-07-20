@@ -354,6 +354,27 @@ async def run_pipeline(
 
     kind = item["kind"]
 
+    # If item has a storage_path that points to a missing file, fail early
+    # (dropped/moved/corrupt source must not silently look successful).
+    storage_path = item.get("storage_path", "")
+    source_url = item.get("source_url", "")
+    if storage_path and not source_url:
+        sp = Path(storage_path)
+        if not sp.exists():
+            logger.warning(
+                "Library pipeline: source file missing for item %s: %s",
+                item_id, storage_path,
+            )
+            await store.update_item_status(item_id, "error")
+            await store.update_item(
+                item_id,
+                meta_json={
+                    **json.loads(item.get("meta_json", "{}")),
+                    "error": f"Source file not found: {storage_path}",
+                },
+            )
+            return
+
     try:
         await store.update_item_status(item_id, "processing")
 
