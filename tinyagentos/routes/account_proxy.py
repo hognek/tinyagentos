@@ -417,14 +417,18 @@ async def cluster_guest_preauth(request: Request):
     ``POST /api/cluster/join/guest-preauth``, which creates an ACL-pinned
     (``tag:guest``) single-use preauth key via the Headscale admin API.
 
-    **Security:** validates the ``contact_id`` body field before forwarding,
-    and strips every preauth key from the response so no credential reaches
-    browser JavaScript. The caller (peer channel, D1) must extract the key
-    server-side before the response is sent to the browser, or use an
-    alternative internal delivery path.
+    **Security:** validates the ``contact_id`` *format* at the edge (length,
+    prefix) before forwarding to avoid wasted upstream API calls, but does
+    **not** assert the caller owns that contact — contact-to-caller ownership
+    is enforced by the upstream taos.my service which has access to the
+    contacts database.  Every preauth key is stripped from the response so no
+    credential reaches browser JavaScript. The caller (peer channel, D1) must
+    extract the key server-side before the response is sent to the browser, or
+    use an alternative internal delivery path.
     """
-    # Validate contact_id before forwarding (defense-in-depth: the upstream also
-    # validates, but we reject garbage at the edge to avoid wasted API calls).
+    # Validate contact_id format at the edge (defense-in-depth: the upstream
+    # also validates + enforces ownership, but we reject garbage at the edge
+    # to avoid wasted API calls).
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
