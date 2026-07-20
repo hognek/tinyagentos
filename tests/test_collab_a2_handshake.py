@@ -307,7 +307,8 @@ class TestFriendAcceptHandshake:
     async def test_accept_reupsert_contact(
         self, client_with_contacts, app_with_contacts, monkeypatch
     ):
-        """Re-accepting a friend (re-establish) refreshes the contact and link."""
+        """Re-accepting a friend (re-establish) refreshes the contact and link,
+        and clears a prior revocation."""
         dir_resp_body = {
             "peer": _PEER_FP,
             "username": _PEER_USERNAME,
@@ -332,7 +333,12 @@ class TestFriendAcceptHandshake:
         first_link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
         first_established = first_link["established_at"]
 
-        # Second accept with different endpoints — should update
+        # Simulate a revocation so we can verify re-establish actually clears it.
+        await store.revoke_peer_link(f"hub:{_PEER_USERNAME}")
+        revoked_link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
+        assert revoked_link["revoked_at"] is not None, "revocation must stick"
+
+        # Second accept with different endpoints — should re-establish and clear
         dir_resp_body["endpoints"] = ["https://second.example.com:6969"]
         resp2 = await client_with_contacts.post(
             "/api/hub/friends/requests/test-rid-re/accept",
@@ -343,7 +349,7 @@ class TestFriendAcceptHandshake:
         link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
         assert link is not None
         assert link["endpoints"] == ["https://second.example.com:6969"]
-        assert link["revoked_at"] is None  # re-establish clears revocation
+        assert link["revoked_at"] is None, "re-establish must clear revocation"
 
     async def test_accept_without_contacts_store_does_not_crash(
         self, client_with_contacts, app_with_contacts, monkeypatch

@@ -74,11 +74,30 @@ class ContactsStore(BaseStore):
 
     SCHEMA = CONTACTS_SCHEMA
 
-    MIGRATIONS: list = [
-        # Add peer_fingerprint column for stable fingerprint→contact resolution
-        # in the block cascade (independent of the volatile hub_authors cache).
-        (1, """ALTER TABLE contacts ADD COLUMN peer_fingerprint TEXT NOT NULL DEFAULT ''"""),
-    ]
+    MIGRATIONS: list = []
+
+    async def _post_init(self) -> None:
+        """Add ``peer_fingerprint`` column on pre-existing databases.
+
+        The ``peer_fingerprint`` column was added after contacts_store shipped
+        to dev (PR #2025).  BaseStore's migration runner uses baseline-at-latest
+        semantics, so a MIGRATIONS entry would stamp existing DBs at the latest
+        version without executing the ALTER, leaving the column absent.  We
+        use the guarded PRAGMA pattern instead: check if the column exists, and
+        ALTER only when it is missing.  Fresh databases get the column from
+        SCHEMA; upgraded databases get it here.
+        """
+        existing_cols = {
+            row[1]
+            for row in await (
+                await self._db.execute("PRAGMA table_info(contacts)")
+            ).fetchall()
+        }
+        if "peer_fingerprint" not in existing_cols:
+            await self._db.execute(
+                "ALTER TABLE contacts ADD COLUMN peer_fingerprint TEXT NOT NULL DEFAULT ''"
+            )
+            await self._db.commit()
 
     # ------------------------------------------------------------------
     # contacts
