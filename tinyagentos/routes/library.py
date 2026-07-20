@@ -238,20 +238,22 @@ _STATUS_CSS: dict[str, str] = {
 
 def _render_item_card(item: dict) -> str:
     """Return an HTML .item-card <div> for *item*."""
+    import html
+
     status = item.get("status", "pending")
     css = _STATUS_CSS.get(status, "status-pending")
-    title = item.get("title", "Untitled")
-    kind = item.get("kind", "file")
+    title = html.escape(item.get("title", "Untitled"))
+    kind = html.escape(item.get("kind", "file"))
     size = item.get("size_bytes") or 0
     size_str = f"{size:,} B" if size else ""
-    item_id = item.get("id", "")
+    item_id = html.escape(item.get("id", ""))
 
     return (
         f'<div class="item-card" id="item-{item_id}">'
         f'<div class="info">'
         f'<h3>{title}</h3>'
         f'<div class="meta">'
-        f'<span class="status-badge {css}">{status}</span>'
+        f'<span class="status-badge {css}">{html.escape(status)}</span>'
         f" {kind}"
         f'{f" &middot; {size_str}" if size_str else ""}'
         f"</div>"
