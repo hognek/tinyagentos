@@ -1,0 +1,251 @@
+"""Persistent store for Library items, artifacts, and processing jobs.
+
+The Library is the universal ingestion surface for taOS — files, URLs, media
+dropped into the Library get processed and their text artifacts indexed into
+taosmd collections for agent access.
+
+Schema mirrors the design doc (docs/design/library-app.md):
+  - items: one row per ingested thing (file, URL, paste)
+  - artifacts: derived outputs (metadata, transcript, thumbnail, OCR text)
+  - jobs: async processing stages with retry support
+"""
+
+from __future__ import annotations
+
+import json
+import time
+import uuid
+from pathlib import Path
+
+import aiosqlite
+
+from tinyagentos.base_store import BaseStore
+
+LIBRARY_SCHEMA = """
+CREATE TABLE IF NOT EXISTS library_items (
+    id TEXT PRIMARY KEY,
+    kind TEXT NOT NULL,
+    source_url TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    storage_path TEXT NOT NULL DEFAULT '',
+    bytes INTEGER NOT NULL DEFAULT 0,
+    meta_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_li_kind ON library_items(kind);
+CREATE INDEX IF NOT EXISTS idx_li_status ON library_items(status);
+CREATE INDEX IF NOT EXISTS idx_li_created ON library_items(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS library_artifacts (
+    id TEXT PRIMARY KEY,
+    item_id TEXT NOT NULL REFERENCES library_items(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    path TEXT NOT NULL DEFAULT '',
+    meta_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_la_item ON library_artifacts(item_id);
+
+CREATE TABLE IF NOT EXISTS library_jobs (
+    id TEXT PRIMARY KEY,
+    item_id TEXT NOT NULL REFERENCES library_items(id) ON DELETE CASCADE,
+    stage TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'queued',
+    error TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_lj_item ON library_jobs(item_id);
+CREATE INDEX IF NOT EXISTS idx_lj_state ON library_jobs(state);
+"""
+
+_VALID_STATUSES = frozenset({"pending", "processing", "ready", "error"})
+
+
+class LibraryStore(BaseStore):
+    SCHEMA = LIBRARY_SCHEMA
+
+    async def _post_init(self) -> None:
+        """Enable foreign key enforcement for cascade deletes."""
+        await self._db.execute("PRAGMA foreign_keys = ON")
+        await self._db.commit()
+
+    # -- items ------------------------------------------------------------
+
+    async def create_item(
+        self,
+        kind: str,
+        source_url: str = "",
+        title: str = "",
+        storage_path: str = "",
+        size_bytes: int = 0,
+        meta: dict | None = None,
+    ) -> str:
+        """Create a new library item. Returns the item id."""
+        item_id = uuid.uuid4().hex
+        now = time.time()
+        await self._db.execute(
+            """INSERT INTO library_items
+               (id, kind, source_url, title, status, storage_path, bytes,
+                meta_json, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)""",
+            (
+                item_id,
+                kind,
+                source_url,
+                title,
+                storage_path,
+                size_bytes,
+                json.dumps(meta or {}),
+                now,
+                now,
+            ),
+        )
+        await self._db.commit()
+        return item_id
+
+    async def get_item(self, item_id: str) -> dict | None:
+        self._db.row_factory = aiosqlite.Row
+        async with self._db.execute(
+            "SELECT * FROM library_items WHERE id = ?", (item_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def list_items(
+        self, kind: str | None = None, status: str | None = None,
+        limit: int = 50, offset: int = 0,
+    ) -> list[dict]:
+        self._db.row_factory = aiosqlite.Row
+        where: list[str] = []
+        params: list = []
+        if kind:
+            where.append("kind = ?")
+            params.append(kind)
+        if status:
+            where.append("status = ?")
+            params.append(status)
+
+        sql = "SELECT * FROM library_items"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+
+        async with self._db.execute(sql, params) as cursor:
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def update_item(self, item_id: str, **kwargs) -> None:
+        allowed = {"kind", "source_url", "title", "status", "storage_path",
+                    "bytes", "meta_json", "updated_at"}
+        fields = [(k, v) for k, v in kwargs.items() if k in allowed]
+        if not fields:
+            return
+        if "updated_at" not in kwargs:
+            fields.append(("updated_at", time.time()))
+        if "meta_json" in kwargs and isinstance(kwargs["meta_json"], dict):
+            # find and replace the meta_json tuple
+            for i, (k, _v) in enumerate(fields):
+                if k == "meta_json":
+                    fields[i] = ("meta_json", json.dumps(kwargs["meta_json"]))
+                    break
+
+        set_clause = ", ".join(f"{k} = ?" for k, _ in fields)
+        values = [v for _, v in fields]
+        values.append(item_id)
+        await self._db.execute(
+            f"UPDATE library_items SET {set_clause} WHERE id = ?", values
+        )
+        await self._db.commit()
+
+    async def delete_item(self, item_id: str) -> None:
+        """Delete an item and cascade its artifacts and jobs."""
+        await self._db.execute("DELETE FROM library_items WHERE id = ?", (item_id,))
+        await self._db.commit()
+
+    async def update_item_status(self, item_id: str, status: str) -> None:
+        if status not in _VALID_STATUSES:
+            raise ValueError(
+                f"Invalid status {status!r}; must be one of {sorted(_VALID_STATUSES)}"
+            )
+        await self.update_item(item_id, status=status)
+
+    # -- artifacts --------------------------------------------------------
+
+    async def add_artifact(
+        self, item_id: str, kind: str, path: str = "",
+        meta: dict | None = None,
+    ) -> str:
+        artifact_id = uuid.uuid4().hex[:16]
+        now = time.time()
+        await self._db.execute(
+            """INSERT INTO library_artifacts (id, item_id, kind, path, meta_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (artifact_id, item_id, kind, path, json.dumps(meta or {}), now),
+        )
+        await self._db.commit()
+        return artifact_id
+
+    async def get_artifacts(self, item_id: str) -> list[dict]:
+        self._db.row_factory = aiosqlite.Row
+        async with self._db.execute(
+            "SELECT * FROM library_artifacts WHERE item_id = ? ORDER BY created_at",
+            (item_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def delete_artifact(self, artifact_id: str) -> None:
+        await self._db.execute(
+            "DELETE FROM library_artifacts WHERE id = ?", (artifact_id,)
+        )
+        await self._db.commit()
+
+    # -- jobs -------------------------------------------------------------
+
+    async def create_job(self, item_id: str, stage: str) -> str:
+        job_id = uuid.uuid4().hex[:16]
+        now = time.time()
+        await self._db.execute(
+            """INSERT INTO library_jobs (id, item_id, stage, state, created_at, updated_at)
+               VALUES (?, ?, ?, 'queued', ?, ?)""",
+            (job_id, item_id, stage, now, now),
+        )
+        await self._db.commit()
+        return job_id
+
+    async def get_job(self, job_id: str) -> dict | None:
+        self._db.row_factory = aiosqlite.Row
+        async with self._db.execute(
+            "SELECT * FROM library_jobs WHERE id = ?", (job_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def get_item_jobs(self, item_id: str) -> list[dict]:
+        self._db.row_factory = aiosqlite.Row
+        async with self._db.execute(
+            "SELECT * FROM library_jobs WHERE item_id = ? ORDER BY created_at",
+            (item_id,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def update_job(self, job_id: str, **kwargs) -> None:
+        allowed = {"state", "error", "updated_at"}
+        fields = [(k, v) for k, v in kwargs.items() if k in allowed]
+        if not fields:
+            return
+        if "updated_at" not in kwargs:
+            fields.append(("updated_at", time.time()))
+
+        set_clause = ", ".join(f"{k} = ?" for k, _ in fields)
+        values = [v for _, v in fields]
+        values.append(job_id)
+        await self._db.execute(
+            f"UPDATE library_jobs SET {set_clause} WHERE id = ?", values
+        )
+        await self._db.commit()
