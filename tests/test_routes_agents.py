@@ -74,7 +74,32 @@ class TestBulkOperations:
         assert "results" in data
         assert "test-agent" in data["results"]
 
-    async def test_bulk_stop(self, client):
+    async def test_bulk_stop(self, client, monkeypatch):
+        # Mock list_containers + stop_container to avoid incus shell-out
+        # in CI and on hosts without a running incus daemon. The new
+        # _grace_kill coroutine in bulk_stop_agents calls both, and
+        # _bulk_container_op calls stop_container for each agent.
+        async def fake_list_containers(prefix="taos-agent-"):
+            return [
+                ContainerInfo(
+                    name="taos-agent-test-agent",
+                    status="Stopped",
+                    ip=None,
+                    memory_mb=0,
+                    cpu_cores=0,
+                )
+            ]
+
+        async def fake_stop_container(name, force=False):
+            return {"success": True, "output": ""}
+
+        monkeypatch.setattr(
+            "tinyagentos.containers.list_containers", fake_list_containers
+        )
+        monkeypatch.setattr(
+            "tinyagentos.containers.stop_container", fake_stop_container
+        )
+
         resp = await client.post("/api/agents/bulk/stop")
         assert resp.status_code == 200
         assert resp.json()["action"] == "stop"
