@@ -198,9 +198,17 @@ export function WallpaperPicker({ open, onClose }: Props) {
                     <div className="pt-2">
                       <WallhavenBrowser
                         onSelect={(url, label) => {
-                          // Escape single-quotes and backslashes to prevent CSS injection
-                          // and render breakage from special characters in remote URLs.
-                          const safeUrl = url.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+                          // Escape backslashes, single-quotes, and parens to prevent
+                          // CSS injection and render breakage from remote URLs.
+                          // ')' prematurely terminates url('...'); '(' is also unsafe.
+                          const safeUrl = url
+                            .replace(/\\/g, "\\\\")
+                            .replace(/'/g, "\\'")
+                            .replace(/\(/g, "%28")
+                            .replace(/\)/g, "%29")
+                            .replace(/[\x00-\x1f\x7f]/g, "");
+                          // Reject non-http(s) schemes (data:, javascript:, etc.)
+                          if (!/^https?:\/\//i.test(safeUrl)) return;
                           const id = `wallhaven-${Date.now()}`;
                           const image = `url('${safeUrl}')`;
                           // Route through a state updater so wallpaperIdByTheme is set for
@@ -230,55 +238,6 @@ export function WallpaperPicker({ open, onClose }: Props) {
           )}
         </div>
           ))}
-        </div>
-        {/* Browse online section */}
-        <div className="border-t border-shell-border shrink-0">
-          <button
-            onClick={() => setBrowseOnlineOpen((v) => !v)}
-            className="flex items-center gap-2 w-full px-4 py-2 text-xs text-shell-text-secondary hover:text-shell-text transition-colors"
-            aria-expanded={browseOnlineOpen}
-            aria-label="Browse online wallpapers"
-          >
-            <Globe size={13} />
-            Browse online
-            <span
-              className={`ml-auto text-[10px] transition-transform ${browseOnlineOpen ? "rotate-180" : ""}`}
-            >
-              ▼
-            </span>
-          </button>
-          {browseOnlineOpen && (
-            <div className="px-4 pb-3">
-              <WallhavenBrowser
-                onSelect={(url, label) => {
-                  // Escape single-quotes and backslashes to prevent CSS injection
-                  // and render breakage from special characters in remote URLs.
-                  const safeUrl = url.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
-                  const id = `wallhaven-${Date.now()}`;
-                  const image = `url('${safeUrl}')`;
-                  // Route through a state updater so wallpaperIdByTheme is set for
-                  // the active theme — otherwise a theme switch loses the pick.
-                  // Also set light/mobile/fallback variants so the remote wallpaper
-                  // works in every scheme.
-                  useThemeStore.setState((s) => ({
-                    wallpaperId: id,
-                    wallpaperImage: image,
-                    wallpaperMobileImage: image,
-                    wallpaperFallback: "#1d1d1f",
-                    wallpaperLightImage: image,
-                    wallpaperLightMobileImage: image,
-                    wallpaperLightFallback: "#f0f0f0",
-                    wallpaperKind: "image",
-                    wallpaperOverlayText: label,
-                    wallpaperIdByTheme: {
-                      ...s.wallpaperIdByTheme,
-                      [s.activeThemeId]: id,
-                    },
-                  }));
-                }}
-              />
-            </div>
-          )}
         </div>
         {wallpaperKind === "animated" && (
           <div className="flex flex-col gap-2.5 px-4 py-3 border-t border-shell-border shrink-0">
