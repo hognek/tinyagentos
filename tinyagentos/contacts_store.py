@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS contacts (
     display_name      TEXT NOT NULL,
     ed25519_pub       TEXT NOT NULL,          -- pinned at friend-accept
     x25519_pub        TEXT NOT NULL,
+    peer_fingerprint  TEXT NOT NULL DEFAULT '', -- signing-key fingerprint; stable lookup key
     status            TEXT NOT NULL DEFAULT 'pending',  -- pending|active|blocked|revoked
     local_crm_id      TEXT,                   -- optional link to existing CRM row
     created_at        REAL NOT NULL,
@@ -73,7 +74,11 @@ class ContactsStore(BaseStore):
 
     SCHEMA = CONTACTS_SCHEMA
 
-    MIGRATIONS: list = []
+    MIGRATIONS: list = [
+        # Add peer_fingerprint column for stable fingerprint→contact resolution
+        # in the block cascade (independent of the volatile hub_authors cache).
+        (1, """ALTER TABLE contacts ADD COLUMN peer_fingerprint TEXT NOT NULL DEFAULT ''"""),
+    ]
 
     # ------------------------------------------------------------------
     # contacts
@@ -87,6 +92,7 @@ class ContactsStore(BaseStore):
         display_name: str,
         ed25519_pub: str,
         x25519_pub: str,
+        peer_fingerprint: str = "",
         status: str = "active",
         local_crm_id: str | None = None,
     ) -> None:
@@ -104,17 +110,18 @@ class ContactsStore(BaseStore):
         await self._db.execute(
             """INSERT INTO contacts
                (contact_id, hub_username, display_name, ed25519_pub, x25519_pub,
-                status, local_crm_id, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                peer_fingerprint, status, local_crm_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(contact_id) DO UPDATE SET
                  ed25519_pub = excluded.ed25519_pub,
                  x25519_pub = excluded.x25519_pub,
+                 peer_fingerprint = excluded.peer_fingerprint,
                  display_name = excluded.display_name,
                  status = excluded.status,
                  local_crm_id = excluded.local_crm_id,
                  revoked_at = NULL""",
             (contact_id, hub_username, display_name, ed25519_pub, x25519_pub,
-             status, local_crm_id, now),
+             peer_fingerprint, status, local_crm_id, now),
         )
         await self._db.commit()
 
@@ -129,6 +136,25 @@ class ContactsStore(BaseStore):
     async def get_contact_by_username(self, hub_username: str) -> Optional[dict]:
         async with self._db.execute(
             "SELECT * FROM contacts WHERE hub_username = ?", (hub_username,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+        return _row_to_dict(columns, rows[0]) if rows else None
+
+    async def get_contact_by_fingerprint(
+        self, peer_fingerprint: str
+    ) -> Optional[dict]:
+        """Look up a contact by its peer signing-key fingerprint.
+
+        Returns the contact row, or None if no contact is pinned to this
+        fingerprint.  Used by the block cascade as a fallback when the
+        hub_authors cache is missing or stale.
+        """
+        if not peer_fingerprint:
+            return None
+        async with self._db.execute(
+            "SELECT * FROM contacts WHERE peer_fingerprint = ?",
+            (peer_fingerprint,),
         ) as cursor:
             rows = await cursor.fetchall()
             columns = [desc[0] for desc in cursor.description]
