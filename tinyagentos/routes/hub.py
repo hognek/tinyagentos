@@ -147,6 +147,18 @@ async def _try_handshake(
         )
         return
 
+    # Verify the directory-supplied pubkey matches the expected peer fingerprint.
+    # A mismatch means the directory returned a key for the wrong identity;
+    # skip the handshake to avoid pinning TOFU keys from an imposter.
+    if peer_fingerprint and identity.fingerprint(ed25519_pub) != peer_fingerprint:
+        logger.warning(
+            "friend-accept handshake skipped: pubkey fingerprint mismatch for %s "
+            "(expected %s)",
+            contact_id,
+            peer_fingerprint,
+        )
+        return
+
     display_name = directory_resp.get("display_name") or username
     endpoints = directory_resp.get("endpoints")
     if isinstance(endpoints, str):
