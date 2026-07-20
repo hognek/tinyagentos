@@ -931,6 +931,165 @@ def get_processor(kind: str, store: LibraryStore,
 
 
 # ---------------------------------------------------------------------------
+# Heavy tier — opt-in media download
+# ---------------------------------------------------------------------------
+
+
+class HeavyDownloadProcessor(Processor):
+    """Downloads media for items that have opted into the heavy tier.
+
+    Currently supports url:youtube items via yt-dlp download_video.
+    Respects per-item quality preference and per-source rules.
+    """
+
+    _VALID_QUALITIES = frozenset({"360", "480", "720", "1080", "best"})
+
+    async def process(self, item: dict) -> list[dict]:
+        item_id = item["id"]
+        source_url = item.get("source_url", "")
+        artifacts: list[dict] = []
+
+        if not source_url:
+            return artifacts
+
+        kind = item.get("kind", "")
+        if kind != "url:youtube":
+            return artifacts
+
+        quality = item.get("quality", "") or "720"
+        if quality not in self._VALID_QUALITIES:
+            quality = "720"
+
+        try:
+            from tinyagentos.knowledge_fetchers.youtube import download_video
+        except ImportError:
+            logger.warning("yt-dlp not available for heavy download")
+            return artifacts
+
+        download_dir = self.storage_dir / "downloads"
+        download_dir.mkdir(parents=True, exist_ok=True)
+
+        path = await download_video(source_url, quality=quality, output_dir=download_dir)
+
+        if not path:
+            msg = f"Heavy download failed for {source_url!r}: yt-dlp returned no output path"
+            logger.warning(msg)
+            await self.store.update_item(
+                item_id,
+                meta_json={
+                    **json.loads(item.get("meta_json", "{}")),
+                    "download_error": msg,
+                },
+            )
+            return artifacts
+
+        p = Path(path)
+        if not p.exists():
+            # Try to find the downloaded file
+            candidates = sorted(
+                download_dir.glob("*"), key=lambda x: x.stat().st_mtime, reverse=True
+            )
+            if candidates:
+                p = candidates[0]
+            else:
+                await self.store.update_item(
+                    item_id,
+                    meta_json={
+                        **json.loads(item.get("meta_json", "{}")),
+                        "download_error": "Downloaded file not found on disk",
+                    },
+                )
+                return artifacts
+
+        size_bytes = p.stat().st_size
+        await self.store.update_item(
+            item_id,
+            download_path=str(p),
+            download_bytes=size_bytes,
+            bytes=size_bytes,
+            downloaded_at=time.time(),
+        )
+
+        download_meta: dict = {
+            "path": str(p),
+            "bytes": size_bytes,
+            "quality": quality,
+            "format": p.suffix.lstrip("."),
+        }
+        await self.store.add_artifact(
+            item_id, kind="download", path=str(p), meta=download_meta,
+        )
+        artifacts.append({
+            "kind": "download", "path": str(p), "meta": download_meta,
+        })
+
+        return artifacts
+
+
+async def run_heavy_pipeline(
+    store: LibraryStore,
+    item_id: str,
+    storage_dir: Path,
+    quality: str = "",
+) -> dict | None:
+    """Run the heavy-tier download pipeline for one item.
+
+    Checks per-source rules for auto_download settings, respects per-item
+    quality override, and downloads the media via yt-dlp.
+
+    Returns download metadata dict on success, None if skipped or failed.
+    """
+    item = await store.get_item(item_id)
+    if not item:
+        return None
+
+    kind = item.get("kind", "")
+    source_url = item.get("source_url", "")
+
+    # Only YouTube items are supported for heavy download currently
+    if kind != "url:youtube" or not source_url:
+        return None
+
+    # Check for matching rules (apply first matching rule's quality if
+    # no explicit quality was provided)
+    if not quality:
+        rules = await store.match_rules(source_url)
+        if rules:
+            quality = rules[0].get("quality", "") or "720"
+
+    # Fallback to item's quality field, then default 720
+    if not quality:
+        quality = item.get("quality", "") or "720"
+
+    # Create a job entry
+    await store.create_job(item_id, "heavy_download")
+
+    try:
+        proc = HeavyDownloadProcessor(store, storage_dir)
+        # Override the item's quality for this run
+        item_with_quality = dict(item, quality=quality)
+        artifacts = await proc.process(item_with_quality)
+
+        if artifacts:
+            await store.update_job(
+                (await store.get_item_jobs(item_id))[-1]["id"],
+                state="done",
+            )
+            return artifacts[0].get("meta", {})
+        else:
+            await store.update_job(
+                (await store.get_item_jobs(item_id))[-1]["id"],
+                state="error",
+                error="Download produced no artifacts",
+            )
+            return None
+    except Exception:
+        logger.exception("Heavy pipeline failed for item %s", item_id)
+        await store.update_item_status(item_id, "error")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Pipeline runner
 # ---------------------------------------------------------------------------
 
