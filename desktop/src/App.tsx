@@ -133,24 +133,22 @@ function SystemShortcuts({ toggleSearch, toggleLaunchpad, toggleAssistant }: Sys
       if (!resp.ok) {
         throw new Error(`Server returned ${resp.status}`);
       }
-      const data = await resp.json();
-      window.dispatchEvent(new CustomEvent("taos:agents-changed"));
-
-      // Surface partial failures from force-kill results
-      const forceResults: Record<string, { force_killed?: boolean; error?: string }> =
-        data.force_kill_results ?? {};
-      const failures = Object.entries(forceResults).filter(
-        ([, r]) => !r.force_killed
-      );
+      const body: any = await resp.json().catch(() => ({}));
+      const results: Record<string, any> = body.results || {};
+      const forceResults: Record<string, any> = body.force_kill_results || {};
+      const failures = [
+        ...Object.entries(results).filter(([, r]) => !r.success),
+        ...Object.entries(forceResults).filter(([, r]) => !r.force_killed),
+      ];
       if (failures.length > 0) {
-        const names = failures.map(([n]) => n).join(", ");
         addNotification({
           source: "system",
-          title: "Agents stopped with warnings",
-          body: `Force-kill failed for: ${names}. Check server logs for details.`,
+          title: "Kill switch partial failure",
+          body: `${failures.length} agent(s) failed to stop.`,
           level: "warning",
         });
       } else {
+        window.dispatchEvent(new CustomEvent("taos:agents-changed"));
         addNotification({
           source: "system",
           title: "Agents stopped",

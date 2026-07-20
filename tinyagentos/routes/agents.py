@@ -171,14 +171,7 @@ async def list_agents(request: Request):
 async def list_agent_containers(request: Request):
     """List live LXC container status for all agent containers."""
     from tinyagentos.containers import list_containers
-    try:
-        containers = await list_containers(prefix="taos-agent-")
-    except RuntimeError as e:
-        logger.error("list_agent_containers: incus unreachable: %s", e)
-        return JSONResponse(
-            {"error": "Incus daemon unreachable", "detail": str(e)},
-            status_code=503,
-        )
+    containers = await list_containers(prefix="taos-agent-")
     return [
         {
             "name": c.name,
@@ -818,72 +811,76 @@ async def bulk_stop_agents(request: Request):
     if orchestrator is not None:
         report = await orchestrator.prepare("all", "stop")
 
-    # Phase 1: SIGTERM every agent container
-    results = await _bulk_container_op(config, stop_container)
-
-    # Phase 2: 2-second grace window, then SIGKILL any stragglers
-    # (shielded from cancellation; the sleep+force is bounded by the 120s _run cap)
+    # Phase 1: Grace window + force-kill (started first to overlap with graceful stop)
+    # (shielded from cancellation; no route-level timeout applies)
     async def _grace_kill():
         await asyncio.sleep(2)
-        incus_unhealthy = False
-        containers = []
         try:
             containers = await list_containers(prefix="taos-agent-")
-        except RuntimeError as e:
+        except Exception:
             logger.warning(
-                "list_containers failed; incus may be unhealthy: %s. "
-                "Attempting force-kill on all configured agents.",
-                e,
+                "list_containers raised; incus may be unhealthy. Skipping force-kill."
             )
-            incus_unhealthy = True
-        else:
-            if not containers and config.agents:
-                logger.warning(
-                    "list_containers returned empty; no agent containers found. "
-                    "Skipping force-kill."
-                )
+            return {}
+        if not containers and config.agents:
+            logger.warning(
+                "list_containers returned empty; incus may be unhealthy. "
+                "Attempting force-kill on all configured agents."
+            )
         running = {
             c.name
             for c in containers
-            if c.status in ("Running", "Stopping", "Freezing", "Frozen")
+            if c.status in ("Running", "Stopping")
         }
-        force_results: dict[str, dict] = {}
+        incus_unhealthy = not containers and bool(config.agents)
 
-        async def _force_kill_one(agent: dict) -> tuple[str, dict]:
+        async def _force_kill_one(agent):
             name = agent["name"]
             container_name = f"taos-agent-{name}"
             try:
                 if container_name in running or incus_unhealthy:
                     force_result = await stop_container(container_name, force=True)
-                    result = {
+                    return name, {
                         "force_killed": force_result.get("success", False),
                         "output": force_result.get("output", ""),
                     }
-                    if not force_result.get("success", False):
-                        result["error"] = force_result.get("output") or "Force-kill command failed"
-                        logger.warning(
-                            "Force-kill of %s failed: %s",
-                            container_name,
-                            force_result.get("output", "unknown"),
-                        )
-                    return (name, result)
-                return (name, {"force_killed": False, "output": ""})
             except Exception as e:
-                return (name, {"force_killed": False, "error": str(e)})
+                return name, {"force_killed": False, "error": str(e)}
+            return name, {}
 
-        tasks = [_force_kill_one(agent) for agent in config.agents]
-        results_list = await asyncio.gather(*tasks)
-        force_results = dict(results_list)
+        gathered = await asyncio.gather(
+            *[_force_kill_one(agent) for agent in config.agents],
+            return_exceptions=True,
+        )
+        force_results = {}
+        for item in gathered:
+            if isinstance(item, BaseException):
+                logger.warning("Force-kill task failed: %s", item)
+                continue
+            name, data = item
+            if data:
+                force_results[name] = data
+                if not data.get("force_killed", True):
+                    logger.warning("Force-kill of taos-agent-%s failed", name)
         return force_results
 
-    task = asyncio.create_task(_grace_kill())
+    grace_task = asyncio.create_task(_grace_kill())
+
+    # Phase 2: SIGTERM every agent container
     try:
-        force_results = await asyncio.shield(task)
-    except asyncio.CancelledError:
+        results = await _bulk_container_op(config, stop_container)
+    except BaseException:
+        grace_task.cancel()
         try:
-            await task
+            await grace_task
         except asyncio.CancelledError:
             pass
+        raise
+
+    try:
+        force_results = await asyncio.shield(grace_task)
+    except asyncio.CancelledError:
+        await grace_task
         raise
 
     return {
@@ -943,35 +940,29 @@ async def stop_agent(request: Request, name: str):
         report = await orchestrator.prepare([name], "stop")
 
     container_name = f"taos-agent-{name}"
-    stop_result = await stop_container(container_name)
 
-    # 2-second grace window, then SIGKILL
-    # (shielded from cancellation; the sleep+force is bounded by the 120s _run cap)
+    # Grace window + force-kill (started first to overlap with graceful stop)
+    # (shielded from cancellation; no route-level timeout applies)
     async def _grace_kill():
         await asyncio.sleep(2)
-        incus_unhealthy = False
-        containers = []
         try:
             containers = await list_containers(prefix="taos-agent-")
-        except RuntimeError as e:
+        except Exception:
             logger.warning(
-                "list_containers failed; incus may be unhealthy: %s. "
-                "Attempting force-kill anyway.",
-                e,
+                "list_containers raised; incus may be unhealthy. Skipping force-kill."
             )
-            incus_unhealthy = True
-        else:
-            if not containers:
-                logger.warning(
-                    "list_containers returned empty; no agent containers found. "
-                    "Skipping force-kill."
-                )
+            return (False, "")
+        if not containers:
+            logger.warning(
+                "list_containers returned empty; incus may be unhealthy. "
+                "Attempting force-kill anyway."
+            )
         running = {
             c.name
             for c in containers
-            if c.status in ("Running", "Stopping", "Freezing", "Frozen")
+            if c.status in ("Running", "Stopping")
         }
-        if container_name in running or incus_unhealthy:
+        if container_name in running or not containers:
             force_result = await stop_container(container_name, force=True)
             success = force_result.get("success", False)
             if not success:
@@ -983,14 +974,22 @@ async def stop_agent(request: Request, name: str):
             return (success, force_result.get("output", ""))
         return (False, "")
 
-    task = asyncio.create_task(_grace_kill())
+    grace_task = asyncio.create_task(_grace_kill())
+
     try:
-        force_killed, force_output = await asyncio.shield(task)
-    except asyncio.CancelledError:
+        stop_result = await stop_container(container_name)
+    except BaseException:
+        grace_task.cancel()
         try:
-            await task
+            await grace_task
         except asyncio.CancelledError:
             pass
+        raise
+
+    try:
+        force_killed, force_output = await asyncio.shield(grace_task)
+    except asyncio.CancelledError:
+        await grace_task
         raise
 
     return {
