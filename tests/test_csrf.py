@@ -87,6 +87,34 @@ class TestVerifyCSRF:
             )
         assert resp.status_code == 403
 
+    @pytest.mark.asyncio
+    async def test_todo_mutation_without_csrf_token_forbidden(self, app):
+        """Todo list creation without matching X-CSRF-Token returns 403."""
+        from tinyagentos.todo.todo_store import TodoStore
+
+        todo_store = TodoStore(app.state.data_dir / "todo.db")
+        await todo_store.init()
+        app.state.todo_store = todo_store
+
+        app.state.auth.setup_user("csrftest", "CSRF Test", "", "pass1234!")
+        record = app.state.auth.find_user("csrftest")
+        token = app.state.auth.create_session(user_id=record["id"], long_lived=False)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            cookies={"taos_session": token, "csrf_token": "real-token"},
+        ) as c:
+            resp = await c.post(
+                "/api/todo",
+                json={"title": "x"},
+                headers={"X-CSRF-Token": "wrong-token"},
+            )
+        assert resp.status_code == 403
+
+        await todo_store.close()
+
 
 def test_verify_csrf_is_noop_for_websocket_scope():
     # verify_csrf is typed HTTPConnection so FastAPI injects it on BOTH http and

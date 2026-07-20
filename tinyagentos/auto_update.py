@@ -372,6 +372,41 @@ class AutoUpdateService:
                         new_commit[:7],
                     )
                     return
+
+                # ── GPG signature verification ──────────────────────────
+                gpg_result, gpg_prefs = await self._verify_gpg(new_commit)
+                if not gpg_result.ok:
+                    if gpg_prefs.required:
+                        logger.warning(
+                            "auto-update: blocking update — GPG verification "
+                            "failed (required): %s", gpg_result.status,
+                        )
+                        await self._notif.emit_event(
+                            event_type="system.update",
+                            title="taOS update blocked",
+                            message=(
+                                f"An update is available ({current[:7]}→{new_commit[:7]}) "
+                                f"but GPG signature verification failed: {gpg_result.status}"
+                            ),
+                            level="warning",
+                        )
+                        return
+                    # Warn but don't block — defence-in-depth.
+                    logger.warning(
+                        "auto-update: GPG verification failed (warn-only): %s",
+                        gpg_result.status,
+                    )
+                    await self._notif.emit_event(
+                        event_type="system.update",
+                        title="taOS update — signature warning",
+                        message=(
+                            f"An update is available ({current[:7]}→{new_commit[:7]}) "
+                            f"but GPG signature verification failed: {gpg_result.status}"
+                        ),
+                        level="warning",
+                    )
+                    # Fall through — still notify about the update.
+
                 # Skip re-notifying for a commit we've already flagged.
                 if prefs.get("last_notified_commit") != new_commit:
                     await self._notify_available(current, new_commit)
@@ -404,6 +439,38 @@ class AutoUpdateService:
                 arch=_arch,
                 cache=_fw_cache,
             )
+
+    async def _verify_gpg(self, commit_sha: str) -> tuple["GpgVerificationResult", "GpgPrefs"]:
+        """Verify GPG signature on *commit_sha* according to user prefs.
+
+        Returns (result, gpg_prefs) so the caller can read gpg_prefs.required
+        from the correct (GPG) namespace rather than the auto-update namespace.
+        """
+        from tinyagentos.gpg_verify import (
+            verify_remote_commit,
+            resolve_gpg_prefs,
+            GpgVerificationResult,
+            GpgPrefs,
+        )
+        try:
+            gpg_prefs = await resolve_gpg_prefs(self._settings)
+            result = await verify_remote_commit(
+                self._project_dir, commit_sha, gpg_prefs,
+            )
+            return result, gpg_prefs
+        except Exception:
+            logger.exception("auto-update: GPG verification crashed")
+            # Resolve prefs outside the try so we have the real required flag
+            # even on crash — otherwise a crash with required=True would
+            # return GpgPrefs() (required=False) and fail open.
+            try:
+                gpg_prefs = await resolve_gpg_prefs(self._settings)
+            except Exception:
+                gpg_prefs = GpgPrefs()
+            return GpgVerificationResult(
+                ok=False,
+                status="GPG verification raised an exception — check server logs",
+            ), gpg_prefs
 
     async def _probe_remote(self) -> Optional[str]:
         """Return the tip of the tracked remote branch (the branch this install

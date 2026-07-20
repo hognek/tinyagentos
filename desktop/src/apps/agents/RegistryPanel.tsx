@@ -12,6 +12,7 @@ import {
   ScrollText,
   ArrowRight,
   UserPlus,
+  Archive,
 } from "lucide-react";
 import { Button, Card } from "@/components/ui";
 import { projectsApi } from "@/lib/projects";
@@ -753,6 +754,19 @@ export function RegistryPanel() {
   }
 
   const pendingCount = entries.filter((e) => e.status === "pending").length;
+  // Anything not explicitly retired (revoked/rejected/suspended) is visible
+  // by default so future RegistryStatus values are never silently hidden.
+  const retiredEntries = entries.filter(
+    (e) => e.status === "revoked" || e.status === "rejected" || e.status === "suspended",
+  );
+  const knownVisibleEntries = entries.filter(
+    (e) => !retiredEntries.includes(e) && (e.status === "active" || e.status === "pending"),
+  );
+  // Catch-all for any RegistryStatus values not in the known groups above.
+  const otherEntries = entries.filter(
+    (e) => !retiredEntries.includes(e) && e.status !== "active" && e.status !== "pending",
+  );
+  const [retiredExpanded, setRetiredExpanded] = useState(false);
 
   return (
     <section className="mt-4" aria-label="Agent registry">
@@ -798,16 +812,76 @@ export function RegistryPanel() {
             No registered agents yet.
           </p>
         ) : (
-          entries.map((entry) => (
-            <RegistryEntryRow
-              key={entry.canonical_id}
-              entry={entry}
-              isAdmin={isAdmin}
-              currentUserId={currentUserId}
-              onAction={handleAction}
-              onAssign={setAssignEntry}
-            />
-          ))
+          <>
+            {/* Active + Pending: always visible */}
+            {knownVisibleEntries.map((entry) => (
+              <RegistryEntryRow
+                key={entry.canonical_id}
+                entry={entry}
+                isAdmin={isAdmin}
+                currentUserId={currentUserId}
+                onAction={handleAction}
+                onAssign={setAssignEntry}
+              />
+            ))}
+
+            {/* Other: catch-all for unknown RegistryStatus values */}
+            {otherEntries.length > 0 && (
+              <section className="mt-2" aria-label="Other registry entries">
+                <div className="flex items-center gap-2 text-xs text-shell-text-tertiary mb-2">
+                  <Archive size={12} aria-hidden />
+                  Other ({otherEntries.length})
+                </div>
+                <div className="space-y-2">
+                  {otherEntries.map((entry) => (
+                    <RegistryEntryRow
+                      key={entry.canonical_id}
+                      entry={entry}
+                      isAdmin={isAdmin}
+                      currentUserId={currentUserId}
+                      onAction={handleAction}
+                      onAssign={setAssignEntry}
+                    />
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {/* Retired: collapsed by default */}
+            {retiredEntries.length > 0 && (
+              <section className="mt-2" aria-label="Retired registry entries">
+                <button
+                  onClick={() => setRetiredExpanded((v) => !v)}
+                  className="flex items-center gap-2 text-xs text-shell-text-tertiary hover:text-shell-text-secondary transition-colors mb-2"
+                  aria-expanded={retiredExpanded}
+                  aria-controls="retired-registry-panel"
+                >
+                  <ChevronRight
+                    size={13}
+                    className={`transition-transform shrink-0 ${retiredExpanded ? "rotate-90" : ""}`}
+                    aria-hidden
+                  />
+                  <Archive size={12} aria-hidden />
+                  Retired ({retiredEntries.length})
+                </button>
+                <div
+                  id="retired-registry-panel"
+                  className={`space-y-2 ${retiredExpanded ? "" : "hidden"}`}
+                >
+                  {retiredEntries.map((entry) => (
+                    <RegistryEntryRow
+                      key={entry.canonical_id}
+                      entry={entry}
+                      isAdmin={isAdmin}
+                      currentUserId={currentUserId}
+                      onAction={handleAction}
+                      onAssign={setAssignEntry}
+                    />
+                  ))}
+                </div>
+              </section>
+            )}
+          </>
         )}
         <GovernanceAuditPanel isAdmin={isAdmin} />
       </div>

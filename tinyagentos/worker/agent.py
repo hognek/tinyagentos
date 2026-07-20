@@ -104,10 +104,19 @@ class WorkerAgent:
         self.advertise_url = advertise_url
         self._running = False
         self._registered = False
+        # Worker-initiated lifecycle status (taOS #890 C2).  Persisted across
+        # controller restarts so that periodic status-less heartbeats don't
+        # silently revert a draining/updating worker back to "online".
+        self._lifecycle_status: str | None = None
+        self._lifecycle_reason: str | None = None
 
         from tinyagentos.worker.pairing import default_state_dir, load_signing_key
         self._state_dir = state_dir or default_state_dir()
         self._signing_key: bytes | None = load_signing_key(self._state_dir)
+
+        # Worker update-check service (background version polling).
+        # Created eagerly so callers can inspect state; started in run().
+        self._update_service: "WorkerUpdateService | None" = None
 
     async def detect_backends(self) -> list[dict]:
         """Discover locally running inference backends via live probing.
@@ -574,13 +583,21 @@ class WorkerAgent:
             logger.error(f"Failed to register: {e}")
             return False
 
-    async def heartbeat(self) -> int:
+    async def heartbeat(self, status: str | None = None, drain_reason: str | None = None) -> int:
         """Send heartbeat to controller with live backend catalog.
 
         Backend-driven: the heartbeat carries a fresh probe of every
         detected backend, not a cached snapshot. This lets the controller
         aggregate per-worker catalogs into a cluster-wide view that
         reflects what's actually loaded right now across the mesh.
+
+        Worker-initiated state transitions (taOS #890 C2): when ``status``
+        is set to ``"update-available"`` or ``"draining"``, the controller
+        heeds the worker's self-reported status instead of forcing it back
+        to ``"online"``. This inverts the classic controller-push drain
+        into a worker-pull drain: the worker detects an update, reports
+        its readiness to drain, waits for inflight work to complete, then
+        proceeds to self-install.
 
         Returns the HTTP status code from the controller, or 0 on
         connection failure / timeout. The caller uses this to detect
@@ -658,7 +675,14 @@ class WorkerAgent:
                 "host_lan_ip": live_host_lan_ip,
                 "url": live_url,
                 "hardware": live_hardware,
+                # Worker-initiated state transitions (taOS #890 C2).
+                "status": status,
+                "drain_reason": drain_reason,
             }
+            # Attach worker update-check state so the controller surfaces it
+            # in the Resource Manager / cluster view.
+            if self._update_service is not None:
+                payload["update_state"] = self._update_service.get_state()
             body = _json.dumps(payload).encode()
             auth_headers = sign_request_headers(self._signing_key, self.name, "POST", path, body)
             auth_headers["content-type"] = "application/json"
@@ -675,6 +699,51 @@ class WorkerAgent:
             # diagnostics, masquerading as controller unreachability.
             logger.warning("heartbeat send failed: %s: %s", type(exc).__name__, exc)
             return 0
+
+    # ── Worker-initiated drain (taOS #890 C2) ──────────────────────────
+
+    async def report_update_available(self, reason: str = "update") -> int:
+        """Report that an update is available but the worker is still serving.
+
+        Transitions the worker to ``"update-available"`` status on the
+        controller. The worker continues accepting tasks; this is a
+        precursor signal that a drain will follow when the worker is
+        ready.
+        """
+        logger.info("worker '%s': reporting update available (reason=%s)", self.name, reason)
+        self._lifecycle_status = "update-available"
+        self._lifecycle_reason = reason
+        return await self.heartbeat(status="update-available", drain_reason=reason)
+
+    async def initiate_self_drain(self, reason: str = "update") -> int:
+        """Initiate a worker-initiated graceful drain.
+
+        Sends a heartbeat with ``status="draining"`` to the controller,
+        which stops routing new tasks to this worker while letting
+        in-flight leases complete. The monitor loop auto-completes the
+        drain when all leases are released.
+
+        Returns the HTTP status code from the controller (200 on success).
+        """
+        logger.info("worker '%s': initiating self-drain (reason=%s)", self.name, reason)
+        self._lifecycle_status = "draining"
+        self._lifecycle_reason = reason
+        return await self.heartbeat(status="draining", drain_reason=reason)
+
+    async def notify_drain_complete(self) -> int:
+        """Notify the controller that the worker's drain is complete.
+
+        After in-flight work finishes, the worker sends one final
+        heartbeat with status="updating" to signal readiness for
+        the update. The controller can then proceed with the update
+        deploy.
+
+        Returns the HTTP status code from the controller.
+        """
+        logger.info("worker '%s': drain complete, ready for update", self.name)
+        self._lifecycle_status = "updating"
+        self._lifecycle_reason = "drain-complete"
+        return await self.heartbeat(status="updating")
 
     def _log_repair_instruction(self) -> None:
         logger.error(
@@ -708,16 +777,55 @@ class WorkerAgent:
         _in_repair = False
         _last_repair_log: float = 0.0
 
-        while self._running:
-            # Register if we aren't (yet, or any more).
-            if not self._registered:
-                result = await self.register()
-                if result is True:
-                    logger.info(f"worker '{self.name}' registered with {self.controller_url}")
+        # Start the worker update-check service (background version polling).
+        from tinyagentos.worker.update_check import WorkerUpdateService
+        self._update_service = WorkerUpdateService(
+            state_dir=self._state_dir,
+            worker_name=self.name,
+        )
+        await self._update_service.start()
+
+        try:
+            while self._running:
+                # Register if we aren't (yet, or any more).
+                if not self._registered:
+                    result = await self.register()
+                    if result is True:
+                        logger.info(f"worker '{self.name}' registered with {self.controller_url}")
+                        _in_repair = False
+                        continue
+                    if result == _NEEDS_REPAIR:
+                        # Controller rejected our key -- enter needs-re-pair state.
+                        now = time.monotonic()
+                        if not _in_repair or (now - _last_repair_log) >= _REPAIR_LOG_INTERVAL:
+                            self._log_repair_instruction()
+                            _last_repair_log = now
+                        _in_repair = True
+                        await asyncio.sleep(_REPAIR_INTERVAL)
+                        continue
+                    # Generic registration failure -- short retry.
                     _in_repair = False
+                    await asyncio.sleep(5)
                     continue
-                if result == _NEEDS_REPAIR:
-                    # Controller rejected our key -- enter needs-re-pair state.
+
+                # Include any persisted lifecycle status (taOS #890 C2) so that
+                # a controller restart doesn't silently revert a
+                # draining/updating worker back to "online" after re-registration.
+                status = await self.heartbeat(
+                    status=self._lifecycle_status,
+                    drain_reason=self._lifecycle_reason,
+                )
+                if status == 404:
+                    # Controller has forgotten about us (restart, manual
+                    # deregister, etc). Drop our registered state and the
+                    # next loop iteration will re-register.
+                    logger.warning(
+                        f"controller returned 404 on heartbeat, re-registering '{self.name}'"
+                    )
+                    self._registered = False
+                elif status == 401:
+                    # Controller rejected our signing key -- enter needs-re-pair state.
+                    self._registered = False
                     now = time.monotonic()
                     if not _in_repair or (now - _last_repair_log) >= _REPAIR_LOG_INTERVAL:
                         self._log_repair_instruction()
@@ -725,36 +833,17 @@ class WorkerAgent:
                     _in_repair = True
                     await asyncio.sleep(_REPAIR_INTERVAL)
                     continue
-                # Generic registration failure -- short retry.
-                _in_repair = False
+                elif status == 0:
+                    # Network / DNS / controller-down. Don't drop the
+                    # registered flag yet; the controller may still know
+                    # us when it comes back. Just retry on next tick.
+                    pass
                 await asyncio.sleep(5)
-                continue
-
-            status = await self.heartbeat()
-            if status == 404:
-                # Controller has forgotten about us (restart, manual
-                # deregister, etc). Drop our registered state and the
-                # next loop iteration will re-register.
-                logger.warning(
-                    f"controller returned 404 on heartbeat, re-registering '{self.name}'"
-                )
-                self._registered = False
-            elif status == 401:
-                # Controller rejected our signing key -- enter needs-re-pair state.
-                self._registered = False
-                now = time.monotonic()
-                if not _in_repair or (now - _last_repair_log) >= _REPAIR_LOG_INTERVAL:
-                    self._log_repair_instruction()
-                    _last_repair_log = now
-                _in_repair = True
-                await asyncio.sleep(_REPAIR_INTERVAL)
-                continue
-            elif status == 0:
-                # Network / DNS / controller-down. Don't drop the
-                # registered flag yet; the controller may still know
-                # us when it comes back. Just retry on next tick.
-                pass
-            await asyncio.sleep(5)
+        finally:
+            if self._update_service is not None:
+                await self._update_service.stop()
 
     def stop(self):
         self._running = False
+        if self._update_service is not None:
+            self._update_service._stop_event.set()

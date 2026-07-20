@@ -61,8 +61,8 @@ class TestListContainers:
     async def test_handles_incus_failure(self):
         with patch("tinyagentos.containers._run", new_callable=AsyncMock) as mock_run:
             mock_run.return_value = (1, "error")
-            containers = await list_containers()
-            assert containers == []
+            with pytest.raises(RuntimeError, match="incus list failed"):
+                await list_containers()
 
 
 class TestCreateContainer:

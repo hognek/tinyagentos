@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os as _os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,6 +15,10 @@ from tinyagentos.providers import ALL_TYPES as VALID_BACKEND_TYPES
 log = logging.getLogger(__name__)
 
 VALID_ON_WORKER_FAILURE = {"pause", "fallback", "escalate-immediately"}
+
+# Module-level flag to emit the github_app_private_key deprecation warning
+# only once per process, not on every config reload.
+_deprecation_warned_github_key = False
 
 # Port used by LiteLLM on the host side.  Container-internal side is always
 # 4000 (the incus proxy device bridges container:4000 -> host:litellm_port).
@@ -55,6 +60,8 @@ class AppConfig:
     archived_agents: list[dict] = field(default_factory=list)
     archive: dict = field(default_factory=lambda: DEFAULT_ARCHIVE_CONFIG.copy())
     memory_url: str = "http://localhost:7900"
+    wallhaven_api_key: str | None = None
+    github_app_id: str = ""
     config_path: Path | None = None
 
     def to_dict(self) -> dict:
@@ -74,6 +81,8 @@ class AppConfig:
             d["archive"] = self.archive
         if self.memory_url != "http://localhost:7900":
             d["memory_url"] = self.memory_url
+        if self.github_app_id:
+            d["github_app_id"] = self.github_app_id
         return d
 
 # rkllama's taOS default port moved from the upstream 8080 to 7833. Installs
@@ -125,10 +134,18 @@ def _migrate_legacy_rkllama_backend_name(backends: list[dict]) -> None:
 
 
 def load_config(path: Path) -> AppConfig:
+    # Wallhaven API key is env-only (never written to config.yaml).
+    # Read it once before any branching so both fresh-install and
+    # existing-config paths pick it up.
+    wallhaven_api_key: str | None = _os.environ.get("WALLHAVEN_API_KEY") or None
+
     if not path.exists():
         # Fresh install: build defaults with litellm_port explicitly recorded
         # so the choice is durable and never falls back to a hardcoded default.
-        cfg = AppConfig(config_path=path)
+        cfg = AppConfig(
+            config_path=path,
+            wallhaven_api_key=wallhaven_api_key,
+        )
         cfg.server.setdefault("litellm_port", _LITELLM_PORT_NEW)
         return cfg
     text = path.read_text()
@@ -174,8 +191,20 @@ def load_config(path: Path) -> AppConfig:
         archived_agents=data.get("archived_agents", []),
         archive=archive_cfg,
         memory_url=data.get("memory_url", "http://localhost:7900"),
+        github_app_id=str(data.get("github_app_id", "") or ""),
         config_path=path,
+        wallhaven_api_key=wallhaven_api_key,
     )
+    if "github_app_private_key" in data:
+        global _deprecation_warned_github_key
+        if not _deprecation_warned_github_key:
+            _deprecation_warned_github_key = True
+            log.warning(
+                "config.yaml contains github_app_private_key which is no longer "
+                "stored in config. The key will be migrated to SecretsStore on "
+                "next startup. To configure manually, add a secret named "
+                "'github-app-private-key' in the Secrets page."
+            )
     if _pin_applied:
         save_config(cfg, path)
     return cfg

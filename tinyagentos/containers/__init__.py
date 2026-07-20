@@ -158,12 +158,13 @@ async def list_containers(prefix: str = "taos-agent-") -> list[ContainerInfo]:
     """List all agent containers."""
     code, output = await _run(["incus", "list", "-f", "json"])
     if code != 0:
-        logger.error(f"incus list failed: {output}")
-        return []
+        logger.error(f"incus list failed (exit {code}): {output}")
+        raise RuntimeError(f"incus list failed (exit {code}): {output.strip()}")
     try:
         containers = json.loads(output)
-    except json.JSONDecodeError:
-        return []
+    except json.JSONDecodeError as e:
+        logger.error(f"incus list JSON decode failed: {e}")
+        raise RuntimeError(f"incus list returned invalid JSON: {e}") from e
     results = []
     for c in containers:
         name = c.get("name", "")

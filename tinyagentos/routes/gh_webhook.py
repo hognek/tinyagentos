@@ -24,6 +24,9 @@ router = APIRouter()
 
 EVENTS_LOG_PATH = Path.home() / ".taos-gh-events.jsonl"
 
+# Installation event actions that we explicitly handle for store management.
+_HANDLED_INSTALLATION_ACTIONS = frozenset({"created", "deleted", "unsuspend"})
+
 
 def _extract_event_data(event_type: str, payload: dict) -> dict | None:
     """Extract the canonical fields from a payload for the given event type.
@@ -71,6 +74,50 @@ def _extract_event_data(event_type: str, payload: dict) -> dict | None:
     except Exception:
         logger.exception("Failed to extract event data from payload")
         return None
+
+
+async def _handle_installation_event(request: Request, event_type: str, payload: dict) -> None:
+    """Auto-register / auto-remove GitHub App installations from webhook events."""
+    action = payload.get("action", "")
+    if action not in _HANDLED_INSTALLATION_ACTIONS:
+        logger.debug(
+            "Webhook: unhandled installation action %r — ignored (handled: %s)",
+            action, sorted(_HANDLED_INSTALLATION_ACTIONS),
+        )
+        return
+
+    installation = payload.get("installation", {})
+    installation_id = installation.get("id")
+    if not installation_id:
+        return
+
+    installs_store = getattr(request.app.state, "github_app_installations", None)
+    if installs_store is None:
+        return
+
+    if action == "deleted":
+        await installs_store.remove(installation_id)
+        logger.info(
+            "Webhook: removed installation %s (%s)", installation_id, action
+        )
+        return
+
+    if action in ("created", "unsuspend"):
+        account = installation.get("account", {})
+        await installs_store.add(
+            installation_id=installation_id,
+            account_login=account.get("login", ""),
+            account_type=account.get("type", ""),
+            account_avatar_url=account.get("avatar_url", ""),
+            repository_selection=installation.get("repository_selection", "selected"),
+        )
+        logger.info(
+            "Webhook: added installation %s (%s/%s)",
+            installation_id,
+            account.get("login", ""),
+            account.get("type", ""),
+        )
+        return
 
 
 @router.post("/api/webhooks/github")
@@ -125,6 +172,10 @@ async def github_webhook(request: Request) -> Response:
             "sender": "",
             "url": "",
         }
+
+    # Handle GitHub App installation lifecycle events
+    if event_type == "installation":
+        await _handle_installation_event(request, event_type, payload)
 
     # Append as a single JSONL line
     jsonl_line = json.dumps(event_data, ensure_ascii=False) + "\n"

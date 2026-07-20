@@ -7,6 +7,8 @@ from pathlib import Path
 
 import httpx
 
+import yaml
+
 logger = logging.getLogger(__name__)
 from fastapi import FastAPI
 from fastapi.middleware.gzip import GZipMiddleware
@@ -65,6 +67,7 @@ from tinyagentos.scheduler.gpu_arbiter import GpuArbiter
 from tinyagentos.torrent_settings import TorrentSettingsStore
 from tinyagentos.relationships import RelationshipManager
 from tinyagentos.github_identities import GitHubIdentitiesStore
+from tinyagentos.github_app_installations import GitHubAppInstallations
 from tinyagentos.broker import BrokerService, BrokerStore
 from tinyagentos.broker.store import default_broker_path
 from tinyagentos.secrets import SecretsStore
@@ -99,6 +102,7 @@ from tinyagentos.user_personas import UserPersonaStore
 from tinyagentos.installed_apps import InstalledAppsStore
 from tinyagentos.skills import SkillStore
 from tinyagentos.office_docs import OfficeDocStore
+from tinyagentos.contacts_store import ContactsStore
 from tinyagentos.web_sites import WebSiteStore
 from tinyagentos.music_songs import SongStore
 from tinyagentos.design_docs import DesignStore
@@ -255,9 +259,23 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     # hardware_path / hardware_profile already loaded above before the
     # auto-register loop; don't re-probe.
     installed_path = data_dir / "installed.json"
-    registry = AppRegistry(catalog_dir=catalog_dir, installed_path=installed_path)
+
+    from tinyagentos.store_signing import (
+        load_or_create_signing_keypair as load_or_create_store_signing_keypair,
+    )
+
+    # Keypair loading is deferred to the lifespan so a read-only data_dir
+    # does not block create_app().  The registry starts with signing_key=None;
+    # the lifespan will attempt to load the keypair and call
+    # registry.set_signing_key() if it succeeds.
+    _store_priv: bytes | None = None
+    _store_pub: bytes | None = None
+    registry = AppRegistry(
+        catalog_dir=catalog_dir, installed_path=installed_path, signing_key=None,
+    )
 
     from tinyagentos.agent_registry_store import AgentRegistryStore, load_or_create_signing_keypair
+
     agent_registry_store = AgentRegistryStore(data_dir / "agent_registry.db")
     agent_registry_keypair = load_or_create_signing_keypair(data_dir)
 
@@ -289,6 +307,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     broker_service = BrokerService(broker_store)
     mail_store = MailAccountStore(data_dir / "mail.db")
     github_identities_store = GitHubIdentitiesStore(data_dir / "github_identities.db")
+    github_app_installations = GitHubAppInstallations(data_dir)
     relationship_mgr = RelationshipManager(data_dir / "relationships.db")
     channel_store = ChannelStore(data_dir / "channels.db")
     scheduler = TaskScheduler(data_dir / "scheduler.db")
@@ -404,6 +423,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     execution_policy_store = ExecutionPolicyStore(data_dir / "execution_policies.db")
     from tinyagentos.notes.shared_docs_store import SharedDocsStore
     shared_docs_store = SharedDocsStore(data_dir / "shared_docs.db")
+    from tinyagentos.todo.todo_store import TodoStore
+    todo_store = TodoStore(data_dir / "todo.db")
     from tinyagentos.coding_sessions.launcher import CodingSessionLauncher
     from tinyagentos.coding_sessions.store import CodingSessionStore
     coding_session_store = CodingSessionStore(data_dir / "coding_sessions.db")
@@ -429,6 +450,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     web_sites = WebSiteStore(data_dir / "web_sites.db")
     song_store = SongStore(data_dir / "songs.db")
     design_docs = DesignStore(data_dir / "design_docs.db")
+    contacts_store = ContactsStore(data_dir / "contacts.db")
     coding_workspaces_store = CodingWorkspaceStore(
         data_dir / "coding_workspaces.db",
         data_dir / "coding-workspaces",
@@ -493,10 +515,47 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await notif_push_store.init()
         await qmd_client.init()
         await secrets_store.init()
+        # -------------------------------------------------------------------
+        # Migrate legacy github_app_private_key from config.yaml → SecretsStore.
+        # The key was previously stored as plaintext in config and re-serialized
+        # on every config save.  Now it lives encrypted in SecretsStore under
+        # the well-known name ``github-app-private-key``.  This one-shot
+        # migration reads the old value, stores it, and strips it from config.
+        # -------------------------------------------------------------------
+        _cfg_raw = yaml.safe_load(config_path.read_text()) if config_path and config_path.exists() else {}
+        if isinstance(_cfg_raw, dict) and "github_app_private_key" in _cfg_raw:
+            _legacy_key = str(_cfg_raw.get("github_app_private_key", "") or "")
+            if _legacy_key:
+                _existing = await secrets_store.get("github-app-private-key")
+                # Treat an existing row with an empty value as missing so the
+                # migration writes the real key instead of silently skipping it.
+                if not _existing or not _existing.get("value"):
+                    if _existing and not _existing.get("value"):
+                        await secrets_store.update(
+                            name="github-app-private-key",
+                            value=_legacy_key,
+                            category="credentials",
+                            description="GitHub App RSA private key (migrated from config.yaml)",
+                        )
+                    else:
+                        await secrets_store.add(
+                            name="github-app-private-key",
+                            value=_legacy_key,
+                            category="credentials",
+                            description="GitHub App RSA private key (migrated from config.yaml)",
+                        )
+                    logger.info(
+                        "migrated github_app_private_key from config.yaml to SecretsStore"
+                    )
+                # save_config uses the AppConfig object (which no longer carries
+                # the field), so the legacy key is stripped from the file on this
+                # next save regardless of _cfg_raw mutations.
+                save_config(config, config_path)
         await broker_store.init()
         await mail_store.init()
         app.state.mail_store = mail_store
         await github_identities_store.init()
+        await github_app_installations.init()
         await relationship_mgr.init()
         await channel_store.init()
         await scheduler.init()
@@ -520,6 +579,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await decision_store.init()
         await execution_policy_store.init()
         await shared_docs_store.init()
+        await todo_store.init()
+        app.state.todo_store = todo_store
         await coding_session_store.init()
         app.state.coding_launcher = coding_launcher
         projects_root.mkdir(parents=True, exist_ok=True)
@@ -536,6 +597,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await web_sites.init()
         await song_store.init()
         await design_docs.init()
+        await contacts_store.init()
         await coding_workspaces_store.init()
         await install_registry_store.init()
         await store_submissions.init()
@@ -763,6 +825,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         app.state.models_root = models_root()
         app.state.models_root.mkdir(parents=True, exist_ok=True)
         app.state.torrent_settings_store = torrent_settings_store
+
         # Ensure the local token file exists before any request can arrive.
         # Logs the path at INFO so the user can find it.
         _local_token_path = auth_manager.local_token_path()
@@ -771,6 +834,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         channel_hub_router.set_archive(archive)  # Wire archive for zero-loss channel message capture
         # channel_hub_connectors, deploy_tasks, and idempotency_cache are
         # already set by the eager section; do not create new instances here.
+        app.state.todo_store = todo_store
         from tinyagentos.chat.group_policy import GroupPolicy
         app.state.group_policy = GroupPolicy()
         from tinyagentos.chat.reactions import WantsReplyRegistry
@@ -1235,6 +1299,22 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
             app.state.notif_vapid_keypair = None
             logger.warning("notif web-push disabled: VAPID keypair unavailable", exc_info=True)
 
+        # Load the store signing keypair — deferred to the lifespan so a
+        # read-only data_dir does not brick startup.  When the keypair
+        # cannot be loaded, signing is silently disabled and the install
+        # gate skips signature verification.
+        try:
+            _store_priv, _store_pub = load_or_create_store_signing_keypair(data_dir)
+            if _store_priv is not None:
+                registry.set_signing_key(_store_priv)
+                app.state.store_signing_pubkey = _store_pub
+        except (OSError, PermissionError):
+            logger.warning(
+                "store signing keypair could not be created (data_dir=%s may be "
+                "read-only) — catalog signatures will not be available",
+                data_dir,
+            )
+
         # All startup init complete — allow requests through.
         app.state._startup_complete = True
         logger.info("startup complete — accepting requests")
@@ -1329,6 +1409,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await web_sites.close()
         await song_store.close()
         await design_docs.close()
+        await contacts_store.close()
         await coding_workspaces_store.close()
         await install_registry_store.close()
         await user_memory.close()
@@ -1392,6 +1473,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await cluster_pairing_store.close()
         await agent_registry_store.close()
         await github_identities_store.close()
+        await github_app_installations.close()
         # Backstop: close any aiosqlite-backed store still open on app.state.
         # An unclosed BaseStore leaves a NON-daemon connection worker thread
         # alive, which blocks Python's threading._shutdown() until systemd
@@ -1478,11 +1560,13 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.broker = broker_service
     app.state.broker_store = broker_store
     app.state.github_identities = github_identities_store
+    app.state.github_app_installations = github_app_installations
     app.state.relationships = relationship_mgr
     app.state.channels = channel_store
     app.state.fallback = fallback
     app.state.scheduler = scheduler
     app.state.registry = registry
+    app.state.store_signing_pubkey = None  # set by lifespan
     app.state.hardware_profile = hardware_profile
     app.state.cluster_manager = cluster_manager
     app.state.task_router = task_router
@@ -1520,6 +1604,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.decision_store = decision_store
     app.state.execution_policies = execution_policy_store
     app.state.shared_docs_store = shared_docs_store
+    app.state.todo_store = todo_store
     app.state.coding_session_store = coding_session_store
     app.state.beads_bridge = None
     app.state.canvas_snapshotter = None
@@ -1545,6 +1630,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.web_sites = web_sites
     app.state.song_store = song_store
     app.state.design_docs = design_docs
+    app.state.contacts_store = contacts_store
     app.state.coding_workspaces = coding_workspaces_store
     app.state.install_registry = install_registry_store
     app.state.store_submissions = store_submissions

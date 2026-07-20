@@ -17,6 +17,7 @@ controller. For cluster-level job distribution, use taOS's worker dispatch.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -25,6 +26,8 @@ import uuid
 from datetime import datetime, timezone
 from enum import IntEnum
 from pathlib import Path
+
+from tinyagentos.db_migrations import apply_wal_pragmas
 
 logger = logging.getLogger(__name__)
 
@@ -88,19 +91,22 @@ DEFAULT_LIMITS = {
 
 
 class JobQueue:
-    """SQLite-backed job queue for serialising heavy memory tasks."""
+    """SQLite-backed job queue for serialising heavy memory tasks.
+
+    All public methods are async.  Blocking sqlite3 calls are dispatched to a
+    thread via asyncio.to_thread so they never stall the event loop.
+    """
 
     def __init__(self, db_path: str | Path = "data/job-queue.db"):
         self._db_path = str(db_path)
         self._conn: sqlite3.Connection | None = None
         self._limits: dict[str, int] = dict(DEFAULT_LIMITS)
+        self._lock = asyncio.Lock()
 
-    async def init(self) -> None:
-        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        # isolation_level=None puts the connection in autocommit mode so we
-        # can issue BEGIN IMMEDIATE manually for atomic read-check-write.
-        self._conn = sqlite3.connect(self._db_path, isolation_level=None)
+    def _sync_init(self) -> None:
+        self._conn = sqlite3.connect(self._db_path, isolation_level=None, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        apply_wal_pragmas(self._conn)
         self._conn.executescript(SCHEMA)
 
         # Load custom limits from config
@@ -126,6 +132,11 @@ class JobQueue:
         if stale.rowcount > 0:
             logger.info("Marked %d stale running jobs as failed", stale.rowcount)
 
+    async def init(self) -> None:
+        Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
+        async with self._lock:
+            await asyncio.to_thread(self._sync_init)
+
     async def close(self) -> None:
         if self._conn:
             self._conn.close()
@@ -135,16 +146,15 @@ class JobQueue:
     # Enqueue
     # ------------------------------------------------------------------
 
-    async def enqueue(
+    def _sync_enqueue(
         self,
         job_type: str,
-        payload: dict | None = None,
-        agent_name: str | None = None,
-        priority: int = Priority.NORMAL,
-        resource_type: str = RESOURCE_CPU,
-        estimated_seconds: int = 0,
+        payload: dict | None,
+        agent_name: str | None,
+        priority: int,
+        resource_type: str,
+        estimated_seconds: int,
     ) -> str:
-        """Add a job to the queue. Returns job ID."""
         job_id = uuid.uuid4().hex[:12]
         now = time.time()
         self._conn.execute(
@@ -156,18 +166,30 @@ class JobQueue:
         )
         return job_id
 
+    async def enqueue(
+        self,
+        job_type: str,
+        payload: dict | None = None,
+        agent_name: str | None = None,
+        priority: int = Priority.NORMAL,
+        resource_type: str = RESOURCE_CPU,
+        estimated_seconds: int = 0,
+    ) -> str:
+        """Add a job to the queue. Returns job ID."""
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_enqueue,
+                job_type, payload, agent_name, priority, resource_type, estimated_seconds,
+            )
+
     # ------------------------------------------------------------------
     # Dequeue (pull-based)
     # ------------------------------------------------------------------
 
-    async def dequeue(self, resource_types: list[str] | None = None) -> dict | None:
-        """Get the next eligible job to run, atomically.
-
-        Uses BEGIN IMMEDIATE to acquire a write lock before the read-check-update
-        sequence so two concurrent callers cannot both claim the same job.
-
-        Returns the job dict or None if nothing is eligible.
-        """
+    def _sync_dequeue(
+        self,
+        resource_types: list[str] | None,
+    ) -> dict | None:
         query = "SELECT * FROM jobs WHERE status = 'pending'"
         params: list = []
         if resource_types:
@@ -209,12 +231,22 @@ class JobQueue:
 
         return None
 
+    async def dequeue(self, resource_types: list[str] | None = None) -> dict | None:
+        """Get the next eligible job to run, atomically.
+
+        Uses BEGIN IMMEDIATE to acquire a write lock before the read-check-update
+        sequence so two concurrent callers cannot both claim the same job.
+
+        Returns the job dict or None if nothing is eligible.
+        """
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_dequeue, resource_types)
+
     # ------------------------------------------------------------------
     # Complete / fail
     # ------------------------------------------------------------------
 
-    async def complete(self, job_id: str, result: dict | None = None) -> bool:
-        """Mark a job as completed."""
+    def _sync_complete(self, job_id: str, result: dict | None) -> bool:
         now = time.time()
         cursor = self._conn.execute(
             "UPDATE jobs SET status = 'completed', completed_at = ?, result_json = ? WHERE id = ? AND status = 'running'",
@@ -222,8 +254,12 @@ class JobQueue:
         )
         return cursor.rowcount > 0
 
-    async def fail(self, job_id: str, error: str) -> bool:
-        """Mark a job as failed."""
+    async def complete(self, job_id: str, result: dict | None = None) -> bool:
+        """Mark a job as completed."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_complete, job_id, result)
+
+    def _sync_fail(self, job_id: str, error: str) -> bool:
         now = time.time()
         cursor = self._conn.execute(
             "UPDATE jobs SET status = 'failed', completed_at = ?, error = ? WHERE id = ? AND status = 'running'",
@@ -231,23 +267,36 @@ class JobQueue:
         )
         return cursor.rowcount > 0
 
-    async def cancel(self, job_id: str) -> bool:
-        """Cancel a pending job."""
+    async def fail(self, job_id: str, error: str) -> bool:
+        """Mark a job as failed."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_fail, job_id, error)
+
+    def _sync_cancel(self, job_id: str) -> bool:
         cursor = self._conn.execute(
             "UPDATE jobs SET status = 'cancelled' WHERE id = ? AND status = 'pending'",
             (job_id,),
         )
         return cursor.rowcount > 0
 
+    async def cancel(self, job_id: str) -> bool:
+        """Cancel a pending job."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_cancel, job_id)
+
     # ------------------------------------------------------------------
     # Queries
     # ------------------------------------------------------------------
 
-    async def get_job(self, job_id: str) -> dict | None:
+    def _sync_get_job(self, job_id: str) -> dict | None:
         row = self._conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return dict(row) if row else None
 
-    async def pending_count(self, agent_name: str | None = None) -> int:
+    async def get_job(self, job_id: str) -> dict | None:
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_get_job, job_id)
+
+    def _sync_pending_count(self, agent_name: str | None) -> int:
         if agent_name:
             row = self._conn.execute(
                 "SELECT COUNT(*) as n FROM jobs WHERE status = 'pending' AND agent_name = ?",
@@ -257,13 +306,21 @@ class JobQueue:
             row = self._conn.execute("SELECT COUNT(*) as n FROM jobs WHERE status = 'pending'").fetchone()
         return row["n"]
 
-    async def running_jobs(self) -> list[dict]:
+    async def pending_count(self, agent_name: str | None = None) -> int:
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_pending_count, agent_name)
+
+    def _sync_running_jobs(self) -> list[dict]:
         rows = self._conn.execute(
             "SELECT * FROM jobs WHERE status = 'running' ORDER BY started_at"
         ).fetchall()
         return [dict(r) for r in rows]
 
-    async def recent(self, limit: int = 20, status: str | None = None) -> list[dict]:
+    async def running_jobs(self) -> list[dict]:
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_running_jobs)
+
+    def _sync_recent(self, limit: int, status: str | None) -> list[dict]:
         if status:
             rows = self._conn.execute(
                 "SELECT * FROM jobs WHERE status = ? ORDER BY created_at DESC LIMIT ?",
@@ -275,24 +332,36 @@ class JobQueue:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    async def agent_jobs(self, agent_name: str, limit: int = 20) -> list[dict]:
+    async def recent(self, limit: int = 20, status: str | None = None) -> list[dict]:
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_recent, limit, status)
+
+    def _sync_agent_jobs(self, agent_name: str, limit: int) -> list[dict]:
         rows = self._conn.execute(
             "SELECT * FROM jobs WHERE agent_name = ? ORDER BY created_at DESC LIMIT ?",
             (agent_name, limit),
         ).fetchall()
         return [dict(r) for r in rows]
 
+    async def agent_jobs(self, agent_name: str, limit: int = 20) -> list[dict]:
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_agent_jobs, agent_name, limit)
+
     # ------------------------------------------------------------------
     # Config
     # ------------------------------------------------------------------
 
-    async def set_limit(self, resource_type: str, max_concurrent: int) -> None:
-        """Set the concurrency limit for a resource type."""
+    def _sync_set_limit(self, resource_type: str, max_concurrent: int) -> None:
         self._limits[resource_type] = max_concurrent
         self._conn.execute(
             "INSERT INTO queue_config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (f"limit_{resource_type}", str(max_concurrent)),
         )
+
+    async def set_limit(self, resource_type: str, max_concurrent: int) -> None:
+        """Set the concurrency limit for a resource type."""
+        async with self._lock:
+            await asyncio.to_thread(self._sync_set_limit, resource_type, max_concurrent)
 
     async def get_limits(self) -> dict[str, int]:
         return dict(self._limits)
@@ -301,8 +370,7 @@ class JobQueue:
     # Cleanup
     # ------------------------------------------------------------------
 
-    async def cleanup(self, older_than_days: int = 7) -> int:
-        """Remove completed/failed/cancelled jobs older than N days."""
+    def _sync_cleanup(self, older_than_days: int) -> int:
         cutoff = time.time() - (older_than_days * 86400)
         cursor = self._conn.execute(
             "DELETE FROM jobs WHERE status IN ('completed', 'failed', 'cancelled') AND created_at < ?",
@@ -310,12 +378,16 @@ class JobQueue:
         )
         return cursor.rowcount
 
+    async def cleanup(self, older_than_days: int = 7) -> int:
+        """Remove completed/failed/cancelled jobs older than N days."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_cleanup, older_than_days)
+
     # ------------------------------------------------------------------
     # Stats
     # ------------------------------------------------------------------
 
-    async def stats(self) -> dict:
-        """Queue statistics."""
+    def _sync_stats(self) -> dict:
         counts = {}
         for row in self._conn.execute(
             "SELECT status, COUNT(*) as n FROM jobs GROUP BY status"
@@ -335,3 +407,8 @@ class JobQueue:
             "total_pending": counts.get("pending", 0),
             "total_running": counts.get("running", 0),
         }
+
+    async def stats(self) -> dict:
+        """Queue statistics."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_stats)

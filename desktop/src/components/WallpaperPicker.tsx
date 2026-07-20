@@ -1,6 +1,8 @@
 import { useThemeStore } from "@/stores/theme-store";
 import type { Wallpaper } from "@/stores/theme-store";
-import { Check } from "lucide-react";
+import { Check, Globe } from "lucide-react";
+import { WallhavenBrowser } from "./WallhavenBrowser";
+import { useState } from "react";
 
 interface Props {
   open: boolean;
@@ -105,6 +107,7 @@ export function WallpaperPicker({ open, onClose }: Props) {
   const sections = getWallpapersBySection();
   const themeDefaultId = themeDefaultWallpaperId[activeThemeId] || "graphite";
   const isThemeDefault = wallpaperId === themeDefaultId;
+  const [browseOnlineOpen, setBrowseOnlineOpen] = useState(false);
 
   if (!open) return null;
 
@@ -172,7 +175,60 @@ export function WallpaperPicker({ open, onClose }: Props) {
                   }
                 />
               )}
+              {/* Browse online: render inside the Online section so multi-row
+                  results scroll with the picker instead of getting clipped in
+                  a shrink-0 footer. */}
+              {section.id === "online" && (
+                <div className="mt-2">
+                  <button
+                    onClick={() => setBrowseOnlineOpen((v) => !v)}
+                    className="flex items-center gap-2 w-full px-1 py-1.5 text-xs text-shell-text-secondary hover:text-shell-text transition-colors"
+                    aria-expanded={browseOnlineOpen}
+                    aria-label="Browse online wallpapers"
+                  >
+                    <Globe size={13} />
+                    Browse online
+                    <span
+                      className={`ml-auto text-[10px] transition-transform ${browseOnlineOpen ? "rotate-180" : ""}`}
+                    >
+                      ▼
+                    </span>
+                  </button>
+                  {browseOnlineOpen && (
+                    <div className="pt-2">
+                      <WallhavenBrowser
+                        onSelect={(url, label) => {
+                          // Escape single-quotes and backslashes to prevent CSS injection
+                          // and render breakage from special characters in remote URLs.
+                          const safeUrl = url.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
+                          const id = `wallhaven-${Date.now()}`;
+                          const image = `url('${safeUrl}')`;
+                          // Route through a state updater so wallpaperIdByTheme is set for
+                          // the active theme — otherwise a theme switch loses the pick.
+                          // Also set light/mobile/fallback variants so the remote wallpaper
+                          // works in every scheme.
+                          useThemeStore.setState((s) => ({
+                            wallpaperId: id,
+                            wallpaperImage: image,
+                            wallpaperMobileImage: image,
+                            wallpaperFallback: "#1d1d1f",
+                            wallpaperLightImage: image,
+                            wallpaperLightMobileImage: image,
+                            wallpaperLightFallback: "#f0f0f0",
+                            wallpaperKind: "image",
+                            wallpaperOverlayText: label,
+                            wallpaperIdByTheme: {
+                              ...s.wallpaperIdByTheme,
+                              [s.activeThemeId]: id,
+                            },
+                          }));
+                        }}
+              />
             </div>
+          )}
+        </div>
+          )}
+        </div>
           ))}
         </div>
         {wallpaperKind === "animated" && (

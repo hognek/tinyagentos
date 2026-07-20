@@ -273,3 +273,83 @@ describe("RegistryPanel polling", () => {
     expect(screen.getByText("taOSmd-dev")).toBeInTheDocument();
   });
 });
+
+/* ------------------------------------------------------------------ */
+/*  Collapse behaviour — retired agents                                */
+/* ------------------------------------------------------------------ */
+
+describe("RegistryPanel collapsed retired", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("renders retired section collapsed by default, expands on click, active agents always visible", async () => {
+    const entries: RegistryEntry[] = [
+      { ...fakeEntry, canonical_id: "active-1", display_name: "ActiveAgent", status: "active" },
+      { ...fakeEntry, canonical_id: "active-2", display_name: "ActiveTwo", status: "active" },
+      {
+        ...fakeEntry,
+        canonical_id: "revoked-1",
+        display_name: "RevokedAgent",
+        status: "revoked",
+      },
+      {
+        ...fakeEntry,
+        canonical_id: "suspended-1",
+        display_name: "SuspendedAgent",
+        status: "suspended",
+      },
+    ];
+    vi.stubGlobal("fetch", makeFetch(entries));
+
+    render(<RegistryPanel />);
+
+    // Expand the registry panel
+    const toggle = screen.getByRole("button", { name: /agent registry/i });
+    await act(async () => {
+      toggle.click();
+    });
+
+    await waitFor(
+      () => {
+        // Active agents always visible
+        expect(screen.getByText("ActiveAgent")).toBeInTheDocument();
+        expect(screen.getByText("ActiveTwo")).toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+
+    // Retired section is present
+    const retiredSection = screen.getByRole("region", {
+      name: "Retired registry entries",
+    });
+    expect(retiredSection).toBeInTheDocument();
+
+    // Retired toggle shows count and is collapsed
+    const retiredToggle = screen.getByRole("button", {
+      name: /retired \(2\)/i,
+    });
+    expect(retiredToggle).toBeInTheDocument();
+    expect(retiredToggle).toHaveAttribute("aria-expanded", "false");
+
+    // Retired panel is hidden (collapsed by default — jsdom does not compute
+    // Tailwind CSS visibility, so we assert on the class rather than element
+    // visibility)
+    const retiredPanel = document.getElementById("retired-registry-panel");
+    expect(retiredPanel).toBeInTheDocument();
+    expect(retiredPanel!).toHaveClass("hidden");
+
+    // Revoked + suspended agents are IN the DOM but inside a hidden container
+    expect(screen.getByText("RevokedAgent")).toBeInTheDocument();
+    expect(screen.getByText("SuspendedAgent")).toBeInTheDocument();
+
+    // Click to expand retired section
+    await act(async () => {
+      retiredToggle.click();
+    });
+
+    // Retired toggle is now expanded, panel class loses "hidden"
+    expect(retiredToggle).toHaveAttribute("aria-expanded", "true");
+    expect(retiredPanel!).not.toHaveClass("hidden");
+  }, 10_000);
+});

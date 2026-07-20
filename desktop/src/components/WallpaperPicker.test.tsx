@@ -35,7 +35,9 @@ describe("WallpaperPicker", () => {
     expect(themeDefaultHeadings.length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("Built-in")).toBeInTheDocument();
     expect(screen.getByText("Your wallpapers")).toBeInTheDocument();
-    expect(screen.getByText("Browse online")).toBeInTheDocument();
+    // Use getByRole("heading") to disambiguate from the browser-toggle button
+    // that shares the text "Browse online" inside the Online section.
+    expect(screen.getByRole("heading", { name: "Browse online" })).toBeInTheDocument();
   });
 
   it("shows the theme default wallpaper in its own section with a badge when it matches", () => {

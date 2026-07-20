@@ -235,6 +235,80 @@ async def test_cluster_join_503_when_explicitly_blanked(client, monkeypatch):
     assert r.status_code == 503
 
 
+# --- Guest preauth key minting (cross-user C2) ---
+@pytest.mark.asyncio
+async def test_cluster_guest_preauth_forwards_and_strips_key(client, monkeypatch):
+    """POST /api/account/cluster/join/guest-preauth validates contact_id,
+    forwards to upstream, and strips the preauth key from the response."""
+    monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
+    captured: dict[str, str] = {}
+
+    async def handler(method, url, **kw):
+        captured["method"] = method
+        captured["url"] = url
+        captured["cookie"] = kw.get("headers", {}).get("Cookie", "")
+        captured["body"] = (kw.get("content") or b"").decode("utf-8")
+        return _FakeResp(
+            content=b'{"preauth_key":"guest-key-1","hostname":"guest-node",'
+                    b'"controller_token":"ct-token","headscale_preauth_key":"hs-key"}',
+            headers={"content-type": "application/json"},
+        )
+
+    _patch_upstream(monkeypatch, handler)
+    r = await client.post(
+        "/api/account/cluster/join/guest-preauth",
+        json={"contact_id": "hub:hogne"},
+    )
+    assert r.status_code == 200
+    body = r.json()
+    # Secrets must be stripped — no credential reaches the browser.
+    assert "preauth_key" not in body
+    assert "headscale_preauth_key" not in body
+    assert "controller_token" not in body
+    # Non-secret fields survive.
+    assert body.get("hostname") == "guest-node"
+    assert captured["url"] == "https://taos.my/api/cluster/join/guest-preauth"
+    assert captured["method"] == "POST"
+    assert "taos_session" not in captured["cookie"]
+    # The preauth key was captured server-side for out-of-band delivery
+    # to the guest instance (D1 delegation-accept handler consumes via
+    # _pop_guest_preauth_intent, which is the pop-and-evict accessor).
+    from tinyagentos.routes import account_proxy
+    intent = account_proxy._pop_guest_preauth_intent("hub:hogne")
+    assert intent is not None, "guest preauth key was not captured server-side"
+    assert intent["preauth_key"] == "guest-key-1"
+    assert intent["hostname"] == "guest-node"
+    # Consumed once — a second pop returns None.
+    assert account_proxy._pop_guest_preauth_intent("hub:hogne") is None
+
+
+@pytest.mark.asyncio
+async def test_cluster_guest_preauth_rejects_bad_contact_id(client, monkeypatch):
+    """Reject missing, malformed, or non-hub contact_id at the edge."""
+    monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
+    called = {"n": 0}
+
+    async def handler(method, url, **kw):
+        called["n"] += 1
+        return _FakeResp()
+
+    _patch_upstream(monkeypatch, handler)
+    for bad_body in [
+        {},
+        {"contact_id": ""},
+        {"contact_id": "   "},
+        {"contact_id": "not-hub-prefix"},
+        {"contact_id": "hub:"},
+        {"contact_id": "hub:x" * 65},
+    ]:
+        r = await client.post(
+            "/api/account/cluster/join/guest-preauth", json=bad_body
+        )
+        assert r.status_code == 400, f"Expected 400 for {bad_body}"
+    # No upstream call was made for any rejected body.
+    assert called["n"] == 0
+
+
 # --- Account subdomain actions (account model slice 3) ---
 @pytest.mark.asyncio
 async def test_subdomains_check_forwards_name(client, monkeypatch):

@@ -69,7 +69,7 @@ class WorkerRegistry:
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         apply_wal_pragmas(self._conn)
-        run_migrations(self._conn, MIGRATIONS)
+        run_migrations(self._conn, MIGRATIONS, namespace="WorkerRegistry")
 
     async def init(self) -> None:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)

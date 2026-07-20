@@ -24,7 +24,7 @@ interface Secret {
   revealed?: boolean;
 }
 
-type CategoryFilter = "all" | "api-key" | "credential" | "token" | "config";
+type CategoryFilter = "all" | "api-key" | "credential" | "token" | "config" | "github-installation";
 
 /* ------------------------------------------------------------------ */
 /*  Constants                                                          */
@@ -35,6 +35,7 @@ const CATEGORY_STYLES: Record<string, string> = {
   credential: "bg-cyan-500/20 text-cyan-400",
   token: "bg-amber-500/20 text-amber-400",
   config: "bg-emerald-500/20 text-emerald-400",
+  "github-installation": "bg-purple-500/20 text-purple-400",
 };
 
 const MASKED = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022";
@@ -158,6 +159,7 @@ function AddEditDialog({
                 <option value="token">Token</option>
                 <option value="config">Config</option>
                 <option value="ssh-keys">SSH Key</option>
+                <option value="github-installation">GitHub Installation</option>
               </select>
             </div>
 
@@ -345,6 +347,7 @@ export function SecretsApp({ windowId: _windowId }: { windowId: string }) {
               <option value="credential">Credential</option>
               <option value="token">Token</option>
               <option value="config">Config</option>
+              <option value="github-installation">GitHub Installation</option>
             </select>
           </div>
           <Button

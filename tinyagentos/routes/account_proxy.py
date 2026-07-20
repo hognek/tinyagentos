@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import time
 
 import httpx
 from fastapi import APIRouter, Request, Response
@@ -33,8 +34,10 @@ router = APIRouter()
 _JOIN_SERVICE_TOKENS = ("controller_token", "sites_token")
 # Everything stripped from the browser body: the service tokens plus the
 # single-use Headscale preauth key, which the controller consumes server-side to
-# join the mesh (Slice 2). None of these should ever reach browser JavaScript.
-_STRIP_KEYS = _JOIN_SERVICE_TOKENS + ("headscale_preauth_key",)
+# join the mesh (Slice 2). ``headscale_preauth_key`` is the host join key;
+# ``preauth_key`` is the guest preauth key (C2 cross-user transport). None of
+# these should ever reach browser JavaScript.
+_STRIP_KEYS = _JOIN_SERVICE_TOKENS + ("headscale_preauth_key", "preauth_key", "guest_preauth_key")
 
 # Only these account actions are proxied. The upstream base is operator config
 # (env), never user input, so there is no open-proxy / SSRF surface.
@@ -406,6 +409,55 @@ async def cluster_join_deny(request: Request, rid: str):
     return await _forward_to(request, "POST", f"{_JOIN_BASE}/requests/{rid}/deny")
 
 
+@router.post("/api/account/cluster/join/guest-preauth")
+async def cluster_guest_preauth(request: Request):
+    """Mint a scoped guest preauth key for a cross-user collaborator instance.
+
+    Called by the host at delegation-accept time (D1). Forwards to taos.my's
+    ``POST /api/cluster/join/guest-preauth``, which creates an ACL-pinned
+    (``tag:guest``) single-use preauth key via the Headscale admin API.
+
+    **Security:** validates the ``contact_id`` *format* at the edge (length,
+    prefix) before forwarding to avoid wasted upstream API calls, but does
+    **not** assert the caller owns that contact — contact-to-caller ownership
+    is enforced by the upstream taos.my service which has access to the
+    contacts database.  Every preauth key is stripped from the response so no
+    credential reaches browser JavaScript. The caller (peer channel, D1) must
+    extract the key server-side before the response is sent to the browser, or
+    use an alternative internal delivery path.
+    """
+    # Validate contact_id format at the edge (defense-in-depth: the upstream
+    # also validates + enforces ownership, but we reject garbage at the edge
+    # to avoid wasted API calls).
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+    if not isinstance(body, dict) or not isinstance(body.get("contact_id"), str):
+        return JSONResponse({"error": "missing contact_id"}, status_code=400)
+    cid: str = body["contact_id"].strip()
+    if not cid.startswith("hub:") or len(cid) < 5 or len(cid) > 256:
+        return JSONResponse({"error": "invalid contact_id"}, status_code=400)
+
+    # Forward to taos.my with the validated body.
+    resp = await _forward_to(request, "POST", f"{_JOIN_BASE}/guest-preauth",
+                             body=json.dumps({"contact_id": cid}).encode("utf-8"))
+
+    # Strip the preauth key from the response so it never reaches the browser.
+    # Capture the join_intent for out-of-band delivery to the guest instance
+    # via the peer channel (D1 delegation-accept handler calls
+    # _pop_guest_preauth_intent to consume-and-delete).
+    stripped, join_intent = _persist_join_credentials(resp)
+    if join_intent:
+        now = time.monotonic()
+        # Sweep stale entries to bound dict growth even when consumer is inactive.
+        expired = [k for k, (ts, _) in _guest_preauth_intents.items() if now - ts > _GUEST_PREAUTH_TTL_SECONDS]
+        for k in expired:
+            _guest_preauth_intents.pop(k, None)
+        _guest_preauth_intents[cid] = (now, join_intent)
+    return stripped
+
+
 def _persist_join_credentials(resp: Response) -> tuple[Response, dict | None]:
     """When a poll response carries the per-host service tokens, persist them
     server-side (host-bound) and return a copy with those tokens + the single-use
@@ -441,7 +493,7 @@ def _persist_join_credentials(resp: Response) -> tuple[Response, dict | None]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("cluster-join: could not persist mesh credentials: %s", exc)
 
-    preauth = body.get("headscale_preauth_key")
+    preauth = body.get("preauth_key") or body.get("headscale_preauth_key")
     join_intent = None
     if preauth:
         # The Headscale node hostname; the exact value taos.my routes on is the
@@ -466,6 +518,29 @@ def _persist_join_credentials(resp: Response) -> tuple[Response, dict | None]:
 # sufficient (a process restart that loses this simply means a fresh join
 # opportunity, and the key is stale by then anyway).
 _attempted_preauth: set[str] = set()
+
+# Guest preauth keys (C2 cross-user transport). Populated by
+# cluster_guest_preauth when taos.my mints a guest preauth key; consumed
+# by the D1 delegation-accept handler for out-of-band delivery to the guest
+# instance via the peer channel.
+#
+# Single-use keys are stale after a short window (Headscale rejects them
+# once expired), so entries auto-evict after _GUEST_PREAUTH_TTL_SECONDS.
+_GUEST_PREAUTH_TTL_SECONDS = 300  # 5 min — Headscale default expiry window
+_guest_preauth_intents: dict[str, tuple[float, dict]] = {}
+
+
+def _pop_guest_preauth_intent(cid: str) -> dict | None:
+    """Consume-and-delete a guest preauth intent. Also sweeps stale entries."""
+    now = time.monotonic()
+    # Sweep: delete all expired entries on any access.
+    expired = [k for k, (ts, _) in _guest_preauth_intents.items() if now - ts > _GUEST_PREAUTH_TTL_SECONDS]
+    for k in expired:
+        _guest_preauth_intents.pop(k, None)
+    entry = _guest_preauth_intents.pop(cid, None)
+    if entry is None:
+        return None
+    return entry[1]
 
 # Keep a strong reference to in-flight background tasks so they are not
 # garbage-collected mid-run (a bare create_task() can be dropped -> "coroutine

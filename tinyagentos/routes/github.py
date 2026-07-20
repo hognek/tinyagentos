@@ -35,11 +35,22 @@ router = APIRouter()
 # Token resolution helper
 # ---------------------------------------------------------------------------
 
-async def _get_token(request: Request) -> str | None:
+async def _get_token(
+    request: Request,
+    user_scoped: bool = False,
+) -> str | None:
     """Return a GitHub token or None.
 
-    Tries SecretsStore first, then falls back to ``gh auth token``.
+    Resolution order:
+    1. SecretsStore key ``github_token`` (PAT from device flow) — user's own
+       identity takes precedence so personal repos and rate limits apply.
+    2. GitHub App installation token (when github_app_id and key are configured)
+       — fallback for repos accessible to the installed app.
+       **Skipped when ``user_scoped=True``** because installation tokens cannot
+       serve user-scoped endpoints (``/user/starred``, ``/notifications``, etc.).
+    3. ``gh auth token`` subprocess fallback
     """
+    # 1. Try SecretsStore PAT (user's own GitHub identity)
     secrets_store = getattr(request.app.state, "secrets", None)
     if secrets_store is not None:
         try:
@@ -49,7 +60,13 @@ async def _get_token(request: Request) -> str | None:
         except Exception as exc:
             logger.warning("SecretsStore lookup for github_token failed: %s", exc)
 
-    # Fallback: gh CLI (uses list form to avoid shell injection)
+    # 2. Try GitHub App installation token (fallback; skipped for user-scoped endpoints)
+    if not user_scoped:
+        token = await _get_app_installation_token(request)
+        if token:
+            return token
+
+    # 3. Fallback: gh CLI
     try:
         proc = await asyncio.create_subprocess_exec(
             "gh", "auth", "token",
@@ -62,6 +79,74 @@ async def _get_token(request: Request) -> str | None:
             return token
     except Exception as exc:
         logger.debug("gh auth token fallback failed: %s", exc)
+
+    return None
+
+
+async def _get_app_installation_token(
+    request: Request, installation_id: int | None = None
+) -> str | None:
+    """Mint a short-lived installation token from the configured GitHub App.
+
+    If *installation_id* is provided, uses that specific installation.
+    Otherwise, uses the first active installation (backward-compatible default).
+
+    Returns None if GitHub App is not configured or no installations exist.
+    """
+    cfg = getattr(request.app.state, "config", None)
+    if not cfg or not cfg.github_app_id:
+        return None
+
+    secrets = getattr(request.app.state, "secrets", None)
+    if secrets is None:
+        return None
+    try:
+        rec = await secrets.get("github-app-private-key")
+    except Exception:
+        return None
+    if not rec or not rec.get("value"):
+        return None
+    private_key = rec["value"]
+
+    installs = getattr(request.app.state, "github_app_installations", None)
+    if installs is None:
+        return None
+
+    if installation_id is not None:
+        inst = installs.get(installation_id)
+        if not inst:
+            return None
+        http_client = request.app.state.http_client
+        from tinyagentos.github_app import get_installation_token
+
+        token = await get_installation_token(
+            cfg.github_app_id, private_key, installation_id,
+            http_client,
+        )
+        if token:
+            logger.debug("Using GitHub App installation token (installation %s)", installation_id)
+            return token
+        return None
+
+    active = installs.list_all()
+    if not active:
+        return None
+
+    http_client = request.app.state.http_client
+    from tinyagentos.github_app import get_installation_token
+
+    # Use the first active installation. The caller may pass an explicit
+    # installation_id to select a specific installation (e.g. scoped by repo).
+    for inst in active:
+        iid = inst.get("installation_id")
+        if not iid:
+            continue
+        token = await get_installation_token(
+            cfg.github_app_id, private_key, iid, http_client,
+        )
+        if token:
+            logger.debug("Using GitHub App installation token (installation %s)", iid)
+            return token
 
     return None
 
@@ -79,8 +164,8 @@ def _no_token_response() -> JSONResponse:
 
 @router.get("/api/github/auth/status")
 async def github_auth_status(request: Request):
-    """Return whether a GitHub token is available."""
-    token = await _get_token(request)
+    """Return whether a GitHub token is available for user-scoped API calls."""
+    token = await _get_token(request, user_scoped=True)
     if token:
         return {"authenticated": True, "source": "token"}
     return {"authenticated": False, "source": None}
@@ -93,7 +178,7 @@ async def github_auth_status(request: Request):
 @router.get("/api/github/starred")
 async def github_starred(request: Request, page: int = 1):
     """Return paginated starred repositories for the authenticated user."""
-    token = await _get_token(request)
+    token = await _get_token(request, user_scoped=True)
     if not token:
         return _no_token_response()
 
@@ -113,7 +198,7 @@ async def github_starred(request: Request, page: int = 1):
 @router.get("/api/github/notifications")
 async def github_notifications(request: Request):
     """Return unread notifications for the authenticated user."""
-    token = await _get_token(request)
+    token = await _get_token(request, user_scoped=True)
     if not token:
         return _no_token_response()
 

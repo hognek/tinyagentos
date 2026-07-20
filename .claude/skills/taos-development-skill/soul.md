@@ -14,11 +14,15 @@ desktop SPA and a YAML app catalog. It runs hardware-frugally across a Python 3.
    active development happens on `dev`. PRs go to `jaylfc/taOS:dev`.
 2. **Python 3.11 floor.** The pyproject.toml pins `>=3.11,<3.14`. `match`/`case` and `X | None`
    unions are available; most modules use `from __future__ import annotations`.
-3. **Conventional commits, no AI attribution.** `feat: fix: docs: refactor: test: chore:`. No
-   "Co-authored-by" or "Generated with" trailers.
-4. **Draft-first; mark ready when the CODE is done, not when CI is green.** Fork PRs are gated
-   behind maintainer workflow approval - waiting for green CI on a fork PR is a deadlock. Create
-   the PR as draft, verify tests locally, then mark ready immediately.
+3. **Conventional commits, no AI attribution - anywhere public.** `feat: fix: docs: refactor:
+   test: chore:`. No "Co-authored-by" or "Generated with" trailers, and the same rule extends to
+   PR bodies, issue comments, and docs: no AI attribution and no em dashes in any public-facing
+   text.
+4. **Draft-first; mark ready when the CODE is done.** Create the PR as draft, verify tests
+   locally, then mark ready immediately. Fork-CI approval is first-time-only: a FIRST fork PR's
+   CI waits for maintainer approval (waiting on it is a deadlock - mark ready and surface it); a
+   RETURNING contributor's CI runs automatically, and you own making it green before the task is
+   done.
 5. **The human account-holder signs the CLA - not the agent.** An agent must NOT post the CLA
    acceptance comment on the maintainer's behalf; it is a legal agreement. If the CLA check fails,
    surface the bot's link to the human.
@@ -50,10 +54,8 @@ System-level recovery is a human decision.
 - **One concern per module.** No cross-importing between route modules.
 - **Routes access stores via `request.app.state`** (dependency injection), not by importing stores
   directly. Check existing routes for the pattern.
-- **All real UI work goes in the `desktop/` React SPA.** The Pico CSS + htmx rules below apply
-  **only** to the single legacy Jinja template (`agent_debugger.html`):
-- **Pico CSS utility classes only** for that template. No other CSS framework.
-- **htmx** (`hx-get`, `hx-target`, `hx-swap`) for its dynamic partials.
+- **All real UI work goes in the `desktop/` React SPA.** One legacy Jinja template exists
+  (`agent_debugger.html`); if you must touch it, match its Pico CSS + htmx style.
 - **Semantic HTML; ARIA labels** on interactive elements without visible text.
 - **`async def`** route handlers; **`await`** all I/O.
 - **Pydantic** request/response models.

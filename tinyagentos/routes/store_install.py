@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import asdict
+from pathlib import Path
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Request
@@ -202,6 +203,52 @@ def _get_current_user(request: Request) -> dict | None:
 def _registry_get(registry, app_id: str):
     """Look up a manifest by ID."""
     return registry.get(app_id)
+
+
+def _verify_manifest_for_install(
+    manifest_id: str,
+    registry,
+    store_signing_pubkey: bytes | None,
+) -> tuple[bool, str | None]:
+    """Verify a manifest's Ed25519 signature before installing.
+
+    Returns ``(allowed, error_detail)``:
+    - ``(True, None)`` — proceed with install.
+    - ``(False, reason)`` — block install with the given error string.
+
+    When the signing pubkey is not configured, the gate is skipped (allowed).
+    When a manifest has no stored signature (e.g. it was catalog-loaded
+    before signing was enabled), the gate is also skipped (allowed) rather
+    than returning a hard 403 — the absence of a signature is not evidence
+    of tampering.
+    """
+    if store_signing_pubkey is None or registry is None:
+        return True, None
+    if not hasattr(registry, "verify_manifest_signature"):
+        return True, None
+
+    stored_sig = registry.get_signature(manifest_id)
+    if stored_sig is None:
+        # No stored signature.  If signing is configured and this manifest
+        # failed to sign during catalog load, block it — treating a signing
+        # failure as "merely unsigned" would bypass the install gate.
+        if (
+            hasattr(registry, "is_signing_failure")
+            and registry.is_signing_failure(manifest_id)
+        ):
+            return False, (
+                f"manifest {manifest_id} failed to sign during catalog load — "
+                "the manifest may be malformed or the signing key may be invalid"
+            )
+        # Otherwise: never signed — manifest was loaded before signing was
+        # enabled.  Skip the gate; absence of a signature is not evidence of
+        # tampering.
+        return True, None
+
+    if not registry.verify_manifest_signature(manifest_id, store_signing_pubkey):
+        return False, "manifest signature verification failed"
+
+    return True, None
 
 
 async def _install_agent_framework(
@@ -703,6 +750,88 @@ async def install_app(request: Request):
         progress.finish(install_id, success=False, error="manifest not found in registry")
         return await _legacy_install(request, body, manifest_id, target_remote)
 
+    # Code-signing gate (#647): verify the catalog manifest's Ed25519
+    # signature against the store signing public key.  Re-reads the
+    # manifest from disk at install time so post-boot tampering is
+    # detected.  Manifests that were catalog-loaded without a signing
+    # key configured are allowed through — no stored signature means
+    # no tampering evidence.
+    #
+    # Threat model: this protects against post-boot *catalog* tampering
+    # (an attacker modifying a manifest on disk while the server is
+    # running).  It does NOT protect against an attacker who can also
+    # replace the signing keyfile and then restart the server — that is
+    # the OS-level trust boundary.  For defence-in-depth, deploy the
+    # keyfile on a read-only filesystem or use a hardware-backed key
+    # store.
+    _store_pub = getattr(request.app.state, "store_signing_pubkey", None)
+    verified, verify_err = _verify_manifest_for_install(
+        manifest_id, registry, _store_pub,
+    )
+    if not verified:
+        progress.finish(
+            install_id, success=False,
+            error=verify_err or "manifest signature verification failed — the catalog may have been tampered with",
+        )
+        return JSONResponse(
+            {
+                "error": verify_err or "manifest signature verification failed",
+                "detail": "The catalog manifest for this app failed signature verification. "
+                          "The app may have been tampered with. Rebuild the catalog or "
+                          "reinstall the app from a trusted source.",
+                "install_id": install_id,
+            },
+            status_code=403,
+        )
+
+    # TOCTOU guard: the signing gate above verified the signature against
+    # the on-disk manifest, but the install below uses the in-memory
+    # manifest object loaded at boot.  An attacker who swaps the on-disk
+    # file between verification and execution could bypass the gate.
+    # Re-read from disk and re-verify the signature — if it no longer
+    # verifies, the manifest was modified after the gate check and the
+    # install is blocked.
+    _manifest_dir = getattr(manifest, "manifest_dir", None)
+    if (
+        _manifest_dir is not None
+        and isinstance(_manifest_dir, Path)
+        and _store_pub is not None
+        and registry is not None
+        and hasattr(registry, "verify_manifest_signature")
+    ):
+        disk_path = _manifest_dir / "manifest.yaml"
+        try:
+            import yaml as _yaml
+            on_disk = _yaml.safe_load(disk_path.read_text()) if disk_path.exists() else None
+        except Exception:
+            on_disk = None
+        if on_disk is not None:
+            # Re-verify the signature against the just-read bytes.
+            # This catches any change — not just the narrow set of fields
+            # the old comparison whitelisted — and does not false-positive
+            # on legitimate catalog reloads (which update signatures too).
+            stored_sig = registry.get_signature(manifest_id)
+            if stored_sig is not None:
+                from tinyagentos.store_signing import verify_manifest_signature as _verify_sig
+                if not _verify_sig(on_disk, stored_sig, _store_pub):
+                    progress.finish(
+                        install_id, success=False,
+                        error="manifest modified between signature verification and install",
+                    )
+                    return JSONResponse(
+                        {
+                            "error": "manifest modified between signature verification and install",
+                            "detail": (
+                                "The manifest on disk was modified after the initial "
+                                "signature verification. This may indicate post-verification "
+                                "tampering. Rebuild the catalog or reinstall the app from "
+                                "a trusted source."
+                            ),
+                            "install_id": install_id,
+                        },
+                        status_code=403,
+                    )
+
     # Non-commercial weights gate (#169): a manifest's code license (MIT etc.)
     # can be permissive while the model weights it downloads are not (e.g.
     # musicgen pulls Meta's CC-BY-NC 4.0 weights). Block the install until the
@@ -793,6 +922,25 @@ async def install_app(request: Request):
                 {"error": f"backend {result.backend_id!r} has no install.method", "install_id": install_id},
                 status_code=500,
             )
+        # Verify the backend manifest's signature before running its installer.
+        # A backend manifest that was tampered with after catalog load would
+        # run an untrusted script/image — reject it here.
+        be_verified, be_verify_err = _verify_manifest_for_install(
+            result.backend_id, registry, _store_pub,
+        )
+        if not be_verified:
+            progress.finish(
+                install_id, success=False,
+                error=be_verify_err or "backend manifest signature verification failed",
+            )
+            return JSONResponse(
+                {
+                    "error": be_verify_err or "backend manifest signature verification failed",
+                    "detail": f"The backend manifest for {result.backend_id!r} failed signature verification.",
+                    "install_id": install_id,
+                },
+                status_code=403,
+            )
         backend_installer = get_installer(backend_method)
         be_result = await backend_installer.install(
             result.backend_id,
@@ -840,7 +988,7 @@ async def install_app(request: Request):
                 ),
                 "install_id": install_id,
             },
-            status_code=500,
+            status_code=422,
         )
     model_installer = get_installer(install_method)
     install_config = dict(getattr(manifest, "install", None) or {})
@@ -887,6 +1035,20 @@ async def install_app(request: Request):
     progress.finish(install_id, success=True, detail="install complete")
 
     return JSONResponse({"chain": chain, "compat": classify(manifest_dict, device), "install_id": install_id})
+
+
+@router.get("/api/store/signing-pubkey")
+async def store_signing_pubkey(request: Request):
+    """Return the store signing public key (Ed25519, PEM).
+
+    Clients and auditing tools can use this to verify catalog manifest
+    signatures independently.  The corresponding private key never leaves
+    the node.
+    """
+    pub_pem = getattr(request.app.state, "store_signing_pubkey", None)
+    if pub_pem is None:
+        return JSONResponse({"error": "store signing key not configured"}, status_code=404)
+    return JSONResponse({"public_key_pem": pub_pem.decode()})
 
 
 @router.post("/api/store/uninstall-v2")

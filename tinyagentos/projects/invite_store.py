@@ -29,11 +29,17 @@ CREATE TABLE IF NOT EXISTS project_invites (
     status               TEXT NOT NULL,
     redeemed_by          TEXT,
     redeemed_request_id  TEXT,
-    display_name         TEXT
+    display_name         TEXT,
+    kind                 TEXT NOT NULL DEFAULT 'agent',
+    pin_required         INTEGER NOT NULL DEFAULT 1,
+    contact_id           TEXT
 );
 """
 
 MIGRATIONS: list = []
+
+# Valid values for the invite kind column.
+_VALID_KINDS = frozenset({"agent", "collab"})
 
 
 class InvitePinError(Exception):
@@ -89,6 +95,21 @@ class ProjectInviteStore(BaseStore):
                 "ALTER TABLE project_invites ADD COLUMN display_name TEXT"
             )
             await self._db.commit()
+        if "kind" not in existing_cols:
+            await self._db.execute(
+                "ALTER TABLE project_invites ADD COLUMN kind TEXT NOT NULL DEFAULT 'agent'"
+            )
+            await self._db.commit()
+        if "pin_required" not in existing_cols:
+            await self._db.execute(
+                "ALTER TABLE project_invites ADD COLUMN pin_required INTEGER NOT NULL DEFAULT 1"
+            )
+            await self._db.commit()
+        if "contact_id" not in existing_cols:
+            await self._db.execute(
+                "ALTER TABLE project_invites ADD COLUMN contact_id TEXT"
+            )
+            await self._db.commit()
         await self._db.execute(
             "CREATE INDEX IF NOT EXISTS idx_project_invites_project "
             "ON project_invites(project_id)"
@@ -107,9 +128,24 @@ class ProjectInviteStore(BaseStore):
 
     async def mint(self, *, project_id=None, scopes: list[str], approval_mode: str,
                    check_interval_secs: int, created_by: str,
-                   display_name: str | None = None) -> dict:
+                   display_name: str | None = None,
+                   kind: str = "agent",
+                   pin_required: bool = True,
+                   contact_id: str | None = None) -> dict:
         if self._db is None:
             raise RuntimeError("ProjectInviteStore not initialised")
+
+        if kind not in _VALID_KINDS:
+            raise ValueError(
+                f"invalid invite kind: {kind!r} — must be one of {sorted(_VALID_KINDS)}"
+            )
+
+        # Human-collaborator invites carry no agent scopes — delegation arrives
+        # later via the D-milestone handshake, never on the human invite.
+        if kind == "collab" and scopes:
+            raise ValueError(
+                "collab invites must carry no scopes"
+            )
 
         # The pending cap is per-scope: project-scoped invites are capped per
         # project, OS-level (project_id IS NULL) invites are capped as a group.
@@ -141,34 +177,55 @@ class ProjectInviteStore(BaseStore):
         if project_id is not None:
             scopes = list(dict.fromkeys(scopes + ["project_tasks"]))
 
-        invite_id = self._generate_invite_id()
         pin = self._generate_pin()
         pin_hash = hashlib.sha256(pin.encode()).hexdigest()
         now = _now()
         expires_ts = now + _EXPIRY_SECS
 
-        await self._db.execute(
-            """
-            INSERT INTO project_invites
-                (invite_id, project_id, pin_hash, scopes, approval_mode,
-                 check_interval_secs, created_by, created_ts, expires_ts, status,
-                 display_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-            """,
-            (
-                invite_id,
-                project_id,
-                pin_hash,
-                json.dumps(scopes),
-                approval_mode,
-                check_interval_secs,
-                created_by,
-                now,
-                expires_ts,
-                display_name,
-            ),
-        )
-        await self._db.commit()
+        # 6-digit invite IDs have a non-trivial collision chance under load
+        # (~12 % at 500 pending).  Retry on UNIQUE constraint violation so a
+        # collision surfaces as a slight latency bump rather than a 500.
+        max_retries = 5
+        for attempt in range(max_retries):
+            invite_id = self._generate_invite_id()
+            try:
+                await self._db.execute(
+                    """
+                    INSERT INTO project_invites
+                        (invite_id, project_id, pin_hash, scopes, approval_mode,
+                         check_interval_secs, created_by, created_ts, expires_ts, status,
+                         display_name, kind, pin_required, contact_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                    """,
+                    (
+                        invite_id,
+                        project_id,
+                        pin_hash,
+                        json.dumps(scopes),
+                        approval_mode,
+                        check_interval_secs,
+                        created_by,
+                        now,
+                        expires_ts,
+                        display_name,
+                        kind,
+                        int(pin_required),
+                        contact_id,
+                    ),
+                )
+                await self._db.commit()
+                break
+            except aiosqlite.IntegrityError as exc:
+                # Only retry on UNIQUE/PRIMARY KEY constraint violations
+                # (invite_id collision).  Other integrity errors re-raise.
+                if getattr(exc, "sqlite_errorcode", 0) not in (19, 1555, 2067):
+                    raise
+                if attempt == max_retries - 1:
+                    raise RuntimeError(
+                        "Failed to generate a unique invite ID "
+                        f"after {max_retries} attempts"
+                    ) from exc
+                continue
 
         return {
             "record": {
@@ -186,6 +243,9 @@ class ProjectInviteStore(BaseStore):
                 "redeemed_by": None,
                 "redeemed_request_id": None,
                 "display_name": display_name,
+                "kind": kind,
+                "pin_required": int(pin_required),
+                "contact_id": contact_id,
             },
             "pin": pin,
         }
@@ -229,6 +289,26 @@ class ProjectInviteStore(BaseStore):
         cursor = await self._db.execute(
             "SELECT * FROM project_invites WHERE project_id IS NULL "
             "ORDER BY created_ts DESC",
+        )
+        rows = await cursor.fetchall()
+        result = []
+        for row in rows:
+            d = self._row_to_dict(row)
+            d.pop("pin_hash", None)
+            result.append(d)
+        return result
+
+    async def list_pending_collab_for_contact(
+        self, contact_id: str
+    ) -> list[dict]:
+        """List pending collab-kind invites addressed to a specific contact."""
+        if self._db is None:
+            raise RuntimeError("ProjectInviteStore not initialised")
+        cursor = await self._db.execute(
+            "SELECT * FROM project_invites "
+            "WHERE kind = 'collab' AND contact_id = ? AND status = 'pending' "
+            "ORDER BY created_ts DESC",
+            (contact_id,),
         )
         rows = await cursor.fetchall()
         result = []
@@ -289,8 +369,12 @@ class ProjectInviteStore(BaseStore):
                 await self._db.commit()
             raise InvitePinError("invalid invite id or pin")
 
+        # Atomically claim the invite (pending→claimed) rather than immediately
+        # marking it redeemed.  The caller must flip claimed→redeemed on success
+        # or roll back to pending on failure so a failed approve does not burn
+        # the invite unrecoverably (issue #1993).
         cursor = await self._db.execute(
-            "UPDATE project_invites SET status = 'redeemed' WHERE invite_id = ? AND status = 'pending'",
+            "UPDATE project_invites SET status = 'claimed' WHERE invite_id = ? AND status = 'pending'",
             (invite_id,),
         )
         await self._db.commit()
@@ -303,21 +387,63 @@ class ProjectInviteStore(BaseStore):
     async def mark_redeemed(
         self, invite_id: str, redeemed_by: str, redeemed_request_id: str
     ) -> None:
-        """Record who/what redeemed an invite for audit (called by the redeem
-        route after the auth-request has been created/approved). Best-effort
-        from the caller's perspective; the status flip already happened in
+        """Record who/what redeemed an invite for audit and flip claimed→redeemed
+        (called by the redeem route after the auth-request has been created/approved).
+        Best-effort from the caller's perspective; the status flip already happened in
         ``redeem``."""
         if self._db is None:
             raise RuntimeError("ProjectInviteStore not initialised")
         await self._db.execute(
             """
             UPDATE project_invites
-               SET redeemed_by = ?, redeemed_request_id = ?
-             WHERE invite_id = ?
+               SET redeemed_by = ?, redeemed_request_id = ?, status = 'redeemed'
+             WHERE invite_id = ? AND status = 'claimed'
             """,
             (redeemed_by, redeemed_request_id, invite_id),
         )
         await self._db.commit()
+
+    async def mark_accepted(self, invite_id: str, accepted_by: str) -> None:
+        """Record who accepted a collab invite and flip pending→redeemed.
+
+        Collab invites are minted as 'pending' (no redeem/PIN step on the inviter
+        side — the PIN is delivered out of band to the invitee). This method
+        transitions the invite directly from 'pending' to 'redeemed', or from
+        'claimed' to 'redeemed' for invites that went through the claim flow first.
+        """
+        if self._db is None:
+            raise RuntimeError("ProjectInviteStore not initialised")
+        await self._db.execute(
+            """
+            UPDATE project_invites
+               SET redeemed_by = ?, status = 'redeemed'
+             WHERE invite_id = ? AND status IN ('pending', 'claimed')
+            """,
+            (accepted_by, invite_id),
+        )
+        await self._db.commit()
+
+    async def rollback_to_pending(self, invite_id: str) -> None:
+        """Roll back a claimed invite to pending so the caller can retry after a
+        failed approve (issue #1993).  Only touches invites in 'claimed' status."""
+        if self._db is None:
+            raise RuntimeError("ProjectInviteStore not initialised")
+        await self._db.execute(
+            "UPDATE project_invites SET status = 'pending' WHERE invite_id = ? AND status = 'claimed'",
+            (invite_id,),
+        )
+        await self._db.commit()
+
+    async def mark_expired(self, invite_id: str) -> bool:
+        """Mark a pending invite as expired. Returns True if a row was updated."""
+        if self._db is None:
+            raise RuntimeError("ProjectInviteStore not initialised")
+        cursor = await self._db.execute(
+            "UPDATE project_invites SET status = 'expired' WHERE invite_id = ? AND status = 'pending'",
+            (invite_id,),
+        )
+        await self._db.commit()
+        return cursor.rowcount > 0
 
     async def _fetch_row(self, invite_id: str) -> aiosqlite.Row | None:
         cursor = await self._db.execute(

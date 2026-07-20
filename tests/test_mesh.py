@@ -85,6 +85,57 @@ class TestMeshStatus:
         assert s["tailnet"] == "jason"
         assert s["node_ip"] == "100.64.0.5"
         assert s["hostname"] == "node-1"
+        assert s["guests"] == []
+
+    async def test_guests_field_present_even_when_no_peers(self):
+        """mesh_status always includes ``guests`` (empty list when no guest peers)."""
+        s = await mesh.mesh_status()
+        # Fast-path: not installed returns joined=False with detail, never raises.
+        assert isinstance(s, dict)
+        if s.get("joined"):
+            assert isinstance(s.get("guests"), list)
+
+    async def test_guest_peer_detected(self):
+        """A peer tagged ``tag:guest`` appears in the guests list."""
+        status = dict(self._STATUS)
+        status["Peer"] = {
+            "nodekey:abc": {
+                "HostName": "hogne-box",
+                "Online": True,
+                "TailscaleIPs": ["100.64.0.6"],
+                "Tags": ["tag:guest"],
+            }
+        }
+        with patch.object(mesh, "is_tailscale_installed", return_value=True), \
+             patch.object(mesh, "_run", _run_returns(0, out=json.dumps(status))):
+            s = await mesh.mesh_status()
+        assert s["guests"] == [
+            {"hostname": "hogne-box", "node_ip": "100.64.0.6", "online": True}
+        ]
+
+    async def test_non_guest_peers_excluded(self):
+        """Peers without ``tag:guest`` are omitted from the guests list."""
+        status = dict(self._STATUS)
+        status["Peer"] = {
+            "nodekey:a": {"HostName": "host-2", "Online": True,
+                          "TailscaleIPs": ["100.64.0.7"], "Tags": []},
+            "nodekey:b": {"HostName": "guest-1", "Online": False,
+                          "TailscaleIPs": ["100.64.0.8"], "Tags": ["tag:guest"]},
+        }
+        with patch.object(mesh, "is_tailscale_installed", return_value=True), \
+             patch.object(mesh, "_run", _run_returns(0, out=json.dumps(status))):
+            s = await mesh.mesh_status()
+        assert len(s["guests"]) == 1
+        assert s["guests"][0]["hostname"] == "guest-1"
+
+    async def test_malformed_peer_data_graceful(self):
+        """A peer dict that isn't a dict is silently skipped."""
+        status = dict(self._STATUS)
+        status["Peer"] = {"bad": "not-a-dict"}
+        with patch.object(mesh, "is_tailscale_installed", return_value=True), \
+             patch.object(mesh, "_run", _run_returns(0, out=json.dumps(status))):
+            s = await mesh.mesh_status()
+        assert s["guests"] == []
 
     async def test_not_running_not_joined(self):
         stopped = {"BackendState": "Stopped", "Self": {}}

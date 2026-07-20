@@ -91,7 +91,8 @@ class TestBaseStore:
         store = await self._make_store(db_path)
         try:
             cursor = await store._db.execute(
-                "SELECT version FROM schema_migrations"
+                "SELECT version FROM schema_migrations WHERE store_name = ?",
+                ("TestStore",),
             )
             versions = [row[0] for row in await cursor.fetchall()]
             assert 1 in versions
@@ -108,7 +109,8 @@ class TestBaseStore:
         await store2.init()
         try:
             cursor = await store2._db.execute(
-                "SELECT version FROM schema_migrations ORDER BY version"
+                "SELECT version FROM schema_migrations WHERE store_name = ? ORDER BY version",
+                ("TestStore",),
             )
             versions = [row[0] for row in await cursor.fetchall()]
             assert versions == [1]
@@ -142,7 +144,8 @@ class TestBaseStore:
             assert row[0] == "migrated"
 
             cursor = await store._db.execute(
-                "SELECT version FROM schema_migrations"
+                "SELECT version FROM schema_migrations WHERE store_name = ?",
+                ("TestStoreEmptySchema",),
             )
             versions = [row[0] for row in await cursor.fetchall()]
             assert 1 in versions

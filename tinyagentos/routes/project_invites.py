@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
@@ -19,6 +20,7 @@ from tinyagentos.projects.invite_store import (
     InvitePendingCapError,
     InviteRevokedError,
 )
+from tinyagentos.routes.agent_auth_requests import VALID_SCOPES
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -73,8 +75,6 @@ class RedeemInviteIn(BaseModel):
 # already holding the target handle in this project and append -2, -3, ...
 # until free. The label is the natural first disambiguator, so the numeric
 # suffix is the fallback for same-harness/same-label re-invites.
-
-_CANCEL_SCOPES = {"canvas_read", "canvas_write"}
 
 # Scopes that only mean anything bound to a specific project. An OS-level
 # (project-less) invite has no project to bind them to, so they are stripped
@@ -618,6 +618,14 @@ async def mint_invite(
     if project is None:
         return JSONResponse({"error": "project not found"}, status_code=404)
     require_owner_or_admin(user, project["user_id"])
+    # Reject unknown scopes at mint so an owner can never create an auto-invite
+    # whose scopes can never redeem successfully (issue #1993).
+    unknown = sorted(set(payload.scopes) - VALID_SCOPES)
+    if unknown:
+        return JSONResponse(
+            {"error": f"unknown scopes: {unknown}; valid: {sorted(VALID_SCOPES)}"},
+            status_code=400,
+        )
     try:
         result = await store.mint(
             project_id=project_id,
@@ -710,9 +718,17 @@ async def mint_os_invite(
 ):
     _require_admin(user)
     store = request.app.state.project_invites
+    # Reject unknown scopes at mint (issue #1993).
+    unknown = sorted(set(payload.scopes) - VALID_SCOPES)
+    if unknown:
+        return JSONResponse(
+            {"error": f"unknown scopes: {unknown}; valid: {sorted(VALID_SCOPES)}"},
+            status_code=400,
+        )
     # OS-level invites carry no project, so drop any project-bound scopes rather
     # than granting them against a non-existent project (kilo review #1918).
     os_scopes = [s for s in payload.scopes if s not in _PROJECT_SCOPED]
+    dropped = sorted(set(payload.scopes) & _PROJECT_SCOPED)
     try:
         result = await store.mint(
             project_id=None,
@@ -725,7 +741,7 @@ async def mint_os_invite(
     except InvitePendingCapError as exc:
         return JSONResponse({"error": str(exc)}, status_code=429)
     record = result["record"]
-    return {
+    response = {
         "invite_id": record["invite_id"],
         "pin": result["pin"],
         "expires_ts": record["expires_ts"],
@@ -734,6 +750,11 @@ async def mint_os_invite(
         "check_interval_secs": record["check_interval_secs"],
         "display_name": record["display_name"],
     }
+    if dropped:
+        response["warnings"] = [
+            f"project-scoped scopes dropped (OS invites cannot grant project access): {dropped}"
+        ]
+    return response
 
 
 @router.get("/api/agents/invites")
@@ -774,6 +795,191 @@ async def revoke_os_invite(
     if not ok:
         return JSONResponse({"error": "invite not found or already redeemed"}, status_code=404)
     return JSONResponse(content=None, status_code=204)
+
+
+# ---------------------------------------------------------------------------
+# Collab invites — human collaborator invitations over the peer channel
+# ---------------------------------------------------------------------------
+
+
+class MintCollabInviteIn(BaseModel):
+    contact_id: str = Field(..., description="Hub contact ID, e.g. hub:hogne")
+    pin_required: bool = Field(default=True, description="Require PIN verification")
+    display_name: str | None = Field(default=None, max_length=64)
+
+    @field_validator("contact_id")
+    @classmethod
+    def _check_contact_id(cls, v: str) -> str:
+        if not v.startswith("hub:"):
+            raise ValueError("contact_id must start with 'hub:'")
+        return v
+
+    @field_validator("display_name")
+    @classmethod
+    def _clean_display_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not v:
+            return None
+        if any(ord(c) < 0x20 for c in v):
+            raise ValueError("display_name must not contain control characters")
+        return v
+
+
+@router.post("/api/projects/{project_id}/invites/collab")
+async def mint_collab_invite(
+    project_id: str,
+    payload: MintCollabInviteIn,
+    request: Request,
+    user: CurrentUser = Depends(current_user),
+):
+    """Mint a collab-kind invite for a human contact and deliver it as a signed
+    envelope over the peer channel.
+
+    The inviter consents by minting; the invitee consents via a Decisions card
+    generated on their instance when the envelope arrives.  The PIN (if
+    pin_required) is delivered out of band — the envelope body carries the
+    invite_id and project info but not the PIN itself.
+    """
+    project_store = request.app.state.project_store
+    invite_store = request.app.state.project_invites
+    contacts_store = getattr(request.app.state, "contacts_store", None)
+
+    # ---- validate project ownership ----
+    project = await project_store.get_project(project_id)
+    if project is None:
+        return JSONResponse({"error": "project not found"}, status_code=404)
+    require_owner_or_admin(user, project["user_id"])
+
+    # ---- validate contact exists and is active ----
+    if contacts_store is None:
+        return JSONResponse(
+            {"error": "peer channel not available — contacts store not configured"},
+            status_code=503,
+        )
+    contact = await contacts_store.get_contact(payload.contact_id)
+    if contact is None:
+        return JSONResponse(
+            {"error": f"contact {payload.contact_id} not found"},
+            status_code=404,
+        )
+    if contact.get("status") != "active":
+        return JSONResponse(
+            {"error": f"contact {payload.contact_id} is not active"},
+            status_code=400,
+        )
+
+    # ---- check no duplicate pending collab invite for this contact+project ----
+    existing = await invite_store.list_pending_collab_for_contact(payload.contact_id)
+    for inv in existing:
+        if inv.get("project_id") == project_id:
+            return JSONResponse(
+                {"error": "a pending collab invite already exists for this contact+project"},
+                status_code=409,
+            )
+
+    # ---- mint the invite ----
+    collab_scopes: list[str] = []  # human collaborators need no agent scopes
+    try:
+        result = await invite_store.mint(
+            project_id=project_id,
+            scopes=collab_scopes,
+            approval_mode="manual",  # collab invites always require consent
+            check_interval_secs=1800,
+            created_by=user.user_id,
+            display_name=payload.display_name,
+            kind="collab",
+            pin_required=payload.pin_required,
+            contact_id=payload.contact_id,
+        )
+    except InvitePendingCapError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=429)
+
+    record = result["record"]
+    pin = result["pin"]
+
+    # ---- deliver envelope over peer channel ----
+    envelope: dict | None = None
+    delivery_error: str | None = None
+    try:
+        from tinyagentos.peer import build_envelope, resolve_local_identity_id
+
+        # Resolve the local hub identity and the contact's hub username.
+        contact_username = (contact.get("hub_username") or "").strip()
+        if not contact_username:
+            delivery_error = "contact has no hub_username"
+        local_id = await asyncio.to_thread(
+            resolve_local_identity_id, request.app.state.data_dir
+        )
+        if local_id is None:
+            delivery_error = "hub identity not configured"
+        if delivery_error is None and contact_username and local_id:
+            local_username = local_id.removeprefix("hub:")
+            envelope_body = {
+                "invite_id": record["invite_id"],
+                "project_id": project_id,
+                "project_name": project.get("name", ""),
+                "project_slug": project.get("slug", ""),
+                "inviter": local_id,
+                "pin_required": payload.pin_required,
+                "display_name": payload.display_name,
+            }
+            envelope = build_envelope(
+                from_username=local_username,
+                to_username=contact_username,
+                kind="collab_invite",
+                body=envelope_body,
+            )
+
+            # POST the envelope to the remote contact's peer inbox.
+            # The peer link's endpoints are tried in priority order.
+            peer_link = await contacts_store.get_peer_link(payload.contact_id)
+            if peer_link is None or not peer_link.get("endpoints"):
+                delivery_error = "no peer endpoints for contact"
+            else:
+                import httpx
+
+                outbound_token = peer_link.get("outbound_token", "")
+                delivered = False
+                for ep in sorted(
+                    peer_link["endpoints"],
+                    key=lambda e: e.get("priority", 99),
+                ):
+                    inbox_url = f"{ep['url'].rstrip('/')}/api/peer/inbox"
+                    try:
+                        async with httpx.AsyncClient(timeout=10.0) as client:
+                            resp = await client.post(
+                                inbox_url,
+                                json={"envelope": envelope},
+                                headers={
+                                    "Authorization": f"Bearer {outbound_token}",
+                                    "Content-Type": "application/json",
+                                },
+                            )
+                            if 200 <= resp.status_code < 300:
+                                delivered = True
+                                break
+                    except Exception:
+                        continue
+                if not delivered:
+                    delivery_error = (
+                        "failed to deliver invite envelope to any peer endpoint"
+                    )
+    except Exception as exc:
+        delivery_error = f"envelope delivery failed: {exc}"
+
+    response = {
+        "invite_id": record["invite_id"],
+        "pin": pin if payload.pin_required else None,
+        "expires_ts": record["expires_ts"],
+        "kind": "collab",
+        "contact_id": payload.contact_id,
+        "delivered": delivery_error is None,
+    }
+    if delivery_error:
+        response["delivery_error"] = delivery_error
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -855,15 +1061,21 @@ async def redeem_invite(request: Request, body: RedeemInviteIn):
     from tinyagentos.routes.agent_auth_requests import approve_request_record
 
     auth_store = request.app.state.auth_requests
-    record = await auth_store.create(
-        identity_claim=handle,
-        framework=body.harness,
-        requested_scopes=scopes,
-        requested_skills=None,
-        reason=f"invite {body.invite_id}",
-        duration_secs=None,
-        project_id=invite["project_id"],
-    )
+    try:
+        record = await auth_store.create(
+            identity_claim=handle,
+            framework=body.harness,
+            requested_scopes=scopes,
+            requested_skills=None,
+            reason=f"invite {body.invite_id}",
+            duration_secs=None,
+            project_id=invite["project_id"],
+        )
+    except Exception as exc:  # noqa: BLE001 - release claimed invite on auth failure
+        await store.rollback_to_pending(body.invite_id)
+        return JSONResponse(
+            {"error": f"failed to create auth request: {exc}"}, status_code=500
+        )
 
     if invite["approval_mode"] == "auto":
         try:
@@ -876,6 +1088,11 @@ async def redeem_invite(request: Request, body: RedeemInviteIn):
                 project_id=invite["project_id"],
             )
         except Exception as exc:  # noqa: BLE001 - surface as JSON error
+            await store.rollback_to_pending(body.invite_id)
+            try:
+                await auth_store.set_decision(record['id'], 'refused', decided_by='system:invite-rollback')
+            except Exception:  # noqa: BLE001 - cleanup best-effort
+                pass
             return JSONResponse({"error": str(exc)}, status_code=400)
     else:
         # manual: leave pending so the consent bell fires (handled by
@@ -954,6 +1171,11 @@ async def _redeem_os_level(request: Request, body: RedeemInviteIn, invite: dict,
                 display_name=display_name,
             )
         except Exception as exc:  # noqa: BLE001 - surface as JSON error
+            await store.rollback_to_pending(body.invite_id)
+            try:
+                await auth_store.set_decision(record['id'], 'refused', decided_by='system:invite-rollback')
+            except Exception:  # noqa: BLE001 - cleanup best-effort
+                pass
             return JSONResponse({"error": str(exc)}, status_code=400)
     else:
         _notify_pending_invite(request, record)

@@ -14,10 +14,13 @@ Lease model:
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 import time
 import uuid
 from pathlib import Path
+
+from tinyagentos.db_migrations import apply_wal_pragmas
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS leases (
@@ -39,24 +42,36 @@ MAX_RENEW_COUNT = 5    # Prevent infinite lease hogging
 
 
 class LeaseManager:
-    """SQLite-backed lease manager for multi-agent coordination."""
+    """SQLite-backed lease manager for multi-agent coordination.
+
+    All public methods are async.  Blocking sqlite3 calls are dispatched to a
+    thread via asyncio.to_thread so they never stall the event loop.
+    """
 
     def __init__(self, db_path: str | Path = "data/leases.db"):
         self._db_path = str(db_path)
         self._conn: sqlite3.Connection | None = None
+        self._lock = asyncio.Lock()
+
+    def _sync_init(self) -> None:
+        self._conn = sqlite3.connect(self._db_path, isolation_level=None, check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        apply_wal_pragmas(self._conn)
+        self._conn.executescript(SCHEMA)
 
     async def init(self) -> None:
         Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-        # isolation_level=None puts the connection in autocommit mode so we
-        # can issue BEGIN IMMEDIATE manually for atomic read-check-write.
-        self._conn = sqlite3.connect(self._db_path, isolation_level=None)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.executescript(SCHEMA)
+        async with self._lock:
+            await asyncio.to_thread(self._sync_init)
 
     async def close(self) -> None:
         if self._conn:
             self._conn.close()
             self._conn = None
+
+    # ------------------------------------------------------------------
+    # Internal helpers (thread-safe, called via asyncio.to_thread)
+    # ------------------------------------------------------------------
 
     def _cleanup_expired(self) -> int:
         """Remove expired leases. Returns count removed."""
@@ -84,21 +99,13 @@ class LeaseManager:
             "renewed_count": existing["renewed_count"] + 1,
         }
 
-    async def acquire(
-        self,
-        resource_key: str,
-        agent_name: str,
-        ttl: float = DEFAULT_TTL,
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def _sync_acquire(
+        self, resource_key: str, agent_name: str, ttl: float
     ) -> dict | None:
-        """Acquire an exclusive lease on a resource, atomically.
-
-        Uses BEGIN IMMEDIATE so the cleanup + check + insert sequence is
-        serialised: two concurrent callers cannot both observe the lease as
-        absent and then both succeed.
-
-        Returns lease dict on success, None if resource is already held
-        by another agent.
-        """
         ttl = min(ttl, MAX_TTL)
 
         self._conn.execute("BEGIN IMMEDIATE")
@@ -142,18 +149,29 @@ class LeaseManager:
             "renewed_count": 0,
         }
 
-    async def renew(
+    async def acquire(
         self,
         resource_key: str,
         agent_name: str,
         ttl: float = DEFAULT_TTL,
     ) -> dict | None:
-        """Renew an existing lease, atomically. Only the holder can renew.
+        """Acquire an exclusive lease on a resource, atomically.
 
-        Uses BEGIN IMMEDIATE so the read-check-update sequence is serialised:
-        two concurrent renewals from the same agent cannot both pass the
-        renewed_count cap.
+        Uses BEGIN IMMEDIATE so the cleanup + check + insert sequence is
+        serialised: two concurrent callers cannot both observe the lease as
+        absent and then both succeed.
+
+        Returns lease dict on success, None if resource is already held
+        by another agent.
         """
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_acquire, resource_key, agent_name, ttl
+            )
+
+    def _sync_renew(
+        self, resource_key: str, agent_name: str, ttl: float
+    ) -> dict | None:
         ttl = min(ttl, MAX_TTL)
 
         self._conn.execute("BEGIN IMMEDIATE")
@@ -175,16 +193,33 @@ class LeaseManager:
             self._conn.execute("ROLLBACK")
             raise
 
-    async def release(self, resource_key: str, agent_name: str) -> bool:
-        """Release a lease. Only the holder can release."""
+    async def renew(
+        self,
+        resource_key: str,
+        agent_name: str,
+        ttl: float = DEFAULT_TTL,
+    ) -> dict | None:
+        """Renew an existing lease. Only the holder can renew."""
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_renew, resource_key, agent_name, ttl
+            )
+
+    def _sync_release(self, resource_key: str, agent_name: str) -> bool:
         cursor = self._conn.execute(
             "DELETE FROM leases WHERE resource_key = ? AND agent_name = ?",
             (resource_key, agent_name),
         )
         return cursor.rowcount > 0
 
-    async def check(self, resource_key: str) -> dict | None:
-        """Check who holds a lease on a resource. Returns lease dict or None."""
+    async def release(self, resource_key: str, agent_name: str) -> bool:
+        """Release a lease. Only the holder can release."""
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_release, resource_key, agent_name
+            )
+
+    def _sync_check(self, resource_key: str) -> dict | None:
         self._cleanup_expired()
         row = self._conn.execute(
             "SELECT * FROM leases WHERE resource_key = ?",
@@ -192,8 +227,12 @@ class LeaseManager:
         ).fetchone()
         return dict(row) if row else None
 
-    async def is_held_by(self, resource_key: str, agent_name: str) -> bool:
-        """Check if a specific agent holds the lease."""
+    async def check(self, resource_key: str) -> dict | None:
+        """Check who holds a lease on a resource. Returns lease dict or None."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_check, resource_key)
+
+    def _sync_is_held_by(self, resource_key: str, agent_name: str) -> bool:
         self._cleanup_expired()
         row = self._conn.execute(
             "SELECT 1 FROM leases WHERE resource_key = ? AND agent_name = ?",
@@ -201,8 +240,14 @@ class LeaseManager:
         ).fetchone()
         return row is not None
 
-    async def agent_leases(self, agent_name: str) -> list[dict]:
-        """List all active leases held by an agent."""
+    async def is_held_by(self, resource_key: str, agent_name: str) -> bool:
+        """Check if a specific agent holds the lease."""
+        async with self._lock:
+            return await asyncio.to_thread(
+                self._sync_is_held_by, resource_key, agent_name
+            )
+
+    def _sync_agent_leases(self, agent_name: str) -> list[dict]:
         self._cleanup_expired()
         rows = self._conn.execute(
             "SELECT * FROM leases WHERE agent_name = ? ORDER BY acquired_at",
@@ -210,17 +255,30 @@ class LeaseManager:
         ).fetchall()
         return [dict(r) for r in rows]
 
-    async def release_all(self, agent_name: str) -> int:
-        """Release all leases held by an agent (e.g., on agent shutdown)."""
+    async def agent_leases(self, agent_name: str) -> list[dict]:
+        """List all active leases held by an agent."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_agent_leases, agent_name)
+
+    def _sync_release_all(self, agent_name: str) -> int:
         cursor = self._conn.execute(
             "DELETE FROM leases WHERE agent_name = ?",
             (agent_name,),
         )
         return cursor.rowcount
 
-    async def stats(self) -> dict:
-        """Lease statistics."""
+    async def release_all(self, agent_name: str) -> int:
+        """Release all leases held by an agent (e.g., on agent shutdown)."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_release_all, agent_name)
+
+    def _sync_stats(self) -> dict:
         self._cleanup_expired()
         total = self._conn.execute("SELECT COUNT(*) as n FROM leases").fetchone()["n"]
         agents = self._conn.execute("SELECT COUNT(DISTINCT agent_name) as n FROM leases").fetchone()["n"]
         return {"active_leases": total, "agents_with_leases": agents}
+
+    async def stats(self) -> dict:
+        """Lease statistics."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_stats)
