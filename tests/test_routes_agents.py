@@ -147,7 +147,7 @@ class TestKillSwitchRunStateGate:
         data = resp.json()
         assert data["action"] == "stop"
         # The stopped container should not receive a force kill
-        assert "test-agent" not in force_calls, (
+        assert "taos-agent-test-agent" not in force_calls, (
             f"force-kill should NOT be called on a Stopped container, "
             f"but stop_container(force=True) was called {force_calls}"
         )
@@ -226,6 +226,45 @@ class TestKillSwitchRunStateGate:
         assert data["action"] == "stop"
         assert "taos-agent-test-agent" in force_calls, (
             "force-kill should be called on a Running container"
+        )
+
+
+    async def test_stop_agent_force_kills_running_container(
+        self, client, monkeypatch
+    ):
+        """A single running agent container MUST receive incus stop --force."""
+        running = ContainerInfo(
+            name="taos-agent-test-agent",
+            status="Running",
+            ip="10.0.0.5",
+            memory_mb=1024,
+            cpu_cores=2,
+        )
+
+        async def fake_list_containers(prefix="taos-agent-"):
+            return [running]
+
+        monkeypatch.setattr(
+            "tinyagentos.containers.list_containers", fake_list_containers
+        )
+
+        force_calls = []
+
+        async def fake_stop(name, force=False):
+            if force:
+                force_calls.append(name)
+            return {"success": True, "output": ""}
+
+        monkeypatch.setattr("tinyagentos.containers.stop_container", fake_stop)
+
+        resp = await client.post("/api/agents/test-agent/stop")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["force_killed"] is True, (
+            "force_killed should be True for a Running container"
+        )
+        assert "taos-agent-test-agent" in force_calls, (
+            "force-kill should be called on a Running container via stop_agent"
         )
 
 

@@ -133,13 +133,29 @@ function SystemShortcuts({ toggleSearch, toggleLaunchpad, toggleAssistant }: Sys
       if (!resp.ok) {
         throw new Error(`Server returned ${resp.status}`);
       }
-      window.dispatchEvent(new CustomEvent("taos:agents-changed"));
-      addNotification({
-        source: "system",
-        title: "Agents stopped",
-        body: "Emergency kill switch activated — all agents stopped.",
-        level: "success",
-      });
+      const body: any = await resp.json().catch(() => ({}));
+      const results: Record<string, any> = body.results || {};
+      const forceResults: Record<string, any> = body.force_kill_results || {};
+      const failures = [
+        ...Object.entries(results).filter(([, r]) => !r.success),
+        ...Object.entries(forceResults).filter(([, r]) => !r.force_killed),
+      ];
+      if (failures.length > 0) {
+        addNotification({
+          source: "system",
+          title: "Kill switch partial failure",
+          body: `${failures.length} agent(s) failed to stop.`,
+          level: "warning",
+        });
+      } else {
+        window.dispatchEvent(new CustomEvent("taos:agents-changed"));
+        addNotification({
+          source: "system",
+          title: "Agents stopped",
+          body: "Emergency kill switch activated — all agents stopped.",
+          level: "success",
+        });
+      }
     } catch (err) {
       addNotification({
         source: "system",
