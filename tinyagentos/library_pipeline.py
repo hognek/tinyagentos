@@ -248,6 +248,262 @@ class PdfProcessor(Processor):
         return artifacts
 
 
+class YouTubeProcessor(Processor):
+    """YouTube URL processor — cheap tier: metadata, thumbnail, transcript, chapters.
+
+    Uses yt-dlp via the knowledge_fetchers.youtube module to fetch video
+    metadata and captions without downloading the video file. Produces
+    artifacts that flow into taosmd collections for agent querying.
+
+    The cheap tier (per the design doc, docs/design/library-app.md section 4)
+    covers steps 1-4: canonical link, title, channel, description, thumbnail,
+    duration, upload date, subtitles/transcript, chapters.
+    """
+
+    async def process(self, item: dict) -> list[dict]:
+        item_id = item["id"]
+        source_url = item.get("source_url", "")
+        artifacts: list[dict] = []
+
+        if not source_url:
+            return artifacts
+
+        try:
+            from tinyagentos.knowledge_fetchers.youtube import (
+                fetch,
+                format_timestamp,
+            )
+
+            media_dir = self.storage_dir / "youtube"
+            result = await fetch(source_url, media_dir=media_dir)
+        except ImportError:
+            logger.warning("YouTube fetcher not available — skipping %s",
+                           source_url)
+            return artifacts
+        except Exception:
+            logger.exception("YouTube fetch failed for %s", source_url)
+            return artifacts
+
+        title = result.get("title", "")
+        if title and not item.get("title"):
+            await self.store.update_item(item_id, title=title)
+
+        meta = result.get("metadata", {})
+
+        # Update item meta_json with structured video metadata
+        stored_meta = json.loads(item.get("meta_json", "{}"))
+        stored_meta.update({
+            "video_id": meta.get("video_id", ""),
+            "channel": meta.get("channel", ""),
+            "duration": meta.get("duration"),
+            "views": meta.get("views"),
+            "upload_date": meta.get("upload_date", ""),
+        })
+        await self.store.update_item(item_id, meta_json=stored_meta)
+
+        # Artifact: metadata
+        await self.store.add_artifact(
+            item_id, kind="metadata", path=source_url, meta=meta,
+        )
+        artifacts.append({"kind": "metadata", "path": source_url, "meta": meta})
+
+        # Artifact: thumbnail (if downloaded)
+        thumbnail = result.get("thumbnail")
+        if thumbnail and Path(thumbnail).exists():
+            await self.store.add_artifact(
+                item_id, kind="thumbnail", path=thumbnail,
+                meta={"source": "youtube"},
+            )
+            artifacts.append({
+                "kind": "thumbnail", "path": thumbnail,
+                "meta": {"source": "youtube"},
+            })
+
+        # Artifact: transcript
+        content = result.get("content", "")
+        if content:
+            transcript_dir = self.storage_dir / "transcripts"
+            transcript_dir.mkdir(parents=True, exist_ok=True)
+            transcript_path = transcript_dir / f"{item_id}_transcript.txt"
+            transcript_path.write_text(content, encoding="utf-8")
+
+            transcript_meta = {
+                "char_count": len(content),
+                "language": "en",
+            }
+            await self.store.add_artifact(
+                item_id, kind="transcript", path=str(transcript_path),
+                meta=transcript_meta,
+            )
+            artifacts.append({
+                "kind": "transcript", "path": str(transcript_path),
+                "meta": transcript_meta,
+            })
+
+            # Store preview for item card
+            preview = content[:200]
+            stored_meta["preview"] = preview
+            await self.store.update_item(item_id, meta_json=stored_meta)
+
+        # Artifact: chapters (if available)
+        chapters = meta.get("chapters", [])
+        if chapters:
+            chapters_lines: list[str] = []
+            for ch in chapters:
+                ts = format_timestamp(ch.get("start_time", 0))
+                ch_title = ch.get("title", "")
+                chapters_lines.append(f"[{ts}] {ch_title}")
+
+            chapters_text = "\n".join(chapters_lines)
+            chapters_dir = self.storage_dir / "chapters"
+            chapters_dir.mkdir(parents=True, exist_ok=True)
+            chapters_path = chapters_dir / f"{item_id}_chapters.txt"
+            chapters_path.write_text(chapters_text, encoding="utf-8")
+
+            await self.store.add_artifact(
+                item_id, kind="chapters", path=str(chapters_path),
+                meta={"count": len(chapters)},
+            )
+            artifacts.append({
+                "kind": "chapters", "path": str(chapters_path),
+                "meta": {"count": len(chapters)},
+            })
+
+        return artifacts
+
+
+class WebProcessor(Processor):
+    """Generic web-page URL processor — extracts readable text from HTML.
+
+    Fetches the URL (SSRF-guarded against loopback/link-local/private hosts),
+    then extracts the main content using readability-lxml. Falls back to a
+    simple tag-stripping approach when readability-lxml is not installed.
+
+    Produces a text artifact suitable for taosmd collection indexing so that
+    agents granted the collection can query the page content.
+    """
+
+    async def process(self, item: dict) -> list[dict]:
+        item_id = item["id"]
+        source_url = item.get("source_url", "")
+        artifacts: list[dict] = []
+
+        if not source_url:
+            return artifacts
+
+        # Fetch the page (SSRF-guarded)
+        try:
+            import httpx
+            from tinyagentos.routes.desktop_browser.ssrf import (
+                validate_url_or_raise,
+            )
+
+            validate_url_or_raise(source_url)
+
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(30),
+                follow_redirects=True,
+            ) as client:
+                resp = await client.get(source_url)
+                resp.raise_for_status()
+                html = resp.text
+        except ImportError:
+            logger.warning("httpx not available — skipping web fetch for %s",
+                           source_url)
+            return artifacts
+        except Exception:
+            logger.exception("Web fetch failed for %s", source_url)
+            return artifacts
+
+        if not html:
+            return artifacts
+
+        # Extract readable text
+        content = _extract_readable_text(html, source_url)
+
+        # Extract title from <title> tag if item has no title
+        title = item.get("title", "")
+        if not title or title == source_url:
+            import re
+            m = re.search(
+                r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE,
+            )
+            if m:
+                title = m.group(1).strip()[:200]
+                await self.store.update_item(item_id, title=title)
+
+        # Artifact: metadata
+        page_meta = {
+            "char_count": len(content),
+            "content_type": resp.headers.get("content-type", ""),
+            "status_code": resp.status_code,
+        }
+        await self.store.add_artifact(
+            item_id, kind="metadata", path=source_url, meta=page_meta,
+        )
+        artifacts.append({
+            "kind": "metadata", "path": source_url, "meta": page_meta,
+        })
+
+        # Artifact: extracted text
+        if content:
+            text_dir = self.storage_dir / "text"
+            text_dir.mkdir(parents=True, exist_ok=True)
+            text_path = text_dir / f"{item_id}_web.txt"
+            text_path.write_text(content, encoding="utf-8")
+
+            text_meta = {
+                "char_count": len(content),
+                "source": "readability",
+            }
+            await self.store.add_artifact(
+                item_id, kind="text", path=str(text_path), meta=text_meta,
+            )
+            artifacts.append({
+                "kind": "text", "path": str(text_path), "meta": text_meta,
+            })
+
+            # Store preview
+            preview = content[:200]
+            stored_meta = json.loads(item.get("meta_json", "{}"))
+            stored_meta["preview"] = preview
+            await self.store.update_item(item_id, meta_json=stored_meta)
+
+        return artifacts
+
+
+def _extract_readable_text(html: str, source_url: str = "") -> str:
+    """Extract the main readable content from an HTML page.
+
+    Uses readability-lxml when available; falls back to simple tag-stripping.
+    """
+    try:
+        from readability import Document
+        doc = Document(html)
+        content = doc.summary()
+        # Strip remaining HTML from readability output
+        import re
+        text = re.sub(r"<[^>]+>", " ", content)
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(text) >= 100:
+            return text
+    except ImportError:
+        logger.debug("readability-lxml not installed — using simple extractor")
+    except Exception:
+        logger.warning("readability extraction failed for %s", source_url,
+                       exc_info=True)
+
+    # Fallback: simple tag-stripping (from knowledge_ingest._extract_text_readability)
+    import re
+    cleaned = re.sub(
+        r"<(script|style)[^>]*>.*?</(script|style)>", "", html,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+    text = re.sub(r"<[^>]+>", " ", cleaned)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
 class ImageProcessor(Processor):
     """Image processor — records dimensions, creates thumbnail.
 
@@ -319,6 +575,8 @@ _PROCESSORS: dict[str, type[Processor]] = {
     "text": TextProcessor,
     "pdf": PdfProcessor,
     "image": ImageProcessor,
+    "url:youtube": YouTubeProcessor,
+    "url:web": WebProcessor,
 }
 
 
