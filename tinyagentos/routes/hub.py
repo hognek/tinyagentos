@@ -133,43 +133,44 @@ async def _try_handshake(
     ed25519_pub = directory_resp.get("signing_pubkey") or ""
     x25519_pub = directory_resp.get("encryption_pubkey") or ""
 
-    if not ed25519_pub or not x25519_pub:
-        # Fall back to hub_authors (populated during friend-request flow).
-        hub_store = await _get_store(request)
-        author = await hub_store.get_author(peer_fingerprint) if peer_fingerprint else None
-        if author:
-            ed25519_pub = ed25519_pub or author.get("signing_pubkey", "")
-            x25519_pub = x25519_pub or author.get("encryption_pubkey", "")
-
-    if not ed25519_pub or not x25519_pub:
-        logger.warning(
-            "friend-accept handshake skipped: no pubkeys for %s", contact_id
-        )
-        return
-
-    # Verify the directory-supplied pubkey matches the expected peer fingerprint.
-    # A mismatch means the directory returned a key for the wrong identity;
-    # skip the handshake to avoid pinning TOFU keys from an imposter.
-    if peer_fingerprint and identity.fingerprint(ed25519_pub) != peer_fingerprint:
-        logger.warning(
-            "friend-accept handshake skipped: pubkey fingerprint mismatch for %s "
-            "(expected %s)",
-            contact_id,
-            peer_fingerprint,
-        )
-        return
-
-    display_name = directory_resp.get("display_name") or username
-    endpoints = directory_resp.get("endpoints")
-    if isinstance(endpoints, str):
-        try:
-            endpoints = json.loads(endpoints)
-        except (ValueError, TypeError):
-            endpoints = []
-    if not isinstance(endpoints, list):
-        endpoints = []
-
     try:
+        if not ed25519_pub or not x25519_pub:
+            # Fall back to hub_authors (populated during friend-request flow).
+            store = await _get_store(request)
+            author = await store.get_author(peer_fingerprint) if peer_fingerprint else None
+            if author:
+                ed25519_pub = ed25519_pub or author.get("signing_pubkey", "")
+                x25519_pub = x25519_pub or author.get("encryption_pubkey", "")
+
+        if not ed25519_pub or not x25519_pub:
+            logger.warning(
+                "friend-accept handshake skipped: no pubkeys for %s", contact_id
+            )
+            return
+
+        # Verify the directory-supplied pubkey matches the expected peer fingerprint.
+        # A mismatch (or malformed hex from a malicious directory) means the
+        # directory returned a key for the wrong identity; skip the handshake
+        # to avoid pinning TOFU keys from an imposter.
+        if peer_fingerprint and identity.fingerprint(ed25519_pub) != peer_fingerprint:
+            logger.warning(
+                "friend-accept handshake skipped: pubkey fingerprint mismatch for %s "
+                "(expected %s)",
+                contact_id,
+                peer_fingerprint,
+            )
+            return
+
+        display_name = directory_resp.get("display_name") or username
+        endpoints = directory_resp.get("endpoints")
+        if isinstance(endpoints, str):
+            try:
+                endpoints = json.loads(endpoints)
+            except (ValueError, TypeError):
+                endpoints = []
+        if not isinstance(endpoints, list):
+            endpoints = []
+
         # Create/refresh the contact row (trust-on-first-use key pinning).
         await contacts_store.add_contact(
             contact_id=contact_id,
@@ -177,6 +178,7 @@ async def _try_handshake(
             display_name=display_name,
             ed25519_pub=ed25519_pub,
             x25519_pub=x25519_pub,
+            peer_fingerprint=peer_fingerprint,
         )
 
         # Mint the inbound token WE give to the remote instance.
@@ -511,9 +513,9 @@ async def block_peer(
 
     # Cascade to contacts: revoke the peer link so the blocked contact can no
     # longer authenticate on the peer channel (A2 subscribe-to-block).
-    # The peer fingerprint is a hub signing key fingerprint; resolve it to a
-    # contact_id (hub:username) via the hub_authors cache, falling back to a
-    # contact-table scan when the author row is missing or stale.
+    # Resolve the peer fingerprint to a contact_id first via the hub_authors
+    # cache, then fall back to a direct fingerprint lookup on the contacts
+    # table when the author row is missing or stale.
     contacts_store = getattr(request.app.state, "contacts_store", None)
     if contacts_store is not None:
         try:
@@ -521,13 +523,16 @@ async def block_peer(
             if author and author.get("username"):
                 await contacts_store.revoke_peer_link(f"hub:{author['username']}")
             else:
-                # Author row is missing from hub_authors cache (may have been
-                # pruned or never populated).  We cannot resolve fingerprint →
-                # contact_id without the author record, so log and skip.
-                logger.warning(
-                    "hub block: author missing from hub_authors for %s; "
-                    "peer link may still be active", peer,
-                )
+                # Fall back to the fingerprint pinned on the contacts row
+                # (independent of the volatile hub_authors cache).
+                contact = await contacts_store.get_contact_by_fingerprint(peer)
+                if contact:
+                    await contacts_store.revoke_peer_link(contact["contact_id"])
+                else:
+                    logger.warning(
+                        "hub block: could not resolve fingerprint %s to a "
+                        "contact; peer link may still be active", peer,
+                    )
         except Exception:
             logger.exception("hub block: contacts-store cascade failed for %s", peer)
 

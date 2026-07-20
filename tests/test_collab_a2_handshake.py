@@ -390,6 +390,7 @@ class TestBlockCascade:
             display_name="Remote",
             ed25519_pub=_PEER_SIGNING_PUB,
             x25519_pub=_PEER_ENCRYPTION_PUB,
+            peer_fingerprint=_PEER_FP,
         )
         await store.establish_peer_link(
             contact_id=f"hub:{_PEER_USERNAME}",
@@ -456,3 +457,47 @@ class TestBlockCascade:
         )
         assert resp.status_code == 200
         assert resp.json()["state"] == "blocked"
+
+    async def test_block_cascade_fingerprint_fallback(
+        self, client_with_contacts, app_with_contacts, monkeypatch
+    ):
+        """Block revokes peer link via fingerprint fallback when hub_authors is empty."""
+        store = app_with_contacts.state.contacts_store
+
+        # Create contact + peer link with fingerprint, but do NOT seed hub_authors.
+        await store.add_contact(
+            contact_id=f"hub:{_PEER_USERNAME}",
+            hub_username=_PEER_USERNAME,
+            display_name="Remote",
+            ed25519_pub=_PEER_SIGNING_PUB,
+            x25519_pub=_PEER_ENCRYPTION_PUB,
+            peer_fingerprint=_PEER_FP,
+        )
+        await store.establish_peer_link(
+            contact_id=f"hub:{_PEER_USERNAME}",
+            inbound_token=generate_peer_token(),
+            outbound_token=generate_peer_token(),
+        )
+
+        # Mock directory block-edge revoke.
+        async def handler(method, url, **kw):
+            if "/api/hub/edges/revoke" in url:
+                return _fake_dir_resp(body={"status": "revoked"})
+            return _fake_dir_resp(body={})
+
+        _patch_account_proxy(monkeypatch, handler)
+
+        resp = await client_with_contacts.post(
+            "/api/hub/friends/block",
+            json={"peer_fingerprint": _PEER_FP},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["state"] == "blocked"
+
+        # Verify peer link is revoked (fingerprint fallback worked)
+        link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
+        assert link["revoked_at"] is not None
+
+        # Verify contact is revoked
+        contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
+        assert contact["status"] == "revoked"
