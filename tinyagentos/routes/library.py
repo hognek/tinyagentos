@@ -10,6 +10,7 @@ POST /api/library/items/{item_id}/reprocess — re-run the pipeline
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import uuid
 from pathlib import Path
@@ -241,6 +242,7 @@ def _render_item_card(item: dict) -> str:
     status = item.get("status", "pending")
     css = _STATUS_CSS.get(status, "status-pending")
     title = item.get("title", "Untitled")
+    title_escaped = html.escape(title)
     kind = item.get("kind", "file")
     size = item.get("size_bytes") or 0
     size_str = f"{size:,} B" if size else ""
@@ -249,7 +251,7 @@ def _render_item_card(item: dict) -> str:
     return (
         f'<div class="item-card" id="item-{item_id}">'
         f'<div class="info">'
-        f'<h3>{title}</h3>'
+        f'<h3>{title_escaped}</h3>'
         f'<div class="meta">'
         f'<span class="status-badge {css}">{status}</span>'
         f" {kind}"

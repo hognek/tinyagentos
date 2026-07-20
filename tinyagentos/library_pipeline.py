@@ -354,6 +354,14 @@ async def run_pipeline(
 
     kind = item["kind"]
 
+    # URL-only items (no storage_path) are stored as references — the pipeline
+    # records metadata but does not fetch remote content (future: WebFetcherProcessor).
+    if not item.get("storage_path") and item.get("source_url"):
+        logger.info(
+            "Library pipeline: URL-only item %s (%s) — stored as reference, not fetched",
+            item_id, kind,
+        )
+
     # If item has a storage_path that points to a missing file, fail early
     # (dropped/moved/corrupt source must not silently look successful).
     storage_path = item.get("storage_path", "")

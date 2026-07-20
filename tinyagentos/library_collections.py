@@ -20,6 +20,15 @@ from tinyagentos.library_store import LibraryStore
 
 logger = logging.getLogger(__name__)
 
+# Try importing taosmd at module level so we can skip the per-artifact loop
+# entirely when it's not available.
+try:
+    import taosmd  # noqa: F401
+    _TAOSMD_AVAILABLE = True
+except ImportError:
+    _TAOSMD_AVAILABLE = False
+    logger.debug("taosmd not available — collection indexing will be skipped")
+
 # Text artifact kinds that should be indexed into collections
 _TEXT_ARTIFACT_KINDS = frozenset({"text", "transcript", "description", "ocr"})
 
@@ -70,34 +79,30 @@ async def handoff_to_collections(
         # Copy to collections folder
         dst = item_dir / src.name
         try:
-            dst.write_bytes(src.read_bytes())
+            raw_bytes = src.read_bytes()
+            dst.write_bytes(raw_bytes)
         except OSError:
             logger.warning("Failed to copy artifact %s → %s", src, dst,
                            exc_info=True)
             continue
 
-        # Ingest into taosmd
-        try:
-            import taosmd
-
-            text_content = src.read_text(encoding="utf-8", errors="replace")
-            await taosmd.ingest(
-                text_content,
-                agent=f"library-{item_id[:12]}",
-                project=project_id,
-            )
-            handed_off += 1
-            logger.debug("Library item %s artifact %s ingested into taosmd",
-                         item_id, art["kind"])
-        except ImportError:
-            logger.debug("taosmd not available — collection indexing skipped")
-            # Still count as handed off since file is in place
-            handed_off += 1
-        except Exception:
-            logger.warning(
-                "taosmd ingest failed for item %s artifact %s",
-                item_id, art["kind"], exc_info=True,
-            )
+        # Ingest into taosmd (skip if not available)
+        if _TAOSMD_AVAILABLE:
+            try:
+                text_content = raw_bytes.decode("utf-8", errors="replace")
+                await taosmd.ingest(
+                    text_content,
+                    agent=f"library-{item_id[:12]}",
+                    project=project_id,
+                )
+                handed_off += 1
+                logger.debug("Library item %s artifact %s ingested into taosmd",
+                             item_id, art["kind"])
+            except Exception:
+                logger.warning(
+                    "taosmd ingest failed for item %s artifact %s",
+                    item_id, art["kind"], exc_info=True,
+                )
 
     # Write a manifest so downstream knows what's here
     manifest = {
