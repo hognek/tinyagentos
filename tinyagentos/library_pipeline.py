@@ -103,6 +103,7 @@ class FileProcessor(Processor):
         artifacts: list[dict] = []
 
         storage_path = item.get("storage_path", "")
+        source_url = item.get("source_url", "")
         if storage_path:
             p = Path(storage_path)
             if p.exists():
@@ -110,6 +111,9 @@ class FileProcessor(Processor):
                 file_meta = {
                     "size_bytes": stat.st_size,
                     "mtime": stat.st_mtime,
+                    "source_url": source_url,
+                    "processed_at": time.time(),
+                    "processor": "FileProcessor/v1",
                 }
                 # Try mimetype detection
                 mime_type, _ = mimetypes.guess_type(p.name)
@@ -159,6 +163,9 @@ class TextProcessor(Processor):
         text_meta = {
             "char_count": len(text),
             "line_count": text.count("\n") + 1,
+            "source_url": item.get("source_url", ""),
+            "processed_at": time.time(),
+            "processor": "TextProcessor/v1",
         }
         await self.store.add_artifact(
             item_id, kind="text", path=str(text_path), meta=text_meta
@@ -355,11 +362,21 @@ async def run_pipeline(
     kind = item["kind"]
 
     # URL-only items (no storage_path) are stored as references — the pipeline
-    # records metadata but does not fetch remote content (future: WebFetcherProcessor).
+    # records a reference metadata artifact but does not fetch remote content
+    # (future: WebFetcherProcessor).  The item gets a "reference" artifact so it
+    # is not silently empty.
     if not item.get("storage_path") and item.get("source_url"):
         logger.info(
             "Library pipeline: URL-only item %s (%s) — stored as reference, not fetched",
             item_id, kind,
+        )
+        ref_meta = {
+            "source_url": item["source_url"],
+            "kind": kind,
+            "note": "Reference-only item — content not fetched (P2+)",
+        }
+        await store.add_artifact(
+            item_id, kind="reference", path="", meta=ref_meta,
         )
 
     # If item has a storage_path that points to a missing file, fail early

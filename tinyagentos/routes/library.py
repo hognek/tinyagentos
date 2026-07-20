@@ -10,17 +10,12 @@ POST /api/library/items/{item_id}/reprocess — re-run the pipeline
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Request, UploadFile, File, Form
-from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.templating import Jinja2Templates
-
-_TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
-_templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+from fastapi.responses import JSONResponse
 
 from tinyagentos.library_pipeline import run_pipeline
 from tinyagentos.library_collections import handoff_to_collections
@@ -47,17 +42,6 @@ def _track_background_task(coro) -> asyncio.Task:
     task.add_done_callback(_on_done)
     _background_tasks.add(task)
     return task
-
-
-# ---------------------------------------------------------------------------
-# App page
-# ---------------------------------------------------------------------------
-
-
-@router.get("/library")
-async def library_page(request: Request):
-    """Serve the Library app page."""
-    return _templates.TemplateResponse(request=request, name="library.html")
 
 
 # ---------------------------------------------------------------------------
@@ -172,10 +156,6 @@ async def ingest(
     else:
         _create_supervised_task(coro, task_set)
 
-    if _is_htmx(request):
-        item = await store.get_item(item_id) or {}
-        return HTMLResponse(_render_item_card(item), status_code=202)
-
     return JSONResponse({"item_id": item_id, "status": "pending"}, status_code=202)
 
 
@@ -194,7 +174,12 @@ async def _ingest_task(app, item_id: str, store, storage_dir: Path) -> None:
     # Collections handoff after successful pipeline
     try:
         collections_dir = storage_dir.parent / "collections"
-        await handoff_to_collections(store, item_id, collections_dir)
+        qmd_base = getattr(app.state, "qmd_client", None)
+        qmd_base_url = qmd_base.base_url if qmd_base else None
+        await handoff_to_collections(
+            store, item_id, collections_dir,
+            qmd_base_url=qmd_base_url,
+        )
     except Exception:
         logger.exception("Collections handoff failed for item %s", item_id)
 
@@ -220,60 +205,6 @@ def _detect_kind_from_url(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# HTMX helpers -- return HTML fragments when the HX-Request header is present
-# ---------------------------------------------------------------------------
-
-
-def _is_htmx(request: Request) -> bool:
-    """Return True when the request is from an HTMX component."""
-    return request.headers.get("HX-Request", "").lower() == "true"
-
-
-_STATUS_CSS: dict[str, str] = {
-    "pending": "status-pending",
-    "processing": "status-processing",
-    "ready": "status-ready",
-    "error": "status-error",
-}
-
-
-def _render_item_card(item: dict) -> str:
-    """Return an HTML .item-card <div> for *item*."""
-    status = item.get("status", "pending")
-    css = _STATUS_CSS.get(status, "status-pending")
-    title = item.get("title", "Untitled")
-    title_escaped = html.escape(title)
-    kind = item.get("kind", "file")
-    size = item.get("size_bytes") or 0
-    size_str = f"{size:,} B" if size else ""
-    item_id = item.get("id", "")
-
-    return (
-        f'<div class="item-card" id="item-{item_id}">'
-        f'<div class="info">'
-        f'<h3>{title_escaped}</h3>'
-        f'<div class="meta">'
-        f'<span class="status-badge {css}">{status}</span>'
-        f" {kind}"
-        f'{f" &middot; {size_str}" if size_str else ""}'
-        f"</div>"
-        f"</div>"
-        f"</div>"
-    )
-
-
-def _render_item_list(items: list[dict]) -> str:
-    """Return an HTML fragment wrapping .item-card elements or an empty state."""
-    if not items:
-        return (
-            '<div class="empty-state">'
-            "<p>No items yet. Drop a file or paste a URL above.</p>"
-            "</div>"
-        )
-    return "".join(_render_item_card(item) for item in items)
-
-
-# ---------------------------------------------------------------------------
 # List / Get / Delete
 # ---------------------------------------------------------------------------
 
@@ -289,10 +220,6 @@ async def list_items(
     """List library items, optionally filtered by kind or status."""
     store = await _get_library_store(request)
     items = await store.list_items(kind=kind, status=status, limit=limit, offset=offset)
-
-    if _is_htmx(request):
-        return HTMLResponse(_render_item_list(items))
-
     return {"items": items, "count": len(items)}
 
 
@@ -351,13 +278,30 @@ async def delete_item(request: Request, item_id: str):
 
 @router.post("/api/library/items/{item_id}/reprocess")
 async def reprocess_item(request: Request, item_id: str):
-    """Re-run the ingest pipeline for an existing item."""
+    """Re-run the ingest pipeline for an existing item.
+
+    Idempotent per (item, stage): old artifacts and their on-disk files are
+    removed before the pipeline re-runs, so no duplicate rows or files accumulate.
+    """
     store = await _get_library_store(request)
     item = await store.get_item(item_id)
     if not item:
         return JSONResponse({"error": f"Item {item_id!r} not found"}, status_code=404)
 
+    # Delete old artifacts so reprocess is idempotent
     storage_dir = _library_dir(request)
+    old_artifacts = await store.get_artifacts(item_id)
+    for art in old_artifacts:
+        art_path = art.get("path", "")
+        if art_path and (ap := Path(art_path)).exists():
+            try:
+                ap.unlink()
+            except OSError:
+                pass
+        await store.delete_artifact(art["id"])
+
+    # Reset status to pending so the pipeline picks it up fresh
+    await store.update_item_status(item_id, "pending")
 
     task_set = getattr(request.app.state, "_background_tasks", None)
     coro = _ingest_task(request.app, item_id, store, storage_dir)

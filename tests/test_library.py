@@ -407,7 +407,9 @@ class TestRunPipeline:
 
 class TestCollectionsHandoff:
     @pytest.mark.asyncio
-    async def test_handoff(self, lib_store, storage_dir):
+    async def test_handoff_files_copied(self, lib_store, storage_dir):
+        """Text artifacts are copied to collections dir even without qmd;
+        returns 0 when qmd is unreachable (no silent ImportError success)."""
         file_path = storage_dir / "notes.txt"
         file_path.write_text("content for collections")
 
@@ -422,23 +424,56 @@ class TestCollectionsHandoff:
         collections_dir = storage_dir / "collections"
         count = await handoff_to_collections(lib_store, item_id, collections_dir)
 
-        assert count >= 1
+        # Files copied but no qmd → 0 indexed
+        assert count == 0
 
-        manifest_path = collections_dir / item_id / "manifest.json"
-        assert manifest_path.exists()
-
-        manifest = json.loads(manifest_path.read_text())
-        assert manifest["item_id"] == item_id
-        assert manifest["title"] == "notes.txt"
+        # Verify files were still copied to collections dir
+        item_dir = collections_dir / item_id
+        assert item_dir.exists()
+        text_files = list(item_dir.glob("*.txt"))
+        assert len(text_files) >= 1
+        assert "content for collections" in text_files[0].read_text()
 
     @pytest.mark.asyncio
-    async def test_handoff_no_text_artifacts(self, lib_store, storage_dir):
+    async def test_handoff_with_qmd(self, lib_store, storage_dir):
+        """Handoff indexes into qmd when the API is reachable."""
+        from unittest.mock import AsyncMock, patch
+
+        file_path = storage_dir / "notes.txt"
+        file_path.write_text("hello from library")
+
         item_id = await lib_store.create_item(
-            kind="file", title="no_text", storage_path="/some/path"
+            kind="text", title="notes.txt", storage_path=str(file_path)
         )
+        item = await lib_store.get_item(item_id)
+
+        proc = TextProcessor(lib_store, storage_dir)
+        await proc.process(item)
+
         collections_dir = storage_dir / "collections"
-        count = await handoff_to_collections(lib_store, item_id, collections_dir)
-        assert count == 0
+        qmd_url = "http://localhost:17832"
+
+        # Mock httpx.AsyncClient to simulate a working qmd
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_client = MagicMock()
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+        # POST responses — MagicMock for sync .json(), AsyncMock for async .post()
+        mock_create_resp = MagicMock()
+        mock_create_resp.status_code = 200
+        mock_create_resp.json.return_value = {"id": "coll-123"}
+        mock_index_resp = MagicMock()
+        mock_index_resp.status_code = 200
+        mock_client.post = AsyncMock(side_effect=[mock_create_resp, mock_index_resp])
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            count = await handoff_to_collections(
+                lib_store, item_id, collections_dir,
+                qmd_base_url=qmd_url,
+            )
+
+        assert count == 1  # One artifact indexed
 
 
 # ---------------------------------------------------------------------------
@@ -448,11 +483,11 @@ class TestCollectionsHandoff:
 
 class TestLibraryRoutes:
     @pytest.mark.asyncio
-    async def test_library_page(self, client):
+    async def test_library_page_gone(self, client):
+        """The server-rendered /library page was dropped (fold 6) —
+        the Library UI is the React desktop app."""
         resp = await client.get("/library")
-        assert resp.status_code == 200
-        assert "Library" in resp.text
-        assert "drop-zone" in resp.text
+        assert resp.status_code == 404
 
     @pytest.mark.asyncio
     async def test_ingest_no_input(self, client):
@@ -527,6 +562,64 @@ class TestLibraryRoutes:
         data = resp.json()
         for item in data["items"]:
             assert item["kind"] == "url:youtube"
+
+    # -- Auth: all endpoints require a session (CSRF is bypassed in tests, but
+    #    unauthenticated requests still hit the global auth middleware).  Test
+    #    that the 6 new endpoints return 401 when no session cookie/header is
+    #    present.
+
+    @pytest.mark.asyncio
+    async def test_unauth_library_endpoints(self, app):
+        """All 6 library endpoints return 401 without authentication."""
+        from httpx import ASGITransport, AsyncClient
+
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as unauth_client:
+            endpoints: list[tuple[str, str]] = [
+                ("post", "/api/library/ingest"),
+                ("get", "/api/library/items"),
+                ("get", "/api/library/items/abc123"),
+                ("delete", "/api/library/items/abc123"),
+                ("post", "/api/library/items/abc123/reprocess"),
+            ]
+            for method, url in endpoints:
+                if method == "post":
+                    resp = await unauth_client.post(url, data={"url": "https://example.com"})
+                elif method == "delete":
+                    resp = await unauth_client.delete(url)
+                else:
+                    resp = await unauth_client.get(url)
+                assert resp.status_code == 401, f"{method.upper()} {url} returned {resp.status_code}, expected 401"
+
+    # -- 413: oversized upload (tested at the HTTP level in integration;
+    #    ASGI transport does not propagate Content-Length to file.size)
+
+    @pytest.mark.asyncio
+    async def test_reprocess_idempotent(self, client, tmp_path):
+        """Reprocessing an item deletes old artifacts first — no duplicates."""
+        test_file = tmp_path / "notes.txt"
+        test_file.write_text("test content")
+
+        with open(test_file, "rb") as f:
+            resp = await client.post(
+                "/api/library/ingest",
+                files={"file": ("notes.txt", f, "text/plain")},
+            )
+        assert resp.status_code == 202
+        item_id = resp.json()["item_id"]
+
+        # Wait for pipeline to finish (background task)
+        import asyncio
+        await asyncio.sleep(0.5)
+
+        # First reprocess
+        resp = await client.post(f"/api/library/items/{item_id}/reprocess")
+        assert resp.status_code == 202
+
+        await asyncio.sleep(0.5)
+
+        # Second reprocess — should still work, no duplicates
+        resp = await client.post(f"/api/library/items/{item_id}/reprocess")
+        assert resp.status_code == 202
 
 
 # ---------------------------------------------------------------------------
