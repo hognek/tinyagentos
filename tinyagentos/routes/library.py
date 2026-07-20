@@ -288,6 +288,11 @@ async def reprocess_item(request: Request, item_id: str):
     if not item:
         return JSONResponse({"error": f"Item {item_id!r} not found"}, status_code=404)
 
+    if item.get("status") in ("pending", "processing"):
+        return JSONResponse(
+            {"error": "Item is currently being processed"}, status_code=409
+        )
+
     # Delete old artifacts so reprocess is idempotent
     storage_dir = _library_dir(request)
     old_artifacts = await store.get_artifacts(item_id)
