@@ -16,6 +16,10 @@ from pathlib import Path
 
 from fastapi import APIRouter, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse
+from fastapi.templating import Jinja2Templates
+
+_TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
+_templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
 
 from tinyagentos.library_pipeline import run_pipeline
 from tinyagentos.library_collections import handoff_to_collections
@@ -27,21 +31,16 @@ router = APIRouter()
 
 LIBRARY_DIR_NAME = "library"
 
-# Module-level background task tracking so unreferenced tasks are not
-# garbage-collected when request.app.state._background_tasks is absent.
-_background_tasks: set[asyncio.Task] = set()
+
+# ---------------------------------------------------------------------------
+# App page
+# ---------------------------------------------------------------------------
 
 
-def _track_background_task(coro) -> asyncio.Task:
-    """Create a task, store it in ``_background_tasks``, and auto-discard on done."""
-    task = asyncio.create_task(coro)
-
-    def _on_done(t: asyncio.Task) -> None:
-        _background_tasks.discard(t)
-
-    task.add_done_callback(_on_done)
-    _background_tasks.add(task)
-    return task
+@router.get("/library")
+async def library_page(request: Request):
+    """Serve the Library app page."""
+    return _templates.TemplateResponse(request=request, name="library.html")
 
 
 # ---------------------------------------------------------------------------
@@ -108,30 +107,14 @@ async def ingest(
         safe_name = _sanitise_filename(file.filename)
         dest = file_dir / f"{uuid.uuid4().hex[:8]}_{safe_name}"
 
-        # Stream file in bounded chunks to avoid loading it entirely into
-        # memory.  Reject uploads exceeding 100 MB with HTTP 413.
-        MAX_SIZE = 100 * 1024 * 1024  # 100 MB
-        if file.size and file.size > MAX_SIZE:
-            return JSONResponse(
-                {"error": "Payload Too Large"}, status_code=413,
-            )
-
-        size = 0
-        with dest.open("wb") as f:
-            while chunk := await file.read(1024 * 1024):
-                size += len(chunk)
-                if size > MAX_SIZE:
-                    dest.unlink(missing_ok=True)
-                    return JSONResponse(
-                        {"error": "Payload Too Large"}, status_code=413,
-                    )
-                f.write(chunk)
+        content = await file.read()
+        dest.write_bytes(content)
 
         item_id = await store.create_item(
             kind=kind,
             title=title or file.filename,
             storage_path=str(dest),
-            size_bytes=size,
+            size_bytes=len(content),
             source_url="",
         )
     elif url:
@@ -152,7 +135,7 @@ async def ingest(
     task_set = getattr(request.app.state, "_background_tasks", None)
     coro = _ingest_task(request.app, item_id, store, storage_dir)
     if task_set is None:
-        _track_background_task(coro)
+        asyncio.create_task(coro)
     else:
         _create_supervised_task(coro, task_set)
 
@@ -174,30 +157,7 @@ async def _ingest_task(app, item_id: str, store, storage_dir: Path) -> None:
     # Collections handoff after successful pipeline
     try:
         collections_dir = storage_dir.parent / "collections"
-        config = getattr(app.state, "config", None)
-        taosmd_url = getattr(config, "memory_url", None) if config else None
-        taosmd_admin_token = None
-        secrets = getattr(app.state, "secrets", None)
-        if secrets:
-            secret = await secrets.get("taosmd-admin-token")
-            if secret:
-                taosmd_admin_token = secret["value"]
-        indexed = await handoff_to_collections(
-            store, item_id, collections_dir,
-            taosmd_url=taosmd_url,
-            taosmd_admin_token=taosmd_admin_token,
-        )
-        if indexed > 0:
-            logger.info(
-                "Collections handoff indexed %d file(s) for item %s",
-                indexed, item_id,
-            )
-        else:
-            logger.debug(
-                "Collections handoff indexed 0 files for item %s "
-                "(no text artifacts or taosmd unavailable)",
-                item_id,
-            )
+        await handoff_to_collections(store, item_id, collections_dir)
     except Exception:
         logger.exception("Collections handoff failed for item %s", item_id)
 
@@ -268,8 +228,7 @@ async def delete_item(request: Request, item_id: str):
         try:
             p.unlink()
         except OSError:
-            logger.warning("Failed to remove storage file %s for item %s",
-                           storage_path, item_id)
+            pass
 
     # Remove artifacts from disk
     artifacts = await store.get_artifacts(item_id)
@@ -279,8 +238,7 @@ async def delete_item(request: Request, item_id: str):
             try:
                 ap.unlink()
             except OSError:
-                logger.warning("Failed to remove artifact %s for item %s",
-                               art_path, item_id)
+                pass
 
     # Remove collections folder
     storage_dir = _library_dir(request)
@@ -290,8 +248,7 @@ async def delete_item(request: Request, item_id: str):
         try:
             shutil.rmtree(item_collection_dir)
         except OSError:
-            logger.warning("Failed to remove collection dir %s for item %s",
-                           item_collection_dir, item_id)
+            pass
 
     await store.delete_item(item_id)
     return {"status": "deleted", "item_id": item_id}
@@ -299,59 +256,19 @@ async def delete_item(request: Request, item_id: str):
 
 @router.post("/api/library/items/{item_id}/reprocess")
 async def reprocess_item(request: Request, item_id: str):
-    """Re-run the ingest pipeline for an existing item.
-
-    Idempotent per (item, stage): old artifacts and their on-disk files are
-    removed before the pipeline re-runs, so no duplicate rows or files accumulate.
-    """
+    """Re-run the ingest pipeline for an existing item."""
     store = await _get_library_store(request)
     item = await store.get_item(item_id)
     if not item:
         return JSONResponse({"error": f"Item {item_id!r} not found"}, status_code=404)
 
-    # Atomic CAS: transition to pending only when NOT already pending/processing.
-    # Beats the TOCTOU race — two concurrent reprocess requests cannot both
-    # pass a separate read-then-write guard.
-    if not await store.try_update_item_status(item_id, "pending",
-                                               if_not_in=("pending", "processing")):
-        return JSONResponse(
-            {"error": "Item is currently being processed"}, status_code=409
-        )
-
-    # Delete old artifacts so reprocess is idempotent.
-    # Guard: never unlink the user's original uploaded file (storage_path).
     storage_dir = _library_dir(request)
-    old_artifacts = await store.get_artifacts(item_id)
-    item_storage_path = item.get("storage_path", "")
-    for art in old_artifacts:
-        art_path = art.get("path", "")
-        if art_path and art_path == item_storage_path:
-            # This artifact records the source file — skip deletion.
-            logger.debug("Skipping unlink of source file %s for item %s",
-                         art_path, item_id)
-        elif art_path and (ap := Path(art_path)).exists():
-            try:
-                ap.unlink()
-            except OSError:
-                logger.warning("Failed to remove artifact %s for item %s",
-                               art_path, item_id)
-        await store.delete_artifact(art["id"])
 
-    # Status was already atomically set to pending by try_update_item_status above;
-    # re-queue the pipeline now.  If scheduling fails, roll back to ready so the
-    # item is not stuck pending forever.
-    try:
-        task_set = getattr(request.app.state, "_background_tasks", None)
-        coro = _ingest_task(request.app, item_id, store, storage_dir)
-        if task_set is None:
-            _track_background_task(coro)
-        else:
-            _create_supervised_task(coro, task_set)
-    except Exception:
-        logger.exception("Failed to schedule reprocess for item %s", item_id)
-        await store.update_item_status(item_id, "ready")
-        return JSONResponse(
-            {"error": "Failed to schedule reprocess"}, status_code=500,
-        )
+    task_set = getattr(request.app.state, "_background_tasks", None)
+    coro = _ingest_task(request.app, item_id, store, storage_dir)
+    if task_set is None:
+        asyncio.create_task(coro)
+    else:
+        _create_supervised_task(coro, task_set)
 
     return JSONResponse({"item_id": item_id, "status": "reprocessing"}, status_code=202)

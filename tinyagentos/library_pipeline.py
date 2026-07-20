@@ -103,7 +103,6 @@ class FileProcessor(Processor):
         artifacts: list[dict] = []
 
         storage_path = item.get("storage_path", "")
-        source_url = item.get("source_url", "")
         if storage_path:
             p = Path(storage_path)
             if p.exists():
@@ -111,21 +110,16 @@ class FileProcessor(Processor):
                 file_meta = {
                     "size_bytes": stat.st_size,
                     "mtime": stat.st_mtime,
-                    "source_url": source_url,
-                    "processed_at": time.time(),
-                    "processor": "FileProcessor/v1",
                 }
                 # Try mimetype detection
                 mime_type, _ = mimetypes.guess_type(p.name)
                 if mime_type:
                     file_meta["mime_type"] = mime_type
 
-                # path="" because storage_path is the user's original uploaded
-                # file — the reprocess unlink loop must never delete it.
                 await self.store.add_artifact(
-                    item_id, kind="metadata", path="", meta=file_meta
+                    item_id, kind="metadata", path=storage_path, meta=file_meta
                 )
-                artifacts.append({"kind": "metadata", "path": "", "meta": file_meta})
+                artifacts.append({"kind": "metadata", "path": storage_path, "meta": file_meta})
 
                 # Update item bytes
                 await self.store.update_item(item_id, bytes=stat.st_size)
@@ -165,9 +159,6 @@ class TextProcessor(Processor):
         text_meta = {
             "char_count": len(text),
             "line_count": text.count("\n") + 1,
-            "source_url": item.get("source_url", ""),
-            "processed_at": time.time(),
-            "processor": "TextProcessor/v1",
         }
         await self.store.add_artifact(
             item_id, kind="text", path=str(text_path), meta=text_meta
@@ -250,9 +241,9 @@ class PdfProcessor(Processor):
                            exc_info=True)
 
         await self.store.add_artifact(
-            item_id, kind="metadata", path="", meta=pdf_meta
+            item_id, kind="metadata", path=storage_path, meta=pdf_meta
         )
-        artifacts.append({"kind": "metadata", "path": "", "meta": pdf_meta})
+        artifacts.append({"kind": "metadata", "path": storage_path, "meta": pdf_meta})
 
         return artifacts
 
@@ -312,9 +303,9 @@ class ImageProcessor(Processor):
                            exc_info=True)
 
         await self.store.add_artifact(
-            item_id, kind="metadata", path="", meta=img_meta
+            item_id, kind="metadata", path=storage_path, meta=img_meta
         )
-        artifacts.append({"kind": "metadata", "path": "", "meta": img_meta})
+        artifacts.append({"kind": "metadata", "path": storage_path, "meta": img_meta})
 
         return artifacts
 
@@ -362,45 +353,6 @@ async def run_pipeline(
         return
 
     kind = item["kind"]
-
-    # URL-only items (no storage_path) are stored as references — the pipeline
-    # records a reference metadata artifact but does not fetch remote content
-    # (future: WebFetcherProcessor, #2078).  The item gets a "reference" artifact so it
-    # is not silently empty.
-    if not item.get("storage_path") and item.get("source_url"):
-        logger.info(
-            "Library pipeline: URL-only item %s (%s) — stored as reference, not fetched",
-            item_id, kind,
-        )
-        ref_meta = {
-            "source_url": item["source_url"],
-            "kind": kind,
-            "note": "Reference-only item — content not fetched (TODO: WebFetcherProcessor)",
-        }
-        await store.add_artifact(
-            item_id, kind="reference", path="", meta=ref_meta,
-        )
-
-    # If item has a storage_path that points to a missing file, fail early
-    # (dropped/moved/corrupt source must not silently look successful).
-    storage_path = item.get("storage_path", "")
-    source_url = item.get("source_url", "")
-    if storage_path and not source_url:
-        sp = Path(storage_path)
-        if not sp.exists():
-            logger.warning(
-                "Library pipeline: source file missing for item %s: %s",
-                item_id, storage_path,
-            )
-            await store.update_item_status(item_id, "error")
-            await store.update_item(
-                item_id,
-                meta_json={
-                    **json.loads(item.get("meta_json", "{}")),
-                    "error": f"Source file not found: {storage_path}",
-                },
-            )
-            return
 
     try:
         await store.update_item_status(item_id, "processing")
