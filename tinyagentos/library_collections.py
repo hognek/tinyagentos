@@ -114,39 +114,70 @@ async def handoff_to_collections(
     indexed = 0
     try:
         import httpx
+        import json
+
+        # Normalise base URL
+        base_url = qmd_base_url.rstrip("/")
 
         async with httpx.AsyncClient(timeout=30) as http_client:
-            # 1. Create a collection for this library item
+            # 1. Get or create a collection for this library item.
+            #    Look up a previously-created collection id from item metadata
+            #    so reprocess is idempotent (no duplicate collections).
             collection_name = f"library-{item_id[:12]}"
             db_path = str(collections_dir / "library-collections.db")
             title = item.get("title", "Untitled") or "Untitled"
 
-            create_resp = await http_client.post(
-                f"{qmd_base_url}/collections",
-                json={
-                    "dbPath": db_path,
-                    "name": collection_name,
-                    "metadata": {
-                        "title": title,
-                        "kind": item.get("kind", ""),
-                        "source_url": item.get("source_url", ""),
-                        "library_item_id": item_id,
-                    },
-                },
-            )
-            if create_resp.status_code >= 400:
-                logger.warning(
-                    "qmd POST /collections returned %d for item %s: %s",
-                    create_resp.status_code, item_id, create_resp.text[:200],
-                )
-                return 0
-            collection_id = create_resp.json().get("id", "")
+            collection_id = ""
+            item_meta = json.loads(item.get("meta_json", "{}"))
+            existing_coll_id = item_meta.get("collection_id", "")
+
+            if existing_coll_id:
+                # Verify the collection still exists
+                try:
+                    check_resp = await http_client.get(
+                        f"{base_url}/collections/{existing_coll_id}",
+                        params={"dbPath": db_path},
+                    )
+                    if check_resp.status_code < 400:
+                        collection_id = existing_coll_id
+                        logger.debug(
+                            "Reusing existing collection %s for item %s",
+                            collection_id, item_id,
+                        )
+                except Exception:
+                    pass
 
             if not collection_id:
-                logger.warning(
-                    "qmd POST /collections returned no id for item %s", item_id,
+                create_resp = await http_client.post(
+                    f"{base_url}/collections",
+                    json={
+                        "dbPath": db_path,
+                        "name": collection_name,
+                        "metadata": {
+                            "title": title,
+                            "kind": item.get("kind", ""),
+                            "source_url": item.get("source_url", ""),
+                            "library_item_id": item_id,
+                        },
+                    },
                 )
-                return 0
+                if create_resp.status_code >= 400:
+                    logger.warning(
+                        "qmd POST /collections returned %d for item %s: %s",
+                        create_resp.status_code, item_id, create_resp.text[:200],
+                    )
+                    return 0
+                collection_id = create_resp.json().get("id", "")
+
+                if not collection_id:
+                    logger.warning(
+                        "qmd POST /collections returned no id for item %s", item_id,
+                    )
+                    return 0
+
+                # Persist collection_id in item metadata for idempotent reprocess
+                item_meta["collection_id"] = collection_id
+                await store.update_item(item_id, meta_json=item_meta)
 
             # 2. Index each text artifact into the collection
             for file_path, text_content in indexed_paths:
@@ -154,7 +185,7 @@ async def handoff_to_collections(
                     continue
                 try:
                     index_resp = await http_client.post(
-                        f"{qmd_base_url}/collections/{collection_id}/index",
+                        f"{base_url}/collections/{collection_id}/index",
                         json={
                             "dbPath": db_path,
                             "text": text_content,
