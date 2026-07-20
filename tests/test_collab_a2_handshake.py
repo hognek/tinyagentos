@@ -100,7 +100,7 @@ def _bootstrap_hub_identity(data_dir: Path, username: str = "localnode") -> str:
     return f"hub:{username}"
 
 
-_PEER_FP = "deadbeef" * 8  # 64-char fake fingerprint
+_PEER_FP = "9a2db2e23f1504cd056606553ac049c5e718e8f9ce9233876df1a7a1821af885"  # SHA-256 of _PEER_SIGNING_PUB
 _PEER_USERNAME = "remotepeer"
 _PEER_SIGNING_PUB = "ab" * 32  # 64-char fake Ed25519 pubkey
 _PEER_ENCRYPTION_PUB = "cd" * 32  # 64-char fake X25519 pubkey
@@ -226,13 +226,16 @@ class TestFriendAcceptHandshake:
         hub_store = HubStore(
             Path(app_with_contacts.state.data_dir) / "hub" / "hub.db"
         )
-        await hub_store.init()
-        await hub_store.upsert_author(
-            _PEER_FP,
-            username=_PEER_USERNAME,
-            signing_pubkey=_PEER_SIGNING_PUB,
-            encryption_pubkey=_PEER_ENCRYPTION_PUB,
-        )
+        try:
+            await hub_store.init()
+            await hub_store.upsert_author(
+                _PEER_FP,
+                username=_PEER_USERNAME,
+                signing_pubkey=_PEER_SIGNING_PUB,
+                encryption_pubkey=_PEER_ENCRYPTION_PUB,
+            )
+        finally:
+            await hub_store.close()
 
         resp = await client_with_contacts.post(
             "/api/hub/friends/requests/test-rid-2/accept",
@@ -399,13 +402,16 @@ class TestBlockCascade:
         hub_store = HubStore(
             Path(app_with_contacts.state.data_dir) / "hub" / "hub.db"
         )
-        await hub_store.init()
-        await hub_store.upsert_author(
-            _PEER_FP,
-            username=_PEER_USERNAME,
-            signing_pubkey=_PEER_SIGNING_PUB,
-            encryption_pubkey=_PEER_ENCRYPTION_PUB,
-        )
+        try:
+            await hub_store.init()
+            await hub_store.upsert_author(
+                _PEER_FP,
+                username=_PEER_USERNAME,
+                signing_pubkey=_PEER_SIGNING_PUB,
+                encryption_pubkey=_PEER_ENCRYPTION_PUB,
+            )
+        finally:
+            await hub_store.close()
 
         # Mock the directory block edge revoke call (best-effort, must not fail block).
         async def handler(method, url, **kw):
