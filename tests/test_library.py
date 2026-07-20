@@ -1021,5 +1021,12 @@ def _mock_httpx_response(html: str, status_code: int = 200):
     mock = MagicMock()
     mock.text = html
     mock.status_code = status_code
+    mock.is_redirect = False
+    mock.encoding = "utf-8"
     mock.headers = {"content-type": "text/html; charset=utf-8"}
+
+    async def _aiter_bytes(_chunk_size: int = 8192):
+        yield html.encode("utf-8")
+
+    mock.aiter_bytes = _aiter_bytes
     return mock
