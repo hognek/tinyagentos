@@ -1,8 +1,8 @@
 """Library collections handoff — index text artifacts into taosmd collections.
 
 After the ingest pipeline produces text artifacts (extracted text, transcripts,
-descriptions), this module hands them off to taosmd collections via the qmd
-HTTP API so agents can query the content through collection grants.
+descriptions), this module hands them off to taosmd collections via the
+taosmd HTTP API so agents can query the content through collection grants.
 
 The design doc (docs/design/library-app.md) says:
   "Collections handoff: write text artifacts into a per-target folder under an
@@ -11,13 +11,18 @@ The design doc (docs/design/library-app.md) says:
 
 Flow (Phase 1):
   1. Write text artifacts under collections_dir/{item_id}/
-  2. Create a collection via POST /collections (qmd HTTP API)
-  3. Index each text artifact via POST /collections/{id}/index
+  2. Create a collection via POST /collections (taosmd HTTP API)
+  3. Trigger async index via POST /collections/{id}/index
+  4. Poll GET /collections/{id} until status=ready|error
+  5. Link collection to the library item via POST /collections/{id}/link
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+import stat
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -25,21 +30,28 @@ logger = logging.getLogger(__name__)
 # Text artifact kinds that should be indexed into collections
 _TEXT_ARTIFACT_KINDS = frozenset({"text", "transcript", "description", "ocr"})
 
+# Maximum polls while waiting for async index to complete.
+_MAX_INDEX_POLLS = 30
+# Seconds between poll attempts.
+_POLL_INTERVAL = 2
+
 
 async def handoff_to_collections(
     store,
     item_id: str,
     collections_dir: Path,
-    qmd_base_url: str | None = None,
+    taosmd_url: str | None = None,
+    taosmd_admin_token: str | None = None,
     project_id: str | None = None,
 ) -> int:
     """Hand off all text artifacts for an item to taosmd collections.
 
     Writes text artifacts under ``collections_dir/{item_id}/``, then calls
-    the qmd HTTP API to create a collection and index the text content.
+    the taosmd HTTP API to create a collection and index the text content.
 
-    Returns the number of artifacts successfully indexed into the collection.
-    Returns 0 when qmd is unavailable (no collection created).
+    Returns the number of files indexed (``files_indexed`` from taosmd stats)
+    after a successful async index.  Returns 0 when taosmd is unavailable
+    (no collection created).
 
     Parameters
     ----------
@@ -48,12 +60,15 @@ async def handoff_to_collections(
     item_id:
         Library item id.
     collections_dir:
-        Allowed root for collection files (e.g. ``data/collections/``).
-    qmd_base_url:
-        Base URL of the running qmd serve instance (e.g. ``http://localhost:7832``).
+        Allowed root for collection files (e.g. ``/opt/taos/data/collections/``).
+    taosmd_url:
+        Base URL of the running taosmd instance (e.g. ``http://localhost:7900``).
         When omitted or None, file-copy still happens but no collection is
         created or indexed — the caller must have already created the collection
         separately (production paths always supply this; test paths may omit it).
+    taosmd_admin_token:
+        Admin bearer token for taosmd API auth, fetched from SecretsStore as
+        ``taosmd-admin-token``.  Required when *taosmd_url* is set.
     project_id:
         Optional project to link the collection to (Phase 2+).
     """
@@ -76,9 +91,15 @@ async def handoff_to_collections(
     # Write text artifacts to a per-item folder under the collections root
     item_dir = collections_dir / item_id
     item_dir.mkdir(parents=True, exist_ok=True)
+    # Set group-readable perms on the directory
+    try:
+        os.chmod(item_dir, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
+    except OSError:
+        pass
 
-    # Copy each text artifact and collect content for indexing
-    indexed_paths: list[tuple[str, str]] = []  # (path, text_content)
+    # Copy each text artifact into the collection source path.
+    # taosmd discovers files by scanning the source_path directory.
+    indexed_paths: list[str] = []
     for art in text_artifacts:
         art_path = art.get("path", "")
         if not art_path:
@@ -92,39 +113,42 @@ async def handoff_to_collections(
         try:
             raw_bytes = src.read_bytes()
             dst.write_bytes(raw_bytes)
+            # Group-readable file perms
+            try:
+                os.chmod(dst, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
+            except OSError:
+                pass
         except OSError:
             logger.warning("Failed to copy artifact %s → %s", src, dst,
                            exc_info=True)
             continue
-
-        try:
-            text_content = raw_bytes.decode("utf-8", errors="replace")
-        except Exception:
-            text_content = ""
-        indexed_paths.append((str(dst), text_content))
+        indexed_paths.append(str(dst))
 
     if not indexed_paths:
         return 0
 
-    # Index into taosmd collections via the qmd HTTP API
-    if not qmd_base_url:
-        logger.debug("qmd base URL not provided — collection indexing skipped")
+    # Index into taosmd collections via the taosmd HTTP API
+    if not taosmd_url:
+        logger.debug("taosmd URL not provided — collection indexing skipped")
         return 0
 
-    indexed = 0
     try:
         import httpx
         import json
 
         # Normalise base URL
-        base_url = qmd_base_url.rstrip("/")
+        base_url = taosmd_url.rstrip("/")
+
+        # Build auth headers when a token is available
+        auth_headers: dict[str, str] = {}
+        if taosmd_admin_token:
+            auth_headers["Authorization"] = f"Bearer {taosmd_admin_token}"
 
         async with httpx.AsyncClient(timeout=30) as http_client:
             # 1. Get or create a collection for this library item.
             #    Look up a previously-created collection id from item metadata
             #    so reprocess is idempotent (no duplicate collections).
             collection_name = f"library-{item_id[:12]}"
-            db_path = str(collections_dir / "library-collections.db")
             title = item.get("title", "Untitled") or "Untitled"
 
             collection_id = ""
@@ -136,7 +160,7 @@ async def handoff_to_collections(
                 try:
                     check_resp = await http_client.get(
                         f"{base_url}/collections/{existing_coll_id}",
-                        params={"dbPath": db_path},
+                        headers=auth_headers,
                     )
                     if check_resp.status_code < 400:
                         collection_id = existing_coll_id
@@ -146,17 +170,19 @@ async def handoff_to_collections(
                         )
                 except Exception:
                     logger.warning(
-                        "qmd GET /collections/%s failed — cannot verify "
+                        "taosmd GET /collections/%s failed — cannot verify "
                         "existing collection, falling through to create",
                         existing_coll_id,
                     )
 
             if not collection_id:
+                source_path = str(item_dir)
                 create_resp = await http_client.post(
                     f"{base_url}/collections",
                     json={
-                        "dbPath": db_path,
                         "name": collection_name,
+                        "kind": "mixed",
+                        "source_path": source_path,
                         "metadata": {
                             "title": title,
                             "kind": item.get("kind", ""),
@@ -164,18 +190,21 @@ async def handoff_to_collections(
                             "library_item_id": item_id,
                         },
                     },
+                    headers=auth_headers,
                 )
                 if create_resp.status_code >= 400:
                     logger.warning(
-                        "qmd POST /collections returned %d for item %s: %s",
+                        "taosmd POST /collections returned %d for item %s: %s",
                         create_resp.status_code, item_id, create_resp.text[:200],
                     )
                     return 0
-                collection_id = create_resp.json().get("id", "")
+                # taosmd 0.4.0 nests the id under "collection"
+                collection_id = create_resp.json().get("collection", {}).get("id", "")
 
                 if not collection_id:
                     logger.warning(
-                        "qmd POST /collections returned no id for item %s", item_id,
+                        "taosmd POST /collections returned no collection.id for item %s",
+                        item_id,
                     )
                     return 0
 
@@ -183,53 +212,101 @@ async def handoff_to_collections(
                 item_meta["collection_id"] = collection_id
                 await store.update_item(item_id, meta_json=item_meta)
 
-            # 2. Index each text artifact into the collection.
-            #    Pass a stable key derived from the source path so qmd can
-            #    upsert rather than append — reprocess is idempotent.
-            for file_path, text_content in indexed_paths:
-                if not text_content.strip():
-                    continue
-                try:
-                    index_resp = await http_client.post(
-                        f"{base_url}/collections/{collection_id}/index",
-                        json={
-                            "dbPath": db_path,
-                            "text": text_content,
-                            "key": f"library:{item_id}:{Path(file_path).name}",
-                            "metadata": {
-                                "source_path": file_path,
-                                "library_item_id": item_id,
-                                "item_title": title,
-                            },
-                        },
+            # 2. Trigger async index — no body, returns 202.
+            try:
+                index_resp = await http_client.post(
+                    f"{base_url}/collections/{collection_id}/index",
+                    headers=auth_headers,
+                )
+                if index_resp.status_code != 202:
+                    logger.warning(
+                        "taosmd POST /collections/%s/index returned %d (expected 202)",
+                        collection_id, index_resp.status_code,
                     )
-                    if index_resp.status_code < 400:
-                        indexed += 1
-                        logger.debug(
-                            "Indexed artifact %s into collection %s",
-                            Path(file_path).name, collection_id,
-                        )
-                    else:
+                    return 0
+            except Exception:
+                logger.warning(
+                    "taosmd POST /collections/%s/index failed",
+                    collection_id, exc_info=True,
+                )
+                return 0
+
+            # 3. Poll until indexing completes.
+            indexed = 0
+            for _poll_attempt in range(_MAX_INDEX_POLLS):
+                try:
+                    poll_resp = await http_client.get(
+                        f"{base_url}/collections/{collection_id}",
+                        headers=auth_headers,
+                    )
+                    if poll_resp.status_code >= 400:
                         logger.warning(
-                            "qmd POST /collections/%s/index returned %d",
-                            collection_id, index_resp.status_code,
+                            "taosmd GET /collections/%s returned %d during poll",
+                            collection_id, poll_resp.status_code,
                         )
+                        break
+                    poll_data = poll_resp.json()
+                    status = poll_data.get("status", "")
+                    if status == "ready":
+                        stats = poll_data.get("stats", {})
+                        indexed = stats.get("files_indexed", 0)
+                        logger.info(
+                            "Collections handoff for item %s: "
+                            "files_indexed=%d files_total=%d "
+                            "chunks_ingested=%d chunks_skipped=%d "
+                            "collection=%s",
+                            item_id,
+                            stats.get("files_indexed", 0),
+                            stats.get("files_total", 0),
+                            stats.get("chunks_ingested", 0),
+                            stats.get("chunks_skipped", 0),
+                            collection_id,
+                        )
+                        break
+                    elif status == "error":
+                        logger.warning(
+                            "taosmd collection %s entered error state for item %s",
+                            collection_id, item_id,
+                        )
+                        break
+                    # Still indexing — wait and retry
+                    await asyncio.sleep(_POLL_INTERVAL)
                 except Exception:
                     logger.warning(
-                        "qmd index failed for artifact %s in collection %s",
-                        file_path, collection_id, exc_info=True,
+                        "taosmd poll GET /collections/%s failed",
+                        collection_id, exc_info=True,
                     )
+                    break
+            else:
+                logger.warning(
+                    "taosmd collection %s did not reach ready state within %d polls",
+                    collection_id, _MAX_INDEX_POLLS,
+                )
 
-            logger.info(
-                "Collections handoff for item %s: %d/%d artifacts indexed into %s",
-                item_id, indexed, len(indexed_paths), collection_id,
-            )
+            # 4. Link the collection to the library item.
+            try:
+                await http_client.post(
+                    f"{base_url}/collections/{collection_id}/link",
+                    json={"type": "taos", "id": item_id},
+                    headers=auth_headers,
+                )
+                logger.debug(
+                    "Linked collection %s to library item %s",
+                    collection_id, item_id,
+                )
+            except Exception:
+                logger.warning(
+                    "taosmd POST /collections/%s/link failed for item %s",
+                    collection_id, item_id, exc_info=True,
+                )
+
+            return indexed
 
     except ImportError:
         logger.debug("httpx not available — collection indexing skipped")
     except Exception:
         logger.exception(
-            "qmd collections API unreachable for item %s", item_id,
+            "taosmd collections API unreachable for item %s", item_id,
         )
 
-    return indexed
+    return 0

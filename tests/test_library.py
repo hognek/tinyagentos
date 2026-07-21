@@ -436,7 +436,7 @@ class TestCollectionsHandoff:
 
     @pytest.mark.asyncio
     async def test_handoff_with_qmd(self, lib_store, storage_dir):
-        """Handoff indexes into qmd when the API is reachable."""
+        """Handoff indexes into taosmd when the API is reachable."""
         from unittest.mock import AsyncMock, patch
 
         file_path = storage_dir / "notes.txt"
@@ -451,29 +451,55 @@ class TestCollectionsHandoff:
         await proc.process(item)
 
         collections_dir = storage_dir / "collections"
-        qmd_url = "http://localhost:17832"
+        taosmd_url = "http://localhost:17900"
+        taosmd_token = "test-admin-token"
 
-        # Mock httpx.AsyncClient to simulate a working qmd
+        # Mock httpx.AsyncClient to simulate a working taosmd
         from unittest.mock import AsyncMock, MagicMock
 
         mock_client = MagicMock()
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=None)
-        # POST responses — MagicMock for sync .json(), AsyncMock for async .post()
+
+        # POST /collections → nested response shape (taosmd 0.4.0)
         mock_create_resp = MagicMock()
         mock_create_resp.status_code = 200
-        mock_create_resp.json.return_value = {"id": "coll-123"}
+        mock_create_resp.json.return_value = {"collection": {"id": "coll-123"}}
+
+        # POST /collections/{id}/index → 202 (no body)
         mock_index_resp = MagicMock()
-        mock_index_resp.status_code = 200
-        mock_client.post = AsyncMock(side_effect=[mock_create_resp, mock_index_resp])
+        mock_index_resp.status_code = 202
+
+        # POST /collections/{id}/link → 200
+        mock_link_resp = MagicMock()
+        mock_link_resp.status_code = 200
+
+        # GET /collections/{id} → status=ready with stats
+        mock_poll_resp = MagicMock()
+        mock_poll_resp.status_code = 200
+        mock_poll_resp.json.return_value = {
+            "status": "ready",
+            "stats": {
+                "files_indexed": 1,
+                "files_total": 1,
+                "chunks_ingested": 3,
+                "chunks_skipped": 0,
+            },
+        }
+
+        mock_client.post = AsyncMock(
+            side_effect=[mock_create_resp, mock_index_resp, mock_link_resp]
+        )
+        mock_client.get = AsyncMock(return_value=mock_poll_resp)
 
         with patch("httpx.AsyncClient", return_value=mock_client):
             count = await handoff_to_collections(
                 lib_store, item_id, collections_dir,
-                qmd_base_url=qmd_url,
+                taosmd_url=taosmd_url,
+                taosmd_admin_token=taosmd_token,
             )
 
-        assert count == 1  # One artifact indexed
+        assert count == 1  # One file indexed per stats
 
 
 # ---------------------------------------------------------------------------

@@ -174,11 +174,18 @@ async def _ingest_task(app, item_id: str, store, storage_dir: Path) -> None:
     # Collections handoff after successful pipeline
     try:
         collections_dir = storage_dir.parent / "collections"
-        qmd_base = getattr(app.state, "qmd_client", None)
-        qmd_base_url = qmd_base.base_url if qmd_base else None
+        config = getattr(app.state, "config", None)
+        taosmd_url = getattr(config, "memory_url", None) if config else None
+        taosmd_admin_token = None
+        secrets = getattr(app.state, "secrets", None)
+        if secrets:
+            secret = await secrets.get("taosmd-admin-token")
+            if secret:
+                taosmd_admin_token = secret["value"]
         await handoff_to_collections(
             store, item_id, collections_dir,
-            qmd_base_url=qmd_base_url,
+            taosmd_url=taosmd_url,
+            taosmd_admin_token=taosmd_admin_token,
         )
     except Exception:
         logger.exception("Collections handoff failed for item %s", item_id)
