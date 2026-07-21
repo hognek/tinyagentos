@@ -30,6 +30,8 @@ data/videos/
 data/secrets.db
 data/models/
 data/workspace/
+data/library/
+data/collections/
 data/*.log
 
 # Environment

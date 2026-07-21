@@ -30,6 +30,10 @@ class MintInviteIn(BaseModel):
     scopes: list[str] = Field(default_factory=list)
     approval_mode: str = Field(default="auto", pattern="^(auto|manual)$")
     check_interval_secs: int = Field(default=1800, ge=60)
+    # How long the invite stays redeemable. Omitted means the store default
+    # (1 hour). Capped at 24 hours: the PIN is the security gate, expiry is
+    # hygiene, but an indefinitely live link is not a state we want.
+    ttl_secs: int | None = Field(default=None, ge=60, le=86400)
 
 
 class MintOsInviteIn(BaseModel):
@@ -605,6 +609,22 @@ def _build_os_guide_markdown(
     return "\n".join(lines)
 
 
+
+def _scopes_as_list(raw) -> list:
+    """The store keeps scopes as a JSON-encoded TEXT column; the API contract
+    is a list. Parse defensively so a malformed row degrades to [] instead of
+    crashing every client that renders the list."""
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, str):
+        try:
+            import json as _json
+            v = _json.loads(raw)
+            return v if isinstance(v, list) else []
+        except Exception:
+            return []
+    return []
+
 @router.post("/api/projects/{project_id}/invites")
 async def mint_invite(
     project_id: str,
@@ -633,6 +653,7 @@ async def mint_invite(
             approval_mode=payload.approval_mode,
             check_interval_secs=payload.check_interval_secs,
             created_by=user.user_id,
+            ttl_secs=payload.ttl_secs,
         )
     except InvitePendingCapError as exc:
         return JSONResponse({"error": str(exc)}, status_code=429)
@@ -663,7 +684,7 @@ async def list_invites(
     return [
         {
             "invite_id": i["invite_id"],
-            "scopes": i["scopes"],
+            "scopes": _scopes_as_list(i["scopes"]),
             "status": i["status"],
             "expires_ts": i["expires_ts"],
             "redeemed_by": i.get("redeemed_by"),
@@ -688,9 +709,19 @@ async def revoke_invite(
     row = await store.get(invite_id)
     if row is None or row.get("project_id") != project_id:
         return JSONResponse({"error": "invite not found"}, status_code=404)
+    status = row.get("status")
+    if status in ("redeemed", "revoked"):
+        return JSONResponse({"error": f"invite already {status}"}, status_code=409)
+    # 'claimed' is the transient mid-redeem state. Revoking it would race the
+    # redeem, so refuse with a message that names the state rather than the
+    # generic retry text.
+    if status == "claimed":
+        return JSONResponse(
+            {"error": "invite is mid-redeem, retry once it settles"}, status_code=409
+        )
     ok = await store.revoke(invite_id)
     if not ok:
-        return JSONResponse({"error": "invite not found or already redeemed"}, status_code=404)
+        return JSONResponse({"error": "invite state changed, retry"}, status_code=409)
     return JSONResponse(content=None, status_code=204)
 
 
@@ -768,7 +799,7 @@ async def list_os_invites(
     return [
         {
             "invite_id": i["invite_id"],
-            "scopes": i["scopes"],
+            "scopes": _scopes_as_list(i["scopes"]),
             "status": i["status"],
             "expires_ts": i["expires_ts"],
             "redeemed_by": i.get("redeemed_by"),
