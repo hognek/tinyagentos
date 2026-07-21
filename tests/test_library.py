@@ -501,6 +501,19 @@ class TestCollectionsHandoff:
 
         assert count == 1  # One file indexed per stats
 
+        # Verify request sequence — create → index → link
+        assert mock_client.post.call_count == 3
+        post_calls = [c.args[0] for c in mock_client.post.call_args_list]
+        assert post_calls[0] == f"{taosmd_url}/collections"
+        assert post_calls[1] == f"{taosmd_url}/collections/coll-123/index"
+        assert post_calls[2] == f"{taosmd_url}/collections/coll-123/link"
+
+        # Verify poll GET called
+        mock_client.get.assert_called_once_with(
+            f"{taosmd_url}/collections/coll-123",
+            headers={"Authorization": f"Bearer {taosmd_token}"},
+        )
+
 
 # ---------------------------------------------------------------------------
 # API routes
