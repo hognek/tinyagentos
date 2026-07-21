@@ -20,6 +20,7 @@ Flow (Phase 1):
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import stat
@@ -72,8 +73,6 @@ async def handoff_to_collections(
     project_id:
         Optional project to link the collection to (Phase 2+).
     """
-    from tinyagentos.library_store import LibraryStore
-
     artifacts = await store.get_artifacts(item_id)
     if not artifacts:
         return 0
@@ -93,7 +92,7 @@ async def handoff_to_collections(
     item_dir.mkdir(parents=True, exist_ok=True)
     # Set group-readable perms on the directory
     try:
-        os.chmod(item_dir, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
+        os.chmod(item_dir, stat.S_ISGID | stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP)
     except OSError:
         pass
 
@@ -115,7 +114,7 @@ async def handoff_to_collections(
             dst.write_bytes(raw_bytes)
             # Group-readable file perms
             try:
-                os.chmod(dst, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
+                os.chmod(dst, stat.S_ISGID | stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
             except OSError:
                 pass
         except OSError:
@@ -134,7 +133,6 @@ async def handoff_to_collections(
 
     try:
         import httpx
-        import json
 
         # Normalise base URL
         base_url = taosmd_url.rstrip("/")
@@ -245,7 +243,7 @@ async def handoff_to_collections(
                             collection_id, poll_resp.status_code,
                         )
                         break
-                    poll_data = poll_resp.json()
+                    poll_data = poll_resp.json().get("collection", {})
                     status = poll_data.get("status", "")
                     if status == "ready":
                         stats = poll_data.get("stats", {})
@@ -303,10 +301,24 @@ async def handoff_to_collections(
             return indexed
 
     except ImportError:
-        logger.debug("httpx not available — collection indexing skipped")
+        logger.warning("httpx not available — collection indexing skipped")
+        try:
+            await store.update_item(item_id, meta_json={
+                **(json.loads(item.get("meta_json", "{}"))),
+                "collection_retryable": True,
+            })
+        except Exception:
+            pass
     except Exception:
         logger.exception(
             "taosmd collections API unreachable for item %s", item_id,
         )
+        try:
+            await store.update_item(item_id, meta_json={
+                **(json.loads(item.get("meta_json", "{}"))),
+                "collection_retryable": True,
+            })
+        except Exception:
+            pass
 
     return 0

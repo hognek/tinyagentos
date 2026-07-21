@@ -173,6 +173,30 @@ class LibraryStore(BaseStore):
             )
         await self.update_item(item_id, status=status)
 
+    async def try_update_item_status(
+        self, item_id: str, new_status: str, *,
+        if_not_in: tuple[str, ...] = ("pending", "processing"),
+    ) -> bool:
+        """Atomically set status to *new_status* when current status is NOT in *if_not_in*.
+
+        Returns True when a row was updated, False otherwise.
+        Used by reprocess to avoid TOCTOU races — two concurrent reprocess
+        requests cannot both pass a read-then-write guard.
+        """
+        if new_status not in _VALID_STATUSES:
+            raise ValueError(
+                f"Invalid status {new_status!r}; must be one of {sorted(_VALID_STATUSES)}"
+            )
+        placeholders = ",".join("?" * len(if_not_in))
+        params = [new_status, time.time(), item_id, *if_not_in]
+        cursor = await self._db.execute(
+            f"UPDATE library_items SET status = ?, updated_at = ? "
+            f"WHERE id = ? AND status NOT IN ({placeholders})",
+            params,
+        )
+        await self._db.commit()
+        return cursor.rowcount > 0
+
     # -- artifacts --------------------------------------------------------
 
     async def add_artifact(

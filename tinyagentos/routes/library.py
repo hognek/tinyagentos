@@ -182,11 +182,22 @@ async def _ingest_task(app, item_id: str, store, storage_dir: Path) -> None:
             secret = await secrets.get("taosmd-admin-token")
             if secret:
                 taosmd_admin_token = secret["value"]
-        await handoff_to_collections(
+        indexed = await handoff_to_collections(
             store, item_id, collections_dir,
             taosmd_url=taosmd_url,
             taosmd_admin_token=taosmd_admin_token,
         )
+        if indexed > 0:
+            logger.info(
+                "Collections handoff indexed %d file(s) for item %s",
+                indexed, item_id,
+            )
+        else:
+            logger.debug(
+                "Collections handoff indexed 0 files for item %s "
+                "(no text artifacts or taosmd unavailable)",
+                item_id,
+            )
     except Exception:
         logger.exception("Collections handoff failed for item %s", item_id)
 
@@ -257,7 +268,8 @@ async def delete_item(request: Request, item_id: str):
         try:
             p.unlink()
         except OSError:
-            pass
+            logger.warning("Failed to remove storage file %s for item %s",
+                           storage_path, item_id)
 
     # Remove artifacts from disk
     artifacts = await store.get_artifacts(item_id)
@@ -267,7 +279,8 @@ async def delete_item(request: Request, item_id: str):
             try:
                 ap.unlink()
             except OSError:
-                pass
+                logger.warning("Failed to remove artifact %s for item %s",
+                               art_path, item_id)
 
     # Remove collections folder
     storage_dir = _library_dir(request)
@@ -277,7 +290,8 @@ async def delete_item(request: Request, item_id: str):
         try:
             shutil.rmtree(item_collection_dir)
         except OSError:
-            pass
+            logger.warning("Failed to remove collection dir %s for item %s",
+                           item_collection_dir, item_id)
 
     await store.delete_item(item_id)
     return {"status": "deleted", "item_id": item_id}
@@ -295,7 +309,11 @@ async def reprocess_item(request: Request, item_id: str):
     if not item:
         return JSONResponse({"error": f"Item {item_id!r} not found"}, status_code=404)
 
-    if item.get("status") in ("pending", "processing"):
+    # Atomic CAS: transition to pending only when NOT already pending/processing.
+    # Beats the TOCTOU race — two concurrent reprocess requests cannot both
+    # pass a separate read-then-write guard.
+    if not await store.try_update_item_status(item_id, "pending",
+                                               if_not_in=("pending", "processing")):
         return JSONResponse(
             {"error": "Item is currently being processed"}, status_code=409
         )
@@ -309,12 +327,12 @@ async def reprocess_item(request: Request, item_id: str):
             try:
                 ap.unlink()
             except OSError:
-                pass
+                logger.warning("Failed to remove artifact %s for item %s",
+                               art_path, item_id)
         await store.delete_artifact(art["id"])
 
-    # Reset status to pending so the pipeline picks it up fresh
-    await store.update_item_status(item_id, "pending")
-
+    # Status was already atomically set to pending by try_update_item_status above;
+    # re-queue the pipeline now.
     task_set = getattr(request.app.state, "_background_tasks", None)
     coro = _ingest_task(request.app, item_id, store, storage_dir)
     if task_set is None:

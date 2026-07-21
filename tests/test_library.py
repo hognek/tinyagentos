@@ -474,16 +474,18 @@ class TestCollectionsHandoff:
         mock_link_resp = MagicMock()
         mock_link_resp.status_code = 200
 
-        # GET /collections/{id} → status=ready with stats
+        # GET /collections/{id} → nested shape (taosmd 0.4.0), status=ready with stats
         mock_poll_resp = MagicMock()
         mock_poll_resp.status_code = 200
         mock_poll_resp.json.return_value = {
-            "status": "ready",
-            "stats": {
-                "files_indexed": 1,
-                "files_total": 1,
-                "chunks_ingested": 3,
-                "chunks_skipped": 0,
+            "collection": {
+                "status": "ready",
+                "stats": {
+                    "files_indexed": 1,
+                    "files_total": 1,
+                    "chunks_ingested": 3,
+                    "chunks_skipped": 0,
+                },
             },
         }
 
@@ -507,6 +509,13 @@ class TestCollectionsHandoff:
         assert post_calls[0] == f"{taosmd_url}/collections"
         assert post_calls[1] == f"{taosmd_url}/collections/coll-123/index"
         assert post_calls[2] == f"{taosmd_url}/collections/coll-123/link"
+
+        # Verify POST /collections body contains required fields
+        create_kwargs = mock_client.post.call_args_list[0].kwargs
+        create_body = create_kwargs.get("json", {})
+        assert create_body["name"] == f"library-{item_id[:12]}"
+        assert create_body["kind"] == "mixed"
+        assert create_body["source_path"] == str(collections_dir / item_id)
 
         # Verify poll GET called
         mock_client.get.assert_called_once_with(
@@ -650,11 +659,26 @@ class TestLibraryRoutes:
         import asyncio
         await asyncio.sleep(0.5)
 
+        # Check initial artifact count
+        resp = await client.get(f"/api/library/items/{item_id}")
+        data = resp.json()
+        initial_artifact_count = len(data["artifacts"])
+        assert initial_artifact_count > 0, "Pipeline should produce artifacts"
+
         # First reprocess
         resp = await client.post(f"/api/library/items/{item_id}/reprocess")
         assert resp.status_code == 202
-
         await asyncio.sleep(0.5)
+
+        # After first reprocess — old artifacts deleted, fresh ones created;
+        # count should be roughly the same, not doubled.
+        resp = await client.get(f"/api/library/items/{item_id}")
+        data = resp.json()
+        after_first = len(data["artifacts"])
+        assert abs(after_first - initial_artifact_count) <= 2, (
+            f"Reprocess should not double artifacts: "
+            f"initial={initial_artifact_count} after_first={after_first}"
+        )
 
         # Second reprocess — should still work, no duplicates
         resp = await client.post(f"/api/library/items/{item_id}/reprocess")

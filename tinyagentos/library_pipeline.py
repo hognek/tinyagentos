@@ -373,7 +373,7 @@ async def run_pipeline(
         ref_meta = {
             "source_url": item["source_url"],
             "kind": kind,
-            "note": "Reference-only item — content not fetched (P2+)",
+            "note": "Reference-only item — content not fetched (tracked in #2063)",
         }
         await store.add_artifact(
             item_id, kind="reference", path="", meta=ref_meta,
