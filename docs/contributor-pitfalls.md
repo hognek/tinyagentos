@@ -154,3 +154,75 @@ say so in the PR body and file the follow-up issue in the same push. Never let
 a partial slice close the parent issue. Silent shortfalls read as done, get
 caught in review anyway, and cost a full extra round (#2042: community chat
 and peer access absent with no deferral note).
+
+**20. A tolerance is not a test of an invariant.**
+An assertion like `assert abs(after - before) <= 2` cannot distinguish correct
+behaviour from catastrophic failure. In PR #2062 that exact assertion ran green
+while reprocess destroyed the user's original uploaded file: the observed values
+were `before=2, after=0`, which the tolerance accepted, and the same tolerance
+would equally have accepted a doubling to 4. If the property is "the count does
+not change", assert equality and assert the resulting status, so the test fails
+loudly on both loss and duplication. Reserve tolerances for genuinely
+approximate quantities such as timings, and even then bound them tightly.
+
+**21. Shell snippets inside template literals must escape `${`.**
+A bash or PowerShell snippet stored in a JavaScript template literal collides
+with the language's own interpolation: `${VAR:-default}` is parsed as JS, not
+shell. In PR #2077 this produced 225 TypeScript syntax errors from a single
+cause, in one of four otherwise-clean files, and read like incoherent output
+rather than one mechanical mistake. Escape as `\${`, or keep snippets in plain
+non-template strings or separate asset files. The class generalises to any
+language sharing `${...}` with the shell, and it is invisible to anything that
+does not actually compile the file, which is why the frontend typecheck gate
+exists before a PR is opened.
+
+**22. Conflict resolution is a decision, not a mechanical act.**
+Taking the wrong side of a hunk silently reverts fixes that were just made. When
+a base branch has moved substantially under a long-lived branch, read what
+changed underneath before resolving: the four defects fixed in Library P1
+(nested response envelope, the guard preventing reprocess from deleting the
+source upload, the compare-and-swap status transition, exact artifact-count
+assertions) are all reintroducible by a plausible-looking resolution. Rebase
+rather than merging the base in, so the diff stays reviewable and each conflict
+is seen individually.
+
+**23. Mocks of EXTERNAL service contracts need a real source, not a guess.**
+Mocking our own internals or injecting errors you cannot produce on demand (a
+500, a timeout, an ImportError) is fine and unavoidable. The dangerous class is
+narrow: a mock of a service we do not control, whose fixture was hand-written
+from what the calling code expects. That fixture encodes a BELIEF about someone
+else's API, and when the belief is wrong the test proves nothing while going
+green. This happened three times in one PR cycle (#2062): an invented `dbPath`
+request shape, an un-nested poll response, and a tolerance assertion over both.
+
+First, split the class by whether the contract has a reachable OWNER.
+
+**Sibling services (taOSmd, taOS website): ASK. Do not guess.** These are not
+third parties. Their maintainer is on the A2A bus, and asking costs one message.
+Every failure in the #2062 cycle came from inferring a contract that was free to
+obtain: the builder guessed a request shape, and the reviewer verified against
+source rather than asking the owner. When we finally asked, we got the envelope
+documented, a wrong stats key list corrected by its own author, and a
+`/version` capabilities endpoint built to make the contract machine-checkable.
+Reverse-engineering a sibling's API from its source is a smell, not diligence:
+source tells you what it does today, the owner tells you what it guarantees.
+Contributors without bus access (external collaborators) ask in the PR, and the
+lead relays.
+
+**Genuinely third-party (GitHub, OpenRouter, Reddit): capture, do not compose.**
+There is no one to ask, so call the real service once and commit its response as
+the fixture. A recorded response cannot encode a wrong belief.
+
+For both, then:
+
+1. **Keep one real integration test per external contract.** Have it feature
+   detect and skip when the service is unreachable, so CI stays green offline
+   but drift surfaces the moment anyone runs it against a live instance. For
+   taosmd, `GET /version` returns a capabilities list for exactly this.
+2. **If that is impossible, mark the mock provisional IN CODE** with the
+   contract source and the date it was verified. A follow-up issue is not
+   sufficient: it detaches the caveat from the code and, in a tracker with
+   hundreds of open items, functions as indefinite deferral.
+
+Reviewer's job: ask where the fixture came from. A green test over a fictional
+contract is worse than no test, because it certifies the bug.
