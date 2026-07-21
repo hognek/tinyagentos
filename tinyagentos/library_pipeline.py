@@ -411,41 +411,40 @@ class WebProcessor(Processor):
         _MAX_WEB_BYTES = 10 * 1024 * 1024  # 10 MB
 
         current_url = source_url
-        resp = None
-        for _hop in range(_MAX_WEB_REDIRECTS + 1):
-            validate_url_or_raise(current_url)
-
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(30),
-                follow_redirects=False,
-            ) as client:
-                resp = await client.get(current_url)
-
-            if resp.is_redirect and resp.headers.get("location"):
-                current_url = urljoin(current_url, resp.headers["location"])
-                continue
-            break
-        else:
-            raise SsrfBlockedError(
-                f"too many redirects fetching {source_url!r}"
-            )
-
-        resp.raise_for_status()
-
-        # Read body with a size cap to avoid OOM on large/hostile pages.
-        body_chunks: list[bytes] = []
-        total = 0
-        async for chunk in resp.aiter_bytes(8192):
-            total += len(chunk)
-            if total > _MAX_WEB_BYTES:
-                raise ValueError(
-                    f"Response body exceeds {_MAX_WEB_BYTES} bytes "
-                    f"for {source_url!r}"
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(30),
+            follow_redirects=False,
+        ) as client:
+            for _hop in range(_MAX_WEB_REDIRECTS + 1):
+                validate_url_or_raise(current_url)
+                async with client.stream("GET", current_url) as resp:
+                    if resp.is_redirect and resp.headers.get("location"):
+                        current_url = urljoin(
+                            current_url, resp.headers["location"],
+                        )
+                        continue
+                    break
+            else:
+                raise SsrfBlockedError(
+                    f"too many redirects fetching {source_url!r}"
                 )
-            body_chunks.append(chunk)
-        html = b"".join(body_chunks).decode(
-            resp.encoding or "utf-8", errors="replace"
-        )
+
+            resp.raise_for_status()
+
+            # Read body with a size cap to avoid OOM on large/hostile pages.
+            body_chunks: list[bytes] = []
+            total = 0
+            async for chunk in resp.aiter_bytes(8192):
+                total += len(chunk)
+                if total > _MAX_WEB_BYTES:
+                    raise ValueError(
+                        f"Response body exceeds {_MAX_WEB_BYTES} bytes "
+                        f"for {source_url!r}"
+                    )
+                body_chunks.append(chunk)
+            html = b"".join(body_chunks).decode(
+                resp.encoding or "utf-8", errors="replace"
+            )
 
         if not html:
             return artifacts
@@ -645,23 +644,29 @@ async def run_pipeline(
 
     kind = item["kind"]
 
-    # URL-only items (no storage_path) are stored as references — the pipeline
-    # records a reference metadata artifact but does not fetch remote content
-    # (future: WebFetcherProcessor, #2078).  The item gets a "reference" artifact so it
-    # is not silently empty.
+    # URL-only items (no storage_path) are stored as references only when
+    # no kind-specific processor is registered to fetch them.  url:youtube
+    # and url:web have dedicated processors; other URL kinds fall through
+    # to the reference-only path (future: WebFetcherProcessor, #2078).
     if not item.get("storage_path") and item.get("source_url"):
-        logger.info(
-            "Library pipeline: URL-only item %s (%s) — stored as reference, not fetched",
-            item_id, kind,
-        )
-        ref_meta = {
-            "source_url": item["source_url"],
-            "kind": kind,
-            "note": "Reference-only item — content not fetched (TODO: WebFetcherProcessor)",
-        }
-        await store.add_artifact(
-            item_id, kind="reference", path="", meta=ref_meta,
-        )
+        proc_cls = _PROCESSORS.get(kind)
+        if proc_cls is None or proc_cls is FileProcessor:
+            logger.info(
+                "Library pipeline: URL-only item %s (%s) — no processor registered, "
+                "stored as reference",
+                item_id, kind,
+            )
+            ref_meta = {
+                "source_url": item["source_url"],
+                "kind": kind,
+                "note": (
+                    "Reference-only item — no processor registered for "
+                    f"kind={kind} (TODO: WebFetcherProcessor, #2078)"
+                ),
+            }
+            await store.add_artifact(
+                item_id, kind="reference", path="", meta=ref_meta,
+            )
 
     # If item has a storage_path that points to a missing file, fail early
     # (dropped/moved/corrupt source must not silently look successful).

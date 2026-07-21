@@ -413,9 +413,10 @@ class TestYouTubeProcessor:
         assert "preview" in meta
 
         updated_title = updated.get("title", "")
-        # If item had no title, processor should set it from video
-        # (but our update_item may not set title if it was initially empty - that depends)
-        # At minimum, verify the title field exists
+        assert updated_title == "Test Video", (
+            f"YouTube processor should set title from video metadata; "
+            f"got {updated_title!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_process_youtube_url_no_source(self, lib_store, storage_dir):
@@ -525,9 +526,7 @@ class TestWebProcessor:
                 "tinyagentos.routes.desktop_browser.ssrf.validate_url_or_raise",
             ),
         ):
-            mock_client_cls.return_value.__aenter__.return_value.get = (
-                _async_return(mock_resp)
-            )
+            _mock_httpx_stream(mock_client_cls, mock_resp)
             artifacts = await proc.process(item)
 
         kinds = {a["kind"] for a in artifacts}
@@ -583,9 +582,7 @@ class TestWebProcessor:
                 "tinyagentos.routes.desktop_browser.ssrf.validate_url_or_raise",
             ),
         ):
-            mock_client_cls.return_value.__aenter__.return_value.get = (
-                _async_return(mock_resp)
-            )
+            _mock_httpx_stream(mock_client_cls, mock_resp)
             await proc.process(item)
 
         updated = await lib_store.get_item(item_id)
@@ -613,9 +610,7 @@ class TestWebProcessor:
                 "tinyagentos.routes.desktop_browser.ssrf.validate_url_or_raise",
             ),
         ):
-            mock_client_cls.return_value.__aenter__.return_value.get = (
-                _async_return(mock_resp)
-            )
+            _mock_httpx_stream(mock_client_cls, mock_resp)
             await run_pipeline(lib_store, item_id, storage_dir)
 
         item = await lib_store.get_item(item_id)
@@ -1014,6 +1009,26 @@ def _async_return(value):
     async def _inner(*args, **kwargs):
         return value
     return _inner
+
+
+def _make_stream_ctx(resp):
+    """Return a mock async context manager whose __aenter__ yields *resp*."""
+    ctx = MagicMock()
+    ctx.__aenter__ = _async_return(resp)
+    async def _aexit(*args, **kwargs):
+        return None
+    ctx.__aexit__ = _aexit
+    return ctx
+
+
+def _mock_httpx_stream(mock_client_cls, resp):
+    """Configure the mocked httpx.AsyncClient to use client.stream().
+
+    After this call, ``client.stream(\"GET\", url)`` returns an async context
+    manager whose ``__aenter__`` yields *resp*.
+    """
+    client = mock_client_cls.return_value.__aenter__.return_value
+    client.stream = MagicMock(return_value=_make_stream_ctx(resp))
 
 
 def _mock_httpx_response(html: str, status_code: int = 200):
