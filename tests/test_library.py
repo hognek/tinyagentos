@@ -22,6 +22,7 @@ from tinyagentos.library_pipeline import (
 )
 from tinyagentos.library_store import LibraryStore
 from tinyagentos.library_collections import handoff_to_collections
+from tinyagentos.routes.library import _ingest_task
 
 
 # ---------------------------------------------------------------------------
@@ -667,6 +668,38 @@ class TestRunPipeline:
         await run_pipeline(lib_store, item_id, storage_dir)
         item = await lib_store.get_item(item_id)
         assert item["status"] == "error"
+
+    @pytest.mark.asyncio
+    async def test_ingest_task_preserves_error_status(
+        self, lib_store, storage_dir,
+    ):
+        """_ingest_task must not overwrite a pipeline error with 'ready'.
+
+        When run_pipeline sets status=error without raising (e.g. missing
+        source file), _ingest_task must detect the terminal status and abort
+        the collections handoff rather than unconditionally writing 'ready'.
+        Reproduces the bug where commit 52c3c7ab undid d4af00c's guarantee.
+        """
+        item_id = await lib_store.create_item(
+            kind="file",
+            title="missing.txt",
+            storage_path="/missing/file.txt",
+        )
+        # Minimal mock app — _ingest_task reads app.state.config + secrets
+        # during the collections handoff window (which should never be
+        # reached for an error item).
+        app = MagicMock()
+        app.state.config = None
+        app.state.secrets = AsyncMock()
+        app.state.secrets.get = AsyncMock(return_value=None)
+
+        await _ingest_task(app, item_id, lib_store, storage_dir)
+
+        item = await lib_store.get_item(item_id)
+        assert item["status"] == "error", (
+            f"Expected status=error, got {item['status']!r} — "
+            "_ingest_task overwrote a terminal pipeline error with ready"
+        )
 
 
 # ---------------------------------------------------------------------------

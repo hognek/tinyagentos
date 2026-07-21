@@ -178,6 +178,19 @@ async def _ingest_task(app, item_id: str, store, storage_dir: Path) -> None:
         await store.update_item_status(item_id, "error")
         return
 
+    # run_pipeline may set status=error without raising (e.g. missing
+    # source file, processor-level failure).  Do NOT overwrite a terminal
+    # status with "ready" — re-read and abort the collections handoff when
+    # the pipeline left the item in a non-transient state.
+    item = await store.get_item(item_id)
+    if item and item.get("status") == "error":
+        logger.warning(
+            "Library pipeline set status=error for item %s, "
+            "aborting collections handoff",
+            item_id,
+        )
+        return
+
     # Re-acquire processing state so reprocess sees us as busy during the
     # collections handoff window.  If we lose the CAS race, another pipeline
     # already claimed the item — abort cleanly (it will do its own handoff).

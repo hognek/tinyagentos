@@ -337,7 +337,7 @@ class YouTubeProcessor(Processor):
 
             transcript_meta = {
                 "char_count": len(content),
-                "language": "en",
+                "language": "en",  # TODO(#2059): support all languages, not just English
             }
             await self.store.add_artifact(
                 item_id, kind="transcript", path=str(transcript_path),
@@ -415,6 +415,8 @@ class WebProcessor(Processor):
         _MAX_WEB_BYTES = 10 * 1024 * 1024  # 10 MB
 
         current_url = source_url
+        resp_status_code: int = 0
+        resp_content_type: str = ""
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(30),
             follow_redirects=False,
@@ -430,6 +432,24 @@ class WebProcessor(Processor):
                         continue
 
                     resp.raise_for_status()
+
+                    # Gate on content-type: only process text/* responses.
+                    # Binary payloads (images, PDFs, videos, archives) must
+                    # not be downloaded and stored as text — they waste
+                    # storage and produce garbage for collections indexing.
+                    resp_content_type = (
+                        resp.headers.get("content-type", "")
+                    )
+                    resp_status_code = resp.status_code
+                    if resp_content_type:
+                        ct_main = resp_content_type.split(";")[0].strip()
+                        if not ct_main.startswith("text/"):
+                            logger.info(
+                                "WebProcessor: skipping non-text response "
+                                "for %s (content-type=%s)",
+                                source_url, resp_content_type,
+                            )
+                            return artifacts
 
                     # Read body with a size cap to avoid OOM.
                     body_chunks: list[bytes] = []
@@ -472,8 +492,8 @@ class WebProcessor(Processor):
         # Artifact: metadata
         page_meta = {
             "char_count": len(content),
-            "content_type": resp.headers.get("content-type", ""),
-            "status_code": resp.status_code,
+            "content_type": resp_content_type,
+            "status_code": resp_status_code,
         }
         await self.store.add_artifact(
             item_id, kind="metadata", path=source_url, meta=page_meta,
@@ -505,6 +525,9 @@ class WebProcessor(Processor):
             stored_meta = json.loads(item.get("meta_json", "{}"))
             stored_meta["preview"] = preview
             await self.store.update_item(item_id, meta_json=stored_meta)
+
+            # TODO(#2059): full-page screenshot artifact not yet implemented
+            # (spec asks for readability-style text extract + screenshot)
 
         return artifacts
 
@@ -642,6 +665,10 @@ async def run_pipeline(
     3. Run file + kind-specific processors
     4. Collect artifacts
     5. Mark item as 'ready' (or 'error')
+
+    TODO(#2059): explicit failure sub-states on the item card
+    (unavailable video, no transcript, geo-block) are not yet
+    surfaced — only a generic 'error' status is written.
     """
     item = await store.get_item(item_id)
     if not item:
