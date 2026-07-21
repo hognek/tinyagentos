@@ -31,6 +31,10 @@ LIBRARY_DIR_NAME = "library"
 # garbage-collected when request.app.state._background_tasks is absent.
 _background_tasks: set[asyncio.Task] = set()
 
+# Guard lazy LibraryStore init against concurrent requests.
+# Same pattern as _config_lock in tinyagentos/config.py.
+_store_init_lock = asyncio.Lock()
+
 
 def _track_background_task(coro) -> asyncio.Task:
     """Create a task, store it in ``_background_tasks``, and auto-discard on done."""
@@ -65,13 +69,16 @@ async def _get_library_store(request: Request):
     """Get the LibraryStore from app.state (lazily initialised)."""
     store = getattr(request.app.state, "library_store", None)
     if store is None:
-        from tinyagentos.library_store import LibraryStore
+        async with _store_init_lock:
+            store = getattr(request.app.state, "library_store", None)
+            if store is None:
+                from tinyagentos.library_store import LibraryStore
 
-        data_dir = getattr(request.app.state, "data_dir", None)
-        base = Path(data_dir) if data_dir else Path(__file__).parent.parent.parent / "data"
-        store = LibraryStore(base / "library.db")
-        await store.init()
-        request.app.state.library_store = store
+                data_dir = getattr(request.app.state, "data_dir", None)
+                base = Path(data_dir) if data_dir else Path(__file__).parent.parent.parent / "data"
+                store = LibraryStore(base / "library.db")
+                await store.init()
+                request.app.state.library_store = store
     return store
 
 
