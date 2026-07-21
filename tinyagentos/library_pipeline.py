@@ -120,10 +120,12 @@ class FileProcessor(Processor):
                 if mime_type:
                     file_meta["mime_type"] = mime_type
 
+                # path="" because storage_path is the user's original uploaded
+                # file — the reprocess unlink loop must never delete it.
                 await self.store.add_artifact(
-                    item_id, kind="metadata", path=storage_path, meta=file_meta
+                    item_id, kind="metadata", path="", meta=file_meta
                 )
-                artifacts.append({"kind": "metadata", "path": storage_path, "meta": file_meta})
+                artifacts.append({"kind": "metadata", "path": "", "meta": file_meta})
 
                 # Update item bytes
                 await self.store.update_item(item_id, bytes=stat.st_size)
@@ -248,9 +250,9 @@ class PdfProcessor(Processor):
                            exc_info=True)
 
         await self.store.add_artifact(
-            item_id, kind="metadata", path=storage_path, meta=pdf_meta
+            item_id, kind="metadata", path="", meta=pdf_meta
         )
-        artifacts.append({"kind": "metadata", "path": storage_path, "meta": pdf_meta})
+        artifacts.append({"kind": "metadata", "path": "", "meta": pdf_meta})
 
         return artifacts
 
@@ -310,9 +312,9 @@ class ImageProcessor(Processor):
                            exc_info=True)
 
         await self.store.add_artifact(
-            item_id, kind="metadata", path=storage_path, meta=img_meta
+            item_id, kind="metadata", path="", meta=img_meta
         )
-        artifacts.append({"kind": "metadata", "path": storage_path, "meta": img_meta})
+        artifacts.append({"kind": "metadata", "path": "", "meta": img_meta})
 
         return artifacts
 
@@ -373,7 +375,7 @@ async def run_pipeline(
         ref_meta = {
             "source_url": item["source_url"],
             "kind": kind,
-            "note": "Reference-only item — content not fetched (tracked in #2063)",
+            "note": "Reference-only item — content not fetched (TODO: WebFetcherProcessor)",
         }
         await store.add_artifact(
             item_id, kind="reference", path="", meta=ref_meta,

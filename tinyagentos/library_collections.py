@@ -112,9 +112,9 @@ async def handoff_to_collections(
         try:
             raw_bytes = src.read_bytes()
             dst.write_bytes(raw_bytes)
-            # Group-readable file perms
+            # Group-readable file perms (0o640 — setgid meaningless on files)
             try:
-                os.chmod(dst, stat.S_ISGID | stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
+                os.chmod(dst, stat.S_IRUSR | stat.S_IWUSR | stat.S_IRGRP)
             except OSError:
                 pass
         except OSError:
@@ -130,6 +130,18 @@ async def handoff_to_collections(
     if not taosmd_url:
         logger.debug("taosmd URL not provided — collection indexing skipped")
         return 0
+
+    # Parse item metadata once before the httpx try block so exception
+    # handlers (below) can merge into it without re-reading a stale item dict.
+    item_meta = json.loads(item.get("meta_json", "{}"))
+
+    async def _set_retryable() -> None:
+        """Persist collection_retryable so a future retry can re-attempt."""
+        try:
+            item_meta["collection_retryable"] = True
+            await store.update_item(item_id, meta_json=item_meta)
+        except Exception:
+            pass
 
     try:
         import httpx
@@ -150,11 +162,13 @@ async def handoff_to_collections(
             title = item.get("title", "Untitled") or "Untitled"
 
             collection_id = ""
-            item_meta = json.loads(item.get("meta_json", "{}"))
             existing_coll_id = item_meta.get("collection_id", "")
 
             if existing_coll_id:
-                # Verify the collection still exists
+                # Verify the collection still exists.
+                # 404 (genuinely gone) → fall through to create.
+                # Transient failure (5xx, timeout, connection error) → mark
+                # retryable and bail — must not create a duplicate.
                 try:
                     check_resp = await http_client.get(
                         f"{base_url}/collections/{existing_coll_id}",
@@ -166,12 +180,27 @@ async def handoff_to_collections(
                             "Reusing existing collection %s for item %s",
                             collection_id, item_id,
                         )
+                    elif check_resp.status_code == 404:
+                        logger.debug(
+                            "Existing collection %s not found (404) — "
+                            "will create replacement", existing_coll_id,
+                        )
+                    else:
+                        logger.warning(
+                            "taosmd GET /collections/%s returned %d — "
+                            "transient failure, marking retryable",
+                            existing_coll_id, check_resp.status_code,
+                        )
+                        await _set_retryable()
+                        return 0
                 except Exception:
                     logger.warning(
-                        "taosmd GET /collections/%s failed — cannot verify "
-                        "existing collection, falling through to create",
-                        existing_coll_id,
+                        "taosmd GET /collections/%s failed — "
+                        "transient failure, marking retryable",
+                        existing_coll_id, exc_info=True,
                     )
+                    await _set_retryable()
+                    return 0
 
             if not collection_id:
                 source_path = str(item_dir)
@@ -195,6 +224,7 @@ async def handoff_to_collections(
                         "taosmd POST /collections returned %d for item %s: %s",
                         create_resp.status_code, item_id, create_resp.text[:200],
                     )
+                    await _set_retryable()
                     return 0
                 # taosmd 0.4.0 nests the id under "collection"
                 collection_id = create_resp.json().get("collection", {}).get("id", "")
@@ -204,6 +234,7 @@ async def handoff_to_collections(
                         "taosmd POST /collections returned no collection.id for item %s",
                         item_id,
                     )
+                    await _set_retryable()
                     return 0
 
                 # Persist collection_id in item metadata for idempotent reprocess
@@ -221,12 +252,14 @@ async def handoff_to_collections(
                         "taosmd POST /collections/%s/index returned %d (expected 202)",
                         collection_id, index_resp.status_code,
                     )
+                    await _set_retryable()
                     return 0
             except Exception:
                 logger.warning(
                     "taosmd POST /collections/%s/index failed",
                     collection_id, exc_info=True,
                 )
+                await _set_retryable()
                 return 0
 
             # 3. Poll until indexing completes.
@@ -242,6 +275,7 @@ async def handoff_to_collections(
                             "taosmd GET /collections/%s returned %d during poll",
                             collection_id, poll_resp.status_code,
                         )
+                        await _set_retryable()
                         break
                     poll_data = poll_resp.json().get("collection", {})
                     status = poll_data.get("status", "")
@@ -266,6 +300,7 @@ async def handoff_to_collections(
                             "taosmd collection %s entered error state for item %s",
                             collection_id, item_id,
                         )
+                        await _set_retryable()
                         break
                     # Still indexing — wait and retry
                     await asyncio.sleep(_POLL_INTERVAL)
@@ -274,12 +309,14 @@ async def handoff_to_collections(
                         "taosmd poll GET /collections/%s failed",
                         collection_id, exc_info=True,
                     )
+                    await _set_retryable()
                     break
             else:
                 logger.warning(
                     "taosmd collection %s did not reach ready state within %d polls",
                     collection_id, _MAX_INDEX_POLLS,
                 )
+                await _set_retryable()
 
             # 4. Link the collection to the library item.
             try:
@@ -298,27 +335,23 @@ async def handoff_to_collections(
                     collection_id, item_id, exc_info=True,
                 )
 
+            # Clear retryable on success; the handoff completed.
+            if indexed > 0:
+                item_meta.pop("collection_retryable", None)
+                try:
+                    await store.update_item(item_id, meta_json=item_meta)
+                except Exception:
+                    pass
+
             return indexed
 
     except ImportError:
         logger.warning("httpx not available — collection indexing skipped")
-        try:
-            await store.update_item(item_id, meta_json={
-                **(json.loads(item.get("meta_json", "{}"))),
-                "collection_retryable": True,
-            })
-        except Exception:
-            pass
+        await _set_retryable()
     except Exception:
         logger.exception(
             "taosmd collections API unreachable for item %s", item_id,
         )
-        try:
-            await store.update_item(item_id, meta_json={
-                **(json.loads(item.get("meta_json", "{}"))),
-                "collection_retryable": True,
-            })
-        except Exception:
-            pass
+        await _set_retryable()
 
     return 0

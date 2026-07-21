@@ -318,12 +318,18 @@ async def reprocess_item(request: Request, item_id: str):
             {"error": "Item is currently being processed"}, status_code=409
         )
 
-    # Delete old artifacts so reprocess is idempotent
+    # Delete old artifacts so reprocess is idempotent.
+    # Guard: never unlink the user's original uploaded file (storage_path).
     storage_dir = _library_dir(request)
     old_artifacts = await store.get_artifacts(item_id)
+    item_storage_path = item.get("storage_path", "")
     for art in old_artifacts:
         art_path = art.get("path", "")
-        if art_path and (ap := Path(art_path)).exists():
+        if art_path and art_path == item_storage_path:
+            # This artifact records the source file — skip deletion.
+            logger.debug("Skipping unlink of source file %s for item %s",
+                         art_path, item_id)
+        elif art_path and (ap := Path(art_path)).exists():
             try:
                 ap.unlink()
             except OSError:
@@ -332,12 +338,20 @@ async def reprocess_item(request: Request, item_id: str):
         await store.delete_artifact(art["id"])
 
     # Status was already atomically set to pending by try_update_item_status above;
-    # re-queue the pipeline now.
-    task_set = getattr(request.app.state, "_background_tasks", None)
-    coro = _ingest_task(request.app, item_id, store, storage_dir)
-    if task_set is None:
-        _track_background_task(coro)
-    else:
-        _create_supervised_task(coro, task_set)
+    # re-queue the pipeline now.  If scheduling fails, roll back to ready so the
+    # item is not stuck pending forever.
+    try:
+        task_set = getattr(request.app.state, "_background_tasks", None)
+        coro = _ingest_task(request.app, item_id, store, storage_dir)
+        if task_set is None:
+            _track_background_task(coro)
+        else:
+            _create_supervised_task(coro, task_set)
+    except Exception:
+        logger.exception("Failed to schedule reprocess for item %s", item_id)
+        await store.update_item_status(item_id, "ready")
+        return JSONResponse(
+            {"error": "Failed to schedule reprocess"}, status_code=500,
+        )
 
     return JSONResponse({"item_id": item_id, "status": "reprocessing"}, status_code=202)

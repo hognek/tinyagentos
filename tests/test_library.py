@@ -670,14 +670,16 @@ class TestLibraryRoutes:
         assert resp.status_code == 202
         await asyncio.sleep(0.5)
 
-        # After first reprocess — old artifacts deleted, fresh ones created;
-        # count should be roughly the same, not doubled.
+        # After first reprocess — exact same artifact count, not doubled.
         resp = await client.get(f"/api/library/items/{item_id}")
         data = resp.json()
         after_first = len(data["artifacts"])
-        assert abs(after_first - initial_artifact_count) <= 2, (
-            f"Reprocess should not double artifacts: "
+        assert after_first == initial_artifact_count, (
+            f"Reprocess should not duplicate artifacts: "
             f"initial={initial_artifact_count} after_first={after_first}"
+        )
+        assert data["item"].get("status") == "ready", (
+            f"Item status should be ready after reprocess, got {data['item'].get('status')}"
         )
 
         # Second reprocess — should still work, no duplicates
