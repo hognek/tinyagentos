@@ -365,7 +365,7 @@ async def run_pipeline(
 
     # URL-only items (no storage_path) are stored as references — the pipeline
     # records a reference metadata artifact but does not fetch remote content
-    # (future: WebFetcherProcessor).  The item gets a "reference" artifact so it
+    # (future: WebFetcherProcessor, #2078).  The item gets a "reference" artifact so it
     # is not silently empty.
     if not item.get("storage_path") and item.get("source_url"):
         logger.info(

@@ -136,7 +136,12 @@ async def handoff_to_collections(
     item_meta = json.loads(item.get("meta_json", "{}"))
 
     async def _set_retryable() -> None:
-        """Persist collection_retryable so a future retry can re-attempt."""
+        """Persist collection_retryable so a future retry can re-attempt.
+
+        NOTE: collection_retryable currently has no consumer — it is scaffolding
+        for a future retry path. Clearing on success prevents stale markers
+        but no code path reads this flag yet.
+        """
         try:
             item_meta["collection_retryable"] = True
             await store.update_item(item_id, meta_json=item_meta)
