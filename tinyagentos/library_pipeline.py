@@ -7,6 +7,7 @@ that are stored on the item and optionally handed off to taosmd collections.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import mimetypes
@@ -286,7 +287,10 @@ class YouTubeProcessor(Processor):
         )
 
         media_dir = self.storage_dir / "youtube"
-        result = await fetch(source_url, media_dir=media_dir)
+        result = await asyncio.wait_for(
+            fetch(source_url, media_dir=media_dir),
+            timeout=120,  # yt-dlp can hang on network stalls / large channels
+        )
 
         title = result.get("title", "")
         if title and not item.get("title"):
@@ -415,6 +419,7 @@ class WebProcessor(Processor):
             timeout=httpx.Timeout(30),
             follow_redirects=False,
         ) as client:
+            html = ""
             for _hop in range(_MAX_WEB_REDIRECTS + 1):
                 validate_url_or_raise(current_url)
                 async with client.stream("GET", current_url) as resp:
@@ -423,28 +428,28 @@ class WebProcessor(Processor):
                             current_url, resp.headers["location"],
                         )
                         continue
+
+                    resp.raise_for_status()
+
+                    # Read body with a size cap to avoid OOM.
+                    body_chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.aiter_bytes(8192):
+                        total += len(chunk)
+                        if total > _MAX_WEB_BYTES:
+                            raise ValueError(
+                                f"Response body exceeds {_MAX_WEB_BYTES} "
+                                f"bytes for {source_url!r}"
+                            )
+                        body_chunks.append(chunk)
+                    html = b"".join(body_chunks).decode(
+                        resp.encoding or "utf-8", errors="replace",
+                    )
                     break
             else:
                 raise SsrfBlockedError(
                     f"too many redirects fetching {source_url!r}"
                 )
-
-            resp.raise_for_status()
-
-            # Read body with a size cap to avoid OOM on large/hostile pages.
-            body_chunks: list[bytes] = []
-            total = 0
-            async for chunk in resp.aiter_bytes(8192):
-                total += len(chunk)
-                if total > _MAX_WEB_BYTES:
-                    raise ValueError(
-                        f"Response body exceeds {_MAX_WEB_BYTES} bytes "
-                        f"for {source_url!r}"
-                    )
-                body_chunks.append(chunk)
-            html = b"".join(body_chunks).decode(
-                resp.encoding or "utf-8", errors="replace"
-            )
 
         if not html:
             return artifacts

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -341,7 +341,7 @@ class TestImageProcessor:
         assert "metadata" in kinds
         assert "thumbnail" in kinds
 
-        thumb_art = [a for a in artifacts if a["kind"] == "thumbnail"][0]
+        thumb_art = next(a for a in artifacts if a["kind"] == "thumbnail")
         assert Path(thumb_art["path"]).exists()
 
     @pytest.mark.asyncio
@@ -706,7 +706,6 @@ class TestCollectionsHandoff:
     @pytest.mark.asyncio
     async def test_handoff_with_qmd(self, lib_store, storage_dir):
         """Handoff indexes into taosmd when the API is reachable."""
-        from unittest.mock import AsyncMock, patch
 
         file_path = storage_dir / "notes.txt"
         file_path.write_text("hello from library")
@@ -724,7 +723,6 @@ class TestCollectionsHandoff:
         taosmd_token = "test-admin-token"
 
         # Mock httpx.AsyncClient to simulate a working taosmd
-        from unittest.mock import AsyncMock, MagicMock
 
         mock_client = MagicMock()
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
@@ -882,12 +880,12 @@ class TestLibraryRoutes:
 
     # -- Auth: all endpoints require a session (CSRF is bypassed in tests, but
     #    unauthenticated requests still hit the global auth middleware).  Test
-    #    that the 6 new endpoints return 401 when no session cookie/header is
+    #    that the 5 library endpoints return 401 when no session cookie/header is
     #    present.
 
     @pytest.mark.asyncio
     async def test_unauth_library_endpoints(self, app):
-        """All 6 library endpoints return 401 without authentication."""
+        """All 5 library endpoints return 401 without authentication."""
         from httpx import ASGITransport, AsyncClient
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as unauth_client:
@@ -924,9 +922,16 @@ class TestLibraryRoutes:
         assert resp.status_code == 202
         item_id = resp.json()["item_id"]
 
-        # Wait for pipeline to finish (background task)
+        # Wait for pipeline to finish (background task) — poll status, not a fixed sleep
         import asyncio
-        await asyncio.sleep(0.5)
+        for _ in range(50):  # up to 5 s
+            resp = await client.get(f"/api/library/items/{item_id}")
+            status = resp.json()["item"].get("status")
+            if status in ("ready", "error"):
+                break
+            await asyncio.sleep(0.1)
+        else:
+            pytest.fail("Pipeline did not finish within 5 s")
 
         # Check initial artifact count
         resp = await client.get(f"/api/library/items/{item_id}")
@@ -937,7 +942,15 @@ class TestLibraryRoutes:
         # First reprocess
         resp = await client.post(f"/api/library/items/{item_id}/reprocess")
         assert resp.status_code == 202
-        await asyncio.sleep(0.5)
+        # Poll until reprocess finishes
+        for _ in range(50):  # up to 5 s
+            resp = await client.get(f"/api/library/items/{item_id}")
+            status = resp.json()["item"].get("status")
+            if status in ("ready", "error"):
+                break
+            await asyncio.sleep(0.1)
+        else:
+            pytest.fail("Reprocess did not finish within 5 s")
 
         # After first reprocess — exact same artifact count, not doubled.
         resp = await client.get(f"/api/library/items/{item_id}")
@@ -967,7 +980,15 @@ class TestLibraryRoutes:
         )
         assert resp.status_code == 202
         item_id = resp.json()["item_id"]
-        await asyncio.sleep(0.5)
+        # Poll until pipeline finishes — not a fixed sleep
+        for _ in range(50):  # up to 5 s
+            resp = await client.get(f"/api/library/items/{item_id}")
+            status = resp.json()["item"].get("status")
+            if status in ("ready", "error"):
+                break
+            await asyncio.sleep(0.1)
+        else:
+            pytest.fail("Pipeline did not finish within 5 s")
 
         # Force status to "processing" to simulate an in-flight pipeline
         store = app.state.library_store

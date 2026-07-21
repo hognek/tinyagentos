@@ -178,6 +178,14 @@ async def _ingest_task(app, item_id: str, store, storage_dir: Path) -> None:
         await store.update_item_status(item_id, "error")
         return
 
+    # Re-acquire processing state so reprocess sees us as busy during the
+    # collections handoff window.  If we lose the CAS race, another pipeline
+    # already claimed the item — abort cleanly (it will do its own handoff).
+    if not await store.try_update_item_status(
+        item_id, "processing", if_not_in=("pending", "processing")
+    ):
+        return
+
     # Collections handoff after successful pipeline
     try:
         collections_dir = storage_dir.parent / "collections"
@@ -205,8 +213,10 @@ async def _ingest_task(app, item_id: str, store, storage_dir: Path) -> None:
                 "(no text artifacts or taosmd unavailable)",
                 item_id,
             )
+        await store.update_item_status(item_id, "ready")
     except Exception:
         logger.exception("Collections handoff failed for item %s", item_id)
+        await store.update_item_status(item_id, "error")
 
 
 def _sanitise_filename(name: str) -> str:
@@ -345,8 +355,8 @@ async def reprocess_item(request: Request, item_id: str):
         await store.delete_artifact(art["id"])
 
     # Status was already atomically set to pending by try_update_item_status above;
-    # re-queue the pipeline now.  If scheduling fails, roll back to ready so the
-    # item is not stuck pending forever.
+    # re-queue the pipeline now.  If scheduling fails, mark as error — artifacts
+    # were already deleted so rolling back to ready would leave a data-less item.
     try:
         task_set = getattr(request.app.state, "_background_tasks", None)
         coro = _ingest_task(request.app, item_id, store, storage_dir)
@@ -356,7 +366,7 @@ async def reprocess_item(request: Request, item_id: str):
             _create_supervised_task(coro, task_set)
     except Exception:
         logger.exception("Failed to schedule reprocess for item %s", item_id)
-        await store.update_item_status(item_id, "ready")
+        await store.update_item_status(item_id, "error")
         return JSONResponse(
             {"error": "Failed to schedule reprocess"}, status_code=500,
         )

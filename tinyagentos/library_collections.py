@@ -325,11 +325,12 @@ async def handoff_to_collections(
 
             # 4. Link the collection to the library item.
             try:
-                await http_client.post(
+                link_resp = await http_client.post(
                     f"{base_url}/collections/{collection_id}/link",
                     json={"type": "taos", "id": item_id},
                     headers=auth_headers,
                 )
+                link_resp.raise_for_status()
                 logger.debug(
                     "Linked collection %s to library item %s",
                     collection_id, item_id,
