@@ -709,9 +709,19 @@ async def revoke_invite(
     row = await store.get(invite_id)
     if row is None or row.get("project_id") != project_id:
         return JSONResponse({"error": "invite not found"}, status_code=404)
+    status = row.get("status")
+    if status in ("redeemed", "revoked"):
+        return JSONResponse({"error": f"invite already {status}"}, status_code=409)
+    # 'claimed' is the transient mid-redeem state. Revoking it would race the
+    # redeem, so refuse with a message that names the state rather than the
+    # generic retry text.
+    if status == "claimed":
+        return JSONResponse(
+            {"error": "invite is mid-redeem, retry once it settles"}, status_code=409
+        )
     ok = await store.revoke(invite_id)
     if not ok:
-        return JSONResponse({"error": "invite not found or already redeemed"}, status_code=404)
+        return JSONResponse({"error": "invite state changed, retry"}, status_code=409)
     return JSONResponse(content=None, status_code=204)
 
 
