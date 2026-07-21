@@ -139,6 +139,37 @@ async def test_revoke_nonexistent_returns_404(client, app):
     assert resp.status_code == 404, resp.text
 
 
+@pytest.mark.asyncio
+async def test_revoke_expired_returns_204(client, app):
+    pid = await _create_project(client)
+    mint_resp = await client.post(
+        f"/api/projects/{pid}/invites",
+        json={"scopes": [], "approval_mode": "auto"},
+    )
+    iid = mint_resp.json()["invite_id"]
+    store = app.state.project_invites
+    await store._db.execute(
+        "UPDATE project_invites SET expires_ts = 1 WHERE invite_id = ?", (iid,)
+    )
+    await store._db.commit()
+    resp = await client.delete(f"/api/projects/{pid}/invites/{iid}")
+    assert resp.status_code == 204, resp.text
+
+
+@pytest.mark.asyncio
+async def test_revoke_already_revoked_returns_409(client, app):
+    pid = await _create_project(client)
+    mint_resp = await client.post(
+        f"/api/projects/{pid}/invites",
+        json={"scopes": [], "approval_mode": "auto"},
+    )
+    iid = mint_resp.json()["invite_id"]
+    first = await client.delete(f"/api/projects/{pid}/invites/{iid}")
+    assert first.status_code == 204, first.text
+    second = await client.delete(f"/api/projects/{pid}/invites/{iid}")
+    assert second.status_code == 409, second.text
+
+
 # ---------------------------------------------------------------------------
 # Redeem slice (S2): auto + manual approval, handle derivation, bundle, errors
 # ---------------------------------------------------------------------------
@@ -585,3 +616,71 @@ async def test_guide_markdown_contains_required_instructions(client, app, monkey
     # Timed-check instruction mentions the interval value.
     assert "1800" in guide
 
+
+
+@pytest.mark.asyncio
+async def test_mint_default_ttl_is_one_hour(client, app):
+    pid = await _create_project(client)
+    before = time.time()
+    resp = await client.post(
+        f"/api/projects/{pid}/invites",
+        json={"scopes": [], "approval_mode": "auto"},
+    )
+    assert resp.status_code == 200, resp.text
+    ttl = resp.json()["expires_ts"] - before
+    assert 3500 < ttl <= 3610
+
+
+@pytest.mark.asyncio
+async def test_mint_honours_ttl_secs(client, app):
+    pid = await _create_project(client)
+    before = time.time()
+    resp = await client.post(
+        f"/api/projects/{pid}/invites",
+        json={"scopes": [], "approval_mode": "auto", "ttl_secs": 86400},
+    )
+    assert resp.status_code == 200, resp.text
+    ttl = resp.json()["expires_ts"] - before
+    assert 86300 < ttl <= 86410
+
+
+@pytest.mark.asyncio
+async def test_mint_rejects_ttl_over_cap(client, app):
+    pid = await _create_project(client)
+    resp = await client.post(
+        f"/api/projects/{pid}/invites",
+        json={"scopes": [], "approval_mode": "auto", "ttl_secs": 999999},
+    )
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+async def test_revoke_redeemed_returns_409(client, app):
+    pid = await _create_project(client)
+    mint_resp = await client.post(
+        f"/api/projects/{pid}/invites",
+        json={"scopes": [], "approval_mode": "auto"},
+    )
+    body = mint_resp.json()
+    store = app.state.project_invites
+    await store.redeem(body["invite_id"], body["pin"])
+    resp = await client.delete(f"/api/projects/{pid}/invites/{body['invite_id']}")
+    assert resp.status_code == 409, resp.text
+
+
+@pytest.mark.asyncio
+async def test_revoke_claimed_returns_409_with_mid_redeem_message(client, app):
+    pid = await _create_project(client)
+    mint_resp = await client.post(
+        f"/api/projects/{pid}/invites",
+        json={"scopes": [], "approval_mode": "auto"},
+    )
+    iid = mint_resp.json()["invite_id"]
+    store = app.state.project_invites
+    await store._db.execute(
+        "UPDATE project_invites SET status = 'claimed' WHERE invite_id = ?", (iid,)
+    )
+    await store._db.commit()
+    resp = await client.delete(f"/api/projects/{pid}/invites/{iid}")
+    assert resp.status_code == 409, resp.text
+    assert "mid-redeem" in resp.json()["error"]

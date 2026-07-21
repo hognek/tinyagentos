@@ -408,6 +408,9 @@ def register_all_routers(app):
     from tinyagentos.routes.receipts import router as receipts_router
     app.include_router(receipts_router, dependencies=_csrf)
 
+    from tinyagentos.routes.library import router as library_router
+    app.include_router(library_router, dependencies=_csrf)
+
     from tinyagentos.routes import wallhaven as wallhaven_routes
     app.include_router(wallhaven_routes.router, dependencies=_csrf)
 
