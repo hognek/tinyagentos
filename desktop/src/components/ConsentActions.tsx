@@ -137,8 +137,13 @@ export function ConsentActions({
       setBusy(false);
       return;
     }
+    if (source === "agent_scope_requests" && !canonicalId) {
+      setError("Missing agent identifier; cannot process this scope request.");
+      setBusy(false);
+      return;
+    }
     const baseUrl = source === "agent_scope_requests"
-      ? `/api/agents/registry/${encodeURIComponent(canonicalId ?? requestId)}/scope-requests/${encodeURIComponent(requestId)}`
+      ? `/api/agents/registry/${encodeURIComponent(canonicalId!)}/scope-requests/${encodeURIComponent(requestId)}`
       : `/api/agents/auth-requests/${encodeURIComponent(requestId)}`;
     const url = `${baseUrl}/${approved ? "approve" : "deny"}`;
     let body: string | undefined;
