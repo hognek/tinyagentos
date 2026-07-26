@@ -77,8 +77,16 @@ export function installAuthGuard(): void {
         if (CSRF_MUTATING.has(method) && isSameOrigin(input.url)) {
           const token = getCsrfToken();
           if (token) {
-            const baseHeaders = init?.headers || input.headers;
-            const headers = new Headers(baseHeaders);
+            // Merge BOTH sources rather than picking one. `init?.headers ||
+            // input.headers` silently discarded the Request's own headers
+            // whenever init also carried headers, so
+            //   fetch(new Request(url, {headers: {Authorization}}), {method, headers})
+            // lost the Authorization header entirely. init wins on conflict,
+            // matching how fetch itself resolves the two.
+            const headers = new Headers(input.headers);
+            if (init?.headers) {
+              new Headers(init.headers).forEach((v, k) => headers.set(k, v));
+            }
             if (!headers.has("X-CSRF-Token")) {
               headers.set("X-CSRF-Token", token);
               effectiveInit = { ...init, headers };
