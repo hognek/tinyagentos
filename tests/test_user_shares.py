@@ -170,6 +170,34 @@ class TestShareRoutes:
         assert resp.status_code == 400
         assert "yourself" in resp.json()["detail"]
 
+    async def test_create_share_invalid_resource_type_returns_422(self, shares_client):
+        """POST with an unsupported resource_type returns 422."""
+        resp = await shares_client.post(
+            "/api/shares",
+            json={
+                "resource_type": "bogus_type",
+                "resource_id": "proj-422-rt",
+                "to_username": "target",
+                "permission": "read",
+            },
+        )
+        assert resp.status_code == 422
+        assert "invalid resource_type" in resp.json()["detail"]
+
+    async def test_create_share_invalid_permission_returns_422(self, shares_client):
+        """POST with an unsupported permission returns 422."""
+        resp = await shares_client.post(
+            "/api/shares",
+            json={
+                "resource_type": "project",
+                "resource_id": "proj-422-perm",
+                "to_username": "target",
+                "permission": "bogus_perm",
+            },
+        )
+        assert resp.status_code == 422
+        assert "invalid permission" in resp.json()["detail"]
+
     # -- Accept ----------------------------------------------------------
 
     async def test_accept_share_target_user(self, shares_client, shares_client_target):

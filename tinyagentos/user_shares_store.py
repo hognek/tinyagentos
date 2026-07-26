@@ -126,6 +126,14 @@ class UserSharesStore(BaseStore):
             ).fetchone()
 
             # Remove any existing row for the exact key first.
+            #
+            # NOTE: The DELETE+INSERT mints a new ``id`` on every
+            # idempotent re-share.  Any Decision or notification that
+            # referenced the old ``id`` becomes an orphan.  Switching to
+            # an UPDATE-in-place when the key already exists would keep
+            # the id stable, but the current delete+insert is simpler and
+            # matches the agent_grants_store add_share pattern.  Full
+            # UPDATE-in-place id stability is deferred.
             await self._db.execute(
                 "DELETE FROM user_shares "
                 "WHERE owner_user_id = ? AND resource_type = ? AND resource_id = ? "
@@ -200,6 +208,11 @@ class UserSharesStore(BaseStore):
         if self._db is None:
             raise RuntimeError("UserSharesStore not initialised")
         now = datetime.now(timezone.utc).isoformat()
+        # Lexicographic ISO-8601 comparison is safe here because both
+        # ``now`` and any caller-set ``expires_at`` are UTC-normalised
+        # (datetime.now(timezone.utc).isoformat() produces a consistent
+        # UTC Z-suffixed string).  See ``add_share`` docstring for the
+        # UTC contract.
         cursor = await self._db.execute(
             "SELECT * FROM user_shares "
             "WHERE expires_at IS NULL OR expires_at > ? "

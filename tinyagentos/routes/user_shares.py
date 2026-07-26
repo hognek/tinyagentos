@@ -163,11 +163,23 @@ async def create_share(
                 },
             )
         except Exception:
-            pass
+            logger.warning(
+                "user_shares: notification for share %s failed",
+                record["id"],
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Consent wiring — Decision record for the target user's Decisions
     # inbox so desktop consent actions (approve/deny) can act on it.
+    #
+    # NOTE: The Decision created here is intentionally NOT resolved by
+    # accept_share/deny_share/revoke_share.  This mirrors the consent
+    # pattern in agent_auth_requests.py, where the Decision is an inbox
+    # notification that a pending consent action exists — the API
+    # accept/deny endpoints update the share directly.  Full Decision
+    # lifecycle resolution (linking the Decision id back to the share
+    # and resolving it on consent) is deferred to a future pass.
     # ------------------------------------------------------------------
     decision_store = getattr(request.app.state, "decision_store", None)
     if decision_store is not None:
@@ -190,7 +202,11 @@ async def create_share(
                 },
             )
         except Exception:
-            pass
+            logger.warning(
+                "user_shares: decision for share %s failed",
+                record["id"],
+                exc_info=True,
+            )
 
     return record
 
