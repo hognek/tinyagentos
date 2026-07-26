@@ -42,14 +42,20 @@ _AGENT_TOKEN_PATHS = _REGISTRY_FEED_PATHS | _A2A_BUS_READ_PATHS | _A2A_BUS_WRITE
 # paths (/api/projects/{pid}/tasks...), so an exact frozenset can't match them;
 # a (method, compiled-regex) allowlist is used instead.  Each pattern is fully
 # anchored and uses a slash-free segment ([^/]+) with an exact segment count, so
-# sibling routes that must stay session-only -- POST .../tasks (create),
-# /members, /relationships, /audit, /activity, project lifecycle -- never match.
+# sibling routes that must stay session-only -- /members, /relationships,
+# /audit, /activity, project lifecycle -- never match. POST .../tasks IS
+# reachable, but only with project_tasks_create, never with project_tasks.
 # This is the project-scoped analogue of the exact _AGENT_TOKEN_PATHS contract:
 # the token only reaches the handler, which then verifies the JWT + grant +
 # project binding.  Anything not listed here is NOT reachable by a registry JWT.
 _SEG = r"[^/]+"
 _AGENT_TASK_ROUTES = (
     ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks$")),
+    # Task CREATION, gated by the SEPARATE project_tasks_create scope (not
+    # project_tasks, which stays read + lifecycle + comments per Invariant 2+5).
+    # Reaching the handler is not authorisation: it then verifies the JWT, the
+    # project binding, and that narrower scope.
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks/ready$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}$")),
     ("GET", re.compile(rf"^/api/projects/tasks/{_SEG}/context$")),
@@ -80,6 +86,33 @@ _AGENT_CANVAS_ROUTES = (
 # session-only. The route verifies the JWT + grant + project binding.
 _AGENT_DECISIONS_ROUTES = (
     ("POST", re.compile(r"^/api/decisions$")),
+)
+
+# Project-files routes a files_read / files_write token may reach. Reads
+# (list/watch/get/trash-list/stats) require a files_read grant; writes
+# (upload/mkdir/delete/restore/purge/empty) require files_write. The route
+# verifies the JWT + grant + project binding (slug resolves to the project).
+_AGENT_FILES_ROUTES = (
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/files$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/files/watch$")),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/files/upload$")),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/mkdir$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/files/.+$")),
+    ("DELETE", re.compile(rf"^/api/projects/{_SEG}/files/.+$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/trash$")),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/trash/{_SEG}/restore$")),
+    ("DELETE", re.compile(rf"^/api/projects/{_SEG}/trash/{_SEG}$")),
+    ("DELETE", re.compile(rf"^/api/projects/{_SEG}/trash$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/stats$")),
+)
+
+# Scope-request CREATE an agent may reach with its own registry JWT to ask for
+# MORE scopes on its own identity. Only the create endpoint; the approve/deny
+# subactions have extra path segments and are NOT matched here, so they stay
+# owner/admin session-only. The route verifies the JWT identity == the path
+# canonical_id (an agent may only self-request).
+_AGENT_SCOPE_REQUEST_ROUTES = (
+    ("POST", re.compile(rf"^/api/agents/registry/{_SEG}/scope-requests$")),
 )
 
 
@@ -121,6 +154,21 @@ def _is_agent_decisions_path(method: str, path: str) -> bool:
     """True only for POST /api/decisions, which a decisions_write-bound agent
     token may reach.  The route verifies the JWT + grant."""
     return any(m == method and rx.match(path) for m, rx in _AGENT_DECISIONS_ROUTES)
+
+
+def _is_agent_files_path(method: str, path: str) -> bool:
+    """True only for the project-files routes a files_read / files_write token
+    may reach.  Strict method + anchored-regex match; the route verifies the
+    JWT + grant + project binding."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_FILES_ROUTES)
+
+
+def _is_agent_scope_request_path(method: str, path: str) -> bool:
+    """True only for POST /api/agents/registry/{cid}/scope-requests, which an
+    agent may reach with its own registry JWT to self-request more scopes. The
+    route verifies the JWT identity == canonical_id; approve/deny are excluded
+    (extra path segments) and stay owner/admin session-only."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_SCOPE_REQUEST_ROUTES)
 # Bundle assets and the SPA shell HTML must be reachable without auth so:
 #   1. The browser can install and cache the shell for offline / PWA use.
 #   2. After a backend restart the cached shell loads immediately without
@@ -364,6 +412,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
             or _is_agent_doc_review_path(request.method, path)
             or _is_agent_canvas_path(request.method, path)
             or _is_agent_decisions_path(request.method, path)
+            or _is_agent_files_path(request.method, path)
+            or _is_agent_scope_request_path(request.method, path)
         ) and auth_header.lower().startswith("bearer "):
             request.state.user_id = None
             request.state.is_admin = False

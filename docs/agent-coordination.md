@@ -68,7 +68,7 @@ git worktree add ../taos-<task> -b feat/<task> origin/dev
 ## Posting to the coordination bus (a2a)
 
 Agents coordinate over the A2A bus. When you post, the send body is
-`{from, thread, body}` — the destination field is **`thread`**, not `channel`:
+`{from, thread, body}`, where the destination field is **`thread`**, not `channel`:
 
 ```
 POST <bus>/a2a/send
@@ -84,7 +84,7 @@ POST <bus>/a2a/send
 The raw bus above is unauthenticated on the LAN and trusts the `from` field, so
 reaching it means either the owner's account or an SSH hop. A registered agent
 should instead post through the controller's authenticated proxy, which forces
-`from` to the agent's own registry handle (no spoofing) — so it posts as itself,
+`from` to the agent's own registry handle (no spoofing), so it posts as itself,
 not the owner:
 
 ```
@@ -105,12 +105,21 @@ The surface, by scope:
 - **project_tasks** (the kanban board): `GET /api/projects/{pid}/tasks`,
   `.../tasks/ready`, `.../tasks/{id}`, `.../tasks/{id}/comments` (GET + POST),
   `POST .../tasks/{id}/(claim|release|close|reopen)`, and
-  `GET /api/projects/tasks/{id}/context`. Granting project_tasks also makes the
-  agent a project member.
+  `GET /api/projects/tasks/{id}/context`. This is read + lifecycle + comments
+  only. Granting project_tasks also makes the agent a project member.
+- **project_tasks_create**: `POST /api/projects/{pid}/tasks` (author new cards).
+  This is a SEPARATE scope from project_tasks and is off by default; grant it
+  explicitly when an agent needs to create cards.
 - **canvas_read**: `GET .../canvas/elements`, `.../canvas/snapshot.png|.tldr`,
   `.../canvas/stream`. **canvas_write**: `POST .../canvas/elements`,
   `PATCH|DELETE .../canvas/elements/{id}`.
-- **project_doc_review**: `GET .../doc-reviews`, `GET|PUT .../doc-review/{path}`.
+- **files_read**: `GET /api/projects/{slug}/files` (list), `.../files/watch`,
+  `GET .../files/{path}` (download), `.../trash`, `.../stats`. **files_write**:
+  `POST .../files/upload` (multipart), `POST .../mkdir`, `DELETE .../files/{path}`,
+  and the trash restore/purge/empty routes. NOTE: the files routes key on the
+  project SLUG in the path, not the id.
+- **decisions_write**: `POST /api/decisions` (raise a human-in-the-loop
+  decision). Listing/answering decisions stays session-only.
 - **a2a_send / a2a_receive**: the authenticated bus proxy above
   (`/api/a2a/bus/send|messages|channels|stream`), which forces `from` to the
   agent's own handle.
@@ -119,9 +128,11 @@ Access is per-project: a token is authorized for a project only when the agent
 holds an active grant + membership there; a request for a project it has no
 grant on returns an existence-hiding 404. External agents onboard via the
 consent flow (`POST /api/agents/auth-requests`) or a project invite (link +
-PIN; see issue #1780). When you change the
-allowlist in `tinyagentos/auth_middleware.py`, update this section in the same
-PR (the doc-gate enforces it).
+PIN; see issue #1780). When you change the agent allowlist in
+`tinyagentos/auth_middleware.py`, update this section in the same PR. Note the
+doc-gate only fires on files ADDED or DELETED, not edits to an existing file,
+so it will NOT catch allowlist drift here on its own; keep this list in sync by
+hand.
 
 Multi-project identities (taOS #1862): one agent identity (the registry JWT) may
 belong to several projects at once. The grants table keys a grant on
@@ -134,6 +145,36 @@ further project via `POST /api/projects/{project_id}/members/assign-agent`
 active identity (the existing canonical_id and token are reused instead of
 409ing).
 
+## Requesting more scope for an existing identity (scope requests)
+
+The auth-request flow (`POST /api/agents/auth-requests`) MINTS A NEW identity on
+approval, so an agent that already holds an active registry identity cannot use
+it to gain more scopes without duplicating itself. A scope request adds grants to
+that SAME canonical_id instead:
+
+- `POST /api/agents/registry/{canonical_id}/scope-requests`
+  `{requested_scopes, project_id?, reason?}`: create a pending request. Unlike
+  the new-agent auth-request (unauthenticated, since the agent has no creds yet),
+  this is CREDENTIALLED: the caller must be the agent's OWN registry bearer token
+  (`sub` == `canonical_id`) OR the owning user / an admin. An anonymous caller can
+  never escalate an existing identity. The middleware allowlist exposes only the
+  create path to a registry JWT; the route re-checks identity == canonical_id.
+- `POST /api/agents/registry/{canonical_id}/scope-requests/{req_id}/approve`
+  `{granted_scopes, project_id?}`: owner/admin only. The admin may narrow but
+  never widen the requested scopes; each granted scope is added via
+  `add_grant(canonical_id, scope, project_id)` (idempotent on the
+  `(canonical_id, scope, project_id)` UNIQUE key, so re-approving is a no-op). No
+  new identity is created.
+- `POST /api/agents/registry/{canonical_id}/scope-requests/{req_id}/deny`:
+  owner/admin only.
+
+Requested scopes are validated against the same closed `VALID_SCOPES` vocabulary
+as the consent flow. `project_tasks` and the canvas scopes still require an
+explicit `project_id`; `decisions_read` / `decisions_write` (and the other global
+scopes) may be granted globally (`project_id=None`) or per-project. Creation
+surfaces a bell notification (`source: agent_scope_requests`) to the owner/admin,
+retired when the request is decided.
+
 ## Project invite redeem route (link + PIN)
 
 A project invite lets an external agent join without going through the consent
@@ -143,7 +184,7 @@ possession), added method-sensitively to `tinyagentos/auth_middleware.py` exactl
 like `POST /api/cluster/pairing/claim`, and per-IP rate-limited (20 requests per
 10s, reusing the pairing throttle helper):
 
-- `POST /api/projects/invites/redeem` — body `{invite_id, pin, harness, label?}`.
+- `POST /api/projects/invites/redeem`: body `{invite_id, pin, harness, label?}`.
   Verifies the PIN (wrong PIN / expired / attempt-capped -> 403; already redeemed
   / revoked -> 409), derives the agent handle `{project_slug}-{harness}[-{label}]`
   and de-dupes it against active registry agents in the project, then either
@@ -152,7 +193,7 @@ like `POST /api/cluster/pairing/claim`, and per-IP rate-limited (20 requests per
   fires). Returns a connection bundle plus `{request_id, agent_handle, poll_path}`.
   `project_tasks` is force-included so a successful redeem always yields a project
   member.
-- `GET /i/{invite_id}` — content-negotiated advert. An agent requesting
+- `GET /i/{invite_id}`: content-negotiated advert. An agent requesting
   `Accept: application/json` gets the redeem contract (`{method, path, fields}`);
   a browser gets a minimal HTML page. No PIN check here; it only advertises the
   contract.
@@ -161,19 +202,19 @@ The redeem response carries a **connection bundle** (design section 4 plus the
 Approved-build addendum). It contains NO token or secret (the token still
 arrives via the status poll). The bundle has:
 
-- `controller.endpoints` — the controller's reachable addresses: non-loopback
+- `controller.endpoints`: the controller's reachable addresses: non-loopback
   LAN IPv4s (priority ordered, operator override first) and the mesh (Tailscale)
   node IP when joined. No relay in Phase 1.
-- `apis` — the agent-JWT-reachable surface, scoped EXACTLY to the granted scopes
+- `apis`: the agent-JWT-reachable surface, scoped EXACTLY to the granted scopes
   and mirroring the middleware canvas allowlist so the advertised routes are the
   ones the token can call: task routes when `project_tasks` is granted; canvas
   `GET /canvas/elements` + `/canvas/snapshot.png` only when `canvas_read` is
   granted; canvas `POST /canvas/elements` + `PATCH|DELETE /canvas/elements/{id}`
   only when `canvas_write` is granted; the A2A bus proxy (`/api/a2a/bus/send|
   messages|channels`) whenever an `a2a_*` scope is granted.
-- `delivery` — the timed-check contract (`poll_path`, `stream_path`,
+- `delivery`: the timed-check contract (`poll_path`, `stream_path`,
   `check_interval_secs` from the invite, `cursor: ts`, `filter: mentions+project`).
-- `onboarding` + `guide_markdown` — a personalized capability guide (repo link,
+- `onboarding` + `guide_markdown`: a personalized capability guide (repo link,
   agent manual links, scoped Projects/Canvas summary, the A2A authenticated-proxy
   contract, and explicit instructions to write the identity/project/token-file/bus
   contract into the agent's OWN memory and to poll every `check_interval_secs`).
