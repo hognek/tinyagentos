@@ -88,7 +88,9 @@ class ClusterManager:
             except asyncio.CancelledError:
                 pass
 
-    async def register_worker(self, info: WorkerInfo) -> None:
+    async def register_worker(
+        self, info: WorkerInfo, generation: int | None = None
+    ) -> None:
         # Snapshot capabilities before adding worker
         caps_before = set()
         if self._capabilities:
@@ -96,6 +98,16 @@ class ClusterManager:
 
         is_first_time = info.name not in self._ever_seen
         self._ever_seen.add(info.name)
+
+        # taOS #640: split-brain protection — reject registration from a
+        # worker that echoes a different generation (another active controller).
+        # Legacy workers that don't send generation get a pass (None).
+        if generation is not None and generation != self._generation:
+            logger.warning(
+                "Registration from '%s' rejected: generation %s != controller %s",
+                info.name, generation, self._generation,
+            )
+            return
 
         prev_status = self._workers[info.name].status if info.name in self._workers else None
 
@@ -106,6 +118,8 @@ class ClusterManager:
         logger.info(f"Worker registered: {info.name} ({info.platform}, {len(info.capabilities)} capabilities)")
 
         # taOS #640: persist worker to SQLite so the registry survives restarts.
+        # Generation is checked at the top of this method — if the worker echoes
+        # a stale generation, the registration is rejected before we reach here.
         if self._registry_store is not None:
             try:
                 await self._persist_worker(info)
@@ -274,6 +288,12 @@ class ClusterManager:
                 name, generation, self._generation,
             )
             return False
+        if generation is None and self._generation > 1:
+            logger.debug(
+                "Heartbeat from '%s' accepted without generation "
+                "(controller gen %d) — legacy worker or not-yet-upgraded",
+                name, self._generation,
+            )
         prev_status = worker.status
         worker.last_heartbeat = time.time()
         worker.load = load
@@ -387,10 +407,16 @@ class ClusterManager:
                 pass
         # taOS #640: persist updated worker state to SQLite.
         if self._registry_store is not None:
+            async def _safe_persist() -> None:
+                try:
+                    await self._persist_worker(worker)
+                except Exception:
+                    logger.exception("Failed to persist worker '%s'", worker.name)
+
             try:
-                asyncio.get_running_loop().create_task(
-                    self._persist_worker(worker)
-                )
+                task = asyncio.get_running_loop().create_task(_safe_persist())
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
             except RuntimeError:
                 pass  # no running loop (e.g. sync tests) — skip gracefully
         # Fire worker.online notification when a previously-offline worker recovers.

@@ -23,7 +23,7 @@ class _FailureRecord(NamedTuple):
     first_failure_at: float
 
 
-# Sensible defaults: 5 failures in 60 seconds trips the breaker.
+# Sensible defaults: 3 failures in 60 seconds trips the breaker.
 # A tripped worker is excluded from routing for the cooldown period.
 DEFAULT_FAILURE_THRESHOLD = 3
 DEFAULT_WINDOW_SECONDS = 60.0

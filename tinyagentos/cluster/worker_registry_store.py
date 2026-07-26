@@ -174,14 +174,12 @@ class WorkerRegistryStore(BaseStore):
         """Atomically increment the generation counter and return the new value."""
         if self._db is None:
             raise RuntimeError("WorkerRegistryStore not initialised")
-        await self._db.execute(
-            "UPDATE cluster_generation SET value = value + 1 WHERE id = 1"
-        )
-        await self._db.commit()
         cursor = await self._db.execute(
-            "SELECT value FROM cluster_generation WHERE id = 1"
+            "UPDATE cluster_generation SET value = value + 1 WHERE id = 1 "
+            "RETURNING value"
         )
         row = await cursor.fetchone()
+        await self._db.commit()
         return row["value"] if row else 1
 
     async def current_generation(self) -> int:

@@ -238,6 +238,9 @@ class WorkerRegister(BaseModel):
     # preserved under the renamed pool. Worker deletes its local marker
     # after a successful registration so this never repeats.
     pending_storage_backup: dict | None = None
+    # taOS #640: split-brain protection — worker echoes the controller's
+    # generation. Legacy workers that don't send it get a pass.
+    generation: int | None = None
 
 
 class HeartbeatBody(BaseModel):
@@ -279,6 +282,9 @@ class HeartbeatBody(BaseModel):
     # ready but the worker is still accepting tasks.
     status: str | None = None
     drain_reason: str | None = None
+    # taOS #640: split-brain protection — worker echoes the controller's
+    # generation. Legacy workers that don't send it get a pass.
+    generation: int | None = None
 
 
 class RouteRequest(BaseModel):
@@ -372,7 +378,7 @@ async def register_worker(request: Request, body: WorkerRegister):
         worker_lxc_image_version=body.worker_lxc_image_version,
         signing_key=signing_key,
     )
-    await cluster.register_worker(info)
+    await cluster.register_worker(info, generation=body.generation)
     await _record_worker_capability(request.app, body.name, body.host_lan_ip, body.hardware)
     if body.pending_storage_backup:
         await _surface_storage_backup(request.app, body.name, body.pending_storage_backup)
@@ -529,6 +535,7 @@ async def worker_heartbeat(request: Request, body: HeartbeatBody):
         hardware=body.hardware,
         status=body.status,
         drain_reason=body.drain_reason,
+        generation=body.generation,
     )
     if not ok:
         return JSONResponse({"error": "Worker not registered"}, status_code=404)
