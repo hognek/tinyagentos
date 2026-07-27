@@ -128,7 +128,7 @@ async def test_non_owner_rejected(store):
 
 
 @pytest.mark.asyncio
-async def test_add_item_attributed_to_agent(store):
+async def test_add_item_attributed_to_owner(store):
     doc = await store.create_list("user-1", "Tasks")
 
     req = _make_request(store)
@@ -138,7 +138,7 @@ async def test_add_item_attributed_to_agent(store):
         req,
     )
     item = await store.get_item(res["item_id"])
-    assert item["author"] == "atlas"
+    assert item["author"] == "user-1"
 
 
 @pytest.mark.asyncio
@@ -532,3 +532,85 @@ async def test_resolve_falls_back_without_registry(store):
     )
     assert "lists" in res
     assert any(d["id"] == doc["id"] for d in res["lists"])
+
+
+# ----------------------------------------- real AgentRegistryStore tests (F2)
+# Pattern: test_registry_governance_lifecycle.py:35 — instantiate a real
+# AgentRegistryStore, not a MagicMock, so the get_by_handle return-None
+# production path is actually exercised.
+
+@pytest.mark.asyncio
+async def test_registry_hit_uses_store_user_id(store, tmp_path):
+    """Real AgentRegistryStore: registered handle → use registry's user_id."""
+    from tinyagentos.agent_registry_store import AgentRegistryStore
+
+    doc = await store.create_list("user-1", "Registered Agent's List")
+
+    reg = AgentRegistryStore(tmp_path / "reg.db")
+    await reg.init()
+    try:
+        await reg.register(framework="test", handle="atlas", user_id="user-1")
+        rec = await reg.get_by_handle("atlas")
+        assert rec is not None
+        assert rec["user_id"] == "user-1"
+
+        req = _make_request(store, agent_registry=reg)
+        res = await execute_todo_list_lists(
+            {"agent_name": "atlas", "owner_user_id": "user-99"}, req
+        )
+        # Registry overrides caller-supplied owner_user_id → user-1 owns the list
+        assert "lists" in res
+        assert any(d["id"] == doc["id"] for d in res["lists"])
+    finally:
+        await reg.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_miss_falls_back_to_config(store, tmp_path):
+    """Real AgentRegistryStore: handle not found → config fallback (deployed agent)."""
+    from tinyagentos.agent_registry_store import AgentRegistryStore
+
+    doc = await store.create_list("user-1", "Deployed Agent's List")
+
+    reg = AgentRegistryStore(tmp_path / "reg2.db")
+    await reg.init()
+    try:
+        # Store is empty — no rows at all, so get_by_handle returns None.
+        rec = await reg.get_by_handle("deployed-agent")
+        assert rec is None
+
+        mock_config = MagicMock()
+        mock_config.agents = [{"name": "deployed-agent"}]
+        req = _make_request(
+            store, config=mock_config, agent_registry=reg, user_id="user-1"
+        )
+
+        res = await execute_todo_list_lists(
+            {"agent_name": "deployed-agent"}, req
+        )
+        assert "lists" in res
+        assert any(d["id"] == doc["id"] for d in res["lists"])
+    finally:
+        await reg.close()
+
+
+@pytest.mark.asyncio
+async def test_registry_miss_no_config_errors(store, tmp_path):
+    """Real AgentRegistryStore: handle not found, no config → error."""
+    from tinyagentos.agent_registry_store import AgentRegistryStore
+
+    reg = AgentRegistryStore(tmp_path / "reg3.db")
+    await reg.init()
+    try:
+        rec = await reg.get_by_handle("unknown")
+        assert rec is None
+
+        # No config on state → fallback cannot fire
+        req = _make_request(store, agent_registry=reg)
+        res = await execute_todo_list_lists(
+            {"agent_name": "unknown", "owner_user_id": "user-1"}, req
+        )
+        assert "error" in res
+        assert "not found" in res["error"]
+    finally:
+        await reg.close()

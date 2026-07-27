@@ -135,7 +135,7 @@ async def execute_todo_add_item(args: dict, request: Request) -> dict:
         if doc.get("archived_at") is not None:
             return {"error": "list is archived"}
 
-        item = await store.add_item(list_id, text, author=agent_name)
+        item = await store.add_item(list_id, text, author=owner_user_id)
 
         try:
             from tinyagentos.todo.notify import _trigger_todo_agent_notifications

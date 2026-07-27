@@ -502,18 +502,24 @@ async def list_tools(request: Request, agent_name: str):
         schema = skill.get("tool_schema") or {}
         if not schema:
             continue
+        skill_id = skill["id"]
+        # Only advertise skills that have a wired implementation — orphaned
+        # rows (seeded with INSERT OR IGNORE, then removed from the default
+        # set) survive in the skills table but would 501 on call.
+        if skill_id not in SKILL_IMPLEMENTATIONS:
+            continue
         tools.append(
             {
                 "type": "function",
                 "function": {
-                    "name": schema.get("name", skill["id"]),
+                    "name": schema.get("name", skill_id),
                     "description": schema.get(
                         "description", skill.get("description", "")
                     ),
                     "parameters": schema.get("input_schema", {}),
                 },
-                "skill_id": skill["id"],
-                "exec_url": f"/api/skill-exec/{skill['id']}/call",
+                "skill_id": skill_id,
+                "exec_url": f"/api/skill-exec/{skill_id}/call",
             }
         )
 

@@ -39,6 +39,9 @@ class SkillStore(BaseStore):
         # backfills any builtin skills added since it was first seeded (e.g. new
         # desktop-control tools) without disturbing user-installed skills.
         await self._seed_defaults()
+        # Clean up skills removed from SKILL_IMPLEMENTATIONS — rows are seeded
+        # with INSERT OR IGNORE so they survive when the default-set is trimmed.
+        await self._remove_orphan_skills()
 
     async def _seed_defaults(self):
         """Seed the default skill set."""
@@ -791,6 +794,29 @@ class SkillStore(BaseStore):
                     json.dumps(skill.get("requires_services", [])),
                     skill["install_target"], skill["id"],
                 ),
+            )
+        await self._db.commit()
+
+    async def _remove_orphan_skills(self) -> None:
+        """Delete seeded skills that no longer have an implementation.
+
+        Built-in skills are seeded with INSERT OR IGNORE on every startup,
+        so removing a skill from the default set does not delete its row
+        on existing installs.  This method cleans up known-orphaned rows
+        so agents that had the skill assigned are no longer advertised a
+        tool that will 501 on call.
+        """
+        if self._db is None:
+            return
+        # The list is deliberately explicit — each entry documents *when*
+        # the skill was removed and why (issue #1923 notes/todo split).
+        _ORPHAN_SKILL_IDS: list[str] = [
+            "notes_set_done",  # removed 2026-07 — replaced by todo_set_done (#1923)
+        ]
+        for skill_id in _ORPHAN_SKILL_IDS:
+            await self._db.execute("DELETE FROM skills WHERE id = ?", (skill_id,))
+            await self._db.execute(
+                "DELETE FROM agent_skills WHERE skill_id = ?", (skill_id,)
             )
         await self._db.commit()
 
