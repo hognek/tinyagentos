@@ -21,7 +21,7 @@ from tinyagentos.library_store import LibraryStore
 logger = logging.getLogger(__name__)
 
 # Text artifact kinds that should be indexed into collections
-_TEXT_ARTIFACT_KINDS = frozenset({"text", "transcript", "description", "ocr"})
+_TEXT_ARTIFACT_KINDS = frozenset({"text", "transcript", "description", "ocr", "chapters"})
 
 
 async def handoff_to_collections(

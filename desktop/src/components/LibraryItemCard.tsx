@@ -32,7 +32,7 @@ const JOB_STATE_COLORS: Record<string, string> = {
   failed: "bg-red-500/15 text-red-400 border-red-500/30",
 };
 
-const TEXT_ARTIFACT_KINDS = ["text", "transcript", "description", "ocr"];
+const TEXT_ARTIFACT_KINDS = ["text", "transcript", "description", "ocr", "chapters"];
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
