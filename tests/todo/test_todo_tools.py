@@ -53,7 +53,7 @@ async def test_list_returns_owned_lists(store):
     assert "lists" in res
     assert any(d["id"] == doc["id"] for d in res["lists"])
     assert len(res["lists"]) == 1
-    # Internal fields must be stripped (CodeRabbit nitpick, #2035)
+    # Internal fields must be stripped.
     for d in res["lists"]:
         assert "owner_user_id" not in d
         assert "archived_at" not in d
@@ -389,6 +389,88 @@ async def test_list_lists_rejects_deployed_agent_no_user_id(store):
     req = _make_request(store, config=mock_config, agent_registry=registry)
     res = await execute_todo_list_lists(
         {"agent_name": "deployed-agent"}, req
+    )
+    assert "error" in res
+    assert "not found" in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_add_item_deployed_agent_fallback(store):
+    """Agent not in registry but found in config → uses request.state.user_id."""
+    doc = await store.create_list("user-1", "Deployed Agent's List")
+
+    registry = MagicMock()
+    registry.get_by_handle = AsyncMock(return_value=None)
+
+    mock_config = MagicMock()
+    mock_config.agents = [{"name": "deployed-agent"}]
+    req = _make_request(store, config=mock_config, agent_registry=registry, user_id="user-1")
+
+    res = await execute_todo_add_item(
+        {"agent_name": "deployed-agent", "list_id": doc["id"], "text": "test item"},
+        req,
+    )
+    assert res.get("ok") is True
+
+
+@pytest.mark.asyncio
+async def test_add_item_rejects_deployed_agent_no_user_id(store):
+    """Agent in config but request.state has no user_id → error."""
+    doc = await store.create_list("user-1", "Deployed Agent's List")
+
+    registry = MagicMock()
+    registry.get_by_handle = AsyncMock(return_value=None)
+
+    mock_config = MagicMock()
+    mock_config.agents = [{"name": "deployed-agent"}]
+    # No user_id on state
+    req = _make_request(store, config=mock_config, agent_registry=registry)
+    res = await execute_todo_add_item(
+        {"agent_name": "deployed-agent", "list_id": doc["id"], "text": "test item"},
+        req,
+    )
+    assert "error" in res
+    assert "not found" in res["error"]
+
+
+@pytest.mark.asyncio
+async def test_set_done_deployed_agent_fallback(store):
+    """Agent not in registry but found in config → uses request.state.user_id."""
+    doc = await store.create_list("user-1", "Tasks")
+    item = await store.add_item(doc["id"], "A task", author="user-1")
+
+    registry = MagicMock()
+    registry.get_by_handle = AsyncMock(return_value=None)
+
+    mock_config = MagicMock()
+    mock_config.agents = [{"name": "deployed-agent"}]
+    req = _make_request(store, config=mock_config, agent_registry=registry, user_id="user-1")
+
+    res = await execute_todo_set_done(
+        {"agent_name": "deployed-agent", "list_id": doc["id"],
+         "item_id": item["id"], "done": True},
+        req,
+    )
+    assert res.get("ok") is True
+
+
+@pytest.mark.asyncio
+async def test_set_done_rejects_deployed_agent_no_user_id(store):
+    """Agent in config but request.state has no user_id → error."""
+    doc = await store.create_list("user-1", "Tasks")
+    item = await store.add_item(doc["id"], "A task", author="user-1")
+
+    registry = MagicMock()
+    registry.get_by_handle = AsyncMock(return_value=None)
+
+    mock_config = MagicMock()
+    mock_config.agents = [{"name": "deployed-agent"}]
+    # No user_id on state
+    req = _make_request(store, config=mock_config, agent_registry=registry)
+    res = await execute_todo_set_done(
+        {"agent_name": "deployed-agent", "list_id": doc["id"],
+         "item_id": item["id"], "done": True},
+        req,
     )
     assert "error" in res
     assert "not found" in res["error"]

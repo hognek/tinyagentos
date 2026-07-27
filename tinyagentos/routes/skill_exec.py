@@ -429,32 +429,23 @@ async def _skill_notes_add_entry(args: dict, request: Request) -> dict:
 
 async def _skill_todo_list_lists(args: dict, request: Request) -> dict:
     """List non-archived todo lists the calling agent has access to."""
-    try:
-        from tinyagentos.tools.todo_tools import execute_todo_list_lists
+    from tinyagentos.tools.todo_tools import execute_todo_list_lists
 
-        return await execute_todo_list_lists(args, request)
-    except Exception as exc:
-        return {"error": str(exc)}
+    return await execute_todo_list_lists(args, request)
 
 
 async def _skill_todo_add_item(args: dict, request: Request) -> dict:
     """Append an item to a todo list the calling agent has access to."""
-    try:
-        from tinyagentos.tools.todo_tools import execute_todo_add_item
+    from tinyagentos.tools.todo_tools import execute_todo_add_item
 
-        return await execute_todo_add_item(args, request)
-    except Exception as exc:
-        return {"error": str(exc)}
+    return await execute_todo_add_item(args, request)
 
 
 async def _skill_todo_set_done(args: dict, request: Request) -> dict:
     """Mark a todo item done/not-done on a list the agent has access to."""
-    try:
-        from tinyagentos.tools.todo_tools import execute_todo_set_done
+    from tinyagentos.tools.todo_tools import execute_todo_set_done
 
-        return await execute_todo_set_done(args, request)
-    except Exception as exc:
-        return {"error": str(exc)}
+    return await execute_todo_set_done(args, request)
 
 
 SKILL_IMPLEMENTATIONS = {

@@ -68,7 +68,12 @@ async def execute_todo_list_lists(args: dict, request: Request) -> dict:
     try:
         owner_user_id = await _resolve_owner_user_id(args, request)
         if owner_user_id is None:
-            return {"error": "agent not found in registry"}
+            return {
+                "error": (
+                    "unable to resolve owner: agent not found or "
+                    "no user identity available"
+                )
+            }
         if not isinstance(owner_user_id, str) or not owner_user_id:
             return {"error": "todo_list_lists requires an 'owner_user_id' string"}
 
@@ -80,8 +85,9 @@ async def execute_todo_list_lists(args: dict, request: Request) -> dict:
             for doc in lists
         ]
         return {"lists": slim}
-    except Exception as exc:
-        return {"error": str(exc)}
+    except Exception:  # noqa: BLE001
+        logger.exception("todo_list_lists failed")
+        return {"error": "todo_list_lists failed"}
 
 
 async def execute_todo_add_item(args: dict, request: Request) -> dict:
@@ -106,7 +112,12 @@ async def execute_todo_add_item(args: dict, request: Request) -> dict:
     try:
         owner_user_id = await _resolve_owner_user_id(args, request)
         if owner_user_id is None:
-            return {"error": "agent not found in registry"}
+            return {
+                "error": (
+                    "unable to resolve owner: agent not found or "
+                    "no user identity available"
+                )
+            }
         if not isinstance(owner_user_id, str) or not owner_user_id:
             return {"error": "todo_add_item requires an 'owner_user_id' string"}
 
@@ -136,8 +147,9 @@ async def execute_todo_add_item(args: dict, request: Request) -> dict:
             logger.warning("todo_add_item: agent trigger failed: %s", exc)
 
         return {"ok": True, "item_id": item["id"]}
-    except Exception as exc:
-        return {"error": str(exc)}
+    except Exception:  # noqa: BLE001
+        logger.exception("todo_add_item failed")
+        return {"error": "todo_add_item failed"}
 
 
 async def execute_todo_set_done(args: dict, request: Request) -> dict:
@@ -164,7 +176,12 @@ async def execute_todo_set_done(args: dict, request: Request) -> dict:
     try:
         owner_user_id = await _resolve_owner_user_id(args, request)
         if owner_user_id is None:
-            return {"error": "agent not found in registry"}
+            return {
+                "error": (
+                    "unable to resolve owner: agent not found or "
+                    "no user identity available"
+                )
+            }
         if not isinstance(owner_user_id, str) or not owner_user_id:
             return {"error": "todo_set_done requires an 'owner_user_id' string"}
 
@@ -188,5 +205,6 @@ async def execute_todo_set_done(args: dict, request: Request) -> dict:
 
         await store.patch_item(item_id, done=done)
         return {"ok": True, "item_id": item_id, "done": done}
-    except Exception as exc:
-        return {"error": str(exc)}
+    except Exception:  # noqa: BLE001
+        logger.exception("todo_set_done failed")
+        return {"error": "todo_set_done failed"}
