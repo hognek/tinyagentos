@@ -120,6 +120,36 @@ class TestBuildEnvelope:
                 inner_payload=large,
             )
 
+    def test_size_limit_measured_on_base64_not_raw_json(self):
+        """The 32 KB limit is enforced on the base64-encoded wire form
+        (docstring line 23), not the raw JSON.  Base64 inflates ~33 %,
+        so an envelope whose raw JSON is under 32 KB but whose
+        base64-encoded form exceeds it must be rejected."""
+        _, pub_hex = _make_x25519_keypair()
+        # Build a payload that produces a raw JSON just under the limit
+        # but a base64-encoded form well over it.  The ciphertext is
+        # base64-encoded inside the JSON, and then the whole JSON is
+        # base64-encoded for the size check — so the effective wire cap
+        # is reached at ~24 KB of plaintext (after AEAD tag + JSON
+        # envelope overhead + outer base64 inflation).
+        borderline = b"y" * 24000
+        with pytest.raises(ValueError, match="base64-encoded"):
+            build_envelope(
+                recipient="hub:alice",
+                recipient_x25519_pub_hex=pub_hex,
+                inner_payload=borderline,
+            )
+
+    def test_small_envelope_passes_size_check(self):
+        """A small payload must pass the base64-encoded size check."""
+        _, pub_hex = _make_x25519_keypair()
+        outer = build_envelope(
+            recipient="hub:alice",
+            recipient_x25519_pub_hex=pub_hex,
+            inner_payload=b"tiny",
+        )
+        assert outer["recipient"] == "hub:alice"
+
     def test_inner_json_preserved_after_roundtrip(self):
         priv_hex, pub_hex = _make_x25519_keypair()
         inner = json.dumps(

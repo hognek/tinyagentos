@@ -807,3 +807,69 @@ async def test_hub_relay_poll_rejects_invalid_recipient(client, monkeypatch):
     r = await client.get("/api/account/hub/relay/poll?recipient=../admin")
     assert r.status_code == 400
     assert "invalid recipient" in r.json()["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_hub_relay_drop_rejects_recipient_mismatch(client, monkeypatch):
+    """When the node has a local hub identity, the in-body recipient MUST
+    match it — a caller cannot drop envelopes into another user's queue
+    (audience-binding, same pattern as #2025 peer channel fix)."""
+    monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
+
+    # Simulate a registered hub identity (hub:alice).
+    import tinyagentos.routes.account_proxy as mod
+    monkeypatch.setattr(
+        mod, "resolve_local_identity_id", lambda: "hub:alice"
+    )
+
+    async def handler(method, url, **kw):
+        pytest.fail("must not be called when recipient mismatches")
+
+    _patch_upstream(monkeypatch, handler)
+    r = await client.post(
+        "/api/account/hub/relay/drop",
+        json={
+            "recipient": "hub:bob",
+            "sender_ephemeral_pub": "aa",
+            "nonce": "bb",
+            "ciphertext": "cc",
+        },
+    )
+    assert r.status_code == 403
+    assert "recipient" in r.json()["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_hub_relay_drop_accepts_matching_recipient(client, monkeypatch):
+    """When the in-body recipient matches the local hub identity the request
+    is forwarded normally."""
+    monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
+
+    import tinyagentos.routes.account_proxy as mod
+    monkeypatch.setattr(
+        mod, "resolve_local_identity_id", lambda: "hub:alice"
+    )
+
+    captured: dict[str, str] = {}
+
+    async def handler(method, url, **kw):
+        captured["url"] = url
+        captured["body"] = kw.get("content", b"").decode("utf-8")
+        return _FakeResp(
+            content=b'{"status":"queued","count":1}',
+            headers={"content-type": "application/json"},
+        )
+
+    _patch_upstream(monkeypatch, handler)
+    r = await client.post(
+        "/api/account/hub/relay/drop",
+        json={
+            "recipient": "hub:alice",
+            "sender_ephemeral_pub": "aa",
+            "nonce": "bb",
+            "ciphertext": "cc",
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "queued"
+    assert captured["url"] == "https://taos.my/api/hub/relay/drop"

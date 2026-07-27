@@ -20,7 +20,7 @@ Envelope lifecycle
    silently dropped.
 
 Constraints (enforced at the hub, surfaced in the API)
-- Max envelope size: 32 KB (JSON-serialised outer envelope, UTF-8 encoded)
+- Max envelope size: 32 KB (outer envelope base64-encoded)
 - TTL: 7 days (hub prunes expired envelopes on poll)
 - Per-recipient cap: 200 queued envelopes (hub rejects when full)
 """
@@ -163,12 +163,15 @@ def build_envelope(
     outer = seal(plaintext=inner_payload,
                  recipient_x25519_pub_hex=recipient_x25519_pub_hex)
     outer["recipient"] = recipient
-    # Enforce max size: the JSON-serialised envelope must be ≤ 32 KB.
+    # Enforce max size on the base64-encoded wire form (the hub receives the
+    # envelope as JSON; base64 inflation means a 32 KB raw envelope is ~43 KB
+    # on the wire, so we measure the encoded form for an honest transport cap).
     raw = json.dumps(outer, sort_keys=True, separators=(",", ":"))
     raw_bytes = raw.encode("utf-8")
-    if len(raw_bytes) > MAX_ENVELOPE_SIZE:
+    b64_encoded = base64.urlsafe_b64encode(raw_bytes)
+    if len(b64_encoded) > MAX_ENVELOPE_SIZE:
         raise ValueError(
-            f"sealed envelope is {len(raw_bytes)} bytes, "
+            f"sealed envelope is {len(b64_encoded)} bytes base64-encoded, "
             f"exceeds {MAX_ENVELOPE_SIZE} byte limit"
         )
     return outer

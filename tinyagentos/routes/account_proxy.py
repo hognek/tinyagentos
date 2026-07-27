@@ -23,6 +23,7 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from tinyagentos.taosnet import mesh, mesh_credentials
+from tinyagentos.peer import resolve_local_identity_id
 
 logger = logging.getLogger(__name__)
 
@@ -388,6 +389,16 @@ async def hub_relay_drop(request: Request):
     recipient = str(payload.get("recipient", ""))
     if not _valid_hub_recipient(recipient):
         return JSONResponse({"error": "invalid recipient"}, status_code=400)
+    # Bind the in-body recipient to the caller's hub identity (same
+    # audience-binding pattern as the peer channel fix in #2025).  When
+    # the node has registered a hub identity, the recipient MUST match
+    # it — a caller cannot drop envelopes into another user's queue.
+    local_id = resolve_local_identity_id()
+    if local_id is not None and recipient != local_id:
+        return JSONResponse(
+            {"error": "recipient does not match local identity"},
+            status_code=403,
+        )
     return await _forward_to(request, "POST", _ACTIONS["hub_relay_drop"][1], body=body)
 
 
