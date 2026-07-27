@@ -696,10 +696,7 @@ class SkillStore(BaseStore):
                     "description": "List the non-archived todo lists this agent has access to. Returns id, title, and updated_at for each list.",
                     "input_schema": {
                         "type": "object",
-                        "properties": {
-                            "owner_user_id": {"type": "string", "description": "The user whose todo lists to list."},
-                        },
-                        "required": ["owner_user_id"],
+                        "properties": {},
                     },
                 },
                 "frameworks": {
@@ -723,9 +720,8 @@ class SkillStore(BaseStore):
                         "properties": {
                             "list_id": {"type": "string", "description": "Id of the todo list (from todo_list_lists)."},
                             "text": {"type": "string", "description": "The item text to append."},
-                            "owner_user_id": {"type": "string", "description": "The user who owns the list."},
                         },
-                        "required": ["list_id", "text", "owner_user_id"],
+                        "required": ["list_id", "text"],
                     },
                 },
                 "frameworks": {
@@ -750,9 +746,8 @@ class SkillStore(BaseStore):
                             "list_id": {"type": "string", "description": "Id of the todo list (from todo_list_lists)."},
                             "item_id": {"type": "string", "description": "Id of the todo item to mark."},
                             "done": {"type": "boolean", "description": "True to mark done, false to reopen."},
-                            "owner_user_id": {"type": "string", "description": "The user who owns the list."},
                         },
-                        "required": ["list_id", "item_id", "done", "owner_user_id"],
+                        "required": ["list_id", "item_id", "done"],
                     },
                 },
                 "frameworks": {

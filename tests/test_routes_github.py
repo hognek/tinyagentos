@@ -341,7 +341,8 @@ def _build_app_with_app_config(
     app = FastAPI()
     app.include_router(github_router)
 
-    # SecretsStore (PAT + App private key)
+    # SecretsStore: PAT under ``github_token``, App key under
+    # ``github-app-private-key`` (moved out of config by #2009).
     mock_secrets = MagicMock()
 
     async def _secrets_get(key: str):
@@ -354,10 +355,9 @@ def _build_app_with_app_config(
     mock_secrets.get = AsyncMock(side_effect=_secrets_get)
     app.state.secrets = mock_secrets
 
-    # App config
+    # App config (private key no longer lives here after #2009)
     mock_config = MagicMock()
     mock_config.github_app_id = "123456"
-    mock_config.github_app_private_key = "fake-private-key"
     app.state.config = mock_config
 
     # App installations store

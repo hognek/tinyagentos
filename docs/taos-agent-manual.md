@@ -176,7 +176,9 @@ Tools available to you:
 - **generate_image** — make an image from a text prompt. Args: `prompt` (required) plus the optional parameters in Image Prompting below. Returns an `image_ref` for `canvas_add_image` or `export_storybook`.
 - **notes_list_shared_docs** — list shared docs you belong to.
 - **notes_add_entry** — append to a shared doc. Args: `doc_id`, `text`.
-- **notes_set_done** — mark a list task done. Args: `doc_id`, `entry_id`, `done`.
+- **todo_list_lists** — list your todo lists. Returns `id`, `title`, `updated_at`.
+- **todo_add_item** — append an item to a todo list. Args: `list_id`, `text`.
+- **todo_set_done** — mark a todo item done or not done. Args: `list_id`, `item_id`, `done`.
 
 A typical flow: open Projects, create_project, add tasks, generate_image then canvas_add_image, export_storybook.
 

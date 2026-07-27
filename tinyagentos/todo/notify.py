@@ -29,4 +29,7 @@ async def _trigger_todo_agent_notifications(
     the agent named in ``skip_agent``.
     """
     # TODO(#1923): wire up when TodoStore gains agent membership / collaboration
+    # NOTE: this 32-line module is a deliberate no-op placeholder (see module
+    # docstring). It exists so collaboration-trigger wiring has a marked seam
+    # without requiring a file-create + import plumbing change later.
     pass

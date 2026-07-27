@@ -23,6 +23,11 @@ async def _resolve_owner_user_id(
     registry-verified ``user_id`` (overriding any caller-supplied value).
     When the agent registry is absent from ``request.app.state``, falls back
     to the ``owner_user_id`` in *args* for test compatibility.
+
+    For deployed agents that are *not* in the registry (the common production
+    case), the agent is looked up in ``config.agents`` and the owner is taken
+    from the authenticated request's ``user_id`` (set by the local-token auth
+    middleware).
     """
     agent_registry = getattr(request.app.state, "agent_registry", None)
     agent_name = args.get("agent_name")
@@ -32,9 +37,20 @@ async def _resolve_owner_user_id(
     if not agent_name or not isinstance(agent_name, str):
         return None
     agent = await agent_registry.get_by_handle(agent_name)
-    if agent is None:
-        return None
-    return agent.get("user_id")
+    if agent is not None:
+        return agent.get("user_id")
+    # Deployed agents are never written to agent_registry.  When the
+    # registry exists but has no row for this handle, look the agent up in
+    # config; if it is a known (config-deployed) agent, the owner is the
+    # authenticated user (local-token auth, primary user).
+    config = getattr(request.app.state, "config", None)
+    if config is not None:
+        from tinyagentos.agent_db import find_agent
+
+        deployed = find_agent(config, agent_name)
+        if deployed is not None:
+            return getattr(request.state, "user_id", None)
+    return None
 
 
 async def execute_todo_list_lists(args: dict, request: Request) -> dict:
