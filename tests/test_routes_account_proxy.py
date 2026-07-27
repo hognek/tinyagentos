@@ -705,6 +705,8 @@ async def test_hub_relay_drop_forwards_envelope(client, monkeypatch):
     """POST /api/account/hub/relay/drop forwards to
     {base}/api/hub/relay/drop with the sealed envelope body."""
     monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
+    import tinyagentos.routes.account_proxy as mod
+    monkeypatch.setattr(mod, "resolve_local_identity_id", lambda: None)
     captured: dict[str, str] = {}
 
     async def handler(method, url, **kw):
@@ -738,6 +740,8 @@ async def test_hub_relay_poll_forwards_recipient(client, monkeypatch):
     """GET /api/account/hub/relay/poll?recipient=hub:alice forwards to
     {base}/api/hub/relay/poll?recipient=hub:alice."""
     monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
+    import tinyagentos.routes.account_proxy as mod
+    monkeypatch.setattr(mod, "resolve_local_identity_id", lambda: None)
     captured: dict[str, str] = {}
 
     async def handler(method, url, **kw):

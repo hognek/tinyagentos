@@ -189,6 +189,17 @@ class TestCanonicalize:
         c = canonicalize(payload)
         assert "café".encode("utf-8") in c
 
+    def test_rejects_nan(self):
+        """NaN is not valid JSON — canonicalize() must reject it."""
+        import math
+        with pytest.raises(ValueError):
+            canonicalize({"v": float("nan")})
+
+    def test_rejects_infinity(self):
+        """Infinity is not valid JSON — canonicalize() must reject it."""
+        with pytest.raises(ValueError):
+            canonicalize({"v": float("inf")})
+
 
 # ---------------------------------------------------------------------------
 # base64 round-trip

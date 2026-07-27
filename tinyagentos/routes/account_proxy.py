@@ -393,7 +393,7 @@ async def hub_relay_drop(request: Request):
     # audience-binding pattern as the peer channel fix in #2025).  When
     # the node has registered a hub identity, the recipient MUST match
     # it — a caller cannot drop envelopes into another user's queue.
-    local_id = resolve_local_identity_id()
+    local_id = await asyncio.to_thread(resolve_local_identity_id)
     if local_id is not None and recipient != local_id:
         return JSONResponse(
             {"error": "recipient does not match local identity"},
@@ -413,6 +413,14 @@ async def hub_relay_poll(request: Request):
     recipient = request.query_params.get("recipient", "")
     if not _valid_hub_recipient(str(recipient)):
         return JSONResponse({"error": "invalid recipient"}, status_code=400)
+    # Bind the queried recipient to the caller's hub identity — same
+    # audience-binding as hub_relay_drop.
+    local_id = await asyncio.to_thread(resolve_local_identity_id)
+    if local_id is not None and recipient != local_id:
+        return JSONResponse(
+            {"error": "recipient does not match local identity"},
+            status_code=403,
+        )
     _method, path = _ACTIONS["hub_relay_poll"]
     return await _forward_to(request, "GET",
                              f"{path}?recipient={recipient}")

@@ -191,5 +191,6 @@ def canonicalize(payload: dict) -> bytes:
     """
     inner = {k: v for k, v in payload.items() if k != "sig"}
     return json.dumps(
-        inner, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        inner, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        allow_nan=False,
     ).encode("utf-8")
