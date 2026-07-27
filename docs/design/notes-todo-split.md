@@ -75,9 +75,10 @@ Keep `tinyagentos/notes/shared_docs_store.py` but rename/refactor:
 - Remove `kind` column from `shared_docs` — all docs are notes now
 - Remove `done` from `shared_doc_entries` — notes don't have completion
 - Rename `shared_doc_entries` → `note_blocks` (optional; can defer)
-- The existing entry revision history is preserved **via the shared
-  collaboration module** (see 1c) — it's useful for both apps without
-  duplication
+- The existing `entry_revisions` table is **extracted into the shared
+  collaboration module** (see 1c) — the revision store lives in
+  `tinyagentos/collaboration/revision_store.py` and both NotesStore and
+  TodoStore compose it rather than keeping separate revision tables
 
 Schema (existing, minus `kind` and `done`):
 
@@ -215,10 +216,10 @@ class EditEntryTextIn(BaseModel):  # unchanged
 
 ### 2c. Agent tools
 
-| Current Tool | After (rename) | Purpose |
+| Current Tool | New Name / Status | Purpose |
 |------|---------|-------|
 | `notes_list_shared_docs` | → `notes_list_docs` | Lists the agent's notes |
-| `notes_add_entry` | → `notes_add_entry` | Appends to a note |
+| `notes_add_entry` | → **kept as-is** | Appends to a note |
 | `notes_set_done` | → **removed** from notes | Notes don't have done |
 | (new) `todo_list_lists` | — | Lists the agent's todo lists |
 | (new) `todo_add_item` | — | Appends a todo item |
