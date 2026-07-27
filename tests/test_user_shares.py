@@ -145,7 +145,8 @@ class TestShareRoutes:
     async def test_re_share_preserves_accepted_status(
         self, shares_client, shares_client_target
     ):
-        """Re-sharing an already-accepted share does not downgrade it to 'pending'."""
+        """Re-sharing an already-accepted share does not downgrade it to 'pending'
+        and preserves the share id so accept/deny links remain valid."""
         body = {
             "resource_type": "project",
             "resource_id": "proj-reshare-accepted",
@@ -170,6 +171,10 @@ class TestShareRoutes:
         assert r2.json()["status"] == "accepted", (
             "Re-sharing an accepted share must preserve 'accepted' status, "
             "not downgrade to 'pending'"
+        )
+        assert r2.json()["id"] == share_id, (
+            "Re-sharing must preserve the share id so accept/deny links "
+            "and notification/Decision references remain valid"
         )
 
         # 4. user_can_access still returns True.
@@ -358,6 +363,26 @@ class TestShareRoutes:
         """Revoking a non-existent share returns 404."""
         resp = await shares_client.delete("/api/shares/99999")
         assert resp.status_code == 404
+
+    async def test_revoke_share_unauthorized(
+        self, shares_client, shares_client_target
+    ):
+        """Non-owner, non-admin caller cannot revoke another user's share."""
+        r = await shares_client.post(
+            "/api/shares",
+            json={
+                "resource_type": "project",
+                "resource_id": "proj-revoke-unauth",
+                "to_username": "target",
+                "permission": "read",
+            },
+        )
+        assert r.status_code == 200
+        share_id = r.json()["id"]
+
+        # Target user (not the owner) tries to revoke → 403.
+        resp = await shares_client_target.delete(f"/api/shares/{share_id}")
+        assert resp.status_code == 403
 
     # -- List ------------------------------------------------------------
 

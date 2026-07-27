@@ -44,13 +44,13 @@ class UserSharesStore(BaseStore):
 
     SCHEMA = SCHEMA
 
-    # Serializes the DELETE-then-INSERT-then-SELECT in add_share.  The
+    # Serializes the UPDATE-or-INSERT-then-SELECT in add_share.  The
     # 5-column UNIQUE on all-NOT-NULL columns would allow INSERT OR REPLACE,
-    # but we keep the explicit delete+insert+select under this lock so two
-    # concurrent same-key writes cannot interleave (one DELETE removing the
-    # other's row before its SELECT-back returns it, or the second INSERT
-    # hitting the unique).  The lock makes each write atomic against others
-    # on this single connection.
+    # but we keep the explicit check-then-update/insert under this lock so
+    # two concurrent same-key writes cannot interleave (one INSERT creating
+    # a duplicate, or a race where each sees no row and both INSERT).
+    # The lock makes each write atomic against others on this single
+    # connection.
     _write_lock: asyncio.Lock
 
     async def init(self) -> None:
@@ -114,15 +114,16 @@ class UserSharesStore(BaseStore):
         tier: str = "once",
         expires_at: Optional[str] = None,
     ) -> dict:
-        """Insert or replace a share for the exact 5-column key.
+        """Insert or update a share for the exact 5-column key.
 
         Idempotent re-share: calling add_share again with the same
         (owner_user_id, resource_type, resource_id, shared_with_user_id,
-        permission) tuple replaces the existing share rather than creating
-        a duplicate.  The prior row's ``status`` is preserved (e.g. an
+        permission) tuple updates the existing share in place rather than
+        creating a duplicate.  The id and status are preserved (e.g. an
         already-accepted share stays accepted), so re-sharing merely to
-        "ensure the share exists" does not silently revoke consent.
-        The delete+insert+select runs under the write lock for atomicity.
+        "ensure the share exists" does not invalidate references or
+        silently revoke consent.
+        The update-or-insert+select runs under the write lock for atomicity.
         """
         if self._db is None:
             raise RuntimeError("UserSharesStore not initialised — call init() first")
@@ -130,12 +131,9 @@ class UserSharesStore(BaseStore):
         expires_at = self._normalise_expiry(expires_at)
         now = datetime.now(timezone.utc).isoformat()
         async with self._write_lock:
-            # Fetch the prior status before deleting, so an already-accepted
-            # share is not silently downgraded to 'pending' when the owner
-            # calls add_share again to "ensure the share exists".
-            prior = await (
+            existing = await (
                 await self._db.execute(
-                    "SELECT status FROM user_shares "
+                    "SELECT id FROM user_shares "
                     "WHERE owner_user_id = ? AND resource_type = ? "
                     "AND resource_id = ? AND shared_with_user_id = ? "
                     "AND permission = ?",
@@ -143,35 +141,37 @@ class UserSharesStore(BaseStore):
                      shared_with_user_id, permission),
                 )
             ).fetchone()
-            prior_status = prior["status"] if prior else "pending"
 
-            # Remove any existing row for the exact key first.
-            await self._db.execute(
-                "DELETE FROM user_shares "
-                "WHERE owner_user_id = ? AND resource_type = ? AND resource_id = ? "
-                "AND shared_with_user_id = ? AND permission = ?",
-                (owner_user_id, resource_type, resource_id,
-                 shared_with_user_id, permission),
-            )
-            await self._db.execute(
-                """
-                INSERT INTO user_shares
+            if existing is not None:
+                # Re-share: UPDATE the existing row in place.  This
+                # preserves both the id (so notification / Decision
+                # references and accept/deny links remain valid) and
+                # the status (an already-accepted share is not
+                # silently downgraded to 'pending').
+                share_id = existing["id"]
+                await self._db.execute(
+                    "UPDATE user_shares SET tier = ?, granted_at = ?, "
+                    "expires_at = ? WHERE id = ?",
+                    (tier, now, expires_at, share_id),
+                )
+            else:
+                cursor = await self._db.execute(
+                    """
+                    INSERT INTO user_shares
+                        (owner_user_id, resource_type, resource_id,
+                         shared_with_user_id, permission, tier,
+                         granted_at, expires_at, status)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                    """,
                     (owner_user_id, resource_type, resource_id,
-                     shared_with_user_id, permission, tier, granted_at, expires_at, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (owner_user_id, resource_type, resource_id,
-                 shared_with_user_id, permission, tier, now, expires_at, prior_status),
-            )
+                     shared_with_user_id, permission, tier, now, expires_at),
+                )
+                share_id = cursor.lastrowid
+
             await self._db.commit()
             row = await (
                 await self._db.execute(
-                    "SELECT * FROM user_shares "
-                    "WHERE owner_user_id = ? AND resource_type = ? "
-                    "AND resource_id = ? AND shared_with_user_id = ? "
-                    "AND permission = ?",
-                    (owner_user_id, resource_type, resource_id,
-                     shared_with_user_id, permission),
+                    "SELECT * FROM user_shares WHERE id = ?", (share_id,)
                 )
             ).fetchone()
         return _row_to_dict(row)  # type: ignore[return-value]

@@ -62,26 +62,9 @@ async def user_can_access(
 
 
 async def _find_share_by_id(request: Request, share_id: int) -> dict | None:
-    """Look up a share by id via a direct index lookup on the primary key.
-
-    Falls back to the caller's owned-shares list for expired shares the
-    owner might still want to delete — get_share covers the common case
-    with a single indexed query instead of a full table scan.
-    """
+    """Look up a share by id via a direct primary-key lookup."""
     store = _get_user_shares_store(request)
-    share = await store.get_share(share_id)
-    if share is not None:
-        return share
-    # Fall back to caller's owned shares (includes expired shares the owner
-    # might still want to delete via revoke, which get_share also covers,
-    # but list_shares is here for cases where the share has been physically
-    # deleted and the caller still sees it in their list through caching).
-    user_id: str = getattr(request.state, "user_id", "")
-    if user_id:
-        for s in await store.list_shares(user_id):
-            if s["id"] == share_id:
-                return s
-    return None
+    return await store.get_share(share_id)
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +140,10 @@ async def create_share(
                 },
             )
         except Exception:
-            pass
+            logger.warning(
+                "Failed to create notification for share %s → user %s",
+                record.get("id"), target_user_id, exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Consent wiring — Decision record for the target user's Decisions
@@ -184,7 +170,10 @@ async def create_share(
                 },
             )
         except Exception:
-            pass
+            logger.warning(
+                "Failed to create Decision record for share %s → user %s",
+                record.get("id"), target_user_id, exc_info=True,
+            )
 
     return record
 
