@@ -646,7 +646,7 @@ class TestInstallV2:
         )
 
     @pytest.mark.asyncio
-    @pytest.mark.skipif(os.geteuid() == 0, reason="chmod 0o000 is a no-op for root")
+    @pytest.mark.skipif(getattr(os, 'geteuid', lambda: -1)() == 0, reason="chmod 0o000 is a no-op for root")
     async def test_toctou_manifest_unreadable_returns_403(self, client, tmp_path):
         """TOCTOU re-verify returns 403 when manifest.yaml cannot be read
         (permissions revoked) between the initial gate and the install."""
@@ -840,7 +840,7 @@ class TestInstallV2:
         svc_dir.mkdir(parents=True)
         manifest_path = svc_dir / "manifest.yaml"
         # Load the catalog with a manifest that CAN be signed (no date
-        # fields — _canonical_manifest_bytes succeeds on dicts without
+        # fields - _canonical_manifest_bytes succeeds on dicts without
         # non-JSON-serialisable values).
         manifest_path.write_text(
             "id: test-svc\nname: Test Service\ntype: service\n"
@@ -855,7 +855,7 @@ class TestInstallV2:
             installed_path=installed_path,
             signing_key=priv,
         )
-        reg._ensure_loaded()  # signing succeeds — no date fields yet
+        reg._ensure_loaded()  # signing succeeds - no date fields yet
 
         client._transport.app.state.registry = reg
         client._transport.app.state.store_signing_pubkey = pub
