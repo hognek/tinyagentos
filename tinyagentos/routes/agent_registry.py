@@ -97,6 +97,7 @@ _ALLOWED_SCOPES = frozenset({
     "project_tasks_update",
     "canvas_read", "canvas_write",
     "decisions_read", "decisions_write",
+    "observatory_control",
 })
 
 

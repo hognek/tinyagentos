@@ -14,13 +14,18 @@ import json
 import os
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from tinyagentos.auth_context import CurrentUser, current_user
+from tinyagentos.agent_token_auth import (
+    _get_grants_store,
+    _grant_unexpired,
+    check_agent_scope,
+)
 
 router = APIRouter()
 
@@ -80,24 +85,70 @@ def _write_state(request: Request, state: dict) -> None:
     _atomic_write(_state_path(request), state)
 
 
+async def _authorize_observatory_read(request: Request) -> str:
+    """Gate an observatory read request.
+
+    Admin (session cookie or local token) is allowed unconditionally -- the
+    middleware has already set request.state.is_admin for those.  Otherwise the
+    caller must present a registry JWT holding an active ``observatory_control``
+    grant; check_agent_scope raises 401 (bad/malformed token) or 403 (valid token
+    but not active / missing scope) and returns None only when no Bearer header
+    is present, which is rejected here as 403 (fail closed).
+    """
+    if getattr(request.state, "is_admin", False):
+        return "admin"
+    caller = await check_agent_scope(request, "observatory_control")
+    if caller is None:
+        raise HTTPException(status_code=403, detail="forbidden")
+    return caller
+
+
+async def _authorize_observatory_write(request: Request) -> str:
+    """Gate an observatory write request.
+
+    Admin (session cookie or local token) is allowed unconditionally.  Otherwise
+    the caller must present a registry JWT holding an active GLOBAL
+    (null-project) ``observatory_control`` grant -- a project-bound grant must
+    not confer fleet-wide pause/throttle.  check_agent_scope raises 401/403; a
+    missing Bearer header returns None and is rejected here as 403 (fail closed).
+    """
+    if getattr(request.state, "is_admin", False):
+        return "admin"
+    caller = await check_agent_scope(request, "observatory_control")
+    if caller is None:
+        raise HTTPException(status_code=403, detail="forbidden")
+    grants_store = _get_grants_store(request)
+    grants = await grants_store.list_grants(caller)
+    now = datetime.now(timezone.utc)
+    has_global = any(
+        g["scope"] == "observatory_control"
+        and g.get("project_id") is None
+        and _grant_unexpired(g.get("expires_at"), now)
+        for g in grants
+    )
+    if not has_global:
+        raise HTTPException(status_code=403, detail="forbidden")
+    return caller
+
+
 class PauseBody(BaseModel):
     scope: str  # "global" or a lane handle (e.g. "@taOS-dev-kilo-owl-alpha")
     paused: bool
 
 
 @router.get("/api/observatory/pause")
-async def get_pause(request: Request, user: CurrentUser = Depends(current_user)):
-    """Current pause state. Any authenticated caller (and the dispatch loop,
-    which polls this each iteration) may read it."""
+async def get_pause(request: Request):
+    """Current pause state. Admin or an agent holding ``observatory_control`` may read it."""
+    await _authorize_observatory_read(request)
     return _read_state(request)
 
 
 @router.post("/api/observatory/pause")
-async def set_pause(body: PauseBody, request: Request, user: CurrentUser = Depends(current_user)):
-    """Pause or resume the queue globally or for a single lane. Admin only,
-    since it steers the whole fleet."""
-    if not user.is_admin:
-        raise HTTPException(status_code=403, detail="forbidden")
+async def set_pause(body: PauseBody, request: Request):
+    """Pause or resume the queue globally or for a single lane. Admin or an
+    agent holding a GLOBAL ``observatory_control`` grant only, since it steers
+    the whole fleet."""
+    await _authorize_observatory_write(request)
     scope = body.scope.strip()
     if not scope:
         return JSONResponse({"error": "scope required"}, status_code=400)
@@ -154,16 +205,17 @@ class ThrottleBody(BaseModel):
 
 
 @router.get("/api/observatory/throttle")
-async def get_throttle(request: Request, user: CurrentUser = Depends(current_user)):
-    """Current concurrency caps. The dispatch loop polls this each iteration."""
+async def get_throttle(request: Request):
+    """Current concurrency caps. Admin or an agent holding ``observatory_control`` may read it."""
+    await _authorize_observatory_read(request)
     return _read_throttle(request)
 
 
 @router.post("/api/observatory/throttle")
-async def set_throttle(body: ThrottleBody, request: Request, user: CurrentUser = Depends(current_user)):
-    """Set or clear a concurrency cap globally or for a single lane. Admin only."""
-    if not user.is_admin:
-        raise HTTPException(status_code=403, detail="forbidden")
+async def set_throttle(body: ThrottleBody, request: Request):
+    """Set or clear a concurrency cap globally or for a single lane. Admin or an
+    agent holding a GLOBAL ``observatory_control`` grant only."""
+    await _authorize_observatory_write(request)
     scope = body.scope.strip()
     if not scope:
         return JSONResponse({"error": "scope required"}, status_code=400)
@@ -237,18 +289,18 @@ class ApprovalModeBody(BaseModel):
 
 
 @router.get("/api/observatory/approval-mode")
-async def get_approval_mode(request: Request, user: CurrentUser = Depends(current_user)):
-    """Current approval modes. The dispatch loop will poll this each iteration."""
+async def get_approval_mode(request: Request):
+    """Current approval modes. Admin or an agent holding ``observatory_control`` may read it."""
+    await _authorize_observatory_read(request)
     return _read_approval(request)
 
 
 @router.post("/api/observatory/approval-mode")
-async def set_approval_mode(body: ApprovalModeBody, request: Request, user: CurrentUser = Depends(current_user)):
-    """Set the approval mode globally or for a single session. Admin only, since
-    it relaxes how much an agent may do without asking. ``mode='default'`` on a
-    session clears its override (it falls back to global)."""
-    if not user.is_admin:
-        raise HTTPException(status_code=403, detail="forbidden")
+async def set_approval_mode(body: ApprovalModeBody, request: Request):
+    """Set the approval mode globally or for a single session. Admin or an
+    agent holding a GLOBAL ``observatory_control`` grant only, since it relaxes
+    how much an agent may do without asking."""
+    await _authorize_observatory_write(request)
     scope = body.scope.strip()
     if not scope:
         return JSONResponse({"error": "scope required"}, status_code=400)
@@ -271,21 +323,24 @@ async def set_approval_mode(body: ApprovalModeBody, request: Request, user: Curr
 
 
 @router.get("/api/observatory/fleet")
-async def get_fleet(request: Request, user: CurrentUser = Depends(current_user)):
+async def get_fleet(request: Request):
     """The Observe half: which agents are working and what they hold right now.
 
     Derives state from the board: an agent that holds a claimed task is
     'working' on it, and a registered agent that holds none is 'idle'. Admins
-    see every project + agent; other users see their own. The current pause
-    state is returned alongside so the UI can show both in one read.
-    Trace-timeline and PR-in-review enrichment are phase 2.
+    see every project + agent; other authorized callers see their own. The
+    current pause state is returned alongside so the UI can show both in one
+    read. Trace-timeline and PR-in-review enrichment are phase 2.
     """
+    await _authorize_observatory_read(request)
+    is_admin = getattr(request.state, "is_admin", False)
+    user_id = getattr(request.state, "user_id", None)
     pstore = request.app.state.project_store
     tstore = request.app.state.project_task_store
-    if user.is_admin:
+    if is_admin:
         projects = await pstore.list_projects(status=None)
     else:
-        projects = await pstore.list_for_user(user.user_id, status=None)
+        projects = await pstore.list_for_user(user_id, status=None)
 
     now = time.time()
     agents: list[dict] = []
@@ -327,10 +382,10 @@ async def get_fleet(request: Request, user: CurrentUser = Depends(current_user))
     registered: list[dict] = []
     if registry is not None:
         try:
-            if user.is_admin:
+            if is_admin:
                 registered = await registry.list_all(status="active")
             else:
-                registered = await registry.list_for_user(user.user_id, status="active")
+                registered = await registry.list_for_user(user_id, status="active")
         except Exception:
             registered = []
         for rec in registered:

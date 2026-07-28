@@ -78,6 +78,7 @@ VALID_SCOPES = frozenset({
     # per-project grant authorizes that project only. The route verifies the grant.
     "decisions_read",
     "decisions_write",
+    "observatory_control",
 })
 
 
