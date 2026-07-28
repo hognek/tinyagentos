@@ -97,10 +97,13 @@ _AGENT_CANVAS_ROUTES = (
 )
 
 # Decisions route an agent may reach with its own registry JWT (scope
-# decisions_write). Only the create endpoint; listing/answering stay
-# session-only. The route verifies the JWT + grant + project binding.
+# decisions_write). Create, answer (mirror), read-own, and list-own.  The route
+# verifies the JWT + grant + project binding.
 _AGENT_DECISIONS_ROUTES = (
     ("POST", re.compile(r"^/api/decisions$")),
+    ("POST", re.compile(r"^/api/decisions/[^/]+/answer/agent$")),
+    ("GET", re.compile(r"^/api/decisions/[^/]+/agent$")),
+    ("GET", re.compile(r"^/api/decisions/agent$")),
 )
 
 # Project-files routes a files_read / files_write token may reach. Reads
@@ -146,8 +149,12 @@ def _is_agent_canvas_path(method: str, path: str) -> bool:
 
 
 def _is_agent_decisions_path(method: str, path: str) -> bool:
-    """True only for POST /api/decisions, which a decisions_write-bound agent
-    token may reach.  The route verifies the JWT + grant."""
+    """True only for the exact subset of decision routes an agent token may reach:
+      - POST /api/decisions -> decisions_write (create)
+      - POST /api/decisions/{id}/answer/agent -> decisions_write (mirror)
+      - GET  /api/decisions/{id}/agent        -> decisions_write (read own)
+      - GET  /api/decisions/agent             -> decisions_write (list own)
+    The route verifies the JWT + grant + project binding."""
     return any(m == method and rx.match(path) for m, rx in _AGENT_DECISIONS_ROUTES)
 
 
