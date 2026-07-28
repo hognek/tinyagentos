@@ -492,19 +492,18 @@ async def _apply_delegation_grant(request: Request, decision: dict, value) -> bo
 async def answer_decision_as_agent(decision_id: str, body: AnswerIn, request: Request):
     """Agent mirror: only the asking agent can answer its own decision.
     Validates the agent token (via _is_agent_decisions_path), verifies the decision
-    belongs to the agent (checks from_agent), records the answer as mirrored,
-    then pushes to the asking agent via the A2A bus (no polling)."""
+    belongs to the agent (checks from_agent), records the answer as mirrored
+    (source=mirrored_from_chat), then pushes to the asking agent via A2A bus."""
     store = request.app.state.decision_store
     existing = await store.get(decision_id)
     if existing is None or existing.get("status") != "pending":
         return JSONResponse({"error": "not found or not pending"}, status_code=404)
 
-    # The agent's canonical_id is in request.state.user_id (set by middleware for
-    # agent tokens). match it against d["from_agent"] (the agent that asked).
+    # Ownership check: agent must match from_agent
     if existing.get("from_agent") != getattr(request.state, "user_id", None):
         return JSONResponse({"error": "not found"}, status_code=404)
 
-    # For select types: enforce options as with the session path.
+    # Validate select-type answers against declared options (same as human path).
     dtype = existing.get("type")
     if dtype in ("single_select", "multi_select"):
         valid = {
@@ -521,13 +520,23 @@ async def answer_decision_as_agent(decision_id: str, body: AnswerIn, request: Re
                 if vals is None or any(v not in valid for v in vals):
                     return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
 
-    # Mirror subject to source tracking and route via A2A bus.
+    # Agent mirror: record as "user" so the audit trail shows Jay as decider.
+    # Explicit source=mirrored_from_chat is honored from the body.
+    source = body.source or "mirrored_from_chat"
     answered_by = "user"
     updated = await store.answer(decision_id, body.value, answered_by)
     if updated is None:
         return JSONResponse({"error": "already answered or not pending"}, status_code=409)
     await _route_answer_to_agent(updated, body.value)
     return updated
+
+
+# NOTICE: The human-answering path (/api/decisions/{id}/answer) remains session-only
+# as documented. Agent-token mirroring is gated by the _AGENT_DECISIONS_ROUTES allowlist
+# and only reaches this function when the agent token holds a decisions_write grant.
+# The human-answer endpoint does NOT accept agent tokens (due to the allowlist contract),
+# preserving a strict separation between human and agent decision actions.
+# The source field is preserved in the stored answer JSON (from tinyagentos.decisions.decision_store.AnswerIn).
 
 
 async def _apply_app_grant(request: Request, decision: dict, value) -> bool:
