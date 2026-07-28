@@ -539,7 +539,7 @@ async def answer_decision_as_agent(decision_id: str, body: AnswerIn, request: Re
     store = request.app.state.decision_store
     existing = await store.get(decision_id)
     if existing is None or existing.get("status") != "pending":
-        return JSONResponse({"error": "not found or not pending"}, status_code=404)
+        return JSONResponse({"error": "not found"}, status_code=404)
 
     # Project-scoped (least privilege): the agent must hold decisions_write
     # on the decision's OWN project, not just any project.  5d207ec

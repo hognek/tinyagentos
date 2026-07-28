@@ -178,6 +178,9 @@ async def test_agent_cannot_answer_others_decision(client):
             json={"value": "approve"},
         )
     assert resp.status_code == 404, resp.text
+    assert resp.json() == {"error": "not found"}, (
+        f"body must match scope-mismatch 404: {resp.text}"
+    )
 
 
 @pytest.mark.asyncio
@@ -445,6 +448,9 @@ async def test_agent_cross_project_answer_blocks_wrong_project(client):
         )
     assert resp.status_code == 404, (
         f"expected 404 cross-project block, got {resp.status_code}: {resp.text}"
+    )
+    assert resp.json() == {"error": "not found"}, (
+        f"body must match not-found 404: {resp.text}"
     )
 
 
