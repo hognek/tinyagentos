@@ -589,7 +589,7 @@ class TestInstallV2:
             f"expected 403 after tampering, got {resp.status_code}: {resp.json()}"
         )
         body = resp.json()
-        assert body["error"] == "manifest modified between signature verification and install"
+        assert body["error"] == "manifest signature re-verification failed"
         assert "install_id" in body
 
         # Restore the original so teardown is clean.
@@ -642,10 +642,11 @@ class TestInstallV2:
         })
         assert resp.status_code == 403
         assert resp.json()["error"] == (
-            "manifest modified between signature verification and install"
+            "manifest signature re-verification failed"
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(getattr(os, 'geteuid', lambda: -1)() == 0, reason="chmod 0o000 is a no-op for root")
     async def test_toctou_manifest_unreadable_returns_403(self, client, tmp_path):
         """TOCTOU re-verify returns 403 when manifest.yaml cannot be read
         (permissions revoked) between the initial gate and the install."""
@@ -685,7 +686,7 @@ class TestInstallV2:
             })
             assert resp.status_code == 403
             assert resp.json()["error"] == (
-                "manifest modified between signature verification and install"
+                "manifest signature re-verification failed"
             )
         finally:
             os.chmod(manifest_path, 0o644)  # restore so tmp_path can clean up
@@ -730,7 +731,7 @@ class TestInstallV2:
         })
         assert resp.status_code == 403
         assert resp.json()["error"] == (
-            "manifest modified between signature verification and install"
+            "manifest signature re-verification failed"
         )
 
     @pytest.mark.asyncio
@@ -775,7 +776,7 @@ class TestInstallV2:
         })
         assert resp.status_code == 403
         assert resp.json()["error"] == (
-            "manifest modified between signature verification and install"
+            "manifest signature re-verification failed"
         )
 
     @pytest.mark.asyncio
@@ -822,7 +823,65 @@ class TestInstallV2:
         })
         assert resp.status_code == 403
         assert resp.json()["error"] == (
-            "manifest modified between signature verification and install"
+            "manifest signature re-verification failed"
+        )
+
+    @pytest.mark.asyncio
+    async def test_toctou_date_field_fails_closed_returns_403(self, client, tmp_path):
+        """TOCTOU re-verify returns 403 (not 500) when the manifest contains
+        a YAML date field that ``json.dumps`` cannot serialise without
+        ``default=str``.  Proves the canonicalisation fix is fail-closed:
+        TypeError → return False → 403, consistent with the PR's thesis."""
+        from tinyagentos.registry import AppRegistry
+        from tinyagentos.store_signing import generate_signing_keypair
+
+        catalog_dir = tmp_path / "catalog"
+        svc_dir = catalog_dir / "services" / "test-svc"
+        svc_dir.mkdir(parents=True)
+        manifest_path = svc_dir / "manifest.yaml"
+        # Load the catalog with a manifest that CAN be signed (no date
+        # fields - _canonical_manifest_bytes succeeds on dicts without
+        # non-JSON-serialisable values).
+        manifest_path.write_text(
+            "id: test-svc\nname: Test Service\ntype: service\n"
+            "version: \"1.0\"\ninstall:\n  method: download\n",
+        )
+
+        priv, pub = generate_signing_keypair()
+        installed_path = tmp_path / "installed.json"
+        installed_path.write_text("[]")
+        reg = AppRegistry(
+            catalog_dir=catalog_dir,
+            installed_path=installed_path,
+            signing_key=priv,
+        )
+        reg._ensure_loaded()  # signing succeeds - no date fields yet
+
+        client._transport.app.state.registry = reg
+        client._transport.app.state.store_signing_pubkey = pub
+        client._transport.app.state.installed_apps = _make_installed_apps()
+
+        # Now tamper the manifest to include a YAML date field.
+        # yaml.safe_load parses the unquoted 2026-01-01 into a
+        # datetime.date, which json.dumps cannot serialise without
+        # default=str.  The TypeError from _canonical_manifest_bytes
+        # is caught by verify_manifest_signature's except Exception →
+        # returns False → TOCTOU returns False → 403.
+        manifest_path.write_text(
+            "id: test-svc\nname: Test Service\ntype: service\n"
+            "version: \"1.0\"\nrelease_date: 2026-01-01\n"
+            "install:\n  method: download\n",
+        )
+
+        # Make the first gate pass so the TOCTOU guard runs.
+        reg.verify_manifest_signature = lambda aid, pem: True  # type: ignore[method-assign]
+
+        resp = await client.post("/api/store/install-v2", json={
+            "manifest_id": "test-svc",
+        })
+        assert resp.status_code == 403
+        assert resp.json()["error"] == (
+            "manifest signature re-verification failed"
         )
 
     @pytest.mark.asyncio

@@ -821,22 +821,24 @@ async def install_app(request: Request):
                     return False
                 from tinyagentos.store_signing import verify_manifest_signature as _verify_sig
                 return _verify_sig(on_disk, stored_sig, _store_pub)
-            except Exception:
+            except Exception:  # noqa: BLE001 - fail-closed, never allow on error
+                logger.exception("TOCTOU manifest re-verification failed")
                 return False
 
         if not await asyncio.to_thread(_toctou_reverify):
             progress.finish(
                 install_id, success=False,
-                error="manifest modified between signature verification and install",
+                error="manifest signature re-verification failed",
             )
             return JSONResponse(
                 {
-                    "error": "manifest modified between signature verification and install",
+                    "error": "manifest signature re-verification failed",
                     "detail": (
-                        "The manifest on disk was modified after the initial "
-                        "signature verification. This may indicate post-verification "
-                        "tampering. Rebuild the catalog or reinstall the app from "
-                        "a trusted source."
+                        "The manifest signature could not be re-verified at "
+                        "install time. This may indicate post-load tampering, "
+                        "a missing or unreadable manifest file, or a lost "
+                        "signature. Rebuild the catalog or reinstall the app "
+                        "from a trusted source."
                     ),
                     "install_id": install_id,
                 },
