@@ -51,7 +51,10 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
         app_state.taos_opencode_sessions = sessions
 
     existing: OpenCodeServer | None = servers.get(model)
-    born_degraded = getattr(app_state, "taos_opencode_born_degraded", {})
+    born_degraded = getattr(app_state, "taos_opencode_born_degraded", None)
+    if born_degraded is None:
+        born_degraded = {}
+        app_state.taos_opencode_born_degraded = born_degraded
 
 
     # Self-heal: if the cached server was born before LiteLLM was ready and
