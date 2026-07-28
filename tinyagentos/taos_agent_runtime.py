@@ -92,6 +92,9 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
                     logger.debug("taos_agent_runtime: error stopping old server", exc_info=True)
                 servers.pop(other_model, None)
                 sessions.pop(other_model, None)
+        # Clear the legacy session id so the desktop chat path does not feed
+        # a stale session from a now-stopped model to the new server.
+        app_state.taos_opencode_session_id = None
 
         # Read the taos_agent prefs once: the permitted set (to scope the key)
         # and a persisted own-key (so we reuse it instead of re-minting).
@@ -168,10 +171,11 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
 
     server = servers[model]
     session_id = sessions.get(model)
-    if session_id is not None:
-        # Expose the chosen server's session on the legacy singleton attr so
-        # the desktop chat path (taos_agent.py) can read it without change.
-        app_state.taos_opencode_session_id = session_id
+    # Expose the chosen server's session on the legacy singleton attr so
+    # the desktop chat path (taos_agent.py) can read it without change.
+    # Must be unconditional: a model with no cached session (None) must
+    # clear a stale value left by a previous model.
+    app_state.taos_opencode_session_id = session_id
     # Generous deadline: opencode's first run on a fresh home performs a one-time
     # SQLite migration that can take a couple of minutes; a short deadline would
     # spuriously time out the very first taOS-agent chat.

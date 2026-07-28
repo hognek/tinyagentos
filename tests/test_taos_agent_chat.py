@@ -670,6 +670,71 @@ async def test_ensure_server_self_heals_when_proxy_becomes_ready(tmp_path, monke
     assert state.taos_opencode_born_degraded["gpt-4o"] is False
 
 
+@pytest.mark.asyncio
+async def test_ensure_server_model_switch_clears_legacy_session_id(tmp_path, monkeypatch):
+    """When the model changes, the legacy ``taos_opencode_session_id`` attr is
+    set to None so the desktop chat path does not feed a stale session from the
+    previous model into the new server."""
+    import tinyagentos.taos_agent_runtime as rt
+
+    stop_calls: list[str] = []
+    spawned_cfgs: list = []
+
+    class _FakeServer:
+        def __init__(self, cfg):
+            spawned_cfgs.append(cfg)
+            self._cfg = cfg
+
+        async def ensure_running(self, **kwargs):
+            pass
+
+        async def stop(self):
+            stop_calls.append(f"stopped:{self._cfg.home}")
+
+        @property
+        def base_url(self):
+            return f"http://127.0.0.1:{self._cfg.port}"
+
+        def is_running(self):
+            return True
+
+    monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
+
+    mock_proxy = MagicMock()
+    mock_proxy.is_running.return_value = True
+    mock_proxy.create_agent_key = AsyncMock(return_value="sk-key-1")
+
+    state = SimpleNamespace(
+        data_dir=tmp_path,
+        llm_proxy=mock_proxy,
+        taos_opencode_password=None,
+        taos_opencode_server=None,
+        taos_opencode_model=None,
+        taos_opencode_session_id=None,
+    )
+
+    # First call: create model A's server and simulate a session.
+    await rt.ensure_taos_opencode_server(state, "gpt-4o")
+    assert len(spawned_cfgs) == 1
+    # Simulate the desktop chat path having stored a session id.
+    state.taos_opencode_session_id = "ses-old-model"
+    state.taos_opencode_sessions["gpt-4o"] = "ses-old-model"
+
+    # Second call: switch to model B — must stop model A and clear the legacy
+    # session id so the desktop chat path sees None for the new model.
+    await rt.ensure_taos_opencode_server(state, "claude-sonnet")
+
+    assert len(stop_calls) >= 1, "old-model server must have been stopped"
+    assert len(spawned_cfgs) == 2, "a new server must have been created"
+    assert state.taos_opencode_session_id is None, (
+        "legacy session id must be cleared after model switch; got "
+        f"{state.taos_opencode_session_id!r}"
+    )
+    assert "gpt-4o" not in state.taos_opencode_servers
+    assert "gpt-4o" not in state.taos_opencode_sessions
+    assert "claude-sonnet" in state.taos_opencode_servers
+
+
 # ---------------------------------------------------------------------------
 # Silent-stream guard
 # ---------------------------------------------------------------------------
