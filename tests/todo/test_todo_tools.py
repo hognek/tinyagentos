@@ -561,6 +561,11 @@ async def test_registry_hit_uses_store_user_id(store, tmp_path):
         # Registry overrides caller-supplied owner_user_id → user-1 owns the list
         assert "lists" in res
         assert any(d["id"] == doc["id"] for d in res["lists"])
+        # Internal fields must be stripped from the real-store path too.
+        for d in res["lists"]:
+            assert "owner_user_id" not in d
+            assert "archived_at" not in d
+            assert "created_at" not in d
     finally:
         await reg.close()
 
