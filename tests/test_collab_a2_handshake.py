@@ -198,7 +198,7 @@ class TestFriendAcceptHandshake:
         # Verify peer link was established
         link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
         assert link is not None, "peer link should be established on accept"
-        assert link["endpoints"] == ["https://peer.example.com:6969"]
+        assert link["endpoints"] == [{"kind": "hub", "url": "https://peer.example.com:6969", "priority": 0}]
         # inbound_token should be a fresh token
         assert link["inbound_token_hash"] is not None
         # outbound_token is empty placeholder until A3 handshake reply
@@ -302,7 +302,7 @@ class TestFriendAcceptHandshake:
         store = app_with_contacts.state.contacts_store
         link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
         assert link is not None
-        assert link["endpoints"] == ["https://peer.example.com:6969"]
+        assert link["endpoints"] == [{"kind": "hub", "url": "https://peer.example.com:6969", "priority": 0}]
 
     async def test_accept_reupsert_contact(
         self, client_with_contacts, app_with_contacts, monkeypatch
@@ -348,7 +348,7 @@ class TestFriendAcceptHandshake:
 
         link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
         assert link is not None
-        assert link["endpoints"] == ["https://second.example.com:6969"]
+        assert link["endpoints"] == [{"kind": "hub", "url": "https://second.example.com:6969", "priority": 0}]
         assert link["revoked_at"] is None, "re-establish must clear revocation"
 
     async def test_accept_without_contacts_store_does_not_crash(

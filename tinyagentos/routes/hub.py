@@ -112,6 +112,11 @@ async def _try_handshake(
     logged but never block the accept — the accept always succeeds even
     when the handshake side-effect temporarily can't complete.
     """
+    # Guard: a blocked peer must not be resurrected on re-accept.
+    store = await _get_store(request)
+    if peer_fingerprint and await store.has_edge(peer_fingerprint, relationships.REL_BLOCK):
+        return
+
     contacts_store = getattr(request.app.state, "contacts_store", None)
     if contacts_store is None:
         return
@@ -170,6 +175,15 @@ async def _try_handshake(
                 endpoints = []
         if not isinstance(endpoints, list):
             endpoints = []
+
+        # Normalize bare strings to the dict form consumed by peer link
+        # consumers (e.g., #2045's contact grid expects url/kind/priority).
+        endpoints = [
+            {"kind": "hub", "url": e, "priority": i}
+            if isinstance(e, str)
+            else e
+            for i, e in enumerate(endpoints)
+        ]
 
         # Create/refresh the contact row (trust-on-first-use key pinning).
         await contacts_store.add_contact(
