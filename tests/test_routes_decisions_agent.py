@@ -340,14 +340,14 @@ async def test_agent_mirror_does_not_write_execution_grant(client):
     assert resp.status_code == 200, resp.text
     did = resp.json()["id"]
 
-    # The agent mirrors "approve"
+    # The agent mirrors "approve" -- gate-kind decisions MUST be refused.
     async with _agent_client(app, token) as ac:
         resp = await ac.post(
             f"/api/decisions/{did}/answer/agent",
             json={"value": "approve"},
         )
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["status"] == "answered"
+    assert resp.status_code == 409, resp.text
+    assert "gate decisions cannot be answered" in resp.json()["error"]
 
     # No execution grant must exist — the agent cannot self-approve.
     policies = getattr(app.state, "execution_policies", None)

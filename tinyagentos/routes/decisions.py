@@ -515,6 +515,19 @@ async def answer_decision_as_agent(decision_id: str, body: AnswerIn, request: Re
     if existing.get("from_agent") != canonical_id:
         return JSONResponse({"error": "not found"}, status_code=404)
 
+    # Gate-kind decisions must NOT be mirror-approvable by an agent.
+    # An agent that creates a privileged gate decision (execution_gate,
+    # delegation_gate, app_grant) and then mirrors "approve" through its
+    # own answer/agent endpoint would be able to dismiss the pending gate
+    # card from the owner's inbox without the owner ever seeing it.
+    meta = (existing.get("metadata") or {})
+    gate_kind = meta.get("kind") if isinstance(meta, dict) else None
+    if gate_kind in ("execution_gate", "delegation_gate", "app_grant"):
+        return JSONResponse(
+            {"error": "gate decisions cannot be answered by the asking agent"},
+            status_code=409,
+        )
+
     # Validate select-type answers against declared options (same as human path).
     dtype = existing.get("type")
     if dtype in ("single_select", "multi_select"):
