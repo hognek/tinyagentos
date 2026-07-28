@@ -1187,6 +1187,8 @@ class TestHeavyDownloadProcessor:
 
         proc = HeavyDownloadProcessor(lib_store, storage_dir)
 
+        from unittest.mock import patch
+
         mock_path = str(storage_dir / "downloads" / "test123.mp4")
         storage_dir.joinpath("downloads").mkdir(parents=True, exist_ok=True)
         storage_dir.joinpath("downloads", "test123.mp4").write_text("fake video data")
@@ -1240,6 +1242,8 @@ class TestHeavyDownloadProcessor:
 
         proc = HeavyDownloadProcessor(lib_store, storage_dir)
 
+        from unittest.mock import patch
+
         mock_path = str(storage_dir / "downloads" / "test.mp4")
         storage_dir.joinpath("downloads").mkdir(parents=True, exist_ok=True)
         storage_dir.joinpath("downloads", "test.mp4").write_text("data")
@@ -1278,6 +1282,7 @@ class TestRunHeavyPipeline:
         mock_path = str(storage_dir / "downloads" / "test.mp4")
         storage_dir.joinpath("downloads", "test.mp4").write_text("fake data")
 
+        from unittest.mock import patch
         from tinyagentos.library_pipeline import run_heavy_pipeline
 
         with patch(
@@ -1308,6 +1313,7 @@ class TestRunHeavyPipeline:
         mock_path = str(storage_dir / "downloads" / "test.mp4")
         storage_dir.joinpath("downloads", "test.mp4").write_text("fake data")
 
+        from unittest.mock import patch
         from tinyagentos.library_pipeline import run_heavy_pipeline
 
         with patch(
@@ -1346,6 +1352,7 @@ class TestRunHeavyPipeline:
         mock_path = str(storage_dir / "downloads" / "test.mp4")
         storage_dir.joinpath("downloads", "test.mp4").write_text("fake data")
 
+        from unittest.mock import patch
         from tinyagentos.library_pipeline import run_heavy_pipeline
 
         with patch(
