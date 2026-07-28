@@ -206,6 +206,10 @@ The surface, by scope:
   project SLUG in the path, not the id.
 - **decisions_write**: `POST /api/decisions` (raise a human-in-the-loop
   decision). Listing/answering decisions stays session-only.
+- **observatory_control**: read/write the Observatory fleet dials
+  (`/api/observatory/pause|throttle|approval-mode|fleet`). Writes require a
+  global (null-project) grant; reads admit any active grant. Admin session and
+  local token are always allowed.
 - **a2a_send / a2a_receive**: the authenticated bus proxy above
   (`/api/a2a/bus/send|messages|channels|stream`), which forces `from` to the
   agent's own handle.
