@@ -552,7 +552,7 @@ async def test_ensure_server_born_degraded_when_proxy_not_running(tmp_path, monk
 
     await rt.ensure_taos_opencode_server(state, "gpt-4o")
 
-    assert state.taos_opencode_born_degraded is True
+    assert state.taos_opencode_born_degraded["gpt-4o"] is True
 
 
 @pytest.mark.asyncio
@@ -598,7 +598,7 @@ async def test_ensure_server_self_heals_when_proxy_becomes_ready(tmp_path, monke
 
     # First call: proxy not ready, server born degraded.
     await rt.ensure_taos_opencode_server(state, "gpt-4o")
-    assert state.taos_opencode_born_degraded is True
+    assert state.taos_opencode_born_degraded["gpt-4o"] is True
     assert len(spawned_cfgs) == 1
 
     # Proxy comes up.
@@ -609,7 +609,7 @@ async def test_ensure_server_self_heals_when_proxy_becomes_ready(tmp_path, monke
 
     assert len(stop_calls) == 1, "old server must have been stopped"
     assert len(spawned_cfgs) == 2, "a new server must have been created"
-    assert state.taos_opencode_born_degraded is False
+    assert state.taos_opencode_born_degraded["gpt-4o"] is False
 
 
 # ---------------------------------------------------------------------------
