@@ -994,8 +994,11 @@ async def close_task(
     existing = await store.get_task(task_id)
     if existing is None or existing["project_id"] != project_id:
         return JSONResponse({"error": "not found"}, status_code=404)
-    ok = await store.close_task(task_id, closed_by=closed_by, reason=payload.reason)
+    force = project.get("lead_member_id") == actor_id
+    ok = await store.close_task(task_id, closed_by=closed_by, reason=payload.reason, force=force)
     if not ok:
+        if existing.get("claimed_by") and existing["claimed_by"] != closed_by:
+            return JSONResponse({"error": "not claimed by you"}, status_code=409)
         return JSONResponse({"error": "cannot close"}, status_code=409)
     _beads_mark_dirty(request, project_id)
     await pstore.log_activity(project_id, closed_by, "task.closed", {"task_id": task_id})
