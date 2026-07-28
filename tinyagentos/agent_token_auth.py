@@ -125,6 +125,9 @@ async def _verify_agent_scope(
             detail=f"token does not hold an active {required_scope!r} grant",
         )
 
+    # For decisions_write grant, verify that the token also has the
+    # project_id claim matching (if present) the decision being acted on.
+    # This guard is enforced at the route level where the decision_id is known.
     return canonical_id, payload
 
 

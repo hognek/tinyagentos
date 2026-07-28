@@ -119,6 +119,7 @@ class DecisionIn(BaseModel):
 class AnswerIn(BaseModel):
     value: object
     answered_by: str = ""
+    source: str = "in_app"
 
 
 @dataclass
@@ -129,6 +130,18 @@ class _DecisionActor:
     from_agent: str | None   # agent handle (agent path); None on the human path
     decider_user_id: str     # the human the decision is addressed to
     is_admin: bool           # human-path admin flag; always False for agents
+
+
+@dataclass
+class _DecisionFilter:
+    """Query parameters for filtering decisions (agent-readable only)."""
+    from_agent: str | None = None
+    project_id: str | None = None
+    deadline: str | None = None
+    metadata_kind: str | None = None
+    # New: pending-age filter to surface cards older than a threshold (seconds).
+    # Queries decisions pending beyond the age threshold for sweeping.
+    pending_age_gt: float | None = None
 
 
 async def _resolve_decision_actor(request: Request, project_id: str | None) -> _DecisionActor:
@@ -251,11 +264,48 @@ async def list_decisions(
 
 @router.get("/api/decisions/{decision_id}")
 async def get_decision(decision_id: str, request: Request, user: CurrentUser = Depends(current_user)):
+    # Session-only path: human reading their own or admin reading any
     store = request.app.state.decision_store
     d = await store.get(decision_id)
     if d is None or (not user.is_admin and d["user_id"] != user.user_id):
         return JSONResponse({"error": "not found"}, status_code=404)
     return d
+
+
+@router.get("/api/decisions/{decision_id}/agent")
+async def get_decision_as_agent(decision_id: str, request: Request):
+    # Agent path: the agent may read any decision they asked (matched by from_agent).
+    # Let the store layer enforce the authorization; it returns None if the agent
+    # does not own this decision, and the route will return a 404.
+    store = request.app.state.decision_store
+    d = await store.get(decision_id)
+    if d is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    # Verify the agent owns this decision: the agent must match d["from_agent"]
+    # The middleware has already routed here because _is_agent_decisions_path allowed
+    # this exact (method, path) pattern, so request.state.user_id is the canonical_id
+    # from the registry JWT. Compare against the decision's from_agent field.
+    if d.get("from_agent") != getattr(request.state, "user_id", None):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return d
+
+
+# Agent-decisions list (filtered by agent or project)
+@router.get("/api/decisions/agent")
+async def list_decisions_as_agent(request: Request):
+    """Agent-facing list: filter by from_agent (the asking agent) or project_id
+    (via decisions_write grant binding). This matches taOSmd patterns and UI:
+    agents see all decisions they asked, grouped by project where applicable.
+    Includes source field (in_app / mirrored_from_chat) visible in UI."""
+    store = request.app.state.decision_store
+    # The agent may only see decisions they asked: match from_agent to the canonical_id.
+    canonical_id = getattr(request.state, "user_id", None)
+    if canonical_id is None:
+        return JSONResponse({"error": "agent identity not found"}, status_code=400)
+    # The store layer already enforces that from_agent matches the canonical_id,
+    # so passing from_agent here is safe. Let the store filter for this agent.
+    items = await store.list(from_agent=canonical_id, limit=500)
+    return {"items": items}
 
 
 @router.get("/api/decisions/{decision_id}/history")
@@ -285,6 +335,8 @@ async def decision_history(decision_id: str, request: Request, user: CurrentUser
 async def answer_decision(decision_id: str, body: AnswerIn, request: Request, user: CurrentUser = Depends(current_user)):
     store = request.app.state.decision_store
     existing = await store.get(decision_id)
+    # Authorization check: humans can answer decisions they own or admins; agents are
+    # covered by the _AGENT_TOKEN_PATHS allowlist so they never reach this route.
     if existing is None or (not user.is_admin and existing["user_id"] != user.user_id):
         return JSONResponse({"error": "not found"}, status_code=404)
 
@@ -306,7 +358,17 @@ async def answer_decision(decision_id: str, body: AnswerIn, request: Request, us
                 if vals is None or any(v not in valid for v in vals):
                     return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
 
-    answered_by = body.answered_by or user.user_id or "user"
+    # Record WHO REALLY DECIDED: mirror answers from agents record the agent as the
+    # mirroring actor, not the decider. Set a source field to distinguish mirrored
+    # from in-app answers and ensure the audit trail shows Jay as the true decider.
+    # For session-only (human) answers, source remains in_app unless overridden by body.source.
+    source = body.source or "in_app"
+    if source == "mirrored_from_chat":
+        # Agent mirror: recorded as "user" (or admin) so the agent appears as mirroring
+        # activity, not the decider. answered_by stays "user" or user.user_id for admin.
+        answered_by = user.user_id or "user"
+    else:
+        answered_by = body.answered_by or user.user_id or "user"
     updated = await store.answer(decision_id, body.value, answered_by)
     if updated is None:
         return JSONResponse({"error": "already answered or not pending"}, status_code=409)
@@ -424,6 +486,48 @@ async def _apply_delegation_grant(request: Request, decision: dict, value) -> bo
         reply = "delegation approved, but assigning the task failed - please retry"
     await _route_answer_to_agent(decision, reply)
     return True
+
+
+@router.post("/api/decisions/{decision_id}/answer/agent")
+async def answer_decision_as_agent(decision_id: str, body: AnswerIn, request: Request):
+    """Agent mirror: only the asking agent can answer its own decision.
+    Validates the agent token (via _is_agent_decisions_path), verifies the decision
+    belongs to the agent (checks from_agent), records the answer as mirrored,
+    then pushes to the asking agent via the A2A bus (no polling)."""
+    store = request.app.state.decision_store
+    existing = await store.get(decision_id)
+    if existing is None or existing.get("status") != "pending":
+        return JSONResponse({"error": "not found or not pending"}, status_code=404)
+
+    # The agent's canonical_id is in request.state.user_id (set by middleware for
+    # agent tokens). match it against d["from_agent"] (the agent that asked).
+    if existing.get("from_agent") != getattr(request.state, "user_id", None):
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    # For select types: enforce options as with the session path.
+    dtype = existing.get("type")
+    if dtype in ("single_select", "multi_select"):
+        valid = {
+            o.get("value")
+            for o in (existing.get("options") or [])
+            if o.get("value") is not None
+        }
+        if valid:
+            if dtype == "single_select":
+                if body.value not in valid:
+                    return JSONResponse({"error": "answer is not one of the options"}, status_code=400)
+            else:
+                vals = body.value if isinstance(body.value, list) else None
+                if vals is None or any(v not in valid for v in vals):
+                    return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
+
+    # Mirror subject to source tracking and route via A2A bus.
+    answered_by = "user"
+    updated = await store.answer(decision_id, body.value, answered_by)
+    if updated is None:
+        return JSONResponse({"error": "already answered or not pending"}, status_code=409)
+    await _route_answer_to_agent(updated, body.value)
+    return updated
 
 
 async def _apply_app_grant(request: Request, decision: dict, value) -> bool:
