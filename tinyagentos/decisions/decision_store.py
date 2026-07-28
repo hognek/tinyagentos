@@ -157,12 +157,13 @@ class DecisionStore(BaseStore):
             desc = cur.description
         return [_row_to_decision(r, desc) for r in rows]
 
-    async def answer(self, decision_id: str, value, answered_by: str) -> dict | None:
+    async def answer(self, decision_id: str, value, answered_by: str, source: str = "in_app") -> dict | None:
         """Record an answer. Returns the updated decision, or None if the
         decision does not exist or is not pending (already answered or
-        superseded)."""
+        superseded). The *source* field distinguishes mirrored_from_chat
+        from in_app answers for audit/UI purposes."""
         now = time.time()
-        ans = json.dumps({"value": value, "answered_by": answered_by, "answered_at": now})
+        ans = json.dumps({"value": value, "answered_by": answered_by, "answered_at": now, "source": source})
         cur = await self._db.execute(
             """UPDATE decisions
                SET status = 'answered', answer = ?, answered_at = ?

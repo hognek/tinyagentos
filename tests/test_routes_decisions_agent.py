@@ -123,3 +123,195 @@ async def test_human_path_unchanged(client):
     d = resp.json()
     assert d["from_agent"] == "@taOS-dev"
     assert d["user_id"] == admin_id
+
+
+# ── Agent answer (mirror) tests ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_agent_answers_own_decision(client):
+    """An agent with a decisions_write grant can answer its own pending
+    decision via POST /api/decisions/{id}/answer/agent."""
+    app = client._transport.app
+    pid = await _new_project(client)
+    cid, token = await _mint_agent(app, pid, ("decisions_write",))
+
+    # Create a decision as the agent
+    async with _agent_client(app, token) as ac:
+        resp = await ac.post("/api/decisions", json=_decision_body(project_id=pid))
+    assert resp.status_code == 200, resp.text
+    did = resp.json()["id"]
+
+    # Answer it as the agent
+    async with _agent_client(app, token) as ac:
+        resp = await ac.post(
+            f"/api/decisions/{did}/answer/agent",
+            json={"value": "approve"},
+        )
+    assert resp.status_code == 200, resp.text
+    d = resp.json()
+    assert d["status"] == "answered"
+    ans = d["answer"]
+    assert ans["value"] == "approve"
+    assert ans["source"] == "mirrored_from_chat"
+    assert ans["answered_by"] == cid  # canonical agent id, not "user"
+
+
+@pytest.mark.asyncio
+async def test_agent_cannot_answer_others_decision(client):
+    """An agent answering a decision it did NOT ask must 404."""
+    app = client._transport.app
+    pid = await _new_project(client)
+
+    # Agent A creates a decision
+    cid_a, token_a = await _mint_agent(app, pid, ("decisions_write",), handle="@agent-a")
+    async with _agent_client(app, token_a) as ac:
+        resp = await ac.post("/api/decisions", json=_decision_body(project_id=pid))
+    assert resp.status_code == 200, resp.text
+    did = resp.json()["id"]
+
+    # Agent B tries to answer it
+    _cid_b, token_b = await _mint_agent(app, pid, ("decisions_write",), handle="@agent-b")
+    async with _agent_client(app, token_b) as ac:
+        resp = await ac.post(
+            f"/api/decisions/{did}/answer/agent",
+            json={"value": "approve"},
+        )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_agent_global_grant_answers_os_level(client):
+    """A global (null-project) grant lets the agent answer its own OS-level
+    decision."""
+    app = client._transport.app
+    cid, token = await _mint_agent(app, None, ("decisions_write",))
+
+    async with _agent_client(app, token) as ac:
+        resp = await ac.post("/api/decisions", json=_decision_body())
+    assert resp.status_code == 200, resp.text
+    did = resp.json()["id"]
+
+    async with _agent_client(app, token) as ac:
+        resp = await ac.post(
+            f"/api/decisions/{did}/answer/agent",
+            json={"value": "approve"},
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["answer"]["source"] == "mirrored_from_chat"
+    assert resp.json()["answer"]["answered_by"] == cid
+
+
+# ── Agent read-own tests ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_agent_reads_own_decision(client):
+    """An agent can GET /api/decisions/{id}/agent for a decision it asked."""
+    app = client._transport.app
+    pid = await _new_project(client)
+    cid, token = await _mint_agent(app, pid, ("decisions_write",))
+
+    async with _agent_client(app, token) as ac:
+        resp = await ac.post("/api/decisions", json=_decision_body(project_id=pid))
+    assert resp.status_code == 200, resp.text
+    did = resp.json()["id"]
+
+    async with _agent_client(app, token) as ac:
+        resp = await ac.get(f"/api/decisions/{did}/agent")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["id"] == did
+    assert resp.json()["from_agent"] == cid
+
+
+@pytest.mark.asyncio
+async def test_agent_cannot_read_others_decision(client):
+    """An agent reading a decision it did NOT ask must 404."""
+    app = client._transport.app
+    pid = await _new_project(client)
+
+    cid_a, token_a = await _mint_agent(app, pid, ("decisions_write",), handle="@agent-a")
+    async with _agent_client(app, token_a) as ac:
+        resp = await ac.post("/api/decisions", json=_decision_body(project_id=pid))
+    assert resp.status_code == 200, resp.text
+    did = resp.json()["id"]
+
+    _cid_b, token_b = await _mint_agent(app, pid, ("decisions_write",), handle="@agent-b")
+    async with _agent_client(app, token_b) as ac:
+        resp = await ac.get(f"/api/decisions/{did}/agent")
+    assert resp.status_code == 404, resp.text
+
+
+# ── Agent list-own tests ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_agent_lists_own_decisions(client):
+    """GET /api/decisions/agent returns only the asking agent's decisions."""
+    app = client._transport.app
+    pid = await _new_project(client)
+    cid_a, token_a = await _mint_agent(app, pid, ("decisions_write",), handle="@agent-a")
+    cid_b, token_b = await _mint_agent(app, pid, ("decisions_write",), handle="@agent-b")
+
+    # Agent A posts a decision
+    async with _agent_client(app, token_a) as ac:
+        resp = await ac.post("/api/decisions", json=_decision_body(project_id=pid))
+    assert resp.status_code == 200, resp.text
+
+    # Agent B posts a decision
+    async with _agent_client(app, token_b) as ac:
+        resp = await ac.post("/api/decisions", json=_decision_body(project_id=pid))
+    assert resp.status_code == 200, resp.text
+
+    # Agent A's list only shows its own
+    async with _agent_client(app, token_a) as ac:
+        resp = await ac.get("/api/decisions/agent")
+    assert resp.status_code == 200, resp.text
+    items = resp.json()["items"]
+    assert len(items) == 1
+    assert items[0]["from_agent"] == cid_a
+
+    # Agent B's list only shows its own
+    async with _agent_client(app, token_b) as ac:
+        resp = await ac.get("/api/decisions/agent")
+    assert resp.status_code == 200, resp.text
+    items = resp.json()["items"]
+    assert len(items) == 1
+    assert items[0]["from_agent"] == cid_b
+
+
+@pytest.mark.asyncio
+async def test_agent_list_no_grant_403(client):
+    """An agent without a decisions_write grant cannot list."""
+    app = client._transport.app
+    pid = await _new_project(client)
+    _cid, token = await _mint_agent(app, pid, ("project_tasks",))
+
+    async with _agent_client(app, token) as ac:
+        resp = await ac.get("/api/decisions/agent")
+    assert resp.status_code == 403, resp.text
+
+
+# ── Route order test ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_agent_list_is_not_human_get(client):
+    """GET /api/decisions/agent reaches the list endpoint, not
+    GET /api/decisions/{decision_id} with decision_id='agent'."""
+    app = client._transport.app
+    pid = await _new_project(client)
+    cid, token = await _mint_agent(app, pid, ("decisions_write",))
+
+    # Create a decision so the list is non-empty
+    async with _agent_client(app, token) as ac:
+        resp = await ac.post("/api/decisions", json=_decision_body(project_id=pid))
+    assert resp.status_code == 200, resp.text
+
+    # The list endpoint returns {"items": [...]}, not a single decision
+    async with _agent_client(app, token) as ac:
+        resp = await ac.get("/api/decisions/agent")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert "items" in data  # list response shape
+    assert len(data["items"]) >= 1

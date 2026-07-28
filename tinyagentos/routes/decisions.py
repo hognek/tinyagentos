@@ -262,6 +262,23 @@ async def list_decisions(
     return {"items": items}
 
 
+# Agent-decisions list (filtered by the asking agent). Must be registered
+# BEFORE the parameterised GET /api/decisions/{decision_id} so the literal
+# "agent" segment is not captured as a decision_id.
+@router.get("/api/decisions/agent")
+async def list_decisions_as_agent(request: Request):
+    """Agent-facing list: filter by from_agent (the asking agent).  An agent
+    sees every decision it asked, across all projects.  The store layer
+    enforces the from_agent binding so there is no cross-agent leakage."""
+    from tinyagentos.agent_token_auth import check_agent_scope
+    canonical_id = await check_agent_scope(request, "decisions_write")
+    if canonical_id is None:
+        return JSONResponse({"error": "agent identity not found"}, status_code=401)
+    store = request.app.state.decision_store
+    items = await store.list(from_agent=canonical_id, limit=500)
+    return {"items": items}
+
+
 @router.get("/api/decisions/{decision_id}")
 async def get_decision(decision_id: str, request: Request, user: CurrentUser = Depends(current_user)):
     # Session-only path: human reading their own or admin reading any
@@ -274,38 +291,17 @@ async def get_decision(decision_id: str, request: Request, user: CurrentUser = D
 
 @router.get("/api/decisions/{decision_id}/agent")
 async def get_decision_as_agent(decision_id: str, request: Request):
-    # Agent path: the agent may read any decision they asked (matched by from_agent).
-    # Let the store layer enforce the authorization; it returns None if the agent
-    # does not own this decision, and the route will return a 404.
+    # Agent path: verify the registry JWT holds decisions_write for the
+    # decision's project (or globally) and that from_agent matches.
     store = request.app.state.decision_store
     d = await store.get(decision_id)
     if d is None:
         return JSONResponse({"error": "not found"}, status_code=404)
-    # Verify the agent owns this decision: the agent must match d["from_agent"]
-    # The middleware has already routed here because _is_agent_decisions_path allowed
-    # this exact (method, path) pattern, so request.state.user_id is the canonical_id
-    # from the registry JWT. Compare against the decision's from_agent field.
-    if d.get("from_agent") != getattr(request.state, "user_id", None):
+    from tinyagentos.agent_token_auth import check_agent_scope_for_project
+    cid = await check_agent_scope_for_project(request, "decisions_write", d.get("project_id"))
+    if cid is None or d.get("from_agent") != cid:
         return JSONResponse({"error": "not found"}, status_code=404)
     return d
-
-
-# Agent-decisions list (filtered by agent or project)
-@router.get("/api/decisions/agent")
-async def list_decisions_as_agent(request: Request):
-    """Agent-facing list: filter by from_agent (the asking agent) or project_id
-    (via decisions_write grant binding). This matches taOSmd patterns and UI:
-    agents see all decisions they asked, grouped by project where applicable.
-    Includes source field (in_app / mirrored_from_chat) visible in UI."""
-    store = request.app.state.decision_store
-    # The agent may only see decisions they asked: match from_agent to the canonical_id.
-    canonical_id = getattr(request.state, "user_id", None)
-    if canonical_id is None:
-        return JSONResponse({"error": "agent identity not found"}, status_code=400)
-    # The store layer already enforces that from_agent matches the canonical_id,
-    # so passing from_agent here is safe. Let the store filter for this agent.
-    items = await store.list(from_agent=canonical_id, limit=500)
-    return {"items": items}
 
 
 @router.get("/api/decisions/{decision_id}/history")
@@ -369,7 +365,7 @@ async def answer_decision(decision_id: str, body: AnswerIn, request: Request, us
         answered_by = user.user_id or "user"
     else:
         answered_by = body.answered_by or user.user_id or "user"
-    updated = await store.answer(decision_id, body.value, answered_by)
+    updated = await store.answer(decision_id, body.value, answered_by, source=source)
     if updated is None:
         return JSONResponse({"error": "already answered or not pending"}, status_code=409)
     # Each kind-specific handler runs its side effect and returns True if it
@@ -491,16 +487,19 @@ async def _apply_delegation_grant(request: Request, decision: dict, value) -> bo
 @router.post("/api/decisions/{decision_id}/answer/agent")
 async def answer_decision_as_agent(decision_id: str, body: AnswerIn, request: Request):
     """Agent mirror: only the asking agent can answer its own decision.
-    Validates the agent token (via _is_agent_decisions_path), verifies the decision
-    belongs to the agent (checks from_agent), records the answer as mirrored
-    (source=mirrored_from_chat), then pushes to the asking agent via A2A bus."""
+    Verifies the registry JWT holds decisions_write for the decision's project,
+    checks from_agent ownership, records the answer with source=mirrored_from_chat
+    and the agent's canonical id as the mirroring actor, runs consent side effects
+    (app/execution/delegation grants), then pushes to the asking agent via A2A."""
     store = request.app.state.decision_store
     existing = await store.get(decision_id)
     if existing is None or existing.get("status") != "pending":
         return JSONResponse({"error": "not found or not pending"}, status_code=404)
 
-    # Ownership check: agent must match from_agent
-    if existing.get("from_agent") != getattr(request.state, "user_id", None):
+    # Verify the registry JWT + grant, then check ownership.
+    from tinyagentos.agent_token_auth import check_agent_scope_for_project
+    cid = await check_agent_scope_for_project(request, "decisions_write", existing.get("project_id"))
+    if cid is None or existing.get("from_agent") != cid:
         return JSONResponse({"error": "not found"}, status_code=404)
 
     # Validate select-type answers against declared options (same as human path).
@@ -520,23 +519,23 @@ async def answer_decision_as_agent(decision_id: str, body: AnswerIn, request: Re
                 if vals is None or any(v not in valid for v in vals):
                     return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
 
-    # Agent mirror: record as "user" so the audit trail shows Jay as decider.
-    # Explicit source=mirrored_from_chat is honored from the body.
-    source = body.source or "mirrored_from_chat"
-    answered_by = "user"
-    updated = await store.answer(decision_id, body.value, answered_by)
+    # Agent mirrors are always from chat; record the canonical agent id as the
+    # mirroring actor (not "user") so the audit trail is complete.
+    source = "mirrored_from_chat"
+    answered_by = cid
+    updated = await store.answer(decision_id, body.value, answered_by, source=source)
     if updated is None:
         return JSONResponse({"error": "already answered or not pending"}, status_code=409)
-    await _route_answer_to_agent(updated, body.value)
+
+    # Run consent side effects (same as the human answer path).  Each handler
+    # returns True if it already routed a reply to the asking agent, in which
+    # case we skip the generic answer route to avoid double-messaging.
+    routed_app = await _apply_app_grant(request, updated, body.value)
+    routed_exec = await _apply_execution_grant(request, updated, body.value)
+    routed_deleg = await _apply_delegation_grant(request, updated, body.value)
+    if not (routed_app or routed_exec or routed_deleg):
+        await _route_answer_to_agent(updated, body.value)
     return updated
-
-
-# NOTICE: The human-answering path (/api/decisions/{id}/answer) remains session-only
-# as documented. Agent-token mirroring is gated by the _AGENT_DECISIONS_ROUTES allowlist
-# and only reaches this function when the agent token holds a decisions_write grant.
-# The human-answer endpoint does NOT accept agent tokens (due to the allowlist contract),
-# preserving a strict separation between human and agent decision actions.
-# The source field is preserved in the stored answer JSON (from tinyagentos.decisions.decision_store.AnswerIn).
 
 
 async def _apply_app_grant(request: Request, decision: dict, value) -> bool:
