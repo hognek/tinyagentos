@@ -589,7 +589,7 @@ class TestInstallV2:
             f"expected 403 after tampering, got {resp.status_code}: {resp.json()}"
         )
         body = resp.json()
-        assert body["error"] == "manifest modified between signature verification and install"
+        assert body["error"] == "manifest signature re-verification failed"
         assert "install_id" in body
 
         # Restore the original so teardown is clean.
@@ -642,10 +642,11 @@ class TestInstallV2:
         })
         assert resp.status_code == 403
         assert resp.json()["error"] == (
-            "manifest modified between signature verification and install"
+            "manifest signature re-verification failed"
         )
 
     @pytest.mark.asyncio
+    @pytest.mark.skipif(os.geteuid() == 0, reason="chmod 0o000 is a no-op for root")
     async def test_toctou_manifest_unreadable_returns_403(self, client, tmp_path):
         """TOCTOU re-verify returns 403 when manifest.yaml cannot be read
         (permissions revoked) between the initial gate and the install."""
@@ -685,7 +686,7 @@ class TestInstallV2:
             })
             assert resp.status_code == 403
             assert resp.json()["error"] == (
-                "manifest modified between signature verification and install"
+                "manifest signature re-verification failed"
             )
         finally:
             os.chmod(manifest_path, 0o644)  # restore so tmp_path can clean up
@@ -730,7 +731,7 @@ class TestInstallV2:
         })
         assert resp.status_code == 403
         assert resp.json()["error"] == (
-            "manifest modified between signature verification and install"
+            "manifest signature re-verification failed"
         )
 
     @pytest.mark.asyncio
@@ -775,7 +776,7 @@ class TestInstallV2:
         })
         assert resp.status_code == 403
         assert resp.json()["error"] == (
-            "manifest modified between signature verification and install"
+            "manifest signature re-verification failed"
         )
 
     @pytest.mark.asyncio
@@ -822,7 +823,7 @@ class TestInstallV2:
         })
         assert resp.status_code == 403
         assert resp.json()["error"] == (
-            "manifest modified between signature verification and install"
+            "manifest signature re-verification failed"
         )
 
     @pytest.mark.asyncio
