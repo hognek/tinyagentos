@@ -411,10 +411,10 @@ async def test_agent_cross_project_read_blocks_wrong_project(client):
     # Agent with only project B grant tries to read the project A decision.
     async with _agent_client(app, token) as ac:
         resp = await ac.get(f"/api/decisions/{did}/agent")
-    # Project-scoped check must block: 403, not 200 (the 5d207ec leak) nor
-    # 404 (which could be misread as "decision doesn't exist").
-    assert resp.status_code == 403, (
-        f"expected 403 cross-project block, got {resp.status_code}: {resp.text}"
+    # Project-scoped check blocks with 404 (PROJECT_SCOPE_MISMATCH collapsed
+    # to not-found to avoid making the route an existence oracle).
+    assert resp.status_code == 404, (
+        f"expected 404 cross-project block, got {resp.status_code}: {resp.text}"
     )
 
 
@@ -443,6 +443,100 @@ async def test_agent_cross_project_answer_blocks_wrong_project(client):
             f"/api/decisions/{did}/answer/agent",
             json={"value": "approve"},
         )
-    assert resp.status_code == 403, (
-        f"expected 403 cross-project block, got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 404, (
+        f"expected 404 cross-project block, got {resp.status_code}: {resp.text}"
     )
+
+
+# ── Expired-grant test ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_agent_expired_grant_cannot_read(client):
+    """Agent with an expired decisions_write grant on project A but an active
+    grant on project B cannot read a decision on project A (even when
+    from_agent matches)."""
+    app = client._transport.app
+    from datetime import datetime, timedelta, timezone
+
+    pid_a = await _new_project(client, name="alpha", slug="alpha")
+    pid_b = await _new_project(client, name="beta", slug="beta")
+
+    registry = app.state.agent_registry
+    grants = app.state.agent_grants
+    for store_obj in (registry, grants):
+        if store_obj._db is None:
+            await store_obj.init()
+    priv, _pub = app.state.agent_registry_keypair
+    rec = await registry.register(
+        framework="claude-code",
+        display_name="taOS dev",
+        origin="internal",
+        handle="@expired-x",
+    )
+    cid = rec["canonical_id"]
+    if rec.get("status") != "active":
+        await registry.set_status(cid, "active")
+
+    # Expired grant on project A
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    await grants.add_grant(cid, "decisions_write", project_id=pid_a, expires_at=past)
+    # Active grant on project B
+    await grants.add_grant(cid, "decisions_write", project_id=pid_b)
+
+    token = mint_registry_token(
+        cid, priv, user_id="u", framework="claude-code", project_id=pid_b
+    )
+
+    # Admin creates a decision on project A attributed to the agent.
+    resp = await client.post(
+        "/api/decisions",
+        json=_decision_body(project_id=pid_a, from_agent=cid),
+    )
+    assert resp.status_code == 200, resp.text
+    did = resp.json()["id"]
+
+    async with _agent_client(app, token) as ac:
+        resp = await ac.get(f"/api/decisions/{did}/agent")
+    # Expired grant → PROJECT_SCOPE_MISMATCH → collapsed to 404.
+    assert resp.status_code == 404, (
+        f"expected 404 for expired grant, got {resp.status_code}: {resp.text}"
+    )
+
+
+# ── Cross-project list isolation test ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_agent_list_respects_project_grants(client):
+    """Agent with decisions_write only on project B does not see its own
+    decisions on project A in the list endpoint."""
+    app = client._transport.app
+
+    pid_a = await _new_project(client, name="alpha", slug="alpha-2")
+    pid_b = await _new_project(client, name="beta", slug="beta-2")
+    cid, token = await _mint_agent(app, pid_b, ("decisions_write",), handle="@cross-list")
+
+    # Admin creates a decision on project A attributed to the agent
+    # (simulating a grant that was later revoked).
+    resp = await client.post(
+        "/api/decisions",
+        json=_decision_body(project_id=pid_a, from_agent=cid),
+    )
+    assert resp.status_code == 200, resp.text
+
+    # Agent creates a decision on project B (its granted project)
+    async with _agent_client(app, token) as ac:
+        resp = await ac.post(
+            "/api/decisions",
+            json=_decision_body(project_id=pid_b),
+        )
+    assert resp.status_code == 200, resp.text
+
+    # List: must only show the project-B decision, not the project-A one.
+    async with _agent_client(app, token) as ac:
+        resp = await ac.get("/api/decisions/agent")
+    assert resp.status_code == 200, resp.text
+    items = resp.json()["items"]
+    assert len(items) == 1
+    assert items[0]["project_id"] == pid_b

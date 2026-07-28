@@ -132,18 +132,6 @@ class _DecisionActor:
     is_admin: bool           # human-path admin flag; always False for agents
 
 
-@dataclass
-class _DecisionFilter:
-    """Query parameters for filtering decisions (agent-readable only)."""
-    from_agent: str | None = None
-    project_id: str | None = None
-    deadline: str | None = None
-    metadata_kind: str | None = None
-    # New: pending-age filter to surface cards older than a threshold (seconds).
-    # Queries decisions pending beyond the age threshold for sweeping.
-    pending_age_gt: float | None = None
-
-
 async def _resolve_decision_actor(request: Request, project_id: str | None) -> _DecisionActor:
     """Authorize the caller as either a granted agent or a human session.
 
@@ -267,15 +255,33 @@ async def list_decisions(
 # "agent" segment is not captured as a decision_id.
 @router.get("/api/decisions/agent")
 async def list_decisions_as_agent(request: Request):
-    """Agent-facing list: filter by from_agent (the asking agent).  An agent
-    sees every decision it asked, across all projects.  The store layer
+    """Agent-facing list: filter by from_agent (the asking agent).  Only
+    returns decisions whose project the agent holds an active decisions_write
+    grant for; a global (null-project) grant shows all.  The store layer
     enforces the from_agent binding so there is no cross-agent leakage."""
-    from tinyagentos.agent_token_auth import check_agent_scope
+    from datetime import datetime, timezone
+    from tinyagentos.agent_token_auth import check_agent_scope, _grant_unexpired
+
     canonical_id = await check_agent_scope(request, "decisions_write")
     if canonical_id is None:
         return JSONResponse({"error": "agent identity not found"}, status_code=401)
+
+    # Collect project IDs the agent has active decisions_write grants for.
+    grants_store = request.app.state.agent_grants
+    now = datetime.now(timezone.utc)
+    grants = await grants_store.list_grants(canonical_id)
+    allowed_projects: set[str | None] = {
+        g.get("project_id")
+        for g in grants
+        if g["scope"] == "decisions_write" and _grant_unexpired(g.get("expires_at"), now)
+    }
+
     store = request.app.state.decision_store
     items = await store.list(from_agent=canonical_id, limit=500)
+    # A global (null-project) grant shows all; otherwise filter to decisions
+    # whose project_id is in the allowed set.
+    if None not in allowed_projects:
+        items = [d for d in items if d.get("project_id") in allowed_projects]
     return {"items": items}
 
 
@@ -293,7 +299,11 @@ async def get_decision(decision_id: str, request: Request, user: CurrentUser = D
 async def get_decision_as_agent(decision_id: str, request: Request):
     # JWT-first: validate the bearer token before touching the decision
     # store so invalid tokens cannot probe decision existence via timing.
-    from tinyagentos.agent_token_auth import check_agent_identity
+    from tinyagentos.agent_token_auth import (
+        check_agent_identity,
+        check_agent_scope_for_project,
+        PROJECT_SCOPE_MISMATCH_DETAIL,
+    )
     caller = await check_agent_identity(request)
     if caller is None:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -308,10 +318,16 @@ async def get_decision_as_agent(decision_id: str, request: Request):
     # mistakenly swapped this for project-agnostic check_agent_scope,
     # letting any decisions_write grant on ANY project authorize read
     # on EVERY project.  Restored from 6410e3c.
-    from tinyagentos.agent_token_auth import check_agent_scope_for_project
-    cid = await check_agent_scope_for_project(
-        request, "decisions_write", d.get("project_id")
-    )
+    # Collapse PROJECT_SCOPE_MISMATCH to 404 so the route is not an
+    # existence oracle (never distinguish 403-vs-404 to a caller).
+    try:
+        cid = await check_agent_scope_for_project(
+            request, "decisions_write", d.get("project_id")
+        )
+    except HTTPException as exc:
+        if exc.status_code == 403 and exc.detail == PROJECT_SCOPE_MISMATCH_DETAIL:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        raise
     if cid is None or d.get("from_agent") != cid:
         return JSONResponse({"error": "not found"}, status_code=404)
     return d
@@ -510,8 +526,9 @@ async def answer_decision_as_agent(decision_id: str, body: AnswerIn, request: Re
     """Agent mirror: only the asking agent can answer its own decision.
     Verifies the registry JWT holds decisions_write for the decision's project,
     checks from_agent ownership, records the answer with source=mirrored_from_chat
-    and the agent's canonical id as the mirroring actor, runs consent side effects
-    (app/execution/delegation grants), then pushes to the asking agent via A2A."""
+    and the agent's canonical id as the mirroring actor, then pushes to the
+    asking agent via A2A.  Consent side effects (app/execution/delegation grants)
+    are intentionally NOT run on this path for gate-kind decisions (409)."""
     # JWT-first: validate the bearer token before touching the decision
     # store so invalid tokens cannot probe decision existence via timing.
     from tinyagentos.agent_token_auth import check_agent_identity
@@ -529,10 +546,20 @@ async def answer_decision_as_agent(decision_id: str, body: AnswerIn, request: Re
     # mistakenly swapped this for project-agnostic check_agent_scope,
     # letting any decisions_write grant on ANY project authorize answer
     # on EVERY project.  Restored from 6410e3c.
-    from tinyagentos.agent_token_auth import check_agent_scope_for_project
-    canonical_id = await check_agent_scope_for_project(
-        request, "decisions_write", existing.get("project_id")
+    # Collapse PROJECT_SCOPE_MISMATCH to 404 so the route is not an
+    # existence oracle (never distinguish 403-vs-404 to a caller).
+    from tinyagentos.agent_token_auth import (
+        check_agent_scope_for_project,
+        PROJECT_SCOPE_MISMATCH_DETAIL,
     )
+    try:
+        canonical_id = await check_agent_scope_for_project(
+            request, "decisions_write", existing.get("project_id")
+        )
+    except HTTPException as exc:
+        if exc.status_code == 403 and exc.detail == PROJECT_SCOPE_MISMATCH_DETAIL:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        raise
     if canonical_id is None:
         return JSONResponse({"error": "not found"}, status_code=404)
 
