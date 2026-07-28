@@ -435,54 +435,12 @@
   display: flex;
   min-height: 0;
 }
-.wsLeft {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-}
-.wsDivider {
-  width: 5px;
-  flex: none;
-  cursor: col-resize;
-  position: relative;
-  background: transparent;
-}
-.wsDivider::before {
-  content: "";
-  position: absolute;
-  left: 2px;
-  top: 0;
-  bottom: 0;
-  width: 1px;
-  background: var(--color-shell-border);
-}
-.wsDivider::after {
-  content: "";
-  position: absolute;
-  left: 1px;
-  top: 50%;
-  transform: translateY(-50%);
-  width: 3px;
-  height: 34px;
-  border-radius: 99px;
-  background: var(--color-shell-border-strong);
-}
 .wsRight {
   flex: none;
   display: flex;
   flex-direction: column;
   min-height: 0;
   background: var(--color-shell-bg-deep);
-}
-
-/* left: thread host (MessagesApp scoped to the project) */
-.wsThread {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
 }
 
 /* right: preview pane */
@@ -668,9 +626,6 @@
   }
   .ws {
     flex-direction: column;
-  }
-  .wsDivider {
-    display: none;
   }
   .wsRight {
     width: 100% !important;

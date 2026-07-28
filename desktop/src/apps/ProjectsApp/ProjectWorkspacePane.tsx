@@ -1,87 +1,29 @@
-import { useRef, useState } from "react";
+import { useState } from "react";
 import type { Project } from "@/lib/projects";
-import { MessagesApp } from "@/apps/MessagesApp";
 import { CanvasView } from "./canvas/CanvasView";
-import { useIsMobile } from "../../hooks/use-is-mobile";
 import styles from "./ProjectsApp.module.css";
 
 type PreviewMode = "preview" | "code" | "canvas";
 
-const MIN_RIGHT = 320;
-const MIN_LEFT = 360;
-
 /**
- * The Workspace tab (task #59 hero): a split pane.
+ * The Workspace tab (task #59 hero): the design / edit / view surface, with a
+ * Preview | Code | Canvas segmented toggle and a small toolbar.
  *
- *   LEFT:  the project channel thread + composer. Reuses the existing
- *          project-scoped MessagesApp (humans + agents, send logic, A2A bus),
- *          so this is real data, not a mock.
- *   RIGHT: a live-preview pane with a Preview | Code | Canvas segmented
- *          toggle and a small toolbar.
+ * This used to be a split pane with the project channel thread on the left.
+ * That was removed: Messages already has its own dedicated tab, so the split
+ * duplicated it and spent roughly half the width on a second copy of a view the
+ * user could already open full size.
  *
  * Phase 1 scope: the Canvas toggle embeds the real project canvas. Preview and
  * Code render honest placeholders rather than faking a running app build. A
  * true streamed live build preview is #59 phase 2/3 (see TODO below).
  */
 export function ProjectWorkspacePane({ project }: { project: Project }) {
-  const isMobile = useIsMobile();
   const [mode, setMode] = useState<PreviewMode>("preview");
-  const [rightWidth, setRightWidth] = useState(472);
-  const containerRef = useRef<HTMLDivElement>(null);
-  const draggingRef = useRef(false);
-
-  const onDividerDown = (e: React.PointerEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    draggingRef.current = true;
-    e.currentTarget.setPointerCapture(e.pointerId);
-  };
-  const onDividerMove = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!draggingRef.current || !containerRef.current) return;
-    const rect = containerRef.current.getBoundingClientRect();
-    const next = rect.right - e.clientX;
-    setRightWidth(Math.max(MIN_RIGHT, Math.min(rect.width - MIN_LEFT, next)));
-  };
-  const onDividerUp = (e: React.PointerEvent<HTMLDivElement>) => {
-    draggingRef.current = false;
-    try {
-      e.currentTarget.releasePointerCapture(e.pointerId);
-    } catch {
-      // pointer may already be released
-    }
-  };
 
   return (
-    <div className={styles.ws} ref={containerRef}>
-      {/* LEFT: real project channel thread + composer. Desktop only -- on mobile
-          the squeezed split made messages unreadable, so Messages is its own
-          full-page tab and the Workspace pane shows just the preview. */}
-      {!isMobile && (
-        <>
-          <div className={styles.wsLeft}>
-            <div className={styles.wsThread}>
-              <MessagesApp
-                key={project.id}
-                windowId={`project-workspace-messages-${project.id}`}
-                scope={{ projectId: project.id }}
-              />
-            </div>
-          </div>
-
-          {/* draggable resize divider */}
-          <div
-            className={styles.wsDivider}
-            role="separator"
-            aria-orientation="vertical"
-            aria-label="Resize panes"
-            onPointerDown={onDividerDown}
-            onPointerMove={onDividerMove}
-            onPointerUp={onDividerUp}
-          />
-        </>
-      )}
-
-      {/* RIGHT: preview / code / canvas (full width on mobile) */}
-      <div className={styles.wsRight} style={isMobile ? { width: "100%", flex: 1 } : { width: rightWidth }}>
+    <div className={styles.ws}>
+      <div className={styles.wsRight} style={{ width: "100%", flex: 1 }}>
         <div className={styles.pvBar}>
           <div className={styles.seg} role="tablist" aria-label="Preview mode">
             {(["preview", "code", "canvas"] as PreviewMode[]).map((m) => (
