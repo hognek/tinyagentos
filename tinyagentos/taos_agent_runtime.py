@@ -8,7 +8,10 @@ app.state so opencode remembers conversation history across requests.
 from __future__ import annotations
 
 import logging
+import re
 import secrets
+import shutil
+from pathlib import Path
 
 from tinyagentos.litellm_config import get_litellm_master_key
 from tinyagentos.opencode_runtime import OpenCodeServer, OpenCodeServerConfig
@@ -16,6 +19,22 @@ from tinyagentos.opencode_runtime import OpenCodeServer, OpenCodeServerConfig
 logger = logging.getLogger(__name__)
 
 TAOS_OPENCODE_PORT = 4188  # local-only port for the taOS agent opencode server
+
+# Safe filesystem component for opencode home directories.  Agent ids and
+# LiteLLM model names can contain '/' (openai/gpt-4o) and other characters
+# unsafe for a path; this collapses them to a flat slug.  Must stay in sync
+# with the mint-side validator in routes/agent_model_keys.py.
+_SAFE_COMPONENT_RE = re.compile(r"[^A-Za-z0-9._-]")
+
+
+def _safe_path_component(value: str) -> str:
+    """Replace characters unsafe for a filesystem path component.
+
+    A model id like ``openai/gpt-4o`` becomes ``openai_gpt-4o`` so the
+    opencode home stays flat under data_dir.  Traversal payloads like
+    ``../../x`` collapse to ``.._.._x`` — harmless without real slashes.
+    """
+    return _SAFE_COMPONENT_RE.sub("_", value)
 
 
 async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
@@ -153,7 +172,8 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
         app_state.taos_opencode_key = litellm_key
 
         data_dir = getattr(app_state, "data_dir", None)
-        home = str(data_dir / f"taos-agent-opencode-{model}") if data_dir else f"taos-agent-opencode-{model}"
+        safe_model = _safe_path_component(model)
+        home = str(data_dir / f"taos-agent-opencode-{safe_model}") if data_dir else f"taos-agent-opencode-{safe_model}"
 
         cfg = OpenCodeServerConfig(
             home=home,
@@ -188,10 +208,14 @@ async def stop_taos_opencode_server(app_state) -> None:
 
     Safe to call even if no server was ever created. Iterates the per-agent
     cache (taos_opencode_servers) added for concurrent agent support.
+
+    Each per-model home directory is removed so stale configs and serve logs
+    do not accumulate across model switches (CodeRabbit review, PR #2195).
     """
     servers = getattr(app_state, "taos_opencode_servers", None)
     if not servers:
         return
+    data_dir = getattr(app_state, "data_dir", None)
     for model, server in list(servers.items()):
         if server is None:
             continue
@@ -199,6 +223,17 @@ async def stop_taos_opencode_server(app_state) -> None:
             await server.stop()
         except Exception:
             logger.debug("taos_agent_runtime: error during stop", exc_info=True)
+        # Remove the per-model home directory.  Build the path the same way
+        # ensure_taos_opencode_server does (slugified model component).
+        if data_dir is not None:
+            safe_model = _safe_path_component(model)
+            home = data_dir / f"taos-agent-opencode-{safe_model}"
+            try:
+                shutil.rmtree(home, ignore_errors=True)
+            except Exception:
+                logger.debug(
+                    "taos_agent_runtime: error removing home %s", home, exc_info=True
+                )
     app_state.taos_opencode_servers = {}
     app_state.taos_opencode_sessions = {}
     app_state.taos_opencode_born_degraded = {}
