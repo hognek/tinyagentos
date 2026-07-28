@@ -5,7 +5,29 @@ before they ever reach the store, regardless of authentication.
 """
 from __future__ import annotations
 
+import asyncio
+
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _ensure_agent_model_key_store(client, tmp_path_factory):
+    """Init app.state.agent_model_keys on a fresh DB; the test client registers
+    the store but does not run the lifespan that init()s it (production does)."""
+    store = client._transport.app.state.agent_model_keys
+    if store._db is not None:
+        try:
+            asyncio.get_event_loop().run_until_complete(store.close())
+        except Exception:
+            pass
+    tmp_dir = tmp_path_factory.mktemp("agent_model_keys_route_test")
+    store.db_path = tmp_dir / "agent_model_keys.db"
+    asyncio.get_event_loop().run_until_complete(store.init())
+    yield
+    try:
+        asyncio.get_event_loop().run_until_complete(store.close())
+    except Exception:
+        pass
 
 
 @pytest.mark.asyncio
