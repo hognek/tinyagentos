@@ -279,3 +279,40 @@ class TestAdminGate:
         app.state.auth.session_user = lambda token: {"is_admin": False, "username": "guest"}
         resp = await client.get("/api/taos-agent/config")
         assert resp.status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# _safe_path_component (taos_agent_runtime)
+# ---------------------------------------------------------------------------
+
+from tinyagentos.taos_agent_runtime import _safe_path_component
+
+
+class TestSafePathComponent:
+    """Model names become filesystem path components — must be sanitized."""
+
+    @pytest.mark.parametrize(
+        "model,expected",
+        [
+            ("gpt-4o", "gpt-4o"),
+            ("openai/gpt-4o", "openai_gpt-4o"),
+            # Dots stay but slashes are gone — no real traversal possible.
+            ("../../x", ".._.._x"),
+            ("/etc/passwd", "_etc_passwd"),
+            ("a\\b", "a_b"),
+            ("a b", "a_b"),
+            # Dots are safe — they look odd as a dir name but can't escape.
+            ("...", "..."),
+            ("safe_model.name-v2", "safe_model.name-v2"),
+            ("openai/gpt-4o-mini", "openai_gpt-4o-mini"),
+            ("", ""),
+        ],
+    )
+    def test_slugifies_unsafe_characters(self, model, expected):
+        """Path separators and other unsafe chars are replaced with '_'.
+
+        Dots are preserved (part of the safe slug set); without real '/'
+        separators a dotted component like ``.._.._x`` cannot escape the
+        data_dir boundary.
+        """
+        assert _safe_path_component(model) == expected

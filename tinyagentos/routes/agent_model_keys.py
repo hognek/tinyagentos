@@ -13,15 +13,31 @@ its hash), so the response is the sole opportunity to show it to the user.
 """
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from tinyagentos.auth_context import CurrentUser, current_user
 
 router = APIRouter()
+
+# Agent ids are used as filesystem path components (opencode home dirs) and
+# LiteLLM model identifiers; reject traversal, dot-segments, and anything
+# that isn't a safe slug so a malicious mint can't write configs outside
+# the data_dir boundary.  Matches the sanitizer in taos_agent_runtime.py.
+_AGENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _validate_agent_id(v: str) -> str:
+    if not _AGENT_ID_RE.match(v):
+        raise ValueError(
+            f"agent_id {v!r} contains invalid characters; "
+            "only A-Z, a-z, 0-9, '.', '_', '-' are allowed"
+        )
+    return v
 
 
 class MintIn(BaseModel):
@@ -29,6 +45,14 @@ class MintIn(BaseModel):
     scopes: list[str] = []
     rate_cap: Optional[int] = None
     expires_at: Optional[str] = None  # ISO-8601, timezone-aware
+
+    @field_validator("agent_ids")
+    @classmethod
+    def _validate_agent_ids(cls, v: list[str]) -> list[str]:
+        """Reject path traversal and unsafe characters in agent ids."""
+        if not v:
+            raise ValueError("at least one agent_id is required")
+        return [_validate_agent_id(a) for a in v]
 
 
 @router.get("/api/agent-model-keys")
