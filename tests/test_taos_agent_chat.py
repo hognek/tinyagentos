@@ -448,10 +448,11 @@ async def test_ensure_server_reuses_persisted_key(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ensure_server_rescope_failure_marks_degraded(tmp_path, monkeypatch):
-    """When update_agent_key returns False (re-scope failure), the server is still
-    created but marks that model as born degraded — and crucially does NOT crash
-    with AttributeError from rebinding the born_degraded dict to a bool."""
+async def test_ensure_server_rescope_failure_keeps_cached_server(tmp_path, monkeypatch):
+    """When update_agent_key returns False (re-scope no-op), the server is
+    created but NOT marked as born degraded — the proxy is already running
+    so this is a routing-only key-scope no-op, not a degradation. A second
+    ensure call must reuse the cached server, proving no restart churn."""
     import tinyagentos.taos_agent_runtime as rt
 
     spawned_cfgs: list = []
@@ -480,8 +481,7 @@ async def test_ensure_server_rescope_failure_marks_degraded(tmp_path, monkeypatc
 
     mock_proxy = MagicMock()
     mock_proxy.create_agent_key = AsyncMock(return_value="sk-NEW-should-not-be-used")
-    # Re-scope FAILS — triggers born_degraded_now = True (the old born_degraded = True
-    # would have rebound the dict to a bool, crashing at .get() on the next line).
+    # Re-scope returns False — routing-only no-op, not a proxy degradation.
     mock_proxy.update_agent_key = AsyncMock(return_value=False)
     mock_proxy.is_running.return_value = True
 
@@ -495,14 +495,19 @@ async def test_ensure_server_rescope_failure_marks_degraded(tmp_path, monkeypatc
         taos_opencode_session_id=None,
     )
 
-    # Must NOT raise AttributeError.
+    # First call: must create the server and NOT mark it degraded.
     await rt.ensure_taos_opencode_server(state, "gpt-4o")
 
     assert spawned_cfgs[0].litellm_key == "sk-persisted-9"
-    # The server was born while the proxy was running, but the re-scope failed
-    # so the flag should be True (marked degraded).
-    assert state.taos_opencode_born_degraded["gpt-4o"] is True
+    # Proxy IS running, re-scope no-op → NOT degraded.
+    assert state.taos_opencode_born_degraded["gpt-4o"] is False
     mock_proxy.update_agent_key.assert_awaited()
+    assert len(spawned_cfgs) == 1
+
+    # Second call: must reuse the cached server, no restart churn.
+    mock_proxy.update_agent_key.reset_mock()
+    await rt.ensure_taos_opencode_server(state, "gpt-4o")
+    assert len(spawned_cfgs) == 1
 
 
 # ---------------------------------------------------------------------------

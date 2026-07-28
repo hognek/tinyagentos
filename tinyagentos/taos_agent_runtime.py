@@ -92,6 +92,7 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
                     logger.debug("taos_agent_runtime: error stopping old server", exc_info=True)
                 servers.pop(other_model, None)
                 sessions.pop(other_model, None)
+                born_degraded.pop(other_model, None)
         # Clear the legacy session id so the desktop chat path does not feed
         # a stale session from a now-stopped model to the new server.
         app_state.taos_opencode_session_id = None
@@ -134,7 +135,6 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
                             "taos_agent_runtime: re-scoping the taOS agent key returned False "
                             "(key scope may be stale)"
                         )
-                        born_degraded_now = True
                 except Exception:
                     logger.debug("taos_agent_runtime: re-scoping stored key failed", exc_info=True)
         elif llm_proxy is not None:
@@ -165,7 +165,7 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
         )
         server = OpenCodeServer(cfg)
         servers[model] = server
-        born_degraded[model] = born_degraded.get(model, False) or born_degraded_now
+        born_degraded[model] = born_degraded_now
         if model not in sessions:
             sessions[model] = None
 
