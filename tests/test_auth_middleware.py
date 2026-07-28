@@ -396,7 +396,7 @@ class TestCanvasAgentTokenDispatch:
 class TestIsAgentDecisionsPath:
     """Prove the allowlist regexes gate the agent decision routes correctly.
 
-    These are the tests jaylfc requested in PR #2182 — the old regexes with
+    These are the tests jaylfc requested in PR #2182 -- the old regexes with
     ``$`` mid-pattern would FAIL every test below, proving the feature was
     completely inert."""
 
@@ -515,7 +515,7 @@ class TestAgentDecisionsDispatch:
 
     @pytest.mark.asyncio
     async def test_nested_path_requires_session(self):
-        """A path with extra segments must NOT be admitted — stay with
+        """A path with extra segments must NOT be admitted -- stay with
         the exact pattern, do not widen it."""
         middleware = AuthMiddleware(app=MagicMock())
         req = _request(
@@ -534,7 +534,7 @@ class TestAgentDecisionsDispatch:
     @pytest.mark.asyncio
     async def test_human_answer_path_not_admitted(self):
         """POST /api/decisions/{id}/answer (human path) must NOT admit
-        an agent token — the allowlist must not widen."""
+        an agent token -- the allowlist must not widen."""
         middleware = AuthMiddleware(app=MagicMock())
         req = _request(
             method="POST",

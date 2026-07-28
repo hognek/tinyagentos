@@ -315,3 +315,67 @@ async def test_agent_list_is_not_human_get(client):
     data = resp.json()
     assert "items" in data  # list response shape
     assert len(data["items"]) >= 1
+
+
+# ── Agent mirror does not run consent side effects ─────────────────
+
+
+@pytest.mark.asyncio
+async def test_agent_mirror_does_not_write_execution_grant(client):
+    """An agent mirroring an answer must NOT write an execution grant.
+    Only the human answer path runs consent side effects; otherwise an
+    agent could create a privileged decision and self-approve it."""
+    app = client._transport.app
+    pid = await _new_project(client)
+    cid, token = await _mint_agent(app, pid, ("decisions_write",))
+
+    # Create an execution_gate decision as the agent
+    body = _decision_body(
+        project_id=pid,
+        type="approve_deny",
+        metadata={"kind": "execution_gate", "agent_name": cid, "action_class": "test-exec"},
+    )
+    async with _agent_client(app, token) as ac:
+        resp = await ac.post("/api/decisions", json=body)
+    assert resp.status_code == 200, resp.text
+    did = resp.json()["id"]
+
+    # The agent mirrors "approve"
+    async with _agent_client(app, token) as ac:
+        resp = await ac.post(
+            f"/api/decisions/{did}/answer/agent",
+            json={"value": "approve"},
+        )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "answered"
+
+    # No execution grant must exist — the agent cannot self-approve.
+    policies = getattr(app.state, "execution_policies", None)
+    if policies is not None:
+        assert await policies.has_live_grant(cid, "test-exec") is False
+
+
+@pytest.mark.asyncio
+async def test_agent_mirror_handles_non_hashable_select_value(client):
+    """Malformed select values via agent mirror must return 400, not 500."""
+    app = client._transport.app
+    pid = await _new_project(client)
+    cid, token = await _mint_agent(app, pid, ("decisions_write",))
+
+    body = _decision_body(
+        project_id=pid,
+        type="single_select",
+        options=[{"label": "A", "value": "a"}],
+    )
+    async with _agent_client(app, token) as ac:
+        resp = await ac.post("/api/decisions", json=body)
+    assert resp.status_code == 200, resp.text
+    did = resp.json()["id"]
+
+    # A list value for single_select must 400, not 500.
+    async with _agent_client(app, token) as ac:
+        resp = await ac.post(
+            f"/api/decisions/{did}/answer/agent",
+            json={"value": ["a"]},
+        )
+    assert resp.status_code == 400

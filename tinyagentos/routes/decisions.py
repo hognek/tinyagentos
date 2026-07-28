@@ -346,25 +346,33 @@ async def answer_decision(decision_id: str, body: AnswerIn, request: Request, us
             if o.get("value") is not None
         }
         if valid:
-            if dtype == "single_select":
-                if body.value not in valid:
-                    return JSONResponse({"error": "answer is not one of the options"}, status_code=400)
-            else:
-                vals = body.value if isinstance(body.value, list) else None
-                if vals is None or any(v not in valid for v in vals):
-                    return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
+            try:
+                if dtype == "single_select":
+                    if body.value not in valid:
+                        return JSONResponse({"error": "answer is not one of the options"}, status_code=400)
+                else:
+                    vals = body.value if isinstance(body.value, list) else None
+                    if vals is None or any(v not in valid for v in vals):
+                        return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
+            except TypeError:
+                # A list, dict, or other non-hashable/iterable value in the
+                # answer body can hit set membership or any() with a TypeError
+                # (e.g. a list value for single_select, or non-iterable for
+                # multi_select).  Fail closed: 400, not 500.
+                return JSONResponse({"error": "invalid answer value shape"}, status_code=400)
 
-    # Record WHO REALLY DECIDED: mirror answers from agents record the agent as the
-    # mirroring actor, not the decider. Set a source field to distinguish mirrored
-    # from in-app answers and ensure the audit trail shows Jay as the true decider.
-    # For session-only (human) answers, source remains in_app unless overridden by body.source.
-    source = body.source or "in_app"
-    if source == "mirrored_from_chat":
-        # Agent mirror: recorded as "user" (or admin) so the agent appears as mirroring
-        # activity, not the decider. answered_by stays "user" or user.user_id for admin.
-        answered_by = user.user_id or "user"
-    else:
-        answered_by = body.answered_by or user.user_id or "user"
+    # Source is derived server-side from the authenticated route, never trusted
+    # from the request body.  The human path always records in_app; the agent
+    # mirror path (answer_decision_as_agent) always records mirrored_from_chat.
+    # A caller setting source=mirrored_from_chat on the human path is spoofing
+    # the audit trail and must be rejected.
+    if body.source == "mirrored_from_chat":
+        return JSONResponse(
+            {"error": "source must not be mirrored_from_chat on this endpoint"},
+            status_code=400,
+        )
+    source = "in_app"
+    answered_by = body.answered_by or user.user_id or "user"
     updated = await store.answer(decision_id, body.value, answered_by, source=source)
     if updated is None:
         return JSONResponse({"error": "already answered or not pending"}, status_code=409)
@@ -511,13 +519,16 @@ async def answer_decision_as_agent(decision_id: str, body: AnswerIn, request: Re
             if o.get("value") is not None
         }
         if valid:
-            if dtype == "single_select":
-                if body.value not in valid:
-                    return JSONResponse({"error": "answer is not one of the options"}, status_code=400)
-            else:
-                vals = body.value if isinstance(body.value, list) else None
-                if vals is None or any(v not in valid for v in vals):
-                    return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
+            try:
+                if dtype == "single_select":
+                    if body.value not in valid:
+                        return JSONResponse({"error": "answer is not one of the options"}, status_code=400)
+                else:
+                    vals = body.value if isinstance(body.value, list) else None
+                    if vals is None or any(v not in valid for v in vals):
+                        return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
+            except TypeError:
+                return JSONResponse({"error": "invalid answer value shape"}, status_code=400)
 
     # Agent mirrors are always from chat; record the canonical agent id as the
     # mirroring actor (not "user") so the audit trail is complete.
@@ -527,14 +538,12 @@ async def answer_decision_as_agent(decision_id: str, body: AnswerIn, request: Re
     if updated is None:
         return JSONResponse({"error": "already answered or not pending"}, status_code=409)
 
-    # Run consent side effects (same as the human answer path).  Each handler
-    # returns True if it already routed a reply to the asking agent, in which
-    # case we skip the generic answer route to avoid double-messaging.
-    routed_app = await _apply_app_grant(request, updated, body.value)
-    routed_exec = await _apply_execution_grant(request, updated, body.value)
-    routed_deleg = await _apply_delegation_grant(request, updated, body.value)
-    if not (routed_app or routed_exec or routed_deleg):
-        await _route_answer_to_agent(updated, body.value)
+    # Route the answer to the A2A bus so the asking agent can pick it up.
+    # Consent side effects (app/execution/delegation grants) are intentionally
+    # NOT run on the agent mirror path: an agent must not be able to create a
+    # privileged decision and then self-approve the consent via its own mirror
+    # endpoint.  Only the human answer path runs consent side effects.
+    await _route_answer_to_agent(updated, body.value)
     return updated
 
 

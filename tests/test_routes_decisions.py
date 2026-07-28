@@ -375,3 +375,69 @@ async def test_history_returns_lineage_oldest_first(client):
     assert r.status_code == 200
     chain = [d["id"] for d in r.json()["items"]]
     assert chain == ids  # oldest first
+
+
+@pytest.mark.asyncio
+async def test_human_answer_rejects_mirrored_from_chat_source(client):
+    """A human answer with source=mirrored_from_chat must be rejected as
+    spoofing the audit trail. The human path only records in_app."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "free_text",
+    })
+    d = resp.json()
+    resp = await client.post(
+        f"/api/decisions/{d['id']}/answer",
+        json={"value": "ok", "source": "mirrored_from_chat"},
+    )
+    assert resp.status_code == 400
+    assert "mirrored_from_chat" in resp.json()["error"]
+
+
+@pytest.mark.asyncio
+async def test_human_answer_source_field_in_response(client):
+    """A normal human answer includes source and answered_by in its answer JSON."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "free_text",
+    })
+    d = resp.json()
+    resp = await client.post(
+        f"/api/decisions/{d['id']}/answer",
+        json={"value": "ok", "answered_by": "Jay"},
+    )
+    assert resp.status_code == 200
+    ans = resp.json()["answer"]
+    assert ans["source"] == "in_app"
+    assert ans["answered_by"] == "Jay"
+
+
+@pytest.mark.asyncio
+async def test_single_select_handles_non_hashable_value(client):
+    """A list or dict submitted as a single_select answer must return 400,
+    not 500, by catching the TypeError from set membership."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "single_select",
+        "options": [{"label": "A", "value": "a"}],
+    })
+    d = resp.json()
+    # A list as the value is non-hashable and must not 500.
+    resp = await client.post(
+        f"/api/decisions/{d['id']}/answer",
+        json={"value": ["a"]},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_multi_select_handles_non_iterable_value(client):
+    """A non-iterable value for a multi_select answer must 400."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "multi_select",
+        "options": [{"label": "A", "value": "a"}],
+    })
+    d = resp.json()
+    # A bare string (not a list) should 400 for multi_select.
+    resp = await client.post(
+        f"/api/decisions/{d['id']}/answer",
+        json={"value": "a"},
+    )
+    assert resp.status_code == 400

@@ -133,19 +133,26 @@ class DecisionStore(BaseStore):
     ) -> list[dict]:
         conds, params = [], []
         if status is not None:
-            conds.append("status = ?"); params.append(status)
+            conds.append("status = ?")
+            params.append(status)
         if project_id is not None:
-            conds.append("project_id = ?"); params.append(project_id)
+            conds.append("project_id = ?")
+            params.append(project_id)
         if user_id is not None:
-            conds.append("user_id = ?"); params.append(user_id)
+            conds.append("user_id = ?")
+            params.append(user_id)
         if from_agent is not None:
-            conds.append("from_agent = ?"); params.append(from_agent)
+            conds.append("from_agent = ?")
+            params.append(from_agent)
         if metadata_kind is not None:
-            conds.append("metadata LIKE ?"); params.append(f'%' + metadata_kind + f'%')
+            conds.append("metadata LIKE ?")
+            params.append(f'%' + metadata_kind + f'%')
         if pending_age_gt is not None:
-            # Filter for pending decisions older than the threshold
+            # Filter for pending decisions older than the threshold.
+            # created_at is REAL NOT NULL, so no NULL guard is needed.
             now = time.time()
-            conds.append("status = 'pending' AND (created_at IS NULL OR created_at < ?)"); params.append(now - pending_age_gt)
+            conds.append("status = 'pending' AND created_at < ?")
+            params.append(now - pending_age_gt)
         where = (" WHERE " + " AND ".join(conds)) if conds else ""
         # Bound the result set so a long-lived inbox cannot return everything.
         limit = max(1, min(int(limit), 500))
