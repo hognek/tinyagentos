@@ -361,14 +361,25 @@ class ProjectTaskStore(BaseStore):
         task_id: str,
         closed_by: str,
         reason: str | None = None,
+        *,
+        force: bool = False,
     ) -> bool:
         now = time.time()
-        cursor = await self._db.execute(
-            """UPDATE project_tasks
-               SET status = 'closed', closed_by = ?, closed_at = ?, close_reason = ?, updated_at = ?
-               WHERE id = ? AND status NOT IN ('closed', 'cancelled')""",
-            (closed_by, now, reason, now, task_id),
-        )
+        if force:
+            cursor = await self._db.execute(
+                """UPDATE project_tasks
+                   SET status = 'closed', closed_by = ?, closed_at = ?, close_reason = ?, updated_at = ?
+                   WHERE id = ? AND status NOT IN ('closed', 'cancelled')""",
+                (closed_by, now, reason, now, task_id),
+            )
+        else:
+            cursor = await self._db.execute(
+                """UPDATE project_tasks
+                   SET status = 'closed', closed_by = ?, closed_at = ?, close_reason = ?, updated_at = ?
+                   WHERE id = ? AND status NOT IN ('closed', 'cancelled')
+                     AND (claimed_by IS NULL OR claimed_by = ?)""",
+                (closed_by, now, reason, now, task_id, closed_by),
+            )
         await self._db.commit()
         changed = cursor.rowcount == 1
         if changed:
