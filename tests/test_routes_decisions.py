@@ -435,9 +435,9 @@ async def test_multi_select_handles_non_iterable_value(client):
         "options": [{"label": "A", "value": "a"}],
     })
     d = resp.json()
-    # A bare string (not a list) should 400 for multi_select.
+    # An integer (not a list) should 400 for multi_select.
     resp = await client.post(
         f"/api/decisions/{d['id']}/answer",
-        json={"value": "a"},
+        json={"value": 42},
     )
     assert resp.status_code == 400

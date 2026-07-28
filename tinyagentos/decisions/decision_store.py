@@ -145,8 +145,8 @@ class DecisionStore(BaseStore):
             conds.append("from_agent = ?")
             params.append(from_agent)
         if metadata_kind is not None:
-            conds.append("metadata LIKE ?")
-            params.append(f'%' + metadata_kind + f'%')
+            conds.append("json_extract(metadata, '$.kind') = ?")
+            params.append(metadata_kind)
         if pending_age_gt is not None:
             # Filter for pending decisions older than the threshold.
             # created_at is REAL NOT NULL, so no NULL guard is needed.

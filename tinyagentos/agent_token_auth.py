@@ -125,9 +125,10 @@ async def _verify_agent_scope(
             detail=f"token does not hold an active {required_scope!r} grant",
         )
 
-    # For decisions_write grant, verify that the token also has the
-    # project_id claim matching (if present) the decision being acted on.
-    # This guard is enforced at the route level where the decision_id is known.
+    # For decisions_write, the route-level guard (check_agent_scope_for_project)
+    # verifies the agent's GRANT project_id matches the decision's project_id.
+    # The token's own project_id claim is advisory only and is not checked
+    # (taOS #1862) -- see check_agent_scope_for_project below.
     return canonical_id, payload
 
 
