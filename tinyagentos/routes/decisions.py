@@ -291,16 +291,28 @@ async def get_decision(decision_id: str, request: Request, user: CurrentUser = D
 
 @router.get("/api/decisions/{decision_id}/agent")
 async def get_decision_as_agent(decision_id: str, request: Request):
-    # Verify JWT + grant BEFORE accessing the store, so an invalid token
-    # cannot probe decision existence via timing or response differentiation.
-    from tinyagentos.agent_token_auth import check_agent_scope
-    canonical_id = await check_agent_scope(request, "decisions_write")
-    if canonical_id is None:
+    # JWT-first: validate the bearer token before touching the decision
+    # store so invalid tokens cannot probe decision existence via timing.
+    from tinyagentos.agent_token_auth import check_agent_identity
+    caller = await check_agent_identity(request)
+    if caller is None:
         return JSONResponse({"error": "not found"}, status_code=404)
 
     store = request.app.state.decision_store
     d = await store.get(decision_id)
-    if d is None or d.get("from_agent") != canonical_id:
+    if d is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    # Project-scoped (least privilege): the agent must hold decisions_write
+    # on the decision's OWN project, not just any project.  5d207ec
+    # mistakenly swapped this for project-agnostic check_agent_scope,
+    # letting any decisions_write grant on ANY project authorize read
+    # on EVERY project.  Restored from 6410e3c.
+    from tinyagentos.agent_token_auth import check_agent_scope_for_project
+    cid = await check_agent_scope_for_project(
+        request, "decisions_write", d.get("project_id")
+    )
+    if cid is None or d.get("from_agent") != cid:
         return JSONResponse({"error": "not found"}, status_code=404)
     return d
 
@@ -500,16 +512,29 @@ async def answer_decision_as_agent(decision_id: str, body: AnswerIn, request: Re
     checks from_agent ownership, records the answer with source=mirrored_from_chat
     and the agent's canonical id as the mirroring actor, runs consent side effects
     (app/execution/delegation grants), then pushes to the asking agent via A2A."""
-    # Verify JWT + grant BEFORE accessing the store.
-    from tinyagentos.agent_token_auth import check_agent_scope
-    canonical_id = await check_agent_scope(request, "decisions_write")
-    if canonical_id is None:
+    # JWT-first: validate the bearer token before touching the decision
+    # store so invalid tokens cannot probe decision existence via timing.
+    from tinyagentos.agent_token_auth import check_agent_identity
+    caller = await check_agent_identity(request)
+    if caller is None:
         return JSONResponse({"error": "not found"}, status_code=404)
 
     store = request.app.state.decision_store
     existing = await store.get(decision_id)
     if existing is None or existing.get("status") != "pending":
         return JSONResponse({"error": "not found or not pending"}, status_code=404)
+
+    # Project-scoped (least privilege): the agent must hold decisions_write
+    # on the decision's OWN project, not just any project.  5d207ec
+    # mistakenly swapped this for project-agnostic check_agent_scope,
+    # letting any decisions_write grant on ANY project authorize answer
+    # on EVERY project.  Restored from 6410e3c.
+    from tinyagentos.agent_token_auth import check_agent_scope_for_project
+    canonical_id = await check_agent_scope_for_project(
+        request, "decisions_write", existing.get("project_id")
+    )
+    if canonical_id is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
 
     # Verify ownership: only the asking agent can answer its own decision.
     if existing.get("from_agent") != canonical_id:

@@ -379,3 +379,70 @@ async def test_agent_mirror_handles_non_hashable_select_value(client):
             json={"value": ["a"]},
         )
     assert resp.status_code == 400
+
+
+# ── Cross-project scope isolation tests ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_agent_cross_project_read_blocks_wrong_project(client):
+    """Agent with decisions_write on project B cannot read a decision on
+    project A (even when from_agent matches).  5d207ec swapped
+    check_agent_scope_for_project for project-agnostic check_agent_scope,
+    leaking cross-project read.  This test proves the old head leaks
+    (200 under 5d207ec) and the fix blocks it (403 under 6410e3c)."""
+    app = client._transport.app
+
+    # Two projects: agent has a grant on beta but NOT on alpha.
+    pid_a = await _new_project(client, name="alpha", slug="alpha")
+    pid_b = await _new_project(client, name="beta", slug="beta")
+    cid, token = await _mint_agent(app, pid_b, ("decisions_write",), handle="@cross-x")
+
+    # Create a decision on project A attributed to the agent (admin posts
+    # with from_agent set to the agent's canonical id — simulating the
+    # agent having had a grant on A that was later revoked).
+    resp = await client.post(
+        "/api/decisions",
+        json=_decision_body(project_id=pid_a, from_agent=cid),
+    )
+    assert resp.status_code == 200, resp.text
+    did = resp.json()["id"]
+
+    # Agent with only project B grant tries to read the project A decision.
+    async with _agent_client(app, token) as ac:
+        resp = await ac.get(f"/api/decisions/{did}/agent")
+    # Project-scoped check must block: 403, not 200 (the 5d207ec leak) nor
+    # 404 (which could be misread as "decision doesn't exist").
+    assert resp.status_code == 403, (
+        f"expected 403 cross-project block, got {resp.status_code}: {resp.text}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_cross_project_answer_blocks_wrong_project(client):
+    """Agent with decisions_write on project B cannot answer a decision on
+    project A (even when from_agent matches).  Same 5d207ec regression
+    as the read endpoint."""
+    app = client._transport.app
+
+    pid_a = await _new_project(client, name="alpha", slug="alpha")
+    pid_b = await _new_project(client, name="beta", slug="beta")
+    cid, token = await _mint_agent(app, pid_b, ("decisions_write",), handle="@cross-y")
+
+    # Create a pending decision on project A attributed to the agent.
+    resp = await client.post(
+        "/api/decisions",
+        json=_decision_body(project_id=pid_a, from_agent=cid),
+    )
+    assert resp.status_code == 200, resp.text
+    did = resp.json()["id"]
+
+    # Agent with only project B grant tries to answer the project A decision.
+    async with _agent_client(app, token) as ac:
+        resp = await ac.post(
+            f"/api/decisions/{did}/answer/agent",
+            json={"value": "approve"},
+        )
+    assert resp.status_code == 403, (
+        f"expected 403 cross-project block, got {resp.status_code}: {resp.text}"
+    )
