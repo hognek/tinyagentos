@@ -18,7 +18,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel
 
 from tinyagentos.auth_context import CurrentUser, current_user
 
@@ -46,14 +46,6 @@ class MintIn(BaseModel):
     rate_cap: Optional[int] = None
     expires_at: Optional[str] = None  # ISO-8601, timezone-aware
 
-    @field_validator("agent_ids")
-    @classmethod
-    def _validate_agent_ids(cls, v: list[str]) -> list[str]:
-        """Reject path traversal and unsafe characters in agent ids."""
-        if not v:
-            raise ValueError("at least one agent_id is required")
-        return [_validate_agent_id(a) for a in v]
-
 
 @router.get("/api/agent-model-keys")
 async def list_keys(request: Request, user: CurrentUser = Depends(current_user)):
@@ -69,6 +61,10 @@ async def mint_key(
     """Mint a consent key exposing the caller's agent(s). Returns the token ONCE."""
     store = request.app.state.agent_model_keys
     try:
+        if not body.agent_ids:
+            raise ValueError("at least one agent_id is required")
+        for aid in body.agent_ids:
+            _validate_agent_id(aid)
         token, rec = await store.mint(
             user.user_id,
             body.agent_ids,
