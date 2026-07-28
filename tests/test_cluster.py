@@ -1066,10 +1066,12 @@ class TestUpdateOutcomeEndpoint:
             "to_version": "def5678abc",
         }
 
-        # Bypass HMAC for the test — we test HMAC separately
+        # Bypass HMAC for the test — we test HMAC separately.
+        # The side_effect must also set hmac_worker_name so the route-level
+        # name cross-check in report_update_outcome passes.
         with patch(
             "tinyagentos.routes.cluster.require_worker_hmac",
-            side_effect=lambda r: None,
+            side_effect=lambda r: setattr(r.state, "hmac_worker_name", "gpu-box"),
         ):
             resp = await client.post(
                 "/api/cluster/workers/gpu-box/update-outcome",
@@ -1100,7 +1102,7 @@ class TestUpdateOutcomeEndpoint:
 
         with patch(
             "tinyagentos.routes.cluster.require_worker_hmac",
-            side_effect=lambda r: None,
+            side_effect=lambda r: setattr(r.state, "hmac_worker_name", "gpu-box"),
         ):
             resp = await client.post(
                 "/api/cluster/workers/gpu-box/update-outcome",
@@ -1124,7 +1126,7 @@ class TestUpdateOutcomeEndpoint:
 
         with patch(
             "tinyagentos.routes.cluster.require_worker_hmac",
-            side_effect=lambda r: None,
+            side_effect=lambda r: setattr(r.state, "hmac_worker_name", "nonexistent"),
         ):
             resp = await client.post(
                 "/api/cluster/workers/nonexistent/update-outcome",
@@ -1147,7 +1149,7 @@ class TestUpdateOutcomeEndpoint:
 
         with patch(
             "tinyagentos.routes.cluster.require_worker_hmac",
-            side_effect=lambda r: None,
+            side_effect=lambda r: setattr(r.state, "hmac_worker_name", "gpu-box"),
         ):
             resp = await client.post(
                 "/api/cluster/workers/gpu-box/update-outcome",
