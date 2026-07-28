@@ -695,3 +695,185 @@ async def test_forward_to_sends_no_cookie_when_only_local_session(client, monkey
     assert r.status_code == 200
     assert "taos_session" not in captured.get("cookie", "")
     assert captured.get("cookie", "") == ""
+
+
+# --- Hub sealed-envelope relay (cross-user collab A3) ---
+
+
+@pytest.mark.asyncio
+async def test_hub_relay_drop_forwards_envelope(client, monkeypatch):
+    """POST /api/account/hub/relay/drop forwards to
+    {base}/api/hub/relay/drop with the sealed envelope body."""
+    monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
+    import tinyagentos.routes.account_proxy as mod
+    monkeypatch.setattr(mod, "resolve_local_identity_id", lambda _data_dir: None)
+    captured: dict[str, str] = {}
+
+    async def handler(method, url, **kw):
+        captured["method"] = method
+        captured["url"] = url
+        captured["body"] = kw.get("content", b"").decode("utf-8")
+        return _FakeResp(
+            content=b'{"status":"queued","count":1}',
+            headers={"content-type": "application/json"},
+        )
+
+    _patch_upstream(monkeypatch, handler)
+    r = await client.post(
+        "/api/account/hub/relay/drop",
+        json={
+            "recipient": "hub:bob",
+            "sender_ephemeral_pub": "aa",
+            "nonce": "bb",
+            "ciphertext": "cc",
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "queued"
+    assert captured["url"] == "https://taos.my/api/hub/relay/drop"
+    assert captured["method"] == "POST"
+    assert "hub:bob" in captured["body"]
+
+
+@pytest.mark.asyncio
+async def test_hub_relay_poll_forwards_recipient(client, monkeypatch):
+    """GET /api/account/hub/relay/poll?recipient=hub:alice forwards to
+    {base}/api/hub/relay/poll?recipient=hub:alice."""
+    monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
+    import tinyagentos.routes.account_proxy as mod
+    monkeypatch.setattr(mod, "resolve_local_identity_id", lambda _data_dir: None)
+    captured: dict[str, str] = {}
+
+    async def handler(method, url, **kw):
+        captured["method"] = method
+        captured["url"] = url
+        return _FakeResp(
+            content=b'{"envelopes":[],"count":0}',
+            headers={"content-type": "application/json"},
+        )
+
+    _patch_upstream(monkeypatch, handler)
+    r = await client.get("/api/account/hub/relay/poll?recipient=hub:alice")
+    assert r.status_code == 200
+    assert r.json()["count"] == 0
+    assert captured["url"] == "https://taos.my/api/hub/relay/poll?recipient=hub:alice"
+    assert captured["method"] == "GET"
+
+
+@pytest.mark.asyncio
+async def test_hub_relay_drop_rejects_invalid_recipient(client, monkeypatch):
+    """An invalid recipient in the body is rejected 400 before forwarding."""
+    monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
+
+    async def handler(method, url, **kw):
+        pytest.fail("must not be called for invalid recipient")
+
+    _patch_upstream(monkeypatch, handler)
+    r = await client.post(
+        "/api/account/hub/relay/drop",
+        json={
+            "recipient": "../admin",
+            "sender_ephemeral_pub": "aa",
+            "nonce": "bb",
+            "ciphertext": "cc",
+        },
+    )
+    assert r.status_code == 400
+    assert "invalid recipient" in r.json()["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_hub_relay_drop_rejects_non_dict_body(client, monkeypatch):
+    """A JSON array (or any non-dict) body is rejected 400 before forwarding."""
+    monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
+
+    async def handler(method, url, **kw):
+        pytest.fail("must not be called for non-dict body")
+
+    _patch_upstream(monkeypatch, handler)
+    r = await client.post(
+        "/api/account/hub/relay/drop",
+        json=[1, 2, 3],
+    )
+    assert r.status_code == 400
+    assert "invalid body" in r.json()["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_hub_relay_poll_rejects_invalid_recipient(client, monkeypatch):
+    """An invalid recipient (path injection) is rejected 400 before forwarding."""
+    monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
+
+    async def handler(method, url, **kw):
+        pytest.fail("must not be called for invalid recipient")
+
+    _patch_upstream(monkeypatch, handler)
+    r = await client.get("/api/account/hub/relay/poll?recipient=../admin")
+    assert r.status_code == 400
+    assert "invalid recipient" in r.json()["error"].lower()
+
+
+@pytest.mark.asyncio
+async def test_hub_relay_drop_allows_different_recipient(client, monkeypatch):
+    """Drop is outbound send — a node CAN drop envelopes to a different
+    recipient.  Recipient binding only applies to hub_relay_poll (polling
+    your own queue)."""
+    monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
+
+    captured: dict[str, str] = {}
+
+    async def handler(method, url, **kw):
+        captured["url"] = url
+        return _FakeResp(
+            content=b'{"status":"queued","count":1}',
+            headers={"content-type": "application/json"},
+        )
+
+    _patch_upstream(monkeypatch, handler)
+    r = await client.post(
+        "/api/account/hub/relay/drop",
+        json={
+            "recipient": "hub:bob",
+            "sender_ephemeral_pub": "aa",
+            "nonce": "bb",
+            "ciphertext": "cc",
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "queued"
+
+
+@pytest.mark.asyncio
+async def test_hub_relay_drop_accepts_matching_recipient(client, monkeypatch):
+    """When the in-body recipient matches the local hub identity the request
+    is forwarded normally."""
+    monkeypatch.setenv("TAOS_ACCOUNT_BASE_URL", "https://taos.my")
+
+    import tinyagentos.routes.account_proxy as mod
+    monkeypatch.setattr(
+        mod, "resolve_local_identity_id", lambda _data_dir: "hub:alice"
+    )
+
+    captured: dict[str, str] = {}
+
+    async def handler(method, url, **kw):
+        captured["url"] = url
+        captured["body"] = kw.get("content", b"").decode("utf-8")
+        return _FakeResp(
+            content=b'{"status":"queued","count":1}',
+            headers={"content-type": "application/json"},
+        )
+
+    _patch_upstream(monkeypatch, handler)
+    r = await client.post(
+        "/api/account/hub/relay/drop",
+        json={
+            "recipient": "hub:alice",
+            "sender_ephemeral_pub": "aa",
+            "nonce": "bb",
+            "ciphertext": "cc",
+        },
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "queued"
+    assert captured["url"] == "https://taos.my/api/hub/relay/drop"
