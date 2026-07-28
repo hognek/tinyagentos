@@ -146,7 +146,7 @@ class ProjectListEntriesStore(BaseStore):
             (
                 entry_id, list_id, project_id, text, original_text,
                 category, "new", 0, author_kind, author_id,
-                position if position is not None else 0, now, now,
+                position if position is not None else await self._get_next_position(project_id, list_id), now, now,
             ),
         )
         await self._db.commit()
@@ -252,11 +252,11 @@ class ProjectListEntriesStore(BaseStore):
             )
         await self._db.commit()
 
-    async def _get_next_position(self, project_id: str, list_id: str | None = None) -> int:
+    async def _get_next_position(self, project_id: str, list_id: str) -> int:
         async with self._db.execute(
             "SELECT MAX(position) + 1 FROM project_list_entries "
             "WHERE project_id = ? AND list_id = ?",
-            (project_id, list_id or ""),
+            (project_id, list_id),
         ) as cur:
             row = await cur.fetchone()
             return row[0] if row[0] is not None else 0

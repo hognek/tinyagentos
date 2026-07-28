@@ -216,3 +216,37 @@ async def test_list_entries_scoped_to_list_and_status(entries_store):
     await entries_store.update_entry(c["id"], status="closed")
     assert len(await entries_store.list_entries(project_id="prj-1", list_id="lst-1")) == 2
     assert len(await entries_store.list_entries(project_id="prj-1", status="closed")) == 1
+
+
+@pytest.mark.asyncio
+async def test_add_entries_without_positions_gets_ascending(entries_store):
+    """Adding entries without explicit positions should auto-assign distinct
+    ascending positions via _get_next_position (not flat 0s)."""
+    e1 = await entries_store.add_entry(
+        list_id="lst-1",
+        project_id="prj-1",
+        text="First",
+        original_text="First",
+        author_kind="agent",
+        author_id="agent-1",
+    )
+    e2 = await entries_store.add_entry(
+        list_id="lst-1",
+        project_id="prj-1",
+        text="Second",
+        original_text="Second",
+        author_kind="agent",
+        author_id="agent-1",
+    )
+    e3 = await entries_store.add_entry(
+        list_id="lst-1",
+        project_id="prj-1",
+        text="Third",
+        original_text="Third",
+        author_kind="agent",
+        author_id="agent-1",
+    )
+    positions = [e["position"] for e in (e1, e2, e3)]
+    assert positions == [0, 1, 2], (
+        f"Expected [0, 1, 2] but got {positions}"
+    )
