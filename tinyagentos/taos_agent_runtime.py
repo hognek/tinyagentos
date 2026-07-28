@@ -77,6 +77,22 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
             existing = None
 
     if existing is None:
+        # Stop-on-model-change: all per-model servers share TAOS_OPENCODE_PORT,
+        # so only one can bind at a time. Stop any server for a different model
+        # before starting the new one.
+        for other_model, other_server in list(servers.items()):
+            if other_model != model and other_server is not None:
+                logger.info(
+                    "taos_agent_runtime: model changed (%s -> %s); stopping opencode server for %s",
+                    other_model, model, other_model,
+                )
+                try:
+                    await other_server.stop()
+                except Exception:
+                    logger.debug("taos_agent_runtime: error stopping old server", exc_info=True)
+                servers.pop(other_model, None)
+                sessions.pop(other_model, None)
+
         # Read the taos_agent prefs once: the permitted set (to scope the key)
         # and a persisted own-key (so we reuse it instead of re-minting).
         permitted_models: list[str] = [model]
@@ -115,7 +131,7 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
                             "taos_agent_runtime: re-scoping the taOS agent key returned False "
                             "(key scope may be stale)"
                         )
-                        born_degraded = True
+                        born_degraded_now = True
                 except Exception:
                     logger.debug("taos_agent_runtime: re-scoping stored key failed", exc_info=True)
         elif llm_proxy is not None:
