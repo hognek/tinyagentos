@@ -805,18 +805,34 @@ class SkillStore(BaseStore):
         on existing installs.  This method cleans up known-orphaned rows
         so agents that had the skill assigned are no longer advertised a
         tool that will 501 on call.
+
+        Before deleting an orphan skill, any agent assignments are migrated
+        to the replacement skill (INSERT OR IGNORE) so agents do not
+        silently lose tool access after startup.
         """
         if self._db is None:
             return
-        # The list is deliberately explicit — each entry documents *when*
-        # the skill was removed and why (issue #1923 notes/todo split).
-        _ORPHAN_SKILL_IDS: list[str] = [
-            "notes_set_done",  # removed 2026-07 — replaced by todo_set_done (#1923)
-        ]
-        for skill_id in _ORPHAN_SKILL_IDS:
-            await self._db.execute("DELETE FROM skills WHERE id = ?", (skill_id,))
+        # Keys: old (orphaned) skill id → replacement skill id.
+        # Entries document *when* the skill was removed and why.
+        _ORPHAN_REPLACEMENTS: dict[str, str] = {
+            "notes_set_done": "todo_set_done",  # removed 2026-07, #1923 notes/todo split
+        }
+        for old_id, new_id in _ORPHAN_REPLACEMENTS.items():
+            # Migrate agents from the orphan skill to its replacement.
+            # INSERT OR IGNORE: if the agent already has the replacement,
+            # keep the existing (newer) assignment; only fill in for agents
+            # that would otherwise lose completion access.
             await self._db.execute(
-                "DELETE FROM agent_skills WHERE skill_id = ?", (skill_id,)
+                """INSERT OR IGNORE INTO agent_skills (agent_id, skill_id, enabled, config)
+                   SELECT agent_id, ?, enabled, config
+                   FROM agent_skills
+                   WHERE skill_id = ?""",
+                (new_id, old_id),
+            )
+            # Now safe to remove the orphan rows.
+            await self._db.execute("DELETE FROM skills WHERE id = ?", (old_id,))
+            await self._db.execute(
+                "DELETE FROM agent_skills WHERE skill_id = ?", (old_id,)
             )
         await self._db.commit()
 
