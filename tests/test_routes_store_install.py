@@ -459,6 +459,32 @@ class TestInstallV2:
         assert "install_id" in body
 
     @pytest.mark.asyncio
+    async def test_signing_failure_blocks_install_403(self, client):
+        """When a manifest's signing was attempted but failed (is_signing_failed
+        returns True), the install gate must block with 403."""
+        from tinyagentos.store_signing import generate_signing_keypair
+
+        manifest = _make_model_manifest()
+        reg = _make_registry(manifest)
+        # Simulate: signing was attempted but failed — no stored signature,
+        # but the registry knows it was meant to be signed.
+        reg.get_signature = MagicMock(return_value=None)
+        reg.is_signing_failed = MagicMock(return_value=True)
+        client._transport.app.state.registry = reg
+
+        _, pub = generate_signing_keypair()
+        client._transport.app.state.store_signing_pubkey = pub
+
+        resp = await client.post("/api/store/install-v2", json={
+            "manifest_id": "test-model",
+            "variant_id": "v1",
+        })
+        assert resp.status_code == 403
+        body = resp.json()
+        assert "signing failed" in body["error"]
+        assert "install_id" in body
+
+    @pytest.mark.asyncio
     async def test_valid_signature_allows_install(self, client):
         """When registry.verify_manifest_signature returns True, the
         install proceeds past the signing gate."""

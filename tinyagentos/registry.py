@@ -107,6 +107,9 @@ class AppRegistry:
         # Raw manifest dicts (stripped of _signature) keyed by app_id, used for
         # re-verifying at install time.
         self._manifest_dicts: dict[str, dict] = {}
+        # App IDs for which signing was attempted but failed at load time.
+        # These are NOT "unsigned by choice" — they must block the install gate.
+        self._signing_failures: set[str] = set()
         self._catalog_lock = threading.Lock()
 
     def _ensure_loaded(self) -> None:
@@ -121,6 +124,8 @@ class AppRegistry:
         catalog: list[AppManifest] = []
         signatures: dict[str, str] = {}
         manifest_dicts: dict[str, dict] = {}
+        # Reset failure tracking — each load starts fresh.
+        self._signing_failures: set[str] = set()
         for type_dir in ("agents", "models", "services", "plugins"):
             base = self.catalog_dir / type_dir
             if not base.exists():
@@ -140,9 +145,10 @@ class AppRegistry:
                                 manifest_dicts[catalog[-1].id] = raw_dict
                             except Exception:
                                 logger.exception(
-                                    "failed to sign manifest %s — catalog load continues unsigned",
+                                    "signing failed for manifest %s — installs will be blocked",
                                     catalog[-1].id,
                                 )
+                                self._signing_failures.add(catalog[-1].id)
                     except (yaml.YAMLError, KeyError):
                         pass  # skip invalid manifests
         # Single atomic assignment: readers either see the old list or the fully built one.
@@ -178,6 +184,19 @@ class AppRegistry:
         """Return the hex Ed25519 signature for *app_id*, or None."""
         self._ensure_loaded()
         return self._signatures.get(app_id)
+
+    def is_signing_failed(self, app_id: str) -> bool:
+        """Return ``True`` if signing was attempted for *app_id* at load time
+        but the operation raised an exception.
+
+        A signing failure is different from a genuinely unsigned manifest
+        (e.g. one loaded before the signing key was configured).  Callers
+        that gate on signature should treat a signing failure as fail-closed:
+        the manifest was *meant* to be signed but the operation failed, so the
+        system cannot assert its integrity.
+        """
+        self._ensure_loaded()
+        return app_id in self._signing_failures
 
     def get_manifest_dict(self, app_id: str) -> dict | None:
         """Return the raw manifest dict (without _signature field) for *app_id*."""

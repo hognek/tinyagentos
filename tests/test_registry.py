@@ -1,7 +1,10 @@
 # tests/test_registry.py
 import json
+from unittest.mock import patch
+
 import pytest
 import yaml
+
 from tinyagentos.registry import AppManifest, AppRegistry, AppState
 
 
@@ -185,3 +188,67 @@ class TestAppRegistry:
 
         assert all(n == 3 for n in results)
         assert len(r._catalog) == 3
+
+    def test_signing_failure_tracked(self, catalog_dir, tmp_path):
+        """When sign_manifest raises, the app_id must be tracked in
+        _signing_failures and is_signing_failed returns True."""
+        installed_path = tmp_path / "installed.json"
+        signing_key = b"x" * 32  # 32-byte Ed25519 seed
+        reg = AppRegistry(
+            catalog_dir=catalog_dir,
+            installed_path=installed_path,
+            signing_key=signing_key,
+        )
+
+        with patch(
+            "tinyagentos.store_signing.sign_manifest",
+            side_effect=RuntimeError("crypto failure"),
+        ):
+            reg._ensure_loaded()
+
+        apps = reg.list_available()
+        assert len(apps) == 3
+
+        for app in apps:
+            assert reg.is_signing_failed(app.id), (
+                f"expected signing failure for {app.id}"
+            )
+            assert reg.get_signature(app.id) is None, (
+                f"expected no signature for {app.id}"
+            )
+
+    def test_signing_failure_cleared_on_reload(self, catalog_dir, tmp_path):
+        """A subsequent reload with a working sign_manifest must clear
+        the failure tracking."""
+        installed_path = tmp_path / "installed.json"
+        signing_key = b"x" * 32
+        reg = AppRegistry(
+            catalog_dir=catalog_dir,
+            installed_path=installed_path,
+            signing_key=signing_key,
+        )
+
+        # First load: signing fails for all manifests.
+        with patch(
+            "tinyagentos.store_signing.sign_manifest",
+            side_effect=RuntimeError("crypto failure"),
+        ):
+            reg._ensure_loaded()
+
+        for app in reg.list_available():
+            assert reg.is_signing_failed(app.id)
+
+        # Second load: working sign_manifest — failures must be cleared.
+        with patch(
+            "tinyagentos.store_signing.sign_manifest",
+            return_value="0" * 64,
+        ):
+            reg.reload()
+
+        for app in reg.list_available():
+            assert not reg.is_signing_failed(app.id), (
+                f"expected signing failure cleared for {app.id}"
+            )
+            assert reg.get_signature(app.id) is not None, (
+                f"expected signature for {app.id}"
+            )

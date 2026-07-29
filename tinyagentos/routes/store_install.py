@@ -221,6 +221,12 @@ def _verify_manifest_for_install(
     before signing was enabled), the gate is also skipped (allowed) rather
     than returning a hard 403 — the absence of a signature is not evidence
     of tampering.
+
+    **Signing failures are fail-closed:** if signing was attempted at load
+    time but the operation raised an exception (e.g. the manifest content
+    could not be serialised, or a transient crypto error occurred), the
+    install is blocked.  A failed signing is different from a genuinely
+    unsigned manifest — the system cannot assert the manifest's integrity.
     """
     if store_signing_pubkey is None or registry is None:
         return True, None
@@ -229,6 +235,16 @@ def _verify_manifest_for_install(
 
     stored_sig = registry.get_signature(manifest_id)
     if stored_sig is None:
+        # Check if signing was attempted but failed — fail-closed.
+        # A failed signing is different from a genuinely unsigned manifest
+        # (e.g. one loaded before the signing key was configured): the
+        # manifest was *meant* to be signed but the operation failed, so
+        # the system cannot assert its integrity.
+        if hasattr(registry, "is_signing_failed") and registry.is_signing_failed(manifest_id):
+            return False, (
+                "manifest signature not available — signing failed during "
+                "catalog load; the manifest cannot be verified"
+            )
         # Never signed — manifest was loaded before signing was enabled.
         # Skip the gate; absence of a signature is not evidence of tampering.
         return True, None
