@@ -551,7 +551,8 @@ class TestSecurityRegression:
         self, client_with_contacts, app_with_contacts, monkeypatch
     ):
         """A failed directory lookup (403/404) must NOT establish a contact
-        or peer link — the handshake must fail closed."""
+        or peer link — the handshake must fail closed. The route returns
+        the upstream status code on failure."""
         # Directory returns 403
         async def handler(method, url, **kw):
             return _fake_dir_resp(
@@ -564,11 +565,10 @@ class TestSecurityRegression:
             "/api/hub/friends/requests/test-rid-403/accept",
             json={"peer_fingerprint": _PEER_FP},
         )
-        # Accept should handle the upstream error gracefully
-        assert resp.status_code == 200
+        # Route passes upstream status; no contact/handshake happens
+        assert resp.status_code == 403
         data = resp.json()
-        # State must indicate failure
-        assert data["state"] != "accepted"
+        assert data["state"] == "rejected"
 
         store = app_with_contacts.state.contacts_store
         contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
@@ -596,6 +596,19 @@ class TestSecurityRegression:
             outbound_token=generate_peer_token(),
         )
         await store.set_contact_status(f"hub:{_PEER_USERNAME}", "blocked")
+
+        # Also add REL_BLOCK on hub relationships — the accept guard
+        # checks has_edge(peer, REL_BLOCK) at the hub layer, not the
+        # contacts layer.
+        from tinyagentos.hub.store import HubStore
+        hub_store = HubStore(
+            Path(app_with_contacts.state.data_dir) / "hub" / "hub.db"
+        )
+        try:
+            await hub_store.init()
+            await hub_store.put_relationship(_PEER_FP, "block")
+        finally:
+            await hub_store.close()
 
         # Now try to re-accept
         dir_resp_body = {
