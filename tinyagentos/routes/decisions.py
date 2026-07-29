@@ -428,12 +428,12 @@ async def _apply_delegation_grant(request: Request, decision: dict, value) -> bo
 async def _apply_collab_delegation_grant(request: Request, decision: dict, value) -> bool:
     """Side effect for a cross-user collab delegation-gate Decision (D1).
 
-    The decision's metadata carries {kind: \"collab_delegation_gate\", contact_id,
+    The decision's metadata carries {kind: "collab_delegation_gate", contact_id,
     agent_slug, display_name, granted_scopes, denied_scopes, project_id}.
 
-    Approving it mints a project invite for the sponsored agent and returns
-    the connection bundle over the peer channel.  Denying just routes the answer
-    (the remote contact's instance polls for the decision result).
+    Approving it mints a project invite for the sponsored agent and delivers
+    the connection bundle over the peer channel.  Denying delivers the deny
+    result over the peer channel.
 
     Mirrors ``_apply_delegation_grant``: the answer is already persisted, so a
     delegation-completion hiccup must not fail the answer.
@@ -442,16 +442,35 @@ async def _apply_collab_delegation_grant(request: Request, decision: dict, value
     if meta.get("kind") != "collab_delegation_gate":
         return False
 
+    contact_id = meta.get("contact_id", "")
+    agent_slug = meta.get("agent_slug", "")
     approved = value == "approve"
+
     if not approved:
-        # Denied -- just route the deny back so the remote contact knows.
-        deny_text = f"Delegation of {meta.get('agent_slug', '')} by {meta.get('contact_id', '')} was denied."
+        # Denied — deliver the result to the remote contact over the peer
+        # channel so they know immediately.  Also route via the A2A bus as
+        # a best-effort fallback for local agents.
+        from tinyagentos.delegation_handler import deliver_delegation_result
+
+        deny_text = (
+            f"Delegation of {agent_slug} by {contact_id} was denied."
+        )
         await _route_answer_to_agent(decision, deny_text)
+        await deliver_delegation_result(
+            request,
+            contact_id=contact_id,
+            decision_id=decision.get("id", ""),
+            status="denied",
+            message=deny_text,
+        )
         return True
 
-    # Approved -- mint the project invite via the delegation handler.
+    # Approved — mint the project invite via the delegation handler.
     try:
-        from tinyagentos.delegation_handler import complete_delegation_approval
+        from tinyagentos.delegation_handler import (
+            complete_delegation_approval,
+            deliver_delegation_result,
+        )
 
         result = await complete_delegation_approval(
             request, decision_metadata=meta,
@@ -459,25 +478,55 @@ async def _apply_collab_delegation_grant(request: Request, decision: dict, value
         if result.get("status") == "approved":
             invite_id = result.get("invite_id", "")
             reply = (
-                f"Delegation approved. Agent '{meta.get('agent_slug', '')}' "
-                f"sponsored by {meta.get('contact_id', '')}. "
+                f"Delegation approved. Agent '{agent_slug}' "
+                f"sponsored by {contact_id}. "
                 f"Invite ID: {invite_id}. "
                 f"Share this invite with the remote contact so their agent can join."
             )
+            # Deliver via A2A bus (best-effort for local agents) and peer
+            # channel (primary path for remote contacts).
             await _route_answer_to_agent(decision, reply)
+            await deliver_delegation_result(
+                request,
+                contact_id=contact_id,
+                decision_id=decision.get("id", ""),
+                status="approved",
+                message=reply,
+                invite_id=invite_id,
+                agent_slug=agent_slug,
+            )
         else:
-            error_text = f"Delegation approval failed: {result.get('error', 'unknown error')}"
+            error_text = (
+                f"Delegation approval failed: "
+                f"{result.get('error', 'unknown error')}"
+            )
             await _route_answer_to_agent(decision, error_text)
+            await deliver_delegation_result(
+                request,
+                contact_id=contact_id,
+                decision_id=decision.get("id", ""),
+                status="error",
+                message=error_text,
+            )
     except Exception:
         logger.warning(
             "collab delegation completion failed for decision %s",
             decision.get("id"), exc_info=True,
         )
+        from tinyagentos.delegation_handler import deliver_delegation_result
+
         error_msg = (
             f"Delegation approval failed: an internal error occurred while "
             f"setting up the sponsored agent. Please retry or check the logs."
         )
         await _route_answer_to_agent(decision, error_msg)
+        await deliver_delegation_result(
+            request,
+            contact_id=contact_id,
+            decision_id=decision.get("id", ""),
+            status="error",
+            message=error_msg,
+        )
     return True
 
 

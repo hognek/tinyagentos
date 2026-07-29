@@ -16,18 +16,19 @@ class TestDelegationScopeValidation:
     def test_hard_denies_files_write(self):
         from tinyagentos.delegation_handler import validate_delegation_scopes
 
-        granted, denied = validate_delegation_scopes(
+        granted, denied, elevated = validate_delegation_scopes(
             ["a2a_send", "files_write", "project_tasks"]
         )
         assert "files_write" in denied
         assert "files_write" not in granted
+        assert "files_write" not in elevated
         assert "a2a_send" in granted
         assert "project_tasks" in granted
 
     def test_hard_denies_decisions_write(self):
         from tinyagentos.delegation_handler import validate_delegation_scopes
 
-        granted, denied = validate_delegation_scopes(
+        granted, denied, elevated = validate_delegation_scopes(
             ["decisions_write", "canvas_read"]
         )
         assert "decisions_write" in denied
@@ -38,16 +39,39 @@ class TestDelegationScopeValidation:
         from tinyagentos.delegation_handler import validate_delegation_scopes
         from tinyagentos.delegation_handler import SPONSORED_DEFAULT_SCOPES
 
-        granted, denied = validate_delegation_scopes(list(SPONSORED_DEFAULT_SCOPES))
+        granted, denied, elevated = validate_delegation_scopes(list(SPONSORED_DEFAULT_SCOPES))
         assert len(denied) == 0
+        assert len(elevated) == 0
         assert set(granted) == SPONSORED_DEFAULT_SCOPES
 
     def test_empty_request_returns_no_scopes(self):
         from tinyagentos.delegation_handler import validate_delegation_scopes
 
-        granted, denied = validate_delegation_scopes([])
+        granted, denied, elevated = validate_delegation_scopes([])
         assert granted == []
         assert denied == []
+        assert elevated == []
+
+    def test_elevated_scopes_require_approval(self):
+        from tinyagentos.delegation_handler import validate_delegation_scopes
+
+        granted, denied, elevated = validate_delegation_scopes(
+            ["a2a_send", "tools_execute", "memory_read", "files_write"]
+        )
+        assert set(granted) == {"a2a_send"}
+        assert set(denied) == {"files_write"}
+        assert set(elevated) == {"memory_read", "tools_execute"}
+
+    def test_allowlist_strips_unknown_scopes(self):
+        from tinyagentos.delegation_handler import validate_delegation_scopes
+
+        granted, denied, elevated = validate_delegation_scopes(
+            ["a2a_send", "files_read", "tools_execute", "canvas_write"]
+        )
+        # Only a2a_send is in SPONSORED_DEFAULT_SCOPES.
+        assert set(granted) == {"a2a_send"}
+        assert denied == []
+        assert set(elevated) == {"canvas_write", "files_read", "tools_execute"}
 
 
 # ---------------------------------------------------------------------------
@@ -330,7 +354,7 @@ class TestMintReturnShape:
 
         request = MagicMock()
         request.app.state.project_store = project_store
-        request.app.state.project_invite_store = store
+        request.app.state.project_invites = store
 
         envelope_body = {
             "agent_slug": "sponsored-agent",
@@ -378,7 +402,7 @@ class TestMintReturnShape:
 
         request = MagicMock()
         request.app.state.project_store = project_store
-        request.app.state.project_invite_store = store
+        request.app.state.project_invites = store
 
         result = await process_delegation_request(
             request,
@@ -550,7 +574,7 @@ class TestDelegationE2E:
 
         request = MagicMock()
         request.app.state.project_store = project_store
-        request.app.state.project_invite_store = store
+        request.app.state.project_invites = store
 
         # Step 1: process delegation request (auto-approve)
         result = await process_delegation_request(

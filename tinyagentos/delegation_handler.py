@@ -9,6 +9,7 @@ Also provides cascade revocation and kill-switch machinery.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -41,27 +42,44 @@ _PROJECT_SCOPES: frozenset[str] = frozenset({"project_tasks", "canvas_read", "ca
 
 def validate_delegation_scopes(
     requested_scopes: list[str],
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], list[str]]:
     """Validate and filter scopes for a delegation request.
 
-    Returns ``(granted_scopes, denied_scopes)``.  Scopes in
-    ``SPONSORED_DENY_SCOPES`` are stripped with a warning; scopes outside
-    ``SPONSORED_DEFAULT_SCOPES`` require explicit per-scope Decisions approval
-    but are NOT auto-denied — they surface to the human for approval.
+    Returns ``(granted_scopes, denied_scopes, elevated_scopes)``.
 
-    The returned ``granted_scopes`` are safe-to-mint; any scope in
-    ``denied_scopes`` was hard-denied and will never be included in the minted
-    invite.
+    *granted_scopes* — scopes within ``SPONSORED_DEFAULT_SCOPES`` that are NOT
+    in the denylist.  These are safe to mint on approval.
+
+    *denied_scopes* — scopes in ``SPONSORED_DENY_SCOPES``.  Hard-denied and
+    will never be included in the minted invite.
+
+    *elevated_scopes* — scopes outside the sponsored tier (not in
+    ``SPONSORED_DEFAULT_SCOPES`` or ``SPONSORED_DENY_SCOPES``).  These require
+    explicit per-scope Decisions approval from the human; they are NOT
+    auto-included in the minted invite unless separately approved.
+
+    The sponsored default tier is POSITIVE (allowlist), not a denylist:
+    only scopes in SPONSORED_DEFAULT_SCOPES are auto-granted.  Everything
+    outside the tier must get explicit consent per design section 5.
     """
     requested_set = set(requested_scopes)
     denied = sorted(requested_set & SPONSORED_DENY_SCOPES)
-    allowed = sorted(requested_set - SPONSORED_DENY_SCOPES)
+    tier_scopes = requested_set & SPONSORED_DEFAULT_SCOPES
+    granted = sorted(tier_scopes - SPONSORED_DENY_SCOPES)
+    elevated = sorted(
+        requested_set - SPONSORED_DEFAULT_SCOPES - SPONSORED_DENY_SCOPES,
+    )
     if denied:
         logger.warning(
             "delegation: hard-denied scopes %r from request %r",
             denied, sorted(requested_set),
         )
-    return allowed, denied
+    if elevated:
+        logger.info(
+            "delegation: elevated scopes in request %r (require explicit approval)",
+            elevated,
+        )
+    return granted, denied, elevated
 
 
 def _validate_delegation_envelope_body(body: dict) -> tuple[bool, str, Optional[dict]]:
@@ -150,8 +168,8 @@ async def process_delegation_request(
             ),
         }
 
-    # Apply scope denylist.
-    granted_scopes, denied_scopes = validate_delegation_scopes(requested_scopes)
+    # Apply scope denylist + allowlist tier enforcement.
+    granted_scopes, denied_scopes, elevated_scopes = validate_delegation_scopes(requested_scopes)
 
     # Check project policy: auto_approve_delegation knob.
     auto_approve = await project_store.get_project_setting(
@@ -178,6 +196,7 @@ async def process_delegation_request(
         display_name=display_name,
         granted_scopes=granted_scopes,
         denied_scopes=denied_scopes,
+        elevated_scopes=elevated_scopes,
         project_id=project_id,
     )
 
@@ -190,6 +209,7 @@ async def _create_delegation_decision(
     display_name: str,
     granted_scopes: list[str],
     denied_scopes: list[str],
+    elevated_scopes: list[str] | None = None,
     project_id: str,
 ) -> dict:
     """Create a blocking Decisions card for manual delegation approval.
@@ -197,7 +217,8 @@ async def _create_delegation_decision(
     The human sees: "contact {contact_id} wants to delegate agent
     '{display_name}' ({agent_slug}) to project {project_id} with scopes
     {granted_scopes}."  Any hard-denied scopes are noted in the question
-    text so the human knows they were stripped.
+    text so the human knows they were stripped.  Elevated scopes (outside
+    the sponsored tier) are listed as requiring separate approval.
     """
     decision_store = getattr(request.app.state, "decision_store", None)
     if decision_store is None:
@@ -212,6 +233,11 @@ async def _create_delegation_decision(
         question_parts.append(
             f"(Hard-denied: {', '.join(denied_scopes)} — "
             f"these scopes cannot be granted to delegated agents in v1)"
+        )
+    if elevated_scopes:
+        question_parts.append(
+            f"(Elevated — require explicit per-scope approval: "
+            f"{', '.join(elevated_scopes)})"
         )
 
     question = ". ".join(question_parts) + "."
@@ -230,6 +256,7 @@ async def _create_delegation_decision(
                 "display_name": display_name,
                 "granted_scopes": granted_scopes,
                 "denied_scopes": denied_scopes,
+                "elevated_scopes": elevated_scopes or [],
                 "project_id": project_id,
             },
         )
@@ -341,16 +368,23 @@ async def complete_delegation_approval(
     if invite_store is None:
         return {"status": "error", "error": "invite store not available"}
 
-    # Re-apply scope denylist to ensure hard-denied scopes are stripped even
-    # if the stored metadata was tampered with between decision creation and
-    # approval.  The denylist is the authoritative gate; the stored scopes are
-    # the human-approved set, but the code must never mint tokens for
-    # hard-denied scopes regardless.
-    safe_scopes, re_denied = validate_delegation_scopes(granted_scopes)
+    # Re-apply scope denylist + allowlist tier to ensure hard-denied and
+    # elevated scopes are stripped even if the stored metadata was tampered
+    # with between decision creation and approval.  The tier is the
+    # authoritative gate; the stored scopes are the human-approved set, but
+    # the code must never mint tokens for hard-denied or elevated scopes
+    # without separate approval.
+    safe_scopes, re_denied, re_elevated = validate_delegation_scopes(granted_scopes)
     if re_denied:
         logger.warning(
             "complete_delegation_approval: re-stripped hard-denied scopes %r from stored grant",
             re_denied,
+        )
+    if re_elevated:
+        logger.warning(
+            "complete_delegation_approval: re-stripped elevated scopes %r"
+            " from stored grant (require separate per-scope approval)",
+            re_elevated,
         )
 
     try:
@@ -492,34 +526,44 @@ async def _unassign_agent_tasks(
     canonical_id: str,
     project_id: str | None = None,
 ) -> int:
-    """Unassign all in-flight tasks for *canonical_id*, moving them back to 'ready'.
+    """Unassign all in-flight tasks for *canonical_id* via release_task.
 
-    Returns the count of tasks unassigned.
+    Queries for tasks claimed by *canonical_id* (status='claimed') and
+    releases each one with ``release_task(task_id, releaser_id)``, the
+    store's atomic unclaim primitive.  When *project_id* is provided, only
+    tasks within that project are released.
+
+    Returns the count of tasks released.
     """
-    # The task store interface varies by implementation; use the available
-    # method to find and unassign.  We query for tasks with assignee matching
-    # the agent's canonical_id and reset them.
+    # Find all tasks currently held by this agent.
     try:
-        tasks = await task_store.list_for_assignee(canonical_id)
-    except AttributeError:
-        # Fall back: try list_tasks with filter.
-        try:
+        if project_id is not None:
             all_tasks = await task_store.list_tasks(
                 project_id=project_id,
-                status="in_progress",
+                status="claimed",
             )
-            tasks = [t for t in all_tasks if t.get("assignee_id") == canonical_id]
-        except Exception:
-            return 0
+        else:
+            # Contact-wide revoke: query every project the agent is known
+            # to hold tasks in.  Fall back to a broader scan when the
+            # project is unknown.
+            all_tasks = await task_store.list_tasks(
+                project_id=None,  # type: ignore[arg-type]
+                status="claimed",
+            )
+    except Exception:
+        return 0
 
+    # Filter to tasks held by this specific agent.
+    held = [t for t in all_tasks if t.get("claimed_by") == canonical_id]
     count = 0
-    for task in tasks:
+    for task in held:
         task_id = task.get("id") or task.get("task_id")
         if not task_id:
             continue
         try:
-            await task_store.update_task(task_id, assignee_id=None, status="ready")
-            count += 1
+            released = await task_store.release_task(task_id, canonical_id)
+            if released:
+                count += 1
         except Exception:
             pass
 
@@ -589,3 +633,122 @@ async def kill_switch_reenable(request) -> dict:
 def is_peer_disabled(request) -> bool:
     """Check whether the per-instance peer panic switch is active."""
     return getattr(request.app.state, "_peer_disabled", False)
+
+
+# ---------------------------------------------------------------------------
+# Peer-channel delivery for delegation results (A3 fix)
+# ---------------------------------------------------------------------------
+
+
+async def deliver_delegation_result(
+    request,
+    *,
+    contact_id: str,
+    decision_id: str,
+    status: str,
+    message: str,
+    invite_id: str | None = None,
+    agent_slug: str | None = None,
+) -> bool:
+    """Deliver a delegation result to the remote contact over the peer channel.
+
+    Called after a human answers the collab delegation gate decision.
+    Builds a ``delegation_result`` envelope and POSTs it to the remote
+    contact's peer inbox using the outbound token from the peer link.
+
+    Returns True if the envelope was delivered to at least one endpoint.
+    """
+    contacts_store = getattr(request.app.state, "contacts_store", None)
+    if contacts_store is None:
+        logger.warning("deliver_delegation_result: contacts store not available")
+        return False
+
+    try:
+        peer_link = await contacts_store.get_peer_link(contact_id)
+    except Exception:
+        logger.warning(
+            "deliver_delegation_result: peer link lookup failed for %s",
+            contact_id, exc_info=True,
+        )
+        return False
+
+    if peer_link is None or not peer_link.get("endpoints"):
+        logger.warning(
+            "deliver_delegation_result: no peer endpoints for contact %s",
+            contact_id,
+        )
+        return False
+
+    # Build the result envelope.
+    from tinyagentos.peer import build_envelope, resolve_local_identity_id
+
+    local_id = await asyncio.to_thread(resolve_local_identity_id, request.app.state.data_dir)
+    if local_id is None:
+        logger.warning("deliver_delegation_result: local hub identity not configured")
+        return False
+
+    # Extract username from "hub:username" format.
+    local_username = local_id.split(":", 1)[1] if ":" in local_id else local_id
+    contact_username = contact_id.split(":", 1)[1] if ":" in contact_id else contact_id
+
+    body: dict = {
+        "decision_id": decision_id,
+        "status": status,
+        "message": message,
+    }
+    if invite_id:
+        body["invite_id"] = invite_id
+    if agent_slug:
+        body["agent_slug"] = agent_slug
+
+    envelope = build_envelope(
+        from_username=local_username,
+        to_username=contact_username,
+        kind="delegation_result",
+        body=body,
+    )
+
+    outbound_token = peer_link.get("outbound_token", "")
+    if not outbound_token:
+        logger.warning(
+            "deliver_delegation_result: no outbound token for contact %s",
+            contact_id,
+        )
+        return False
+
+    import httpx
+
+    delivered = False
+    for ep in sorted(
+        peer_link["endpoints"],
+        key=lambda e: e.get("priority", 99),
+    ):
+        inbox_url = f"{ep['url'].rstrip('/')}/api/peer/inbox"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    inbox_url,
+                    json={"envelope": envelope},
+                    headers={
+                        "Authorization": f"Bearer {outbound_token}",
+                        "Content-Type": "application/json",
+                    },
+                )
+                if 200 <= resp.status_code < 300:
+                    delivered = True
+                    break
+        except Exception:
+            continue
+
+    if delivered:
+        logger.info(
+            "deliver_delegation_result: delivered to %s (decision %s, status %s)",
+            contact_id, decision_id, status,
+        )
+    else:
+        logger.warning(
+            "deliver_delegation_result: failed to deliver to %s (decision %s)",
+            contact_id, decision_id,
+        )
+
+    return delivered

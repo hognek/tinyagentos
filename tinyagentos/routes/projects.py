@@ -417,6 +417,24 @@ async def remove_member(
     require_owner_or_admin(user, project["user_id"])
     await store.remove_member(project_id, member_id)
     await store.log_activity(project_id, user.user_id, "member.removed", {"member_id": member_id})
+
+    # Cascade revoke: any agents sponsored by this contact must be revoked
+    # when the sponsor is removed from the project (D1/B2 fix).
+    try:
+        from tinyagentos.delegation_handler import cascade_sponsor_revoke
+
+        await cascade_sponsor_revoke(
+            request, contact_id=member_id, project_id=project_id,
+            reason=f"sponsor {member_id} removed from project {project_id}",
+        )
+    except Exception:
+        # Cascade is best-effort alongside the removal.  The member has
+        # already been removed; a cascade failure does not roll back.
+        logger.warning(
+            "remove_member: cascade_sponsor_revoke failed for %s in %s",
+            member_id, project_id, exc_info=True,
+        )
+
     members = await store.list_members(project_id)
     _mirror(request, {**project, "members": members})
     try:
