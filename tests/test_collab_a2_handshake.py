@@ -440,9 +440,9 @@ class TestBlockCascade:
         link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
         assert link["revoked_at"] is not None
 
-        # Verify contact is revoked
+        # Verify contact is blocked
         contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
-        assert contact["status"] == "revoked"
+        assert contact["status"] == "blocked"
 
     async def test_block_cascade_handles_missing_contacts_store(
         self, client_with_contacts, app_with_contacts, monkeypatch
@@ -504,6 +504,123 @@ class TestBlockCascade:
         link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
         assert link["revoked_at"] is not None
 
-        # Verify contact is revoked
+        # Verify contact is blocked
         contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
-        assert contact["status"] == "revoked"
+        assert contact["status"] == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# Security regression tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestSecurityRegression:
+    async def test_anti_imposter_mismatched_pubkey(
+        self, client_with_contacts, app_with_contacts, monkeypatch
+    ):
+        """A directory response with a signing_pubkey that does NOT match the
+        peer fingerprint must NOT create a contact — prevents an imposter from
+        hijacking the handshake."""
+        dir_resp_body = {
+            "peer": _PEER_FP,
+            "username": _PEER_USERNAME,
+            "display_name": "Imposter",
+            "signing_pubkey": "ff" * 32,  # WRONG — does not hash to _PEER_FP
+            "encryption_pubkey": _PEER_ENCRYPTION_PUB,
+            "endpoints": ["https://imposter.example.com:6969"],
+        }
+
+        async def handler(method, url, **kw):
+            return _fake_dir_resp(body=dir_resp_body)
+
+        _patch_account_proxy(monkeypatch, handler)
+
+        resp = await client_with_contacts.post(
+            "/api/hub/friends/requests/test-rid-imp/accept",
+            json={"peer_fingerprint": _PEER_FP},
+        )
+        # Should still return 200 (accept doesn't fail) but NO contact created
+        assert resp.status_code == 200
+
+        store = app_with_contacts.state.contacts_store
+        contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
+        assert contact is None, "imposter pubkey must not create a contact"
+
+    async def test_authz_rejection_no_handshake(
+        self, client_with_contacts, app_with_contacts, monkeypatch
+    ):
+        """A failed directory lookup (403/404) must NOT establish a contact
+        or peer link — the handshake must fail closed."""
+        # Directory returns 403
+        async def handler(method, url, **kw):
+            return _fake_dir_resp(
+                status=403, body={"error": "forbidden"}
+            )
+
+        _patch_account_proxy(monkeypatch, handler)
+
+        resp = await client_with_contacts.post(
+            "/api/hub/friends/requests/test-rid-403/accept",
+            json={"peer_fingerprint": _PEER_FP},
+        )
+        # Accept should handle the upstream error gracefully
+        assert resp.status_code == 200
+        data = resp.json()
+        # State must indicate failure
+        assert data["state"] != "accepted"
+
+        store = app_with_contacts.state.contacts_store
+        contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
+        assert contact is None, "403 must not create a contact"
+
+    async def test_block_guard_prevent_reaccept_resurrection(
+        self, client_with_contacts, app_with_contacts, monkeypatch
+    ):
+        """Blocking a peer then re-accepting the same fingerprint must NOT
+        resurrect the contact — the block guard prevents it."""
+        store = app_with_contacts.state.contacts_store
+
+        # Create a contact and peer link, then block.
+        await store.add_contact(
+            contact_id=f"hub:{_PEER_USERNAME}",
+            hub_username=_PEER_USERNAME,
+            display_name="Remote",
+            ed25519_pub=_PEER_SIGNING_PUB,
+            x25519_pub=_PEER_ENCRYPTION_PUB,
+            peer_fingerprint=_PEER_FP,
+        )
+        await store.establish_peer_link(
+            contact_id=f"hub:{_PEER_USERNAME}",
+            inbound_token=generate_peer_token(),
+            outbound_token=generate_peer_token(),
+        )
+        await store.set_contact_status(f"hub:{_PEER_USERNAME}", "blocked")
+
+        # Now try to re-accept
+        dir_resp_body = {
+            "peer": _PEER_FP,
+            "username": _PEER_USERNAME,
+            "display_name": "Remote Peer",
+            "signing_pubkey": _PEER_SIGNING_PUB,
+            "encryption_pubkey": _PEER_ENCRYPTION_PUB,
+            "endpoints": ["https://peer.example.com:6969"],
+        }
+
+        async def handler(method, url, **kw):
+            return _fake_dir_resp(body=dir_resp_body)
+
+        _patch_account_proxy(monkeypatch, handler)
+
+        resp = await client_with_contacts.post(
+            "/api/hub/friends/requests/test-rid-res/accept",
+            json={"peer_fingerprint": _PEER_FP},
+        )
+        assert resp.status_code == 200
+
+        # Contact must still be blocked — NOT resurrected to active
+        contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
+        assert contact is not None
+        assert contact["status"] == "blocked", (
+            "blocked contact must not be resurrected by re-accept"
+        )

@@ -427,6 +427,9 @@ lane (real build/test CI, fork-approval rules apply), FLEET = free-model builder
 - A1 LEAD: `contacts_store` plus `peer_links` plus envelope sign/verify plus peer
   route family plus rate limits.
 - A2 LEAD: friend-accept to contact-row plus handshake wiring (hub subscription).
+  **Deviation:** the peer-link token is minted locally without hub delivery —
+  the token exchange requires both instances to be online simultaneously, which
+  is acceptable for a pilot and avoids hub-trust assumptions for bearer tokens.
 - A3 HOGNEK: hub sealed-envelope relay endpoints on taos.my (T1, not pilot-blocking,
   can trail).
 - A4 FLEET (cards): ContactsApp taOS section UI; presence dots; request
