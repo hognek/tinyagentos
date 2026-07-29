@@ -175,6 +175,28 @@ scopes) may be granted globally (`project_id=None`) or per-project. Creation
 surfaces a bell notification (`source: agent_scope_requests`) to the owner/admin,
 retired when the request is decided.
 
+## User resource sharing (share routes)
+
+Users can share resources with each other through the `/api/shares` endpoints
+in `tinyagentos/routes/user_shares.py`. The consent loop mirrors the
+external-agent consent pattern (`agent_auth_requests.py`): on share-create, a
+notification and a Decision record (type `approve_deny`) are raised to the
+target user so the desktop consent actions can approve or deny:
+
+- `POST /api/shares {resource_type, resource_id, to_username, permission}` —
+  share a resource with another user by username. Resolves the target via
+  AuthManager; self-share is rejected (400). Duplicate shares (same owner,
+  resource, target, permission) are idempotent.
+- `GET /api/shares?direction=out|in` — list shares. `out` (default) returns
+  shares the user owns; `in` returns shares where the user is the target.
+- `POST /api/shares/{id}/accept` — accept a pending share (target user only).
+  Once accepted, the module-level helper `user_can_access()` returns True for
+  that resource.
+- `POST /api/shares/{id}/deny` — deny a pending share (target user only).
+  The share row is preserved with `status=denied` for audit.
+- `DELETE /api/shares/{id}` — revoke a share. Owner or admin only
+  (requires `require_owner_or_admin` against the share's `owner_user_id`).
+
 ## Project invite redeem route (link + PIN)
 
 A project invite lets an external agent join without going through the consent
