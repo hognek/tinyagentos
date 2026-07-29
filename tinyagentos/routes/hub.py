@@ -534,27 +534,30 @@ async def block_peer(
     if contacts_store is not None:
         try:
             author = await store.get_author(peer)
+            cid = None
             if author and author.get("username"):
-                await contacts_store.revoke_peer_link(f"hub:{author['username']}")
+                cid = f"hub:{author['username']}"
+                await contacts_store.revoke_peer_link(cid)
             else:
                 # Fall back to the fingerprint pinned on the contacts row
                 # (independent of the volatile hub_authors cache).
                 contact = await contacts_store.get_contact_by_fingerprint(peer)
                 if contact:
                     await contacts_store.revoke_peer_link(contact["contact_id"])
-                    # Mark the contact as blocked so the UI reflects the distinct
-                    # status rather than leaving it at the prior accepted state.
                     cid = contact["contact_id"]
-                    try:
-                        await contacts_store.set_contact_status(cid, "blocked")
-                    except Exception:
-                        logger.warning(
-                            "hub block: set_contact_status blocked failed for %s", cid
-                        )
                 else:
                     logger.warning(
                         "hub block: could not resolve fingerprint %s to a "
                         "contact; peer link may still be active", peer,
+                    )
+            # Mark the contact as blocked so the UI reflects the distinct
+            # status rather than leaving it at the prior accepted state.
+            if cid is not None:
+                try:
+                    await contacts_store.set_contact_status(cid, "blocked")
+                except Exception:
+                    logger.warning(
+                        "hub block: set_contact_status blocked failed for %s", cid
                     )
         except Exception:
             logger.exception("hub block: contacts-store cascade failed for %s", peer)
