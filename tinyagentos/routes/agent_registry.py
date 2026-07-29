@@ -220,23 +220,27 @@ async def _audit_governance(
     actor_user_id: str,
     before_status: str,
     after_status: str,
+    **extras,
 ) -> None:
-    """Write a governance audit event to the trace store (best-effort, non-fatal)."""
+    """Write a governance audit event to the trace store (best-effort, non-fatal).
+
+    Extra keyword arguments are merged into the payload (e.g. before/after
+    token_min_iat for rotation events).
+    """
     try:
         trace_registry = getattr(request.app.state, "trace_registry", None)
         if trace_registry is None:
             return
         ts = await trace_registry.get(_GOVERNANCE_SLUG)
-        await ts.record(
-            "governance",
-            payload={
-                "action": action,
-                "canonical_id": canonical_id,
-                "actor_user_id": actor_user_id,
-                "before_status": before_status,
-                "after_status": after_status,
-            },
-        )
+        payload = {
+            "action": action,
+            "canonical_id": canonical_id,
+            "actor_user_id": actor_user_id,
+            "before_status": before_status,
+            "after_status": after_status,
+            **extras,
+        }
+        await ts.record("governance", payload=payload)
     except Exception:
         logger.exception("governance audit write failed (non-fatal)")
 
@@ -777,7 +781,10 @@ async def rotate_tokens(
     require_owner_or_admin(user, record["user_id"])
 
     ts = int(time.time())
+    before_iat = record.get("token_min_iat") or 0
     updated = await store.bump_token_min_iat(canonical_id, ts)
+    if updated is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
 
     await _audit_governance(
         request,
@@ -786,6 +793,8 @@ async def rotate_tokens(
         actor_user_id=user.user_id,
         before_status=record.get("status") or "active",
         after_status=updated.get("status") or "active",
+        before_token_min_iat=before_iat,
+        after_token_min_iat=ts,
     )
     return updated
 

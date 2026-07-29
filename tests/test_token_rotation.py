@@ -387,7 +387,7 @@ class TestRotateTokensRoute:
     @pytest.mark.asyncio
     async def test_admin_can_rotate(self, agent_app, app):
         """An admin can bump token_min_iat on any identity."""
-        cid, token = await _register_and_mint(app, user_id="admin")
+        cid, _token = await _register_and_mint(app, user_id="admin")
         resp = await agent_app.post(f"/api/agents/registry/{cid}/rotate-tokens")
         assert resp.status_code == 200
         body = resp.json()
@@ -396,7 +396,7 @@ class TestRotateTokensRoute:
     @pytest.mark.asyncio
     async def test_owner_can_rotate(self, agent_app, app):
         """A session owner (non-admin) can rotate their own identity."""
-        cid, token = await _register_and_mint(app, user_id="admin")
+        cid, _token = await _register_and_mint(app, user_id="admin")
         resp = await agent_app.post(f"/api/agents/registry/{cid}/rotate-tokens")
         assert resp.status_code == 200
         body = resp.json()

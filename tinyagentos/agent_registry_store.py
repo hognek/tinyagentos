@@ -884,7 +884,7 @@ class AgentRegistryStore(BaseStore):
         if record is None:
             return None
         await self._db.execute(
-            "UPDATE agent_registry SET token_min_iat = ? WHERE canonical_id = ?",
+            "UPDATE agent_registry SET token_min_iat = MAX(token_min_iat, ?) WHERE canonical_id = ?",
             (ts, canonical_id),
         )
         await self._db.commit()
