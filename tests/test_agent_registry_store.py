@@ -1354,3 +1354,38 @@ async def test_get_by_slug_rejects_glob_metacharacters(store):
     assert await store.get_by_slug("alpha?") is None
     assert await store.get_by_slug("") is None
     assert await store.get_by_slug("Alpha") is None
+
+
+# ---------------------------------------------------------------------------
+# token_min_iat — per-identity token rotation
+# ---------------------------------------------------------------------------
+
+
+class TestBumpTokenMinIat:
+    @pytest.mark.asyncio
+    async def test_bump_sets_cutoff(self, store):
+        """bump_token_min_iat persists the cutoff and the new token_min_iat is
+        readable on the record."""
+        row = await store.register(framework="test", display_name="test-agent")
+        cid = row["canonical_id"]
+
+        ts = 1700000000
+        updated = await store.bump_token_min_iat(cid, ts)
+        assert updated is not None
+        assert updated["token_min_iat"] == ts
+
+        reread = await store.get(cid)
+        assert reread["token_min_iat"] == ts
+
+    @pytest.mark.asyncio
+    async def test_default_zero_on_new_registration(self, store):
+        """Freshly registered agents have token_min_iat = 0 so all tokens
+        are valid (migration-safe default)."""
+        row = await store.register(framework="test", display_name="test-agent")
+        assert row["token_min_iat"] == 0
+
+    @pytest.mark.asyncio
+    async def test_bump_nonexistent_returns_none(self, store):
+        """bump_token_min_iat on an unknown canonical_id returns None."""
+        result = await store.bump_token_min_iat("no-such-agent-20260101-000000", 1700000000)
+        assert result is None
