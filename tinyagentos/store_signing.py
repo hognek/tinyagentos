@@ -96,13 +96,13 @@ def _enforce_permissions(keyfile: Path) -> None:
     try:
         mode = keyfile.stat().st_mode & 0o777
     except OSError as exc:
-        raise PermissionError(f"cannot stat keyfile {keyfile}: {exc}") from exc
+        raise PermissionError(f"cannot stat keyfile {keyfile}: {exc}")
     if mode != 0o600:
         os.chmod(keyfile, 0o600)
     try:
         mode_after = keyfile.stat().st_mode & 0o777
     except OSError as exc:
-        raise PermissionError(f"cannot stat keyfile {keyfile}: {exc}") from exc
+        raise PermissionError(f"cannot stat keyfile {keyfile}: {exc}")
     if mode_after != 0o600:
         raise PermissionError(f"cannot enforce 0600 permissions on {keyfile}")
 
@@ -138,7 +138,6 @@ def load_or_create_signing_keypair(data_dir: Path) -> tuple[bytes, bytes]:
             logger.warning(
                 "store signing keyfile corrupt (%s), regenerating", exc,
             )
-            keyfile.unlink(missing_ok=True)
 
     priv, pub = generate_signing_keypair()
     keyfile.parent.mkdir(parents=True, exist_ok=True)
@@ -189,6 +188,13 @@ def load_or_create_signing_keypair(data_dir: Path) -> tuple[bytes, bytes]:
         # Another process won the race — discard our key and load theirs.
         tmp.unlink(missing_ok=True)
         return load_or_create_signing_keypair(data_dir)
+    except OSError:
+        # os.link may fail on filesystems without hardlink support
+        # (overlayfs, FUSE, some container layers, FAT, etc.).
+        # Fall back to os.replace — universally supported, but carries
+        # a small overwrite-race window that the tmp file's 0600 perms
+        # and exclusive-open already bound.
+        os.replace(tmp, keyfile)
     else:
         tmp.unlink(missing_ok=True)
     logger.info("store signing keypair created at %s", keyfile)
@@ -235,9 +241,7 @@ def _canonical_manifest_bytes(manifest_dict: dict) -> bytes:
     keys or change scalar representations.
     """
     stripped = {k: v for k, v in manifest_dict.items() if k != SIGNATURE_FIELD}
-    return json.dumps(
-        stripped, sort_keys=True, ensure_ascii=False,
-    ).encode("utf-8")
+    return json.dumps(stripped, sort_keys=True, ensure_ascii=False).encode("utf-8")
 
 
 # ---------------------------------------------------------------------------
