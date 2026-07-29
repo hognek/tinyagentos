@@ -8,24 +8,26 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+import pytest_asyncio
 
 
-@pytest.fixture(autouse=True)
-def _ensure_agent_model_key_store(client, tmp_path_factory):
+@pytest_asyncio.fixture(autouse=True)
+async def _ensure_agent_model_key_store(client, tmp_path_factory):
     """Init app.state.agent_model_keys on a fresh DB; the test client registers
-    the store but does not run the lifespan that init()s it (production does)."""
+    the store but does not run the lifespan that init()s it (production does).
+    Uses async fixture so init runs on the same event loop as the tests."""
     store = client._transport.app.state.agent_model_keys
     if store._db is not None:
         try:
-            asyncio.get_event_loop().run_until_complete(store.close())
+            await store.close()
         except Exception:
             pass
     tmp_dir = tmp_path_factory.mktemp("agent_model_keys_route_test")
     store.db_path = tmp_dir / "agent_model_keys.db"
-    asyncio.get_event_loop().run_until_complete(store.init())
+    await store.init()
     yield
     try:
-        asyncio.get_event_loop().run_until_complete(store.close())
+        await store.close()
     except Exception:
         pass
 
@@ -48,37 +50,42 @@ class TestAgentModelKeysRouteValidation:
         ],
     )
     async def test_mint_rejects_unsafe_agent_ids(self, client, agent_ids):
-        """Pydantic field_validator must reject path traversal before the store."""
+        """Handler-level _validate_agent_id rejects path traversal with 400."""
         resp = await client.post(
             "/api/agent-model-keys",
             json={"agent_ids": agent_ids},
         )
-        # FastAPI returns 422 for Pydantic validation failures.
-        assert resp.status_code == 422, (
-            f"expected 422 for agent_ids={agent_ids!r}, "
+        assert resp.status_code == 400, (
+            f"expected 400 for agent_ids={agent_ids!r}, "
             f"got {resp.status_code}: {resp.text}"
+        )
+        # The error body should mention the first offending id
+        body = resp.json()
+        assert "error" in body
+        assert "invalid" in body["error"] or "required" in body["error"], (
+            f"error body should mention validation failure, body={body}"
         )
 
     async def test_mint_allows_safe_agent_ids(self, client):
-        """Valid slug-format agent ids pass Pydantic validation (the store is
-        reached — a store-init error proves validation passed the 422 gate).
-        """
+        """Valid slug-format agent ids pass handler validation and reach the store.
+        With the store properly initialised, a successful mint returns the token."""
         resp = await client.post(
             "/api/agent-model-keys",
             json={"agent_ids": ["safe-agent-1", "gpt_4o.test"]},
         )
-        # The store is not initialised in the default conftest client, so we
-        # expect 500 (store error), NOT 422 (validation rejection).  A 422
-        # here would mean the regex is too strict and safe slugs are blocked.
-        assert resp.status_code != 422, (
-            f"safe slugs should not be rejected by validation, "
+        # A 422 would mean the regex is too strict and safe slugs are blocked.
+        # A 400 would mean handler validation blocked legitimate slugs.
+        # A 200 means validation passed and the store minted successfully.
+        assert resp.status_code == 200, (
+            f"safe slugs should pass validation and mint, "
             f"got {resp.status_code}: {resp.text}"
         )
+        assert "key" in resp.json()
 
     async def test_mint_rejects_empty_agent_ids(self, client):
-        """Empty list is rejected."""
+        """Empty list is rejected with 400 by handler validation."""
         resp = await client.post(
             "/api/agent-model-keys",
             json={"agent_ids": []},
         )
-        assert resp.status_code == 422
+        assert resp.status_code == 400
