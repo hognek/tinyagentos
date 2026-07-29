@@ -53,6 +53,26 @@ async def _resolve_owner_user_id(
     return None
 
 
+async def _resolve_and_validate_owner(
+    args: dict, request: Request, tool_name: str
+) -> tuple[str | None, dict | None]:
+    """Resolve and type-validate the owner, returning (owner_id, None) on
+    success or (None, error_dict) on failure."""
+    owner_user_id = await _resolve_owner_user_id(args, request)
+    if owner_user_id is None:
+        return None, {
+            "error": (
+                "unable to resolve owner: agent not found or "
+                "no user identity available"
+            )
+        }
+    if not isinstance(owner_user_id, str) or not owner_user_id:
+        return None, {
+            "error": f"{tool_name} could not resolve a valid owner identity"
+        }
+    return owner_user_id, None
+
+
 async def execute_todo_list_lists(args: dict, request: Request) -> dict:
     """List non-archived todo lists the calling agent has access to.
 
@@ -66,16 +86,11 @@ async def execute_todo_list_lists(args: dict, request: Request) -> dict:
         return {"error": "todo_list_lists requires an 'agent_name' string"}
 
     try:
-        owner_user_id = await _resolve_owner_user_id(args, request)
-        if owner_user_id is None:
-            return {
-                "error": (
-                    "unable to resolve owner: agent not found or "
-                    "no user identity available"
-                )
-            }
-        if not isinstance(owner_user_id, str) or not owner_user_id:
-            return {"error": "todo_list_lists requires an 'owner_user_id' string"}
+        owner_user_id, err = await _resolve_and_validate_owner(
+            args, request, "todo_list_lists"
+        )
+        if err:
+            return err
 
         store = request.app.state.todo_store
         lists = await store.list_lists(owner_user_id)
@@ -110,16 +125,11 @@ async def execute_todo_add_item(args: dict, request: Request) -> dict:
         return {"error": "todo_add_item requires a 'text' string"}
 
     try:
-        owner_user_id = await _resolve_owner_user_id(args, request)
-        if owner_user_id is None:
-            return {
-                "error": (
-                    "unable to resolve owner: agent not found or "
-                    "no user identity available"
-                )
-            }
-        if not isinstance(owner_user_id, str) or not owner_user_id:
-            return {"error": "todo_add_item requires an 'owner_user_id' string"}
+        owner_user_id, err = await _resolve_and_validate_owner(
+            args, request, "todo_add_item"
+        )
+        if err:
+            return err
 
         store = request.app.state.todo_store
 
@@ -174,16 +184,11 @@ async def execute_todo_set_done(args: dict, request: Request) -> dict:
         return {"error": "todo_set_done requires a boolean 'done'"}
 
     try:
-        owner_user_id = await _resolve_owner_user_id(args, request)
-        if owner_user_id is None:
-            return {
-                "error": (
-                    "unable to resolve owner: agent not found or "
-                    "no user identity available"
-                )
-            }
-        if not isinstance(owner_user_id, str) or not owner_user_id:
-            return {"error": "todo_set_done requires an 'owner_user_id' string"}
+        owner_user_id, err = await _resolve_and_validate_owner(
+            args, request, "todo_set_done"
+        )
+        if err:
+            return err
 
         store = request.app.state.todo_store
 
