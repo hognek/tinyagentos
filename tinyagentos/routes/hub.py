@@ -542,6 +542,15 @@ async def block_peer(
                 contact = await contacts_store.get_contact_by_fingerprint(peer)
                 if contact:
                     await contacts_store.revoke_peer_link(contact["contact_id"])
+                    # Mark the contact as blocked so the UI reflects the distinct
+                    # status rather than leaving it at the prior accepted state.
+                    cid = contact["contact_id"]
+                    try:
+                        await contacts_store.set_contact_status(cid, "blocked")
+                    except Exception:
+                        logger.warning(
+                            "hub block: set_contact_status blocked failed for %s", cid
+                        )
                 else:
                     logger.warning(
                         "hub block: could not resolve fingerprint %s to a "
