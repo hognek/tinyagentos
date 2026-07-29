@@ -970,6 +970,8 @@ function CreateNoteForm({ config, onCreated, onCancel }: {
       if (!r.ok) throw new Error(`Could not create ${config.noun}.`);
       const doc: NoteDoc = await r.json();
       onCreated(doc);
+      setCreating(false);
+      setTitle("");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Could not create note.");
       setCreating(false);

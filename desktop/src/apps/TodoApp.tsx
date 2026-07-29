@@ -178,6 +178,7 @@ function TodoDetailPane({ listId, onBack }: { listId: string; onBack: () => void
   const loadReqRef = useRef(0);
   const loadDoc = useCallback(async () => {
     const myReq = ++loadReqRef.current;
+    if (loadReqRef.current === myReq) setError(null);
     try {
       const r = await fetch(`${API_BASE}/${listId}`);
       if (!r.ok) throw new Error("Could not load list.");
@@ -244,7 +245,7 @@ function TodoDetailPane({ listId, onBack }: { listId: string; onBack: () => void
   }
 
   if (loading) return <div className="flex h-full items-center justify-center"><p className="text-sm text-shell-text-tertiary">Loading...</p></div>;
-  if (error || !doc) return <div className="flex h-full items-center justify-center"><p className="text-sm text-red-400" role="alert">{error ?? "List not found."}</p></div>;
+  if (!doc) return <div className="flex h-full items-center justify-center"><p className="text-sm text-red-400" role="alert">List not found.</p></div>;
 
   const items = doc.items ?? [];
   return (
@@ -258,7 +259,7 @@ function TodoDetailPane({ listId, onBack }: { listId: string; onBack: () => void
       </div>
       <div className="flex-1 overflow-y-auto px-4 py-4">
         <div className="flex flex-col gap-4">
-          {error && (<div className="flex items-center gap-2 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-400" role="alert"><AlertCircle size={13} className="shrink-0" />{error}</div>)}
+          {error && (<div className="flex items-center justify-between gap-2 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-400" role="alert"><div className="flex items-center gap-2"><AlertCircle size={13} className="shrink-0" />{error}</div><button type="button" onClick={() => setError(null)} aria-label="Dismiss error" className="shrink-0 text-red-400 transition-opacity hover:opacity-70"><X size={13} /></button></div>)}
           <div className="flex flex-col gap-2">
             <Textarea value={newText} onChange={(e) => setNewText(e.target.value)}
               placeholder={ADD_PLACEHOLDER} rows={2} maxLength={20000} aria-label="New item text"
@@ -314,6 +315,8 @@ function CreateTodoForm({ onCreated, onCancel }: { onCreated: (list: TodoList) =
       if (!r.ok) throw new Error(`Could not create ${NOUN}.`);
       const doc: TodoList = await r.json();
       onCreated(doc);
+      setCreating(false);
+      setTitle("");
     } catch (e) {
       setError(e instanceof Error ? e.message : `Could not create ${NOUN}.`);
       setCreating(false);
