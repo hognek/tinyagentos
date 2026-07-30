@@ -1,4 +1,9 @@
 from __future__ import annotations
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from tinyagentos.worker.update_check import WorkerUpdateService
+
 import asyncio
 import json
 import logging
