@@ -17,6 +17,12 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
   `POST /api/desktop/screenshot` prominently featured. The agent-manual index now
   points at both the OS skill and the existing `taos-development-skill`. Draft for
   @taOS-dev review.
+- **OS-level typed change-event stream + `useOsEvents` hook.** A new authenticated
+  SSE endpoint (`GET /api/os/events`) streams typed change events carrying only the
+  event kind and id, never the payload, so apps can opt into live updates with a
+  single hook call. The shared `useOsEvents(kinds, onEvent)` hook manages a single
+  per-client connection, exposes `connected` and `stale` flags, and handles
+  reconnect with exponential backoff.
 - Projects gain a Notes area: title + markdown notes per project, readable and
   writable by the project owner or by an agent holding a project-bound
   `project_notes` grant (new requestable scope) (#2285).
