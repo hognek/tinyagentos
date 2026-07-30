@@ -32,7 +32,13 @@ async def _resolve_owner_user_id(
     agent_registry = getattr(request.app.state, "agent_registry", None)
     agent_name = args.get("agent_name")
     if agent_registry is None:
-        # No registry available (e.g. test harness) — trust owner_user_id.
+        # No registry available (e.g. test harness) — prefer the
+        # authenticated user_id from the request when available;
+        # fall back to caller-supplied owner_user_id only when
+        # neither registry nor authenticated identity is present.
+        user_id = getattr(request.state, "user_id", None)
+        if user_id:
+            return user_id
         return args.get("owner_user_id")
     if not agent_name or not isinstance(agent_name, str):
         return None
