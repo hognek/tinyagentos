@@ -269,13 +269,21 @@ class BrowserSessionManager:
         worker_url: str,
         profile_volume: str,
         auth_token: str | None = None,
-        mobile: bool = False,
+        mobile: bool | None = None,
     ) -> dict:
         """POST /worker/browser/start on the given worker and update the session.
 
         On success marks the session running and returns the refreshed session dict.
         On any failure marks the session as 'error' and raises BrowserWorkerError.
+
+        When *mobile* is ``None`` (the default) the session's stored
+        ``is_mobile`` flag is read from the row so agent sessions (which
+        are persisted with ``is_mobile=True``) actually render with the
+        mobile UA/viewport.  Explicit ``True`` / ``False`` overrides.
         """
+        if mobile is None:
+            session = await self.get_session(session_id)
+            mobile = bool(session["is_mobile"]) if session else False
         headers = {}
         if auth_token:
             headers["Authorization"] = f"Bearer {auth_token}"
@@ -492,7 +500,7 @@ class BrowserSessionManager:
         return await self.create_session("user", owner_id, url, profile_name, mobile=mobile)
 
     async def start_on_host(self, session_id: str, *, profile_volume: str, runner,
-                             mobile: bool = False, nat1to1_ip: str | None = None) -> dict:
+                             mobile: bool | None = None, nat1to1_ip: str | None = None) -> dict:
         """Start a Neko container in-process via BrowserContainerRunner (host-local).
 
         Mirrors start_on_worker but drives the runner directly. On failure marks
@@ -500,7 +508,15 @@ class BrowserSessionManager:
 
         ``nat1to1_ip`` is forwarded to the runner so the container is told to
         advertise the single IP the client connected from for WebRTC NAT1TO1.
+
+        When *mobile* is ``None`` (the default) the session's stored
+        ``is_mobile`` flag is read from the row so agent sessions (which
+        are persisted with ``is_mobile=True``) actually render with the
+        mobile UA/viewport.  Explicit ``True`` / ``False`` overrides.
         """
+        if mobile is None:
+            session = await self.get_session(session_id)
+            mobile = bool(session["is_mobile"]) if session else False
         try:
             data = await runner.start(session_id=session_id, profile_volume=profile_volume,
                                       mobile=mobile, nat1to1_ip=nat1to1_ip)
