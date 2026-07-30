@@ -59,12 +59,24 @@ class TestAgentModelKeysRouteValidation:
             f"expected 400 for agent_ids={agent_ids!r}, "
             f"got {resp.status_code}: {resp.text}"
         )
-        # The error body should mention the first offending id
+        # The error body should contain the offending id string (or the
+        # "required" message when the list is empty).  The handler uses
+        # {v!r} in the ValueError, so special chars (backslashes) appear
+        # escaped — use repr(aid) to match.
         body = resp.json()
         assert "error" in body
-        assert "invalid" in body["error"] or "required" in body["error"], (
-            f"error body should mention validation failure, body={body}"
-        )
+        if any(aid for aid in agent_ids):
+            # At least one non-empty id — check it appears in the error.
+            assert any(
+                repr(aid).strip("'\"") in body["error"]
+                for aid in agent_ids if aid
+            ), f"error body missing offending id, body={body}"
+        else:
+            # All ids are empty strings (e.g. [\"\"]) — error is about
+            # invalid format, not a "required" message.
+            assert "invalid" in body["error"], (
+                f"error body should mention 'invalid', body={body}"
+            )
 
     async def test_mint_allows_safe_agent_ids(self, client):
         """Valid slug-format agent ids pass handler validation and reach the store.
