@@ -78,6 +78,60 @@ class TestFailureTracker:
         assert not ft.is_tripped("w1")
         assert not ft.is_tripped("w2")
 
+    def test_sliding_window_does_not_discard_recent_failures(self):
+        """Failures at t=0, t=59, t=61 — the t=59 failure must still count.
+
+        The old fixed-bucket approach anchored the window at the first failure
+        time (t=0) and would reset the entire window at t=61, discarding the
+        t=59 failure that was only 2 seconds old (count would drop to 1).
+        A true sliding window keeps the t=59 and t=61 timestamps (count=2),
+        while correctly pruning the t=0 timestamp (age=61 s > window=60 s).
+        """
+        clock = [0.0]
+
+        class ClockedTracker(FailureTracker):
+            def __init__(self):
+                super().__init__(failure_threshold=2, window_seconds=60.0)
+
+        ft = ClockedTracker()
+        ft._time_func = lambda: clock[0]
+
+        clock[0] = 0.0
+        ft.record_failure("w1")
+        assert not ft.is_tripped("w1")
+
+        clock[0] = 59.0
+        ft.record_failure("w1")
+        assert ft.is_tripped("w1")
+
+        clock[0] = 61.0
+        ft.record_failure("w1")
+        assert ft.is_tripped("w1")
+
+    def test_sliding_window_prunes_stale_failures(self):
+        """Failures older than window_seconds should be pruned on check."""
+        clock = [0.0]
+
+        class ClockedTracker(FailureTracker):
+            def __init__(self):
+                super().__init__(failure_threshold=3, window_seconds=60.0)
+
+        ft = ClockedTracker()
+        ft._time_func = lambda: clock[0]
+
+        # t=0: first failure
+        clock[0] = 0.0
+        ft.record_failure("w1")
+
+        # t=30: second failure
+        clock[0] = 30.0
+        ft.record_failure("w1")
+
+        # t=100: first failure is 100 s old (> window) and should be pruned.
+        #         Only the t=30 failure remains — 1 failure → not tripped.
+        clock[0] = 100.0
+        assert not ft.is_tripped("w1")
+
 
 # ── WorkerRegistryStore tests (Fix 1: persistence) ─────────────────────
 
