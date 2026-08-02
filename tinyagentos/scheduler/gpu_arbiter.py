@@ -425,6 +425,7 @@ class GpuArbiter:
     async def _renew_lease_loop(
         self, lease_id: str, stop_event: asyncio.Event,
         task_to_cancel: asyncio.Task | None = None,
+        arbiter_future: asyncio.Future | None = None,
     ) -> None:
         """Periodically renew a lease until *stop_event* is set.
 
@@ -433,6 +434,12 @@ class GpuArbiter:
         failure or expiry is detected the referenced task is cancelled so
         it doesn't keep executing GPU work without a valid lease (taOS
         #1984 — lease-loss detection).
+
+        On lease loss, *arbiter_future* (the submitter's
+        ``_arbiter_future``) is also cancelled so the submitter does not
+        hang forever — ``_propagate`` skips already-cancelled futures,
+        so the lease-loss path must resolve the future directly (taOS
+        #1984 — lease-loss cancellation hang fix).
         """
         RENEW_INTERVAL = 200
         while not stop_event.is_set():
@@ -453,15 +460,38 @@ class GpuArbiter:
                         )
                         if task_to_cancel is not None and not task_to_cancel.done():
                             task_to_cancel.cancel()
+                        if arbiter_future is not None and not arbiter_future.done():
+                            arbiter_future.cancel()
                         return
                     logger.debug("gpu-arbiter: renewed lease %s", lease_id)
             except Exception:
+                logger.warning(
+                    "gpu-arbiter: failed to renew lease %s — retrying once",
+                    lease_id,
+                )
+                # One retry before declaring lease loss — a single transient
+                # network blip shouldn't kill a healthy running task.
+                try:
+                    if self._cluster_manager is not None:
+                        renewed2 = await self._cluster_manager.renew_lease(
+                            lease_id, ttl_seconds=300,
+                        )
+                        if renewed2 is not None:
+                            logger.info(
+                                "gpu-arbiter: lease %s renewal succeeded on retry",
+                                lease_id,
+                            )
+                            continue
+                except Exception:
+                    pass
                 logger.exception(
-                    "gpu-arbiter: failed to renew lease %s — "
+                    "gpu-arbiter: failed to renew lease %s after retry — "
                     "cancelling running task", lease_id,
                 )
                 if task_to_cancel is not None and not task_to_cancel.done():
                     task_to_cancel.cancel()
+                if arbiter_future is not None and not arbiter_future.done():
+                    arbiter_future.cancel()
                 return
 
     async def _run_gpu_task(
@@ -496,7 +526,10 @@ class GpuArbiter:
                 renew_stop = asyncio.Event()
                 current = asyncio.current_task()
                 renew_task = asyncio.create_task(
-                    self._renew_lease_loop(lease_id, renew_stop, current),
+                    self._renew_lease_loop(
+                        lease_id, renew_stop, current,
+                        getattr(task, "_arbiter_future", None),
+                    ),
                     name=f"gpu-arbiter-renew-{task.id}",
                 )
             current = asyncio.current_task()
@@ -668,6 +701,13 @@ class GpuArbiter:
                                 )
                                 break
                             await asyncio.sleep(backoff)
+                        except Exception:
+                            logger.exception(
+                                "gpu-arbiter: _drain_queue raised an unexpected "
+                                "error — restarting queue processor after %ds cooldown",
+                                COOLDOWN_BACKOFF,
+                            )
+                            break
                 # Outer restart loop: wait cooldown, then restart the inner loop
                 await asyncio.sleep(COOLDOWN_BACKOFF)
                 logger.warning(
