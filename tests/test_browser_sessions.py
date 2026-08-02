@@ -51,6 +51,8 @@ async def test_migrate_agent_browsers_idempotent(mgr):
     sessions = await mgr.list_sessions("agent", "agent-A")
     assert {s["profile_name"] for s in sessions} == {"default", "work"}
     assert all(s["status"] == "stopped" for s in sessions)
+    # Agent sessions default to mobile viewport (cleaner DOM, fewer mis-clicks)
+    assert all(s["is_mobile"] is True for s in sessions)
 
 
 @pytest.mark.asyncio
@@ -199,6 +201,40 @@ async def test_get_or_create_mine_recreates_after_stop(mgr):
     await mgr.terminate_session(a["id"])           # status -> stopped
     b = await mgr.get_or_create_mine("user-1", url="https://x")
     assert b["id"] != a["id"]                       # stopped one not reused
+
+
+# ---------------------------------------------------------------------------
+# Agent mobile-default (#635)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_create_session_agent_defaults_to_mobile(mgr):
+    """create_session for agents defaults to is_mobile=True (cleaner DOM, fewer mis-clicks)."""
+    s = await mgr.create_session("agent", "agent-99", "https://work.com")
+    assert s["is_mobile"] is True
+    assert s["owner_type"] == "agent"
+
+
+@pytest.mark.asyncio
+async def test_create_session_user_defaults_to_desktop(mgr):
+    """create_session for users keeps the existing desktop default."""
+    s = await mgr.create_session("user", "user-99", "https://home.com")
+    assert s["is_mobile"] is False
+    assert s["owner_type"] == "user"
+
+
+@pytest.mark.asyncio
+async def test_create_session_explicit_mobile_overrides_agent_default(mgr):
+    """Explicit mobile=False overrides the agent mobile default."""
+    s = await mgr.create_session("agent", "agent-42", "https://example.com", mobile=False)
+    assert s["is_mobile"] is False
+
+
+@pytest.mark.asyncio
+async def test_create_session_explicit_mobile_overrides_user_default(mgr):
+    """Explicit mobile=True overrides the user desktop default."""
+    s = await mgr.create_session("user", "user-42", "https://example.com", mobile=True)
+    assert s["is_mobile"] is True
 
 
 @pytest.mark.asyncio
