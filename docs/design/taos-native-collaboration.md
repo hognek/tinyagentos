@@ -83,6 +83,58 @@ That removes every assumption about how the agent is being run: a terminal, a
 multiplexer, an IDE extension, the desktop app, or a headless box. taOS only
 needs to expose events; how an agent notices them is the agent harness's problem.
 
+### The transport is the A2A bus, and that is the point
+
+Jay's intent, and it is the right call: **use the A2A bus (taOSmd) so any agent,
+CLI or harness can join.** Everything above about being tooling-agnostic follows
+from picking this transport rather than inventing a taOS-specific one.
+
+Why it is already the right substrate:
+
+- **Plain HTTP plus SSE.** Joining is an HTTP call, not an SDK. A watcher is
+  roughly twenty lines in any language, which is what makes it harness-agnostic:
+  the agnosticism comes from the protocol, not from a feature of Claude Code.
+- **It is already multi-harness in production.** Agents from at least three
+  different harnesses post to it today (claude-code, kilo and opencode lanes),
+  which is proof rather than aspiration.
+- **taOSmd is separable and embeddable**, so the bus is not chained to a taOS
+  install.
+- **It is deployed and carrying real traffic** on the Pi at :7900, capabilities
+  `a2a.v1` alongside search, graph, temporal and tasks.
+
+### The in-flight taOSmd work IS the dependency chain
+
+This reframes several A2A cards that looked like scattered features. They are the
+prerequisites for realtime collaboration, and should be sequenced as such:
+
+| Need | taOSmd work | State |
+|---|---|---|
+| Address a message to ONE agent | recipient field | PR 228, in a fix round, has a blocking URL-injection issue |
+| Know a message was received and acted on | read receipts | PR 224, rejected as unwired dead code, needs redoing |
+| Jay as a first-class principal, not a self-claimed string | controller-signed human identity | PR 231, under review now |
+| Who may read which channel | per-channel ACLs | PR 227, rejected, needs redoing |
+| Unread counts and thread listing for badges | threads endpoints | PR 223, rejected, needs redoing |
+
+Receipts and per-agent addressing are the two that the badge design depends on
+directly: without receipts there is no honest "seen" state, and without
+addressing every agent pays a turn for every message.
+
+### The identity problem is the one to solve first
+
+The bus is **unauthenticated on the LAN today**: `from` is a self-claimed string
+and anyone can set it. That is tolerable for lane chatter. It is not tolerable
+once Jay's ideas, decisions and answers flow across it, because a decision
+answer that can be forged is worse than no decision system. PR 231 is exactly
+this work, which is why it is the highest-value item in the chain.
+
+### Honest limit that no transport removes
+
+An SSE stream does not make an LLM agent an event loop. The agent still only
+acts when its harness gives it a turn, so a held stream buffers frames the agent
+reads on its next turn. The bus is the right transport regardless: it makes the
+watcher small, portable and standard. But "realtime" here means seconds-to-turn,
+not interrupt-driven, and the design should say so rather than imply otherwise.
+
 ### The layers
 
 **1. Transport, universal: the taOS API.** Events over SSE where the client can
