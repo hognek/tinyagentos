@@ -72,6 +72,9 @@ def register_all_routers(app):
     from tinyagentos.routes import projects as projects_routes
     app.include_router(projects_routes.router, dependencies=_csrf)
 
+    from tinyagentos.routes.project_doc_review import router as project_doc_review_router
+    app.include_router(project_doc_review_router)
+
     from tinyagentos.routes.community import router as community_router
     app.include_router(community_router, dependencies=_csrf)
 
@@ -179,6 +182,9 @@ def register_all_routers(app):
 
     from tinyagentos.routes.project_canvas import router as project_canvas_router
     app.include_router(project_canvas_router, dependencies=_csrf)
+
+    from tinyagentos.routes.project_doc_review import router as project_doc_review_router
+    app.include_router(project_doc_review_router)
 
     from tinyagentos.routes.desktop_control import router as desktop_control_router
     app.include_router(desktop_control_router, dependencies=_csrf)
