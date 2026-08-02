@@ -6,6 +6,7 @@ def register_all_routers(app):
     at package import time.
     """
     from fastapi import Depends
+
     from tinyagentos.middleware.csrf import verify_csrf
 
     _csrf = [Depends(verify_csrf)]
@@ -386,6 +387,9 @@ def register_all_routers(app):
 
     from tinyagentos.routes.app_permissions import router as app_permissions_router
     app.include_router(app_permissions_router, dependencies=_csrf)
+
+    from tinyagentos.routes.user_shares import router as user_shares_router
+    app.include_router(user_shares_router, dependencies=_csrf)
 
     from tinyagentos.routes.agent_model_api import router as agent_model_api_router
     app.include_router(agent_model_api_router, dependencies=_csrf)
