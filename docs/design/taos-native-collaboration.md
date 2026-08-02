@@ -68,51 +68,69 @@ reported**: an agent that dies cannot mark itself stalled, and a dead agent
 looks exactly like a working one otherwise. That is the same trap as a dead
 watcher looking like a quiet one.
 
-## Delivery: inject into the open session, do not spawn a new one
+## Delivery: agent-pulls, harness-native, no external tooling required
 
-**Corrected 2026-08-02 by Jay, and it is the better design.** The earlier draft
-proposed a daemon that spawns a headless session per event. That is the
-expensive way to build this, and taOS should not be spawning a session per task.
+**Corrected twice on 2026-08-02.** First draft spawned a headless session per
+event, which is the expensive way. Second draft delivered by injecting into an
+open pane with `herdr pane run`, which is cheap but **assumes the operator runs
+herdr**. Jay's constraint, and it is correct: herdr is his local pane manager,
+not something a taOS user has. A product feature cannot depend on it.
 
-**The mechanism already exists and is already in use.** `herdr pane run <pane>
-"<message>"` injects a turn into an ALREADY-OPEN Claude session. That is exactly
-how the context-watch and usage-watch nudges reach the agents today: the cron
-measures, then injects a message into the agent's pane, and the agent picks it
-up on its next turn. There is no cold start, no context reload, and no new
-session: the session is already warm, so the marginal cost is one turn.
+**The dependency has to be inverted. The agent connects to taOS; taOS never
+reaches into the agent's terminal.**
 
-Cost comparison for the same event, measured earlier in this doc:
+That removes every assumption about how the agent is being run: a terminal, a
+multiplexer, an IDE extension, the desktop app, or a headless box. taOS only
+needs to expose events; how an agent notices them is the agent harness's problem.
 
-| Delivery | Cost per event |
-|---|---|
-| Spawn a fresh headless session | $0.164 (full context load first) |
-| Resume a headless session | $0.031 |
-| **Inject into an already-open session** | **incremental turn only, no reload** |
+### The layers
 
-**So the realtime design is a router, not a daemon fleet:**
+**1. Transport, universal: the taOS API.** Events over SSE where the client can
+hold a stream, or a cheap poll where it cannot. This already exists and needs no
+new mechanism.
 
-1. A watcher on taOS events (note created, decision answered, message, mention)
-   with the same hard filtering we already use, so only real signals get through.
-2. A mapping from taOS agent identity to live pane id.
-3. Delivery via `herdr pane run` into that agent's open pane.
-4. Batching: a short settle window so a burst becomes one injection.
+**2. Noticing, harness-native.** Each agent runs a small watcher INSIDE its own
+session using whatever its harness provides for background work. In Claude Code
+that is a background process whose output surfaces as a notification on the next
+turn: exactly what `a2a_watch.sh` already does for the A2A bus today, with no
+external tooling involved. Another harness uses its own equivalent. The watcher
+is session-local, so it lives and dies with the session, which is the honest
+behaviour rather than a hidden dependency.
 
-**What this needs that we do not have yet:**
+**3. Delivery when no session is listening.** This is the only case that needs
+anything extra, and it is optional and pluggable:
 
-- **An agent-to-pane registry.** Today the pane list is discoverable
-  (`herdr pane list` reports agent, cwd, status and pane id) but nothing maps
-  "@taOSmd-dev" to "w1:p2". That mapping has to be explicit and maintained, not
-  guessed from the working directory.
-- **Liveness surfaced in taOS.** If an agent's pane is gone, an idea dropped in
-  taOS will sit unread. taOS must show which agents are actually connected, so
-  the badge says "unseen, agent offline" rather than a silent nothing. A dead
-  agent must not look like a quiet one.
-- **A queue for offline agents**, so work is delivered when they come back
-  rather than lost.
+| Adapter | Requires | Use |
+|---|---|---|
+| Session-local watcher | nothing beyond the harness | **default, ships to everyone** |
+| Queue and deliver on next turn | nothing | universal floor, always works |
+| Pane injection (herdr, tmux, ...) | that specific tool | operator convenience, ours |
+| Headless resume | CLI headless support | unattended boxes |
 
-**Where spawning still belongs:** only for the case where no session is open at
-all. Jay's call is that this becomes a taOS Teams capability later, not part of
-this design.
+**The floor must always work.** If no adapter is available, events queue in taOS
+and the agent picks them up when it next takes a turn. Latency, not loss. Every
+adapter above that is an optimisation, and none may be a prerequisite.
+
+### The distinction that keeps this clean
+
+- **Fleet ops tooling on our own box** (context watch, usage watch, the
+  dispatcher) may use herdr freely. That is our infrastructure, not shipped.
+- **taOS product features** must assume nothing beyond taOS itself and the
+  agent's own harness. Realtime collaboration is a product feature.
+
+Anything that blurs those two produces a feature that works only on Jay's
+machine, which is the same class of mistake as hardcoding a LAN address.
+
+### What this still needs
+
+- **An agent registry with liveness**, so taOS knows which agents are connected
+  and can show "unseen, agent offline" instead of silence. A dead agent must
+  never look like a quiet one.
+- **A durable per-agent queue with acknowledgement.** Delivery without a receipt
+  is how a message vanishes into a session that has since died. The agent
+  acknowledges, or the event stays pending and is redelivered.
+- **Hard filtering**, reusing what `a2a_filter.py` already does, so only real
+  signals cost a turn.
 
 ## Measured, not assumed: headless viability and cost
 
@@ -193,9 +211,10 @@ delivers "I put an idea in and never open Claude Code", just with latency.
 
 **Slice 2, badges.** Agent state on every entry, computed where it can be.
 
-**Slice 3, the event router.** Agent-to-pane registry, liveness in taOS, and
-delivery by injection into open sessions. Realtime replies to messages and
-decisions, with no session spawning.
+**Slice 3, the event queue and agent-side watcher.** Durable per-agent queue with
+acknowledgement, liveness in taOS, and a harness-native watcher on the agent
+side. Realtime replies with no external tooling required and no session
+spawning.
 
 **Slice 4, the rest of the fleet.** The sibling agents get daemons, and Claude
 Code becomes a debugging tool rather than the venue.
