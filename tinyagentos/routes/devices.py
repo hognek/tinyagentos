@@ -40,6 +40,17 @@ async def register_device(
     body: RegisterIn, request: Request, user: CurrentUser = Depends(current_user)
 ):
     store = request.app.state.device_store
+    # A blocked device (revoked + blocked) may not re-pair under a fresh token.
+    # The APNs push token is the stable per-(device, app) identity, so a phone
+    # that is blocked cannot silently register a new scoped token while in the
+    # hands of an attacker. An empty push token is treated as unidentifiable:
+    # real paired devices always carry a push token, so this check only engages
+    # when one is present.
+    if body.push_token and await store.find_blocked_by_push_token(user.user_id, body.push_token) is not None:
+        return JSONResponse(
+            {"error": "device is blocked; unblock it before re-pairing"},
+            status_code=403,
+        )
     if len(await store.list_for_user(user.user_id)) >= _MAX_DEVICES_PER_USER:
         return JSONResponse(
             {"error": f"device limit reached ({_MAX_DEVICES_PER_USER})"},
@@ -57,7 +68,12 @@ async def register_device(
 @router.get("/api/devices")
 async def list_devices(request: Request, user: CurrentUser = Depends(current_user)):
     store = request.app.state.device_store
-    return {"items": await store.list_for_user(user.user_id)}
+    items = await store.list_for_user(user.user_id)
+    # Surface a derived "live scoped token" flag so the UI can tell at a glance
+    # which devices can still authenticate (revoked OR blocked => no token).
+    for d in items:
+        d["live_token"] = not d.get("revoked") and not d.get("blocked")
+    return {"items": items}
 
 
 async def _owned_or_404(store, device_id: str, user: CurrentUser):
@@ -69,6 +85,17 @@ async def _owned_or_404(store, device_id: str, user: CurrentUser):
     # separate surface.
     device = await store.get(device_id)
     if device is None or device["revoked"] or device["user_id"] != user.user_id:
+        return None
+    return device
+
+
+async def _owned_any_state(store, device_id: str, user: CurrentUser):
+    # Ownership check that ignores the revoked/blocked flags. Used by the
+    # block/unblock actions, which must operate on a device whose token is
+    # already dead (blocked implies revoked). _owned_or_404 would refuse such a
+    # row, making it impossible to unblock.
+    device = await store.get(device_id)
+    if device is None or device["user_id"] != user.user_id:
         return None
     return device
 
@@ -106,3 +133,27 @@ async def revoke_device(
         return JSONResponse({"error": "not found"}, status_code=404)
     await store.revoke(device_id)
     return {"revoked": True}
+
+
+@router.post("/api/devices/{device_id}/block")
+async def block_device(
+    device_id: str, request: Request, user: CurrentUser = Depends(current_user)
+):
+    store = request.app.state.device_store
+    device = await _owned_any_state(store, device_id, user)
+    if device is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    changed = await store.block(device_id)
+    return {"blocked": True, "changed": changed}
+
+
+@router.post("/api/devices/{device_id}/unblock")
+async def unblock_device(
+    device_id: str, request: Request, user: CurrentUser = Depends(current_user)
+):
+    store = request.app.state.device_store
+    device = await _owned_any_state(store, device_id, user)
+    if device is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    changed = await store.unblock(device_id)
+    return {"unblocked": True, "changed": changed}
