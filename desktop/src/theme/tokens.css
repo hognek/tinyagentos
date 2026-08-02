@@ -40,6 +40,12 @@
   --color-dock-border: rgba(255, 255, 255, 0.08);
   --color-topbar-bg: rgba(29, 29, 31, 0.92);
 
+  /* Modal / overlay */
+  --color-shell-scrim: rgba(0, 0, 0, 0.6);
+
+  /* Subtle surface fills — input backgrounds, faint raised surfaces */
+  --color-shell-subtle: rgba(255, 255, 255, 0.06);
+
   /* Snap zones */
   --color-snap-preview: rgba(139, 146, 163, 0.15);
   --color-snap-border: rgba(139, 146, 163, 0.4);
@@ -180,10 +186,17 @@
 }
 @media (max-width: 767px), (orientation: portrait) {
   /* On phones we switch to a portrait-cropped image if the wallpaper
-     provides one, and stretch it to fill both axes. */
+     provides one.
+
+     Sizing is `cover`, NOT `100% 100%`. Stretching both axes distorted the
+     image on any display whose aspect ratio did not match the asset, and
+     `(orientation: portrait)` matches every screen where height >= width,
+     which includes SQUARE displays: a square device took the phone branch and
+     had a wide wallpaper squashed into it (reported 2026-08-02). `cover` fills
+     the screen and crops the overflow instead of deforming the picture. */
   .taos-wallpaper {
     background-image: var(--wallpaper-mobile, var(--wallpaper-desktop));
-    background-size: 100% 100%;
+    background-size: cover;
   }
 }
 
@@ -305,8 +318,11 @@
 }
 
 .taos-browser .taos-wallpaper {
-  /* In browser mode, stretch the wallpaper to fill the dynamic viewport */
-  background-size: 100% 100%;
+  /* Fill the dynamic viewport by cropping, not by stretching: the same
+     distortion the portrait rule above had. As the browser chrome collapses
+     the viewport height changes, and 100% 100% re-deformed the image on every
+     one of those changes. */
+  background-size: cover;
 }
 
 /* MobileDock bottom padding in browser mode is handled via the isBrowserMobile

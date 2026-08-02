@@ -23,6 +23,7 @@ from fastapi import APIRouter, Request, Response
 from fastapi.responses import JSONResponse
 
 from tinyagentos.taosnet import mesh, mesh_credentials
+from tinyagentos.peer import resolve_local_identity_id
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,11 @@ _ACTIONS: dict[str, tuple[str, str]] = {
     "hub_presence_get": ("GET", "/api/hub/presence"),
     # Block asks the hub to sever the accepted edge (no more presence/hints).
     "hub_edge_revoke": ("POST", "/api/hub/edges/revoke"),
+    # Hub sealed-envelope relay (cross-user collab A3): store-and-forward
+    # through taos.my.  The node seals with the recipient's X25519 public key;
+    # the hub never sees plaintext.  Recipients poll via the account proxy.
+    "hub_relay_drop": ("POST", "/api/hub/relay/drop"),
+    "hub_relay_poll": ("GET", "/api/hub/relay/poll"),
 }
 
 _TIMEOUT = httpx.Timeout(15.0)
@@ -231,6 +237,16 @@ def _valid_rid(rid: str) -> bool:
     return bool(_RID_RE.match(rid))
 
 
+# Hub recipient usernames carry a "hub:" prefix (e.g. "hub:hogne") so they
+# are distinguishable from other identity namespaces.  The prefix is fixed;
+# the suffix is the same alphanumeric + hyphen/underscore token shape as _RID_RE.
+_HUB_RECIPIENT_RE = re.compile(r"^hub:[A-Za-z0-9_-]{1,64}$")
+
+
+def _valid_hub_recipient(recipient: str) -> bool:
+    return bool(_HUB_RECIPIENT_RE.match(recipient))
+
+
 # --- Account subdomain actions (account model slice 3) ---
 # Proxy to the taos.my subdomain claims service (slices 1 and 2 of the account
 # model). The client calls same-origin /api/account/subdomains/*; we forward to
@@ -354,6 +370,53 @@ async def hub_presence_get(request: Request):
 @router.post("/api/account/hub/edges/revoke")
 async def hub_edge_revoke(request: Request):
     return await _forward(request, "hub_edge_revoke")
+
+
+# --- Hub sealed-envelope relay (cross-user collab A3) ---
+# The node seals an inner payload to the recipient's X25519 public key and
+# drops it at the hub; the recipient polls for queued envelopes.  The hub
+# never sees plaintext — it only inspects ``recipient`` for routing.
+
+@router.post("/api/account/hub/relay/drop")
+async def hub_relay_drop(request: Request):
+    body = await request.body()
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+    if not isinstance(payload, dict):
+        return JSONResponse({"error": "invalid body"}, status_code=400)
+    recipient = str(payload.get("recipient", ""))
+    if not _valid_hub_recipient(recipient):
+        return JSONResponse({"error": "invalid recipient"}, status_code=400)
+    # No recipient-binding on drop — this is outbound send; a node
+    # drops envelopes addressed to any valid hub recipient.  Binding
+    # lives in hub_relay_poll where a node polls its own queue.
+    return await _forward_to(request, "POST", _ACTIONS["hub_relay_drop"][1], body=body)
+
+
+@router.get("/api/account/hub/relay/poll")
+async def hub_relay_poll(request: Request):
+    """Poll for queued envelopes addressed to ``recipient``.
+
+    The ``recipient`` query param is a validated hub username (e.g.
+    ``hub:hogne``).  The hub returns the sealed envelopes; the caller
+    unseals locally with its X25519 private key.
+    """
+    recipient = request.query_params.get("recipient", "")
+    if not _valid_hub_recipient(str(recipient)):
+        return JSONResponse({"error": "invalid recipient"}, status_code=400)
+    # Bind the queried recipient to the caller's hub identity — a node
+    # may only poll envelopes addressed to its own identity.
+    local_id = await asyncio.to_thread(resolve_local_identity_id, request.app.state.data_dir)
+    if local_id is not None and recipient != local_id:
+        return JSONResponse(
+            {"error": "recipient does not match local identity"},
+            status_code=403,
+        )
+    _method, path = _ACTIONS["hub_relay_poll"]
+    return await _forward_to(request, "GET",
+                             f"{path}?recipient={recipient}")
 
 
 @router.get("/api/account/me")

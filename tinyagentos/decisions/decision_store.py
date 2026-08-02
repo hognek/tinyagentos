@@ -127,15 +127,22 @@ class DecisionStore(BaseStore):
         project_id: str | None = None,
         user_id: str | None = None,
         limit: int = 200,
+        from_agent: str | None = None,
     ) -> list[dict]:
         conds, params = [], []
         if status is not None:
-            conds.append("status = ?"); params.append(status)
+            conds.append("status = ?")
+            params.append(status)
         if project_id is not None:
-            conds.append("project_id = ?"); params.append(project_id)
+            conds.append("project_id = ?")
+            params.append(project_id)
         if user_id is not None:
-            conds.append("user_id = ?"); params.append(user_id)
-        where = (" WHERE " + " AND ".join(conds)) if conds else ""
+            conds.append("user_id = ?")
+            params.append(user_id)
+        if from_agent is not None:
+            conds.append("from_agent = ?")
+            params.append(from_agent)
+        where = ((" WHERE " + " AND ".join(conds)) if conds else "")
         # Bound the result set so a long-lived inbox cannot return everything.
         limit = max(1, min(int(limit), 500))
         async with self._db.execute(
@@ -146,12 +153,13 @@ class DecisionStore(BaseStore):
             desc = cur.description
         return [_row_to_decision(r, desc) for r in rows]
 
-    async def answer(self, decision_id: str, value, answered_by: str) -> dict | None:
+    async def answer(self, decision_id: str, value, answered_by: str, source: str = "in_app") -> dict | None:
         """Record an answer. Returns the updated decision, or None if the
         decision does not exist or is not pending (already answered or
-        superseded)."""
+        superseded). The *source* field distinguishes mirrored_from_chat
+        from in_app answers for audit/UI purposes."""
         now = time.time()
-        ans = json.dumps({"value": value, "answered_by": answered_by, "answered_at": now})
+        ans = json.dumps({"value": value, "answered_by": answered_by, "answered_at": now, "source": source})
         cur = await self._db.execute(
             """UPDATE decisions
                SET status = 'answered', answer = ?, answered_at = ?

@@ -17,8 +17,9 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator
 
-from tinyagentos.auth_context import CurrentUser, current_user
+from tinyagentos.auth_context import CurrentUser
 from tinyagentos.decisions.decision_store import DECISION_TYPES, PRIORITIES
+from tinyagentos.device_auth import current_user_or_device
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,7 @@ class DecisionIn(BaseModel):
 class AnswerIn(BaseModel):
     value: object
     answered_by: str = ""
+    source: str = "in_app"
 
 
 @dataclass
@@ -240,7 +242,7 @@ async def list_decisions(
     status: str | None = None,
     project_id: str | None = None,
     limit: int = 200,
-    user: CurrentUser = Depends(current_user),
+    user: CurrentUser = Depends(current_user_or_device),
 ):
     store = request.app.state.decision_store
     # Non-admins see only their own decisions; admins see all.
@@ -249,8 +251,44 @@ async def list_decisions(
     return {"items": items}
 
 
+# Agent-decisions list (filtered by the asking agent). Must be registered
+# BEFORE the parameterised GET /api/decisions/{decision_id} so the literal
+# "agent" segment is not captured as a decision_id.
+@router.get("/api/decisions/agent")
+async def list_decisions_as_agent(request: Request):
+    """Agent-facing list: filter by from_agent (the asking agent).  Only
+    returns decisions whose project the agent holds an active decisions_write
+    grant for; a global (null-project) grant shows all.  The store layer
+    enforces the from_agent binding so there is no cross-agent leakage."""
+    from datetime import datetime, timezone
+    from tinyagentos.agent_token_auth import check_agent_scope, _grant_unexpired
+
+    canonical_id = await check_agent_scope(request, "decisions_write")
+    if canonical_id is None:
+        return JSONResponse({"error": "agent identity not found"}, status_code=401)
+
+    # Collect project IDs the agent has active decisions_write grants for.
+    grants_store = request.app.state.agent_grants
+    now = datetime.now(timezone.utc)
+    grants = await grants_store.list_grants(canonical_id)
+    allowed_projects: set[str | None] = {
+        g.get("project_id")
+        for g in grants
+        if g["scope"] == "decisions_write" and _grant_unexpired(g.get("expires_at"), now)
+    }
+
+    store = request.app.state.decision_store
+    items = await store.list(from_agent=canonical_id, limit=500)
+    # A global (null-project) grant shows all; otherwise filter to decisions
+    # whose project_id is in the allowed set.
+    if None not in allowed_projects:
+        items = [d for d in items if d.get("project_id") in allowed_projects]
+    return {"items": items}
+
+
 @router.get("/api/decisions/{decision_id}")
-async def get_decision(decision_id: str, request: Request, user: CurrentUser = Depends(current_user)):
+async def get_decision(decision_id: str, request: Request, user: CurrentUser = Depends(current_user_or_device)):
+    # Session-only path: human reading their own or admin reading any
     store = request.app.state.decision_store
     d = await store.get(decision_id)
     if d is None or (not user.is_admin and d["user_id"] != user.user_id):
@@ -258,8 +296,46 @@ async def get_decision(decision_id: str, request: Request, user: CurrentUser = D
     return d
 
 
+@router.get("/api/decisions/{decision_id}/agent")
+async def get_decision_as_agent(decision_id: str, request: Request):
+    # JWT-first: validate the bearer token before touching the decision
+    # store so invalid tokens cannot probe decision existence via timing.
+    from tinyagentos.agent_token_auth import (
+        check_agent_identity,
+        check_agent_scope_for_project,
+        PROJECT_SCOPE_MISMATCH_DETAIL,
+    )
+    caller = await check_agent_identity(request)
+    if caller is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    store = request.app.state.decision_store
+    d = await store.get(decision_id)
+    if d is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    # Project-scoped (least privilege): the agent must hold decisions_write
+    # on the decision's OWN project, not just any project.  5d207ec
+    # mistakenly swapped this for project-agnostic check_agent_scope,
+    # letting any decisions_write grant on ANY project authorize read
+    # on EVERY project.  Restored from 6410e3c.
+    # Collapse PROJECT_SCOPE_MISMATCH to 404 so the route is not an
+    # existence oracle (never distinguish 403-vs-404 to a caller).
+    try:
+        cid = await check_agent_scope_for_project(
+            request, "decisions_write", d.get("project_id")
+        )
+    except HTTPException as exc:
+        if exc.status_code == 403 and exc.detail == PROJECT_SCOPE_MISMATCH_DETAIL:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        raise
+    if cid is None or d.get("from_agent") != cid:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return d
+
+
 @router.get("/api/decisions/{decision_id}/history")
-async def decision_history(decision_id: str, request: Request, user: CurrentUser = Depends(current_user)):
+async def decision_history(decision_id: str, request: Request, user: CurrentUser = Depends(current_user_or_device)):
     """The supersession lineage for a decision, oldest first: walk the
     parent_decision_id chain (L1). Cycle-guarded."""
     store = request.app.state.decision_store
@@ -282,9 +358,11 @@ async def decision_history(decision_id: str, request: Request, user: CurrentUser
 
 
 @router.post("/api/decisions/{decision_id}/answer")
-async def answer_decision(decision_id: str, body: AnswerIn, request: Request, user: CurrentUser = Depends(current_user)):
+async def answer_decision(decision_id: str, body: AnswerIn, request: Request, user: CurrentUser = Depends(current_user_or_device)):
     store = request.app.state.decision_store
     existing = await store.get(decision_id)
+    # Authorization check: humans can answer decisions they own or admins; agents are
+    # covered by the _AGENT_TOKEN_PATHS allowlist so they never reach this route.
     if existing is None or (not user.is_admin and existing["user_id"] != user.user_id):
         return JSONResponse({"error": "not found"}, status_code=404)
 
@@ -298,16 +376,34 @@ async def answer_decision(decision_id: str, body: AnswerIn, request: Request, us
             if o.get("value") is not None
         }
         if valid:
-            if dtype == "single_select":
-                if body.value not in valid:
-                    return JSONResponse({"error": "answer is not one of the options"}, status_code=400)
-            else:
-                vals = body.value if isinstance(body.value, list) else None
-                if vals is None or any(v not in valid for v in vals):
-                    return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
+            try:
+                if dtype == "single_select":
+                    if body.value not in valid:
+                        return JSONResponse({"error": "answer is not one of the options"}, status_code=400)
+                else:
+                    vals = body.value if isinstance(body.value, list) else None
+                    if vals is None or any(v not in valid for v in vals):
+                        return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
+            except TypeError:
+                # A list, dict, or other non-hashable/iterable value in the
+                # answer body can hit set membership or any() with a TypeError
+                # (e.g. a list value for single_select, or non-iterable for
+                # multi_select).  Fail closed: 400, not 500.
+                return JSONResponse({"error": "invalid answer value shape"}, status_code=400)
 
+    # Source is derived server-side from the authenticated route, never trusted
+    # from the request body.  The human path always records in_app; the agent
+    # mirror path (answer_decision_as_agent) always records mirrored_from_chat.
+    # A caller setting source=mirrored_from_chat on the human path is spoofing
+    # the audit trail and must be rejected.
+    if body.source == "mirrored_from_chat":
+        return JSONResponse(
+            {"error": "source must not be mirrored_from_chat on this endpoint"},
+            status_code=400,
+        )
+    source = "in_app"
     answered_by = body.answered_by or user.user_id or "user"
-    updated = await store.answer(decision_id, body.value, answered_by)
+    updated = await store.answer(decision_id, body.value, answered_by, source=source)
     if updated is None:
         return JSONResponse({"error": "already answered or not pending"}, status_code=409)
     # Each kind-specific handler runs its side effect and returns True if it
@@ -424,6 +520,102 @@ async def _apply_delegation_grant(request: Request, decision: dict, value) -> bo
         reply = "delegation approved, but assigning the task failed - please retry"
     await _route_answer_to_agent(decision, reply)
     return True
+
+
+@router.post("/api/decisions/{decision_id}/answer/agent")
+async def answer_decision_as_agent(decision_id: str, body: AnswerIn, request: Request):
+    """Agent mirror: only the asking agent can answer its own decision.
+    Verifies the registry JWT holds decisions_write for the decision's project,
+    checks from_agent ownership, records the answer with source=mirrored_from_chat
+    and the agent's canonical id as the mirroring actor, then pushes to the
+    asking agent via A2A.  Consent side effects (app/execution/delegation grants)
+    are intentionally NOT run on this path for gate-kind decisions (409)."""
+    # JWT-first: validate the bearer token before touching the decision
+    # store so invalid tokens cannot probe decision existence via timing.
+    from tinyagentos.agent_token_auth import check_agent_identity
+    caller = await check_agent_identity(request)
+    if caller is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    store = request.app.state.decision_store
+    existing = await store.get(decision_id)
+    if existing is None or existing.get("status") != "pending":
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    # Project-scoped (least privilege): the agent must hold decisions_write
+    # on the decision's OWN project, not just any project.  5d207ec
+    # mistakenly swapped this for project-agnostic check_agent_scope,
+    # letting any decisions_write grant on ANY project authorize answer
+    # on EVERY project.  Restored from 6410e3c.
+    # Collapse PROJECT_SCOPE_MISMATCH to 404 so the route is not an
+    # existence oracle (never distinguish 403-vs-404 to a caller).
+    from tinyagentos.agent_token_auth import (
+        check_agent_scope_for_project,
+        PROJECT_SCOPE_MISMATCH_DETAIL,
+    )
+    try:
+        canonical_id = await check_agent_scope_for_project(
+            request, "decisions_write", existing.get("project_id")
+        )
+    except HTTPException as exc:
+        if exc.status_code == 403 and exc.detail == PROJECT_SCOPE_MISMATCH_DETAIL:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        raise
+    if canonical_id is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    # Verify ownership: only the asking agent can answer its own decision.
+    if existing.get("from_agent") != canonical_id:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    # Gate-kind decisions must NOT be mirror-approvable by an agent.
+    # An agent that creates a privileged gate decision (execution_gate,
+    # delegation_gate, app_grant) and then mirrors "approve" through its
+    # own answer/agent endpoint would be able to dismiss the pending gate
+    # card from the owner's inbox without the owner ever seeing it.
+    meta = (existing.get("metadata") or {})
+    gate_kind = meta.get("kind") if isinstance(meta, dict) else None
+    if gate_kind in ("execution_gate", "delegation_gate", "app_grant"):
+        return JSONResponse(
+            {"error": "gate decisions cannot be answered by the asking agent"},
+            status_code=409,
+        )
+
+    # Validate select-type answers against declared options (same as human path).
+    dtype = existing.get("type")
+    if dtype in ("single_select", "multi_select"):
+        valid = {
+            o.get("value")
+            for o in (existing.get("options") or [])
+            if o.get("value") is not None
+        }
+        if valid:
+            try:
+                if dtype == "single_select":
+                    if body.value not in valid:
+                        return JSONResponse({"error": "answer is not one of the options"}, status_code=400)
+                else:
+                    vals = body.value if isinstance(body.value, list) else None
+                    if vals is None or any(v not in valid for v in vals):
+                        return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
+            except TypeError:
+                return JSONResponse({"error": "invalid answer value shape"}, status_code=400)
+
+    # Agent mirrors are always from chat; record the canonical agent id as the
+    # mirroring actor (not "user") so the audit trail is complete.
+    source = "mirrored_from_chat"
+    answered_by = canonical_id
+    updated = await store.answer(decision_id, body.value, answered_by, source=source)
+    if updated is None:
+        return JSONResponse({"error": "already answered or not pending"}, status_code=409)
+
+    # Route the answer to the A2A bus so the asking agent can pick it up.
+    # Consent side effects (app/execution/delegation grants) are intentionally
+    # NOT run on the agent mirror path: an agent must not be able to create a
+    # privileged decision and then self-approve the consent via its own mirror
+    # endpoint.  Only the human answer path runs consent side effects.
+    await _route_answer_to_agent(updated, body.value)
+    return updated
 
 
 async def _apply_app_grant(request: Request, decision: dict, value) -> bool:

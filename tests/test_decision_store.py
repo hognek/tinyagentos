@@ -91,3 +91,30 @@ async def test_branching_fields_reserved(store):
     assert got["parent_decision_id"] == "dec-parent"
     assert got["checkpoint_ref"] == "abc123"
     assert got["timeline_id"] == "t1"
+
+
+@pytest.mark.asyncio
+async def test_list_filter_from_agent(store):
+    """from_agent filter returns only decisions raised by that agent."""
+    await store.create("@agent-x", "q1", "free_text", user_id="u1")
+    await store.create("@agent-y", "q2", "free_text", user_id="u1")
+    x_only = await store.list(from_agent="@agent-x")
+    assert len(x_only) == 1
+    assert x_only[0]["from_agent"] == "@agent-x"
+
+
+@pytest.mark.asyncio
+async def test_answer_source_persistence(store):
+    """Answer source field is persisted and round-trips correctly."""
+    d = await store.create("@a", "q", "approve_deny", user_id="u1")
+    upd = await store.answer(d["id"], "approve", "u1", source="in_app")
+    assert upd["answer"]["source"] == "in_app"
+
+    d2 = await store.create("@a", "q2", "approve_deny", user_id="u1")
+    upd2 = await store.answer(d2["id"], "deny", "u1", source="mirrored_from_chat")
+    assert upd2["answer"]["source"] == "mirrored_from_chat"
+
+    # Default source
+    d3 = await store.create("@a", "q3", "approve_deny", user_id="u1")
+    upd3 = await store.answer(d3["id"], "approve", "u1")
+    assert upd3["answer"]["source"] == "in_app"

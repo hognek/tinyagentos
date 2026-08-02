@@ -9,7 +9,9 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import RedirectResponse
 
-EXEMPT_PATHS = {"/auth/login", "/auth/setup", "/auth/status", "/auth/me", "/auth/complete", "/auth/lock", "/api/health", "/api/version", "/setup", "/setup/complete", "/redeem", "/api/desktop/browser/push/vapid-public-key", "/api/desktop/browser/proxy-config", "/sw.js", "/desktop", "/desktop/index.html", "/chat-pwa", "/app.html", "/manifest", "/api/agents/registry/pubkey"}
+from tinyagentos.device_store import DEVICE_TOKEN_PREFIX
+
+EXEMPT_PATHS = {"/auth/login", "/auth/setup", "/auth/status", "/auth/me", "/auth/complete", "/auth/lock", "/api/health", "/api/version", "/setup", "/setup/complete", "/redeem", "/api/desktop/browser/push/vapid-public-key", "/api/desktop/browser/proxy-config", "/sw.js", "/desktop", "/desktop/index.html", "/chat-pwa", "/app.html", "/manifest", "/api/agents/registry/pubkey", "/api/share/destinations"}
 
 # Registry feed endpoints accept EITHER an admin session OR a registry JWT.
 # When a Bearer token is present for these paths the request bypasses the
@@ -32,10 +34,20 @@ _A2A_BUS_READ_PATHS = frozenset({
 _A2A_BUS_WRITE_PATHS = frozenset({
     "/api/a2a/bus/send",
 })
+# Observatory routes an agent may reach with its own registry JWT (scope
+# observatory_control). The route verifies the JWT + grant itself; the
+# middleware only passes the Bearer through. Admin/local-token is handled
+# before this block so a local token is never mis-verified as a registry JWT.
+_OBSERVATORY_PATHS = frozenset({
+    "/api/observatory/pause",
+    "/api/observatory/throttle",
+    "/api/observatory/approval-mode",
+    "/api/observatory/fleet",
+})
 # Every path that accepts a registry JWT in place of the admin session.  The
 # passthrough is allowlisted to exactly these paths -- a registry JWT must never
-# authenticate an arbitrary route (no skeleton key).
-_AGENT_TOKEN_PATHS = _REGISTRY_FEED_PATHS | _A2A_BUS_READ_PATHS | _A2A_BUS_WRITE_PATHS
+# authenticate any other route (no skeleton key).
+_AGENT_TOKEN_PATHS = _REGISTRY_FEED_PATHS | _A2A_BUS_READ_PATHS | _A2A_BUS_WRITE_PATHS | _OBSERVATORY_PATHS
 
 # Project kanban routes an agent may reach with its own registry JWT (scope
 # project_tasks, verified + project-bound by the route).  These are DYNAMIC
@@ -61,9 +73,14 @@ _AGENT_TASK_ROUTES = (
     ("GET", re.compile(rf"^/api/projects/tasks/{_SEG}/context$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/comments$")),
     ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/comments$")),
-    # PATCH (free task-field mutation) is intentionally NOT here: it is broader
-    # than the "read + lifecycle + comments" the project_tasks scope documents.
     ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/(claim|release|close|reopen)$")),
+    # PATCH (free task-field mutation) was intentionally NOT here: it is broader
+    # than the "read + lifecycle + comments" the project_tasks scope documents.
+    # It is now reachable by a project_tasks_update-bound agent token, but the
+    # route enforces the narrower scope + authorship/lead gate + a field
+    # whitelist (title, body, labels, status, priority) before any mutation, so
+    # a project_tasks worker still cannot rewrite fields it was never meant to.
+    ("PATCH", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}$")),
     # Mark-claimable curation: reachable by a Bearer token, but the handler
     # (_authorize_project_lead) then restricts it to THIS project's LEAD agent --
     # a plain project_tasks worker is refused. Toggles only the "claimable"
@@ -79,14 +96,41 @@ _AGENT_CANVAS_ROUTES = (
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/snapshot\.png$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/snapshot\.tldr$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/stream$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/watch-projection$")),
 )
 
 # Decisions route an agent may reach with its own registry JWT (scope
-# decisions_write). Only the create endpoint; listing/answering stay
-# session-only. The route verifies the JWT + grant + project binding.
+# decisions_write). Create, answer (mirror), read-own, and list-own.  The route
+# verifies the JWT + grant + project binding.
 _AGENT_DECISIONS_ROUTES = (
     ("POST", re.compile(r"^/api/decisions$")),
+    ("POST", re.compile(r"^/api/decisions/[^/]+/answer/agent$")),
+    ("GET", re.compile(r"^/api/decisions/[^/]+/agent$")),
+    ("GET", re.compile(r"^/api/decisions/agent$")),
 )
+
+# Device-bearer self-service paths (lock-screen push-token rotation plus
+# decision list/get/answer). A scoped device token (Bearer taosdev_...) may
+# pass through the auth gate on exactly these routes; the route dependency
+# (current_user_or_device) resolves the device and synthesizes a NON-admin
+# CurrentUser. request.state.user_id is left None on this path so device
+# bearers cannot reach other current_user / request.state consumers (e.g.
+# create_decision which reads uid=request.state.user_id). Session-authenticated
+# calls still work: the session-cookie check runs when no Bearer header is
+# present, so GET/POST without a Bearer reach the guard normally.
+_DEVICE_BEARER_PATHS = (
+    ("PATCH", re.compile(r"^/api/devices/[^/]+/push-token$")),
+    ("GET", re.compile(r"^/api/decisions$")),
+    ("GET", re.compile(r"^/api/decisions/[^/]+$")),
+    ("GET", re.compile(r"^/api/decisions/[^/]+/history$")),
+    ("POST", re.compile(r"^/api/decisions/[^/]+/answer$")),
+)
+
+
+def _is_device_bearer_path(method: str, path: str) -> bool:
+    """True only for the exact device-bearer self-service routes. Strict
+    method + anchored-regex match; everything else stays session-only."""
+    return any(m == method and rx.match(path) for m, rx in _DEVICE_BEARER_PATHS)
 
 # Project-files routes a files_read / files_write token may reach. Reads
 # (list/watch/get/trash-list/stats) require a files_read grant; writes
@@ -151,8 +195,12 @@ def _is_agent_canvas_path(method: str, path: str) -> bool:
 
 
 def _is_agent_decisions_path(method: str, path: str) -> bool:
-    """True only for POST /api/decisions, which a decisions_write-bound agent
-    token may reach.  The route verifies the JWT + grant."""
+    """True only for the exact subset of decision routes an agent token may reach:
+      - POST /api/decisions -> decisions_write (create)
+      - POST /api/decisions/{id}/answer/agent -> decisions_write (mirror)
+      - GET  /api/decisions/{id}/agent        -> decisions_write (read own)
+      - GET  /api/decisions/agent             -> decisions_write (list own)
+    The route verifies the JWT + grant + project binding."""
     return any(m == method and rx.match(path) for m, rx in _AGENT_DECISIONS_ROUTES)
 
 
@@ -418,6 +466,28 @@ class AuthMiddleware(BaseHTTPMiddleware):
             request.state.user_id = None
             request.state.is_admin = False
             request.state.via = "registry_jwt_candidate"
+            return await call_next(request)
+
+        # Device-bearer self-service: a scoped device token may pass the auth
+        # gate on the carded lock-screen routes. The middleware does NOT
+        # resolve the device -- it only lets the Bearer through with
+        # user_id=None (so current_user / request.state consumers stay
+        # session-only, Invariant c). The route dependency
+        # (current_user_or_device) resolves the token and synthesizes a
+        # non-admin CurrentUser (Invariant a).
+        if (
+            _is_device_bearer_path(request.method, path)
+            and auth_header.lower().startswith("bearer ")
+            # Only a DEVICE token may take this passthrough. Matching any
+            # bearer shadowed valid sessions: a logged-in user carrying an
+            # unrelated Authorization header got 401 on every carded route,
+            # because this branch sets user_id=None before the session was
+            # ever consulted.
+            and auth_header[7:].strip().startswith(DEVICE_TOKEN_PREFIX)
+        ):
+            request.state.user_id = None
+            request.state.is_admin = False
+            request.state.via = "device_bearer_candidate"
             return await call_next(request)
 
         # First boot: no user yet. Browsers go to the setup page; APIs

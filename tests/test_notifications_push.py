@@ -144,8 +144,18 @@ class TestSendWebPush:
         assert payload["body"] == "agent x wants chat"
         assert payload["tag"] == "auth_requests:7"
         assert payload["source"] == "auth_requests"
-        # No explicit url on the row -> desktop shell deep link.
         assert payload["data"]["url"] == "/desktop"
+        assert payload["data"]["source"] == "auth_requests"
+        assert payload["data"]["id"] == 7
+
+    async def test_payload_includes_target_when_present(self, push_store):
+        await _seed(push_store, _ENDPOINT_A)
+        row = {**_ROW, "data": {"target": {"kind": "project_file", "project_id": "p1"}}}
+        with patch("pywebpush.webpush") as mock:
+            await send_web_push(row, store=push_store, vapid=FAKE_VAPID)
+        import json
+        payload = json.loads(mock.call_args.kwargs["data"])
+        assert payload["data"]["target"] == {"kind": "project_file", "project_id": "p1"}
 
     async def test_uses_row_deep_link_when_present(self, push_store):
         await _seed(push_store, _ENDPOINT_A)
@@ -523,3 +533,21 @@ class TestPushRoutes:
                 json={"endpoint": "https://push.example.com/never-subscribed"},
             )
         assert resp.status_code == 404
+
+
+def test_vapid_signing_key_is_accepted_by_pywebpush_vapid():
+    """Regression guard for the silent-100%-failure bug: the stored VAPID PEM
+    must convert to a key that py_vapid.Vapid.from_string accepts. Passing raw
+    PEM here raised 'Could not deserialize key data' on every push send, which
+    the per-subscription handler swallowed, disabling all web push invisibly."""
+    from pathlib import Path
+    import tempfile
+    from tinyagentos.routes.desktop_browser.vapid import load_or_create_vapid_keypair
+    from tinyagentos.notifications_push import _vapid_signing_key
+    from py_vapid import Vapid01
+
+    with tempfile.TemporaryDirectory() as d:
+        _pub, private_pem = load_or_create_vapid_keypair(Path(d), filename="notif_vapid.pem")
+        signing_key = _vapid_signing_key(private_pem)
+        # The whole point: this must NOT raise. Raw PEM would.
+        Vapid01.from_string(private_key=signing_key)

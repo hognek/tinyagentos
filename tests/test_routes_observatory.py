@@ -1,6 +1,57 @@
+import asyncio
+from datetime import datetime, timezone
+from httpx import ASGITransport, AsyncClient
+
 import pytest
 
+from tinyagentos.agent_registry_store import mint_registry_token
 from tinyagentos.auth_context import CurrentUser, current_user
+
+
+async def _non_admin_client(app):
+    """Cookie'd client for a non-admin member session on *app*."""
+    auth_mgr = app.state.auth
+    try:
+        invite_code = auth_mgr.add_user_invite("bob", "admin")
+    except ValueError:
+        invite_code = None
+    if invite_code:
+        auth_mgr.complete_invite("bob", invite_code, "Bob", "", "bobpass123")
+    bob = auth_mgr.find_user("bob")
+    token = auth_mgr.create_session(user_id=bob["id"], long_lived=True)
+    return AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        cookies={"taos_session": token},
+    )
+
+
+async def _make_obs_agent_token(app, *, scopes=("observatory_control",), project_id=None):
+    """Register an agent, add its grants through the public consent-mint path,
+    and return (canonical_id, signed JWT)."""
+    registry = app.state.agent_registry
+    grants = app.state.agent_grants
+    if registry._db is None:
+        await registry.init()
+    if grants._db is None:
+        await grants.init()
+    priv, _pub = app.state.agent_registry_keypair
+
+    rec = await registry.register(
+        framework="taosctl",
+        display_name="Obs Agent",
+        origin="taos-deployed",
+        handle="@obs-agent",
+    )
+    cid = rec["canonical_id"]
+    for scope in scopes:
+        await grants.add_grant(cid, scope, project_id=project_id)
+    token = mint_registry_token(cid, priv, user_id="u", framework="taosctl")
+    return cid, token
+
+
+def _bare(app):
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
 
 @pytest.mark.asyncio
@@ -15,10 +66,8 @@ async def test_global_pause_round_trips(client):
     resp = await client.post("/api/observatory/pause", json={"scope": "global", "paused": True})
     assert resp.status_code == 200
     assert resp.json()["global"] is True
-    # A fresh read reflects it (persisted).
     resp = await client.get("/api/observatory/pause")
     assert resp.json()["global"] is True
-    # Resume.
     resp = await client.post("/api/observatory/pause", json={"scope": "global", "paused": False})
     assert resp.json()["global"] is False
 
@@ -28,8 +77,7 @@ async def test_per_lane_pause_and_resume(client):
     lane = "@taOS-dev-kilo-owl-alpha"
     resp = await client.post("/api/observatory/pause", json={"scope": lane, "paused": True})
     assert resp.json()["lanes"].get(lane) is True
-    assert resp.json()["global"] is False  # lane pause does not touch global
-    # Unpausing removes the lane entry rather than leaving a False.
+    assert resp.json()["global"] is False
     resp = await client.post("/api/observatory/pause", json={"scope": lane, "paused": False})
     assert lane not in resp.json()["lanes"]
 
@@ -42,13 +90,12 @@ async def test_empty_scope_rejected(client):
 
 @pytest.mark.asyncio
 async def test_non_admin_cannot_pause(app, client):
-    # Override the auth dependency to a non-admin user for this request.
-    app.dependency_overrides[current_user] = lambda: CurrentUser(user_id="bob", is_admin=False)
+    member_client = await _non_admin_client(app)
     try:
-        resp = await client.post("/api/observatory/pause", json={"scope": "global", "paused": True})
+        resp = await member_client.post("/api/observatory/pause", json={"scope": "global", "paused": True})
         assert resp.status_code == 403
     finally:
-        app.dependency_overrides.pop(current_user, None)
+        await member_client.aclose()
 
 
 @pytest.mark.asyncio
@@ -65,7 +112,6 @@ async def test_global_throttle_round_trips(client):
     assert resp.json()["global"] == 2
     resp = await client.get("/api/observatory/throttle")
     assert resp.json()["global"] == 2
-    # max_concurrent <= 0 (or null) clears the cap.
     resp = await client.post("/api/observatory/throttle", json={"scope": "global", "max_concurrent": 0})
     assert resp.json()["global"] is None
 
@@ -76,7 +122,6 @@ async def test_per_lane_throttle_set_and_clear(client):
     resp = await client.post("/api/observatory/throttle", json={"scope": lane, "max_concurrent": 3})
     assert resp.json()["lanes"].get(lane) == 3
     assert resp.json()["global"] is None
-    # Clearing (null) drops the lane entry rather than storing 0.
     resp = await client.post("/api/observatory/throttle", json={"scope": lane, "max_concurrent": None})
     assert lane not in resp.json()["lanes"]
 
@@ -89,12 +134,12 @@ async def test_throttle_empty_scope_rejected(client):
 
 @pytest.mark.asyncio
 async def test_non_admin_cannot_throttle(app, client):
-    app.dependency_overrides[current_user] = lambda: CurrentUser(user_id="bob", is_admin=False)
+    member_client = await _non_admin_client(app)
     try:
-        resp = await client.post("/api/observatory/throttle", json={"scope": "global", "max_concurrent": 1})
+        resp = await member_client.post("/api/observatory/throttle", json={"scope": "global", "max_concurrent": 1})
         assert resp.status_code == 403
     finally:
-        app.dependency_overrides.pop(current_user, None)
+        await member_client.aclose()
 
 
 @pytest.mark.asyncio
@@ -111,7 +156,6 @@ async def test_global_approval_mode_round_trips(client):
     assert resp.json()["global"] == "accept_edits"
     resp = await client.get("/api/observatory/approval-mode")
     assert resp.json()["global"] == "accept_edits"
-    # Resetting to default restores the baseline.
     resp = await client.post("/api/observatory/approval-mode", json={"scope": "global", "mode": "default"})
     assert resp.json()["global"] == "default"
 
@@ -121,21 +165,18 @@ async def test_per_session_approval_mode_set_and_clear(client):
     session = "cs-abc123"
     resp = await client.post("/api/observatory/approval-mode", json={"scope": session, "mode": "dont_ask"})
     assert resp.json()["sessions"] == {session: "dont_ask"}
-    # mode=default clears the per-session override (falls back to global).
     resp = await client.post("/api/observatory/approval-mode", json={"scope": session, "mode": "default"})
     assert resp.json()["sessions"] == {}
 
 
 @pytest.mark.asyncio
 async def test_approval_mode_tolerates_malformed_file(app, client):
-    # Valid JSON but the wrong shape must degrade to the safe default, not 500.
     from pathlib import Path
     p = Path(app.state.data_dir) / "observatory_approval_mode.json"
     p.write_text('"not a dict"')
     r = await client.get("/api/observatory/approval-mode")
     assert r.status_code == 200
     assert r.json() == {"global": "default", "sessions": {}}
-    # A non-dict "sessions" is ignored, not crashed on.
     p.write_text('{"global": "accept_edits", "sessions": "oops"}')
     r = await client.get("/api/observatory/approval-mode")
     assert r.status_code == 200
@@ -157,12 +198,12 @@ async def test_approval_mode_empty_scope_rejected(client):
 
 @pytest.mark.asyncio
 async def test_non_admin_cannot_set_approval_mode(app, client):
-    app.dependency_overrides[current_user] = lambda: CurrentUser(user_id="bob", is_admin=False)
+    member_client = await _non_admin_client(app)
     try:
-        resp = await client.post("/api/observatory/approval-mode", json={"scope": "global", "mode": "dont_ask"})
+        resp = await member_client.post("/api/observatory/approval-mode", json={"scope": "global", "mode": "dont_ask"})
         assert resp.status_code == 403
     finally:
-        app.dependency_overrides.pop(current_user, None)
+        await member_client.aclose()
 
 
 @pytest.mark.asyncio
@@ -224,7 +265,6 @@ async def test_registered_agent_with_a_claim_is_working_not_idle(app, client):
 
     resp = await client.get("/api/observatory/fleet")
     rows = [a for a in resp.json()["agents"] if a["handle"] == "@busy-agent"]
-    # The agent appears once, as working (not duplicated as idle).
     assert len(rows) == 1
     assert rows[0]["state"] == "working"
 
@@ -254,7 +294,6 @@ async def test_fleet_flags_a_long_held_claim_as_stale(app, client):
     proj = await pstore.create_project(name="ObsStale", slug="obs-stale", created_by="admin", user_id="admin")
     task = await tstore.create_task(proj["id"], title="Wedged card", created_by="admin")
     await tstore.claim_task(task["id"], "@lane-stale")
-    # Backdate the claim well past the threshold to exercise the stale path.
     old = time.time() - (STALE_CLAIM_SECONDS + 600)
     await tstore._db.execute(
         "UPDATE project_tasks SET claimed_at = ? WHERE id = ?", (old, task["id"]))
@@ -290,7 +329,6 @@ async def test_fleet_clamps_held_seconds_under_clock_skew(app, client):
     proj = await pstore.create_project(name="ObsSkew", slug="obs-skew", created_by="admin", user_id="admin")
     task = await tstore.create_task(proj["id"], title="Future card", created_by="admin")
     await tstore.claim_task(task["id"], "@lane-skew")
-    # Claim stamped slightly in the future (clock skew) must not yield a negative age.
     await tstore._db.execute(
         "UPDATE project_tasks SET claimed_at = ? WHERE id = ?", (time.time() + 600, task["id"]))
     await tstore._db.commit()
@@ -373,8 +411,6 @@ async def test_fleet_working_agent_backfills_framework_from_registry(app, client
     reg = app.state.agent_registry
     if reg._db is None:
         await reg.init()
-    # A registered agent that also holds a claimed card: it is 'working', and its
-    # framework is backfilled from the registry by handle.
     await reg.register(framework="kilo", display_name="Busy Fw",
                        handle="@lane-fw-busy", user_id="admin")
     proj = await pstore.create_project(name="ObsFw", slug="obs-fw", created_by="admin", user_id="admin")
@@ -400,3 +436,122 @@ async def test_fleet_unregistered_working_agent_has_empty_framework(app, client)
     mine = [a for a in agents if a["handle"] == "@lane-unregistered"]
     assert len(mine) == 1
     assert mine[0]["framework"] == ""
+
+
+class TestObservatoryAgentAuth:
+    """Agent-token authentication for observatory routes.
+
+    An agent reads/writes /api/observatory/* with its own Ed25519 registry JWT
+    (scope observatory_control), never the owner session/password.  The admin
+    check runs before any JWT verification so a local admin token is never
+    mis-verified as a registry JWT.  Writes require a GLOBAL (null-project)
+    grant; reads accept any active observatory_control grant.
+    """
+
+    @pytest.mark.asyncio
+    async def test_agent_with_observatory_control_can_read_pause(self, app):
+        _cid, token = await _make_obs_agent_token(app)
+        async with _bare(app) as bare:
+            resp = await bare.get(
+                "/api/observatory/pause",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_agent_with_observatory_control_can_set_pause(self, app):
+        _cid, token = await _make_obs_agent_token(app)
+        async with _bare(app) as bare:
+            resp = await bare.post(
+                "/api/observatory/pause",
+                json={"scope": "global", "paused": True},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["global"] is True
+
+    @pytest.mark.asyncio
+    async def test_agent_with_observatory_control_can_set_throttle(self, app):
+        _cid, token = await _make_obs_agent_token(app)
+        async with _bare(app) as bare:
+            resp = await bare.post(
+                "/api/observatory/throttle",
+                json={"scope": "global", "max_concurrent": 3},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp.status_code == 200
+        assert resp.json()["global"] == 3
+
+    @pytest.mark.asyncio
+    async def test_agent_without_observatory_control_cannot_read(self, app):
+        _cid, token = await _make_obs_agent_token(app, scopes=("memory_read",))
+        async with _bare(app) as bare:
+            resp = await bare.get(
+                "/api/observatory/pause",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_agent_without_observatory_control_cannot_write(self, app):
+        _cid, token = await _make_obs_agent_token(app, scopes=("memory_read",))
+        async with _bare(app) as bare:
+            resp = await bare.post(
+                "/api/observatory/pause",
+                json={"scope": "global", "paused": True},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_project_scoped_observatory_control_can_read_but_not_write(self, app):
+        _cid, token = await _make_obs_agent_token(
+            app, scopes=("observatory_control",), project_id="prj-obs"
+        )
+        async with _bare(app) as bare:
+            read_resp = await bare.get(
+                "/api/observatory/pause",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert read_resp.status_code == 200
+        async with _bare(app) as bare:
+            write_resp = await bare.post(
+                "/api/observatory/pause",
+                json={"scope": "global", "paused": True},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert write_resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_local_admin_token_can_read_and_write(self, app):
+        if not app.state.auth.find_user("admin"):
+            app.state.auth.setup_user("admin", "Test Admin", "", "testpass")
+        local_token = app.state.auth.get_local_token()
+        async with _bare(app) as bare:
+            read_resp = await bare.get(
+                "/api/observatory/pause",
+                headers={"Authorization": f"Bearer {local_token}"},
+            )
+        assert read_resp.status_code == 200
+        async with _bare(app) as bare:
+            write_resp = await bare.post(
+                "/api/observatory/pause",
+                json={"scope": "global", "paused": True},
+                headers={"Authorization": f"Bearer {local_token}"},
+            )
+        assert write_resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_malformed_agent_token_gets_401(self, app):
+        async with _bare(app) as bare:
+            resp = await bare.get(
+                "/api/observatory/pause",
+                headers={"Authorization": "Bearer not-a-valid-token"},
+            )
+        assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_no_auth_gets_401(self, app):
+        async with _bare(app) as bare:
+            resp = await bare.get("/api/observatory/pause")
+        assert resp.status_code == 401

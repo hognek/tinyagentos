@@ -92,6 +92,9 @@ screenshots.zip
 data/.auth_user.json
 data/browser_cookie_key.hex
 
+# Hub identity — runtime state, never track (contains generated keypairs)
+data/hub/
+
 # Vite/TS incremental build artifact — regenerated on every build, must not be tracked
 # (a tracked copy dirties the tree and blocks the in-app git-pull update).
 desktop/tsconfig.tsbuildinfo
@@ -128,3 +131,48 @@ data/pending-restart.json
 # Stray dev screenshot artifacts
 desktop-initial.png
 venv/
+
+# Credential material must never be committable. An agent stored a registry
+# token at /opt/taos/secrets/ on 2026-07-27 - correct permissions, but inside the
+# deployed git checkout and one "git add -A" away from a public repo.
+secrets/
+*.token
+*.cred
+
+# Credential material under data/. On 2026-07-27 three of these sat UNTRACKED in
+# the deployed checkout - one 'git add -A' from a public repo. Never committed
+# (verified against full history), but untracked is not the same as safe.
+#
+# Deliberately NOT using 'data/*' deny-all: data/archive, data/sessions and
+# data/guides.yaml are legitimately tracked, and a blanket rule would silently
+# ignore NEW files there - trading a credential risk for a data-loss-by-
+# invisibility one. Enumerate the secrets instead, and keep this list current.
+data/.secrets_key
+data/.seeded-agent-tokens.json
+data/secrets.db*
+data/*.key
+data/*.token
+
+# Key material and secrets. Added 2026-07-27 after data/hub/identity.json was
+# committed to PR #2043 with signing_private and encryption_private in
+# PLAINTEXT. data/hub/ is already covered above; these patterns close the REST
+# of the surface, which was open: an identity.json or a *.key written anywhere
+# outside data/hub/ had nothing stopping it. Pattern-based on purpose, since a
+# per-file allowlist cannot catch a file that does not exist yet.
+# Verified against every tracked file: none become ignored.
+*.key
+*_private.pem
+*_private.key
+*_private.json
+*_private_key*
+identity.json
+*.p8
+*credentials.json
+
+# Credential bundles. Added 2026-07-27: @taOS-website-dev ran the same audit
+# on its repo and found shapes my first pass (PR #2171) missed. Verified on
+# origin/dev: creds.json, my_creds.json and data/creds.json were all NOT
+# ignored, while *credentials.json already was. Matching the *creds* stem
+# closes the shorter spelling, which is the one people actually type.
+# Verified against every tracked file on origin/dev: 0 become ignored.
+*creds*.json

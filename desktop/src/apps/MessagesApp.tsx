@@ -11,8 +11,6 @@ import {
   Archive,
   CircleDot,
   PauseCircle,
-  MessagesSquare,
-  Search,
   AlertTriangle,
   Loader2,
 } from "lucide-react";
@@ -41,8 +39,7 @@ import { useThreadPanel } from "@/lib/use-thread-panel";
 import { openFilePicker } from "@/shell/file-picker-api";
 import { MessageOverflowMenu } from "./chat/MessageOverflowMenu";
 import { BottomSheet } from "@/shell/BottomSheet";
-import { PinBadge } from "./chat/PinBadge";
-import { PinnedMessagesPopover, type PinnedMessage } from "./chat/PinnedMessagesPopover";
+import { type PinnedMessage } from "./chat/PinnedMessagesPopover";
 import { AllThreadsList } from "./chat/AllThreadsList";
 import { ChannelSwitcher } from "./chat/ChannelSwitcher";
 import { useChatNotifications } from "./chat/useChatNotifications";
@@ -70,7 +67,6 @@ import { getApp } from "@/registry/app-registry";
 import { CodeBlock } from "@/components/CodeBlock";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { resolveAgentEmoji } from "@/lib/agent-emoji";
 import { SearchPanel } from "./chat/SearchPanel";
 import { ChannelSidebar } from "./chat/ChannelSidebar";
 import { A2aBusMessageView, useBusChannels } from "./chat/A2aBusPanel";
@@ -158,6 +154,44 @@ export function resolveAuthorDisplayState(
   return "removed";
 }
 
+interface TextContentBlock {
+  kind: "text";
+  text: string;
+}
+
+interface ThinkingContentBlock {
+  kind: "thinking";
+  text: string;
+  collapsed?: boolean;
+}
+
+interface ToolCallContentBlock {
+  kind: "tool_call";
+  call_id: string;
+  name: string;
+  input_preview?: string;
+  status: "running" | "done" | "error";
+  result_preview?: string;
+}
+
+interface StatusContentBlock {
+  kind: "status";
+  text: string;
+}
+
+/**
+ * Structured message content for taOStalk session turns.
+ * Known kinds are handled by dedicated block components (separate cards);
+ * any unrecognized kind falls through to the unknown-block fallback in
+ * renderContent, which is the slice-2 seam.
+ */
+export type ContentBlock =
+  | TextContentBlock
+  | ThinkingContentBlock
+  | ToolCallContentBlock
+  | StatusContentBlock
+  | { kind: string; [key: string]: unknown };
+
 interface Message {
   id: string;
   channel_id: string;
@@ -167,6 +201,7 @@ interface Message {
   /** Parent message id when this message is a thread reply. */
   thread_id?: string;
   content_type?: "text" | "canvas" | string;
+  content_blocks?: ContentBlock[];
   metadata?: {
     canvas_id?: string;
     canvas_url?: string;
@@ -217,7 +252,32 @@ export function relativeTime(ts: number | string, nowMs: number = Date.now()): s
   return new Date(ms).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
 
-export function renderContent(text: string) {
+/**
+ * Dispatch a single content block to its renderer. Known kinds (text,
+ * thinking, tool_call, status) are dispatched to dedicated block components
+ * in separate cards; until those land, they fall through to the unknown
+ * fallback. This is the slice-2 seam: add a case per kind and return the
+ * block component.
+ */
+function renderContentBlock(block: ContentBlock, index: number): React.ReactElement {
+  switch (block.kind) {
+    case "text":
+    case "thinking":
+    case "tool_call":
+    case "status":
+    default:
+      return (
+        <div key={`block-${index}`} className="text-shell-text-tertiary text-[12px]">
+          unsupported block: {block.kind}
+        </div>
+      );
+  }
+}
+
+export function renderContent(text: string, content_blocks?: ContentBlock[]) {
+  if (content_blocks && content_blocks.length > 0) {
+    return content_blocks.map((block, i) => renderContentBlock(block, i));
+  }
   // Split on fenced code blocks first, then apply inline markdown to non-code segments.
   const result: (string | React.ReactElement)[] = [];
   const fenceRegex = /```(?:[^\n]*)?\n([\s\S]*?)```/g;
@@ -257,7 +317,7 @@ export function renderInline(text: string, keyPrefix: string) {
               return <code className={className} {...props}>{children}</code>;
             }
             return (
-              <code className="bg-white/10 px-1.5 py-0.5 rounded text-[13px] font-mono" {...props}>
+              <code className="bg-shell-surface-active px-1.5 py-0.5 rounded text-[13px] font-mono" {...props}>
                 {children}
               </code>
             );
@@ -265,10 +325,10 @@ export function renderInline(text: string, keyPrefix: string) {
           ul: ({ node, ...props }) => <ul className="list-disc pl-5 mb-1" {...props} />,
           ol: ({ node, ...props }) => <ol className="list-decimal pl-5 mb-1" {...props} />,
           blockquote: ({ node, ...props }) => (
-            <blockquote className="border-l-2 border-white/20 pl-3 text-white/70" {...props} />
+            <blockquote className="border-l-2 border-shell-border pl-3 text-shell-text-secondary" {...props} />
           ),
           pre: ({ node, ...props }) => (
-            <pre className="my-2 overflow-x-auto max-w-full bg-black/30 border border-white/10 rounded p-2 text-[13px]" {...props} />
+            <pre className="my-2 overflow-x-auto max-w-full bg-shell-bg-deep border border-shell-border rounded p-2 text-[13px]" {...props} />
           ),
           table: ({ node, ...props }) => (
             <div className="my-2 overflow-x-auto">
@@ -276,10 +336,10 @@ export function renderInline(text: string, keyPrefix: string) {
             </div>
           ),
           th: ({ node, ...props }) => (
-            <th className="border-b border-white/10 px-2 py-1 font-semibold" {...props} />
+            <th className="border-b border-shell-border px-2 py-1 font-semibold" {...props} />
           ),
           td: ({ node, ...props }) => (
-            <td className="border-b border-white/5 px-2 py-1 align-top" {...props} />
+            <td className="border-b border-shell-border px-2 py-1 align-top" {...props} />
           ),
           h1: ({ node, ...props }) => <p className="font-semibold mb-1" {...props} />,
           h2: ({ node, ...props }) => <p className="font-semibold mb-1" {...props} />,
@@ -1627,7 +1687,7 @@ export function MessagesApp({
       )}
       {!selectedChannel ? (
         /* empty state: nothing selected yet */
-        <div className="flex-1 flex items-center justify-center text-white/20">
+        <div className="flex-1 flex items-center justify-center text-shell-text-tertiary">
           <div className="text-center px-6">
             <MessageCircle size={48} className="mx-auto mb-3 opacity-30" />
             <p className="text-sm mb-3">Pick a channel or start a DM</p>
@@ -1638,123 +1698,6 @@ export function MessagesApp({
         </div>
       ) : (
         <>
-          {/* channel header — MobileSplitView owns back nav on mobile */}
-          <div className="px-4 py-2.5 border-b border-white/[0.06] flex items-center gap-3 shrink-0">
-            {currentChannel?.type === "topic" ? <Hash size={16} className="text-white/40" /> :
-             currentChannel?.type === "group" ? <Users size={16} className="text-white/40" /> :
-             <AtSign size={16} className="text-white/40" />}
-            {(() => {
-              // For DM channels, prefix the header with the paired agent's
-              // emoji (or framework default) so the user can see at a glance
-              // who they are chatting with.
-              if (currentChannel?.type !== "dm") return null;
-              const agentName = (currentChannel.members ?? []).find((m) => m !== "user");
-              if (!agentName) return null;
-              const agent = liveAgents.find((a) => a.name === agentName);
-              if (!agent) return null;
-              return (
-                <span
-                  className="text-base leading-none shrink-0"
-                  aria-hidden="true"
-                >
-                  {resolveAgentEmoji(agent.emoji, agent.framework)}
-                </span>
-              );
-            })()}
-            <div className="min-w-0 flex-1">
-              <div className="text-sm font-medium truncate flex items-center gap-1">
-                {currentChannel?.name ?? "Unknown"}
-                {currentChannel && currentChannel.type !== "dm" && (
-                  <button
-                    aria-label="Channel settings"
-                    onClick={handleOpenSettings}
-                    className="ml-1 opacity-60 hover:opacity-100"
-                  >ⓘ</button>
-                )}
-                <a
-                  aria-label="Open chat guide"
-                  href="https://github.com/jaylfc/tinyagentos/blob/master/docs/chat-guide.md"
-                  target="_blank"
-                  rel="noreferrer"
-                  className="ml-1 opacity-60 hover:opacity-100 text-[12px]"
-                >?</a>
-                <div className="relative">
-                  <PinBadge
-                    count={pinnedMessages.length}
-                    onClick={() => setPinnedPopoverOpen((open) => !open)}
-                  />
-                  {pinnedPopoverOpen && (
-                    <PinnedMessagesPopover
-                      pins={pinnedMessages}
-                      authorCtx={{ currentUserId, currentUserDisplayName }}
-                      onJumpTo={(id) => {
-                        setPinnedPopoverOpen(false);
-                        const el = document.querySelector(`[data-message-id="${id}"]`) as HTMLElement | null;
-                        if (el) {
-                          el.scrollIntoView({ behavior: "smooth", block: "center" });
-                          el.classList.add("data-highlight");
-                          setTimeout(() => el.classList.remove("data-highlight"), 2000);
-                        } else {
-                          // Only ~50 messages load; a pin older than that is not in the DOM.
-                          setSendError("Message is older than the loaded history");
-                        }
-                      }}
-                      onClose={() => setPinnedPopoverOpen(false)}
-                    />
-                  )}
-                </div>
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (showAllThreads) {
-                      setShowAllThreads(false);
-                    } else {
-                      closeThread();
-                      setShowSettings(false);
-                      setShowSearch(false);
-                      setShowAllThreads(true);
-                    }
-                  }}
-                  className="ml-2 p-1 rounded hover:bg-white/10 text-white/60 hover:text-white"
-                  aria-label={showAllThreads ? "Hide all threads" : "Show all threads"}
-                  aria-expanded={showAllThreads}
-                  aria-controls="all-threads-panel"
-                  title="All threads"
-                >
-                  <MessagesSquare size={14} aria-hidden="true" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    if (showSearch) {
-                      setShowSearch(false);
-                    } else {
-                      closeThread();
-                      setShowSettings(false);
-                      setShowAllThreads(false);
-                      setShowSearch(true);
-                    }
-                  }}
-                  className="ml-2 p-1 rounded hover:bg-white/10 text-white/60 hover:text-white"
-                  aria-label={showSearch ? "Hide search" : "Search messages"}
-                  aria-expanded={showSearch}
-                  aria-controls="search-panel"
-                  title="Search"
-                >
-                  <Search size={14} aria-hidden="true" />
-                </button>
-              </div>
-              {currentChannel?.description && (
-                <div className="text-[11px] text-white/35 truncate">{currentChannel.description}</div>
-              )}
-            </div>
-            {currentChannel?.members && (
-              <div className="text-[11px] text-white/30 flex items-center gap-1">
-                <Users size={12} /> {currentChannel.members.length}
-              </div>
-            )}
-          </div>
-
           <MessageList
             ref={messageListHandleRef}
             messages={messages}
@@ -1833,15 +1776,15 @@ export function MessagesApp({
           {/* #1741: stall banner — surfaces only when a response is abnormally
               slow or has gone quiet, so a stalled generation no longer looks
               like a frozen window. */}
-          {stallInfo && (
-            <div
-              role="status"
-              className={`mx-4 mb-2 px-3 py-2 rounded-lg border text-[12px] flex items-center gap-2 shrink-0 ${
-                stallInfo.stalled
-                  ? "bg-amber-500/10 border-amber-500/25 text-amber-300/90"
-                  : "bg-white/[0.04] border-white/10 text-white/55"
-              }`}
-            >
+{stallInfo && (
+             <div
+               role="status"
+               className={`mx-4 mb-2 px-3 py-2 rounded-lg border text-[12px] flex items-center gap-2 shrink-0 ${
+                 stallInfo.stalled
+                   ? "bg-amber-500/10 border-amber-500/25 text-amber-300/90"
+                   : "bg-shell-surface border-shell-border text-shell-text-secondary"
+               }`}
+             >
               {stallInfo.stalled ? (
                 <AlertTriangle size={13} aria-hidden="true" className="shrink-0" />
               ) : (
@@ -1895,8 +1838,8 @@ export function MessagesApp({
                   setPrefillBanner(null);
                   setInput("");
                 }}
-                className="shrink-0 p-0.5 rounded hover:bg-white/10 transition-colors"
-                aria-label="Dismiss prefill"
+className="shrink-0 p-0.5 rounded hover:bg-shell-surface-active transition-colors"
+                 aria-label="Dismiss prefill"
               >
                 <X size={12} aria-hidden="true" />
               </button>
@@ -1992,14 +1935,14 @@ export function MessagesApp({
   /* ---------------------------------------------------------------- */
 
   return (
-    <div className="relative flex flex-col h-full bg-shell-base text-white overflow-hidden">
+    <div className="relative flex flex-col h-full bg-shell-base text-shell-text overflow-hidden">
       {/* Toolbar — hidden on mobile when a channel is selected */}
       {showToolbar && (
-        <div className="relative flex items-center px-3 py-2.5 border-b border-white/[0.06] shrink-0">
+        <div className="relative flex items-center px-3 py-2.5 border-b border-shell-border shrink-0">
           {title ? (
             <>
               <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-                <span className="text-sm font-semibold text-white/90">{title}</span>
+                <span className="text-sm font-semibold text-shell-text">{title}</span>
               </div>
               <div className="ml-auto">
                 <Button
@@ -2015,7 +1958,7 @@ export function MessagesApp({
             </>
           ) : (
             <>
-              <div className="flex items-center gap-2 text-sm font-medium text-white/80">
+              <div className="flex items-center gap-2 text-sm font-medium text-shell-text">
                 <MessageCircle size={15} />
                 {!isMobile && "Messages"}
               </div>
@@ -2250,7 +2193,7 @@ export function MessagesApp({
         <div
           role="dialog"
           aria-label={`Agent info for @${agentInfoPopover.slug}`}
-          className="fixed z-50 bg-shell-surface border border-white/10 rounded-lg shadow-xl p-3 text-xs min-w-[200px]"
+          className="fixed z-50 bg-shell-surface border border-shell-border rounded-lg shadow-xl p-3 text-xs min-w-[200px]"
           style={{ top: agentInfoPopover.y, left: agentInfoPopover.x }}
           onMouseLeave={() => setAgentInfoPopover(null)}
         >
@@ -2264,18 +2207,18 @@ export function MessagesApp({
       {/* ---- Canvas Viewer ---- */}
       {viewingCanvas && (
         <div
-          className="fixed inset-0 z-[10002] flex items-center justify-center bg-black/60 backdrop-blur-sm"
+          className="fixed inset-0 z-[10002] flex items-center justify-center bg-shell-scrim backdrop-blur-sm"
           onClick={() => setViewingCanvas(null)}
           role="dialog"
           aria-modal="true"
           aria-label="Canvas viewer"
         >
           <div
-            className="w-[90vw] h-[85vh] max-w-5xl rounded-xl border border-white/10 overflow-hidden bg-shell-bg flex flex-col"
+            className="w-[90vw] h-[85vh] max-w-5xl rounded-xl border border-shell-border overflow-hidden bg-shell-bg flex flex-col"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="flex items-center justify-between px-4 py-2 border-b border-white/10 shrink-0">
-              <div className="flex items-center gap-2 text-sm text-white/80">
+            <div className="flex items-center justify-between px-4 py-2 border-b border-shell-border shrink-0">
+              <div className="flex items-center gap-2 text-sm text-shell-text">
                 <PanelRight size={14} />
                 <span>{viewingCanvas.title ?? "Canvas"}</span>
               </div>
@@ -2291,7 +2234,7 @@ export function MessagesApp({
             </div>
             <iframe
               src={viewingCanvas.url}
-              className="flex-1 w-full border-none bg-white"
+              className="flex-1 w-full border-none bg-white" // palette-ok: canvas iframe document background is legitimately white
               title="Canvas"
             />
           </div>
@@ -2309,7 +2252,7 @@ export function MessagesApp({
             aria-label="New channel"
           >
             <div
-              className="absolute bottom-0 left-0 right-0 bg-shell-bg border-t border-white/[0.08] rounded-t-2xl p-4 space-y-3"
+              className="absolute bottom-0 left-0 right-0 bg-shell-bg border-t border-shell-border rounded-t-2xl p-4 space-y-3"
               onClick={(e) => e.stopPropagation()}
             >
               <div className="flex items-center justify-between mb-1">
@@ -2334,7 +2277,7 @@ export function MessagesApp({
                   id="new-channel-type-mobile"
                   value={newChannel.type}
                   onChange={(e) => setNewChannel((s) => ({ ...s, type: e.target.value as "topic" | "group" }))}
-                  className="w-full bg-white/[0.06] border border-white/10 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-accent-line"
+                  className="w-full bg-shell-subtle border border-shell-border rounded-lg px-3 py-2 text-sm text-shell-text outline-none focus:border-accent-line"
                   aria-label="Channel type"
                 >
                   <option value="topic">Topic</option>
@@ -2357,9 +2300,9 @@ export function MessagesApp({
             </div>
           </div>
         ) : (
-          <div className="absolute inset-0 bg-black/60 flex items-center justify-center z-50 p-4">
+          <div className="absolute inset-0 bg-shell-scrim flex items-center justify-center z-50 p-4">
             <Card className="w-full max-w-[380px] max-h-full flex flex-col shadow-2xl bg-shell-bg">
-              <CardHeader className="flex flex-row items-center justify-between gap-2 p-0 px-4 py-3 border-b border-white/[0.06]">
+              <CardHeader className="flex flex-row items-center justify-between gap-2 p-0 px-4 py-3 border-b border-shell-border">
                 <CardTitle className="text-sm font-medium">New Channel</CardTitle>
                 <Button
                   variant="ghost"
@@ -2388,7 +2331,7 @@ export function MessagesApp({
                     id="new-channel-type"
                     value={newChannel.type}
                     onChange={(e) => setNewChannel((s) => ({ ...s, type: e.target.value as "topic" | "group" }))}
-                    className="w-full bg-white/[0.06] border border-white/10 rounded-lg px-3 py-2 text-sm text-white outline-none focus:border-accent-line"
+                    className="w-full bg-shell-subtle border border-shell-border rounded-lg px-3 py-2 text-sm text-shell-text outline-none focus:border-accent-line"
                     aria-label="Channel type"
                   >
                     <option value="topic">Topic</option>

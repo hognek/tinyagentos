@@ -3,13 +3,14 @@ from __future__ import annotations
 import logging
 import re
 import time as _time
+import uuid
 
 import asyncio as _asyncio
 import json as _json
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from tinyagentos.agent_token_auth import (
     PROJECT_SCOPE_MISMATCH_DETAIL,
@@ -21,12 +22,54 @@ from tinyagentos.projects.folders import (
     ensure_project_layout,
     write_project_yaml,
 )
+from tinyagentos.projects.project_store import ProjectConflict
 from tinyagentos.projects.task_store import _ELEMENT_CLEAR
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+
+
+async def _is_field_free(store, field: str, value: str) -> bool:
+    """Return True when no project uses ``value`` for ``field``."""
+    if field == "name":
+        return await store.get_project_by_name(value) is None
+    return await store.get_project_by_slug(value) is None
+
+
+async def _free_suggestions(store, field: str, taken: str) -> list[str]:
+    """Generate 2-3 free suggestions for a collided name or slug.
+
+    Each candidate is verified against the store so it is genuinely free.
+    Formats: numeric suffix (<value>-2), prefixed (<prefix>-<value>),
+    and short random suffix (<value>-<shortid>).
+    """
+    suggestions: list[str] = []
+
+    # 1. Numeric suffix: <value>-2, <value>-3, ...
+    for i in range(2, 10):
+        cand = f"{taken}-{i}"
+        if await _is_field_free(store, field, cand):
+            suggestions.append(cand)
+            break
+
+    # 2. Prefixed: <prefix>-<value>
+    for prefix in ("team", "new", "app"):
+        cand = f"{prefix}-{taken}"
+        if await _is_field_free(store, field, cand):
+            suggestions.append(cand)
+            break
+
+    # 3. Short random suffix: <value>-<shortid>
+    for _ in range(20):
+        shortid = uuid.uuid4().hex[:5]
+        cand = f"{taken}-{shortid}"
+        if await _is_field_free(store, field, cand):
+            suggestions.append(cand)
+            break
+
+    return suggestions
 
 
 class CreateProjectIn(BaseModel):
@@ -91,6 +134,17 @@ async def create_project(
             settings=payload.settings,
             created_by=user.user_id,
             user_id=user.user_id,
+        )
+    except ProjectConflict as e:
+        suggestions = await _free_suggestions(store, e.field, e.taken)
+        return JSONResponse(
+            {
+                "error": str(e),
+                "field": e.field,
+                "taken": e.taken,
+                "suggestions": suggestions,
+            },
+            status_code=409,
         )
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=409)
@@ -382,7 +436,39 @@ async def remove_member(
 # Task models
 # ---------------------------------------------------------------------------
 
-class CreateTaskIn(BaseModel):
+class _TaskRequestModelMixin:
+    """Shared base for task request models (tsk-kqzpjt).
+
+    Observation phase: unknown request-body keys are silently accepted
+    (extra="allow") but logged as a single warning so bad clients can be
+    detected before a future flip to extra="forbid". No behaviour change for
+    any caller; every currently-working request keeps working.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    @model_validator(mode="after")
+    def _log_unknown_keys(self):
+        extra = self.model_extra
+        if extra:
+            # Bound the logged key list: this validator runs before the
+            # handler's auth, so key names are attacker-chosen input. Cap
+            # count and per-key length to keep a junk body from amplifying
+            # into the logs.
+            keys = sorted(extra.keys())
+            shown = [k[:50] for k in keys[:10]]
+            if len(keys) > 10:
+                shown.append(f"...and {len(keys) - 10} more")
+            logger.warning(
+                "%s received unknown keys %s; valid fields are %s",
+                type(self).__name__,
+                shown,
+                sorted(type(self).model_fields.keys()),
+            )
+        return self
+
+
+class CreateTaskIn(_TaskRequestModelMixin, BaseModel):
     title: str
     body: str = ""
     priority: int = 0
@@ -392,11 +478,12 @@ class CreateTaskIn(BaseModel):
     element_id: str | None = None
 
 
-class UpdateTaskIn(BaseModel):
+class UpdateTaskIn(_TaskRequestModelMixin, BaseModel):
     title: str | None = None
     body: str | None = None
     priority: int | None = None
     labels: list[str] | None = None
+    status: str | None = None
     assignee_id: str | None = None
     parent_task_id: str | None = None
     # Omit to leave the element tag unchanged; send "none" to clear it to
@@ -404,24 +491,24 @@ class UpdateTaskIn(BaseModel):
     element_id: str | None = None
 
 
-class ClaimIn(BaseModel):
+class ClaimIn(_TaskRequestModelMixin, BaseModel):
     claimer_id: str
 
 
-class ReleaseIn(BaseModel):
+class ReleaseIn(_TaskRequestModelMixin, BaseModel):
     releaser_id: str
 
 
-class CloseIn(BaseModel):
+class CloseIn(_TaskRequestModelMixin, BaseModel):
     closed_by: str
     reason: str | None = None
 
 
-class ReopenIn(BaseModel):
+class ReopenIn(_TaskRequestModelMixin, BaseModel):
     reopened_by: str | None = None
 
 
-class AddRelIn(BaseModel):
+class AddRelIn(_TaskRequestModelMixin, BaseModel):
     to_task_id: str
     kind: str
 
@@ -682,26 +769,56 @@ async def get_task(
     return t
 
 
+# Fields an agent holding project_tasks_update may PATCH. Everything else in
+# UpdateTaskIn (assignee_id, parent_task_id, element_id, and any future field)
+# is rejected 400 for agents so the surface stays minimal and future task
+# fields are protected by default. Session owner/admin is unaffected.
+_AGENT_EDITABLE_FIELDS = frozenset({"title", "body", "labels", "status", "priority"})
+
+
 @router.patch("/api/projects/{project_id}/tasks/{task_id}")
 async def update_task(
     project_id: str,
     task_id: str,
     payload: UpdateTaskIn,
     request: Request,
-    user: CurrentUser = Depends(current_user),
 ):
-    # Session owner/admin only. A project_tasks agent drives its board through
-    # read + the lifecycle actions (claim/release/close/reopen) + comments; free
-    # PATCH of title/body/assignee_id/parent is a broader mutation than that
-    # scope grants, so it stays off the agent allowlist (Kilo review on #1774).
+    # Dual-auth: session owner/admin OR an agent holding project_tasks_update
+    # bound to THIS project. The agent gate (authorship/lead) and field
+    # whitelist are enforced below.
     pstore = request.app.state.project_store
-    project_or_err = await _get_owned_project(pstore, project_id, user)
-    if isinstance(project_or_err, JSONResponse):
-        return project_or_err
+    auth = await _authorize_task_actor(
+        request, pstore, project_id, scope="project_tasks_update"
+    )
+    if isinstance(auth, JSONResponse):
+        return auth
+    actor_id, is_agent, project = auth
     store = request.app.state.project_task_store
     existing = await store.get_task(task_id)
     if existing is None or existing["project_id"] != project_id:
         return JSONResponse({"error": "not found"}, status_code=404)
+
+    # Agent gate: an agent may PATCH only its OWN cards or cards on a project it
+    # leads. A non-author non-lead agent is refused 403 (it has the scope, so the
+    # project is not hidden; the refusal is an authorization failure, not a
+    # scope mismatch).
+    if is_agent:
+        lead_id = project.get("lead_member_id")
+        if existing.get("created_by") != actor_id and lead_id != actor_id:
+            return JSONResponse(
+                {"error": "agent may only edit its own cards or those it leads"},
+                status_code=403,
+            )
+
+    # Field whitelist for agents: title, body, labels, status, priority ONLY.
+    # Any other field that is set is rejected 400 (future fields included).
+    if is_agent:
+        for f in payload.model_fields:
+            if f not in _AGENT_EDITABLE_FIELDS and getattr(payload, f) is not None:
+                return JSONResponse(
+                    {"error": f"field {f!r} is not editable by agents"},
+                    status_code=400,
+                )
 
     if payload.parent_task_id is not None:
         if payload.parent_task_id == task_id:
@@ -720,7 +837,7 @@ async def update_task(
 
     estore = request.app.state.project_element_store
     update_fields: dict = {}
-    for f in ("title", "body", "priority", "labels", "assignee_id", "parent_task_id"):
+    for f in ("title", "body", "priority", "labels", "status", "assignee_id", "parent_task_id"):
         v = getattr(payload, f)
         if v is not None:
             update_fields[f] = v
@@ -780,7 +897,7 @@ async def claim_task(
     return await store.get_task(task_id)
 
 
-class MarkClaimableIn(BaseModel):
+class MarkClaimableIn(_TaskRequestModelMixin, BaseModel):
     claimable: bool
 
 
@@ -1015,7 +1132,7 @@ async def add_relationship(
     return rel
 
 
-class AddCommentIn(BaseModel):
+class AddCommentIn(_TaskRequestModelMixin, BaseModel):
     body: str
     # Optional: an agent caller may omit it and the route pins it to the token
     # canonical_id. A session caller must still supply it (route enforces).

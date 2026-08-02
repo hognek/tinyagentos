@@ -375,3 +375,291 @@ async def test_history_returns_lineage_oldest_first(client):
     assert r.status_code == 200
     chain = [d["id"] for d in r.json()["items"]]
     assert chain == ids  # oldest first
+
+
+@pytest.mark.asyncio
+async def test_human_answer_rejects_mirrored_from_chat_source(client):
+    """A human answer with source=mirrored_from_chat must be rejected as
+    spoofing the audit trail. The human path only records in_app."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "free_text",
+    })
+    d = resp.json()
+    resp = await client.post(
+        f"/api/decisions/{d['id']}/answer",
+        json={"value": "ok", "source": "mirrored_from_chat"},
+    )
+    assert resp.status_code == 400
+    assert "mirrored_from_chat" in resp.json()["error"]
+
+
+@pytest.mark.asyncio
+async def test_human_answer_source_field_in_response(client):
+    """A normal human answer includes source and answered_by in its answer JSON."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "free_text",
+    })
+    d = resp.json()
+    resp = await client.post(
+        f"/api/decisions/{d['id']}/answer",
+        json={"value": "ok", "answered_by": "Jay"},
+    )
+    assert resp.status_code == 200
+    ans = resp.json()["answer"]
+    assert ans["source"] == "in_app"
+    assert ans["answered_by"] == "Jay"
+
+
+@pytest.mark.asyncio
+async def test_single_select_handles_non_hashable_value(client):
+    """A list or dict submitted as a single_select answer must return 400,
+    not 500, by catching the TypeError from set membership."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "single_select",
+        "options": [{"label": "A", "value": "a"}],
+    })
+    d = resp.json()
+    # A list as the value is non-hashable and must not 500.
+    resp = await client.post(
+        f"/api/decisions/{d['id']}/answer",
+        json={"value": ["a"]},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_multi_select_handles_non_iterable_value(client):
+    """A non-iterable value for a multi_select answer must 400."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "multi_select",
+        "options": [{"label": "A", "value": "a"}],
+    })
+    d = resp.json()
+    # An integer (not a list) should 400 for multi_select.
+    resp = await client.post(
+        f"/api/decisions/{d['id']}/answer",
+        json={"value": 42},
+    )
+    assert resp.status_code == 400
+
+
+# --------------------------------------------------------------------------- #
+# Device-bearer self-service tests
+# --------------------------------------------------------------------------- #
+
+def _bearer(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def _admin_uid(app) -> str:
+    return app.state.auth.find_user("admin")["id"]
+
+
+async def _register_device(app, user_id: str) -> dict:
+    return await app.state.device_store.register(
+        user_id=user_id, platform="ios", display_name="lock-screen"
+    )
+
+
+async def _decision_for_user(app, user_id: str, **extra) -> dict:
+    defaults = {
+        "from_agent": "@taOS-dev",
+        "question": "device-bearer test",
+        "type": "approve_deny",
+    }
+    defaults.update(extra)
+    return await app.state.decision_store.create(
+        from_agent=defaults["from_agent"],
+        question=defaults["question"],
+        type=defaults["type"],
+        user_id=user_id,
+    )
+
+
+def _bearer_only_client(app, token):
+    """AsyncClient with ONLY a device Bearer header, no session cookie."""
+    from httpx import ASGITransport, AsyncClient
+    return AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers=_bearer(token),
+    )
+
+
+@pytest.mark.asyncio
+async def test_device_bearer_lists_only_own_user_decisions(client, app):
+    """Invariant (a): a device paired to an ADMIN user must NOT inherit
+    admin scope.  GET /api/decisions with the device bearer must return only
+    that user's decisions, never uid=None (which lists EVERY user's).
+
+    This test FAILS if is_admin were copied from the user record, because the
+    admin decision AND the other-user decision would both be returned.
+    """
+    admin_uid = _admin_uid(app)
+    admin_decision = await _decision_for_user(app, admin_uid)
+    other_decision = await _decision_for_user(app, "other-user-abc")
+    device = await _register_device(app, admin_uid)
+
+    resp = await client.get("/api/decisions", headers=_bearer(device["scoped_token"]))
+    assert resp.status_code == 200
+    ids = {d["id"] for d in resp.json()["items"]}
+    assert admin_decision["id"] in ids
+    assert other_decision["id"] not in ids
+
+
+@pytest.mark.asyncio
+async def test_device_bearer_cannot_get_other_user_decision(client, app):
+    """Invariants (a) + (d): an admin-paired device bearer cannot read another
+    user's decision -- the ownership gate on get_decision must fire because
+    is_admin is False and the decision's user_id differs."""
+    admin_uid = _admin_uid(app)
+    other_decision = await _decision_for_user(app, "other-user-xyz")
+    device = await _register_device(app, admin_uid)
+
+    resp = await client.get(
+        f"/api/decisions/{other_decision['id']}",
+        headers=_bearer(device["scoped_token"]),
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_device_bearer_cannot_answer_other_user_decision(client, app):
+    """Invariants (a) + (d): an admin-paired device bearer cannot answer
+    another user's decision.  answered_by stays attribution-only; the decider
+    check (existing["user_id"] != user.user_id) blocks it."""
+    admin_uid = _admin_uid(app)
+    other_decision = await _decision_for_user(app, "other-user-qrs")
+    device = await _register_device(app, admin_uid)
+
+    resp = await client.post(
+        f"/api/decisions/{other_decision['id']}/answer",
+        json={"value": "approve"},
+        headers=_bearer(device["scoped_token"]),
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_device_bearer_lists_gets_answers_own_decision(client, app):
+    """Criterion 3: a device bearer can list/get/answer a decision addressed to
+    its own user."""
+    admin_uid = _admin_uid(app)
+    device = await _register_device(app, admin_uid)
+    decision = await _decision_for_user(app, admin_uid, question="Lock screen?")
+    token = device["scoped_token"]
+
+    # List (pending only)
+    resp = await client.get(
+        "/api/decisions?status=pending", headers=_bearer(token)
+    )
+    assert resp.status_code == 200
+    assert any(d["id"] == decision["id"] for d in resp.json()["items"])
+
+    # Get
+    resp = await client.get(
+        f"/api/decisions/{decision['id']}", headers=_bearer(token)
+    )
+    assert resp.status_code == 200
+    assert resp.json()["question"] == "Lock screen?"
+
+    # Answer
+    resp = await client.post(
+        f"/api/decisions/{decision['id']}/answer",
+        json={"value": "approve"},
+        headers=_bearer(token),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "answered"
+    assert resp.json()["answer"]["value"] == "approve"
+
+
+@pytest.mark.asyncio
+async def test_device_bearer_answer_routes_back_to_bus(client, app, monkeypatch):
+    """The device bearer answer must route back to the asking agent on the
+    A2A bus identically to a user-session answer."""
+    import tinyagentos.routes.decisions as dmod
+
+    posted = {}
+
+    class _FakeAsyncClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None):
+            posted["url"] = url
+            posted["json"] = json
+            return None
+
+    monkeypatch.setattr(dmod.httpx, "AsyncClient", _FakeAsyncClient)
+
+    admin_uid = _admin_uid(app)
+    device = await _register_device(app, admin_uid)
+    decision = await _decision_for_user(
+        app, admin_uid, from_agent="@taOS-dev", question="Unlock?",
+    )
+    resp = await client.post(
+        f"/api/decisions/{decision['id']}/answer",
+        json={"value": "approve"},
+        headers=_bearer(device["scoped_token"]),
+    )
+    assert resp.status_code == 200
+    assert posted["url"].endswith("/a2a/send")
+    assert posted["json"]["thread"] == "decisions"
+    assert "@taOS-dev" in posted["json"]["body"]
+
+
+@pytest.mark.asyncio
+async def test_device_bearer_401_on_unrelated_routes(client, app):
+    """Invariant (c): a device bearer must 401 on routes that are NOT carded
+    for device auth -- proving the dependency is per-route and no
+    request.state.user_id injection happened."""
+    admin_uid = _admin_uid(app)
+    device = await _register_device(app, admin_uid)
+
+    async with _bearer_only_client(app, device["scoped_token"]) as dc:
+        # GET /api/devices is session-only (list own devices).
+        assert (await dc.get("/api/devices")).status_code == 401
+        # POST /api/decisions is agent/session-only (create).
+        assert (
+            await dc.post("/api/decisions", json={
+                "from_agent": "@a", "question": "q", "type": "free_text",
+            })
+        ).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_device_bearer_history_parity(client, app):
+    """LOW: /history parity -- a device bearer can read the history of a
+    decision addressed to its own user."""
+    admin_uid = _admin_uid(app)
+    device = await _register_device(app, admin_uid)
+    decision = await _decision_for_user(app, admin_uid)
+
+    resp = await client.get(
+        f"/api/decisions/{decision['id']}/history",
+        headers=_bearer(device["scoped_token"]),
+    )
+    assert resp.status_code == 200
+    assert "items" in resp.json()
+
+
+@pytest.mark.asyncio
+async def test_device_bearer_history_rejects_other_user(client, app):
+    """LOW: /history parity -- a device bearer cannot read another user's
+    decision history."""
+    admin_uid = _admin_uid(app)
+    device = await _register_device(app, admin_uid)
+    other_decision = await _decision_for_user(app, "other-user-hist")
+
+    resp = await client.get(
+        f"/api/decisions/{other_decision['id']}/history",
+        headers=_bearer(device["scoped_token"]),
+    )
+    assert resp.status_code == 404

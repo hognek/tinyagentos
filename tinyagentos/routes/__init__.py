@@ -6,6 +6,7 @@ def register_all_routers(app):
     at package import time.
     """
     from fastapi import Depends
+
     from tinyagentos.middleware.csrf import verify_csrf
 
     _csrf = [Depends(verify_csrf)]
@@ -62,6 +63,9 @@ def register_all_routers(app):
     from tinyagentos.routes.settings import router as settings_router
     app.include_router(settings_router, dependencies=_csrf)
 
+    from tinyagentos.routes.share import router as share_router
+    app.include_router(share_router, dependencies=_csrf)
+
     from tinyagentos.routes.store import router as store_router
     app.include_router(store_router, dependencies=_csrf)
 
@@ -70,6 +74,9 @@ def register_all_routers(app):
 
     from tinyagentos.routes.project_doc_review import router as project_doc_review_router
     app.include_router(project_doc_review_router)
+
+    from tinyagentos.routes.community import router as community_router
+    app.include_router(community_router, dependencies=_csrf)
 
     from tinyagentos.routes import routines as routines_routes
     app.include_router(routines_routes.router, dependencies=_csrf)
@@ -386,6 +393,9 @@ def register_all_routers(app):
 
     from tinyagentos.routes.app_permissions import router as app_permissions_router
     app.include_router(app_permissions_router, dependencies=_csrf)
+
+    from tinyagentos.routes.user_shares import router as user_shares_router
+    app.include_router(user_shares_router, dependencies=_csrf)
 
     from tinyagentos.routes.agent_model_api import router as agent_model_api_router
     app.include_router(agent_model_api_router, dependencies=_csrf)

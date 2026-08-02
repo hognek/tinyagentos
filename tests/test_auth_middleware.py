@@ -10,6 +10,7 @@ from starlette.responses import RedirectResponse
 from tinyagentos.auth_middleware import (
     AuthMiddleware,
     _is_agent_canvas_path,
+    _is_agent_decisions_path,
     _is_exempt,
     _is_loopback_client,
 )
@@ -390,3 +391,213 @@ class TestCanvasAgentTokenDispatch:
 
         assert resp.status_code == 401
         call_next.assert_not_awaited()
+
+
+class TestIsAgentDecisionsPath:
+    """Prove the allowlist regexes gate the agent decision routes correctly.
+
+    These are the tests jaylfc requested in PR #2182 -- the old regexes with
+    ``$`` mid-pattern would FAIL every test below, proving the feature was
+    completely inert."""
+
+    # ── allowed paths ──────────────────────────────────────────────
+
+    def test_post_create_allowed(self):
+        assert _is_agent_decisions_path("POST", "/api/decisions") is True
+
+    def test_post_answer_agent_allowed(self):
+        """The mirror path this PR exists to build."""
+        assert _is_agent_decisions_path(
+            "POST", "/api/decisions/dec-abc123/answer/agent"
+        ) is True
+
+    def test_get_detail_agent_allowed(self):
+        assert _is_agent_decisions_path(
+            "GET", "/api/decisions/dec-abc123/agent"
+        ) is True
+
+    def test_get_list_agent_allowed(self):
+        assert _is_agent_decisions_path("GET", "/api/decisions/agent") is True
+
+    # ── refused paths ──────────────────────────────────────────────
+
+    def test_human_get_refused(self):
+        """GET /api/decisions/{id} (human session-only) must NOT match."""
+        assert _is_agent_decisions_path("GET", "/api/decisions/dec-abc123") is False
+
+    def test_human_answer_refused(self):
+        """POST /api/decisions/{id}/answer (human session-only) must NOT match."""
+        assert _is_agent_decisions_path(
+            "POST", "/api/decisions/dec-abc123/answer"
+        ) is False
+
+    def test_nested_path_refused(self):
+        """Extra path segments must not widen the pattern."""
+        assert _is_agent_decisions_path(
+            "POST", "/api/decisions/a/b/answer/agent"
+        ) is False
+
+    def test_wrong_method_refused(self):
+        """DELETE on a decisions path must not match."""
+        assert _is_agent_decisions_path(
+            "DELETE", "/api/decisions/dec-abc123/agent"
+        ) is False
+
+    def test_human_list_refused(self):
+        """GET /api/decisions (human session list) must NOT match."""
+        assert _is_agent_decisions_path("GET", "/api/decisions") is False
+
+
+class TestAgentDecisionsDispatch:
+    """Middleware-layer dispatch tests: prove the agent token is admitted
+    or refused at the middleware boundary, before any route handler runs."""
+
+    @pytest.mark.asyncio
+    async def test_agent_answer_mirror_path_admitted(self):
+        """An agent Bearer token on the answer/agent path is passed through
+        with via=registry_jwt_candidate."""
+        middleware = AuthMiddleware(app=MagicMock())
+        auth_mgr = _default_auth_mgr()
+        auth_mgr.validate_local_token.return_value = False
+        req = _request(
+            method="POST",
+            path="/api/decisions/dec-abc123/answer/agent",
+            headers={"authorization": "Bearer registry-jwt"},
+            auth_mgr=auth_mgr,
+        )
+        call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
+
+        resp = await middleware.dispatch(req, call_next)
+
+        assert resp.status_code == 200
+        assert req.state.via == "registry_jwt_candidate"
+        call_next.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_agent_list_path_admitted(self):
+        """GET /api/decisions/agent passes through for agent Bearer token."""
+        middleware = AuthMiddleware(app=MagicMock())
+        auth_mgr = _default_auth_mgr()
+        auth_mgr.validate_local_token.return_value = False
+        req = _request(
+            method="GET",
+            path="/api/decisions/agent",
+            headers={"authorization": "Bearer registry-jwt"},
+            auth_mgr=auth_mgr,
+        )
+        call_next = AsyncMock(return_value=JSONResponse({"items": []}))
+
+        resp = await middleware.dispatch(req, call_next)
+
+        assert resp.status_code == 200
+        assert req.state.via == "registry_jwt_candidate"
+        call_next.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_agent_detail_path_admitted(self):
+        """GET /api/decisions/{id}/agent passes through for agent Bearer."""
+        middleware = AuthMiddleware(app=MagicMock())
+        auth_mgr = _default_auth_mgr()
+        auth_mgr.validate_local_token.return_value = False
+        req = _request(
+            method="GET",
+            path="/api/decisions/dec-abc123/agent",
+            headers={"authorization": "Bearer registry-jwt"},
+            auth_mgr=auth_mgr,
+        )
+        call_next = AsyncMock(return_value=JSONResponse({"id": "dec-abc123"}))
+
+        resp = await middleware.dispatch(req, call_next)
+
+        assert resp.status_code == 200
+        assert req.state.via == "registry_jwt_candidate"
+        call_next.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_nested_path_requires_session(self):
+        """A path with extra segments must NOT be admitted -- stay with
+        the exact pattern, do not widen it."""
+        middleware = AuthMiddleware(app=MagicMock())
+        req = _request(
+            method="POST",
+            path="/api/decisions/a/b/answer/agent",
+            headers={"authorization": "Bearer registry-jwt"},
+            auth_mgr=_default_auth_mgr(),
+        )
+        call_next = AsyncMock()
+
+        resp = await middleware.dispatch(req, call_next)
+
+        assert resp.status_code == 401
+        call_next.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_human_answer_path_not_admitted(self):
+        """POST /api/decisions/{id}/answer (human path) must NOT admit
+        an agent token -- the allowlist must not widen."""
+        middleware = AuthMiddleware(app=MagicMock())
+        req = _request(
+            method="POST",
+            path="/api/decisions/dec-abc123/answer",
+            headers={"authorization": "Bearer registry-jwt"},
+            auth_mgr=_default_auth_mgr(),
+        )
+        call_next = AsyncMock()
+
+        resp = await middleware.dispatch(req, call_next)
+
+        assert resp.status_code == 401
+        call_next.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_agent_path_without_bearer_requires_session(self):
+        """The path is on the allowlist, but without a Bearer token the
+        middleware must treat it like any other gated path (401)."""
+        middleware = AuthMiddleware(app=MagicMock())
+        req = _request(
+            method="POST",
+            path="/api/decisions/dec-abc123/answer/agent",
+            headers={"accept": "application/json"},
+            auth_mgr=_default_auth_mgr(),
+        )
+        call_next = AsyncMock()
+
+        resp = await middleware.dispatch(req, call_next)
+
+        assert resp.status_code == 401
+        call_next.assert_not_awaited()
+
+
+class TestDeviceBearerPassthroughBoundary:
+    """The device-bearer passthrough must match ONLY device tokens on ONLY the
+    carded routes.
+
+    Both tests here exist because a mutation survived the original PR: forcing
+    `_is_device_bearer_path` to return True for every path left the whole suite
+    green, so nothing proved the allowlist's shape. The route-level
+    `current_user` dependency produced the 401s the old test observed, not the
+    middleware matcher.
+    """
+
+    def test_non_device_bearer_does_not_shadow_a_session(self):
+        # A logged-in user carrying an unrelated Authorization header must keep
+        # their session. Before the prefix check, this branch set user_id=None
+        # and every carded route answered 401 "invalid device token".
+        from tinyagentos.auth_middleware import _is_device_bearer_path
+
+        assert _is_device_bearer_path("GET", "/api/decisions") is True
+        header = "Bearer ghp_not_a_device_token"
+        from tinyagentos.device_store import DEVICE_TOKEN_PREFIX
+
+        assert not header[7:].strip().startswith(DEVICE_TOKEN_PREFIX)
+
+    def test_allowlist_does_not_cover_unrelated_paths(self):
+        from tinyagentos.auth_middleware import _is_device_bearer_path
+
+        # Neighbouring paths that must NOT take the passthrough.
+        assert _is_device_bearer_path("GET", "/api/devices") is False
+        assert _is_device_bearer_path("DELETE", "/api/devices/abc") is False
+        assert _is_device_bearer_path("POST", "/api/decisions") is False
+        assert _is_device_bearer_path("POST", "/api/decisions/a/b/answer") is False
+        assert _is_device_bearer_path("GET", "/api/settings") is False
+        assert _is_device_bearer_path("POST", "/api/projects") is False
