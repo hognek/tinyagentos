@@ -318,8 +318,11 @@
 }
 
 .taos-browser .taos-wallpaper {
-  /* In browser mode, stretch the wallpaper to fill the dynamic viewport */
-  background-size: 100% 100%;
+  /* Fill the dynamic viewport by cropping, not by stretching: the same
+     distortion the portrait rule above had. As the browser chrome collapses
+     the viewport height changes, and 100% 100% re-deformed the image on every
+     one of those changes. */
+  background-size: cover;
 }
 
 /* MobileDock bottom padding in browser mode is handled via the isBrowserMobile
