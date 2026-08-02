@@ -78,7 +78,7 @@ _AGENT_TASK_ROUTES = (
     # than the "read + lifecycle + comments" the project_tasks scope documents.
     # It is now reachable by a project_tasks_update-bound agent token, but the
     # route enforces the narrower scope + authorship/lead gate + a field
-    # whitelist (title, body, labels, status, priority) before any mutation, so
+    # whitelist (title, body, labels, priority) before any mutation, so
     # a project_tasks worker still cannot rewrite fields it was never meant to.
     ("PATCH", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}$")),
     # Mark-claimable curation: reachable by a Bearer token, but the handler
