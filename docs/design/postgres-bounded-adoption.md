@@ -1,7 +1,7 @@
 # Bounded Postgres adoption, and an 8GB hardware floor
 
 **Status:** PROPOSED, not adopted. Needs Jay's decision before any code lands.
-**Date:** 2026-08-02
+**Date:** 2026-08-02 (revised same day: hardware floor decoupled, 4GB stays supported)
 **Supersedes nothing. Blocks nothing currently in flight.**
 
 ## The question this answers
@@ -33,18 +33,21 @@ would mean writing migration discipline for roughly 68 stores that do not have
 it, and then exercising every one of them over a populated pre change database,
 because that is our standing rule for upgrades.
 
-## Hardware floor: 8GB minimum
+## Hardware floor: unchanged for now
 
-Adopted as part of this proposal.
+**4GB boards stay supported.** An earlier draft of this proposal raised the floor
+to 8GB. That was only ever necessary if Postgres became mandatory, and it does
+not: adoption here is optional and confined to capable nodes, so the small tier
+is unaffected and keeps running SQLite exactly as it does today.
 
-Raising the floor from 4GB to 8GB retires the "core only" low RAM tier, shrinks
-the support matrix, and matches what the hardware market actually sells. It is
-also a precondition for anything in this document: Postgres is not a reasonable
-ask on a 4GB board that is also running inference.
+The two decisions are therefore decoupled. Raising the floor may still be worth
+doing later for unrelated reasons, and if so it should be argued on its own
+merits with its own release note, not smuggled in as a side effect of a storage
+change.
 
-This needs to be an announced, documented floor with a release note, not a
-silent drift. Existing 4GB installs must keep working on their current version
-and must be told plainly that they are on a frozen branch.
+The practical rule that follows: **no default may require Postgres.** If a
+feature cannot degrade to SQLite, it is an opt-in feature for capable nodes, not
+a core one.
 
 ## What Postgres genuinely buys, and where
 
@@ -109,11 +112,13 @@ These are gates, not preferences. Each must be demonstrably true.
 4. **Degraded operation is defined.** If Postgres is unavailable, the OS boots,
    the desktop loads, and the affected app reports a clear error. Postgres must
    not become a boot dependency for the whole system.
-5. **The 8GB floor is announced and in effect.**
+5. **No default path requires Postgres.** A 4GB SQLite-only install
+   must remain fully functional, with the Postgres-backed tier simply absent.
 
 ## Verification
 
-- Fresh install on an 8GB node provisions Postgres unattended and comes up.
+- Fresh install on a capable node provisions Postgres unattended and comes up.
+- A 4GB SQLite-only install is unaffected: same behaviour, no new dependency.
 - A populated corpus survives a pinned major version bump, with rollback proven.
 - Killing Postgres leaves the OS and unrelated apps working.
 - taOSmd's default SQLite path is unchanged and its benchmark is re-run to show
@@ -134,5 +139,5 @@ bounded rather than sweeping.
    multi user work needs RLS anyway, so one adoption serves both?
 2. pgGraph is the thing that makes a single engine attractive rather than merely
    bigger. Do we treat it as a hard part of the case, or as a later option?
-3. On an 8GB node that is also running inference, what is the acceptable
-   Postgres resident footprint before it competes with model memory?
+3. On a node that is also running inference, what is the acceptable Postgres
+   resident footprint before it competes with model memory?
