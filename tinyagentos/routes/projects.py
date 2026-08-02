@@ -451,10 +451,18 @@ class _TaskRequestModelMixin:
     def _log_unknown_keys(self):
         extra = self.model_extra
         if extra:
+            # Bound the logged key list: this validator runs before the
+            # handler's auth, so key names are attacker-chosen input. Cap
+            # count and per-key length to keep a junk body from amplifying
+            # into the logs.
+            keys = sorted(extra.keys())
+            shown = [k[:50] for k in keys[:10]]
+            if len(keys) > 10:
+                shown.append(f"...and {len(keys) - 10} more")
             logger.warning(
                 "%s received unknown keys %s; valid fields are %s",
                 type(self).__name__,
-                sorted(extra.keys()),
+                shown,
                 sorted(type(self).model_fields.keys()),
             )
         return self
