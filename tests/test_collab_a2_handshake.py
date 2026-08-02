@@ -128,7 +128,13 @@ async def app_with_contacts(tmp_data_dir, monkeypatch):
     monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_data_dir))
     _bootstrap_hub_identity(tmp_data_dir)
 
-    return _app
+    yield _app
+
+    # Cleanup: close the contacts_store so the on-disk database file
+    # is released before tmp_data_dir (tmp_path) tears down.
+    store = _app.state.contacts_store
+    if store is not None and store._db is not None:
+        await store.close()
 
 
 @pytest_asyncio.fixture
@@ -275,6 +281,8 @@ class TestFriendAcceptHandshake:
         store = app_with_contacts.state.contacts_store
         contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
         assert contact is None, "no contact should be created without pubkeys"
+        link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
+        assert link is None, "no peer link should be established without pubkeys"
 
     async def test_accept_handles_non_list_endpoints(
         self, client_with_contacts, app_with_contacts, monkeypatch
@@ -546,6 +554,8 @@ class TestSecurityRegression:
         store = app_with_contacts.state.contacts_store
         contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
         assert contact is None, "imposter pubkey must not create a contact"
+        link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
+        assert link is None, "imposter pubkey must not create a peer link"
 
     async def test_authz_rejection_no_handshake(
         self, client_with_contacts, app_with_contacts, monkeypatch
@@ -573,6 +583,8 @@ class TestSecurityRegression:
         store = app_with_contacts.state.contacts_store
         contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
         assert contact is None, "403 must not create a contact"
+        link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
+        assert link is None, "403 must not create a peer link"
 
     async def test_block_guard_prevent_reaccept_resurrection(
         self, client_with_contacts, app_with_contacts, monkeypatch

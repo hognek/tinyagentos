@@ -112,11 +112,6 @@ async def _try_handshake(
     logged but never block the accept — the accept always succeeds even
     when the handshake side-effect temporarily can't complete.
     """
-    # Guard: a blocked peer must not be resurrected on re-accept.
-    store = await _get_store(request)
-    if peer_fingerprint and await store.has_edge(peer_fingerprint, relationships.REL_BLOCK):
-        return
-
     contacts_store = getattr(request.app.state, "contacts_store", None)
     if contacts_store is None:
         return
@@ -139,6 +134,12 @@ async def _try_handshake(
     x25519_pub = directory_resp.get("encryption_pubkey") or ""
 
     try:
+        # Guard: a blocked peer must not be resurrected on re-accept.
+        # Wrapped inside the try block so a store/has_edge failure never
+        # blocks the accept — the handshake is always best-effort.
+        store = await _get_store(request)
+        if peer_fingerprint and await store.has_edge(peer_fingerprint, relationships.REL_BLOCK):
+            return
         if not ed25519_pub or not x25519_pub:
             # Fall back to hub_authors (populated during friend-request flow).
             store = await _get_store(request)
