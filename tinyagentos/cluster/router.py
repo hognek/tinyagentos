@@ -47,9 +47,32 @@ class TaskRouter:
                 if ft is not None:
                     ft.record_success(worker.name)
                 return resp.json(), worker.name
+            except httpx.HTTPStatusError as e:
+                # 4xx = client error (bad request, unauthorized, etc.) —
+                # do NOT trip the circuit breaker; healthy workers should
+                # not be penalised for malformed or unauthorised requests.
+                # 5xx = server error — DO record as a failure.
+                status = getattr(e.response, "status_code", 0) if e.response else 0
+                try:
+                    status = int(status)
+                except (TypeError, ValueError):
+                    status = 0
+                if status >= 500:
+                    logger.warning(
+                        "Worker '%s' failed for %s: 5xx %d",
+                        worker.name, capability, e.response.status_code,
+                    )
+                    if ft is not None:
+                        ft.record_failure(worker.name)
+                else:
+                    logger.debug(
+                        "Worker '%s' returned client error %d for %s (not recorded)",
+                        worker.name, e.response.status_code, capability,
+                    )
+                continue
             except Exception as e:
+                # Transport errors, timeouts, etc. — record as failure.
                 logger.warning(f"Worker '{worker.name}' failed for {capability}: {e}")
-                # taOS #640 Fix 3: record the failure for circuit breaker.
                 if ft is not None:
                     ft.record_failure(worker.name)
                 continue

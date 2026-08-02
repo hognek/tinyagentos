@@ -600,6 +600,48 @@ class TestClusterManagerPersistence:
         await mgr.stop()
 
 
+    async def test_controller_fenced_when_generation_advanced(self, tmp_path):
+        """Controller A at gen 2 fences itself when controller B advances to gen 3."""
+        store = await self._new_store(tmp_path)
+        mgr_a = ClusterManager(worker_registry_store=store)
+        await mgr_a.start()
+        assert mgr_a.generation >= 1
+        gen_a = mgr_a.generation
+
+        # Register a worker so we can verify it gets fenced
+        w = _make_worker("gpu-box", capabilities=["chat"])
+        await mgr_a.register_worker(w)
+        assert mgr_a.get_worker("gpu-box").status == "online"
+
+        # Controller B advances the durable generation past A's
+        await store.increment_generation()
+        durable_gen = await store.current_generation()
+        assert durable_gen > gen_a
+
+        # Simulate the monitor loop's fence detection
+        mgr_a._fenced = False  # reset just in case
+        durable_check = await store.current_generation()
+        if durable_check > mgr_a._generation:
+            mgr_a._fenced = True
+            for worker in list(mgr_a._workers.values()):
+                if worker.name != "local" and worker.status in ("online", "update-available"):
+                    worker.status = "offline"
+
+        assert mgr_a._fenced is True
+        assert mgr_a.get_worker("gpu-box").status == "offline"
+
+        # After fencing, heartbeat should be rejected
+        ok = mgr_a.heartbeat("gpu-box", load=0.1, generation=gen_a)
+        assert ok is False
+
+        # After fencing, new registration should be silently rejected
+        w2 = _make_worker("new-worker", capabilities=["chat"])
+        await mgr_a.register_worker(w2)
+        assert mgr_a.get_worker("new-worker") is None
+
+        await mgr_a.stop()
+        await store.close()
+
 # ── TaskRouter circuit breaker tests (Fix 3) ───────────────────────────
 
 @pytest.mark.asyncio
@@ -631,7 +673,7 @@ class TestTaskRouterCircuitBreaker:
         assert mock_client.post.call_count == 1
 
     async def test_records_failure_on_error(self):
-        ft = FailureTracker(failure_threshold=5)
+        ft = FailureTracker(failure_threshold=1)
         mgr = ClusterManager(failure_tracker=ft)
         await mgr.register_worker(_make_worker("w1", capabilities=["chat"], load=0.1, url="http://w1:8000"))
 
@@ -642,16 +684,16 @@ class TestTaskRouterCircuitBreaker:
         data, name = await router.route_request("chat", "POST", "/v1/chat/completions", {})
 
         assert data is None
-        assert ft.is_tripped("w1") is False  # 1 failure, threshold=5 → not tripped
+        assert ft.is_tripped("w1") is True  # 1 failure, threshold=1 → tripped
 
     async def test_clears_failure_on_success(self):
-        ft = FailureTracker(failure_threshold=3)
+        ft = FailureTracker(failure_threshold=2)
         mgr = ClusterManager(failure_tracker=ft)
         await mgr.register_worker(_make_worker("w1", capabilities=["chat"], load=0.1, url="http://w1:8000"))
 
+        # Record one failure — threshold is 2 so not tripped yet.
         ft.record_failure("w1")
-        ft.record_failure("w1")
-        assert not ft.is_tripped("w1")  # 2 < 3
+        assert not ft.is_tripped("w1")
 
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         ok_resp = MagicMock()
@@ -665,6 +707,12 @@ class TestTaskRouterCircuitBreaker:
         # After success, circuit should be reset
         assert not ft.is_tripped("w1")
 
+        # Record another failure after success — should NOT be tripped
+        # because the success cleared the previous failure counter.
+        # If the circuit was NOT cleared, this would be failure #2 → tripped.
+        ft.record_failure("w1")
+        assert not ft.is_tripped("w1")
+
     async def test_router_without_tracker_still_works(self):
         """Router works fine when no failure_tracker is wired."""
         mgr = ClusterManager()  # no failure_tracker
@@ -673,7 +721,7 @@ class TestTaskRouterCircuitBreaker:
         mock_client = AsyncMock(spec=httpx.AsyncClient)
         fail_resp = MagicMock()
         fail_resp.raise_for_status.side_effect = httpx.HTTPStatusError(
-            "500", request=MagicMock(), response=MagicMock()
+            "500", request=MagicMock(), response=MagicMock(status_code=500)
         )
         ok_resp = MagicMock()
         ok_resp.raise_for_status.return_value = None

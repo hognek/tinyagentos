@@ -67,6 +67,7 @@ class ClusterManager:
         self._registry_store: WorkerRegistryStore | None = worker_registry_store
         self._failure_tracker: FailureTracker | None = failure_tracker
         self._generation: int = 1  # incremented in start() when store is wired
+        self._fenced: bool = False  # True when another controller has advanced generation
 
     async def start(self):
         # taOS #640: increment generation on each controller start (split-brain
@@ -99,6 +100,10 @@ class ClusterManager:
         is_first_time = info.name not in self._ever_seen
         self._ever_seen.add(info.name)
 
+        # taOS #640: controller fence — if this instance has been superseded
+        # by another controller, reject all registrations (CodeRabbit PR #1928).
+        if self._fenced:
+            return
         # taOS #640: split-brain protection — reject registration from a
         # worker that echoes a different generation (another active controller).
         # Legacy workers that don't send generation get a pass (None).
@@ -279,6 +284,10 @@ class ClusterManager:
         worker = self._workers.get(name)
         if not worker:
             return False
+        # taOS #640: controller fence — if this instance has been superseded
+        # by another controller, reject all heartbeats (CodeRabbit PR #1928).
+        if self._fenced:
+            return False
         # taOS #640: split-brain protection — reject heartbeat from a worker
         # that is echoing a different generation (another active controller).
         # Legacy workers that don't send generation get a pass (None).
@@ -409,6 +418,12 @@ class ClusterManager:
         if self._registry_store is not None:
             async def _safe_persist() -> None:
                 try:
+                    # Guard against resurrection: a queued persistence task
+                    # can run after remove_worker() deletes the row — verify
+                    # this exact WorkerInfo instance is still registered before
+                    # upserting (CodeRabbit PR #1928).
+                    if self._workers.get(worker.name) is not worker:
+                        return
                     await self._persist_worker(worker)
                 except Exception:
                     logger.exception("Failed to persist worker '%s'", worker.name)
@@ -964,6 +979,32 @@ class ClusterManager:
         sweep expired GPU leases.  Auto-completes draining workers
         whose leases have all been released (taOS #890)."""
         while True:
+            # taOS #640: controller fence — if another controller instance
+            # has advanced the durable generation beyond ours, self-disable
+            # to prevent split-brain (CodeRabbit PR #1928).
+            if (
+                not self._fenced
+                and self._registry_store is not None
+            ):
+                try:
+                    durable_gen = await self._registry_store.current_generation()
+                    if durable_gen > self._generation:
+                        logger.warning(
+                            "Controller fenced: durable generation %d > local %d — "
+                            "disabling worker acceptance and routing",
+                            durable_gen, self._generation,
+                        )
+                        self._fenced = True
+                except Exception:
+                    logger.exception("Failed to check durable generation")
+            if self._fenced:
+                # Fenced controller — mark all workers offline and stop routing.
+                for worker in list(self._workers.values()):
+                    if worker.name != "local" and worker.status in ("online", "update-available"):
+                        worker.status = "offline"
+                        logger.info("Worker '%s' marked offline (controller fenced)", worker.name)
+                await asyncio.sleep(5)
+                continue
             now = time.time()
             for worker in list(self._workers.values()):
                 # The 'local' worker is the controller itself, kept alive by
