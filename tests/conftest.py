@@ -438,6 +438,11 @@ async def client(app, tmp_data_dir):
         if user_shares._db is not None:
             await user_shares.close()
         await user_shares.init()
+    # Desktop wallpapers store — user-uploaded wallpapers
+    desktop_wallpapers = app.state.desktop_wallpapers
+    if desktop_wallpapers._db is not None:
+        await desktop_wallpapers.close()
+    await desktop_wallpapers.init()
     # BrowserApp v2 stores
     from tinyagentos.routes.desktop_browser.store import BrowserStore, BrowserCookieStore
     _browser_store = BrowserStore(tmp_data_dir / "browser.sqlite3")
@@ -508,6 +513,7 @@ async def client(app, tmp_data_dir):
     await app.state.council_members.close()
     if user_shares is not None:
         await user_shares.close()
+    await desktop_wallpapers.close()
 
 
 def create_test_qmd_db(db_path):

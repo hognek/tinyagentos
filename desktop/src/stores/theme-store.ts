@@ -39,6 +39,22 @@ export interface WallpaperSection {
   items: Wallpaper[];
 }
 
+export interface UserWallpaper {
+  id: string;
+  label: string;
+  url: string; // e.g. "/api/desktop/wallpapers/<id>"
+}
+
+function _userWpToWallpaper(wp: UserWallpaper): Wallpaper {
+  return {
+    id: `user-${wp.id}`,
+    label: wp.label,
+    image: `url('${wp.url}')`,
+    fallback: "#141415",
+    kind: "image",
+  };
+}
+
 const WALLPAPERS: Wallpaper[] = [
   {
     id: "graphite",
@@ -217,6 +233,9 @@ interface ThemeStore {
   // the target theme rather than inheriting the previous theme's wallpaper.
   wallpaperIdByTheme: Record<string, string>;
 
+  // User-uploaded wallpapers
+  userWallpapers: UserWallpaper[];
+
   setWallpaper: (id: string) => void;
   toggleOverlayText: () => void;
   setWallpaperParam: (key: keyof WallpaperParams, value: number) => void;
@@ -224,9 +243,12 @@ interface ThemeStore {
   setReduceEffects: (on: boolean) => void;
   getWallpapers: () => Wallpaper[];
   getWallpapersBySection: () => WallpaperSection[];
+  fetchUserWallpapers: () => Promise<void>;
+  addUserWallpaper: (wp: UserWallpaper) => void;
+  removeUserWallpaper: (id: string) => Promise<void>;
 }
 
-export const useThemeStore = create<ThemeStore>((set) => ({
+export const useThemeStore = create<ThemeStore>((set, get) => ({
   wallpaperId: DEFAULT_WP.id,
   wallpaperImage: DEFAULT_WP.image,
   wallpaperMobileImage: DEFAULT_WP.mobileImage ?? DEFAULT_WP.image,
@@ -251,7 +273,10 @@ export const useThemeStore = create<ThemeStore>((set) => ({
   themeDefaultWallpaperId: {},
   wallpaperIdByTheme: {},
 
+  userWallpapers: [],
+
   setWallpaper(id) {
+    // Check built-in wallpapers first
     const wp = WALLPAPERS.find((w) => w.id === id);
     if (wp) {
       set((s) => ({
@@ -260,6 +285,20 @@ export const useThemeStore = create<ThemeStore>((set) => ({
         // and back restores it instead of the target theme's default.
         wallpaperIdByTheme: { ...s.wallpaperIdByTheme, [s.activeThemeId]: id },
       }));
+      return;
+    }
+    // Check user wallpapers (id format: "user-<uuid>")
+    if (id.startsWith("user-")) {
+      const uwp = get().userWallpapers.find(
+        (u) => `user-${u.id}` === id,
+      );
+      if (uwp) {
+        const wp = _userWpToWallpaper(uwp);
+        set((s) => ({
+          ...wallpaperFields(wp, id),
+          wallpaperIdByTheme: { ...s.wallpaperIdByTheme, [s.activeThemeId]: id },
+        }));
+      }
     }
   },
 
@@ -300,10 +339,14 @@ export const useThemeStore = create<ThemeStore>((set) => ({
     set({ reduceEffects: on });
   },
 
-  getWallpapers: () => WALLPAPERS,
+  getWallpapers: () => {
+    const { userWallpapers }: { userWallpapers: UserWallpaper[] } = get();
+    const userWps = userWallpapers.map(_userWpToWallpaper);
+    return [...WALLPAPERS, ...userWps];
+  },
 
   getWallpapersBySection: () => {
-    const state = useThemeStore.getState();
+    const state = get();
     // The theme's declared default wallpaper id, or the global fallback.
     const themeDefaultId =
       state.themeDefaultWallpaperId[state.activeThemeId] || "graphite";
@@ -337,6 +380,58 @@ export const useThemeStore = create<ThemeStore>((set) => ({
       },
     ];
     return sections;
+  },
+
+  fetchUserWallpapers: async () => {
+    try {
+      const res = await fetch("/api/desktop/wallpapers", { credentials: "include" });
+      if (res.ok) {
+        const data = (await res.json()) as UserWallpaper[];
+        set({ userWallpapers: data });
+      }
+    } catch {
+      // best-effort
+    }
+  },
+
+  addUserWallpaper(wp: UserWallpaper) {
+    set((s) => ({ userWallpapers: [...s.userWallpapers, wp] }));
+  },
+
+  removeUserWallpaper: async (id: string) => {
+    try {
+      const res = await fetch(`/api/desktop/wallpapers/${id}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      if (res.ok) {
+        const userWpId = `user-${id}`;
+        set((s) => {
+          // Purge this wallpaper from per-theme selections
+          const nextByTheme: Record<string, string> = {};
+          let changed = false;
+          for (const [themeId, wpId] of Object.entries(s.wallpaperIdByTheme)) {
+            if (wpId !== userWpId) {
+              nextByTheme[themeId] = wpId;
+            } else {
+              changed = true;
+            }
+          }
+          const updates: Partial<ThemeStore> = {
+            userWallpapers: s.userWallpapers.filter((w) => w.id !== id),
+          };
+          if (changed) updates.wallpaperIdByTheme = nextByTheme;
+          // If the deleted wallpaper is currently active, reset to default
+          if (s.wallpaperId === userWpId) {
+            const graphite = WALLPAPERS.find((w) => w.id === "graphite") ?? WALLPAPERS[0]!;
+            Object.assign(updates, wallpaperFields(graphite, graphite.id));
+          }
+          return updates as ThemeStore;
+        });
+      }
+    } catch {
+      // best-effort — user can retry
+    }
   },
 }));
 
