@@ -68,25 +68,51 @@ reported**: an agent that dies cannot mark itself stalled, and a dead agent
 looks exactly like a working one otherwise. That is the same trap as a dead
 watcher looking like a quiet one.
 
-## The wake daemon, concretely
+## Delivery: inject into the open session, do not spawn a new one
 
-One small persistent service per agent, on the box that agent runs on:
+**Corrected 2026-08-02 by Jay, and it is the better design.** The earlier draft
+proposed a daemon that spawns a headless session per event. That is the
+expensive way to build this, and taOS should not be spawning a session per task.
 
-1. Holds a connection to taOS (SSE where available, a tight poll otherwise) and
-   watches for events addressed to its agent: a new note, a mention, a decision
-   answered, a message.
-2. Filters hard. Only real signals wake the agent. Auto-acks, its own posts and
-   routine chatter are dropped. `a2a_filter.py` already does this job and should
-   be reused rather than rewritten.
-3. On a real signal, invokes the harness headlessly with the payload and a
-   pinned session id, so the agent picks up with its context rather than cold.
-4. Records that it woke, what for, and what came back. Emits a heartbeat, so a
-   dead daemon is visibly dead rather than silently quiet.
+**The mechanism already exists and is already in use.** `herdr pane run <pane>
+"<message>"` injects a turn into an ALREADY-OPEN Claude session. That is exactly
+how the context-watch and usage-watch nudges reach the agents today: the cron
+measures, then injects a message into the agent's pane, and the agent picks it
+up on its next turn. There is no cold start, no context reload, and no new
+session: the session is already warm, so the marginal cost is one turn.
 
-**This is what makes Jay's paused-session scenario work.** A session that ends
-mid-question posts the question to Decisions, and the daemon, not the session,
-watches for the answer. When Jay answers, the daemon wakes the agent with the
-answer and the agent resumes. The session ending stops being data loss.
+Cost comparison for the same event, measured earlier in this doc:
+
+| Delivery | Cost per event |
+|---|---|
+| Spawn a fresh headless session | $0.164 (full context load first) |
+| Resume a headless session | $0.031 |
+| **Inject into an already-open session** | **incremental turn only, no reload** |
+
+**So the realtime design is a router, not a daemon fleet:**
+
+1. A watcher on taOS events (note created, decision answered, message, mention)
+   with the same hard filtering we already use, so only real signals get through.
+2. A mapping from taOS agent identity to live pane id.
+3. Delivery via `herdr pane run` into that agent's open pane.
+4. Batching: a short settle window so a burst becomes one injection.
+
+**What this needs that we do not have yet:**
+
+- **An agent-to-pane registry.** Today the pane list is discoverable
+  (`herdr pane list` reports agent, cwd, status and pane id) but nothing maps
+  "@taOSmd-dev" to "w1:p2". That mapping has to be explicit and maintained, not
+  guessed from the working directory.
+- **Liveness surfaced in taOS.** If an agent's pane is gone, an idea dropped in
+  taOS will sit unread. taOS must show which agents are actually connected, so
+  the badge says "unseen, agent offline" rather than a silent nothing. A dead
+  agent must not look like a quiet one.
+- **A queue for offline agents**, so work is delivered when they come back
+  rather than lost.
+
+**Where spawning still belongs:** only for the case where no session is open at
+all. Jay's call is that this becomes a taOS Teams capability later, not part of
+this design.
 
 ## Measured, not assumed: headless viability and cost
 
@@ -108,9 +134,9 @@ loaded *before any work happens*. **Resume is 5.3x cheaper per wake**, and that
 ratio, not the daily count, is what decides whether this is affordable. At 50
 wakes a day it is roughly $8 a day cold versus $1.55 resumed.
 
-**Design consequence: the daemon must resume, not cold-start.** A daemon that
-spawns a fresh session per event pays the full context load every time and is
-the expensive way to build the same feature.
+**Design consequence:** never spawn per event. Injecting into an open session is
+cheaper than both rows above, and resume is the fallback for a session that has
+been closed, not the primary path.
 
 ## Session identity and context lifecycle
 
@@ -167,8 +193,9 @@ delivers "I put an idea in and never open Claude Code", just with latency.
 
 **Slice 2, badges.** Agent state on every entry, computed where it can be.
 
-**Slice 3, the wake daemon.** One agent first, most likely me, with the wake
-budget and heartbeat from day one. Realtime replies to messages and decisions.
+**Slice 3, the event router.** Agent-to-pane registry, liveness in taOS, and
+delivery by injection into open sessions. Realtime replies to messages and
+decisions, with no session spawning.
 
 **Slice 4, the rest of the fleet.** The sibling agents get daemons, and Claude
 Code becomes a debugging tool rather than the venue.
