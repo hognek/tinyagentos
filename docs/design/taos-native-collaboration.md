@@ -88,6 +88,64 @@ mid-question posts the question to Decisions, and the daemon, not the session,
 watches for the answer. When Jay answers, the daemon wakes the agent with the
 answer and the agent resumes. The session ending stops being data loss.
 
+## Measured, not assumed: headless viability and cost
+
+Tested on this Max subscription on 2026-08-02, no API key present, so these are
+subscription numbers.
+
+**Headless works.** `claude -p` returns clean JSON, `is_error: false`, and a
+`session_id`. No API key required and no restriction encountered.
+
+**Cost per wake, measured on a trivial prompt:**
+
+| Mode | Cost | Cache creation | Cache read |
+|---|---|---|---|
+| Cold start (new session) | $0.164 | 7,347 | 15,251 |
+| `--resume` an existing session | $0.031 | 388 | 22,598 |
+
+The cold-start floor is the system prompt, CLAUDE.md and the memory index being
+loaded *before any work happens*. **Resume is 5.3x cheaper per wake**, and that
+ratio, not the daily count, is what decides whether this is affordable. At 50
+wakes a day it is roughly $8 a day cold versus $1.55 resumed.
+
+**Design consequence: the daemon must resume, not cold-start.** A daemon that
+spawns a fresh session per event pays the full context load every time and is
+the expensive way to build the same feature.
+
+## Session identity and context lifecycle
+
+Sessions are plain files: `~/.claude/projects/<path-slug>/<session-id>.jsonl`.
+The session id is the filename, so tracking is a matter of recording one uuid
+per agent and confirming the file still exists before resuming.
+
+The catch with resume is that context grows monotonically. This session's
+transcript is already 4.9MB. Left alone, a long-lived resumed session gets
+slower, more expensive per wake, and eventually hits the context ceiling.
+
+**We already solved this by hand, and the daemon should automate the existing
+pattern rather than invent one.** `context_watch.sh` measures a session's token
+usage and nudges at banded thresholds; `checkpoint_and_clear.sh` and the
+`RESUME-*.md` handoff docs capture durable state so a fresh session can pick up
+without re-deriving. The policy that falls out:
+
+- **Preserve** by default: resume the pinned session, cheapest per wake.
+- **Summarise** at a token band: write the handoff doc, start a fresh session,
+  record the new id. The cost of one cold start is repaid within a few wakes.
+- **Clear** deliberately when the work changes shape, so an agent is not
+  carrying a finished project's context into a new one.
+
+The durable memory is the handoff doc and taOS itself, never the transcript.
+That is what makes clearing safe, and it is already how the agents work.
+
+## Risk: this depends on a harness feature
+
+Headless invocation working on a subscription is an external dependency we do
+not control, and it has been discussed as something that might be restricted.
+The mitigation is in the ordering: slices 1 and 2 deliver the notes surface and
+the badges with timed pickup, which need none of this. Only the realtime upgrade
+depends on it, and if that route closed, the fallback is a scheduled pickup on a
+few-minute cadence, which is worse but not broken.
+
 ## Cost, stated plainly
 
 Every wake is a paid turn. A chatty channel could wake an agent hundreds of
