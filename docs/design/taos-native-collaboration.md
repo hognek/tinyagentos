@@ -83,6 +83,48 @@ That removes every assumption about how the agent is being run: a terminal, a
 multiplexer, an IDE extension, the desktop app, or a headless box. taOS only
 needs to expose events; how an agent notices them is the agent harness's problem.
 
+### Cost discipline is a design constraint, not a later optimisation
+
+Last week's usage was largely consumed by agents CHECKING the A2A bus. Realtime
+and cheap pull in opposite directions, so the rule has to be built in from the
+start rather than retrofitted.
+
+**The measured facts, taken today rather than assumed:** only about 10 percent of
+recent `build` traffic is automated noise, and the existing filter already drops
+non-mentions and delivery acks. So the filter was never the problem.
+
+**The problem was that "check the bus" was implemented as an LLM turn.** A timed
+prompt that says "go and look" pays a full turn every time it fires, including
+every time there is nothing there. Five agents checking hourly is 120 turns a
+day of mostly empty checks, each reloading context before discovering there is
+no work. That is how a week evaporates without producing anything.
+
+**The rule, in one line: checking is mechanical, waking is gated.**
+
+- **A poll costs nothing when a script does it.** A shell or Python watcher can
+  hit the bus every few seconds forever at zero token cost, because no model is
+  involved. Never spend a turn to discover emptiness.
+- **A turn is spent only on a real signal**: addressed to this agent, not an
+  auto-ack, not its own post, and not already handled. This is what
+  `a2a_filter.py` does and it should be the shared reference implementation
+  rather than something each agent reinvents.
+- **Batch a burst.** A short settle window so five messages in a minute become
+  one turn, not five.
+- **Per-agent daily wake ceiling**, and when it is hit the agent stops waking and
+  SAYS it has stopped. Going quiet at a limit is indistinguishable from being
+  broken.
+- **Recipient addressing removes the broadcast tax.** Until a message can be
+  addressed to one agent, every agent must inspect every message to find out it
+  was not for them. That is why the recipient field in the dependency chain is a
+  cost feature as much as a routing feature.
+- **Receipts make redelivery cheap.** Without them an agent cannot know it has
+  already handled something, so the safe behaviour is to re-read, which costs
+  again.
+
+**Anti-pattern to name explicitly:** a cron whose prompt is "check X". If the
+answer is usually "nothing", it must be a script that stays silent, not a prompt
+that reports emptiness at full price.
+
 ### The transport is the A2A bus, and that is the point
 
 Jay's intent, and it is the right call: **use the A2A bus (taOSmd) so any agent,
