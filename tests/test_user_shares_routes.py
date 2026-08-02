@@ -201,8 +201,8 @@ class TestShareRoutes:
         assert "proj-list-in-from-bob" not in out_ids
 
     async def test_list_incoming_shares(self, shares_client, bob_client):
-        """GET /api/shares?direction=in lists shares received by the user."""
-        # Admin shares with bob.
+        """GET /api/shares?direction=in lists ONLY received shares (not owned)."""
+        # Admin shares with bob — this is incoming for bob.
         r = await shares_client.post(
             "/api/shares",
             json={
@@ -214,13 +214,29 @@ class TestShareRoutes:
         )
         assert r.status_code == 200
 
-        # Bob lists incoming shares.
+        # Bob also creates an outgoing share to admin.
+        # This must NOT appear in bob's incoming list.
+        r_out = await bob_client.post(
+            "/api/shares",
+            json={
+                "resource_type": "project",
+                "resource_id": "proj-out-from-bob",
+                "to_username": "admin",
+                "permission": "read",
+            },
+        )
+        assert r_out.status_code == 200
+
+        # Bob lists incoming shares — should only include admin→bob,
+        # not bob's own outgoing share to admin.
         resp = await bob_client.get("/api/shares?direction=in")
         assert resp.status_code == 200
         data = resp.json()
         assert isinstance(data, list)
         in_ids = [s["resource_id"] for s in data if s["resource_type"] == "project"]
         assert "proj-list-in" in in_ids
+        # Direction=in must exclude outgoing shares.
+        assert "proj-out-from-bob" not in in_ids
 
     # -- Revoke ----------------------------------------------------------
 
