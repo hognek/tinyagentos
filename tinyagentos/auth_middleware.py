@@ -78,7 +78,7 @@ _AGENT_TASK_ROUTES = (
     # than the "read + lifecycle + comments" the project_tasks scope documents.
     # It is now reachable by a project_tasks_update-bound agent token, but the
     # route enforces the narrower scope + authorship/lead gate + a field
-    # whitelist (title, body, labels, status, priority) before any mutation, so
+    # whitelist (title, body, labels, priority) before any mutation, so
     # a project_tasks worker still cannot rewrite fields it was never meant to.
     ("PATCH", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}$")),
     # Mark-claimable curation: reachable by a Bearer token, but the handler
@@ -87,6 +87,26 @@ _AGENT_TASK_ROUTES = (
     # label, so it does not widen the scope into free field edits (cf. PATCH).
     ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/claimable$")),
 )
+
+# Project doc-review stamp store routes an agent may reach with its own registry
+# JWT (scope project_doc_review, verified + project-bound by the route).  These
+# are DYNAMIC paths (/api/projects/{pid}/doc-review/...), so a (method,
+# compiled-regex) allowlist is used.  The single-doc path is `path`-typed:
+# doc_path may contain slashes (e.g. src/foo.md), so the final segment is `(.+)`
+# rather than the slash-free `[^/]+` used for the task routes.  Same contract as
+# the task allowlist: the token only reaches the handler, which then verifies
+# the JWT + grant + project binding; nothing else is reachable by the token.
+_AGENT_DOC_REVIEW_ROUTES = (
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/doc-reviews$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/doc-review/(.+)$")),
+    ("PUT", re.compile(rf"^/api/projects/{_SEG}/doc-review/(.+)$")),
+)
+
+
+def _is_agent_doc_review_path(method: str, path: str) -> bool:
+    """True only for the doc-review routes a project_doc_review token may reach."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_DOC_REVIEW_ROUTES)
+
 
 _AGENT_CANVAS_ROUTES = (
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/elements$")),
@@ -164,26 +184,6 @@ def _is_agent_task_path(method: str, path: str) -> bool:
     """True only for the exact subset of task routes a project_tasks token may
     reach.  Strict method + anchored-regex match; everything else is excluded."""
     return any(m == method and rx.match(path) for m, rx in _AGENT_TASK_ROUTES)
-
-
-# Project doc-review stamp store routes an agent may reach with its own registry
-# JWT (scope project_doc_review, verified + project-bound by the route).  These
-# are DYNAMIC paths (/api/projects/{pid}/doc-review/...), so a (method,
-# compiled-regex) allowlist is used.  The single-doc path is `path`-typed:
-# doc_path may contain slashes (e.g. src/foo.md), so the final segment is `(.+)`
-# rather than the slash-free `[^/]+` used for the task routes.  Same contract as
-# the task allowlist: the token only reaches the handler, which then verifies
-# the JWT + grant + project binding; nothing else is reachable by the token.
-_AGENT_DOC_REVIEW_ROUTES = (
-    ("GET", re.compile(rf"^/api/projects/{_SEG}/doc-reviews$")),
-    ("GET", re.compile(rf"^/api/projects/{_SEG}/doc-review/(.+)$")),
-    ("PUT", re.compile(rf"^/api/projects/{_SEG}/doc-review/(.+)$")),
-)
-
-
-def _is_agent_doc_review_path(method: str, path: str) -> bool:
-    """True only for the doc-review routes a project_doc_review token may reach."""
-    return any(m == method and rx.match(path) for m, rx in _AGENT_DOC_REVIEW_ROUTES)
 
 
 def _is_agent_canvas_path(method: str, path: str) -> bool:

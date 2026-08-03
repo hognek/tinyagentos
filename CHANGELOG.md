@@ -7,6 +7,35 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
 
 ## [Unreleased]
 
+## [1.0.0-beta.46] - 2026-08-03
+
+### Fixed
+
+- Decisions API: authentication now runs before request-body validation, so an
+  invalid bearer token always returns 401 and token validity can no longer be
+  probed through validation errors (#2268).
+
+### Added
+
+- Observatory fleet view for agents holding a global `observatory_control`
+  grant; project-scoped grants see only their granted projects (#2267).
+- Deployed agents are registered into the agent registry at deploy time, each
+  minting its own canonical identity; names that resolve to a reserved prefix
+  are rejected with a 400 (#2266).
+- Lead agents can edit their own board cards: the seeded internal lead now
+  carries the `project_tasks_update` scope (title/body/labels/priority on
+  own-or-lead cards; a plain `project_tasks` grant still gets 403 on PATCH,
+  pinned by a regression test) (#2244).
+- **Doc-review stamps reconciled into dev** (#1835 / #2247): the review-state
+  store, routes, `project_doc_review` agent scope (now requestable via the
+  consent flow and internal mint) and the Files-app review UI. The feature has
+  shipped on every install since beta.43 but lived only on the release branch;
+  it is now developed and reviewed like everything else.
+- **Docs**: the agent manual now documents the project Files REST API for member
+  agents (multipart upload, listing, fetch, and the one-write principle), linked
+  from the manual index; the compiled-manual size guard is raised to 18000 chars
+  to make room (redo of #2139).
+
 ## [1.0.0-beta.45] - 2026-08-02
 
 ### Added
