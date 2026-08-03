@@ -620,6 +620,180 @@ class TestDeployPersistence:
 
 
 @pytest.mark.asyncio
+class TestDeployRegistryRegistration:
+    """Deploy endpoint must mint a fresh agent_registry canonical_id for every
+    deployed agent - identities are minted once per agent and never shared,
+    even between agents with the same display name."""
+
+    async def test_deploy_creates_registry_row(self, client, app, monkeypatch):
+        import re
+        import taosmd.agents as tm_agents
+        from unittest.mock import AsyncMock, MagicMock
+
+        app.state.archive = MagicMock(
+            record=AsyncMock(), query=AsyncMock(return_value=[{}])
+        )
+
+        register_calls = []
+        canonical_ids = []
+
+        async def fake_register(*, framework, display_name, **kw):
+            register_calls.append((framework, display_name))
+            cid = f"{display_name.lower().replace(' ', '-')}-20260101-000000"
+            canonical_ids.append(cid)
+            return {"canonical_id": cid, "framework": framework, "display_name": display_name}
+
+        mock_registry = MagicMock()
+        mock_registry.register = fake_register
+        mock_registry.get = AsyncMock(return_value=None)
+        app.state.agent_registry = mock_registry
+
+        def fake_register_agent(name, **kwargs):
+            pass
+        monkeypatch.setattr(tm_agents, "register_agent", fake_register_agent)
+
+        async def fake_deploy(req):
+            return {"success": True, "name": req.name, "ip": "10.0.0.42",
+                    "llm_key": "sk-test", "steps": ["deployment_complete"],
+                    "container": f"taos-agent-{req.name}"}
+        monkeypatch.setattr("tinyagentos.deployer.deploy_agent", fake_deploy)
+
+        class _FakeCatalog:
+            def all_models(self, capability=None):
+                return [{"name": "test-model", "id": "test-model"}]
+        app.state.backend_catalog = _FakeCatalog()
+        app.state.cluster_manager._workers.clear()
+
+        resp = await client.post("/api/agents/deploy", json={
+            "name": "RegistryTest",
+            "framework": "none",
+            "model": "test-model",
+        })
+        assert resp.status_code == 200
+        import asyncio
+        await asyncio.sleep(0.2)
+
+        assert len(register_calls) == 1
+        assert re.match(r"^[a-z0-9-]+-\d{8}-\d{6}(-[0-9a-f]{2})?$", canonical_ids[0])
+        agent = next(a for a in app.state.config.agents if a["name"] == resp.json()["name"])
+        assert agent["registry_canonical_id"] == canonical_ids[0]
+
+    async def test_same_display_name_deploys_mint_distinct_identities(self, client, app, monkeypatch):
+        """Display names are not unique; a second deploy with the same name is
+        a NEW agent (suffixed slug) and must get its own canonical_id, never
+        inherit the first agent's identity."""
+        import taosmd.agents as tm_agents
+        from unittest.mock import AsyncMock, MagicMock
+
+        app.state.archive = MagicMock(
+            record=AsyncMock(), query=AsyncMock(return_value=[{}])
+        )
+
+        register_calls = []
+
+        async def fake_register(*, framework, display_name, **kw):
+            register_calls.append((framework, display_name))
+            cid = f"registrytwin-20260101-{len(register_calls):06d}"
+            return {"canonical_id": cid, "framework": framework, "display_name": display_name}
+
+        mock_registry = MagicMock()
+        mock_registry.register = fake_register
+        # get() resolves any id to a live row: reusing an existing entry's
+        # identity would therefore succeed if the route ever tried it.
+        async def fake_get(cid):
+            return {"canonical_id": cid}
+        mock_registry.get = fake_get
+        app.state.agent_registry = mock_registry
+
+        def fake_register_agent(name, **kwargs):
+            pass
+        monkeypatch.setattr(tm_agents, "register_agent", fake_register_agent)
+
+        async def fake_deploy(req):
+            return {"success": True, "name": req.name, "ip": "10.0.0.42",
+                    "llm_key": "sk-test", "steps": ["deployment_complete"],
+                    "container": f"taos-agent-{req.name}"}
+        monkeypatch.setattr("tinyagentos.deployer.deploy_agent", fake_deploy)
+
+        class _FakeCatalog:
+            def all_models(self, capability=None):
+                return [{"name": "test-model", "id": "test-model"}]
+        app.state.backend_catalog = _FakeCatalog()
+        app.state.cluster_manager._workers.clear()
+
+        import asyncio
+        resp1 = await client.post("/api/agents/deploy", json={
+            "name": "RegistryTwin",
+            "framework": "none",
+            "model": "test-model",
+        })
+        assert resp1.status_code == 200
+        await asyncio.sleep(0.2)
+
+        resp2 = await client.post("/api/agents/deploy", json={
+            "name": "RegistryTwin",
+            "framework": "none",
+            "model": "test-model",
+        })
+        assert resp2.status_code == 200
+        await asyncio.sleep(0.2)
+
+        assert len(register_calls) == 2
+        twins = [a for a in app.state.config.agents
+                 if a.get("display_name") == "RegistryTwin"]
+        assert len(twins) == 2
+        ids = {a["registry_canonical_id"] for a in twins}
+        assert len(ids) == 2, f"identities must be distinct, got {ids}"
+
+    async def test_reserved_name_registration_rejected_as_400(self, client, app, monkeypatch):
+        """A name the registry rejects (reserved prefix) is a user error: the
+        deploy must return 400 with the registry's message and add no agent."""
+        import taosmd.agents as tm_agents
+        from unittest.mock import AsyncMock, MagicMock
+
+        app.state.archive = MagicMock(
+            record=AsyncMock(), query=AsyncMock(return_value=[{}])
+        )
+
+        async def fake_register(*, framework, display_name, **kw):
+            raise ValueError(
+                f"cannot register agent: name {display_name!r} resolves to "
+                "reserved prefix 'admin-'; choose a different name"
+            )
+
+        mock_registry = MagicMock()
+        mock_registry.register = fake_register
+        mock_registry.get = AsyncMock(return_value=None)
+        app.state.agent_registry = mock_registry
+
+        def fake_register_agent(name, **kwargs):
+            pass
+        monkeypatch.setattr(tm_agents, "register_agent", fake_register_agent)
+
+        async def fake_deploy(req):
+            return {"success": True, "name": req.name, "ip": "10.0.0.42",
+                    "llm_key": "sk-test", "steps": ["deployment_complete"],
+                    "container": f"taos-agent-{req.name}"}
+        monkeypatch.setattr("tinyagentos.deployer.deploy_agent", fake_deploy)
+
+        class _FakeCatalog:
+            def all_models(self, capability=None):
+                return [{"name": "test-model", "id": "test-model"}]
+        app.state.backend_catalog = _FakeCatalog()
+        app.state.cluster_manager._workers.clear()
+
+        resp = await client.post("/api/agents/deploy", json={
+            "name": "Admin",
+            "framework": "none",
+            "model": "test-model",
+        })
+        assert resp.status_code == 400
+        assert "reserved prefix" in resp.json()["error"]
+        assert not any(a.get("display_name") == "Admin"
+                       for a in app.state.config.agents)
+
+
+@pytest.mark.asyncio
 class TestAgentArchiveLifecycle:
     async def test_archive_creates_snapshot_not_rename(self, client, monkeypatch):
         """DELETE /api/agents/{name} archives via snapshot; no rename called."""
