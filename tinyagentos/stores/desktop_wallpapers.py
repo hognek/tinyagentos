@@ -4,8 +4,6 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-import aiosqlite
-
 from tinyagentos.base_store import BaseStore
 
 
@@ -55,6 +53,7 @@ class DesktopWallpapersStore(BaseStore):
         await self._db.commit()
         return {
             "id": wp_id,
+            "user_id": user_id,
             "label": label,
             "filename": filename,
             "mime_type": mime_type,
@@ -66,7 +65,7 @@ class DesktopWallpapersStore(BaseStore):
         """Return all user-uploaded wallpapers, newest first."""
         assert self._db is not None
         cursor = await self._db.execute(
-            "SELECT id, label, filename, mime_type, created_at "
+            "SELECT id, user_id, label, filename, mime_type, created_at "
             "FROM user_wallpapers WHERE user_id = ? ORDER BY created_at DESC",
             (user_id,),
         )
@@ -74,11 +73,12 @@ class DesktopWallpapersStore(BaseStore):
         return [
             {
                 "id": row[0],
-                "label": row[1],
-                "filename": row[2],
-                "mime_type": row[3],
+                "user_id": row[1],
+                "label": row[2],
+                "filename": row[3],
+                "mime_type": row[4],
                 "url": f"/api/desktop/wallpapers/{row[0]}",
-                "created_at": row[4],
+                "created_at": row[5],
             }
             for row in rows
         ]

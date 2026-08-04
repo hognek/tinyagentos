@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-from pathlib import Path
 
 import pytest
 
@@ -51,6 +50,34 @@ async def test_store_add_and_list(wallpapers_store):
     assert len(wallpapers) == 2
     # Newest first
     assert wallpapers[0]["id"] == w2["id"]
+
+    await wallpapers_store.close()
+
+
+@pytest.mark.asyncio
+async def test_store_multi_user_isolation(wallpapers_store):
+    """Each user only sees their own uploaded wallpapers, and records carry
+    the owning user_id so the route can scope serve/delete by the caller."""
+    await wallpapers_store.init()
+
+    w_a = await wallpapers_store.add_wallpaper("alice", "a.png", "image/png", user_id="user-A")
+    await wallpapers_store.add_wallpaper("bob", "b.png", "image/png", user_id="user-B")
+
+    # The stored / returned shape includes the owner.
+    assert w_a["user_id"] == "user-A"
+
+    # Alice sees only her own.
+    alice = await wallpapers_store.list_wallpapers(user_id="user-A")
+    assert [w["id"] for w in alice] == [w_a["id"]]
+    assert all(w["user_id"] == "user-A" for w in alice)
+
+    # Bob does not see Alice's wallpaper.
+    bob = await wallpapers_store.list_wallpapers(user_id="user-B")
+    assert all(w["id"] != w_a["id"] for w in bob)
+    assert all(w["user_id"] == "user-B" for w in bob)
+
+    # get_wallpaper exposes the owner for ownership checks.
+    assert (await wallpapers_store.get_wallpaper(w_a["id"]))["user_id"] == "user-A"
 
     await wallpapers_store.close()
 
