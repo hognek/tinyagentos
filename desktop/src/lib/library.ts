@@ -2,6 +2,8 @@
 /*  Types                                                              */
 /* ------------------------------------------------------------------ */
 
+import { withCsrf } from "./csrf";
+
 export type LibraryItemStatus = "pending" | "processing" | "ready" | "error";
 
 export interface LibraryItem {
@@ -48,7 +50,9 @@ export interface LibraryItemDetail {
 
 async function fetchJson<T>(url: string, fallback: T, init?: RequestInit): Promise<T> {
   try {
-    const res = await fetch(url, { ...init, headers: { Accept: "application/json", ...init?.headers } });
+    const headers = new Headers(init?.headers);
+    headers.set("Accept", "application/json");
+    const res = await fetch(url, { ...init, headers });
     if (!res.ok) return fallback;
     const ct = res.headers.get("content-type") ?? "";
     if (!ct.includes("application/json")) return fallback;
@@ -99,10 +103,10 @@ export async function getLibraryItem(itemId: string): Promise<LibraryItemDetail 
 
 export async function deleteLibraryItem(itemId: string): Promise<boolean> {
   try {
-    const res = await fetch(`/api/library/items/${encodeURIComponent(itemId)}`, {
+    const res = await fetch(`/api/library/items/${encodeURIComponent(itemId)}`, withCsrf({
       method: "DELETE",
       headers: { Accept: "application/json" },
-    });
+    }));
     return res.ok;
   } catch {
     return false;
@@ -111,10 +115,10 @@ export async function deleteLibraryItem(itemId: string): Promise<boolean> {
 
 export async function reprocessLibraryItem(itemId: string): Promise<boolean> {
   try {
-    const res = await fetch(`/api/library/items/${encodeURIComponent(itemId)}/reprocess`, {
+    const res = await fetch(`/api/library/items/${encodeURIComponent(itemId)}/reprocess`, withCsrf({
       method: "POST",
       headers: { Accept: "application/json" },
-    });
+    }));
     return res.ok;
   } catch {
     return false;
@@ -134,11 +138,11 @@ export async function ingestLibraryUrl(
   opts?: IngestLibraryOptions,
 ): Promise<{ item_id: string; status: string } | null> {
   try {
-    const res = await fetch("/api/library/ingest", {
+    const res = await fetch("/api/library/ingest", withCsrf({
       method: "POST",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
       body: JSON.stringify({ url, title: opts?.title ?? "" }),
-    });
+    }));
     if (!res.ok) return null;
     const ct = res.headers.get("content-type") ?? "";
     if (!ct.includes("application/json")) return null;
