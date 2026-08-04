@@ -226,7 +226,7 @@ interface ThemeStore {
   getWallpapersBySection: () => WallpaperSection[];
 }
 
-export const useThemeStore = create<ThemeStore>((set) => ({
+export const useThemeStore = create<ThemeStore>((set, get) => ({
   wallpaperId: DEFAULT_WP.id,
   wallpaperImage: DEFAULT_WP.image,
   wallpaperMobileImage: DEFAULT_WP.mobileImage ?? DEFAULT_WP.image,
@@ -303,7 +303,7 @@ export const useThemeStore = create<ThemeStore>((set) => ({
   getWallpapers: () => WALLPAPERS,
 
   getWallpapersBySection: () => {
-    const state = useThemeStore.getState();
+    const state = get();
     // The theme's declared default wallpaper id, or the global fallback.
     const themeDefaultId =
       state.themeDefaultWallpaperId[state.activeThemeId] || "graphite";
