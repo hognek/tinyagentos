@@ -510,6 +510,68 @@ async def test_ensure_server_rescope_failure_keeps_cached_server(tmp_path, monke
     assert len(spawned_cfgs) == 1
 
 
+@pytest.mark.asyncio
+async def test_ensure_server_rescope_exception_not_degraded(tmp_path, monkeypatch):
+    """When update_agent_key raises an exception (proxy is running but the
+    re-scope call fails), the server is still created and NOT marked as born
+    degraded.  The exception is swallowed as a logged debug, not a crash.
+    Regression test for BLOCKER 1 — the old code shadowed the born_degraded
+    dict with a bool inside the rescope-failure branch, causing .get() 500s."""
+    import tinyagentos.taos_agent_runtime as rt
+
+    spawned_cfgs: list = []
+
+    class _FakeServer:
+        def __init__(self, cfg):
+            spawned_cfgs.append(cfg)
+            self._cfg = cfg
+        async def ensure_running(self, **kwargs):
+            pass
+        async def stop(self):
+            pass
+        @property
+        def base_url(self):
+            return f"http://127.0.0.1:{self._cfg.port}"
+        def is_running(self):
+            return True
+
+    monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
+
+    class _FakeSettings:
+        async def get_preference(self, user, ns):
+            return {"llm_key": "sk-persisted-9", "permitted_models": ["gpt-4o"]}
+        async def save_preference(self, user, ns, prefs):
+            pass
+
+    mock_proxy = MagicMock()
+    mock_proxy.create_agent_key = AsyncMock(return_value="sk-NEW-should-not-be-used")
+    # update_agent_key raises — the rescope-exception branch.
+    mock_proxy.update_agent_key = AsyncMock(side_effect=RuntimeError("proxy busy"))
+    mock_proxy.is_running.return_value = True
+
+    state = SimpleNamespace(
+        data_dir=tmp_path,
+        llm_proxy=mock_proxy,
+        desktop_settings=_FakeSettings(),
+        taos_opencode_password=None,
+        taos_opencode_server=None,
+        taos_opencode_model=None,
+        taos_opencode_session_id=None,
+    )
+
+    await rt.ensure_taos_opencode_server(state, "gpt-4o")
+
+    # Server must still be created with the persisted key.
+    assert len(spawned_cfgs) == 1
+    assert spawned_cfgs[0].litellm_key == "sk-persisted-9"
+    # The born_degraded dict must still be a dict (not a bool) and the
+    # entry for this model must be False — proxy IS running.
+    assert isinstance(state.taos_opencode_born_degraded, dict)
+    assert state.taos_opencode_born_degraded["gpt-4o"] is False
+    mock_proxy.create_agent_key.assert_not_called()
+    mock_proxy.update_agent_key.assert_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Degraded-birth detection and self-heal
 # ---------------------------------------------------------------------------
