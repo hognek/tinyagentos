@@ -54,8 +54,9 @@ EXIT_CONFIG_ERROR = 3
 # exist in the repo itself. `-` is in the lookbehind for the same reason:
 # home-dir slugs like "-*-tinyagentos/memory/MEMORY.md" embed a repo prefix
 # after a hyphen, and the glob `*` sits BEFORE the match so the glob filter
-# never sees it.
-_TOKEN_RE = re.compile(r"(?<![\w/-])(?:scripts|tinyagentos|docs|desktop)/[^\s`\"'|]+")
+# never sees it. `)` and `]` are excluded from the token body so a markdown
+# link's closing bracket ends the token instead of gluing the URL on.
+_TOKEN_RE = re.compile(r"(?<![\w/-])(?:scripts|tinyagentos|docs|desktop)/[^\s`\"'|)\]]+")
 
 # Chars that mark a token as a glob pattern or a <placeholder> rather than a
 # concrete repo path -- these are never asserted to exist.
@@ -73,6 +74,7 @@ def _clean_token(raw: str) -> str | None:
     for sep in ("#", "?", "::"):
         if sep in token:
             token = token.split(sep, 1)[0]
+    token = re.sub(r":[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*$", "", token)
     while token and token[-1] in _TRAILING_PUNCT:
         token = token[:-1]
     if not token:

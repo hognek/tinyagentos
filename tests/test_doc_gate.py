@@ -175,6 +175,30 @@ class TestCheckReferencedPaths:
         failures = dg.check_referenced_paths(tmp_path, ["README.md"], {})
         assert failures == []
 
+    def test_file_line_citation_is_ignored(self, tmp_path: Path):
+        """A file:line citation like `scripts/foo.sh:123` must not be treated as
+        a nonexistent path; the line-number suffix is stripped before the
+        existence check."""
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "foo.sh").write_text("#!/bin/sh\n")
+        readme = tmp_path / "README.md"
+        readme.write_text("See `scripts/foo.sh:123` for details.\n")
+        failures = dg.check_referenced_paths(tmp_path, ["README.md"], {})
+        assert failures == []
+
+    def test_markdown_link_url_not_consumed_as_path(self, tmp_path: Path):
+        """A markdown link whose URL points to another repo must not have the
+        URL consumed as part of the path token."""
+        (tmp_path / "docs").mkdir()
+        (tmp_path / "docs" / "agent-manual.md").write_text("# Agent Manual\n")
+        readme = tmp_path / "README.md"
+        readme.write_text(
+            "See [docs/agent-manual.md]"
+            "(https://github.com/other/repo/blob/main/docs/agent-manual.md).\n"
+        )
+        failures = dg.check_referenced_paths(tmp_path, ["README.md"], {})
+        assert failures == []
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
