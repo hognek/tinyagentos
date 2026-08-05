@@ -1380,3 +1380,242 @@ class TestConcurrentApproveSameIdentity:
         await registry.close()
         await auth_store.close()
         await grants.close()
+
+
+class TestDeferBindingApproval:
+    """PR 2187 fix-forward: defer_binding must be wired through _do_approve so the
+    admin's 'Assign later' choice actually mints an unbound token instead of
+    silently binding to a project."""
+
+    @pytest.mark.asyncio
+    async def test_defer_with_project_scopes_no_project_id_succeeds_unbound(
+        self, client, monkeypatch, tmp_path
+    ):
+        """defer_binding=true + project scopes + no explicit project_id returns 200
+        with an unbound token (no project_id claim), unbound grants, no membership
+        row, and no a2a channel. The project_id-required 400 guard is skipped."""
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+            verify_registry_token,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.agent_grants_store import AgentGrantsStore
+        from tinyagentos.projects.project_store import ProjectStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-defer.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-defer.db")
+        await auth_store.init()
+        grants = AgentGrantsStore(tmp_path / "grants-defer.db")
+        await grants.init()
+        pstore = ProjectStore(tmp_path / "projects-defer.db")
+        await pstore.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-defer")
+
+        project = await pstore.create_project(
+            name="Defer Proj", slug="defer-proj", created_by="u"
+        )
+
+        # The agent REQUESTED project_tasks against a project, but the admin
+        # defers binding: no explicit project_id on approve, defer_binding=true.
+        record = await auth_store.create(
+            identity_claim="@defer-bot",
+            framework="defer-cli",
+            requested_scopes=["project_tasks"],
+            requested_skills=None,
+            reason="",
+            duration_secs=None,
+            project_id=project["id"],
+        )
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "agent_grants", grants)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            f"/api/agents/auth-requests/{record['id']}/approve",
+            json={"granted_scopes": ["project_tasks"], "defer_binding": True},
+        )
+        assert resp.status_code == 200, resp.text
+        cid = resp.json()["canonical_id"]
+
+        # Token carries NO project_id claim (minted unbound).
+        approved = await auth_store.get(record["id"])
+        claims = verify_registry_token(approved["token"], pub)
+        assert "project_id" not in claims
+
+        # Grants are written UNBOUND (project_id IS NULL).
+        agent_grants = await grants.list_grants(cid)
+        assert len(agent_grants) == 1
+        assert agent_grants[0]["scope"] == "project_tasks"
+        assert agent_grants[0]["project_id"] is None
+
+        # No membership row created for the project.
+        members = await pstore.list_members(project["id"])
+        assert len(members) == 0
+
+        # No a2a channel created for the project.
+        channels = await client._transport.app.state.chat_channels.list_channels(
+            project_id=project["id"]
+        )
+        assert not any(c.get("name") == "a2a" for c in channels)
+
+        await registry.close()
+        await auth_store.close()
+        await grants.close()
+        await pstore.close()
+
+    @pytest.mark.asyncio
+    async def test_defer_with_explicit_project_id_returns_400(
+        self, client, monkeypatch, tmp_path
+    ):
+        """defer_binding=true combined with an explicit project_id is contradictory
+        and must 400, rather than silently binding anyway (the bug PR 2187 shipped)."""
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.agent_grants_store import AgentGrantsStore
+        from tinyagentos.projects.project_store import ProjectStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-defer-400.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-defer-400.db")
+        await auth_store.init()
+        grants = AgentGrantsStore(tmp_path / "grants-defer-400.db")
+        await grants.init()
+        pstore = ProjectStore(tmp_path / "projects-defer-400.db")
+        await pstore.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-defer-400")
+
+        project = await pstore.create_project(
+            name="Defer400", slug="defer-400", created_by="u"
+        )
+
+        record = await auth_store.create(
+            identity_claim="@defer400-bot",
+            framework="defer-cli",
+            requested_scopes=["project_tasks"],
+            requested_skills=None,
+            reason="",
+            duration_secs=None,
+            project_id=None,
+        )
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "agent_grants", grants)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            f"/api/agents/auth-requests/{record['id']}/approve",
+            json={
+                "granted_scopes": ["project_tasks"],
+                "project_id": project["id"],
+                "defer_binding": True,
+            },
+        )
+        assert resp.status_code == 400, resp.text
+        assert "defer_binding" in resp.text
+
+        # Nothing should have been registered by the rejected approval.
+        assert await registry.list_all() == []
+
+        await registry.close()
+        await auth_store.close()
+        await grants.close()
+        await pstore.close()
+
+    @pytest.mark.asyncio
+    async def test_non_deferred_project_binding_unchanged(
+        self, client, monkeypatch, tmp_path
+    ):
+        """Without defer_binding, a project-scoped approval binds to the explicit
+        project_id as before: token carries the project claim, grants are bound,
+        membership + a2a channel are created."""
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+            verify_registry_token,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.agent_grants_store import AgentGrantsStore
+        from tinyagentos.projects.project_store import ProjectStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-nondefer.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-nondefer.db")
+        await auth_store.init()
+        grants = AgentGrantsStore(tmp_path / "grants-nondefer.db")
+        await grants.init()
+        pstore = ProjectStore(tmp_path / "projects-nondefer.db")
+        await pstore.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-nondefer")
+
+        project = await pstore.create_project(
+            name="NonDefer", slug="nondefer-proj", created_by="u"
+        )
+
+        record = await auth_store.create(
+            identity_claim="@nondefer-bot",
+            framework="defer-cli",
+            requested_scopes=["project_tasks"],
+            requested_skills=None,
+            reason="",
+            duration_secs=None,
+            project_id=project["id"],
+        )
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "agent_grants", grants)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            f"/api/agents/auth-requests/{record['id']}/approve",
+            json={
+                "granted_scopes": ["project_tasks"],
+                "project_id": project["id"],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        cid = resp.json()["canonical_id"]
+
+        # Token carries the project_id claim.
+        approved = await auth_store.get(record["id"])
+        claims = verify_registry_token(approved["token"], pub)
+        assert claims.get("project_id") == project["id"]
+
+        # Grants are bound to the project.
+        agent_grants = await grants.list_grants(cid)
+        assert any(
+            g["scope"] == "project_tasks" and g["project_id"] == project["id"]
+            for g in agent_grants
+        )
+
+        # Membership row created.
+        members = await pstore.list_members(project["id"])
+        assert any(m["member_id"] == cid for m in members)
+
+        # a2a channel created.
+        channels = await client._transport.app.state.chat_channels.list_channels(
+            project_id=project["id"]
+        )
+        assert any(c.get("name") == "a2a" for c in channels)
+
+        await registry.close()
+        await auth_store.close()
+        await grants.close()
+        await pstore.close()
