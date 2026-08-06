@@ -295,3 +295,34 @@ class TestChangelogFragments:
             ("A", "desktop/src/stores/__tests__/theme-store.test.ts"),
         ]
         assert dg.evaluate_rules(changed, [], CHANGELOG_RULE_CONFIG) == []
+
+
+class TestConfigErrorExitCode:
+    """A broken/unparseable config must exit distinctly from a real violation.
+
+    Regression: previously an unparseable config raised an unhandled traceback
+    that exited 1 -- identical to a genuine doc-gate violation -- so a typo in
+    docs/doc-gate.toml looked just like a missing changelog."""
+
+    def test_unparseable_config_returns_config_error_code(self, tmp_path, capsys):
+        bad = tmp_path / "bad.toml"
+        bad.write_text('key = "unterminated string\n')
+        rc = dg.main(["--config", str(bad), "print-trailer"])
+        captured = capsys.readouterr()
+        assert rc == dg.EXIT_CONFIG_ERROR
+        assert rc != dg.EXIT_VIOLATION
+        assert "config error" in captured.err
+
+    def test_missing_config_file_returns_config_error_code(self, tmp_path):
+        missing = tmp_path / "does_not_exist.toml"
+        rc = dg.main(["--config", str(missing), "print-trailer"])
+        assert rc == dg.EXIT_CONFIG_ERROR
+        assert rc != dg.EXIT_VIOLATION
+
+    def test_real_violation_returns_violation_not_config_error(self):
+        """Exit code 1 (violation) must remain distinct from exit code 2
+        (config error)."""
+        changed = [("A", "tinyagentos/routes/themes.py")]
+        failures = dg.evaluate_rules(changed, [], APPS_RULE_CONFIG)
+        assert dg._report(failures) == dg.EXIT_VIOLATION
+

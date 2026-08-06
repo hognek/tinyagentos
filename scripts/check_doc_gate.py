@@ -37,6 +37,13 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = REPO_ROOT / "docs" / "doc-gate.toml"
 DEFAULT_TRAILER = "Docs-Reviewed:"
 
+# Exit codes: 0 clean, 1 a doc-gate violation, 2 a config/usage error
+# (broken, missing, or unparseable config). Distinct so a misconfigured gate
+# is never mistaken for a real documentation-drift violation.
+EXIT_OK = 0
+EXIT_VIOLATION = 1
+EXIT_CONFIG_ERROR = 2
+
 # A path-like token: one of the four known repo prefixes followed by a run of
 # non-whitespace / non-quoting characters. The negative lookbehind stops us
 # matching a prefix that is actually embedded inside a larger path (e.g. the
@@ -254,10 +261,10 @@ def get_trailer(config: dict) -> str:
 def _report(failures: list[str]) -> int:
     if not failures:
         print("doc-gate: clean")
-        return 0
+        return EXIT_OK
     for failure in failures:
         print(f"DOC-GATE FAIL: {failure}")
-    return 1
+    return EXIT_VIOLATION
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -273,7 +280,11 @@ def main(argv: list[str] | None = None) -> int:
     group.add_argument("--base", help="Compare <base>...HEAD (CI / commit-msg)")
 
     args = parser.parse_args(argv)
-    config = load_config(args.config)
+    try:
+        config = load_config(args.config)
+    except (tomllib.TOMLDecodeError, OSError) as e:
+        print(f"doc-gate: config error: {args.config}: {e}", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
 
     if args.command == "invariants":
         files_to_scan = config.get("invariants", {}).get("referenced_paths_scan", [])
