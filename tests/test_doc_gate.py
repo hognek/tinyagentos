@@ -320,9 +320,50 @@ class TestConfigErrorExitCode:
         assert rc != dg.EXIT_VIOLATION
 
     def test_real_violation_returns_violation_not_config_error(self):
-        """Exit code 1 (violation) must remain distinct from exit code 2
-        (config error)."""
+        """Exit code 1 (violation) must remain distinct from the config-error
+        code."""
         changed = [("A", "tinyagentos/routes/themes.py")]
         failures = dg.evaluate_rules(changed, [], APPS_RULE_CONFIG)
         assert dg._report(failures) == dg.EXIT_VIOLATION
+
+    def test_structurally_invalid_config_returns_config_error_code(self, tmp_path, capsys):
+        """Valid TOML of the wrong shape (rules is a string, not a list of
+        tables) must be caught as a config error, not crash the rule loop with
+        an AttributeError that exits 1."""
+        bad = tmp_path / "struct.toml"
+        bad.write_text('rules = "not a list"\n[gate]\ntrailer = "X:"\n')
+        rc = dg.main(["--config", str(bad), "print-trailer"])
+        captured = capsys.readouterr()
+        assert rc == dg.EXIT_CONFIG_ERROR
+        assert rc != dg.EXIT_VIOLATION
+        assert "config error" in captured.err
+
+    def test_non_utf8_config_returns_config_error_code(self, tmp_path, capsys):
+        """A config file with invalid UTF-8 bytes raises UnicodeDecodeError
+        inside tomllib.load (which decodes before parsing).  That must be
+        caught and reported as a config error, not exit 1."""
+        bad = tmp_path / "bad_utf8.toml"
+        bad.write_bytes(b'trailer = "Docs-Reviewed:"\n\x80\xff\xfe\n')
+        rc = dg.main(["--config", str(bad), "print-trailer"])
+        captured = capsys.readouterr()
+        assert rc == dg.EXIT_CONFIG_ERROR
+        assert rc != dg.EXIT_VIOLATION
+        assert "config error" in captured.err
+
+    def test_bad_cli_flag_exits_argparse_code(self):
+        """A typo'd flag must exit with argparse's own code (2), distinct from
+        both the violation code (1) and the config-error code."""
+        with pytest.raises(SystemExit) as exc_info:
+            dg.main(["diff-gate"])
+        assert exc_info.value.code == 2
+        assert exc_info.value.code != dg.EXIT_VIOLATION
+        assert exc_info.value.code != dg.EXIT_CONFIG_ERROR
+
+    def test_exit_codes_are_mutually_distinguishable(self):
+        """The three non-zero outcomes must be mutually distinguishable:
+        violation (1), argparse usage error (2), config error (not 2)."""
+        assert dg.EXIT_OK == 0
+        assert dg.EXIT_VIOLATION == 1
+        assert dg.EXIT_CONFIG_ERROR != 1
+        assert dg.EXIT_CONFIG_ERROR != 2
 

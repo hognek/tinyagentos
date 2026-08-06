@@ -37,12 +37,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = REPO_ROOT / "docs" / "doc-gate.toml"
 DEFAULT_TRAILER = "Docs-Reviewed:"
 
-# Exit codes: 0 clean, 1 a doc-gate violation, 2 a config/usage error
-# (broken, missing, or unparseable config). Distinct so a misconfigured gate
-# is never mistaken for a real documentation-drift violation.
+# Exit codes: 0 clean, 1 a doc-gate violation, 2 a CLI/usage error (reserved
+# for argparse, never our own code), 3 a config error (broken, missing, or
+# unparseable config).  3 is kept off 2 so a typo'd flag is never mistaken for
+# a bad config: a misconfigured gate must be distinguishable from both a real
+# documentation-drift violation and a usage mistake.
 EXIT_OK = 0
 EXIT_VIOLATION = 1
-EXIT_CONFIG_ERROR = 2
+EXIT_CONFIG_ERROR = 3
 
 # A path-like token: one of the four known repo prefixes followed by a run of
 # non-whitespace / non-quoting characters. The negative lookbehind stops us
@@ -89,6 +91,34 @@ def extract_path_tokens(text: str) -> list[str]:
 def load_config(path: Path) -> dict:
     with open(path, "rb") as f:
         return tomllib.load(f)
+
+
+def _validate_config(config: dict) -> None:
+    """Validate the structural shape of a parsed doc-gate config.
+
+    A config that parses as valid TOML but has the wrong shape (e.g.
+    ``rules = "not a list"``) is a config error, not a runtime crash: surface
+    it as EXIT_CONFIG_ERROR rather than letting it die in the rule loop with
+    an AttributeError."""
+    if not isinstance(config, dict):
+        raise ValueError("config root must be a table")
+    rules = config.get("rules", [])
+    if not isinstance(rules, list):
+        raise ValueError("'rules' must be a list of tables")
+    for i, rule in enumerate(rules):
+        if not isinstance(rule, dict):
+            raise ValueError(f"rules[{i}] must be a table")
+    gate = config.get("gate", {})
+    if not isinstance(gate, dict):
+        raise ValueError("'gate' must be a table")
+    if "trailer" in gate and not isinstance(gate["trailer"], str):
+        raise ValueError("'gate.trailer' must be a string")
+    invariants = config.get("invariants", {})
+    if not isinstance(invariants, dict):
+        raise ValueError("'invariants' must be a table")
+    scan = invariants.get("referenced_paths_scan", [])
+    if not isinstance(scan, list):
+        raise ValueError("'invariants.referenced_paths_scan' must be a list")
 
 
 def check_referenced_paths(repo_root: Path, files_to_scan: list[str], config: dict) -> list[str]:
@@ -282,7 +312,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         config = load_config(args.config)
-    except (tomllib.TOMLDecodeError, OSError) as e:
+        _validate_config(config)
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError, OSError, ValueError) as e:
         print(f"doc-gate: config error: {args.config}: {e}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
 
