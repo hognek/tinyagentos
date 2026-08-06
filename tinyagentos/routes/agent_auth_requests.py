@@ -472,7 +472,16 @@ async def approve_request_record(
         # fallback for global scopes) would be safe only by invariant. Gate and
         # bind on project_id so cross-project escalation is impossible by
         # construction (kilo review, taOS #1862).
-        if not defer_binding and project_id and set(granted_scopes) & _PROJECT_SCOPES:
+        if defer_binding:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"handle '{handle}' is already in use by active agent "
+                    f"{existing_active['canonical_id']}; use POST /api/projects/{{id}}/members/assign-agent "
+                    f"to bind the existing identity to a project"
+                ),
+            )
+        if project_id and set(granted_scopes) & _PROJECT_SCOPES:
             existing_cid = existing_active["canonical_id"]
             token = mint_registry_token(
                 existing_cid,

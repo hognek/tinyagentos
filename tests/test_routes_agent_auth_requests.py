@@ -1619,3 +1619,62 @@ class TestDeferBindingApproval:
         await auth_store.close()
         await grants.close()
         await pstore.close()
+
+    @pytest.mark.asyncio
+    async def test_defer_with_active_handle_returns_409_assign_agent(
+        self, client, monkeypatch, tmp_path
+    ):
+        """defer_binding=true when the handle already maps to an active identity
+        must 409 and point the operator at assign-agent, not at minting a
+        duplicate identity."""
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.agent_grants_store import AgentGrantsStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-defer-active.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-defer-active.db")
+        await auth_store.init()
+        grants = AgentGrantsStore(tmp_path / "grants-defer-active.db")
+        await grants.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-defer-active")
+
+        existing = await registry.register(
+            framework="openclaw",
+            display_name="defer-bot",
+            user_id="user-existing",
+            origin="taos-deployed",
+            handle="defer-bot",
+        )
+
+        record = await auth_store.create(
+            identity_claim="@defer-bot",
+            framework="defer-cli",
+            requested_scopes=["memory_read"],
+            requested_skills=None,
+            reason="",
+            duration_secs=None,
+            project_id=None,
+        )
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "agent_grants", grants)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            f"/api/agents/auth-requests/{record['id']}/approve",
+            json={"granted_scopes": ["memory_read"], "defer_binding": True},
+        )
+        assert resp.status_code == 409, resp.text
+        assert "assign-agent" in resp.text
+        assert "pick a different identity_claim" not in resp.text
+
+        await registry.close()
+        await auth_store.close()
+        await grants.close()
