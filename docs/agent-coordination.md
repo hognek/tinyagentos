@@ -289,6 +289,15 @@ further project via `POST /api/projects/{project_id}/members/assign-agent`
 active identity (the existing canonical_id and token are reused instead of
 409ing).
 
+Deferred binding and an existing active handle are mutually exclusive. Approving
+an auth-request with `defer_binding` mints the token and grants UNBOUND, so the
+agent has no project until `assign-agent` binds it. If that agent ALREADY holds
+an active handle the approve returns **409** and names
+`POST /api/projects/{project_id}/members/assign-agent` as the route to use. Do
+not resolve that 409 by minting a second identity: canonical ids are issued once
+per agent (`{slug}-{YYYYMMDD}-{HHMMSS}`), and a duplicate splits the agent's
+memory and grants across two ids that never reconcile.
+
 Reserved name prefixes: registration rejects any name whose slug is or starts
 with `user-`, `human-`, `admin-` or `taos-` (including casing, spacing and
 punctuation obfuscations like `U s e r`), so an external agent cannot mint an
