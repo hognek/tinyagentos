@@ -205,7 +205,7 @@ async def _migration_v4_dedupe_active_handles(conn) -> None:
         await conn.commit()
 
 
-async def _migration_v6_add_token_min_iat(conn) -> None:
+async def _migration_v5_add_token_min_iat(conn) -> None:
     """Add token_min_iat column (idempotent) for per-identity token rotation.
 
     Default value 0 means every existing row's tokens remain valid so the
@@ -468,7 +468,7 @@ class AgentRegistryStore(BaseStore):
         # Dedupe BEFORE the index so a pre-invariant DB with duplicate active
         # handles cannot make the CREATE UNIQUE INDEX (hence boot) fail.
         await _migration_v4_dedupe_active_handles(self._db)
-        await _migration_v6_add_token_min_iat(self._db)
+        await _migration_v5_add_token_min_iat(self._db)
         # Created after the status migration so the partial index's WHERE clause
         # can reference the status column on the pre-status migration path.
         # Guard the index creation too: if some path we did not anticipate still
