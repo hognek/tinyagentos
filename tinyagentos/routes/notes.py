@@ -114,7 +114,7 @@ async def list_docs(
     user: CurrentUser = Depends(current_user),
 ):
     store = _get_store(request)
-    return await store.list_docs(user.user_id, include_archived=include_archived)
+    return await store.list_docs(user.user_id, include_archived=include_archived, kind="note")
 
 
 @router.post("/api/notes")

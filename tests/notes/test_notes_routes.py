@@ -344,7 +344,7 @@ async def test_contributor_can_add_but_not_edit(two_user_clients):
 @pytest.mark.asyncio
 async def test_owner_always_has_full_access(two_user_clients):
     """The owner can add, edit, and delete regardless of any member permission rules."""
-    alice, bob, _ = two_user_clients
+    alice, _, _ = two_user_clients
     doc = (await alice.post("/api/notes", json={"title": "Mine"})).json()
     doc_id = doc["id"]
     entry = (await alice.post(f"/api/notes/{doc_id}/entries", json={"text": "item"})).json()
@@ -730,4 +730,45 @@ async def test_discuss_action_falls_back_to_dm_without_channel_store(tmp_path):
 
     # Fell back to the DM channel rather than dropping the notification.
     assert sent == ["ch-atlas"]
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_list_notes_filters_by_kind(tmp_path):
+    """GET /api/notes only returns docs with kind='note'.
+
+    Regression for #2325: the list endpoint should not leak todo-list or
+    other-kind docs into the Notes UI.
+    """
+    config = _make_config(tmp_path)
+    (tmp_path / "config.yaml").write_text(yaml.dump(config))
+    (tmp_path / ".setup_complete").touch()
+
+    app = create_app(data_dir=tmp_path)
+    store = SharedDocsStore(tmp_path / "shared_docs.db")
+    await store.init()
+    app.state.shared_docs_store = store
+    app.state.auth.setup_user("admin", "Admin", "", "adminpass")
+    record = app.state.auth.find_user("admin")
+    token = app.state.auth.create_session(user_id=record["id"], long_lived=True)
+    app.state._startup_complete = True
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        cookies={"taos_session": token},
+    ) as client:
+        # Create a note (kind="note") — should be visible
+        note = (await client.post("/api/notes", json={"title": "My Note"})).json()
+
+        # Insert a list-kind doc directly into the store — should NOT be visible
+        await store.create_doc(record["id"], "list", "My List")
+
+        # Only the note should appear
+        resp = (await client.get("/api/notes")).json()
+        ids = {d["id"] for d in resp}
+        assert note["id"] in ids, "Note should be in list"
+        assert len(ids) == 1, f"Expected only 1 note, got {len(resp)} docs"
+
     await store.close()

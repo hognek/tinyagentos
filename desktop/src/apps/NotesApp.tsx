@@ -11,11 +11,8 @@ import {
   Trash2,
   Check,
   X,
-  Square,
-  CheckSquare,
   AlertCircle,
   ChevronLeft,
-  type LucideIcon,
 } from "lucide-react";
 import { Button, Textarea } from "@/components/ui";
 
@@ -480,14 +477,12 @@ function EntryRow({
   showDone,
   onDelete,
   onEditSave,
-  onToggleDone,
 }: {
   entry: NoteEntry;
   docId: string;
   showDone: boolean;
   onDelete: (id: string) => void;
   onEditSave: (id: string, text: string) => Promise<void>;
-  onToggleDone: (id: string, done: boolean) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(entry.text);
@@ -556,21 +551,6 @@ function EntryRow({
           </div>
         ) : (
           <>
-            {showDone && (
-              <button
-                type="button"
-                onClick={() => onToggleDone(entry.id, !entry.done)}
-                aria-label={entry.done ? "Mark task not done" : "Mark task done"}
-                aria-pressed={entry.done}
-                className="mt-0.5 shrink-0 text-shell-text-tertiary transition-colors hover:text-accent"
-              >
-                {entry.done ? (
-                  <CheckSquare size={16} className="text-accent" />
-                ) : (
-                  <Square size={16} />
-                )}
-              </button>
-            )}
             <p
               className={[
                 "min-w-0 flex-1 whitespace-pre-wrap text-sm",
@@ -713,36 +693,6 @@ function NoteDetailPane({
     );
   }
 
-  async function toggleDone(entryId: string, done: boolean) {
-    if (!doc) return;
-    // Optimistic: flip immediately, revert on failure.
-    setDoc((prev) =>
-      prev
-        ? { ...prev, entries: prev.entries.map((e) => (e.id === entryId ? { ...e, done } : e)) }
-        : prev,
-    );
-    try {
-      const r = await fetch(`/api/notes/${doc.id}/entries/${entryId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ done }),
-      });
-      if (!r.ok) throw new Error("Could not update task.");
-    } catch (e) {
-      setDoc((prev) =>
-        prev
-          ? {
-              ...prev,
-              entries: prev.entries.map((el) =>
-                el.id === entryId ? { ...el, done: !done } : el,
-              ),
-            }
-          : prev,
-      );
-      setError(e instanceof Error ? e.message : "Could not update task.");
-    }
-  }
-
   if (loading) {
     return (
       <div className="flex h-full items-center justify-center">
@@ -869,7 +819,6 @@ function NoteDetailPane({
                   showDone={false}
                   onDelete={deleteEntry}
                   onEditSave={editEntry}
-                  onToggleDone={toggleDone}
                 />
               ))}
             </ul>
@@ -1084,7 +1033,7 @@ function DocsApp() {
               </button>
             </div>
           ) : (
-            <ul className="flex flex-col gap-2" aria-label=Notes>
+            <ul className="flex flex-col gap-2" aria-label="Notes">
               {notes.map((note) => (
                 <NoteListItem
                   key={note.id}
