@@ -45,7 +45,10 @@ async def register_device(
     # that is blocked cannot silently register a new scoped token while in the
     # hands of an attacker. An empty push token is treated as unidentifiable:
     # real paired devices always carry a push token, so this check only engages
-    # when one is present.
+    # when one is present. A caller sending a DIFFERENT push token also slips
+    # past it -- acceptable because register already requires the owner's own
+    # auth, and that caller could simply unblock instead; this is
+    # defense-in-depth against silent re-pair, not a hard boundary.
     if body.push_token and await store.find_blocked_by_push_token(user.user_id, body.push_token) is not None:
         return JSONResponse(
             {"error": "device is blocked; unblock it before re-pairing"},
