@@ -443,6 +443,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     desktop_settings = DesktopSettingsStore(data_dir / "desktop.db")
     from tinyagentos.device_store import DeviceStore
     device_store = DeviceStore(data_dir / "devices.db")
+    from tinyagentos.device_pair_requests_store import DevicePairRequestsStore
+    device_pair_requests_store = DevicePairRequestsStore(data_dir / "device_pair_requests.db")
     from tinyagentos.push.apns import apns_sender_from_env
     apns_sender = apns_sender_from_env()
     user_memory = UserMemoryStore(data_dir / "user_memory.db")
@@ -601,6 +603,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await canvas_store.init()
         await desktop_settings.init()
         await device_store.init()
+        await device_pair_requests_store.init()
         await user_memory.init()
         await installed_apps.init()
         await feedback_store.init()
@@ -1429,6 +1432,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await user_memory.close()
         await desktop_settings.close()
         await device_store.close()
+        await device_pair_requests_store.close()
         # Close the APNs sender's httpx client (self-created by HttpApnsSender);
         # guarded so the Null sender or a missing attribute is a no-op.
         _apns = getattr(app.state, "apns_sender", None)
@@ -1635,6 +1639,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.canvas_store = canvas_store
     app.state.desktop_settings = desktop_settings
     app.state.device_store = device_store
+    app.state.device_pair_requests = device_pair_requests_store
     app.state.apns_sender = apns_sender
     app.state.user_memory = user_memory
     app.state.user_personas = user_personas

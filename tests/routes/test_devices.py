@@ -123,3 +123,49 @@ class TestDeviceRoutes:
         )
         assert resp.status_code == 200
         assert resp.json()["push_token"] == "session-token"
+
+    async def test_block_unblock_repair_flow(self, client):
+        reg = (
+            await client.post(
+                "/api/devices/register", json={"platform": "ios", "push_token": "pt-flow"}
+            )
+        ).json()
+
+        resp = await client.post(f"/api/devices/{reg['device_id']}/block")
+        assert resp.status_code == 200
+        assert resp.json() == {"blocked": True, "changed": True}
+
+        # Blocked device stays listed, with the derived live_token flag off.
+        items = (await client.get("/api/devices")).json()["items"]
+        assert [d["device_id"] for d in items] == [reg["device_id"]]
+        assert items[0]["live_token"] is False
+
+        # Re-pairing under the same push token is refused while blocked.
+        resp = await client.post(
+            "/api/devices/register", json={"platform": "ios", "push_token": "pt-flow"}
+        )
+        assert resp.status_code == 403
+
+        resp = await client.post(f"/api/devices/{reg['device_id']}/unblock")
+        assert resp.status_code == 200
+        assert resp.json() == {"unblocked": True, "changed": True}
+
+        # After unblock the device may re-pair (fresh registration, fresh token).
+        resp = await client.post(
+            "/api/devices/register", json={"platform": "ios", "push_token": "pt-flow"}
+        )
+        assert resp.status_code == 200
+        assert resp.json()["scoped_token"] != reg["scoped_token"]
+
+    async def test_live_token_flag_true_for_active_device(self, client):
+        await client.post("/api/devices/register", json={"platform": "ios"})
+        items = (await client.get("/api/devices")).json()["items"]
+        assert items[0]["live_token"] is True
+
+    async def test_block_unblock_other_users_device_404(self, client, app):
+        other = await app.state.device_store.register(user_id="someone-else", platform="ios")
+        assert (await client.post(f"/api/devices/{other['device_id']}/block")).status_code == 404
+        assert (await client.post(f"/api/devices/{other['device_id']}/unblock")).status_code == 404
+        # And the foreign device was not touched.
+        row = await app.state.device_store.get(other["device_id"])
+        assert row["blocked"] == 0 and row["revoked"] == 0

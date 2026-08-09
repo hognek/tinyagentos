@@ -10,12 +10,12 @@ DEVICE_TOKEN_PREFIX = "taosdev_"
 # Columns returned to internal callers (includes the secret scoped_token).
 _FULL_COLS = (
     "device_id, user_id, platform, push_token, scoped_token, "
-    "display_name, registered_at, last_seen, revoked"
+    "display_name, registered_at, last_seen, revoked, blocked"
 )
 # Columns safe to return to the owning user (no scoped_token).
 _SAFE_COLS = (
     "device_id, user_id, platform, push_token, "
-    "display_name, registered_at, last_seen, revoked"
+    "display_name, registered_at, last_seen, revoked, blocked"
 )
 
 
@@ -34,11 +34,28 @@ class DeviceStore(BaseStore):
         display_name TEXT NOT NULL DEFAULT '',
         registered_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
         last_seen INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-        revoked INTEGER NOT NULL DEFAULT 0
+        revoked INTEGER NOT NULL DEFAULT 0,
+        blocked INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_devices_user ON devices(user_id);
     CREATE INDEX IF NOT EXISTS idx_devices_token ON devices(scoped_token);
     """
+
+    async def _post_init(self) -> None:
+        # `blocked` was added after the initial devices ship. Guarded ALTER so
+        # existing databases gain it without a destructive migration (SQLite
+        # lacks ADD COLUMN IF NOT EXISTS before 3.37). Mirrors decision_store.py.
+        cols = {
+            row[1]
+            for row in await (
+                await self._db.execute("PRAGMA table_info(devices)")
+            ).fetchall()
+        }
+        if "blocked" not in cols:
+            await self._db.execute(
+                "ALTER TABLE devices ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0"
+            )
+            await self._db.commit()
 
     async def register(
         self, *, user_id: str, platform: str, push_token: str = "", display_name: str = ""
@@ -67,7 +84,8 @@ class DeviceStore(BaseStore):
     async def get_by_token(self, scoped_token: str) -> dict | None:
         assert self._db is not None
         cur = await self._db.execute(
-            f"SELECT {_FULL_COLS} FROM devices WHERE scoped_token = ? AND revoked = 0",
+            f"SELECT {_FULL_COLS} FROM devices WHERE scoped_token = ? "
+            "AND revoked = 0 AND blocked = 0",
             (scoped_token,),
         )
         row = await cur.fetchone()
@@ -76,7 +94,8 @@ class DeviceStore(BaseStore):
     async def list_for_user(self, user_id: str) -> list[dict]:
         assert self._db is not None
         cur = await self._db.execute(
-            f"SELECT {_SAFE_COLS} FROM devices WHERE user_id = ? AND revoked = 0 "
+            f"SELECT {_SAFE_COLS} FROM devices WHERE user_id = ? "
+            "AND (revoked = 0 OR blocked = 1) "
             "ORDER BY registered_at DESC, device_id DESC",
             (user_id,),
         )
@@ -107,3 +126,43 @@ class DeviceStore(BaseStore):
         )
         await self._db.commit()
         return cur.rowcount > 0
+
+    async def block(self, device_id: str) -> bool:
+        """Block a device: kill its token (revoked) and forbid re-pairing
+        (blocked). A blocked device stays visible in the user's device list so
+        the owner can see the safety valve is engaged; it only disappears once
+        unblocked (at which point it becomes a plain revoked row that can
+        re-pair)."""
+        assert self._db is not None
+        cur = await self._db.execute(
+            "UPDATE devices SET revoked = 1, blocked = 1 "
+            "WHERE device_id = ? AND blocked = 0",
+            (device_id,),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def unblock(self, device_id: str) -> bool:
+        """Clear the blocked flag. The old scoped token stays dead (revoked),
+        so the device must re-pair to obtain a fresh one."""
+        assert self._db is not None
+        cur = await self._db.execute(
+            "UPDATE devices SET blocked = 0 WHERE device_id = ? AND blocked = 1",
+            (device_id,),
+        )
+        await self._db.commit()
+        return cur.rowcount > 0
+
+    async def find_blocked_by_push_token(self, user_id: str, push_token: str) -> str | None:
+        """Return the device_id of a BLOCKED device for this user that shares
+        the given APNs push token, or None. The push token is the stable
+        per-(device, app) identity, so a blocked phone cannot silently re-pair
+        under a new scoped token while in the hands of an attacker."""
+        assert self._db is not None
+        cur = await self._db.execute(
+            "SELECT device_id FROM devices "
+            "WHERE user_id = ? AND push_token = ? AND blocked = 1",
+            (user_id, push_token),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else None
