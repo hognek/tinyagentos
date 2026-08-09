@@ -364,6 +364,10 @@ async def client(app, tmp_data_dir):
     if project_element_store._db is not None:
         await project_element_store.close()
     await project_element_store.init()
+    project_notes_store = app.state.project_notes_store
+    if project_notes_store._db is not None:
+        await project_notes_store.close()
+    await project_notes_store.init()
     routine_store = app.state.routine_store
     if routine_store._db is not None:
         await routine_store.close()
@@ -431,6 +435,13 @@ async def client(app, tmp_data_dir):
     if council_members._db is not None:
         await council_members.close()
     await council_members.init()
+    # user_shares store (user-to-user resource sharing) is lifespan-owned;
+    # tests that bypass the lifespan must init it so routes can consult it.
+    user_shares = getattr(app.state, "user_shares", None)
+    if user_shares is not None:
+        if user_shares._db is not None:
+            await user_shares.close()
+        await user_shares.init()
     # BrowserApp v2 stores
     from tinyagentos.routes.desktop_browser.store import BrowserStore, BrowserCookieStore
     _browser_store = BrowserStore(tmp_data_dir / "browser.sqlite3")
@@ -493,12 +504,15 @@ async def client(app, tmp_data_dir):
     await feedback_store.close()
     await client_log_store.close()
     await project_element_store.close()
+    await project_notes_store.close()
     await app.state.qmd_client.close()
     await app.state.http_client.aclose()
     await _browser_store.close()
     await _browser_cookie_store.close()
     await app.state.council_roles.close()
     await app.state.council_members.close()
+    if user_shares is not None:
+        await user_shares.close()
 
 
 def create_test_qmd_db(db_path):

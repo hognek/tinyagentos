@@ -23,6 +23,7 @@ from tinyagentos.agent_registry_store import (
     verify_registry_token,
     _slugify,
 )
+from tinyagentos.routes.agent_registry import _ALLOWED_SCOPES
 from datetime import datetime, timezone
 
 
@@ -477,6 +478,16 @@ class TestAgentRegistryRoutes:
             )
             assert resp.status_code == 200, f"origin={origin!r} should be accepted"
 
+    async def test_register_reserved_name_rejected_as_client_error(self, registry_client):
+        """A reserved name through the real HTTP caller must 422, not 500 --
+        the route has to translate the store's ValueError."""
+        resp = await registry_client.post(
+            "/api/agents/registry/register",
+            json={"framework": "openclaw", "display_name": "taos-dev"},
+        )
+        assert resp.status_code == 422
+        assert "reserved prefix" in resp.json()["detail"]
+
     async def test_pubkey_endpoint_returns_pem(self, registry_client):
         resp = await registry_client.get("/api/agents/registry/pubkey")
         assert resp.status_code == 200
@@ -808,3 +819,13 @@ class TestFeedReadScope:
         assert "revoked" in r1.json()
         assert r2.status_code == 200
         assert "grants" in r2.json()
+
+
+def test_allowed_scopes_includes_project_doc_review():
+    """project_doc_review must be in the mint allowlist so internal agents can be granted it."""
+    assert "project_doc_review" in _ALLOWED_SCOPES
+
+
+def test_allowed_scopes_includes_observatory_control():
+    """observatory_control must be in the mint allowlist so internal agents can be granted it."""
+    assert "observatory_control" in _ALLOWED_SCOPES

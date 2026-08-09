@@ -2,6 +2,8 @@
 /*  Types                                                              */
 /* ------------------------------------------------------------------ */
 
+import { withCsrf } from "./csrf";
+
 export interface TweetMedia {
   type: string;
   url: string;
@@ -51,7 +53,9 @@ export interface XAuthStatus {
 
 async function fetchJson<T>(url: string, fallback: T, init?: RequestInit): Promise<T> {
   try {
-    const res = await fetch(url, { ...init, headers: { Accept: "application/json", ...init?.headers } });
+    const headers = new Headers(init?.headers);
+    headers.set("Accept", "application/json");
+    const res = await fetch(url, { ...init, headers });
     if (!res.ok) return fallback;
     const ct = res.headers.get("content-type") ?? "";
     if (!ct.includes("application/json")) return fallback;
@@ -62,19 +66,19 @@ async function fetchJson<T>(url: string, fallback: T, init?: RequestInit): Promi
 }
 
 async function postJson<T>(url: string, body: unknown, fallback: T): Promise<T> {
-  return fetchJson(url, fallback, {
+  return fetchJson(url, fallback, withCsrf({
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  });
+  }));
 }
 
 async function putJson<T>(url: string, body: unknown, fallback: T): Promise<T> {
-  return fetchJson(url, fallback, {
+  return fetchJson(url, fallback, withCsrf({
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
-  });
+  }));
 }
 
 /* ------------------------------------------------------------------ */
@@ -148,7 +152,7 @@ export async function deleteWatch(handle: string): Promise<boolean> {
   const result = await fetchJson<{ deleted?: boolean } | null>(
     `/api/x/watch/${encodeURIComponent(handle)}`,
     null,
-    { method: "DELETE" },
+    withCsrf({ method: "DELETE" }),
   );
   return result?.deleted === true;
 }

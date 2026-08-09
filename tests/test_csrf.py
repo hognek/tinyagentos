@@ -115,6 +115,39 @@ class TestVerifyCSRF:
 
         await todo_store.close()
 
+    @pytest.mark.asyncio
+    async def test_share_create_without_csrf_token_forbidden(self, app):
+        """POST /api/shares without matching X-CSRF-Token returns 403."""
+        from tinyagentos.user_shares_store import UserSharesStore
+
+        share_store = UserSharesStore(app.state.data_dir / "user_shares.db")
+        await share_store.init()
+        app.state.user_shares = share_store
+
+        app.state.auth.setup_user("csrftest2", "CSRF Test2", "", "pass1234!")
+        record = app.state.auth.find_user("csrftest2")
+        token = app.state.auth.create_session(user_id=record["id"], long_lived=False)
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            cookies={"taos_session": token, "csrf_token": "real-token"},
+        ) as c:
+            resp = await c.post(
+                "/api/shares",
+                json={
+                    "resource_type": "project",
+                    "resource_id": "proj-1",
+                    "to_username": "csrftest2",
+                    "permission": "read",
+                },
+                headers={"X-CSRF-Token": "wrong-token"},
+            )
+        assert resp.status_code == 403
+
+        await share_store.close()
+
 
 def test_verify_csrf_is_noop_for_websocket_scope():
     # verify_csrf is typed HTTPConnection so FastAPI injects it on BOTH http and

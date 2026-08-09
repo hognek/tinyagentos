@@ -42,7 +42,7 @@ describe("listItems", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, opts] = fetchMock.mock.calls[0];
     expect(url).toBe("/api/knowledge/items");
-    expect(opts.headers.Accept).toBe("application/json");
+    expect((opts.headers?.get?.("Accept") ?? opts.headers?.Accept)).toBe("application/json");
     expect(result.items).toHaveLength(2);
     expect(result.items[0].id).toBe("ki-1");
     expect(result.count).toBe(2);
@@ -104,7 +104,7 @@ describe("getItem", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, opts] = fetchMock.mock.calls[0];
     expect(url).toBe("/api/knowledge/items/ki-1");
-    expect(opts.headers.Accept).toBe("application/json");
+    expect((opts.headers?.get?.("Accept") ?? opts.headers?.Accept)).toBe("application/json");
     expect(result).toEqual({ id: "ki-1", title: "Hello", source_type: "web" });
   });
 
@@ -227,7 +227,7 @@ describe("ingestUrl", () => {
     const [url, opts] = fetchMock.mock.calls[0];
     expect(url).toBe("/api/knowledge/ingest");
     expect(opts.method).toBe("POST");
-    expect(opts.headers["Content-Type"]).toBe("application/json");
+    expect((opts.headers?.get?.("Content-Type") ?? opts.headers?.["Content-Type"])).toBe("application/json");
     const body = JSON.parse(opts.body);
     expect(body.url).toBe("https://example.com/article");
     expect(body.title).toBe("Example");
@@ -369,7 +369,7 @@ describe("createRule", () => {
     const [url, opts] = fetchMock.mock.calls[0];
     expect(url).toBe("/api/knowledge/rules");
     expect(opts.method).toBe("POST");
-    expect(opts.headers["Content-Type"]).toBe("application/json");
+    expect((opts.headers?.get?.("Content-Type") ?? opts.headers?.["Content-Type"])).toBe("application/json");
     const body = JSON.parse(opts.body);
     expect(body.pattern).toBe("github.com");
     expect(body.match_on).toBe("url");
@@ -483,7 +483,7 @@ describe("setSubscription", () => {
     const [url, opts] = fetchMock.mock.calls[0];
     expect(url).toBe("/api/knowledge/subscriptions");
     expect(opts.method).toBe("POST");
-    expect(opts.headers["Content-Type"]).toBe("application/json");
+    expect((opts.headers?.get?.("Content-Type") ?? opts.headers?.["Content-Type"])).toBe("application/json");
     const body = JSON.parse(opts.body);
     expect(body.agent_name).toBe("agent-1");
     expect(body.category).toBe("dev");

@@ -9,6 +9,8 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import RedirectResponse
 
+from tinyagentos.device_store import DEVICE_TOKEN_PREFIX
+
 EXEMPT_PATHS = {"/auth/login", "/auth/setup", "/auth/status", "/auth/me", "/auth/complete", "/auth/lock", "/api/health", "/api/version", "/setup", "/setup/complete", "/redeem", "/api/desktop/browser/push/vapid-public-key", "/api/desktop/browser/proxy-config", "/sw.js", "/desktop", "/desktop/index.html", "/chat-pwa", "/app.html", "/manifest", "/api/agents/registry/pubkey", "/api/share/destinations"}
 
 # Registry feed endpoints accept EITHER an admin session OR a registry JWT.
@@ -76,7 +78,7 @@ _AGENT_TASK_ROUTES = (
     # than the "read + lifecycle + comments" the project_tasks scope documents.
     # It is now reachable by a project_tasks_update-bound agent token, but the
     # route enforces the narrower scope + authorship/lead gate + a field
-    # whitelist (title, body, labels, status, priority) before any mutation, so
+    # whitelist (title, body, labels, priority) before any mutation, so
     # a project_tasks worker still cannot rewrite fields it was never meant to.
     ("PATCH", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}$")),
     # Mark-claimable curation: reachable by a Bearer token, but the handler
@@ -85,6 +87,44 @@ _AGENT_TASK_ROUTES = (
     # label, so it does not widen the scope into free field edits (cf. PATCH).
     ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/claimable$")),
 )
+
+# Project doc-review stamp store routes an agent may reach with its own registry
+# JWT (scope project_doc_review, verified + project-bound by the route).  These
+# are DYNAMIC paths (/api/projects/{pid}/doc-review/...), so a (method,
+# compiled-regex) allowlist is used.  The single-doc path is `path`-typed:
+# doc_path may contain slashes (e.g. src/foo.md), so the final segment is `(.+)`
+# rather than the slash-free `[^/]+` used for the task routes.  Same contract as
+# the task allowlist: the token only reaches the handler, which then verifies
+# the JWT + grant + project binding; nothing else is reachable by the token.
+_AGENT_DOC_REVIEW_ROUTES = (
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/doc-reviews$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/doc-review/(.+)$")),
+    ("PUT", re.compile(rf"^/api/projects/{_SEG}/doc-review/(.+)$")),
+)
+
+# Project notes store routes an agent may reach with its own registry JWT
+# (scope project_notes, verified + project-bound by the route).  The token only
+# reaches the handler, which then verifies the JWT + grant + project binding;
+# nothing else is reachable by the token.  List/create are on the collection
+# segment; patch/delete target a specific note id.
+_AGENT_NOTES_ROUTES = (
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/notes$")),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/notes$")),
+    ("PATCH", re.compile(rf"^/api/projects/{_SEG}/notes/{_SEG}$")),
+    ("DELETE", re.compile(rf"^/api/projects/{_SEG}/notes/{_SEG}$")),
+)
+
+
+def _is_agent_doc_review_path(method: str, path: str) -> bool:
+    """True only for the doc-review routes a project_doc_review token may reach."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_DOC_REVIEW_ROUTES)
+
+
+def _is_agent_notes_path(method: str, path: str) -> bool:
+    """True only for the notes routes a project_notes token may reach.
+    Strict method + anchored-regex match; everything else is excluded."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_NOTES_ROUTES)
+
 
 _AGENT_CANVAS_ROUTES = (
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/elements$")),
@@ -106,6 +146,29 @@ _AGENT_DECISIONS_ROUTES = (
     ("GET", re.compile(r"^/api/decisions/[^/]+/agent$")),
     ("GET", re.compile(r"^/api/decisions/agent$")),
 )
+
+# Device-bearer self-service paths (lock-screen push-token rotation plus
+# decision list/get/answer). A scoped device token (Bearer taosdev_...) may
+# pass through the auth gate on exactly these routes; the route dependency
+# (current_user_or_device) resolves the device and synthesizes a NON-admin
+# CurrentUser. request.state.user_id is left None on this path so device
+# bearers cannot reach other current_user / request.state consumers (e.g.
+# create_decision which reads uid=request.state.user_id). Session-authenticated
+# calls still work: the session-cookie check runs when no Bearer header is
+# present, so GET/POST without a Bearer reach the guard normally.
+_DEVICE_BEARER_PATHS = (
+    ("PATCH", re.compile(r"^/api/devices/[^/]+/push-token$")),
+    ("GET", re.compile(r"^/api/decisions$")),
+    ("GET", re.compile(r"^/api/decisions/[^/]+$")),
+    ("GET", re.compile(r"^/api/decisions/[^/]+/history$")),
+    ("POST", re.compile(r"^/api/decisions/[^/]+/answer$")),
+)
+
+
+def _is_device_bearer_path(method: str, path: str) -> bool:
+    """True only for the exact device-bearer self-service routes. Strict
+    method + anchored-regex match; everything else stays session-only."""
+    return any(m == method and rx.match(path) for m, rx in _DEVICE_BEARER_PATHS)
 
 # Project-files routes a files_read / files_write token may reach. Reads
 # (list/watch/get/trash-list/stats) require a files_read grant; writes
@@ -412,6 +475,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if (
             path in _AGENT_TOKEN_PATHS
             or _is_agent_task_path(request.method, path)
+            or _is_agent_doc_review_path(request.method, path)
+            or _is_agent_notes_path(request.method, path)
             or _is_agent_canvas_path(request.method, path)
             or _is_agent_decisions_path(request.method, path)
             or _is_agent_files_path(request.method, path)
@@ -420,6 +485,28 @@ class AuthMiddleware(BaseHTTPMiddleware):
             request.state.user_id = None
             request.state.is_admin = False
             request.state.via = "registry_jwt_candidate"
+            return await call_next(request)
+
+        # Device-bearer self-service: a scoped device token may pass the auth
+        # gate on the carded lock-screen routes. The middleware does NOT
+        # resolve the device -- it only lets the Bearer through with
+        # user_id=None (so current_user / request.state consumers stay
+        # session-only, Invariant c). The route dependency
+        # (current_user_or_device) resolves the token and synthesizes a
+        # non-admin CurrentUser (Invariant a).
+        if (
+            _is_device_bearer_path(request.method, path)
+            and auth_header.lower().startswith("bearer ")
+            # Only a DEVICE token may take this passthrough. Matching any
+            # bearer shadowed valid sessions: a logged-in user carrying an
+            # unrelated Authorization header got 401 on every carded route,
+            # because this branch sets user_id=None before the session was
+            # ever consulted.
+            and auth_header[7:].strip().startswith(DEVICE_TOKEN_PREFIX)
+        ):
+            request.state.user_id = None
+            request.state.is_admin = False
+            request.state.via = "device_bearer_candidate"
             return await call_next(request)
 
         # First boot: no user yet. Browsers go to the setup page; APIs

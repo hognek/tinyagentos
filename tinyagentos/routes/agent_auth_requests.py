@@ -78,6 +78,15 @@ VALID_SCOPES = frozenset({
     # per-project grant authorizes that project only. The route verifies the grant.
     "decisions_read",
     "decisions_write",
+    # Doc-review stamps: read/set review state on a project's docs
+    # (project-bound like project_tasks). Reconciled from master at beta.45 -
+    # the routes shipped on every install while the scope was missing here.
+    "project_doc_review",
+    # Project notes: read/write a project's persistent idea notes
+    # (title + markdown body) by a session owner/admin or a project-bound
+    # project_notes grant holder. Mirrors project_doc_review's single-scope
+    # read+write surface for a lightweight persistent notes surface.
+    "project_notes",
     "observatory_control",
 })
 

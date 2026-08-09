@@ -49,6 +49,42 @@ git worktree add ../taos-<task> -b feat/<task> origin/dev
   than letting the PR sprawl.
 
 
+## Never kill a shared-path process by its path
+
+Every agent on this box runs the SAME scripts out of `~/.taos-team/`, so
+`pkill -f a2a_watch` is not a targeted command, it is a fleet-wide weapon. It
+matches every other agent's instance identically to your own.
+
+This is not hypothetical. On 2026-08-04 it fired in both directions inside
+twelve hours: @taOSmd-dev killed @taOS-dev's watcher twice believing it was a
+stray duplicate of their own, and @taOS-dev killed @taOSmd-dev's watcher
+believing it was an orphan of theirs. Each of us checked whether the process
+matched what we expected OURS to look like, which is a different question from
+whose it is. Three watcher deaths and two wrong diagnoses came out of it.
+
+**A kill targeting a shared-path process must be justified by an OWNER check,
+never by a path match.** Identity lives in the environment, not the command
+line, because the command lines are identical:
+
+    tr '\0' '\n' < /proc/$pid/environ | grep -qx 'A2A_HB_FILE=/home/jay/.my-agent/heartbeat' && kill "$pid"
+
+Three traps in writing that check, all of which have bitten someone here:
+
+- `grep -q "pattern" /proc/<pid>/cmdline` NEVER matches: cmdline is
+  NUL-separated. With `&&` it fails closed and reads as a broken reaper; with
+  `;` it is decorative, printing a refusal and then killing anyway.
+- Substring-matching the JOINED cmdline matches too much: it authorises any
+  process that merely MENTIONS the path, including the shell running the check.
+- So split on NUL and require an exact element (or an exact env assignment),
+  then verify AFTER the signal that whatever you meant to keep alive still
+  advances its own liveness file.
+
+Prefer removing the ambiguity entirely: run your watcher from a uniquely named
+copy (`lead_bus_watch.sh`, `taosmd_bus_watch.sh`) so no one else's pattern can
+reach it, and write your pid to a pidfile. Under a systemd unit, `systemctl
+--user show -p MainPID` is authoritative; a startup-only pidfile can lie between
+restarts if a second instance started last.
+
 ## Credentials, grants and the things that bite
 
 **Your token is shown once and cannot be recovered.** Not by you, not by the
@@ -196,6 +232,24 @@ The surface, by scope:
 - **project_tasks_create**: `POST /api/projects/{pid}/tasks` (author new cards).
   This is a SEPARATE scope from project_tasks and is off by default; grant it
   explicitly when an agent needs to create cards.
+- **project_tasks_update**: `PATCH /api/projects/{pid}/tasks/{tid}` on the
+  whitelisted fields (title, body, labels, priority), own-or-lead cards only.
+  Also SEPARATE from project_tasks - a plain project_tasks token gets 403 on
+  PATCH. The seeded internal lead (@taOS-dev) carries it by default so it can
+  edit its own board's cards; assignee_id and parent_task_id stay human-only.
+- **project_doc_review**: read and write doc-review stamps for a project.
+  `GET /api/projects/{pid}/doc-reviews` (list), `GET /api/projects/{pid}/doc-review/{path}`
+  (read one), and `PUT /api/projects/{pid}/doc-review/{path}` (set state).
+  The route verifies the JWT + grant + project binding; the middleware allowlist
+  is closed to these paths only.
+- **project_notes**: read and write a project's persistent idea notes
+  (title + markdown body). `GET /api/projects/{pid}/notes` (list),
+  `POST /api/projects/{pid}/notes` (create), `PATCH /api/projects/{pid}/notes/{nid}`
+  (edit) and `DELETE /api/projects/{pid}/notes/{nid}`. One scope covers read and
+  write, mirroring project_doc_review. The route verifies the JWT + grant +
+  project binding, and a token bound to a DIFFERENT project gets a 404 rather
+  than a 403, so it cannot confirm that another project exists. The note's
+  author is taken from the verified token, never from the request body.
 - **canvas_read**: `GET .../canvas/elements`, `.../canvas/watch-projection`,
   `.../canvas/snapshot.png|.tldr`, `.../canvas/stream`. **canvas_write**: `POST .../canvas/elements`,
   `PATCH|DELETE .../canvas/elements/{id}`.
@@ -234,6 +288,40 @@ further project via `POST /api/projects/{project_id}/members/assign-agent`
 (admin/owner gated) or by redeeming an invite whose handle collides with an
 active identity (the existing canonical_id and token are reused instead of
 409ing).
+
+Reserved name prefixes: registration rejects any name whose slug is or starts
+with `user-`, `human-`, `admin-` or `taos-` (including casing, spacing and
+punctuation obfuscations like `U s e r`), so an external agent cannot mint an
+identity that reads as a person or as an internal taOS agent. The public
+register route returns 422. The admin-only internal mint/seed path is exempt -
+internal driver agents (`taos-dev`, ...) legitimately live under `taos-`.
+
+## Device bearer self-service (second, narrower passthrough)
+
+Beyond the `EXEMPT_PATHS` entry for `GET /api/share/destinations`, a paired
+device may call a small fixed set of routes with its scoped bearer. This is a
+**different and narrower mechanism**: the path is not exempt from auth, the
+middleware simply lets the request through with `user_id=None` so the route's
+own `current_user_or_device` dependency resolves the device and synthesizes a
+NON-admin identity.
+
+Two properties hold this together and both are enforced in code and tests:
+
+- The passthrough matches only tokens carrying the device prefix
+  (`taosdev_`). Matching any bearer previously shadowed valid sessions: a
+  logged-in user who happened to send an unrelated `Authorization` header got
+  401 on every one of these routes.
+- The allowlist is method-and-path anchored. `GET /api/devices`,
+  `DELETE /api/devices/{id}` and `POST /api/decisions` are deliberately NOT on
+  it and stay session-only.
+
+Device identity always comes from the verified bearer, never from the path or
+body, and a device is never admin.
+
+Note for reviewers: answering a decision on this path can apply app, execution
+and delegation grants, so a device bearer carries real authority for its own
+user. Device scoped tokens do not expire and cannot be self-rotated; the only
+revocation is `DELETE /api/devices/{id}` from a session.
 
 ## Share destinations (device bearer)
 
@@ -298,6 +386,28 @@ explicit `project_id`; `decisions_read` / `decisions_write` (and the other globa
 scopes) may be granted globally (`project_id=None`) or per-project. Creation
 surfaces a bell notification (`source: agent_scope_requests`) to the owner/admin,
 retired when the request is decided.
+
+## User resource sharing (share routes)
+
+Users can share resources with each other through the `/api/shares` endpoints
+in `tinyagentos/routes/user_shares.py`. The consent loop mirrors the
+external-agent consent pattern (`agent_auth_requests.py`): on share-create, a
+notification and a Decision record (type `approve_deny`) are raised to the
+target user so the desktop consent actions can approve or deny:
+
+- `POST /api/shares {resource_type, resource_id, to_username, permission}` —
+  share a resource with another user by username. Resolves the target via
+  AuthManager; self-share is rejected (400). Duplicate shares (same owner,
+  resource, target, permission) are idempotent.
+- `GET /api/shares?direction=out|in` — list shares. `out` (default) returns
+  shares the user owns; `in` returns shares where the user is the target.
+- `POST /api/shares/{id}/accept` — accept a pending share (target user only).
+  Once accepted, the module-level helper `user_can_access()` returns True for
+  that resource.
+- `POST /api/shares/{id}/deny` — deny a pending share (target user only).
+  The share row is preserved with `status=denied` for audit.
+- `DELETE /api/shares/{id}` — revoke a share. Owner or admin only
+  (requires `require_owner_or_admin` against the share's `owner_user_id`).
 
 ## Project invite redeem route (link + PIN)
 

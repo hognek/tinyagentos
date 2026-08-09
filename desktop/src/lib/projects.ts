@@ -124,6 +124,27 @@ export type Routine = {
   updated_at: number;
 };
 
+export type DocReviewState = "awaiting_review" | "approved" | "changes_requested";
+
+export type DocReview = {
+  id: string;
+  project_id: string;
+  doc_path: string;
+  review_state: DocReviewState;
+  reviewed_by: string | null;
+  reviewed_at: number | null;
+  changes_requested_by: string | null;
+  changes_requested_at: number | null;
+  created_at: number;
+  updated_at: number;
+};
+
+export type DocReviewMissing = {
+  project_id: string;
+  doc_path: string;
+  review_state: null;
+};
+
 export type TaskContextAncestor = { id: string; title: string; status: string };
 export type TaskContextBlocker = { id: string; title: string; status: string };
 
@@ -138,10 +159,12 @@ async function http<T>(path: string, init?: RequestInit): Promise<T> {
   // withCsrf attaches X-CSRF-Token on mutating methods (POST/PUT/PATCH/DELETE);
   // without it, cookie-authenticated project create/update/delete 403 with
   // "CSRF token missing". Non-mutating GETs pass through unchanged.
+  const headers = new Headers(init?.headers);
+  headers.set("Content-Type", "application/json");
   const r = await fetch(path, withCsrf({
     credentials: "include",
-    headers: { "Content-Type": "application/json", ...(init?.headers || {}) },
     ...init,
+    headers,
   }));
   if (!r.ok) {
     const text = await r.text().catch(() => r.statusText);
@@ -334,6 +357,22 @@ export const projectsApi = {
 
   activity: (pid: string) =>
     http<{ items: ProjectActivity[] }>(`/api/projects/${pid}/activity`).then((r) => r.items),
+
+  docReviews: {
+    list: (pid: string, state?: string) =>
+      http<{ items: DocReview[] }>(
+        `/api/projects/${encodeURIComponent(pid)}/doc-reviews${state ? `?state=${encodeURIComponent(state)}` : ""}`,
+      ).then((r) => r.items),
+    get: (pid: string, docPath: string) =>
+      http<DocReview | DocReviewMissing>(
+        `/api/projects/${encodeURIComponent(pid)}/doc-review/${encodeURIComponent(docPath)}`,
+      ),
+    set: (pid: string, docPath: string, state: string) =>
+      http<DocReview>(
+        `/api/projects/${encodeURIComponent(pid)}/doc-review/${encodeURIComponent(docPath)}`,
+        { method: "PUT", body: JSON.stringify({ state }) },
+      ),
+  },
 
   subscribeEvents(projectId: string, onEvent: (ev: ProjectEvent) => void): () => void {
     const es = new EventSource(`/api/projects/${projectId}/events`);

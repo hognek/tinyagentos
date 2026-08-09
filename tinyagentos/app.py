@@ -286,6 +286,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     agent_scope_requests_store = AgentScopeRequestsStore(data_dir / "agent_scope_requests.db")
     from tinyagentos.agent_grants_store import AgentGrantsStore
     agent_grants_store = AgentGrantsStore(data_dir / "agent_grants.db")
+    from tinyagentos.user_shares_store import UserSharesStore
+    user_shares_store = UserSharesStore(data_dir / "user_shares.db")
     from tinyagentos.app_grants_store import AppGrantsStore
     app_grants_store = AppGrantsStore(data_dir / "app_grants.db")
     from tinyagentos.license_acceptances_store import LicenseAcceptancesStore
@@ -399,6 +401,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     from tinyagentos.projects.events import ProjectEventBroker
     from tinyagentos.projects.canvas.store import ProjectCanvasStore as ProjectCanvasStoreImpl
     from tinyagentos.projects.canvas.snapshotter import CanvasSnapshotter
+    from tinyagentos.projects.doc_review_store import DocReviewStore
     from tinyagentos.projects.invite_store import ProjectInviteStore
     project_store = ProjectStore(data_dir / "projects.db")
     project_invite_store = ProjectInviteStore(data_dir / "project_invites.db")
@@ -419,6 +422,9 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     from tinyagentos.projects.routines_store import RoutineStore
     routine_store = RoutineStore(data_dir / "routines.db")
     project_canvas_store = ProjectCanvasStoreImpl(data_dir / "projects.db", broker=project_event_broker)
+    doc_review_store = DocReviewStore(data_dir / "projects.db")
+    from tinyagentos.projects.notes_store import ProjectNotesStore
+    project_notes_store = ProjectNotesStore(data_dir / "projects.db")
     from tinyagentos.decisions.decision_store import DecisionStore
     decision_store = DecisionStore(data_dir / "decisions.db")
     from tinyagentos.governance.policy_store import ExecutionPolicyStore
@@ -508,6 +514,9 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await auth_requests_store.init()
         await agent_scope_requests_store.init()
         await agent_grants_store.init()
+        app.state.agent_grants = agent_grants_store
+        await user_shares_store.init()
+        app.state.user_shares = user_shares_store
         await app_grants_store.init()
         await license_acceptances_store.init()
         await agent_model_key_store.init()
@@ -579,6 +588,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await project_element_store.init()
         await routine_store.init()
         await project_canvas_store.init()
+        await doc_review_store.init()
+        await project_notes_store.init()
         await decision_store.init()
         await execution_policy_store.init()
         await shared_docs_store.init()
@@ -1440,6 +1451,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
             except Exception:
                 logger.exception("canvas snapshotter stop failed")
         await project_canvas_store.close()
+        await doc_review_store.close()
+        await project_notes_store.close()
         await project_invite_store.close()
         await project_task_store.close()
         await project_element_store.close()
@@ -1603,6 +1616,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.project_event_broker = project_event_broker
     app.state.desktop_command_broker = desktop_command_broker
     app.state.project_canvas_store = project_canvas_store
+    app.state.doc_review_store = doc_review_store
+    app.state.project_notes_store = project_notes_store
     app.state.decision_store = decision_store
     app.state.execution_policies = execution_policy_store
     app.state.shared_docs_store = shared_docs_store
