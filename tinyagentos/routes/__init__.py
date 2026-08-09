@@ -192,6 +192,9 @@ def register_all_routers(app):
     from tinyagentos.routes.project_notes import router as project_notes_router
     app.include_router(project_notes_router, dependencies=_csrf)
 
+    from tinyagentos.routes.project_lists import router as project_lists_router
+    app.include_router(project_lists_router, dependencies=_csrf)
+
     from tinyagentos.routes.desktop_control import router as desktop_control_router
     app.include_router(desktop_control_router, dependencies=_csrf)
 

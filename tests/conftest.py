@@ -368,6 +368,14 @@ async def client(app, tmp_data_dir):
     if project_notes_store._db is not None:
         await project_notes_store.close()
     await project_notes_store.init()
+    project_lists_store = app.state.project_lists_store
+    if project_lists_store._db is not None:
+        await project_lists_store.close()
+    await project_lists_store.init()
+    project_list_entries_store = app.state.project_list_entries_store
+    if project_list_entries_store._db is not None:
+        await project_list_entries_store.close()
+    await project_list_entries_store.init()
     routine_store = app.state.routine_store
     if routine_store._db is not None:
         await routine_store.close()
@@ -509,6 +517,8 @@ async def client(app, tmp_data_dir):
     await client_log_store.close()
     await project_element_store.close()
     await project_notes_store.close()
+    await project_lists_store.close()
+    await project_list_entries_store.close()
     await app.state.qmd_client.close()
     await app.state.http_client.aclose()
     await _browser_store.close()
