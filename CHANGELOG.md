@@ -7,6 +7,30 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
 
 ## [Unreleased]
 
+### Added
+
+- **Docs**: new `taos-agent` OS skill (`.claude/skills/taos-agent/SKILL.md`) that
+  consolidates the agent-manual OS-operation content into actionable instructions for
+  the OS-native agent (opening and driving apps/windows, projects, files, memory,
+  notes, chat conventions, image generation, and answering the user), with the hard
+  rule that all desktop driving goes only through `POST /api/desktop/command` +
+  `POST /api/desktop/screenshot` prominently featured. The agent-manual index now
+  points at both the OS skill and the existing `taos-development-skill`. Draft for
+  @taOS-dev review.
+- Projects gain a Notes area: title + markdown notes per project, readable and
+  writable by the project owner or by an agent holding a project-bound
+  `project_notes` grant (new requestable scope) (#2285).
+- Chat renders `text` and `thinking` content blocks: thinking is a
+  collapsed-by-default disclosure with a proper ARIA expand/collapse contract (#2282).
+- Messages sidebar shows a live "thinking" badge on channels whose bound
+  taOStalk agent is currently working, on desktop and mobile (#2281).
+- Admin-only `POST /api/notifications` so orchestrators and lead agents can
+  raise review-request notifications through the store (and therefore through
+  SSE and web push) instead of a raw database insert (#2280).
+- Chat renders `tool_call` and `status` content blocks: tool calls as a
+  collapsible detail with an ARIA disclosure contract, status (and the
+  `question` variant) as a muted line with a "reply below" hint (#2275).
+
 ## [1.0.0-beta.46] - 2026-08-03
 
 ### Fixed
@@ -16,6 +40,8 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
   probed through validation errors (#2268).
 
 ### Added
+
+- **Library**: settings pane for download preferences: preferred quality and per-source rules (#2276).
 
 - Observatory fleet view for agents holding a global `observatory_control`
   grant; project-scoped grants see only their granted projects (#2267).
@@ -124,6 +150,8 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
 ## [1.0.0-beta.44] - 2026-07-26
 
 ### Added
+
+- **Cluster**: device and node revoke and blocking controls (#2238).
 
 - **Assistant Studio**: a workspace app for a personal-assistant agent. Pick a
   registered agent as your PA, then work out of one hub with Overview, Journal,

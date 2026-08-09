@@ -120,6 +120,52 @@ interface StorageViewData {
 const STORAGE_CAP_BYTES = 50 * 1024 * 1024 * 1024;
 
 /* ------------------------------------------------------------------ */
+/*  Library Settings (mock contract until #2060)                       */
+/* ------------------------------------------------------------------ */
+
+const LIBRARY_SETTINGS_KEY = "taos-library-settings";
+
+interface LibrarySettings {
+  preferred_quality: string;
+  storage_cap_bytes: number;
+  source_rules: Array<{ source: string; action: string; quality: string }>;
+}
+
+const QUALITY_OPTIONS = ["low", "medium", "high", "best"] as const;
+const ACTION_OPTIONS = ["download", "skip", "ask"] as const;
+
+const DEFAULT_LIBRARY_SETTINGS: LibrarySettings = {
+  preferred_quality: "high",
+  storage_cap_bytes: STORAGE_CAP_BYTES,
+  source_rules: [],
+};
+
+function loadLibrarySettings(): LibrarySettings {
+  try {
+    const raw = localStorage.getItem(LIBRARY_SETTINGS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<LibrarySettings>;
+      return {
+        preferred_quality: parsed.preferred_quality ?? DEFAULT_LIBRARY_SETTINGS.preferred_quality,
+        storage_cap_bytes: parsed.storage_cap_bytes ?? DEFAULT_LIBRARY_SETTINGS.storage_cap_bytes,
+        source_rules: Array.isArray(parsed.source_rules) ? parsed.source_rules : DEFAULT_LIBRARY_SETTINGS.source_rules,
+      };
+    }
+  } catch {
+    /* ignore */
+  }
+  return { ...DEFAULT_LIBRARY_SETTINGS };
+}
+
+function saveLibrarySettings(settings: LibrarySettings): void {
+  try {
+    localStorage.setItem(LIBRARY_SETTINGS_KEY, JSON.stringify(settings));
+  } catch {
+    /* ignore */
+  }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -139,7 +185,7 @@ const mockItemBytes = (id: string): number => {
   return (Math.abs(hash) % 4000 + 100) * 1024 * 1024;
 };
 
-const deriveMockStorageData = (items: KnowledgeItem[]): StorageViewData => {
+const deriveMockStorageData = (items: KnowledgeItem[], capBytes: number): StorageViewData => {
   const itemRows: ItemStorageRow[] = items.map((item) => ({
     id: item.id,
     title: item.title || "Untitled",
@@ -157,8 +203,8 @@ const deriveMockStorageData = (items: KnowledgeItem[]): StorageViewData => {
     .sort((a, b) => b.bytes - a.bytes);
   return {
     total_bytes: totalBytes,
-    cap_bytes: STORAGE_CAP_BYTES,
-    paused_at_cap: totalBytes >= STORAGE_CAP_BYTES,
+    cap_bytes: capBytes,
+    paused_at_cap: totalBytes >= capBytes,
     sources,
     items: itemRows.sort((a, b) => b.bytes - a.bytes),
   };
@@ -228,7 +274,11 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
     monitor: null,
   });
 
-  const [activeView, setActiveView] = useState<"items" | "storage">("items");
+  const [activeView, setActiveView] = useState<"items" | "storage" | "settings">("items");
+
+  /* ---------- settings ---------- */
+  const [settings, setSettings] = useState<LibrarySettings>(() => loadLibrarySettings());
+  const [newSourceRule, setNewSourceRule] = useState({ source: "", action: "download" as const, quality: "high" as const });
 
   /* ---------- detail state ---------- */
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
@@ -480,6 +530,32 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
     setRules((prev) => prev.filter((r) => r.id !== id));
   }, []);
 
+  /* ---------- settings handlers ---------- */
+
+  const handleAddSourceRule = useCallback(() => {
+    if (!newSourceRule.source) return;
+    setSettings((prev) => {
+      const next = {
+        ...prev,
+        source_rules: [...prev.source_rules, { ...newSourceRule }],
+      };
+      saveLibrarySettings(next);
+      return next;
+    });
+    setNewSourceRule({ source: "", action: "download", quality: "high" });
+  }, [newSourceRule]);
+
+  const handleDeleteSourceRule = useCallback((index: number) => {
+    setSettings((prev) => {
+      const next = {
+        ...prev,
+        source_rules: prev.source_rules.filter((_, i) => i !== index),
+      };
+      saveLibrarySettings(next);
+      return next;
+    });
+  }, []);
+
   /* ---------------------------------------------------------------- */
   /*  Render helpers                                                   */
   /* ---------------------------------------------------------------- */
@@ -692,7 +768,7 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
             </div>
           )}
           <div className="flex items-center gap-1 shrink-0" role="radiogroup" aria-label="View mode">
-            {(["items", "storage"] as const).map((v) => (
+            {(["items", "storage", "settings"] as const).map((v) => (
               <Button
                 key={v}
                 variant={activeView === v ? "secondary" : "ghost"}
@@ -1008,7 +1084,7 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
       </div>
     </main>
   ) : (() => {
-    const data = deriveMockStorageData(items);
+    const data = deriveMockStorageData(items, settings.storage_cap_bytes);
     const totalPct = Math.min(100, (data.total_bytes / data.cap_bytes) * 100);
     return (
       <main className="flex-1 flex flex-col overflow-hidden">
@@ -1103,6 +1179,163 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
       </main>
     );
   })();
+
+  /* ---------------------------------------------------------------- */
+  /*  Settings View UI                                                  */
+  /* ---------------------------------------------------------------- */
+
+  const settingsViewUI = (
+    <main className="flex-1 flex flex-col overflow-hidden">
+      <div className="flex flex-col gap-2 px-4 py-3 border-b border-white/5 shrink-0">
+        <span className="text-xs font-medium">Library Settings</span>
+        <span className="text-[11px] text-shell-text-tertiary">(mock until #2060)</span>
+      </div>
+      <div className="flex-1 overflow-y-auto p-4 space-y-6">
+        {/* Preferred Quality */}
+        <section>
+          <p className="text-[10px] uppercase tracking-wider text-shell-text-tertiary mb-2">Preferred Quality</p>
+          <div className="space-y-1">
+            <label className="text-xs text-shell-text-secondary" htmlFor="preferred-quality">
+              Default download quality
+            </label>
+            <select
+              id="preferred-quality"
+              value={settings.preferred_quality}
+              onChange={(e) => {
+                const next = { ...settings, preferred_quality: e.target.value };
+                saveLibrarySettings(next);
+                setSettings(next);
+              }}
+              className="flex h-9 w-full rounded-lg border border-white/10 bg-shell-bg-deep px-3 text-sm text-shell-text focus-visible:outline-none focus-visible:border-accent/40"
+            >
+              {QUALITY_OPTIONS.map((q) => (
+                <option key={q} value={q}>{q}</option>
+              ))}
+            </select>
+          </div>
+        </section>
+
+        {/* Storage Cap */}
+        <section>
+          <p className="text-[10px] uppercase tracking-wider text-shell-text-tertiary mb-2">Storage Cap</p>
+          <div className="space-y-1">
+            <label className="text-xs text-shell-text-secondary" htmlFor="storage-cap">
+              Maximum storage (bytes)
+            </label>
+            <Input
+              id="storage-cap"
+              type="number"
+              value={settings.storage_cap_bytes}
+              onChange={(e) => {
+                const next = { ...settings, storage_cap_bytes: parseInt(e.target.value) || 0 };
+                saveLibrarySettings(next);
+                setSettings(next);
+              }}
+              className="text-xs"
+            />
+            <p className="text-[11px] text-shell-text-tertiary">
+              {fmtBytes(settings.storage_cap_bytes)}
+            </p>
+          </div>
+        </section>
+
+        {/* Per-source Rules */}
+        <section>
+          <p className="text-[10px] uppercase tracking-wider text-shell-text-tertiary mb-2">Per-source Rules</p>
+          {settings.source_rules.length > 0 ? (
+            <table className="w-full text-xs">
+              <thead>
+                <tr className="text-shell-text-tertiary border-b border-white/5">
+                  <th className="text-left pb-1.5 font-normal" scope="col">Source</th>
+                  <th className="text-left pb-1.5 font-normal" scope="col">Action</th>
+                  <th className="text-left pb-1.5 font-normal" scope="col">Quality</th>
+                  <th className="pb-1.5 w-8"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {settings.source_rules.map((rule, idx) => (
+                  <tr key={`${rule.source}-${rule.action}-${rule.quality}-${idx}`} className="border-t border-white/5">
+                    <td className="py-1.5 pr-2 text-shell-text-secondary">{rule.source}</td>
+                    <td className="py-1.5 pr-2 text-shell-text-secondary">{rule.action}</td>
+                    <td className="py-1.5 pr-2 text-shell-text-secondary">{rule.quality}</td>
+                    <td className="py-1.5">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-6 w-6 hover:text-red-400 hover:bg-red-500/15"
+                        onClick={() => handleDeleteSourceRule(idx)}
+                        aria-label={`Delete rule for ${rule.source}`}
+                      >
+                        <Trash2 size={11} />
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <p className="text-xs text-shell-text-tertiary italic">No source rules yet</p>
+          )}
+
+          {/* Add rule form */}
+          <div className="border-t border-white/5 pt-3 mt-3 space-y-2">
+            <p className="text-[10px] text-shell-text-tertiary uppercase tracking-wider">Add rule</p>
+            <div className="grid grid-cols-3 gap-2">
+              <div className="space-y-1">
+                <label className="text-[10px] text-shell-text-tertiary" htmlFor="rule-source">Source</label>
+                <select
+                  id="rule-source"
+                  value={newSourceRule.source}
+                  onChange={(e) => setNewSourceRule((prev) => ({ ...prev, source: e.target.value }))}
+                  className="flex h-7 w-full rounded-lg border border-white/10 bg-shell-bg-deep px-2 text-xs text-shell-text focus-visible:outline-none focus-visible:border-accent/40"
+                >
+                  <option value="">Select...</option>
+                  {SOURCE_TYPES.map((s) => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] text-shell-text-tertiary" htmlFor="rule-action">Action</label>
+                <select
+                  id="rule-action"
+                  value={newSourceRule.action}
+                  onChange={(e) => setNewSourceRule((prev) => ({ ...prev, action: e.target.value as typeof prev.action }))}
+                  className="flex h-7 w-full rounded-lg border border-white/10 bg-shell-bg-deep px-2 text-xs text-shell-text focus-visible:outline-none focus-visible:border-accent/40"
+                >
+                  {ACTION_OPTIONS.map((a) => (
+                    <option key={a} value={a}>{a}</option>
+                  ))}
+                </select>
+              </div>
+              <div className="space-y-1">
+                <label className="text-[10px] text-shell-text-tertiary" htmlFor="rule-quality">Quality</label>
+                <select
+                  id="rule-quality"
+                  value={newSourceRule.quality}
+                  onChange={(e) => setNewSourceRule((prev) => ({ ...prev, quality: e.target.value as typeof prev.quality }))}
+                  className="flex h-7 w-full rounded-lg border border-white/10 bg-shell-bg-deep px-2 text-xs text-shell-text focus-visible:outline-none focus-visible:border-accent/40"
+                >
+                  {QUALITY_OPTIONS.map((q) => (
+                    <option key={q} value={q}>{q}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <Button
+              size="sm"
+              className="text-xs"
+              onClick={handleAddSourceRule}
+              disabled={!newSourceRule.source}
+              aria-label="Add source rule"
+            >
+              Add rule
+            </Button>
+          </div>
+        </section>
+      </div>
+    </main>
+  );
 
   /* ---------------------------------------------------------------- */
   /*  Detail View UI                                                   */
@@ -1689,6 +1922,8 @@ export function LibraryApp({ windowId: _windowId }: { windowId: string }) {
               {!isMobile && sidebarUI}
               {listViewUI}
             </div>
+          ) : activeView === "settings" ? (
+            settingsViewUI
           ) : (
             storageViewUI
           )

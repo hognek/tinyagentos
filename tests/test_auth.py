@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import stat
 import time
 
@@ -134,6 +135,88 @@ class TestAuthManager:
         mgr.cleanup_sessions()
         assert t1 not in mgr._sessions
         assert t2 in mgr._sessions
+
+    def test_prune_expired_sessions_at_startup(self, tmp_path):
+        """Expired entries are pruned when AuthManager is initialized."""
+        mgr = AuthManager(tmp_path)
+        # Create an expired session (will be written to file)
+        token = mgr.create_session(user_id="uid1")
+        # Manually expire it and force prune
+        mgr._sessions[token] = {"user_id": "uid1", "expires_at": time.time() - 1, "long_lived": False}
+        mgr.cleanup_sessions()
+        assert token not in mgr._sessions
+        
+        # Create a valid session
+        token2 = mgr.create_session(user_id="uid2")
+        # Verify it's still valid
+        assert mgr.validate_session(token2) is not None
+
+    def test_prune_at_startup_removes_expired(self, tmp_path):
+        """Expired sessions from previous run are pruned at startup."""
+        # Create a file with expired session content (simulating previous run)
+        session_data = {"expired_token": {"user_id": "uid1", "expires_at": time.time() - 3600, "long_lived": False}}
+        sessions_file = tmp_path / ".auth_sessions"
+        sessions_file.write_text(json.dumps(session_data))
+        
+        # Now create a new manager - should prune the expired session
+        mgr2 = AuthManager(tmp_path)
+        # The expired token should be removed
+        assert "expired_token" not in mgr2._sessions
+
+    def test_prune_at_startup_preserves_unexpired(self, tmp_path):
+        """Unexpired sessions survive startup pruning."""
+        # Create a file with valid session content (simulating previous run)
+        token1 = "valid_token_123"
+        session_data = {token1: {"user_id": "uid1", "expires_at": time.time() + 3600, "long_lived": False}}
+        sessions_file = tmp_path / ".auth_sessions"
+        sessions_file.write_text(json.dumps(session_data))
+        
+        # New manager should preserve it
+        mgr2 = AuthManager(tmp_path)
+        assert token1 in mgr2._sessions
+
+    def test_prune_long_lived_unexpired_survives(self, tmp_path):
+        """Long-lived sessions survive pruning when unexpired."""
+        # Create a file with long-lived valid session (simulating previous run)
+        token1 = "long_lived_token_456"
+        session_data = {token1: {"user_id": "uid1", "expires_at": time.time() + 3600, "long_lived": True}}
+        sessions_file = tmp_path / ".auth_sessions"
+        sessions_file.write_text(json.dumps(session_data))
+        
+        # New manager should preserve it
+        mgr2 = AuthManager(tmp_path)
+        assert token1 in mgr2._sessions
+        assert mgr2._sessions[token1]["long_lived"] is True
+
+    def test_prune_at_startup_shrinks_the_file(self, tmp_path):
+        """Startup pruning must persist: the sessions FILE shrinks at init,
+        not merely the in-memory view (which _load() already prunes)."""
+        expired = {
+            f"tok{i}": {"user_id": "u", "expires_at": time.time() - 10, "long_lived": False}
+            for i in range(50)
+        }
+        expired["live"] = {"user_id": "u", "expires_at": time.time() + 3600, "long_lived": False}
+        sessions_file = tmp_path / ".auth_sessions"
+        sessions_file.write_text(json.dumps(expired))
+        size_before = sessions_file.stat().st_size
+
+        AuthManager(tmp_path)
+
+        on_disk = json.loads(sessions_file.read_text())
+        assert list(on_disk) == ["live"]
+        assert sessions_file.stat().st_size < size_before
+
+    def test_prune_already_clean_is_noop(self, tmp_path):
+        """Pruning an already-clean store (no expired entries) is a no-op."""
+        # Create a file with no expired entries (simulating clean state)
+        token1 = "valid_token_789"
+        session_data = {token1: {"user_id": "uid1", "expires_at": time.time() + 3600, "long_lived": False}}
+        sessions_file = tmp_path / ".auth_sessions"
+        sessions_file.write_text(json.dumps(session_data))
+        
+        # Create new manager - should preserve the valid session
+        mgr2 = AuthManager(tmp_path)
+        assert token1 in mgr2._sessions
 
 
 # --- Integration tests for routes ---

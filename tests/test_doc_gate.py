@@ -190,3 +190,108 @@ def test_glob_double_star_matches_bare_parent():
     # A single `*` still does not cross a separator.
     assert _glob_match("tinyagentos/routes/desktop_browser/__init__.py",
                        "tinyagentos/routes/*.py") is False
+
+
+# ---------------------------------------------------------------------------
+# Changelog fragments: a new changelog.d/*.md file satisfies the changelog rule
+# instead of editing CHANGELOG.md, so concurrent PRs cannot conflict on the
+# shared [Unreleased] anchor. The gate must NOT go inert in the process.
+# ---------------------------------------------------------------------------
+
+CHANGELOG_RULE_CONFIG = {
+    "gate": {"trailer": "Docs-Reviewed:"},
+    "rules": [
+        {
+            "name": "user-visible-changelog",
+            "on_modify": True,
+            "when_changed": [
+                "tinyagentos/routes/*.py",
+                "desktop/src/apps/*/**",
+                "desktop/src/App.tsx",
+                "desktop/src/components/**",
+                "desktop/src/stores/**",
+                "tinyagentos/installers/*",
+            ],
+            "require_doc": ["CHANGELOG.md", "changelog.d/*.md"],
+            "hint": "user-visible behaviour changed",
+        },
+    ],
+}
+
+
+class TestChangelogFragments:
+    def test_fragment_satisfies_the_changelog_rule(self):
+        changed = [
+            ("M", "tinyagentos/routes/notifications.py"),
+            ("A", "changelog.d/2291-notes.md"),
+        ]
+        assert dg.evaluate_rules(changed, [], CHANGELOG_RULE_CONFIG) == []
+
+    def test_editing_changelog_directly_still_satisfies_it(self):
+        """Additive, not a migration - the old path must keep working."""
+        changed = [
+            ("M", "tinyagentos/routes/notifications.py"),
+            ("M", "CHANGELOG.md"),
+        ]
+        assert dg.evaluate_rules(changed, [], CHANGELOG_RULE_CONFIG) == []
+
+    def test_neither_fragment_nor_changelog_nor_trailer_STILL_FAILS(self):
+        """The point is fewer conflicts, NOT a weaker gate.
+
+        If this ever passes the rule has gone inert and user-visible changes
+        ship undocumented. This is the case that caught a real mistake while
+        the feature was being built: putting the convention README inside
+        changelog.d/ made it match the glob, so the gate went green here.
+        """
+        changed = [("M", "tinyagentos/routes/notifications.py")]
+        failures = dg.evaluate_rules(changed, [], CHANGELOG_RULE_CONFIG)
+        assert len(failures) == 1
+        assert failures[0].startswith("user-visible-changelog -- ")
+
+    def test_fragment_in_a_subdirectory_does_not_count(self):
+        """One segment deep on purpose: a stray markdown file nested under
+        changelog.d/ must not silently satisfy the rule."""
+        changed = [
+            ("M", "tinyagentos/routes/notifications.py"),
+            ("A", "changelog.d/archive/old.md"),
+        ]
+        assert len(dg.evaluate_rules(changed, [], CHANGELOG_RULE_CONFIG)) == 1
+
+    def test_non_markdown_fragment_does_not_count(self):
+        changed = [
+            ("M", "tinyagentos/routes/notifications.py"),
+            ("A", "changelog.d/2291-notes.txt"),
+        ]
+        assert len(dg.evaluate_rules(changed, [], CHANGELOG_RULE_CONFIG)) == 1
+
+    def test_desktop_app_shell_triggers_changelog_rule(self):
+        changed = [("M", "desktop/src/App.tsx")]
+        failures = dg.evaluate_rules(changed, [], CHANGELOG_RULE_CONFIG)
+        assert len(failures) == 1
+        assert failures[0].startswith("user-visible-changelog -- ")
+
+    def test_desktop_component_triggers_changelog_rule(self):
+        changed = [("M", "desktop/src/components/Desktop.tsx")]
+        failures = dg.evaluate_rules(changed, [], CHANGELOG_RULE_CONFIG)
+        assert len(failures) == 1
+        assert failures[0].startswith("user-visible-changelog -- ")
+
+    def test_desktop_store_triggers_changelog_rule(self):
+        changed = [("M", "desktop/src/stores/theme-store.ts")]
+        failures = dg.evaluate_rules(changed, [], CHANGELOG_RULE_CONFIG)
+        assert len(failures) == 1
+        assert failures[0].startswith("user-visible-changelog -- ")
+
+    def test_desktop_shell_fragment_satisfies_rule(self):
+        changed = [
+            ("M", "desktop/src/App.tsx"),
+            ("A", "changelog.d/2303-reduce-effects.md"),
+        ]
+        assert dg.evaluate_rules(changed, [], CHANGELOG_RULE_CONFIG) == []
+
+    def test_desktop_shell_test_file_does_not_trigger(self):
+        changed = [
+            ("A", "desktop/src/components/__tests__/Desktop.test.tsx"),
+            ("A", "desktop/src/stores/__tests__/theme-store.test.ts"),
+        ]
+        assert dg.evaluate_rules(changed, [], CHANGELOG_RULE_CONFIG) == []

@@ -423,6 +423,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     routine_store = RoutineStore(data_dir / "routines.db")
     project_canvas_store = ProjectCanvasStoreImpl(data_dir / "projects.db", broker=project_event_broker)
     doc_review_store = DocReviewStore(data_dir / "projects.db")
+    from tinyagentos.projects.notes_store import ProjectNotesStore
+    project_notes_store = ProjectNotesStore(data_dir / "projects.db")
     from tinyagentos.decisions.decision_store import DecisionStore
     decision_store = DecisionStore(data_dir / "decisions.db")
     from tinyagentos.governance.policy_store import ExecutionPolicyStore
@@ -441,6 +443,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     desktop_settings = DesktopSettingsStore(data_dir / "desktop.db")
     from tinyagentos.device_store import DeviceStore
     device_store = DeviceStore(data_dir / "devices.db")
+    from tinyagentos.device_pair_requests_store import DevicePairRequestsStore
+    device_pair_requests_store = DevicePairRequestsStore(data_dir / "device_pair_requests.db")
     from tinyagentos.push.apns import apns_sender_from_env
     apns_sender = apns_sender_from_env()
     user_memory = UserMemoryStore(data_dir / "user_memory.db")
@@ -587,6 +591,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await routine_store.init()
         await project_canvas_store.init()
         await doc_review_store.init()
+        await project_notes_store.init()
         await decision_store.init()
         await execution_policy_store.init()
         await shared_docs_store.init()
@@ -598,6 +603,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await canvas_store.init()
         await desktop_settings.init()
         await device_store.init()
+        await device_pair_requests_store.init()
         await user_memory.init()
         await installed_apps.init()
         await feedback_store.init()
@@ -1426,6 +1432,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await user_memory.close()
         await desktop_settings.close()
         await device_store.close()
+        await device_pair_requests_store.close()
         # Close the APNs sender's httpx client (self-created by HttpApnsSender);
         # guarded so the Null sender or a missing attribute is a no-op.
         _apns = getattr(app.state, "apns_sender", None)
@@ -1449,6 +1456,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
                 logger.exception("canvas snapshotter stop failed")
         await project_canvas_store.close()
         await doc_review_store.close()
+        await project_notes_store.close()
         await project_invite_store.close()
         await project_task_store.close()
         await project_element_store.close()
@@ -1613,6 +1621,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.desktop_command_broker = desktop_command_broker
     app.state.project_canvas_store = project_canvas_store
     app.state.doc_review_store = doc_review_store
+    app.state.project_notes_store = project_notes_store
     app.state.decision_store = decision_store
     app.state.execution_policies = execution_policy_store
     app.state.shared_docs_store = shared_docs_store
@@ -1630,6 +1639,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.canvas_store = canvas_store
     app.state.desktop_settings = desktop_settings
     app.state.device_store = device_store
+    app.state.device_pair_requests = device_pair_requests_store
     app.state.apns_sender = apns_sender
     app.state.user_memory = user_memory
     app.state.user_personas = user_personas
