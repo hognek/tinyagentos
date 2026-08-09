@@ -20,220 +20,19 @@ from tinyagentos.agent_token_auth import check_agent_scope
 
 
 @pytest_asyncio.fixture
-async def agent_app(app):
-    """AsyncClient logged in as admin + agent_registry / agent_grants initialised."""
+async def agent_app(app, client):
+    """AsyncClient logged in as admin + agent_registry / agent_grants initialised.
+
+    Reuses the shared ``client`` fixture (which initialises every store and
+    sets up the admin session) and only adds the agent_registry and
+    agent_grants stores on top.  This prevents breakage when new stores get
+    added to conftest — there is no copy-paste to drift.
+    """
     for attr in ("agent_registry", "agent_grants"):
         store = getattr(app.state, attr, None)
         if store is not None and store._db is None:
             await store.init()
-    # Reuse the same init + admin-session logic as the main client fixture
-    store = app.state.metrics
-    if store._db is not None:
-        await store.close()
-    await store.init()
-    notif_store = app.state.notifications
-    if notif_store._db is not None:
-        await notif_store.close()
-    await notif_store.init()
-    await app.state.qmd_client.init()
-    secrets_store = app.state.secrets
-    if secrets_store._db is not None:
-        await secrets_store.close()
-    await secrets_store.init()
-    broker_store = app.state.broker_store
-    if broker_store._db is not None:
-        await broker_store.close()
-    await broker_store.init()
-    scheduler = app.state.scheduler
-    if scheduler._db is not None:
-        await scheduler.close()
-    await scheduler.init()
-    channel_store = app.state.channels
-    if channel_store._db is not None:
-        await channel_store.close()
-    await channel_store.init()
-    relationship_mgr = app.state.relationships
-    if relationship_mgr._db is not None:
-        await relationship_mgr.close()
-    await relationship_mgr.init()
-    conversion_mgr = app.state.conversion
-    if conversion_mgr._db is not None:
-        await conversion_mgr.close()
-    await conversion_mgr.init()
-    training_mgr = app.state.training
-    if training_mgr._db is not None:
-        await training_mgr.close()
-    await training_mgr.init()
-    agent_messages = app.state.agent_messages
-    if agent_messages._db is not None:
-        await agent_messages.close()
-    await agent_messages.init()
-    shared_folders = app.state.shared_folders
-    if shared_folders._db is not None:
-        await shared_folders.close()
-    await shared_folders.init()
-    streaming_sessions = app.state.streaming_sessions
-    if streaming_sessions._db is not None:
-        await streaming_sessions.close()
-    await streaming_sessions.init()
-    expert_agents = app.state.expert_agents
-    if expert_agents._db is not None:
-        await expert_agents.close()
-    await expert_agents.init()
-    chat_messages = app.state.chat_messages
-    if chat_messages._db is not None:
-        await chat_messages.close()
-    await chat_messages.init()
-    chat_channels = app.state.chat_channels
-    if chat_channels._db is not None:
-        await chat_channels.close()
-    await chat_channels.init()
-    project_store = app.state.project_store
-    if project_store._db is not None:
-        await project_store.close()
-    await project_store.init()
-    project_invites = app.state.project_invites
-    if project_invites._db is not None:
-        await project_invites.close()
-    await project_invites.init()
-    board_audit = app.state.board_audit
-    if board_audit._db is not None:
-        await board_audit.close()
-    await board_audit.init()
-    receipt_store = app.state.receipt_store
-    if receipt_store._db is not None:
-        await receipt_store.close()
-    await receipt_store.init()
-    project_task_store = app.state.project_task_store
-    if project_task_store._db is not None:
-        await project_task_store.close()
-    await project_task_store.init()
-    project_element_store = app.state.project_element_store
-    if project_element_store._db is not None:
-        await project_element_store.close()
-    await project_element_store.init()
-    routine_store = app.state.routine_store
-    if routine_store._db is not None:
-        await routine_store.close()
-    await routine_store.init()
-    decision_store = app.state.decision_store
-    if decision_store._db is not None:
-        await decision_store.close()
-    await decision_store.init()
-    execution_policies = app.state.execution_policies
-    if execution_policies._db is not None:
-        await execution_policies.close()
-    await execution_policies.init()
-    coding_session_store = app.state.coding_session_store
-    if coding_session_store._db is not None:
-        await coding_session_store.close()
-    await coding_session_store.init()
-    app.state.projects_root.mkdir(parents=True, exist_ok=True)
-    canvas_store = app.state.canvas_store
-    if canvas_store._db is not None:
-        await canvas_store.close()
-    await canvas_store.init()
-    themes = app.state.themes
-    if themes._db is not None:
-        await themes.close()
-    await themes.init()
-    office_docs = app.state.office_docs
-    if office_docs._db is not None:
-        await office_docs.close()
-    await office_docs.init()
-    web_sites = app.state.web_sites
-    if web_sites._db is not None:
-        await web_sites.close()
-    await web_sites.init()
-    song_store = app.state.song_store
-    if song_store._db is not None:
-        await song_store.close()
-    await song_store.init()
-    design_docs = app.state.design_docs
-    if design_docs._db is not None:
-        await design_docs.close()
-    await design_docs.init()
-    await app.state.app_grants.init()
-    await app.state.license_acceptances.init()
-    feedback_store = app.state.feedback_store
-    if feedback_store._db is not None:
-        await feedback_store.close()
-    await feedback_store.init()
-    client_log_store = app.state.client_log_store
-    if client_log_store._db is not None:
-        await client_log_store.close()
-    await client_log_store.init()
-    device_store = app.state.device_store
-    if device_store._db is not None:
-        await device_store.close()
-    await device_store.init()
-    council_roles = app.state.council_roles
-    if council_roles._db is not None:
-        await council_roles.close()
-    await council_roles.init()
-    council_members = app.state.council_members
-    if council_members._db is not None:
-        await council_members.close()
-    await council_members.init()
-    from tinyagentos.routes.desktop_browser.store import BrowserStore, BrowserCookieStore
-    _browser_store = BrowserStore(app.state.data_dir / "browser.sqlite3")
-    await _browser_store.init()
-    app.state.browser_store = _browser_store
-    _browser_cookie_store = BrowserCookieStore(
-        app.state.data_dir / "browser_cookies.sqlite3", key_hex="0" * 64
-    )
-    await _browser_cookie_store.init()
-    app.state.browser_cookie_store = _browser_cookie_store
-    from tinyagentos.routes.desktop_browser.copilot_ws import CopilotTicketStore, CopilotHub
-    app.state.copilot_ticket_store = CopilotTicketStore()
-    app.state.copilot_hub = CopilotHub()
-    app.state.auth.setup_user("admin", "Test Admin", "", "testpass")
-    _record = app.state.auth.find_user("admin")
-    _uid = _record["id"] if _record else ""
-    _token = app.state.auth.create_session(user_id=_uid, long_lived=True)
-    app.state._startup_complete = True
-    transport = ASGITransport(app=app)
-    async with AsyncClient(
-        transport=transport,
-        base_url="http://test",
-        cookies={"taos_session": _token},
-    ) as c:
-        yield c
-    await canvas_store.close()
-    await project_task_store.close()
-    await routine_store.close()
-    await board_audit.close()
-    await project_store.close()
-    await project_invites.close()
-    await chat_channels.close()
-    await chat_messages.close()
-    await expert_agents.close()
-    await streaming_sessions.close()
-    await shared_folders.close()
-    await agent_messages.close()
-    await conversion_mgr.close()
-    await training_mgr.close()
-    await relationship_mgr.close()
-    await channel_store.close()
-    await scheduler.close()
-    await secrets_store.close()
-    await broker_store.close()
-    await notif_store.close()
-    await store.close()
-    await office_docs.close()
-    await web_sites.close()
-    await song_store.close()
-    await design_docs.close()
-    await coding_session_store.close()
-    await feedback_store.close()
-    await client_log_store.close()
-    await project_element_store.close()
-    await app.state.qmd_client.close()
-    await app.state.http_client.aclose()
-    await _browser_store.close()
-    await _browser_cookie_store.close()
-    await council_roles.close()
-    await council_members.close()
+    yield client
 
 
 # ---------------------------------------------------------------------------
@@ -251,8 +50,13 @@ class _FakeRequest:
             self.headers["Authorization"] = f"Bearer {token}"
 
 
-async def _register_and_mint(app, *, user_id="u", scopes=("a2a_receive",)):
+async def _register_and_mint(app, *, user_id="u", owner_user_id=None, scopes=("a2a_receive",)):
     """Register an active agent, add grants, and mint a signed JWT.
+
+    If *owner_user_id* is given it is passed to ``register(user_id=...)``
+    so the DB row's owner matches.  Otherwise the DB row uses the default
+    (empty string, admin-only) while the JWT claim gets the separate
+    *user_id* value (legacy behaviour for auth-path tests).
 
     Returns (canonical_id, token).
     """
@@ -264,6 +68,7 @@ async def _register_and_mint(app, *, user_id="u", scopes=("a2a_receive",)):
         display_name="TestAgent",
         origin="external-selfjoin",
         handle="@test",
+        user_id=owner_user_id if owner_user_id is not None else "",
     )
     cid = rec["canonical_id"]
     await registry.set_status(cid, "active")
@@ -271,6 +76,26 @@ async def _register_and_mint(app, *, user_id="u", scopes=("a2a_receive",)):
         await grants.add_grant(cid, scope)
     token = mint_registry_token(cid, priv, user_id=user_id, framework="test")
     return cid, token
+
+
+def _make_nonadmin_client(
+    app, auth, *, username: str, full_name: str, password: str
+) -> tuple[AsyncClient, str]:
+    """Create an AsyncClient authenticated as a new non-admin user.
+
+    The user is created via ``auth.setup_user`` and a session cookie is set.
+    Returns (AsyncClient, user_id).
+    """
+    auth.setup_user(username, full_name, "", password)
+    record = auth.find_user(username)
+    uid = record["id"]
+    token = auth.create_session(user_id=uid)
+    transport = ASGITransport(app=app)
+    return AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        cookies={"taos_session": token},
+    ), uid
 
 
 # ---------------------------------------------------------------------------
@@ -382,7 +207,7 @@ class TestTokenMinIatAuth:
 
 
 class TestRotateTokensRoute:
-    """Test POST /api/agents/registry/{id}/rotate-tokens via the admin client."""
+    """Test POST /api/agents/registry/{id}/rotate-tokens."""
 
     @pytest.mark.asyncio
     async def test_admin_can_rotate(self, agent_app, app):
@@ -394,13 +219,70 @@ class TestRotateTokensRoute:
         assert body["token_min_iat"] > 0
 
     @pytest.mark.asyncio
-    async def test_owner_can_rotate(self, agent_app, app):
-        """A session owner (non-admin) can rotate their own identity."""
+    async def test_nonadmin_owner_can_rotate_own_identity(self, agent_app, app):
+        """A non-admin session owner can rotate their OWN identity (200)."""
+        # Create a non-admin user and register an agent they own.
+        client, uid = _make_nonadmin_client(
+            app, app.state.auth, username="owner1", full_name="Owner One",
+            password="pw",
+        )
+        async with client:
+            cid, _token = await _register_and_mint(
+                app, user_id=uid, owner_user_id=uid,
+            )
+            resp = await client.post(
+                f"/api/agents/registry/{cid}/rotate-tokens"
+            )
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["token_min_iat"] > 0
+
+    @pytest.mark.asyncio
+    async def test_nonadmin_cannot_rotate_others_agent(self, agent_app, app):
+        """A non-admin, non-owner rotating someone ELSE'S agent → 403."""
+        # First user owns an agent.
+        owner_client, owner_uid = _make_nonadmin_client(
+            app, app.state.auth, username="owner2", full_name="Owner Two",
+            password="pw",
+        )
+        # Second user tries to rotate the first user's agent.
+        intruder_client, intruder_uid = _make_nonadmin_client(
+            app, app.state.auth, username="intruder", full_name="Intruder",
+            password="pw",
+        )
+        async with owner_client:
+            cid, _token = await _register_and_mint(
+                app, user_id=owner_uid, owner_user_id=owner_uid,
+            )
+        async with intruder_client:
+            resp = await intruder_client.post(
+                f"/api/agents/registry/{cid}/rotate-tokens"
+            )
+            assert resp.status_code == 403
+
+    @pytest.mark.asyncio
+    async def test_empty_userid_agent_is_admin_only(self, agent_app, app):
+        """An agent_registry row with user_id='' can ONLY be rotated by admin.
+
+        Non-admin sessions get 403 because require_owner_or_admin compares
+        the session's user_id against an empty string (owner match fails)
+        and the session is not admin.
+        """
+        # Register an agent with the default user_id="" (admin-only).
         cid, _token = await _register_and_mint(app, user_id="admin")
-        resp = await agent_app.post(f"/api/agents/registry/{cid}/rotate-tokens")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["token_min_iat"] > 0
+        r = await app.state.agent_registry.get(cid)
+        assert r["user_id"] == ""
+
+        # A non-admin session trying to rotate it must get 403.
+        nonadmin_client, _uid = _make_nonadmin_client(
+            app, app.state.auth, username="randouser", full_name="Rando",
+            password="pw",
+        )
+        async with nonadmin_client:
+            resp = await nonadmin_client.post(
+                f"/api/agents/registry/{cid}/rotate-tokens"
+            )
+            assert resp.status_code == 403
 
     @pytest.mark.asyncio
     async def test_rotate_nonexistent_returns_404(self, agent_app):
