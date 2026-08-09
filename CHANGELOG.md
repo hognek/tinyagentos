@@ -7,6 +7,13 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
 
 ## [Unreleased]
 
+### Added
+
+- **Docs**: mechanical-simple-auditable design law added to the agent manual
+  (`01-rules.md`), with a worked example anonymised as "an agent". Also trimmed
+  verbose prose in the image-prompting guide to stay within the compiled manual
+  character budget.
+
 ## [1.0.0-beta.47] - 2026-08-09
 
 ### Added
