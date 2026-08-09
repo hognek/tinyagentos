@@ -654,7 +654,14 @@ async def auth_status(request: Request):
     auth_mgr = request.app.state.auth
     configured = auth_mgr.is_configured()
     token = request.cookies.get("taos_session", "")
-    user_id = auth_mgr.validate_session(token) if token else None
+    # Pass the request's User-Agent so the stolen-cookie binding check runs
+    # here exactly as it does in the API middleware. Without it a session
+    # whose UA hash no longer matches (browser auto-update rotated the UA)
+    # reads authenticated here while every /api/* call 401s, and the SPA's
+    # LoginGate remount-loops on that contradiction (the beta.46 PWA
+    # refresh-loop, 2026-08-10).
+    _ua = request.headers.get("user-agent", "")
+    user_id = auth_mgr.validate_session(token, user_agent=_ua) if token else None
     authenticated = user_id is not None
 
     user = None
@@ -681,7 +688,9 @@ async def auth_me(request: Request):
     """Return the current user's profile. 401 when not signed in."""
     auth_mgr = request.app.state.auth
     token = request.cookies.get("taos_session", "")
-    if not token or auth_mgr.validate_session(token) is None:
+    if not token or auth_mgr.validate_session(
+        token, user_agent=request.headers.get("user-agent", "")
+    ) is None:
         return JSONResponse({"error": "not authenticated"}, status_code=401)
     user = auth_mgr.get_user(token=token)
     if user is None:
