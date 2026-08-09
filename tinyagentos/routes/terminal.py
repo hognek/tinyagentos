@@ -23,7 +23,11 @@ def _ws_session_user_id(websocket: WebSocket) -> str | None:
     token = websocket.cookies.get("taos_session", "")
     if not token:
         return None
-    return auth_mgr.validate_session(token)
+    # Same UA-binding check as the API middleware: the terminal is the most
+    # sensitive surface, it must not accept a cookie the APIs reject.
+    return auth_mgr.validate_session(
+        token, user_agent=websocket.headers.get("user-agent", "")
+    )
 
 
 def build_command(config: dict) -> list[str]:
