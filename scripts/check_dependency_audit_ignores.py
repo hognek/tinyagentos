@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -103,6 +104,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Path to the ignore list (default: security/pip-audit-ignore.toml)",
     )
     args = parser.parse_args(argv)
+
+    for tool in ("uv", "pip-audit"):
+        if not shutil.which(tool):
+            print(f"error: {tool} not found in PATH", file=sys.stderr)
+            return 2
 
     ignore_list = load_ignore_list(args.ignore_file)
     ignore_ids = {entry["id"] for entry in ignore_list}

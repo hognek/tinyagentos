@@ -170,10 +170,11 @@ class TestMain:
                 ]
             }),
         )
-        with patch.object(check_mod, "run_pip_audit", return_value=([
-            {"package": "pip", "id": "CVE-2026-3219"},
-        ], "")):
-            rc = check_mod.main(["--ignore-file", str(ignore)])
+        with patch.object(check_mod.shutil, "which", return_value="/usr/bin/uv"):
+            with patch.object(check_mod, "run_pip_audit", return_value=([
+                {"package": "pip", "id": "CVE-2026-3219"},
+            ], "")):
+                rc = check_mod.main(["--ignore-file", str(ignore)])
         captured = capsys.readouterr()
         assert rc == 0
         assert "SKIPPED: pip (CVE-2026-3219)" in captured.out
@@ -187,10 +188,11 @@ class TestMain:
         ignore.write_text(
             '[[ignore]]\npackage = "pip"\nid = "CVE-2026-3219"\ncheck_upgrade = false\n'
         )
-        with patch.object(check_mod, "run_pip_audit", return_value=([
-            {"package": "pip", "id": "CVE-2026-9999"},
-        ], "")):
-            rc = check_mod.main(["--ignore-file", str(ignore)])
+        with patch.object(check_mod.shutil, "which", return_value="/usr/bin/uv"):
+            with patch.object(check_mod, "run_pip_audit", return_value=([
+                {"package": "pip", "id": "CVE-2026-9999"},
+            ], "")):
+                rc = check_mod.main(["--ignore-file", str(ignore)])
         captured = capsys.readouterr()
         assert rc == 1
         assert "UNLISTED: pip CVE-2026-9999" in captured.out
@@ -201,9 +203,10 @@ class TestMain:
         sec.mkdir()
         ignore = sec / "pip-audit-ignore.toml"
         ignore.write_text('[[ignore]]\npackage = "cryptography"\nid = "CVE-2026-69247"\n')
-        with patch.object(check_mod, "check_upgrade_resolves", return_value=(True, "resolved to 50.0.0")):
-            with patch.object(check_mod, "run_pip_audit", return_value=([], "")):
-                rc = check_mod.main(["--ignore-file", str(ignore)])
+        with patch.object(check_mod.shutil, "which", return_value="/usr/bin/uv"):
+            with patch.object(check_mod, "check_upgrade_resolves", return_value=(True, "resolved to 50.0.0")):
+                with patch.object(check_mod, "run_pip_audit", return_value=([], "")):
+                    rc = check_mod.main(["--ignore-file", str(ignore)])
         captured = capsys.readouterr()
         assert rc == 1
         assert "DROPPABLE: cryptography (CVE-2026-69247)" in captured.out
