@@ -7,7 +7,13 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
 
 ## [Unreleased]
 
+## [1.0.0-beta.47] - 2026-08-09
+
 ### Added
+
+- **Devices**: pairing requests can be created and tracked via the new device
+  pair-request API, with approval or denial surfaced to the user through the
+  Decisions app (#2233).
 
 - **Docs**: new `taos-agent` OS skill (`.claude/skills/taos-agent/SKILL.md`) that
   consolidates the agent-manual OS-operation content into actionable instructions for
@@ -30,6 +36,27 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
 - Chat renders `tool_call` and `status` content blocks: tool calls as a
   collapsible detail with an ARIA disclosure contract, status (and the
   `question` variant) as a muted line with a "reply below" hint (#2275).
+
+### Changed
+
+- Contributors add a `changelog.d/<pr>-<slug>.md` fragment instead of editing
+  `CHANGELOG.md`, so concurrent PRs no longer conflict on the shared
+  `[Unreleased]` anchor; `scripts/collate_changelog.py` folds fragments into a
+  release section at bump time. Editing `CHANGELOG.md` directly still works.
+- The Tasks app is now called Routines in the launcher and window title. The
+  app id is unchanged, so existing layouts and pinned positions are preserved
+  (#2298).
+- Approving an agent auth-request with `defer_binding` now returns 409 when that
+  agent already has an active handle, and the response points the operator at
+  `POST /api/projects/{project_id}/members/assign-agent`. It previously advised
+  minting a second identity, which splits an agent's memory and grants across
+  two canonical ids (#2313).
+
+### Security
+
+- Bumped `cryptography` from 48.0.1 to 50.0.0, picking up the upstream fixes
+  for PYSEC-2026-3552/3553/3554 and CVE-2026-69247 (PKCS#7 EnvelopedData
+  Bleichenbacher). Also updates `uvicorn[standard]` to 0.52.1.
 
 ## [1.0.0-beta.46] - 2026-08-03
 
