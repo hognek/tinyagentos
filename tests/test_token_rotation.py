@@ -226,7 +226,7 @@ class TestRotateTokensRoute:
         # Create a non-admin user and register an agent they own.
         client, uid = _make_nonadmin_client(
             app, app.state.auth, username="owner1", full_name="Owner One",
-            password="pw",
+            password="password123",
         )
         async with client:
             cid, _token = await _register_and_mint(
@@ -245,12 +245,12 @@ class TestRotateTokensRoute:
         # First user owns an agent.
         owner_client, owner_uid = _make_nonadmin_client(
             app, app.state.auth, username="owner2", full_name="Owner Two",
-            password="pw",
+            password="password123",
         )
         # Second user tries to rotate the first user's agent.
         intruder_client, intruder_uid = _make_nonadmin_client(
             app, app.state.auth, username="intruder", full_name="Intruder",
-            password="pw",
+            password="password123",
         )
         async with owner_client:
             cid, _token = await _register_and_mint(
@@ -278,7 +278,7 @@ class TestRotateTokensRoute:
         # A non-admin session trying to rotate it must get 403.
         nonadmin_client, _uid = _make_nonadmin_client(
             app, app.state.auth, username="randouser", full_name="Rando",
-            password="pw",
+            password="password123",
         )
         async with nonadmin_client:
             resp = await nonadmin_client.post(
