@@ -54,3 +54,96 @@ async def test_update_push_token(store):
     updated = await store.update_push_token(dev["device_id"], "new")
     assert updated["push_token"] == "new"
     assert (await store.get(dev["device_id"]))["push_token"] == "new"
+
+
+@pytest.mark.asyncio
+async def test_block_kills_token_but_stays_listed(store):
+    dev = await store.register(user_id="u1", platform="ios", push_token="pt1")
+
+    assert await store.block(dev["device_id"]) is True
+    # Token is dead (blocked implies revoked).
+    assert await store.get_by_token(dev["scoped_token"]) is None
+    row = await store.get(dev["device_id"])
+    assert row["revoked"] == 1 and row["blocked"] == 1
+    # Unlike a plain revoke, the row stays visible so the owner can see the
+    # safety valve is engaged.
+    listed = await store.list_for_user("u1")
+    assert [r["device_id"] for r in listed] == [dev["device_id"]]
+    # Second block is a no-op.
+    assert await store.block(dev["device_id"]) is False
+
+
+@pytest.mark.asyncio
+async def test_unblock_leaves_token_dead_and_hides_row(store):
+    dev = await store.register(user_id="u1", platform="ios")
+    await store.block(dev["device_id"])
+
+    assert await store.unblock(dev["device_id"]) is True
+    # The old token stays dead: unblock does not resurrect it.
+    assert await store.get_by_token(dev["scoped_token"]) is None
+    # Now a plain revoked row, hidden from the list.
+    assert await store.list_for_user("u1") == []
+    row = await store.get(dev["device_id"])
+    assert row["revoked"] == 1 and row["blocked"] == 0
+    # Second unblock is a no-op.
+    assert await store.unblock(dev["device_id"]) is False
+
+
+@pytest.mark.asyncio
+async def test_find_blocked_by_push_token(store):
+    dev = await store.register(user_id="u1", platform="ios", push_token="pt1")
+    # Not blocked yet: no match.
+    assert await store.find_blocked_by_push_token("u1", "pt1") is None
+
+    await store.block(dev["device_id"])
+    assert await store.find_blocked_by_push_token("u1", "pt1") == dev["device_id"]
+    # Scoped to the owning user and the exact push token.
+    assert await store.find_blocked_by_push_token("u2", "pt1") is None
+    assert await store.find_blocked_by_push_token("u1", "other") is None
+
+    await store.unblock(dev["device_id"])
+    assert await store.find_blocked_by_push_token("u1", "pt1") is None
+
+
+@pytest.mark.asyncio
+async def test_blocked_column_migration_over_existing_db(tmp_path):
+    """The `blocked` column must be retrofitted onto a database created BEFORE
+    this change. A fresh-schema test passes vacuously; this one builds the old
+    table by hand and fails if the guarded ALTER in _post_init is removed."""
+    import aiosqlite
+
+    path = tmp_path / "devices.db"
+    async with aiosqlite.connect(path) as db:
+        await db.execute(
+            """
+            CREATE TABLE devices (
+                device_id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                push_token TEXT NOT NULL DEFAULT '',
+                scoped_token TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL DEFAULT '',
+                registered_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                last_seen INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+                revoked INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        await db.execute(
+            "INSERT INTO devices (device_id, user_id, platform, scoped_token) "
+            "VALUES ('d-old', 'u1', 'ios', 'taosdev_pre_block')"
+        )
+        await db.commit()
+
+    s = DeviceStore(path)
+    await s.init()
+    try:
+        # The pre-existing row gained the column with the safe default...
+        row = await s.get("d-old")
+        assert row is not None and row["blocked"] == 0
+        # ...and every blocked-aware query path works against the migrated DB.
+        assert (await s.get_by_token("taosdev_pre_block"))["device_id"] == "d-old"
+        assert await s.block("d-old") is True
+        assert await s.get_by_token("taosdev_pre_block") is None
+    finally:
+        await s.close()

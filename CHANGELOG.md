@@ -151,6 +151,8 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
 
 ### Added
 
+- **Cluster**: device and node revoke and blocking controls (#2238).
+
 - **Assistant Studio**: a workspace app for a personal-assistant agent. Pick a
   registered agent as your PA, then work out of one hub with Overview, Journal,
   Calendar/time, Tasks, Comms, Canvas, and a Deliverables area (#2103, #2104).
