@@ -43,13 +43,28 @@ class _PersistentSessions:
         if not self._path.exists():
             return {}
         try:
-            return json.loads(self._path.read_text())
+            data = json.loads(self._path.read_text())
         except (json.JSONDecodeError, OSError):
             return {}
+        self._prune_expired(data)
+        return data
 
     def _save(self, data: dict) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._save_pruned(data)
+
+    def _save_pruned(self, data: dict) -> None:
+        self._prune_expired(data)
         self._path.write_text(json.dumps(data))
+
+    def _prune_expired(self, data: dict) -> None:
+        now = time.time()
+        expired_keys = [
+            token for token, entry in data.items()
+            if isinstance(entry, dict) and entry.get("expires_at") is not None and now >= entry.get("expires_at")
+        ]
+        for token in expired_keys:
+            del data[token]
 
     def __getitem__(self, key: str):
         return self._load()[key]
@@ -84,6 +99,28 @@ class _PersistentSessions:
 
     def items(self):
         return list(self._load().items())
+
+    def _prune_sessions_on_startup(self) -> None:
+        """Prune expired sessions at startup and opportunistically on writes."""
+        if self._sessions_file.exists():
+            try:
+                data = json.loads(self._sessions_file.read_text())
+                before = len(data)
+                self._prune_expired(data)
+                after = len(data)
+                removed = before - after
+                if removed:
+                    logger.info(
+                        "Pruned %s expired auth sessions at startup (%s -> %s live)",
+                        removed, after, after
+                    )
+                if after > 50000:
+                    logger.warning(
+                        "Auth sessions count %s after pruning is still excessive; "
+                        "sessions are being minted faster than they expire", after
+                    )
+            except (json.JSONDecodeError, OSError):
+                pass
 
 
 def hash_password(password: str, salt: str = "") -> str:
@@ -177,6 +214,39 @@ class AuthManager:
         self._sessions = _PersistentSessions(self._sessions_file)
         self.session_ttl = 86400 * 7  # 7 days, default
         self.long_session_ttl = 86400 * 30  # 30 days for "stay signed in"
+        self._prune_sessions_on_startup()
+
+    def _prune_expired(self, data: dict) -> None:
+        """Remove expired sessions from the data dict in place."""
+        now = time.time()
+        expired_keys = [
+            token for token, entry in data.items()
+            if isinstance(entry, dict) and entry.get("expires_at") is not None and now >= entry.get("expires_at")
+        ]
+        for token in expired_keys:
+            del data[token]
+
+    def _prune_sessions_on_startup(self) -> None:
+        """Prune expired sessions at startup and opportunistically on writes."""
+        if self._sessions_file.exists():
+            try:
+                data = json.loads(self._sessions_file.read_text())
+                before = len(data)
+                self._prune_expired(data)
+                after = len(data)
+                removed = before - after
+                if removed:
+                    logger.info(
+                        "Pruned %s expired auth sessions at startup (%s -> %s live)",
+                        removed, after, after
+                    )
+                if after > 50000:
+                    logger.warning(
+                        "Auth sessions count %s after pruning is still excessive; "
+                        "sessions are being minted faster than they expire", after
+                    )
+            except (json.JSONDecodeError, OSError):
+                pass
 
     # ------------------------------------------------------------------ #
     #  Profile storage helpers                                             #
