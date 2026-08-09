@@ -37,7 +37,7 @@ _ACTION_DIRECTIVE = {
 
 # --------------------------------------------------------------------- models
 
-class CreateDocIn(BaseModel):
+class CreateNoteIn(BaseModel):
     title: str = ""
 
 
@@ -48,10 +48,6 @@ class PatchDocIn(BaseModel):
 
 class AddEntryIn(BaseModel):
     text: str
-
-
-class PatchEntryIn(BaseModel):
-    done: bool
 
 
 class EditEntryTextIn(BaseModel):
@@ -123,7 +119,7 @@ async def list_docs(
 
 @router.post("/api/notes")
 async def create_doc(
-    body: CreateDocIn,
+    body: CreateNoteIn,
     request: Request,
     user: CurrentUser = Depends(current_user),
 ):
@@ -305,25 +301,6 @@ async def add_entry(
     except Exception as exc:  # noqa: BLE001
         logger.warning("notes: agent trigger raised unexpectedly: %s", exc)
     return entry
-
-
-@router.patch("/api/notes/{doc_id}/entries/{entry_id}")
-async def patch_entry(
-    doc_id: str,
-    entry_id: str,
-    body: PatchEntryIn,
-    request: Request,
-    user: CurrentUser = Depends(current_user),
-):
-    store = _get_store(request)
-    doc = await store.get_doc(doc_id)
-    if doc is None:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    err = await _check_edit_access(store, doc, user)
-    if err:
-        return err
-    await store.set_entry_done(entry_id, body.done)
-    return JSONResponse({"ok": True})
 
 
 @router.delete("/api/notes/{doc_id}/entries/{entry_id}")

@@ -88,35 +88,7 @@ const ACTION_OPTIONS = [
   { value: "discuss", label: "Discuss" },
 ] as const;
 
-// ---- Kind config ----
-// NotesApp is now notes-only (todos live in TodoApp). The config object
-// keeps copy and behaviour centralised instead of scattering magic strings.
-
-interface DocKindConfig {
-  kind: "note";
-  appName: string; // header + listing aria
-  icon: LucideIcon;
-  noun: string; // doc-level aria: New {noun}, Create {noun}, Share {noun}
-  titlePlaceholder: string;
-  addPlaceholder: string;
-  emptyDocs: string;
-  emptyEntries: string;
-  selectPrompt: string;
-  showDone: boolean;
-}
-
-const NOTES_CONFIG: DocKindConfig = {
-  kind: "note",
-  appName: "Notes",
-  icon: StickyNote,
-  noun: "note",
-  titlePlaceholder: "Note title...",
-  addPlaceholder: "Add a note...",
-  emptyDocs: "No notes yet.",
-  emptyEntries: "Nothing here yet. Add your first note above.",
-  selectPrompt: "Select a note to get started.",
-  showDone: false,
-};
+// ---- Kind config removed for C4 cleanup: NotesApp is now notes-only (no kind discrimination).
 
 // ---- Sub-components ----
 
@@ -658,11 +630,9 @@ function EntryRow({
 // Detail pane for a selected note
 function NoteDetailPane({
   docId,
-  config,
   onBack,
 }: {
   docId: string;
-  config: DocKindConfig;
   onBack: () => void;
 }) {
   const [doc, setDoc] = useState<NoteDetail | null>(null);
@@ -792,7 +762,7 @@ function NoteDetailPane({
   const members = doc.members ?? [];
   const hasMembers = members.length > 0;
   const hasAgentMembers = members.some((m) => m.member_type === "agent");
-  const Icon = config.icon;
+  const Icon = StickyNote;
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -834,7 +804,7 @@ function NoteDetailPane({
             variant="outline"
             size="sm"
             onClick={() => setShowShare((v) => !v)}
-            aria-label={`Share ${config.noun}`}
+            aria-label="Share note"
             aria-expanded={showShare}
           >
             <Users size={13} />
@@ -862,7 +832,7 @@ function NoteDetailPane({
             <Textarea
               value={newText}
               onChange={(e) => setNewText(e.target.value)}
-              placeholder={config.addPlaceholder}
+              placeholder="Add a note..."
               rows={2}
               maxLength={20000}
               aria-label="New entry text"
@@ -896,7 +866,7 @@ function NoteDetailPane({
                   key={entry.id}
                   entry={entry}
                   docId={doc.id}
-                  showDone={config.showDone}
+                  showDone={false}
                   onDelete={deleteEntry}
                   onEditSave={editEntry}
                   onToggleDone={toggleDone}
@@ -906,7 +876,7 @@ function NoteDetailPane({
           ) : (
             <div className="flex flex-col items-center gap-2 py-10 text-center">
               <Icon size={28} className="text-shell-text-tertiary" />
-              <p className="text-sm text-shell-text-secondary">{config.emptyEntries}</p>
+              <p className="text-sm text-shell-text-secondary">Nothing here yet. Add your first note above.</p>
             </div>
           )}
 
@@ -957,8 +927,7 @@ function NoteListItem({
 }
 
 // Create note modal/inline form
-function CreateNoteForm({ config, onCreated, onCancel }: {
-  config: DocKindConfig;
+function CreateNoteForm({ onCreated, onCancel }: {
   onCreated: (note: NoteDoc) => void;
   onCancel: () => void;
 }) {
@@ -979,9 +948,9 @@ function CreateNoteForm({ config, onCreated, onCancel }: {
       const r = await fetch("/api/notes", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ kind: config.kind, title: title.trim() }),
+        body: JSON.stringify({ title: title.trim() }),
       });
-      if (!r.ok) throw new Error(`Could not create ${config.noun}.`);
+      if (!r.ok) throw new Error("Could not create note.");
       const doc: NoteDoc = await r.json();
       onCreated(doc);
     } catch (e) {
@@ -997,8 +966,8 @@ function CreateNoteForm({ config, onCreated, onCancel }: {
         type="text"
         value={title}
         onChange={(e) => setTitle(e.target.value)}
-        placeholder={config.titlePlaceholder}
-        aria-label={`New ${config.noun} title`}
+        placeholder="Note title..."
+        aria-label="New note title"
         maxLength={255}
         onKeyDown={(e) => {
           if (e.key === "Enter") { e.preventDefault(); void create(); }
@@ -1013,7 +982,7 @@ function CreateNoteForm({ config, onCreated, onCancel }: {
         <Button type="button" variant="ghost" size="sm" onClick={onCancel} disabled={creating} aria-label="Cancel">
           Cancel
         </Button>
-        <Button type="button" size="sm" onClick={create} disabled={creating || !title.trim()} aria-label={`Create ${config.noun}`}>
+        <Button type="button" size="sm" onClick={create} disabled={creating || !title.trim()} aria-label="Create note">
           {creating ? "Creating..." : "Create"}
         </Button>
       </div>
@@ -1023,7 +992,7 @@ function CreateNoteForm({ config, onCreated, onCancel }: {
 
 // ---- Main app ----
 
-function DocsApp({ config }: { config: DocKindConfig }) {
+function DocsApp() {
   const [notes, setNotes] = useState<NoteDoc[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -1035,15 +1004,14 @@ function DocsApp({ config }: { config: DocKindConfig }) {
       if (r.ok) {
         const data: unknown = await r.json();
         const all = Array.isArray(data) ? (data as NoteDoc[]) : [];
-        // Notes and lists share one API; each app shows only its own kind.
-        setNotes(all.filter((d) => d.kind === config.kind));
+        setNotes(all);
       }
     } catch {
       // Keep whatever was loaded.
     } finally {
       setLoading(false);
     }
-  }, [config.kind]);
+  }, []);
 
   useEffect(() => {
     loadNotes();
@@ -1057,7 +1025,7 @@ function DocsApp({ config }: { config: DocKindConfig }) {
     setShowCreate(false);
   }
 
-  const Icon = config.icon;
+  const Icon = StickyNote;
 
   return (
     <div className="flex h-full overflow-hidden bg-shell-bg">
@@ -1072,11 +1040,11 @@ function DocsApp({ config }: { config: DocKindConfig }) {
         {/* List header */}
         <div className="flex items-center gap-2 border-b border-shell-border px-4 py-4">
           <Icon size={17} className="text-accent" />
-          <h1 className="flex-1 text-base font-semibold text-shell-text">{config.appName}</h1>
+          <h1 className="flex-1 text-base font-semibold text-shell-text">Notes</h1>
           <button
             type="button"
             onClick={() => setShowCreate((v) => !v)}
-            aria-label={`New ${config.noun}`}
+            aria-label="New note"
             aria-expanded={showCreate}
             className={[
               "flex h-8 w-8 items-center justify-center rounded-lg border transition-colors",
@@ -1093,7 +1061,6 @@ function DocsApp({ config }: { config: DocKindConfig }) {
         {showCreate && (
           <div className="border-b border-shell-border px-3 py-3">
             <CreateNoteForm
-              config={config}
               onCreated={handleCreated}
               onCancel={() => setShowCreate(false)}
             />
@@ -1107,7 +1074,7 @@ function DocsApp({ config }: { config: DocKindConfig }) {
           ) : notes.length === 0 ? (
             <div className="flex flex-col items-center gap-2 py-16 text-center">
               <Icon size={28} className="text-shell-text-tertiary" />
-              <p className="text-sm text-shell-text-secondary">{config.emptyDocs}</p>
+              <p className="text-sm text-shell-text-secondary">No notes yet.</p>
               <button
                 type="button"
                 onClick={() => setShowCreate(true)}
@@ -1117,7 +1084,7 @@ function DocsApp({ config }: { config: DocKindConfig }) {
               </button>
             </div>
           ) : (
-            <ul className="flex flex-col gap-2" aria-label={config.appName}>
+            <ul className="flex flex-col gap-2" aria-label=Notes>
               {notes.map((note) => (
                 <NoteListItem
                   key={note.id}
@@ -1142,13 +1109,12 @@ function DocsApp({ config }: { config: DocKindConfig }) {
           <NoteDetailPane
             key={selectedId}
             docId={selectedId}
-            config={config}
             onBack={() => setSelectedId(null)}
           />
         ) : (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-center">
             <Icon size={32} className="text-shell-text-tertiary" />
-            <p className="text-sm text-shell-text-secondary">{config.selectPrompt}</p>
+            <p className="text-sm text-shell-text-secondary">Select a note to get started.</p>
           </div>
         )}
       </div>
@@ -1157,5 +1123,5 @@ function DocsApp({ config }: { config: DocKindConfig }) {
 }
 
 export function NotesApp({ windowId: _windowId }: { windowId: string }) {
-  return <DocsApp config={NOTES_CONFIG} />;
+  return <DocsApp />;
 }
