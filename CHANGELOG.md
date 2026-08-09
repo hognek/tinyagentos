@@ -387,15 +387,6 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
   A2A connection guide for deployed agents (#2161), agent token storage
   hardening (#2159).
 
-### Added
-
-- **Agent-as-a-Model turn execution**: `POST /v1/chat/completions` now drives a
-  real one-shot agent turn (consented agent → opencode host-server seam →
-  OpenAI ChatCompletion envelope) instead of returning 501. Per-agent opencode
-  server cache so concurrent agents do not churn a shared singleton. Missing
-  user message returns 400 (not 502); `stream` requires an explicit JSON
-  boolean (#2176).
-
 ## [1.0.0-beta.44] - 2026-07-26
 
 ### Added

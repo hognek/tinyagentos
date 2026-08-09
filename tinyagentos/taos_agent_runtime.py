@@ -7,6 +7,7 @@ app.state so opencode remembers conversation history across requests.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 import secrets
@@ -33,8 +34,14 @@ def _safe_path_component(value: str) -> str:
     A model id like ``openai/gpt-4o`` becomes ``openai_gpt-4o`` so the
     opencode home stays flat under data_dir.  Traversal payloads like
     ``../../x`` collapse to ``.._.._x`` — harmless without real slashes.
+
+    Appends a short hex digest so two distinct inputs that happen to slugify
+    to the same string (e.g. ``openai/gpt-4o`` and literal ``openai_gpt-4o``)
+    do not share a home directory and cross-contaminate conversation history.
     """
-    return _SAFE_COMPONENT_RE.sub("_", value)
+    slug = _SAFE_COMPONENT_RE.sub("_", value)
+    digest = hashlib.sha256(value.encode()).hexdigest()[:8]
+    return f"{slug}-{digest}"
 
 
 async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
@@ -98,7 +105,11 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
     if existing is None:
         # Stop-on-model-change: all per-model servers share TAOS_OPENCODE_PORT,
         # so only one can bind at a time. Stop any server for a different model
-        # before starting the new one.
+        # before starting the new one.  Per-model home directories are cleaned
+        # up here so stale configs do not accumulate across model switches
+        # (CodeRabbit review, PR #2195).  Homes are NOT cleaned on ordinary
+        # app shutdown — that would discard conversation history.
+        data_dir = getattr(app_state, "data_dir", None)
         for other_model, other_server in list(servers.items()):
             if other_model != model and other_server is not None:
                 logger.info(
@@ -112,6 +123,16 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
                 servers.pop(other_model, None)
                 sessions.pop(other_model, None)
                 born_degraded.pop(other_model, None)
+                # Clean up the old model's home directory on model switch.
+                if data_dir is not None:
+                    old_safe = _safe_path_component(other_model)
+                    old_home = data_dir / f"taos-agent-opencode-{old_safe}"
+                    try:
+                        shutil.rmtree(old_home, ignore_errors=True)
+                    except Exception:
+                        logger.debug(
+                            "taos_agent_runtime: error removing old home %s", old_home, exc_info=True
+                        )
         # Clear the legacy session id so the desktop chat path does not feed
         # a stale session from a now-stopped model to the new server.
         app_state.taos_opencode_session_id = None
@@ -171,7 +192,6 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
             litellm_key = get_litellm_master_key(getattr(app_state, "data_dir", None))
         app_state.taos_opencode_key = litellm_key
 
-        data_dir = getattr(app_state, "data_dir", None)
         safe_model = _safe_path_component(model)
         home = str(data_dir / f"taos-agent-opencode-{safe_model}") if data_dir else f"taos-agent-opencode-{safe_model}"
 
@@ -209,13 +229,14 @@ async def stop_taos_opencode_server(app_state) -> None:
     Safe to call even if no server was ever created. Iterates the per-agent
     cache (taos_opencode_servers) added for concurrent agent support.
 
-    Each per-model home directory is removed so stale configs and serve logs
-    do not accumulate across model switches (CodeRabbit review, PR #2195).
+    Home directories are NOT removed here — this runs on every ordinary app
+    shutdown; deleting homes would discard conversation history and force a
+    multi-minute SQLite migration on the next start.  Per-model home cleanup
+    only happens on model switch inside ensure_taos_opencode_server.
     """
     servers = getattr(app_state, "taos_opencode_servers", None)
     if not servers:
         return
-    data_dir = getattr(app_state, "data_dir", None)
     for model, server in list(servers.items()):
         if server is None:
             continue
@@ -223,17 +244,6 @@ async def stop_taos_opencode_server(app_state) -> None:
             await server.stop()
         except Exception:
             logger.debug("taos_agent_runtime: error during stop", exc_info=True)
-        # Remove the per-model home directory.  Build the path the same way
-        # ensure_taos_opencode_server does (slugified model component).
-        if data_dir is not None:
-            safe_model = _safe_path_component(model)
-            home = data_dir / f"taos-agent-opencode-{safe_model}"
-            try:
-                shutil.rmtree(home, ignore_errors=True)
-            except Exception:
-                logger.debug(
-                    "taos_agent_runtime: error removing home %s", home, exc_info=True
-                )
     app_state.taos_opencode_servers = {}
     app_state.taos_opencode_sessions = {}
     app_state.taos_opencode_born_degraded = {}
