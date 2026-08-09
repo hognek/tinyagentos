@@ -188,6 +188,24 @@ class TestAuthManager:
         assert token1 in mgr2._sessions
         assert mgr2._sessions[token1]["long_lived"] is True
 
+    def test_prune_at_startup_shrinks_the_file(self, tmp_path):
+        """Startup pruning must persist: the sessions FILE shrinks at init,
+        not merely the in-memory view (which _load() already prunes)."""
+        expired = {
+            f"tok{i}": {"user_id": "u", "expires_at": time.time() - 10, "long_lived": False}
+            for i in range(50)
+        }
+        expired["live"] = {"user_id": "u", "expires_at": time.time() + 3600, "long_lived": False}
+        sessions_file = tmp_path / ".auth_sessions"
+        sessions_file.write_text(json.dumps(expired))
+        size_before = sessions_file.stat().st_size
+
+        AuthManager(tmp_path)
+
+        on_disk = json.loads(sessions_file.read_text())
+        assert list(on_disk) == ["live"]
+        assert sessions_file.stat().st_size < size_before
+
     def test_prune_already_clean_is_noop(self, tmp_path):
         """Pruning an already-clean store (no expired entries) is a no-op."""
         # Create a file with no expired entries (simulating clean state)
