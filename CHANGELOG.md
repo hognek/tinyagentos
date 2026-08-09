@@ -41,6 +41,8 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
 
 ### Added
 
+- **Library**: settings pane for download preferences: preferred quality and per-source rules (#2276).
+
 - Observatory fleet view for agents holding a global `observatory_control`
   grant; project-scoped grants see only their granted projects (#2267).
 - Deployed agents are registered into the agent registry at deploy time, each
