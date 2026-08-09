@@ -115,8 +115,9 @@ class DevicePairRequestsStore(BaseStore):
         verify_code: str = "",
         requester_ip: str = "",
     ) -> dict:
-        """Create a new pending pair request with a fresh verify_code. Returns
-        the full record."""
+        """Create a new pending pair request. Returns the stored record via
+        ``get``, i.e. WITHOUT ``verify_code`` -- callers that need the code
+        already hold it (they supplied it)."""
         if self._db is None:
             raise RuntimeError("DevicePairRequestsStore not initialised -- call init() first")
 

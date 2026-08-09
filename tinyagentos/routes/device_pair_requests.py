@@ -45,16 +45,11 @@ logger = logging.getLogger(__name__)
 # F5: the store does not validate the platform, so the whitelist lives here.
 _VALID_PLATFORMS = frozenset({"ios", "watchos", "android"})
 _VERIFY_CODE_DIGITS = 6
-_MAX_DEVICES_PER_USER = 50
 
 
 class CreatePairRequest(BaseModel):
     platform: str
     display_name: str = ""
-
-
-class PairRequestIn(BaseModel):
-    verify_code: str | None = None
 
 
 def _get_pair_requests_store(request: Request) -> DevicePairRequestsStore:
