@@ -43,13 +43,28 @@ class _PersistentSessions:
         if not self._path.exists():
             return {}
         try:
-            return json.loads(self._path.read_text())
+            data = json.loads(self._path.read_text())
         except (json.JSONDecodeError, OSError):
             return {}
+        self._prune_expired(data)
+        return data
 
     def _save(self, data: dict) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._save_pruned(data)
+
+    def _save_pruned(self, data: dict) -> None:
+        self._prune_expired(data)
         self._path.write_text(json.dumps(data))
+
+    def _prune_expired(self, data: dict) -> None:
+        now = time.time()
+        expired_keys = [
+            token for token, entry in data.items()
+            if isinstance(entry, dict) and entry.get("expires_at") is not None and now >= entry.get("expires_at")
+        ]
+        for token in expired_keys:
+            del data[token]
 
     def __getitem__(self, key: str):
         return self._load()[key]
@@ -177,6 +192,34 @@ class AuthManager:
         self._sessions = _PersistentSessions(self._sessions_file)
         self.session_ttl = 86400 * 7  # 7 days, default
         self.long_session_ttl = 86400 * 30  # 30 days for "stay signed in"
+        self._prune_sessions_on_startup()
+
+    def _prune_sessions_on_startup(self) -> None:
+        """Prune expired sessions at startup AND persist the shrunk file.
+
+        _load() prunes in memory on every read and _save() prunes on every
+        write, so correctness never depends on this -- but without a write-back
+        here, a grown sessions file only shrinks on the next session mint.
+        Load (which prunes) then save once, so startup leaves the file small."""
+        if not self._sessions_file.exists():
+            return
+        try:
+            before = len(json.loads(self._sessions_file.read_text()))
+        except (json.JSONDecodeError, OSError):
+            return
+        data = self._sessions._load()
+        self._sessions._save(data)
+        removed = before - len(data)
+        if removed:
+            logger.info(
+                "Pruned %s expired auth sessions at startup (%s -> %s live)",
+                removed, before, len(data),
+            )
+        if len(data) > 50000:
+            logger.warning(
+                "Auth sessions count %s after pruning is still excessive; "
+                "sessions are being minted faster than they expire", len(data),
+            )
 
     # ------------------------------------------------------------------ #
     #  Profile storage helpers                                             #

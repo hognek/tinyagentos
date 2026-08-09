@@ -450,7 +450,8 @@ async def answer_decision(decision_id: str, body: AnswerIn, request: Request, us
     routed_app = await _apply_app_grant(request, updated, body.value)
     routed_exec = await _apply_execution_grant(request, updated, body.value)
     routed_deleg = await _apply_delegation_grant(request, updated, body.value)
-    if not (routed_app or routed_exec or routed_deleg):
+    routed_pair = await _apply_device_pairing_grant(request, updated, body.value)
+    if not (routed_app or routed_exec or routed_deleg or routed_pair):
         await _route_answer_to_agent(updated, body.value)
     return updated
 
@@ -496,6 +497,75 @@ async def _apply_execution_grant(request: Request, decision: dict, value) -> boo
     else:
         reply = "your action was approved, but saving the grant failed - please retry"
     await _route_answer_to_agent(decision, reply)
+    return True
+
+
+async def _apply_device_pairing_grant(request: Request, decision: dict, value) -> bool:
+    """Side effect for a device_pairing Decision (taOS S4e): the decision's
+    metadata carries {kind: "device_pairing", pair_request_id}. Approving it
+    mints the device via DeviceStore.register (bound to the user the Decision
+    was addressed to -- F1) and atomically transitions THAT pair request to
+    accepted (F2); denying transitions it to denied. Expiry is enforced here,
+    at approve time, not merely hidden from the poll (F6).
+
+    Mirrors ``_apply_app_grant``: the answer is already persisted, so a store
+    hiccup must not fail the answer. Returns True when the decision was a
+    device_pairing one (there is no asking agent to route a reply to -- the
+    requesting device learns the outcome by polling its pair request).
+
+    Double-mint safety (F5): the Decisions store's ``answer`` is itself atomic
+    (a second answer 409s before any applier runs), so this applier runs at
+    most once per decision, and creation makes exactly one decision per pair
+    request. Belt-and-braces on top: if the pair request's conditional
+    pending->accepted UPDATE reports the row was already decided, the freshly
+    minted device is revoked rather than left dangling."""
+    meta = decision.get("metadata") or {}
+    if meta.get("kind") != "device_pairing":
+        return False
+    store = getattr(request.app.state, "device_pair_requests", None)
+    pair_request_id = meta.get("pair_request_id")
+    if store is None or not pair_request_id:
+        return False
+    decided_by = decision.get("user_id") or "user"
+    try:
+        record = await store.get(pair_request_id)
+        if record is None:
+            return True
+        if value != "approve":
+            await store.set_decision(pair_request_id, "denied", decided_by=decided_by)
+            return True
+        from tinyagentos.device_pair_requests_store import _live_status
+        if _live_status(record) == "expired":
+            # F6: an approval of an already-expired request persists the expiry
+            # instead of minting.
+            await store.set_decision(pair_request_id, "expired", decided_by=decided_by)
+            return True
+        device_store = getattr(request.app.state, "device_store", None)
+        if device_store is None:
+            logger.warning(
+                "device pairing approve: device_store missing (decision %s)",
+                decision.get("id"),
+            )
+            return True
+        # F1: the device is bound to the user the Decision was addressed to,
+        # never to anything the unauthenticated creator supplied.
+        device = await device_store.register(
+            user_id=decided_by,
+            platform=record.get("platform") or "",
+            display_name=record.get("display_name") or "",
+        )
+        updated = await store.set_decision(
+            pair_request_id, "accepted",
+            device_id=device["device_id"], decided_by=decided_by,
+        )
+        if updated is None:
+            # Lost a (should-be-impossible) race: request already decided.
+            # Revoke the fresh mint so no orphan credential survives.
+            await device_store.revoke(device["device_id"])
+    except Exception:
+        logger.warning(
+            "device pairing grant failed for decision %s", decision.get("id"), exc_info=True,
+        )
     return True
 
 
