@@ -87,6 +87,12 @@ def register_all_routers(app):
     from tinyagentos.routes.devices import router as devices_router
     app.include_router(devices_router, dependencies=_csrf)
 
+    # CSRF-exempt like peer_router: the pairing endpoints are called by an
+    # external device that has no session cookie yet (the opaque
+    # pair_request_id is the capability); CSRF is a cookie-auth defence.
+    from tinyagentos.routes.device_pair_requests import router as device_pair_requests_router
+    app.include_router(device_pair_requests_router)
+
     from tinyagentos.routes.observatory import router as observatory_router
     app.include_router(observatory_router, dependencies=_csrf)
 

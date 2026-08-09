@@ -427,6 +427,10 @@ async def client(app, tmp_data_dir):
     if device_store._db is not None:
         await device_store.close()
     await device_store.init()
+    device_pair_requests = app.state.device_pair_requests
+    if device_pair_requests._db is not None:
+        await device_pair_requests.close()
+    await device_pair_requests.init()
     council_roles = app.state.council_roles
     if council_roles._db is not None:
         await council_roles.close()
