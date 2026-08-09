@@ -350,3 +350,13 @@ was actually granted.
 These rules are deliberately lightweight. The goal is not process for its own
 sake; it is to let many hands move quickly on the same codebase without undoing
 each other's work.
+
+## Device pair requests (S4e)
+
+Route module `tinyagentos/routes/device_pair_requests.py`:
+
+- `POST /api/devices/pair-requests` creates a pairing request for a device.
+- `GET /api/devices/pair-requests/{pair_request_id}` returns its status.
+
+Approval or denial of a pair request is surfaced to the user through the Decisions app;
+agents must not grant pairing directly.
