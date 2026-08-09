@@ -83,10 +83,12 @@ def _make_nonadmin_client(
 ) -> tuple[AsyncClient, str]:
     """Create an AsyncClient authenticated as a new non-admin user.
 
-    The user is created via ``auth.setup_user`` and a session cookie is set.
+    Uses the invite flow (``add_user_invite`` + ``complete_invite``) because
+    ``setup_user`` only works for the first user.
     Returns (AsyncClient, user_id).
     """
-    auth.setup_user(username, full_name, "", password)
+    code = auth.add_user_invite(username, "admin")
+    auth.complete_invite(username, code, full_name, "", password)
     record = auth.find_user(username)
     uid = record["id"]
     token = auth.create_session(user_id=uid)
