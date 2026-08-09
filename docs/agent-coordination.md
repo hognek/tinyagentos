@@ -49,6 +49,42 @@ git worktree add ../taos-<task> -b feat/<task> origin/dev
   than letting the PR sprawl.
 
 
+## Never kill a shared-path process by its path
+
+Every agent on this box runs the SAME scripts out of `~/.taos-team/`, so
+`pkill -f a2a_watch` is not a targeted command, it is a fleet-wide weapon. It
+matches every other agent's instance identically to your own.
+
+This is not hypothetical. On 2026-08-04 it fired in both directions inside
+twelve hours: @taOSmd-dev killed @taOS-dev's watcher twice believing it was a
+stray duplicate of their own, and @taOS-dev killed @taOSmd-dev's watcher
+believing it was an orphan of theirs. Each of us checked whether the process
+matched what we expected OURS to look like, which is a different question from
+whose it is. Three watcher deaths and two wrong diagnoses came out of it.
+
+**A kill targeting a shared-path process must be justified by an OWNER check,
+never by a path match.** Identity lives in the environment, not the command
+line, because the command lines are identical:
+
+    tr '\0' '\n' < /proc/$pid/environ | grep -qx 'A2A_HB_FILE=/home/jay/.my-agent/heartbeat' && kill "$pid"
+
+Three traps in writing that check, all of which have bitten someone here:
+
+- `grep -q "pattern" /proc/<pid>/cmdline` NEVER matches: cmdline is
+  NUL-separated. With `&&` it fails closed and reads as a broken reaper; with
+  `;` it is decorative, printing a refusal and then killing anyway.
+- Substring-matching the JOINED cmdline matches too much: it authorises any
+  process that merely MENTIONS the path, including the shell running the check.
+- So split on NUL and require an exact element (or an exact env assignment),
+  then verify AFTER the signal that whatever you meant to keep alive still
+  advances its own liveness file.
+
+Prefer removing the ambiguity entirely: run your watcher from a uniquely named
+copy (`lead_bus_watch.sh`, `taosmd_bus_watch.sh`) so no one else's pattern can
+reach it, and write your pid to a pidfile. Under a systemd unit, `systemctl
+--user show -p MainPID` is authoritative; a startup-only pidfile can lie between
+restarts if a second instance started last.
+
 ## Credentials, grants and the things that bite
 
 **Your token is shown once and cannot be recovered.** Not by you, not by the
@@ -206,6 +242,14 @@ The surface, by scope:
   (read one), and `PUT /api/projects/{pid}/doc-review/{path}` (set state).
   The route verifies the JWT + grant + project binding; the middleware allowlist
   is closed to these paths only.
+- **project_notes**: read and write a project's persistent idea notes
+  (title + markdown body). `GET /api/projects/{pid}/notes` (list),
+  `POST /api/projects/{pid}/notes` (create), `PATCH /api/projects/{pid}/notes/{nid}`
+  (edit) and `DELETE /api/projects/{pid}/notes/{nid}`. One scope covers read and
+  write, mirroring project_doc_review. The route verifies the JWT + grant +
+  project binding, and a token bound to a DIFFERENT project gets a 404 rather
+  than a 403, so it cannot confirm that another project exists. The note's
+  author is taken from the verified token, never from the request body.
 - **canvas_read**: `GET .../canvas/elements`, `.../canvas/watch-projection`,
   `.../canvas/snapshot.png|.tldr`, `.../canvas/stream`. **canvas_write**: `POST .../canvas/elements`,
   `PATCH|DELETE .../canvas/elements/{id}`.
@@ -244,6 +288,15 @@ further project via `POST /api/projects/{project_id}/members/assign-agent`
 (admin/owner gated) or by redeeming an invite whose handle collides with an
 active identity (the existing canonical_id and token are reused instead of
 409ing).
+
+Deferred binding and an existing active handle are mutually exclusive. Approving
+an auth-request with `defer_binding` mints the token and grants UNBOUND, so the
+agent has no project until `assign-agent` binds it. If that agent ALREADY holds
+an active handle the approve returns **409** and names
+`POST /api/projects/{project_id}/members/assign-agent` as the route to use. Do
+not resolve that 409 by minting a second identity: canonical ids are issued once
+per agent (`{slug}-{YYYYMMDD}-{HHMMSS}`), and a duplicate splits the agent's
+memory and grants across two ids that never reconcile.
 
 Reserved name prefixes: registration rejects any name whose slug is or starts
 with `user-`, `human-`, `admin-` or `taos-` (including casing, spacing and
@@ -416,3 +469,13 @@ was actually granted.
 These rules are deliberately lightweight. The goal is not process for its own
 sake; it is to let many hands move quickly on the same codebase without undoing
 each other's work.
+
+## Device pair requests (S4e)
+
+Route module `tinyagentos/routes/device_pair_requests.py`:
+
+- `POST /api/devices/pair-requests` creates a pairing request for a device.
+- `GET /api/devices/pair-requests/{pair_request_id}` returns its status.
+
+Approval or denial of a pair request is surfaced to the user through the Decisions app;
+agents must not grant pairing directly.

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tinyagentos"
-version = "1.0.0-beta.46"
+version = "1.0.0-beta.47"
 description = "Self-hosted AI agent memory system for low-power hardware"
 license = { file = "LICENSE" }
 # Upper-capped at <3.14 because litellm (the proxy extra, the agent/model proxy
@@ -18,7 +18,7 @@ dependencies = [
     # mounted APIRouter contributes none of its routes to the app, leaving
     # create_app() with an empty API surface. 0.136.3 is the last good release.
     "fastapi>=0.115.0,<0.137",
-    "uvicorn[standard]>=0.52.0",
+    "uvicorn[standard]>=0.52.1",
     "httpx>=0.27.0",
     "jinja2>=3.1.0",
     "pyyaml>=6.0",
@@ -51,7 +51,7 @@ dependencies = [
     # ES256 signing for APNs JWTs (tinyagentos/push/apns.py), imported at
     # startup via app.py. Previously only pulled in transitively through
     # pywebpush; declare it directly so the import is guaranteed.
-    "cryptography>=48.0",
+    "cryptography>=50.0.0",
 ]
 
 [project.optional-dependencies]
