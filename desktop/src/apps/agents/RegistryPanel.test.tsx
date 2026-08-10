@@ -695,3 +695,135 @@ describe("RegistryPanel handle editing", () => {
     expect(body.handle).toBe("new-alias");
   });
 });
+
+/* ------------------------------------------------------------------ */
+/*  Retired summary + expand/collapse                                   */
+/* ------------------------------------------------------------------ */
+
+describe("RegistryPanel retired summary and expand", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("renders retired entries collapsed by default with Retired (N) summary and expands on click", async () => {
+    const entries: RegistryEntry[] = [
+      { ...fakeEntry, canonical_id: "active-1", display_name: "ActiveAgent", status: "active" },
+      {
+        ...fakeEntry,
+        canonical_id: "revoked-1",
+        display_name: "RevokedAgent",
+        status: "revoked",
+      },
+      {
+        ...fakeEntry,
+        canonical_id: "suspended-1",
+        display_name: "SuspendedAgent",
+        status: "suspended",
+      },
+    ];
+    vi.stubGlobal("fetch", makeFetch(entries));
+
+    render(<RegistryPanel />);
+
+    const toggle = screen.getByRole("button", { name: /agent registry/i });
+    await act(async () => {
+      toggle.click();
+    });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("ActiveAgent")).toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+
+    const retiredToggle = screen.getByRole("button", {
+      name: /retired \(2\)/i,
+    });
+    expect(retiredToggle).toBeInTheDocument();
+    expect(retiredToggle).toHaveAttribute("aria-expanded", "false");
+
+    const retiredPanel = document.getElementById("retired-registry-panel");
+    expect(retiredPanel).toHaveClass("hidden");
+
+    await act(async () => {
+      retiredToggle.click();
+    });
+
+    expect(retiredToggle).toHaveAttribute("aria-expanded", "true");
+    expect(retiredPanel).not.toHaveClass("hidden");
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Active + pending visibility                                        */
+/* ------------------------------------------------------------------ */
+
+describe("RegistryPanel active and pending visibility", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("renders active and pending entries in the always-visible section", async () => {
+    const entries: RegistryEntry[] = [
+      { ...fakeEntry, canonical_id: "active-1", display_name: "ActiveAgent", status: "active" },
+      { ...fakeEntry, canonical_id: "pending-1", display_name: "PendingAgent", status: "pending" },
+    ];
+    vi.stubGlobal("fetch", makeFetch(entries));
+
+    render(<RegistryPanel />);
+
+    const toggle = screen.getByRole("button", { name: /agent registry/i });
+    await act(async () => {
+      toggle.click();
+    });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("ActiveAgent")).toBeInTheDocument();
+        expect(screen.getByText("PendingAgent")).toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Fail-open guard for unknown RegistryStatus values                   */
+/* ------------------------------------------------------------------ */
+
+describe("RegistryPanel fail-open guard", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("renders an unrecognised status in the visible Other section, not hidden or in Retired", async () => {
+    const entries: RegistryEntry[] = [
+      { ...fakeEntry, canonical_id: "frozen-1", display_name: "FrozenAgent", status: "frozen" },
+    ];
+    vi.stubGlobal("fetch", makeFetch(entries));
+
+    render(<RegistryPanel />);
+
+    const toggle = screen.getByRole("button", { name: /agent registry/i });
+    await act(async () => {
+      toggle.click();
+    });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("FrozenAgent")).toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+
+    const otherSection = screen.getByRole("region", {
+      name: "Other registry entries",
+    });
+    expect(otherSection).toBeInTheDocument();
+    expect(screen.getByText("Other (1)")).toBeInTheDocument();
+
+    expect(screen.queryByRole("region", { name: "Retired registry entries" })).not.toBeInTheDocument();
+  });
+});
+
