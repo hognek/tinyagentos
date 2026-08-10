@@ -41,7 +41,7 @@ router = APIRouter()
 DEFAULT_MODELS_DIR = models_root()
 
 
-_MODEL_FILE_SUFFIXES = (".gguf", ".rkllm", ".bin", ".safetensors", ".onnx")
+_MODEL_FILE_SUFFIXES = (".gguf", ".rkllm", ".bin", ".safetensors", ".onnx", ".hef")
 
 
 def get_downloaded_models(models_dir: Path) -> list[dict]:
