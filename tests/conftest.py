@@ -356,6 +356,10 @@ async def client(app, tmp_data_dir):
     if receipt_store._db is not None:
         await receipt_store.close()
     await receipt_store.init()
+    task_strikes = app.state.task_strikes
+    if task_strikes._db is not None:
+        await task_strikes.close()
+    await task_strikes.init()
     project_task_store = app.state.project_task_store
     if project_task_store._db is not None:
         await project_task_store.close()

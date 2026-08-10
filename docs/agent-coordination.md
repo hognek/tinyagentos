@@ -229,6 +229,9 @@ The surface, by scope:
   `POST .../tasks/{id}/(claim|release|close|reopen)`, and
   `GET /api/projects/tasks/{id}/context`. This is read + lifecycle + comments
   only. Granting project_tasks also makes the agent a project member.
+  `POST .../tasks/{id}/unquarantine` is also reachable, but LEAD-only: the
+  route (`_authorize_project_lead`) refuses a plain project_tasks worker.
+  It returns a quarantined card to the open pool and clears its strikes.
 - **project_tasks_create**: `POST /api/projects/{pid}/tasks` (author new cards).
   This is a SEPARATE scope from project_tasks and is off by default; grant it
   explicitly when an agent needs to create cards.

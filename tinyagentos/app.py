@@ -412,11 +412,14 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     board_audit_store = BoardAuditLog(data_dir / "board_audit.db")
     from tinyagentos.receipt_store import ReceiptStore
     receipt_store = ReceiptStore(data_dir / "receipts.db")
+    from tinyagentos.projects.strike_store import StrikeStore
+    strike_store = StrikeStore(data_dir / "task_strikes.db")
     project_task_store = ProjectTaskStore(
         data_dir / "projects.db",
         broker=project_event_broker,
         audit=board_audit_store,
         project_store=project_store,
+        strikes=strike_store,
     )
     project_element_store = ProjectElementStore(data_dir / "projects.db")
     from tinyagentos.projects.routines_store import RoutineStore
@@ -586,6 +589,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await project_invite_store.init()
         await board_audit_store.init()
         await receipt_store.init()
+        await strike_store.init()
         await project_task_store.init()
         await project_element_store.init()
         await routine_store.init()
@@ -1458,6 +1462,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await doc_review_store.close()
         await project_notes_store.close()
         await project_invite_store.close()
+        await strike_store.close()
         await project_task_store.close()
         await project_element_store.close()
         await routine_store.close()
@@ -1614,6 +1619,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.project_invites = project_invite_store
     app.state.board_audit = board_audit_store
     app.state.receipt_store = receipt_store
+    app.state.task_strikes = strike_store
     app.state.project_task_store = project_task_store
     app.state.project_element_store = project_element_store
     app.state.routine_store = routine_store

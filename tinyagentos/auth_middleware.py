@@ -86,6 +86,10 @@ _AGENT_TASK_ROUTES = (
     # a plain project_tasks worker is refused. Toggles only the "claimable"
     # label, so it does not widen the scope into free field edits (cf. PATCH).
     ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/claimable$")),
+    # Un-quarantine curation: same LEAD-only gate as claimable above
+    # (_authorize_project_lead). Returns a quarantined card to the open pool
+    # and clears its strikes (see StrikeStore / unquarantine_task).
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/unquarantine$")),
 )
 
 # Project doc-review stamp store routes an agent may reach with its own registry
