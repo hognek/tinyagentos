@@ -684,3 +684,119 @@ async def test_revoke_claimed_returns_409_with_mid_redeem_message(client, app):
     resp = await client.delete(f"/api/projects/{pid}/invites/{iid}")
     assert resp.status_code == 409, resp.text
     assert "mid-redeem" in resp.json()["error"]
+
+
+# ---------------------------------------------------------------------------
+# #2002: scope validation at mint (OS-level) + failed auto-approve rollback
+# ---------------------------------------------------------------------------
+# mint rejects unknown scopes on BOTH endpoints (project + OS-level) with 400.
+# A failed auto-approve rolls the invite back to 'pending', refuses the auth
+# request it already created (so it doesn't dangle in the consent inbox),
+# and the same invite+pin must then redeem on retry.
+
+
+@pytest.mark.asyncio
+async def test_mint_rejects_unknown_scopes_os_level(client, app):
+    """The OS-level (/api/agents/invites) mint must reject unknown scopes (#1993)."""
+    resp = await client.post(
+        "/api/agents/invites",
+        json={"scopes": ["a2a_send", "garbage_scope"], "approval_mode": "auto"},
+    )
+    assert resp.status_code == 400, resp.text
+    data = resp.json()
+    assert "garbage_scope" in data["error"]
+
+
+async def _redeem_failed_auto_approve_then_retry(
+    client, app, monkeypatch, iid, pin, auth_store, *, harness, expected_handle
+):
+    """Force the auto-approve step to blow up once, then retry with the real
+    helper. Asserts the #2002 rollback invariants:
+
+      * the failed redeem returns 400
+      * the invite is restored to 'pending' (not stuck in 'claimed')
+      * the auth request created before the failure is 'refused' (dangling)
+      * the same invite+pin redeems successfully on retry
+      * the retry's auth request is accepted and the invite is 'redeemed'
+    """
+    import tinyagentos.routes.agent_auth_requests as _aar
+
+    real_approve = _aar.approve_request_record
+    captured: dict = {}
+    control = {"fail_next": True}
+
+    async def _spy(*args, **kwargs):
+        record = kwargs.get("record")
+        if record is not None:
+            captured["request_id"] = record["id"]
+        if control["fail_next"]:
+            raise RuntimeError("simulated auto-approve failure")
+        return await real_approve(*args, **kwargs)
+
+    monkeypatch.setattr(_aar, "approve_request_record", _spy)
+
+    # 1) The auto-approve fails: the route rolls back the invite and refuses
+    #    the auth request it just minted so it cannot linger or be double-approved.
+    failed = await client.post(
+        "/api/projects/invites/redeem",
+        json={"invite_id": iid, "pin": pin, "harness": harness},
+    )
+    assert failed.status_code == 400, failed.text
+
+    pending_row = await app.state.project_invites.get(iid)
+    assert pending_row["status"] == "pending", pending_row
+
+    refused_req = await auth_store.get(captured["request_id"])
+    assert refused_req is not None, captured
+    assert refused_req["status"] == "refused", refused_req
+
+    # 2) Retry: real approve now runs. Same invite+pin must redeem successfully.
+    control["fail_next"] = False
+    retry = await client.post(
+        "/api/projects/invites/redeem",
+        json={"invite_id": iid, "pin": pin, "harness": harness},
+    )
+    assert retry.status_code == 200, retry.text
+    body = retry.json()
+    assert body["agent_handle"] == expected_handle, body
+
+    final_row = await app.state.project_invites.get(iid)
+    assert final_row["status"] == "redeemed", final_row
+    retry_req = await auth_store.get(body["request_id"])
+    assert retry_req["status"] == "accepted", retry_req
+
+    return body
+
+
+@pytest.mark.asyncio
+async def test_redeem_failed_approve_restores_pending_and_refuses_auth(
+    client, app, monkeypatch, tmp_path
+):
+    """A failed auto-approve rolls the project invite back to 'pending' and
+    refuses the dangling auth request; the same invite+pin redeems on retry."""
+    _registry, auth_store, _grants = await _setup_agent_ecosystem(app, monkeypatch, tmp_path)
+    pid = await _create_project(client, slug="redfail")
+    iid, pin = await _mint_invite(client, pid, approval_mode="auto", scopes=["a2a_send"])
+    body = await _redeem_failed_auto_approve_then_retry(
+        client, app, monkeypatch, iid, pin, auth_store,
+        harness="claude", expected_handle="redfail-claude",
+    )
+    poll = await client.get(f"/api/agents/auth-requests/{body['request_id']}")
+    assert poll.status_code == 200, poll.text
+    assert poll.json()["status"] == "accepted"
+    members = await app.state.project_store.list_members(pid)
+    assert len(members) == 1
+
+
+@pytest.mark.asyncio
+async def test_redeem_failed_approve_os_level_restores_pending(
+    client, app, monkeypatch, tmp_path
+):
+    """The OS-level redeem path must also roll back to 'pending' on a failed
+    auto-approve, refuse the dangling auth request, and redeem on retry."""
+    _registry, auth_store, _grants = await _setup_agent_ecosystem(app, monkeypatch, tmp_path)
+    iid, pin = await _mint_os_invite(client, scopes=["a2a_send"], display_name="Scout")
+    await _redeem_failed_auto_approve_then_retry(
+        client, app, monkeypatch, iid, pin, auth_store,
+        harness="claude", expected_handle="scout",
+    )
