@@ -16,15 +16,29 @@ from pathlib import Path
 import yaml
 
 # Known target enums -- the resolver only accepts values produced by
-# hardware_to_targets in tinyagentos/cluster/capabilities.py.
-KNOWN_TARGETS = {
-    "apple-silicon",
-    "x86-cuda",
-    "x86-vulkan",
-    "arm-vulkan",
-    "rockchip",
-    "cpu",
-}
+# hardware_to_targets in tinyagentos/cluster/capabilities.py. DERIVED from
+# that source file rather than hardcoded: a literal copy silently drifts the
+# moment a new backend target lands (adding "hailo" there would have made
+# this sweep bounce the very PR that introduced it).
+_CAPABILITIES_SRC = (
+    Path(__file__).resolve().parent.parent
+    / "tinyagentos" / "cluster" / "capabilities.py"
+).read_text()
+KNOWN_TARGETS = set(
+    re.findall(r'targets\.append\(\s*"([a-z0-9-]+)"', _CAPABILITIES_SRC)
+) | set(
+    # conditional-expression appends: targets.append("a" if cond else "b")
+    t
+    for pair in re.findall(
+        r'targets\.append\(\s*"([a-z0-9-]+)" if .+ else "([a-z0-9-]+)"',
+        _CAPABILITIES_SRC,
+    )
+    for t in pair
+)
+assert len(KNOWN_TARGETS) >= 6, (
+    f"target derivation collapsed ({sorted(KNOWN_TARGETS)}) - "
+    "capabilities.py changed shape; fix the extraction, do not hardcode"
+)
 
 # Pre-existing debt: every model manifest ships without sha256 (None or
 # empty string).  IDs listed here are exempt from the sha256 rule until
