@@ -13,8 +13,9 @@ import {
   ArrowRight,
   UserPlus,
   Archive,
+  Pencil,
 } from "lucide-react";
-import { Button, Card } from "@/components/ui";
+import { Button, Card, Input } from "@/components/ui";
 import { projectsApi } from "@/lib/projects";
 import { AssignAgentToProjectDialog } from "./AssignAgentToProjectDialog";
 import { InviteAgentDialog } from "@/apps/ProjectsApp/InviteAgentDialog";
@@ -134,18 +135,48 @@ function RegistryEntryRow({
   currentUserId,
   onAction,
   onAssign,
+  onPatchHandle,
 }: {
   entry: RegistryEntry;
   isAdmin: boolean;
   currentUserId: string;
   onAction: (id: string, action: "approve" | "reject" | "suspend" | "reactivate" | "revoke") => Promise<void>;
   onAssign: (entry: RegistryEntry) => void;
+  onPatchHandle: (id: string, handle: string) => Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [editingHandle, setEditingHandle] = useState(false);
+  const [handleDraft, setHandleDraft] = useState(entry.handle);
+  const [savingHandle, setSavingHandle] = useState(false);
+  const [handleErr, setHandleErr] = useState<string | null>(null);
   const isOwner = entry.user_id === currentUserId;
+  const canEditHandle = isAdmin || isOwner;
   const canRevoke = (isAdmin || isOwner) && (entry.status === "active" || entry.status === "suspended");
   const canAssign = (isAdmin || isOwner) && entry.status === "active";
+
+  useEffect(() => {
+    setHandleDraft(entry.handle);
+  }, [entry.handle]);
+
+  async function saveHandle() {
+    const trimmed = handleDraft.trim();
+    if (trimmed === entry.handle) {
+      setEditingHandle(false);
+      setHandleErr(null);
+      return;
+    }
+    setSavingHandle(true);
+    setHandleErr(null);
+    try {
+      await onPatchHandle(entry.canonical_id, trimmed);
+      setEditingHandle(false);
+    } catch (e: unknown) {
+      setHandleErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingHandle(false);
+    }
+  }
 
   async function act(action: "approve" | "reject" | "suspend" | "reactivate" | "revoke") {
     setBusy(true);
@@ -189,6 +220,69 @@ function RegistryEntryRow({
               <span className="text-[11px] text-shell-text-tertiary">
                 by {entry.user_id}
               </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2 mt-1">
+            <span className="text-[11px] text-shell-text-tertiary">
+              {entry.handle ? `@${entry.handle}` : "no handle"}
+            </span>
+            {canEditHandle && (
+              editingHandle ? (
+                <>
+                  <Input
+                    value={handleDraft}
+                    onChange={(e) => setHandleDraft(e.target.value)}
+                    className="h-7 text-xs w-40"
+                    autoFocus
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") saveHandle();
+                      if (e.key === "Escape") {
+                        setHandleDraft(entry.handle);
+                        setEditingHandle(false);
+                        setHandleErr(null);
+                      }
+                    }}
+                    disabled={savingHandle}
+                  />
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 hover:bg-emerald-500/15 hover:text-emerald-400"
+                    onClick={saveHandle}
+                    disabled={savingHandle}
+                    title="Save handle"
+                  >
+                    <CheckCircle size={14} />
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 hover:bg-zinc-500/15 hover:text-zinc-400"
+                    onClick={() => {
+                      setHandleDraft(entry.handle);
+                      setEditingHandle(false);
+                      setHandleErr(null);
+                    }}
+                    disabled={savingHandle}
+                    title="Cancel"
+                  >
+                    <XCircle size={14} />
+                  </Button>
+                </>
+              ) : (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-7 w-7 hover:bg-white/[0.06] hover:text-shell-text"
+                  onClick={() => setEditingHandle(true)}
+                  title="Edit handle"
+                >
+                  <Pencil size={12} />
+                </Button>
+              )
+            )}
+            {handleErr && (
+              <span className="text-[11px] text-red-400" role="alert">{handleErr}</span>
             )}
           </div>
         </div>
@@ -745,6 +839,26 @@ export function RegistryPanel() {
     };
   }, [expanded, load]);
 
+  async function handlePatchHandle(
+    canonical_id: string,
+    handle: string,
+  ) {
+    const resp = await fetch(
+      `/api/agents/registry/${encodeURIComponent(canonical_id)}`,
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ handle }),
+        credentials: "include",
+      },
+    );
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error((err as { error?: string }).error ?? `HTTP ${resp.status}`);
+    }
+    await load({ quiet: true });
+  }
+
   async function handleAction(
     canonical_id: string,
     action: "approve" | "reject" | "suspend" | "reactivate" | "revoke",
@@ -822,6 +936,7 @@ export function RegistryPanel() {
                 currentUserId={currentUserId}
                 onAction={handleAction}
                 onAssign={setAssignEntry}
+                onPatchHandle={handlePatchHandle}
               />
             ))}
 
@@ -841,6 +956,7 @@ export function RegistryPanel() {
                       currentUserId={currentUserId}
                       onAction={handleAction}
                       onAssign={setAssignEntry}
+                      onPatchHandle={handlePatchHandle}
                     />
                   ))}
                 </div>
@@ -876,6 +992,7 @@ export function RegistryPanel() {
                       currentUserId={currentUserId}
                       onAction={handleAction}
                       onAssign={setAssignEntry}
+                      onPatchHandle={handlePatchHandle}
                     />
                   ))}
                 </div>
