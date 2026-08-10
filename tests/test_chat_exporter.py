@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -63,12 +64,15 @@ async def test_flatten_text_blocks():
 
 @pytest.mark.asyncio
 async def test_flatten_skips_empty_text():
+    # Updated for card rule 3: a non-text block (image) no longer vanishes
+    # silently — it flattens to a descriptive placeholder. An empty-text
+    # text-type block still contributes nothing.
     blocks = [
         {"type": "paragraph", "text": "Hello"},
         {"type": "image", "url": "http://x/img.png"},
         {"type": "paragraph", "text": ""},
     ]
-    assert flatten_body(blocks) == "Hello"
+    assert flatten_body(blocks) == "Hello\n[image: http://x/img.png]"
 
 
 # ---------------------------------------------------------------------------
@@ -183,13 +187,19 @@ async def test_reexport_produces_byte_identical_output(store, tmp_path):
 
 @pytest.mark.asyncio
 async def test_oversized_content_becomes_ref(store, tmp_path):
+    # Updated for card rule 5: the oversized envelope's blocks are no
+    # longer destroyed. The full original envelope (blocks intact) is
+    # written through file_writer, and the emitted body keeps the
+    # (possibly truncated) flattened text plus a note carrying the ref,
+    # rather than the body being replaced by the bare ref.
     big_text = "x" * 100_000
+    blocks = [{"type": "paragraph", "text": big_text}]
     await store.send_message(
         channel_id="ch1",
         author_id="user1",
         author_type="user",
         content=big_text,
-        content_blocks=[{"type": "paragraph", "text": big_text}],
+        content_blocks=blocks,
     )
 
     writer = _make_file_writer(tmp_path)
@@ -202,10 +212,13 @@ async def test_oversized_content_becomes_ref(store, tmp_path):
     assert len(batch) == 1
     env = batch[0]
     assert env["blocks"] == []
-    assert "chat-export/" in env["body"]
-    assert env["body"].endswith(".txt")
-    written = (tmp_path / env["body"]).read_bytes()
-    assert written.decode("utf-8") == big_text
+    ref_match = re.search(r"chat-export/[^\s\]]+\.txt", env["body"])
+    assert ref_match, f"no ref found in body: {env['body']!r}"
+    assert env["body"].endswith(f"[oversized content exported to: {ref_match.group(0)}]")
+    written = (tmp_path / ref_match.group(0)).read_bytes()
+    full_envelope = json.loads(written.decode("utf-8"))
+    assert full_envelope["blocks"] == blocks
+    assert full_envelope["body"] == big_text
 
 
 @pytest.mark.asyncio
@@ -398,6 +411,49 @@ async def test_custom_source_identifier(store):
 
 
 @pytest.mark.asyncio
+async def test_dropped_fields_are_not_exported(store):
+    """Card rule 5 (documented drops): a message carrying content_type,
+    embeds, components, attachments, reactions, metadata, edited_at,
+    pinned, ephemeral, expires_at, and a non-default author_type still
+    exports cleanly, with the envelope carrying only the agreed fields."""
+    msg = await store.send_message(
+        channel_id="ch1",
+        author_id="user1",
+        author_type="agent",
+        content="hello",
+        content_type="markdown",
+        content_blocks=[{"type": "paragraph", "text": "hello"}],
+        embeds=[{"kind": "link"}],
+        components=[{"kind": "button"}],
+        attachments=[{"filename": "x.png"}],
+        metadata={"secret": "do-not-export"},
+        expires_at=time.time() + 1000,
+    )
+    await store.pin_message("ch1", msg["id"], pinned_by="user1")
+    await store.edit_message(msg["id"], "hello edited")
+    await store.add_reaction(msg["id"], "\U0001F44D", "user1")
+
+    exporter = ChatExporter(
+        message_store=store,
+        identity_map=_identity_map(["user1"]),
+    )
+    batch = await exporter.export_channel("ch1")
+    assert len(batch) == 1
+    env = batch[0]
+    allowed_keys = {
+        "from", "thread", "body", "blocks", "ts", "source", "source_id",
+        "reply_to",
+    }
+    assert set(env.keys()) <= allowed_keys
+    for dropped in (
+        "content_type", "embeds", "components", "attachments", "reactions",
+        "metadata", "edited_at", "pinned", "ephemeral", "expires_at",
+        "author_type",
+    ):
+        assert dropped not in env
+
+
+@pytest.mark.asyncio
 async def test_empty_body_when_no_content(store):
     await store.send_message(
         channel_id="ch1",
@@ -433,8 +489,133 @@ async def test_file_writer_receives_utf8_body(store, tmp_path):
         file_writer=writer,
     )
     batch = await exporter.export_channel("ch1")
-    ref = batch[0]["body"]
-    assert ref.startswith("chat-export/")
-    assert ref.endswith(".txt")
-    written = (tmp_path / ref).read_bytes()
-    assert written.decode("utf-8") == text
+    body = batch[0]["body"]
+    ref_match = re.search(r"chat-export/[^\s\]]+\.txt", body)
+    assert ref_match, f"no ref found in body: {body!r}"
+    written = (tmp_path / ref_match.group(0)).read_bytes()
+    full_envelope = json.loads(written.decode("utf-8"))
+    assert full_envelope["body"] == text
+
+
+# ---------------------------------------------------------------------------
+# RED-FIRST proof tests for fix batch (card tsk-yfy5j5).
+# Each test below reproduces one of the 4 blockers found in review; they are
+# written and run against the UNFIXED source first (captured in
+# REDPROOF.txt), then the source is fixed until these go green.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_oversize_message_preserves_blocks_via_ref(store, tmp_path):
+    """Card rule 5: an oversized message must not silently drop its blocks.
+    The full original envelope (blocks intact) is written through
+    file_writer, and the emitted body carries a reference to it."""
+    big_text = "x" * 100_000
+    blocks = [
+        {"type": "paragraph", "text": big_text},
+        {"type": "image", "url": "http://x/big.png"},
+    ]
+    await store.send_message(
+        channel_id="ch1",
+        author_id="user1",
+        author_type="user",
+        content=big_text,
+        content_blocks=blocks,
+    )
+    writer = _make_file_writer(tmp_path)
+    exporter = ChatExporter(
+        message_store=store,
+        identity_map=_identity_map(["user1"]),
+        file_writer=writer,
+    )
+    batch = await exporter.export_channel("ch1")
+    env = batch[0]
+    assert env["blocks"] == []
+    ref_match = re.search(r"chat-export/[^\s\]]+\.txt", env["body"])
+    assert ref_match, f"no ref found in body: {env['body']!r}"
+    written = (tmp_path / ref_match.group(0)).read_text()
+    full_envelope = json.loads(written)
+    assert full_envelope["blocks"] == blocks
+    assert full_envelope["body"] == flatten_body(blocks)
+
+
+@pytest.mark.asyncio
+async def test_image_only_message_exports_with_placeholder_body(store):
+    """Card rule 3: a non-text (e.g. image) block must flatten to a
+    descriptive placeholder, never brick the whole channel export."""
+    await store.send_message(
+        channel_id="ch1",
+        author_id="user1",
+        author_type="user",
+        content="",
+        content_blocks=[{"type": "image", "url": "http://x/img.png"}],
+    )
+    exporter = ChatExporter(
+        message_store=store,
+        identity_map=_identity_map(["user1"]),
+    )
+    batch = await exporter.export_channel("ch1")
+    assert len(batch) == 1
+    assert batch[0]["body"] == "[image: http://x/img.png]"
+
+
+@pytest.mark.asyncio
+async def test_streaming_message_excluded_from_export(store):
+    """A message whose state is 'streaming' (or 'error') is not authentic
+    history and must be excluded, the same way deleted messages are."""
+    await store.send_message(
+        channel_id="ch1",
+        author_id="user1",
+        author_type="agent",
+        content="",
+        content_blocks=[{"type": "paragraph", "text": "partial"}],
+        state="streaming",
+    )
+    await store.send_message(
+        channel_id="ch1",
+        author_id="user1",
+        author_type="user",
+        content="done",
+        content_blocks=[{"type": "paragraph", "text": "done"}],
+        state="complete",
+    )
+    exporter = ChatExporter(
+        message_store=store,
+        identity_map=_identity_map(["user1"]),
+    )
+    batch = await exporter.export_channel("ch1")
+    assert len(batch) == 1
+    assert batch[0]["body"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_same_timestamp_reply_sorts_after_parent(store):
+    """Card rule 7: sort key (created_at, id) with random ids can put a
+    reply before its parent on a timestamp tie. Ids are chosen so the
+    naive sort gets it wrong (\"a-reply\" < \"z-parent\" lexically)."""
+    ts = time.time()
+    await store.ensure_message({
+        "id": "z-parent",
+        "channel_id": "ch1",
+        "author_id": "user1",
+        "author_type": "user",
+        "content": "parent",
+        "content_blocks": [{"type": "paragraph", "text": "parent"}],
+        "created_at": ts,
+    })
+    await store.ensure_message({
+        "id": "a-reply",
+        "channel_id": "ch1",
+        "thread_id": "z-parent",
+        "author_id": "user1",
+        "author_type": "user",
+        "content": "reply",
+        "content_blocks": [{"type": "paragraph", "text": "reply"}],
+        "created_at": ts,
+    })
+    exporter = ChatExporter(
+        message_store=store,
+        identity_map=_identity_map(["user1"]),
+    )
+    batch = await exporter.export_channel("ch1")
+    ids = [e["source_id"] for e in batch]
+    assert ids.index("z-parent") < ids.index("a-reply")

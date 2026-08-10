@@ -1,7 +1,18 @@
+"""Chat message exporter: transforms ChatMessageStore rows into A2A bus
+import-batch envelopes.
+
+DROPPED FIELDS: the following ``chat_messages`` columns (and the
+``chat_attachments`` table) are intentionally NOT carried into the export
+envelope — they live outside the agreed bus envelope by design:
+content_type, embeds, components, attachments (+ chat_attachments table),
+reactions, metadata, edited_at, pinned, ephemeral, expires_at, author_type.
+Only ``from``, ``thread``, ``body``, ``blocks``, ``ts``, ``source``,
+``source_id``, and (when applicable) ``reply_to`` are exported.
+"""
+
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 _MAX_MESSAGE_BYTES = 64 * 1024
@@ -13,22 +24,84 @@ class ChatExportError(Exception):
 
 
 def flatten_body(blocks: list[dict] | None) -> str:
-    """Flatten content blocks to plain text."""
+    """Flatten content blocks to plain text.
+
+    Blocks carrying a ``text`` key flatten as text (empty text contributes
+    nothing, same as before). Blocks without a ``text`` key (images, files,
+    and other non-text blocks) flatten to a descriptive placeholder built
+    from their type plus the most useful identifying field present, so a
+    non-text block never silently disappears or bricks the export.
+    """
     if not blocks:
         return ""
     parts = []
     for block in blocks:
         if isinstance(block, dict):
-            text = block.get("text") or block.get("content") or ""
-            if text:
-                parts.append(str(text))
+            if "text" in block:
+                text = block.get("text") or ""
+                if text:
+                    parts.append(str(text))
+                continue
+            block_type = block.get("type") or "block"
+            identifier = (
+                block.get("url") or block.get("name") or block.get("filename")
+            )
+            if identifier:
+                parts.append(f"[{block_type}: {identifier}]")
+            else:
+                parts.append(f"[{block_type} block]")
         elif isinstance(block, str):
-            parts.append(block)
+            if block:
+                parts.append(block)
     return "\n".join(parts)
 
 
 def _serialized_size(envelope: dict) -> int:
     return len(json.dumps(envelope, ensure_ascii=False).encode("utf-8"))
+
+
+def _causal_tiebreak(group: list[dict]) -> list[dict]:
+    """Stable topological sort of a same-timestamp group of messages: a
+    message replying (via ``thread_id``) to another message in the same
+    group is ordered after that parent. Messages with no such relationship
+    keep their original (already created_at/id sorted) relative order."""
+    ids = {m.get("id") for m in group}
+    indegree = {m.get("id"): 0 for m in group}
+    children: dict[Any, list[dict]] = {m.get("id"): [] for m in group}
+    for m in group:
+        parent_id = m.get("thread_id")
+        if parent_id in ids:
+            children[parent_id].append(m)
+            indegree[m.get("id")] += 1
+
+    ready = [m for m in group if indegree[m.get("id")] == 0]
+    ordered: list[dict] = []
+    while ready:
+        m = ready.pop(0)
+        ordered.append(m)
+        for child in children[m.get("id")]:
+            indegree[child.get("id")] -= 1
+            if indegree[child.get("id")] == 0:
+                ready.append(child)
+    return ordered
+
+
+def _sort_with_causality(messages: list[dict]) -> list[dict]:
+    """Sort by (created_at, id) then run a same-timestamp causality pass so
+    a reply never precedes its parent within an equal-timestamp group."""
+    messages = sorted(
+        messages, key=lambda m: (m.get("created_at") or 0.0, m.get("id") or "")
+    )
+    result: list[dict] = []
+    i, n = 0, len(messages)
+    while i < n:
+        j = i
+        ts = messages[i].get("created_at") or 0.0
+        while j < n and (messages[j].get("created_at") or 0.0) == ts:
+            j += 1
+        result.extend(_causal_tiebreak(messages[i:j]))
+        i = j
+    return result
 
 
 class ChatExporter:
@@ -56,17 +129,21 @@ class ChatExporter:
         self._file_writer = file_writer
 
     async def export_channel(self, channel_id: str) -> list[dict]:
-        """Export all non-deleted messages from a channel.
+        """Export all non-deleted, complete messages from a channel.
 
-        Returns envelopes ordered by (created_at ASC, id ASC) for
-        deterministic, reproducible output.  Raises ChatExportError if any
-        author_id is unmapped.
+        Returns envelopes ordered by (created_at ASC, id ASC), with a
+        same-timestamp causality pass so a reply never precedes its parent,
+        for deterministic, reproducible output.  Raises ChatExportError if
+        any author_id is unmapped.
         """
         messages = await self._msg_store.get_all_messages_for_channel(channel_id)
-        messages = [m for m in messages if m.get("deleted_at") is None]
-        messages.sort(
-            key=lambda m: (m.get("created_at") or 0.0, m.get("id") or "")
-        )
+        messages = [
+            m
+            for m in messages
+            if m.get("deleted_at") is None
+            and m.get("state") in (None, "complete")
+        ]
+        messages = _sort_with_causality(messages)
 
         batch: list[dict] = []
         exported_ids: set[str] = set()
@@ -128,8 +205,27 @@ class ChatExporter:
                     f"message {source_id!r} exceeds {self._max_message_bytes} bytes "
                     f"and no file_writer configured"
                 )
-            ref = await self._file_writer(source_id, body.encode("utf-8"))
-            envelope["body"] = ref
+            # Preserve the full original envelope (blocks intact) out-of-band
+            # rather than destroying it — oversize is usually caused by the
+            # blocks that would otherwise be dropped.
+            full_bytes = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+            ref = await self._file_writer(source_id, full_bytes)
+
+            emitted_body = body
+            body_bytes = emitted_body.encode("utf-8")
+            if len(body_bytes) > self._max_message_bytes:
+                truncate_note = "... [truncated]"
+                budget = max(
+                    self._max_message_bytes - len(truncate_note.encode("utf-8")), 0
+                )
+                emitted_body = (
+                    body_bytes[:budget].decode("utf-8", errors="ignore")
+                    + truncate_note
+                )
+
+            envelope["body"] = (
+                f"{emitted_body}\n[oversized content exported to: {ref}]"
+            )
             envelope["blocks"] = []
 
         return envelope
