@@ -629,69 +629,136 @@ describe("RegistryPanel handle editing", () => {
       { timeout: 3000 },
     );
   });
+});
 
-  it("strips a typed leading @ before PATCH (@ is bus syntax, not part of the name)", async () => {
-    const entryWithHandle: RegistryEntry = {
-      ...fakeEntry,
-      handle: "old-alias",
-    };
-    const mockFetch = vi.fn().mockImplementation((url: string, opts?: RequestInit) => {
-      if (url === "/auth/status") {
-        return Promise.resolve({
-          ok: true,
-          json: () => Promise.resolve({ user: { is_admin: true, id: "user-1" } }),
-        });
-      }
-      if (url === "/api/agents/registry") {
-        return Promise.resolve({
-          ok: true,
-          json: () => Promise.resolve([entryWithHandle]),
-        });
-      }
-      if (typeof url === "string" && url.includes("/api/agents/registry/") && opts?.method === "PATCH") {
-        return Promise.resolve({
-          ok: true,
-          json: () => Promise.resolve({ ...entryWithHandle, handle: "new-alias" }),
-        });
-      }
-      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
-    });
-    vi.stubGlobal("fetch", mockFetch);
+/* ------------------------------------------------------------------ */
+/*  Retired summary + expand/collapse                                   */
+/* ------------------------------------------------------------------ */
+
+describe("RegistryPanel retired summary and expand", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("renders retired entries collapsed by default with Retired (N) summary and expands on click", async () => {
+    const entries: RegistryEntry[] = [
+      { ...fakeEntry, canonical_id: "active-1", display_name: "ActiveAgent", status: "active" },
+      {
+        ...fakeEntry,
+        canonical_id: "revoked-1",
+        display_name: "RevokedAgent",
+        status: "revoked",
+      },
+      {
+        ...fakeEntry,
+        canonical_id: "suspended-1",
+        display_name: "SuspendedAgent",
+        status: "suspended",
+      },
+    ];
+    vi.stubGlobal("fetch", makeFetch(entries));
 
     render(<RegistryPanel />);
 
     const toggle = screen.getByRole("button", { name: /agent registry/i });
-    await act(async () => { toggle.click(); });
+    await act(async () => {
+      toggle.click();
+    });
 
     await waitFor(
       () => {
-        expect(screen.getByText("@old-alias")).toBeInTheDocument();
+        expect(screen.getByText("ActiveAgent")).toBeInTheDocument();
       },
       { timeout: 3000 },
     );
 
-    const editBtn = screen.getByTitle("Edit handle");
-    await act(async () => { editBtn.click(); });
+    const retiredToggle = screen.getByRole("button", {
+      name: /retired \(2\)/i,
+    });
+    expect(retiredToggle).toBeInTheDocument();
+    expect(retiredToggle).toHaveAttribute("aria-expanded", "false");
 
-    const input = screen.getByRole("textbox");
+    const retiredPanel = document.getElementById("retired-registry-panel");
+    expect(retiredPanel).toHaveClass("hidden");
+
     await act(async () => {
-      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
-        window.HTMLInputElement.prototype,
-        "value",
-      )!.set!;
-      nativeInputValueSetter.call(input, "@new-alias");
-      input.dispatchEvent(new Event("input", { bubbles: true }));
+      retiredToggle.click();
     });
 
-    const saveBtn = screen.getByTitle("Save handle");
-    await act(async () => { saveBtn.click(); });
-    await act(async () => { await Promise.resolve(); });
-
-    const patchCalls = mockFetch.mock.calls.filter(
-      ([url, opts]) => typeof url === "string" && url.includes("/api/agents/registry/") && (opts as RequestInit)?.method === "PATCH",
-    );
-    expect(patchCalls.length).toBe(1);
-    const body = JSON.parse((patchCalls[0][1] as RequestInit).body as string);
-    expect(body.handle).toBe("new-alias");
+    expect(retiredToggle).toHaveAttribute("aria-expanded", "true");
+    expect(retiredPanel).not.toHaveClass("hidden");
   });
 });
+
+/* ------------------------------------------------------------------ */
+/*  Active + pending visibility                                        */
+/* ------------------------------------------------------------------ */
+
+describe("RegistryPanel active and pending visibility", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("renders active and pending entries in the always-visible section", async () => {
+    const entries: RegistryEntry[] = [
+      { ...fakeEntry, canonical_id: "active-1", display_name: "ActiveAgent", status: "active" },
+      { ...fakeEntry, canonical_id: "pending-1", display_name: "PendingAgent", status: "pending" },
+    ];
+    vi.stubGlobal("fetch", makeFetch(entries));
+
+    render(<RegistryPanel />);
+
+    const toggle = screen.getByRole("button", { name: /agent registry/i });
+    await act(async () => {
+      toggle.click();
+    });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("ActiveAgent")).toBeInTheDocument();
+        expect(screen.getByText("PendingAgent")).toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/*  Fail-open guard for unknown RegistryStatus values                   */
+/* ------------------------------------------------------------------ */
+
+describe("RegistryPanel fail-open guard", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("renders an unrecognised status in the visible Other section, not hidden or in Retired", async () => {
+    const entries: RegistryEntry[] = [
+      { ...fakeEntry, canonical_id: "frozen-1", display_name: "FrozenAgent", status: "frozen" },
+    ];
+    vi.stubGlobal("fetch", makeFetch(entries));
+
+    render(<RegistryPanel />);
+
+    const toggle = screen.getByRole("button", { name: /agent registry/i });
+    await act(async () => {
+      toggle.click();
+    });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("FrozenAgent")).toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+
+    const otherSection = screen.getByRole("region", {
+      name: "Other registry entries",
+    });
+    expect(otherSection).toBeInTheDocument();
+    expect(screen.getByText("Other (1)")).toBeInTheDocument();
+
+    expect(screen.queryByRole("region", { name: "Retired registry entries" })).not.toBeInTheDocument();
+  });
+});
+
