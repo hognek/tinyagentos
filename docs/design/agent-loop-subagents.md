@@ -75,16 +75,35 @@ SAFE_POINT --(immediate)--> IDLE
 
 ## Integration points
 
-> **Not yet integrated**: `AgentLoop` is standalone library infrastructure.
-> It is not yet wired into the taOS chat agent routes. Routing integration
-> will be handled in a separate design card once the `AgentChatRouter`-lock
-> design decision is made.
+`AgentLoop` is wired in as the single per-agent serialization owner
+(tsk-icpt4i):
 
-- The taOS chat endpoint (`routes/taos_agent.py`) can use `AgentLoop` to wrap
-  `opencode_runtime.drive_turn`: start a turn, spawn a subagent for long tool
-  calls, and drain the queue at the end of the stream.
-- The `AgentChatRouter._run_acp_turn` path can delegate to a subagent via
-  `openclaw_acp_runtime.drive_turn` when a turn is expected to be long.
+- **`AgentChatRouter._run_acp_turn`** (`tinyagentos/agent_chat_router.py`)
+  keeps one `AgentLoop` per agent slug (replacing the previous per-agent
+  `asyncio.Lock`). The turn-holder drives its turn, then iteratively drains
+  the safe-point queue, driving each queued message as its own turn with its
+  original trace id. A caller whose message returns `QUEUED` exits
+  immediately — the turn-holder drives it. `reach_safe_point` runs in a
+  `finally` so a raising turn can never wedge the loop in `WORKING`.
+- **`POST /api/taos-agent/chat`** (`routes/taos_agent.py`) serializes the
+  desktop taOS agent on a single `AgentLoop` held on
+  `app.state.taos_agent_loop` (previously two concurrent POSTs raced on the
+  shared opencode session with no serialization). A concurrent request gets a
+  one-frame NDJSON stream saying its message is queued; the turn-holder
+  surfaces queued message contents into its own stream's tail at the safe
+  point, before the final `{"done": true}`.
+- **`GET /api/taos-agent/status`** returns the desktop loop's status scoped
+  to `state` / `current_turn_id` / `queued_count` / `subagents` as
+  `[{id, task, state, started_at}]` — subagent `result` / `error` payloads
+  stay server-side.
+
+Still not integrated:
+
+- Router-side subagent spawning (`spawn_subagent` is not called from
+  `_run_acp_turn`).
+- Desktop-endpoint redrive: queued messages are surfaced into the
+  turn-holder's stream, not re-driven as their own turns.
+- Router per-agent loops are not exposed via any status endpoint.
 
 ## Testing
 
