@@ -40,6 +40,7 @@ TRAILER = "Store-Unwired-Intentionally:"
 class Violation:
     class_name: str
     file_path: str
+    reason: str = ""
 
 
 def _run_git(args: list[str], repo_root: Path) -> str:
@@ -94,6 +95,71 @@ def _class_def_in_added_lines(
     diff = _run_git(["diff", f"{base_ref}...HEAD", "--", file_path], repo_root)
     pattern = re.compile(rf"^\+.*class\s+{re.escape(class_name)}\s*\(", re.MULTILINE)
     return bool(pattern.search(diff))
+
+
+def _is_wired_ast(app_py_content: str, class_name: str) -> bool:
+    """Return True if class_name is instantiated and assigned to app.state.
+
+    Handles:
+      app.state.X = ClassName(...)
+      x = ClassName(...); app.state.X = x
+      x = ClassName(...); y = x; app.state.Y = y
+    """
+    try:
+        tree = ast.parse(app_py_content)
+    except SyntaxError:
+        return False
+
+    instance_vars: set[str] = set()
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if isinstance(node.value, ast.Call):
+            func = node.value.func
+            if isinstance(func, ast.Name) and func.id == class_name:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        instance_vars.add(target.id)
+
+    changed = True
+    while changed:
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                if isinstance(node.value, ast.Name) and node.value.id in instance_vars:
+                    for target in node.targets:
+                        if isinstance(target, ast.Name) and target.id not in instance_vars:
+                            instance_vars.add(target.id)
+                            changed = True
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if not isinstance(target, ast.Attribute):
+                continue
+            if not (isinstance(target.value, ast.Name) and target.value.id == "app" and target.attr == "state"):
+                continue
+            if isinstance(node.value, ast.Call):
+                func = node.value.func
+                if isinstance(func, ast.Name) and func.id == class_name:
+                    return True
+            if isinstance(node.value, ast.Name) and node.value.id in instance_vars:
+                return True
+
+    return False
+
+
+def _is_wired_in_app_py(app_py_content: str, class_name: str) -> tuple[bool, str]:
+    ast_ok = _is_wired_ast(app_py_content, class_name)
+    if ast_ok:
+        return True, "AST"
+    code_only = re.sub(r"#.*", "", app_py_content)
+    name_ok = bool(re.search(rf"\b{re.escape(class_name)}\b", code_only))
+    if name_ok:
+        return True, "name-level-fallback"
+    return False, "unwired"
 
 
 def build_class_hierarchy(repo_root: Path) -> dict[str, set[str]]:
@@ -198,7 +264,7 @@ def check_store_wiring(
             continue
         if status.startswith("D"):
             continue
-        if not (status.startswith("A") or status.startswith("M")):
+        if not (status.startswith("A") or status.startswith("M") or status.startswith("R") or status.startswith("C")):
             continue
 
         abs_path = repo_root / file_path
@@ -212,7 +278,7 @@ def check_store_wiring(
 
         for class_name in sorted(store_classes):
             is_new = False
-            if status.startswith("A"):
+            if status.startswith("A") or status.startswith("R") or status.startswith("C"):
                 is_new = True
             elif status.startswith("M"):
                 is_new = _class_def_in_added_lines(
@@ -223,14 +289,17 @@ def check_store_wiring(
                 continue
 
             if class_name in waived:
-                waived.add(class_name)
                 continue
 
-            if not re.search(rf"\b{re.escape(class_name)}\b", app_py_content):
-                violations.append(Violation(
-                    class_name=class_name,
-                    file_path=file_path,
-                ))
+            wired, how = _is_wired_in_app_py(app_py_content, class_name)
+            if wired:
+                continue
+
+            violations.append(Violation(
+                class_name=class_name,
+                file_path=file_path,
+                reason=how,
+            ))
 
     return violations, waived
 
@@ -262,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
             f"so an unwired store is unreachable:"
         )
         for v in violations:
-            print(f"  - {v.class_name} in {v.file_path}")
+            print(f"  - {v.class_name} in {v.file_path} ({v.reason})")
         return 1
 
     print("store-wiring-guard: clean")

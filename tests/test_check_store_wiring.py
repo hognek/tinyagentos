@@ -385,6 +385,68 @@ class TestCheckStoreWiring:
         assert names == {"ParentStore", "ChildStore"}
         assert waived == set()
 
+    def test_comment_only_mention_fails_ast(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        base_tip = _setup_base_repo(repo)
+
+        _branch(repo, "pr")
+        _checkout(repo, "pr")
+        _commit(
+            repo, "tinyagentos/comment_store.py",
+            "from tinyagentos.base_store import BaseStore\n"
+            "\n"
+            "class CommentStore(BaseStore):\n"
+            "    SCHEMA = ''\n"
+            "    MIGRATIONS = []\n",
+            "feat: add CommentStore",
+        )
+        _commit(
+            repo, "tinyagentos/app.py",
+            "from tinyagentos.base_store import BaseStore\n"
+            "from tinyagentos.metrics_store import MetricsStore\n\n"
+            "# CommentStore is not wired here\n"
+            "metrics_store = MetricsStore('/tmp/metrics.db')\n\n"
+            "async def lifespan(app):\n"
+            "    await metrics_store.init()\n"
+            "    app.state.metrics = metrics_store\n",
+            "feat: mention CommentStore in comment",
+        )
+        _checkout(repo, "main")
+        _git(repo, "merge", "pr", "--no-edit")
+
+        violations, waived = csw.check_store_wiring(base_tip, repo)
+
+        assert len(violations) == 1
+        assert violations[0].class_name == "CommentStore"
+        assert violations[0].file_path == "tinyagentos/comment_store.py"
+        assert violations[0].reason == "unwired"
+
+    def test_unwired_store_in_renamed_file_fails(self, tmp_path: Path):
+        repo = tmp_path / "repo"
+        base_tip = _setup_base_repo(repo)
+
+        _branch(repo, "pr")
+        _checkout(repo, "pr")
+        _git(repo, "mv", "tinyagentos/metrics_store.py", "tinyagentos/metrics_v2_store.py")
+        _write(
+            repo, "tinyagentos/metrics_v2_store.py",
+            "from tinyagentos.base_store import BaseStore\n"
+            "\n"
+            "class MetricsV2Store(BaseStore):\n"
+            "    SCHEMA = 'CREATE TABLE IF NOT EXISTS metrics_v2 (id INTEGER PRIMARY KEY);'\n"
+            "    MIGRATIONS = []\n",
+        )
+        _git(repo, "add", "tinyagentos/metrics_v2_store.py")
+        _git(repo, "commit", "-m", "feat: rename and add MetricsV2Store")
+        _checkout(repo, "main")
+        _git(repo, "merge", "pr", "--no-edit")
+
+        violations, waived = csw.check_store_wiring(base_tip, repo)
+
+        assert len(violations) == 1
+        assert violations[0].class_name == "MetricsV2Store"
+        assert violations[0].file_path == "tinyagentos/metrics_v2_store.py"
+
     def test_new_class_added_to_existing_file_fails(self, tmp_path: Path):
         repo = tmp_path / "repo"
         base_tip = _setup_base_repo(repo)
