@@ -31,7 +31,6 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from tinyagentos.otel.trace_context import build_trace_context_headers
-from tinyagentos.agent_db import find_agent
 
 logger = logging.getLogger(__name__)
 
@@ -67,34 +66,29 @@ def _agent_db_path(request: Request, agent: str | None) -> str:
       always pin an explicit taOS-owned ``dbPath`` (an empty index returns no
       results, which is correct — never another framework's data).
 
-    Security: reject any agent value containing path traversal characters.
-    The normalized path must remain inside the base directory.
+    Security: ``agent`` is caller-controlled and becomes a filesystem path
+    component, so it must be a SINGLE plain component. Multi-segment values
+    are rejected outright rather than sanitized: no legitimate agent name
+    contains a separator, and accepting ``a/b`` would only widen the surface.
     """
     base: Path = request.app.state.agent_memory_dir
     if not agent:
         target = base.parent / "user-qmd-index" / "index.sqlite"
     else:
         agent = agent.strip()
-        if not agent:
-            raise HTTPException(status_code=400, detail="Invalid agent name")
-        
-        agent = agent.replace("\\", "/")
-        
-        parts = agent.split("/")
-        for part in parts:
-            if part == "" or part == ".":
-                continue
-            if part == "..":
-                raise HTTPException(status_code=400, detail="Invalid agent name: path traversal not allowed")
-        
-        sanitized = "/".join(part for part in parts if part not in ("", ".", ".."))
-        if not sanitized or all(part == "" or part == "." for part in sanitized.split("/")):
-            raise HTTPException(status_code=400, detail="Invalid agent name")
-        
-        target = base / sanitized / "index.sqlite"
-        resolved_target = target.resolve()
-        if not resolved_target.is_relative_to(base.resolve()):
-            raise HTTPException(status_code=400, detail="Invalid agent name: path traversal not allowed")
+        if (
+            not agent
+            or agent in (".", "..")
+            or "/" in agent
+            or "\\" in agent
+            or "\x00" in agent
+        ):
+            raise HTTPException(status_code=400, detail="invalid agent name")
+        target = base / agent / "index.sqlite"
+        # Belt for anything the component check cannot see (e.g. a symlinked
+        # entry under agent_memory_dir): the resolved path must stay inside it.
+        if not target.resolve().is_relative_to(base.resolve()):
+            raise HTTPException(status_code=400, detail="invalid agent name")
     target.parent.mkdir(parents=True, exist_ok=True)
     return str(target)
 

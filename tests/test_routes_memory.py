@@ -110,3 +110,56 @@ class TestAgentDbPath:
         req.app.state.agent_memory_dir = tmp_path / "agent-memory"
         p = _agent_db_path(req, "foo")
         assert p.endswith("agent-memory/foo/index.sqlite")
+
+
+@pytest.mark.asyncio
+class TestAgentPathTraversal:
+    """The ``agent`` param is caller-controlled and becomes a path component
+    of the dbPath handed to qmd serve. Anything that is not a single plain
+    component must 400 before any qmd call happens (#2352)."""
+
+    async def test_browse_rejects_dotdot(self, client_with_qmd):
+        resp = await client_with_qmd.get(
+            "/api/memory/browse", params={"agent": "../user-qmd-index"},
+        )
+        assert resp.status_code == 400
+
+    async def test_browse_rejects_backslash(self, client_with_qmd):
+        resp = await client_with_qmd.get(
+            "/api/memory/browse", params={"agent": "..\\evil"},
+        )
+        assert resp.status_code == 400
+
+    async def test_browse_rejects_bare_dots(self, client_with_qmd):
+        for bad in (".", ".."):
+            resp = await client_with_qmd.get(
+                "/api/memory/browse", params={"agent": bad},
+            )
+            assert resp.status_code == 400, bad
+
+    async def test_browse_rejects_multi_segment(self, client_with_qmd):
+        resp = await client_with_qmd.get(
+            "/api/memory/browse", params={"agent": "a/b"},
+        )
+        assert resp.status_code == 400
+
+    async def test_search_rejects_traversal_in_body(self, client_with_qmd):
+        resp = await client_with_qmd.post("/api/memory/search", json={
+            "query": "x", "mode": "keyword", "agent": "../../etc",
+        })
+        assert resp.status_code == 400
+
+    async def test_delete_rejects_traversal(self, client_with_qmd):
+        resp = await client_with_qmd.delete(
+            "/api/memory/chunk/abc123", params={"agent": "../user-qmd-index"},
+        )
+        assert resp.status_code == 400
+
+    async def test_clean_agent_still_works(self, client_with_qmd):
+        _stub_http(client_with_qmd, {
+            "/browse": {"chunks": [{"hash": "a"}], "total": 1},
+        })
+        resp = await client_with_qmd.get(
+            "/api/memory/browse", params={"agent": "test-agent"},
+        )
+        assert resp.status_code == 200
