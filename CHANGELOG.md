@@ -7,6 +7,14 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
 
 ## [Unreleased]
 
+### Security
+
+- **Desktop deps**: bump `dompurify` 3.4.12 -> 3.4.13 (GHSA-55q2-fjhq-7xh7,
+  moderate) and `nanoid` 5.1.11 -> 5.1.16 (CVE-2026-67214, high) in
+  `desktop/package-lock.json`; lock-only, both already within the declared
+  ranges. Split out of Dependabot #2331, whose grouped jsdom 30 bump fails
+  spa-build (jsdom 30 requires Node >=22.13; CI pins Node 20).
+
 ### Added
 
 - **Docs**: mechanical-simple-auditable design law added to the agent manual
