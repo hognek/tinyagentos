@@ -157,7 +157,7 @@ async def test_agent_cannot_request_for_another_identity(client, monkeypatch, tm
                 headers={"Authorization": f"Bearer {token_a}"},
                 json={"requested_scopes": ["a2a_send"]},
             )
-        assert resp.status_code == 403, resp.text
+        assert resp.status_code == 404, resp.text
         assert await env.scope_store.count_pending_for(cid_b) == 0
     finally:
         await env.close()
@@ -294,7 +294,7 @@ async def test_non_owner_cannot_approve(client, monkeypatch, tmp_path):
                 f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/approve",
                 json={"granted_scopes": ["memory_read"]},
             )
-        assert resp.status_code == 403, resp.text
+        assert resp.status_code == 404, resp.text
         assert await env.grants.list_grants(cid) == []
     finally:
         await env.close()
@@ -459,7 +459,7 @@ async def test_create_authorizes_before_scope_vocab(client, monkeypatch, tmp_pat
                 json={"requested_scopes": ["not_a_real_scope"]},
             )
         # Authz runs first -> 403, NOT a 400 vocab error confirming the bad scope.
-        assert resp.status_code == 403, resp.text
+        assert resp.status_code == 404, resp.text
         assert "not_a_real_scope" not in resp.text
     finally:
         await env.close()
@@ -598,3 +598,122 @@ def test_every_project_bound_scope_is_a_valid_scope():
     from tinyagentos.routes.agent_auth_requests import VALID_SCOPES, _PROJECT_SCOPES
 
     assert _PROJECT_SCOPES <= set(VALID_SCOPES)
+
+
+# ---------------------------------------------------------------------------
+# Existence-hiding: non-owner vs non-existent must be byte-identical
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_create_scope_request_non_owner_and_nonexistent_identical(
+    client, monkeypatch, tmp_path
+):
+    """An authenticated non-owner and a nonexistent canonical_id must produce
+    byte-identical responses on create_scope_request (status + body)."""
+    app = client._transport.app
+    code = app.state.auth.add_user_invite("carol", "admin")
+    app.state.auth.complete_invite("carol", code, "Carol", "", "carpass123")
+    carol = app.state.auth.find_user("carol")
+    carol_session = app.state.auth.create_session(user_id=carol["id"], long_lived=True)
+
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)  # owned by admin, not carol
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies={"taos_session": carol_session},
+        ) as carol_client:
+            resp_owner = await carol_client.post(
+                f"/api/agents/registry/{cid}/scope-requests",
+                json={"requested_scopes": ["memory_read"]},
+            )
+
+        resp_nonexistent = await client.post(
+            "/api/agents/registry/does-not-exist/scope-requests",
+            json={"requested_scopes": ["memory_read"]},
+        )
+
+        assert resp_owner.status_code == resp_nonexistent.status_code == 404
+        assert resp_owner.json() == resp_nonexistent.json()
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_approve_scope_request_non_owner_and_nonexistent_identical(
+    client, monkeypatch, tmp_path
+):
+    """An authenticated non-owner and a nonexistent canonical_id must produce
+    byte-identical responses on approve_scope_request (status + body)."""
+    app = client._transport.app
+    code = app.state.auth.add_user_invite("carol", "admin")
+    app.state.auth.complete_invite("carol", code, "Carol", "", "carpass123")
+    carol = app.state.auth.find_user("carol")
+    carol_session = app.state.auth.create_session(user_id=carol["id"], long_lived=True)
+
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)  # owned by admin, not carol
+        rec = await env.scope_store.create(
+            canonical_id=cid, requested_scopes=["memory_read"]
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies={"taos_session": carol_session},
+        ) as carol_client:
+            resp_owner = await carol_client.post(
+                f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/approve",
+                json={"granted_scopes": ["memory_read"]},
+            )
+
+        resp_nonexistent = await client.post(
+            "/api/agents/registry/does-not-exist/scope-requests/does-not-exist/approve",
+            json={"granted_scopes": ["memory_read"]},
+        )
+
+        assert resp_owner.status_code == resp_nonexistent.status_code == 404
+        assert resp_owner.json() == resp_nonexistent.json()
+    finally:
+        await env.close()
+
+
+@pytest.mark.asyncio
+async def test_deny_scope_request_non_owner_and_nonexistent_identical(
+    client, monkeypatch, tmp_path
+):
+    """An authenticated non-owner and a nonexistent canonical_id must produce
+    byte-identical responses on deny_scope_request (status + body)."""
+    app = client._transport.app
+    code = app.state.auth.add_user_invite("carol", "admin")
+    app.state.auth.complete_invite("carol", code, "Carol", "", "carpass123")
+    carol = app.state.auth.find_user("carol")
+    carol_session = app.state.auth.create_session(user_id=carol["id"], long_lived=True)
+
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid = await _register_active(env)  # owned by admin, not carol
+        rec = await env.scope_store.create(
+            canonical_id=cid, requested_scopes=["memory_read"]
+        )
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies={"taos_session": carol_session},
+        ) as carol_client:
+            resp_owner = await carol_client.post(
+                f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/deny",
+            )
+
+        resp_nonexistent = await client.post(
+            "/api/agents/registry/does-not-exist/scope-requests/does-not-exist/deny",
+        )
+
+        assert resp_owner.status_code == resp_nonexistent.status_code == 404
+        assert resp_owner.json() == resp_nonexistent.json()
+    finally:
+        await env.close()

@@ -951,24 +951,25 @@ async def _authorize_scope_request_creation(
 
     Allowed: an owner/admin session (or admin local token), OR the agent's own
     registry bearer token whose ``sub`` matches *canonical_id*. Any other caller
-    (including a different agent's token, or no credentials) is a 403/401.
+    (including a different agent's token, or no credentials) is a 404 (the
+    response is uniform with the not-found case to avoid leaking existence).
     """
     is_admin = bool(getattr(request.state, "is_admin", False))
     uid = getattr(request.state, "user_id", None)
     if is_admin or (uid and uid == record.get("user_id")):
         return
 
-    # The agent's own registry token. check_agent_identity returns None when no
-    # Authorization header is present (an unauthenticated caller never reaches
-    # here anyway — the middleware 401s a credential-less non-exempt request) and
-    # raises 401/403 for a malformed/inactive token.
     from tinyagentos.agent_token_auth import check_agent_identity
 
     agent_cid = await check_agent_identity(request)
     if agent_cid is not None and agent_cid == canonical_id:
         return
 
-    raise HTTPException(status_code=403, detail="forbidden")
+    logger.info(
+        "scope request create 403-not-owner for %s by %s",
+        canonical_id, uid,
+    )
+    raise HTTPException(status_code=404, detail="agent not found or not active")
 
 
 @router.post("/api/agents/registry/{canonical_id}/scope-requests")
@@ -983,8 +984,7 @@ async def create_scope_request(
     registry = _get_registry_store(request)
     record = await registry.get(canonical_id)
     if record is None or record.get("status") != "active":
-        # Existence-hiding is unnecessary here (the caller must already be the
-        # agent or its owner/admin) but an inactive/unknown id is simply a 404.
+        logger.info("scope request create 404-unknown for %s", canonical_id)
         raise HTTPException(
             status_code=404, detail="agent not found or not active"
         )
@@ -1069,8 +1069,14 @@ async def approve_scope_request(
     registry = _get_registry_store(request)
     record = await registry.get(canonical_id)
     if record is None or record.get("status") != "active":
+        logger.info("scope request approve 404-unknown for %s", canonical_id)
         raise HTTPException(status_code=404, detail="agent not found or not active")
-    require_owner_or_admin(user, record["user_id"])
+    if not (user.is_admin or user.user_id == record["user_id"]):
+        logger.info(
+            "scope request approve 403-not-owner for %s by %s",
+            canonical_id, user.user_id,
+        )
+        raise HTTPException(status_code=404, detail="agent not found or not active")
 
     store = _get_scope_requests_store(request)
 
@@ -1189,8 +1195,14 @@ async def deny_scope_request(
     registry = _get_registry_store(request)
     record = await registry.get(canonical_id)
     if record is None:
+        logger.info("scope request deny 404-unknown for %s", canonical_id)
         raise HTTPException(status_code=404, detail="agent not found")
-    require_owner_or_admin(user, record["user_id"])
+    if not (user.is_admin or user.user_id == record["user_id"]):
+        logger.info(
+            "scope request deny 403-not-owner for %s by %s",
+            canonical_id, user.user_id,
+        )
+        raise HTTPException(status_code=404, detail="agent not found")
 
     store = _get_scope_requests_store(request)
 
