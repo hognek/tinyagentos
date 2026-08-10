@@ -404,9 +404,8 @@ class ProjectTaskStore(BaseStore):
         now = time.time()
         cursor = await self._db.execute(
             """UPDATE project_tasks
-               SET claimed_by = NULL, claimed_at = NULL, status = 'open',
-                   closed_by = NULL, closed_at = NULL, close_reason = NULL,
-                   updated_at = ?
+               SET status = 'open', closed_by = NULL, closed_at = NULL, close_reason = NULL,
+                   claimed_by = NULL, claimed_at = NULL, updated_at = ?
                WHERE id = ? AND status = 'closed'""",
             (now, task_id),
         )
