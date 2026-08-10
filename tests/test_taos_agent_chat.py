@@ -296,6 +296,68 @@ async def test_chat_error_path_ndjson(client, app, monkeypatch):
     assert items[-1] == {"done": True}
 
 
+@pytest.mark.asyncio
+async def test_chat_queued_message_survives_turn_error(client, app, monkeypatch):
+    """A message queued mid-turn is surfaced even when the turn ERRORS.
+
+    The sink's error path enqueues _DONE early, which used to strand the
+    queued-message frames _drive's finally emits behind it in a queue nobody
+    read - the queued user's message silently evaporated on the most common
+    failure (a model-proxy error). The generator now drains the settled
+    queue after the early _DONE.
+    """
+    await client.patch("/api/taos-agent/settings", json={"model": "gpt-4o"})
+    app.state.llm_proxy = _make_mock_proxy(running=True)
+    app.state.taos_opencode_password = "testpw"
+    app.state.taos_opencode_session_id = None
+
+    server = _fake_server()
+
+    async def fake_ensure_server(state, model):
+        return server
+
+    monkeypatch.setattr(
+        "tinyagentos.routes.taos_agent.ensure_taos_opencode_server",
+        fake_ensure_server,
+    )
+
+    class _QueueThenErrorAdapter:
+        def __init__(self, cfg, sink):
+            self._sink = sink
+            self.session_id = None
+
+        async def ensure_session(self):
+            self.session_id = "ses_qerr"
+
+        async def prompt(self, text, trace_id=None, attachments=None):
+            # A second user message lands while this turn is in flight...
+            loop = app.state.taos_agent_loop
+            from tinyagentos.agent_loop import LoopAction
+            action = await loop.handle_message("urgent follow-up", msg_id="q1")
+            assert action is LoopAction.QUEUED
+            # ...and then the turn fails (the common model-proxy shape).
+            self._sink({"kind": "error", "error": "proxy exploded"})
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(
+        "tinyagentos.routes.taos_agent.OpenCodeAdapter",
+        _QueueThenErrorAdapter,
+    )
+
+    resp = await client.post(
+        "/api/taos-agent/chat",
+        json={"messages": [{"role": "user", "content": "Hi"}]},
+    )
+    assert resp.status_code == 200
+    assert "urgent follow-up" in resp.text
+    items = _parse_ndjson(resp.text)
+    assert items[-1] == {"done": True}
+    # And the loop is back to IDLE - the failed turn must not wedge it.
+    assert app.state.taos_agent_loop.state.value == "idle"
+
+
 # ---------------------------------------------------------------------------
 # ensure_taos_opencode_server: key minting and master-key fallback
 # ---------------------------------------------------------------------------

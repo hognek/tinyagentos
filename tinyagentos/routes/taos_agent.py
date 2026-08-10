@@ -27,6 +27,7 @@ import json
 import logging
 import mimetypes
 import re
+import sys
 import uuid
 from pathlib import Path
 
@@ -38,6 +39,7 @@ from tinyagentos.adapters.opencode_adapter import OpenCodeAdapter, OpenCodeConfi
 from tinyagentos.agent_loop import AgentLoop, LoopAction
 from tinyagentos.opencode_runtime import OpenCodeBinaryNotFoundError
 from tinyagentos.taos_agent_runtime import ensure_taos_opencode_server
+from tinyagentos.task_utils import _create_supervised_task
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -496,8 +498,9 @@ async def chat(request: Request, body: ChatRequest):
             yield json.dumps({
                 "delta": (
                     "[The taOS agent is still working on a previous message. "
-                    "Your message has been queued and will be surfaced to the "
-                    "agent when the current turn completes.]"
+                    "Your message has been queued and will appear at the end "
+                    "of the current response; the agent does not act on it as "
+                    "its own turn, so resend it if you need a full answer.]"
                 ),
             }) + "\n"
             yield json.dumps({"done": True}) + "\n"
@@ -533,10 +536,19 @@ async def chat(request: Request, body: ChatRequest):
                 })
             queue.put_nowait(_DONE)
 
-    drive_task = asyncio.create_task(_drive())
+    # Supervised: _drive's finally is the ONLY thing standing between the
+    # agent loop's WORKING and IDLE states, so a GC'd drive task (asyncio
+    # keeps only weak refs) would wedge the desktop agent in WORKING forever.
+    # Same rationale as AgentChatRouter._acp_tasks.
+    _drive_tasks = getattr(app_state, "_background_tasks", None)
+    if _drive_tasks is None:
+        drive_task = asyncio.create_task(_drive())
+    else:
+        drive_task = _create_supervised_task(_drive(), _drive_tasks)
 
     async def _generate():
         content_frame_yielded = False
+        leftovers: list = []
         try:
             while True:
                 item = await queue.get()
@@ -560,6 +572,25 @@ async def chat(request: Request, body: ChatRequest):
                 exc = drive_task.exception()
                 if exc is not None:
                     logger.error("taos-agent: drive task raised %r", exc)
+            # The sink's early _DONE on the error path strands anything behind
+            # it in the queue - including the queued-message frames _drive's
+            # finally emits. Collect them here (drive_task has settled, so the
+            # queue is final); they are yielded AFTER this finally, which a
+            # client disconnect (GeneratorExit) naturally skips - log those so
+            # a dropped queued message is at least visible.
+            while not queue.empty():
+                item = queue.get_nowait()
+                if item is not _DONE:
+                    leftovers.append(item)
+            if leftovers and isinstance(sys.exc_info()[1], GeneratorExit):
+                logger.warning(
+                    "taos-agent: client disconnected with %d undelivered frame(s): %r",
+                    len(leftovers), leftovers,
+                )
+        for item in leftovers:
+            if "error" not in item:
+                content_frame_yielded = True
+            yield json.dumps(item) + "\n"
         if not content_frame_yielded:
             yield json.dumps({
                 "error": (

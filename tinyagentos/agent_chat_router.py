@@ -95,8 +95,13 @@ class AgentChatRouter:
                 followup = await loop.handle_message(m.content, msg_id=m.id)
                 if followup is LoopAction.IMMEDIATE:
                     pending.append((m.content, m.id))
-                # QUEUED here means another concurrent caller grabbed the
-                # turn — it will drive this message at its own safe point.
+                # QUEUED here means this holder already restarted the turn
+                # with an earlier drained message (handle_message and the
+                # drain are atomic - the lock is never held across an await,
+                # so no other caller can interleave). The message sits in the
+                # loop's queue and this holder's next reach_safe_point
+                # re-drains it; WORKING always implies the current holder
+                # reaches another safe point.
 
     def dispatch(self, message: dict, channel: dict) -> None:
         """Fire-and-forget entry point. Runs routing in a supervised background task."""
