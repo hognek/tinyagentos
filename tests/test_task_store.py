@@ -2,6 +2,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tinyagentos.board_audit import BoardAuditLog
 from tinyagentos.projects import task_store as task_store_mod
 from tinyagentos.projects.task_store import ProjectTaskStore
 
@@ -599,3 +600,23 @@ async def test_no_broker_no_error(tmp_path):
     await s.claim_task(task["id"], "worker-1")
     await s.close_task(task["id"], "worker-1")
     await s.close()
+
+
+@pytest.mark.asyncio
+async def test_quarantine_claimed_task_records_actual_from_status(tmp_path):
+    audit = BoardAuditLog(tmp_path / "audit.db")
+    await audit.init()
+    s = ProjectTaskStore(tmp_path / "tasks.db", audit=audit)
+    await s.init()
+    try:
+        task = await s.create_task("prj-1", "Task", "alice")
+        await s.claim_task(task["id"], "worker-1")
+        ok = await s.quarantine_task(task["id"], "system")
+        assert ok is True
+        history = await audit.history(task["id"])
+        quarantined = [h for h in history if h["event"] == "task.quarantined"]
+        assert len(quarantined) == 1
+        assert quarantined[0]["from_status"] == "claimed"
+    finally:
+        await s.close()
+        await audit.close()

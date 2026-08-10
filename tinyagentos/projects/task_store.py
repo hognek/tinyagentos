@@ -446,8 +446,13 @@ class ProjectTaskStore(BaseStore):
                     "task.quarantined",
                     {"id": task_id, "actor": actor},
                 )
+            # Derive the pre-quarantine status race-free from the committed row
+            # rather than a separate pre-read (which would have a TOCTOU gap).
+            # quarantine does not clear claimed_by, so a set claimer means it was
+            # 'claimed' (cf. close_task's derivation).
+            from_status = "claimed" if existing and existing.get("claimed_by") else "open"
             await self._record_audit(
-                task_id, "task.quarantined", actor, "open", "quarantined",
+                task_id, "task.quarantined", actor, from_status, "quarantined",
                 project_id=existing["project_id"] if existing else "",
             )
         return changed
