@@ -3,7 +3,7 @@ name: Qwen 2.5 Coder 1.5B Instruct (HEF)
 type: model
 version: 1.5.0
 description: "Hailo-10H NPU-accelerated Qwen 2.5 Coder 1.5B Instruct — runs on Raspberry Pi 5 + AI HAT+2 via hailo-ollama"
-homepage: https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B
+homepage: https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct
 license: Apache-2.0
 capabilities:
 - chat
@@ -13,10 +13,9 @@ variants:
 - id: a8w4
   name: A8W4 HEF (1.7GB, NPU)
   format: hef
-  size_mb: 1679
+  size_mb: 1675
   download_url: https://dev-public.hailo.ai/v5.1.1/blob/Qwen2.5-Coder-1.5B-Instruct.hef
-  # sha256: fill in from the pinned HEF file before shipping to users
-  sha256: ''
+  sha256: 88aa7633ebe3385452430ae19f2b459b5a00791cab035576a3262a41ec1350f5
   requires:
     backends:
     - id: hailo-ollama

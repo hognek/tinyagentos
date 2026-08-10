@@ -10,12 +10,11 @@ capabilities:
 - reasoning
 variants:
 - id: a8w4
-  name: A8W4 HEF (2.4GB, NPU)
+  name: A8W4 HEF (2.2GB, NPU)
   format: hef
-  size_mb: 2427
+  size_mb: 2261
   download_url: https://dev-public.hailo.ai/v5.1.1/blob/DeepSeek-R1-Distill-Qwen-1.5B.hef
-  # sha256: fill in from the pinned HEF file before shipping to users
-  sha256: ''
+  sha256: 9c4506dda44d0a1730d939d4049a3cbf72d5179a88762ca551363db087adb38f
   requires:
     backends:
     - id: hailo-ollama
