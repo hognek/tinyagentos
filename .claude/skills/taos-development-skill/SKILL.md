@@ -148,7 +148,7 @@ uv run pytest tests/ --ignore=tests/e2e -n auto
 - Uses `uv sync --frozen` and `pytest -n auto`
 - Also required: `spa-build` (npm build + tsc + **vitest** - a desktop type error or failing
   component test fails CI), a "Verify app starts" `create_app` import smoke, `lint`
-  (`compileall`), and `cla`. The doc-gate is a separate workflow.
+  (`compileall`), and `cla`. The doc-gate and store-wiring gate are separate workflows.
 
 ## CLA - HUMAN signs
 
@@ -437,6 +437,20 @@ Docs-Reviewed: no user-facing change, internal refactor only
 
 Run `scripts/install-git-hooks.sh` to enable local hooks (`.githooks/pre-commit` and
 `.githooks/commit-msg`) so the gate runs before you push.
+
+## Store wiring gate
+
+A gate (`.github/workflows/store-wiring-gate.yml`, running `scripts/check_store_wiring.py`)
+blocks PRs that add a new `BaseStore` subclass without wiring it into `tinyagentos/app.py`.
+Routes reach stores ONLY via `request.app.state`, so an unwired store is unreachable dead
+code. The check is name-level (the class name must appear in `app.py`) and polices only
+classes added by the PR - pre-existing orphans are skipped.
+
+For a store genuinely constructed elsewhere (tests, CLI, workers), waive it with a PR-body
+trailer, which is logged by the gate:
+```
+Store-Unwired-Intentionally: <ClassName>, <why>
+```
 
 ## Upstream conventions (from CONTRIBUTING.md)
 
