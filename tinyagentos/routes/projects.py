@@ -766,6 +766,10 @@ async def get_task(
     t = await store.get_task(task_id)
     if t is None or t["project_id"] != project_id:
         return JSONResponse({"error": "not found"}, status_code=404)
+    strikes = getattr(request.app.state, "task_strikes", None)
+    if strikes is not None:
+        t["strike_count"] = await strikes.count_strikes(task_id)
+        t["latest_strike"] = await strikes.latest(task_id)
     return t
 
 
@@ -1040,6 +1044,42 @@ async def reopen_task(
     notifs = getattr(request.app.state, "notifications", None)
     if notifs is not None:
         await notifs.emit_event("task.reopened", "Task reopened", f"{task_id} reopened by {actor}")
+    return await store.get_task(task_id)
+
+
+@router.post("/api/projects/{project_id}/tasks/{task_id}/unquarantine")
+async def unquarantine_task(
+    project_id: str,
+    task_id: str,
+    request: Request,
+):
+    """Return a quarantined card to the open pool and clear its strikes.
+
+    LEAD-only curation, mirroring mark_task_claimable: only a project LEAD
+    (session owner/admin, or the lead agent's ``project_tasks`` token) may
+    retry a quarantined card -- a plain project_tasks worker cannot self
+    un-quarantine. See ProjectTaskStore.unquarantine_task for the strike-clear
+    behaviour.
+    """
+    pstore = request.app.state.project_store
+    auth = await _authorize_project_lead(request, pstore, project_id)
+    if isinstance(auth, JSONResponse):
+        return auth
+    actor_id, _is_agent, _project = auth
+    store = request.app.state.project_task_store
+    existing = await store.get_task(task_id)
+    if existing is None or existing["project_id"] != project_id:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    ok = await store.unquarantine_task(task_id, actor_id)
+    if not ok:
+        return JSONResponse({"error": "task is not quarantined"}, status_code=409)
+    _beads_mark_dirty(request, project_id)
+    await pstore.log_activity(project_id, actor_id, "task.unquarantined", {"task_id": task_id})
+    notifs = getattr(request.app.state, "notifications", None)
+    if notifs is not None:
+        await notifs.emit_event(
+            "task.unquarantined", "Task unquarantined", f"{task_id} unquarantined by {actor_id}"
+        )
     return await store.get_task(task_id)
 
 
