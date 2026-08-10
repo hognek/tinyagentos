@@ -26,11 +26,12 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from tinyagentos.otel.trace_context import build_trace_context_headers
+from tinyagentos.agent_db import find_agent
 
 logger = logging.getLogger(__name__)
 
@@ -65,12 +66,35 @@ def _agent_db_path(request: Request, agent: str | None) -> str:
       so omitting ``dbPath`` would query/return that foreign data. We therefore
       always pin an explicit taOS-owned ``dbPath`` (an empty index returns no
       results, which is correct — never another framework's data).
+
+    Security: reject any agent value containing path traversal characters.
+    The normalized path must remain inside the base directory.
     """
     base: Path = request.app.state.agent_memory_dir
     if not agent:
         target = base.parent / "user-qmd-index" / "index.sqlite"
     else:
-        target = base / agent / "index.sqlite"
+        agent = agent.strip()
+        if not agent:
+            raise HTTPException(status_code=400, detail="Invalid agent name")
+        
+        agent = agent.replace("\\", "/")
+        
+        parts = agent.split("/")
+        for part in parts:
+            if part == "" or part == ".":
+                continue
+            if part == "..":
+                raise HTTPException(status_code=400, detail="Invalid agent name: path traversal not allowed")
+        
+        sanitized = "/".join(part for part in parts if part not in ("", ".", ".."))
+        if not sanitized or all(part == "" or part == "." for part in sanitized.split("/")):
+            raise HTTPException(status_code=400, detail="Invalid agent name")
+        
+        target = base / sanitized / "index.sqlite"
+        resolved_target = target.resolve()
+        if not resolved_target.is_relative_to(base.resolve()):
+            raise HTTPException(status_code=400, detail="Invalid agent name: path traversal not allowed")
     target.parent.mkdir(parents=True, exist_ok=True)
     return str(target)
 
