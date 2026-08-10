@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -65,12 +65,30 @@ def _agent_db_path(request: Request, agent: str | None) -> str:
       so omitting ``dbPath`` would query/return that foreign data. We therefore
       always pin an explicit taOS-owned ``dbPath`` (an empty index returns no
       results, which is correct — never another framework's data).
+
+    Security: ``agent`` is caller-controlled and becomes a filesystem path
+    component, so it must be a SINGLE plain component. Multi-segment values
+    are rejected outright rather than sanitized: no legitimate agent name
+    contains a separator, and accepting ``a/b`` would only widen the surface.
     """
     base: Path = request.app.state.agent_memory_dir
     if not agent:
         target = base.parent / "user-qmd-index" / "index.sqlite"
     else:
+        agent = agent.strip()
+        if (
+            not agent
+            or agent in (".", "..")
+            or "/" in agent
+            or "\\" in agent
+            or "\x00" in agent
+        ):
+            raise HTTPException(status_code=400, detail="invalid agent name")
         target = base / agent / "index.sqlite"
+        # Belt for anything the component check cannot see (e.g. a symlinked
+        # entry under agent_memory_dir): the resolved path must stay inside it.
+        if not target.resolve().is_relative_to(base.resolve()):
+            raise HTTPException(status_code=400, detail="invalid agent name")
     target.parent.mkdir(parents=True, exist_ok=True)
     return str(target)
 
