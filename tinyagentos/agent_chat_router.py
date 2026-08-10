@@ -5,6 +5,7 @@ import logging
 import os
 from typing import Any
 
+from tinyagentos.agent_loop import AgentLoop, LoopAction
 from tinyagentos.task_utils import _create_supervised_task
 
 logger = logging.getLogger(__name__)
@@ -34,10 +35,12 @@ class AgentChatRouter:
         # Holds in-flight ACP turn tasks so they aren't garbage-collected
         # before completing (asyncio keeps only weak refs to tasks).
         self._acp_tasks: set[asyncio.Task] = set()
-        # Per-agent lock so turns for the same agent run sequentially (a shared
-        # gateway session can't process two prompts at once) — concurrent
-        # across different agents. Preserves the bridge's queued-delivery order.
-        self._agent_locks: dict[str, asyncio.Lock] = {}
+        # Per-agent AgentLoop owns turn serialization: turns for the same
+        # agent run sequentially (a shared gateway session can't process two
+        # prompts at once) — concurrent across different agents. Messages
+        # arriving mid-turn are queued by the loop and driven by the current
+        # turn-holder at its safe point, preserving delivery order.
+        self._agent_loops: dict[str, AgentLoop] = {}
 
     async def close(self) -> None:
         # Cancel + drain any in-flight ACP turns so shutdown doesn't orphan them.
@@ -54,14 +57,46 @@ class AgentChatRouter:
     async def _run_acp_turn(
         self, agent_name: str, text: str, trace_id, record_reply,
     ) -> None:
-        """Drive one OpenClaw ACP turn under the agent's serialization lock."""
+        """Drive one OpenClaw ACP turn, serialized per agent by its AgentLoop."""
         from tinyagentos.openclaw_acp_runtime import drive_turn
 
-        lock = self._agent_locks.setdefault(agent_name, asyncio.Lock())
-        async with lock:
-            await drive_turn(
-                slug=agent_name, text=text, trace_id=trace_id, record_reply=record_reply,
-            )
+        loop = self._agent_loops.setdefault(agent_name, AgentLoop())
+        action = await loop.handle_message(text, msg_id=trace_id)
+        if action is LoopAction.QUEUED:
+            # Another turn is in flight for this agent; the current turn-holder
+            # drives this message at its safe point (drain below).
+            return
+
+        # Turn-holder: drive the turn, then iteratively (never recursively)
+        # drive every message queued while it ran. Each queued message keeps
+        # its own trace id.
+        pending: list[tuple[str, Any]] = [(text, trace_id)]
+        while pending:
+            cur_text, cur_trace = pending.pop(0)
+            try:
+                await drive_turn(
+                    slug=agent_name, text=cur_text, trace_id=cur_trace,
+                    record_reply=record_reply,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Log like _route does: this task has no other supervisor, and
+                # a raise must not drop the messages queued behind the failed
+                # turn (they are still drained and driven below).
+                logger.warning(
+                    "acp turn for agent %s failed: %s",
+                    agent_name, exc, exc_info=True,
+                )
+            finally:
+                # MUST run even when drive_turn raises or the task is
+                # cancelled — skipping it would wedge the loop in WORKING
+                # forever and silence the agent.
+                queued = await loop.reach_safe_point()
+            for m in queued:
+                followup = await loop.handle_message(m.content, msg_id=m.id)
+                if followup is LoopAction.IMMEDIATE:
+                    pending.append((m.content, m.id))
+                # QUEUED here means another concurrent caller grabbed the
+                # turn — it will drive this message at its own safe point.
 
     def dispatch(self, message: dict, channel: dict) -> None:
         """Fire-and-forget entry point. Runs routing in a supervised background task."""
