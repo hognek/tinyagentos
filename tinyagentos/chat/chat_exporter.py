@@ -83,6 +83,13 @@ def _causal_tiebreak(group: list[dict]) -> list[dict]:
             indegree[child.get("id")] -= 1
             if indegree[child.get("id")] == 0:
                 ready.append(child)
+    if len(ordered) < len(group):
+        # thread_id cycle (e.g. a crafted self-reference - the store does not
+        # validate). No topological order exists for the cycle members, but a
+        # migration tool must never silently drop a row: append them in their
+        # original (created_at, id) order.
+        seen = {id(m) for m in ordered}
+        ordered.extend(m for m in group if id(m) not in seen)
     return ordered
 
 
@@ -211,22 +218,32 @@ class ChatExporter:
             full_bytes = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
             ref = await self._file_writer(source_id, full_bytes)
 
+            # Budget the body against the SERIALIZED envelope size: the ref
+            # note and the envelope's other fields (from/thread/ts/source/...)
+            # all count toward the bus's per-message limit, so truncating the
+            # body to the raw limit alone can still emit an oversized envelope
+            # the bus rejects.
+            ref_note = f"\n[oversized content exported to: {ref}]"
+            envelope["blocks"] = []
+            envelope["body"] = ""
+            overhead = len(
+                json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+            ) + len(json.dumps(ref_note, ensure_ascii=False).encode("utf-8"))
+            truncate_note = "... [truncated]"
+            body_bytes = body.encode("utf-8")
             emitted_body = body
-            body_bytes = emitted_body.encode("utf-8")
-            if len(body_bytes) > self._max_message_bytes:
-                truncate_note = "... [truncated]"
+            if overhead + len(body_bytes) > self._max_message_bytes:
                 budget = max(
-                    self._max_message_bytes - len(truncate_note.encode("utf-8")), 0
+                    self._max_message_bytes
+                    - overhead
+                    - len(truncate_note.encode("utf-8")),
+                    0,
                 )
                 emitted_body = (
                     body_bytes[:budget].decode("utf-8", errors="ignore")
                     + truncate_note
                 )
-
-            envelope["body"] = (
-                f"{emitted_body}\n[oversized content exported to: {ref}]"
-            )
-            envelope["blocks"] = []
+            envelope["body"] = f"{emitted_body}{ref_note}"
 
         return envelope
 

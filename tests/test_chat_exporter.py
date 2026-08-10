@@ -619,3 +619,52 @@ async def test_same_timestamp_reply_sorts_after_parent(store):
     batch = await exporter.export_channel("ch1")
     ids = [e["source_id"] for e in batch]
     assert ids.index("z-parent") < ids.index("a-reply")
+
+
+@pytest.mark.asyncio
+async def test_thread_id_cycle_messages_are_not_dropped(store):
+    """A thread_id cycle within a same-timestamp group (the store does not
+    validate against crafted self/mutual references) has no topological
+    order — but a migration tool must never silently drop the rows."""
+    ts = 1700000000.0
+    await store.ensure_message({
+        "id": "msg-a", "channel_id": "ch1", "author_id": "user1",
+        "author_type": "user", "content": "a",
+        "content_blocks": [{"type": "paragraph", "text": "a"}],
+        "created_at": ts, "thread_id": "msg-b",
+    })
+    await store.ensure_message({
+        "id": "msg-b", "channel_id": "ch1", "author_id": "user1",
+        "author_type": "user", "content": "b",
+        "content_blocks": [{"type": "paragraph", "text": "b"}],
+        "created_at": ts, "thread_id": "msg-a",
+    })
+    exporter = ChatExporter(
+        message_store=store, identity_map=_identity_map(["user1"]),
+    )
+    batch = await exporter.export_channel("ch1")
+    assert {e["source_id"] for e in batch} == {"msg-a", "msg-b"}
+
+
+@pytest.mark.asyncio
+async def test_oversize_envelope_never_exceeds_limit_serialized(store, tmp_path):
+    """The 64KB limit applies to the SERIALIZED envelope: body truncation
+    must budget for the ref note and the envelope's other fields, not just
+    the raw body bytes."""
+    big_text = "x" * 100_000
+    await store.send_message(
+        channel_id="ch1", author_id="user1", author_type="user",
+        content=big_text,
+        content_blocks=[{"type": "paragraph", "text": big_text}],
+    )
+    exporter = ChatExporter(
+        message_store=store,
+        identity_map=_identity_map(["user1"]),
+        file_writer=_make_file_writer(tmp_path),
+    )
+    batch = await exporter.export_channel("ch1")
+    env = batch[0]
+    serialized = json.dumps(env, ensure_ascii=False).encode("utf-8")
+    assert len(serialized) <= 64 * 1024, (
+        f"serialized envelope is {len(serialized)} bytes"
+    )
