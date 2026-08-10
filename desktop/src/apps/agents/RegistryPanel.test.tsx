@@ -629,6 +629,71 @@ describe("RegistryPanel handle editing", () => {
       { timeout: 3000 },
     );
   });
+
+  it("strips a typed leading @ before PATCH (@ is bus syntax, not part of the name)", async () => {
+    const entryWithHandle: RegistryEntry = {
+      ...fakeEntry,
+      handle: "old-alias",
+    };
+    const mockFetch = vi.fn().mockImplementation((url: string, opts?: RequestInit) => {
+      if (url === "/auth/status") {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ user: { is_admin: true, id: "user-1" } }),
+        });
+      }
+      if (url === "/api/agents/registry") {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve([entryWithHandle]),
+        });
+      }
+      if (typeof url === "string" && url.includes("/api/agents/registry/") && opts?.method === "PATCH") {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ ...entryWithHandle, handle: "new-alias" }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    render(<RegistryPanel />);
+
+    const toggle = screen.getByRole("button", { name: /agent registry/i });
+    await act(async () => { toggle.click(); });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("@old-alias")).toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+
+    const editBtn = screen.getByTitle("Edit handle");
+    await act(async () => { editBtn.click(); });
+
+    const input = screen.getByRole("textbox");
+    await act(async () => {
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )!.set!;
+      nativeInputValueSetter.call(input, "@new-alias");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    const saveBtn = screen.getByTitle("Save handle");
+    await act(async () => { saveBtn.click(); });
+    await act(async () => { await Promise.resolve(); });
+
+    const patchCalls = mockFetch.mock.calls.filter(
+      ([url, opts]) => typeof url === "string" && url.includes("/api/agents/registry/") && (opts as RequestInit)?.method === "PATCH",
+    );
+    expect(patchCalls.length).toBe(1);
+    const body = JSON.parse((patchCalls[0][1] as RequestInit).body as string);
+    expect(body.handle).toBe("new-alias");
+  });
 });
 
 /* ------------------------------------------------------------------ */
