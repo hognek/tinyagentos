@@ -353,3 +353,345 @@ describe("RegistryPanel collapsed retired", () => {
     expect(retiredPanel!).not.toHaveClass("hidden");
   }, 10_000);
 });
+
+/* ------------------------------------------------------------------ */
+/*  Handle (alias) editing UI                                           */
+/* ------------------------------------------------------------------ */
+
+describe("RegistryPanel handle editing", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("shows the handle text and edit button for owner/admin", async () => {
+    const entryWithHandle: RegistryEntry = {
+      ...fakeEntry,
+      handle: "my-alias",
+    };
+    vi.stubGlobal("fetch", makeFetch([entryWithHandle]));
+
+    render(<RegistryPanel />);
+
+    const toggle = screen.getByRole("button", { name: /agent registry/i });
+    await act(async () => { toggle.click(); });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("@my-alias")).toBeInTheDocument();
+        expect(screen.getByTitle("Edit handle")).toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+  });
+
+  it("hides edit button for non-owner non-admin", async () => {
+    const entryWithHandle: RegistryEntry = {
+      ...fakeEntry,
+      handle: "my-alias",
+      user_id: "other-user",
+    };
+    const mockFetch = vi.fn().mockImplementation((url: string) => {
+      if (url === "/auth/status") {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ user: { is_admin: false, id: "viewer-user" } }),
+        });
+      }
+      if (url === "/api/agents/registry") {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve([entryWithHandle]),
+        });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    render(<RegistryPanel />);
+
+    const toggle = screen.getByRole("button", { name: /agent registry/i });
+    await act(async () => { toggle.click(); });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("@my-alias")).toBeInTheDocument();
+        expect(screen.queryByTitle("Edit handle")).not.toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+  });
+
+  it("enters edit mode and saves handle via PATCH", async () => {
+    const entryWithHandle: RegistryEntry = {
+      ...fakeEntry,
+      handle: "old-alias",
+    };
+    const mockFetch = vi.fn().mockImplementation((url: string, opts?: RequestInit) => {
+      if (url === "/auth/status") {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ user: { is_admin: true, id: "user-1" } }),
+        });
+      }
+      if (url === "/api/agents/registry") {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve([entryWithHandle]),
+        });
+      }
+      if (typeof url === "string" && url.includes("/api/agents/registry/") && opts?.method === "PATCH") {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ ...entryWithHandle, handle: "new-alias" }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    render(<RegistryPanel />);
+
+    const toggle = screen.getByRole("button", { name: /agent registry/i });
+    await act(async () => { toggle.click(); });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("@old-alias")).toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+
+    const editBtn = screen.getByTitle("Edit handle");
+    await act(async () => { editBtn.click(); });
+
+    const input = screen.getByRole("textbox");
+    expect(input).toHaveValue("old-alias");
+
+    await act(async () => {
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )!.set!;
+      nativeInputValueSetter.call(input, "new-alias");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    const saveBtn = screen.getByTitle("Save handle");
+    await act(async () => { saveBtn.click(); });
+    await act(async () => { await Promise.resolve(); });
+
+    const patchCalls = mockFetch.mock.calls.filter(
+      ([url, opts]) => typeof url === "string" && url.includes("/api/agents/registry/") && (opts as RequestInit)?.method === "PATCH",
+    );
+    expect(patchCalls.length).toBeGreaterThanOrEqual(1);
+    const body = JSON.parse((patchCalls[0][1] as RequestInit).body as string);
+    expect(body.handle).toBe("new-alias");
+  });
+
+  it("shows error message when PATCH fails", async () => {
+    const entryWithHandle: RegistryEntry = {
+      ...fakeEntry,
+      handle: "old-alias",
+    };
+    const mockFetch = vi.fn().mockImplementation((url: string, opts?: RequestInit) => {
+      if (url === "/auth/status") {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ user: { is_admin: true, id: "user-1" } }),
+        });
+      }
+      if (url === "/api/agents/registry") {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve([entryWithHandle]),
+        });
+      }
+      if (typeof url === "string" && url.includes("/api/agents/registry/") && opts?.method === "PATCH") {
+        return Promise.resolve({
+          ok: false,
+          status: 409,
+          json: () => Promise.resolve({ error: "handle is already owned by another active agent" }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    render(<RegistryPanel />);
+
+    const toggle = screen.getByRole("button", { name: /agent registry/i });
+    await act(async () => { toggle.click(); });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("@old-alias")).toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+
+    const editBtn = screen.getByTitle("Edit handle");
+    await act(async () => { editBtn.click(); });
+
+    const input = screen.getByRole("textbox");
+    await act(async () => {
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )!.set!;
+      nativeInputValueSetter.call(input, "taken-alias");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    const saveBtn = screen.getByTitle("Save handle");
+    await act(async () => { saveBtn.click(); });
+    await act(async () => { await Promise.resolve(); });
+
+    expect(screen.getByText("handle is already owned by another active agent")).toBeInTheDocument();
+  });
+
+  it("cancel restores original handle and exits edit mode", async () => {
+    const entryWithHandle: RegistryEntry = {
+      ...fakeEntry,
+      handle: "original",
+    };
+    const mockFetch = vi.fn().mockImplementation((url: string) => {
+      if (url === "/auth/status") {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ user: { is_admin: true, id: "user-1" } }),
+        });
+      }
+      if (url === "/api/agents/registry") {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve([entryWithHandle]),
+        });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    render(<RegistryPanel />);
+
+    const toggle = screen.getByRole("button", { name: /agent registry/i });
+    await act(async () => { toggle.click(); });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("@original")).toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+
+    const editBtn = screen.getByTitle("Edit handle");
+    await act(async () => { editBtn.click(); });
+
+    const input = screen.getByRole("textbox");
+    await act(async () => {
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )!.set!;
+      nativeInputValueSetter.call(input, "modified");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    const cancelBtn = screen.getByTitle("Cancel");
+    await act(async () => { cancelBtn.click(); });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("@original")).toBeInTheDocument();
+        expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+        expect(screen.getByTitle("Edit handle")).toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+  });
+
+  it("displays a stored @-prefixed handle with a single @ (internal seeds)", async () => {
+    const entryWithHandle: RegistryEntry = {
+      ...fakeEntry,
+      handle: "@taOS-dev",
+    };
+    vi.stubGlobal("fetch", makeFetch([entryWithHandle]));
+
+    render(<RegistryPanel />);
+
+    const toggle = screen.getByRole("button", { name: /agent registry/i });
+    await act(async () => { toggle.click(); });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("@taOS-dev")).toBeInTheDocument();
+        expect(screen.queryByText("@@taOS-dev")).not.toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+  });
+
+  it("strips a typed leading @ before PATCH (@ is bus syntax, not part of the name)", async () => {
+    const entryWithHandle: RegistryEntry = {
+      ...fakeEntry,
+      handle: "old-alias",
+    };
+    const mockFetch = vi.fn().mockImplementation((url: string, opts?: RequestInit) => {
+      if (url === "/auth/status") {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ user: { is_admin: true, id: "user-1" } }),
+        });
+      }
+      if (url === "/api/agents/registry") {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve([entryWithHandle]),
+        });
+      }
+      if (typeof url === "string" && url.includes("/api/agents/registry/") && opts?.method === "PATCH") {
+        return Promise.resolve({
+          ok: true,
+          json: () => Promise.resolve({ ...entryWithHandle, handle: "new-alias" }),
+        });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve({}) });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    render(<RegistryPanel />);
+
+    const toggle = screen.getByRole("button", { name: /agent registry/i });
+    await act(async () => { toggle.click(); });
+
+    await waitFor(
+      () => {
+        expect(screen.getByText("@old-alias")).toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+
+    const editBtn = screen.getByTitle("Edit handle");
+    await act(async () => { editBtn.click(); });
+
+    const input = screen.getByRole("textbox");
+    await act(async () => {
+      const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        "value",
+      )!.set!;
+      nativeInputValueSetter.call(input, "@new-alias");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    const saveBtn = screen.getByTitle("Save handle");
+    await act(async () => { saveBtn.click(); });
+    await act(async () => { await Promise.resolve(); });
+
+    const patchCalls = mockFetch.mock.calls.filter(
+      ([url, opts]) => typeof url === "string" && url.includes("/api/agents/registry/") && (opts as RequestInit)?.method === "PATCH",
+    );
+    expect(patchCalls.length).toBe(1);
+    const body = JSON.parse((patchCalls[0][1] as RequestInit).body as string);
+    expect(body.handle).toBe("new-alias");
+  });
+});
