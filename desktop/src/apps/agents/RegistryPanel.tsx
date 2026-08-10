@@ -147,7 +147,7 @@ function RegistryEntryRow({
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [editingHandle, setEditingHandle] = useState(false);
-  const [handleDraft, setHandleDraft] = useState(entry.handle);
+  const [handleDraft, setHandleDraft] = useState(stripAt(entry.handle));
   const [savingHandle, setSavingHandle] = useState(false);
   const [handleErr, setHandleErr] = useState<string | null>(null);
   const isOwner = entry.user_id === currentUserId;
@@ -156,12 +156,12 @@ function RegistryEntryRow({
   const canAssign = (isAdmin || isOwner) && entry.status === "active";
 
   useEffect(() => {
-    setHandleDraft(entry.handle);
+    setHandleDraft(stripAt(entry.handle));
   }, [entry.handle]);
 
   async function saveHandle() {
-    const trimmed = handleDraft.trim();
-    if (trimmed === entry.handle) {
+    const trimmed = stripAt(handleDraft.trim());
+    if (trimmed === stripAt(entry.handle)) {
       setEditingHandle(false);
       setHandleErr(null);
       return;
@@ -224,20 +224,21 @@ function RegistryEntryRow({
           </div>
           <div className="flex items-center gap-2 mt-1">
             <span className="text-[11px] text-shell-text-tertiary">
-              {entry.handle ? `@${entry.handle}` : "no handle"}
+              {entry.handle ? `@${stripAt(entry.handle)}` : "no handle"}
             </span>
             {canEditHandle && (
               editingHandle ? (
                 <>
                   <Input
                     value={handleDraft}
+                    aria-label="Agent handle"
                     onChange={(e) => setHandleDraft(e.target.value)}
                     className="h-7 text-xs w-40"
                     autoFocus
                     onKeyDown={(e) => {
                       if (e.key === "Enter") saveHandle();
                       if (e.key === "Escape") {
-                        setHandleDraft(entry.handle);
+                        setHandleDraft(stripAt(entry.handle));
                         setEditingHandle(false);
                         setHandleErr(null);
                       }
@@ -259,7 +260,7 @@ function RegistryEntryRow({
                     size="icon"
                     className="h-7 w-7 hover:bg-zinc-500/15 hover:text-zinc-400"
                     onClick={() => {
-                      setHandleDraft(entry.handle);
+                      setHandleDraft(stripAt(entry.handle));
                       setEditingHandle(false);
                       setHandleErr(null);
                     }}
