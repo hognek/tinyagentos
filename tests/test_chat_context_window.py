@@ -30,6 +30,31 @@ def test_history_token_budget_floored_at_512():
     assert history_token_budget(1) == 512
 
 
+def test_history_token_budget_known_small_rkllm_window():
+    # rkllm manifests (e.g. qwen2.5-1.5b-rkllm) declare 4096. 4096 - 10000
+    # system reserve - 1024 response reserve underflows, so the 512 floor
+    # applies rather than the 4000 unknown-default (#1740).
+    assert history_token_budget(4096) == 512
+
+
+def test_build_context_window_budgets_for_known_small_window():
+    # With a 4096-token model the history budget is only 512 tokens, so a
+    # window of chatty messages must be trimmed hard and oldest-first, never
+    # exceeding that small budget (the #1740 budget math with a real value).
+    budget = history_token_budget(4096)
+    assert budget == 512
+
+    message = "x" * 400  # 100 tokens per message
+    msgs = [_msg("user", message) for _ in range(20)]  # 2000 tokens total
+    ctx = build_context_window(msgs, limit=20, max_tokens=budget)
+
+    total = sum(estimate_tokens(m["content"]) for m in ctx)
+    assert total <= budget
+    assert len(ctx) < 20
+    # Oldest dropped first -> the kept set is a contiguous suffix.
+    assert [m["content"] for m in ctx] == [message] * len(ctx)
+
+
 def test_history_token_budget_large_window_subtracts_reserves():
     # 32768 - 10000 - 1024 = 21744
     assert history_token_budget(32768) == 21744
