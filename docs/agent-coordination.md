@@ -231,9 +231,8 @@ The surface, by scope:
   only. Granting project_tasks also makes the agent a project member.
   `POST .../tasks/{id}/claimable` is also reachable, but LEAD-only: the
   route (`_authorize_project_lead`) refuses a plain project_tasks worker.
-  It toggles only the `claimable` label (the fleet-pickup flag), preserving
-  every other label, so it does not widen the scope into free field edits
-  (cf. PATCH).
+  It adds/removes the `claimable` label in place, preserving all other labels,
+  so it does not widen the scope into free field edits (cf. PATCH).
   `POST .../tasks/{id}/unquarantine` is also reachable, but LEAD-only: the
   route (`_authorize_project_lead`) refuses a plain project_tasks worker.
   It returns a quarantined card to the open pool and clears its strikes.
