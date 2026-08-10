@@ -20,6 +20,8 @@ variants:
   requires:
     backends:
     - id: hailo-ollama
+      targets:
+      - hailo
       min_ram_mb: 2048
 hardware_tiers:
   arm-npu-8gb:
