@@ -259,16 +259,6 @@ export function App() {
   // box (#58). An explicit user choice is always honored and never overridden.
   usePerfAutoDetect();
 
-  // Persist a stable per-browser-profile device id (never sent to the server)
-  // so the per-device wallpaper-fit preference is isolated from other devices.
-  useEffect(() => {
-    const KEY = "taos-wallpaper-device-id";
-    if (typeof window === "undefined") return;
-    if (!localStorage.getItem(KEY)) {
-      localStorage.setItem(KEY, crypto.randomUUID());
-    }
-  }, []);
-
   // Sync the persistent backend notification feed into the bell (desktop and
   // mobile both render NotificationCentre under this component).
   useServerNotifications();
@@ -395,7 +385,7 @@ export function App() {
             <div className="h-screen w-screen flex flex-col overflow-hidden bg-shell-bg text-shell-text">
               <EffectsLayer />
               <TopBar onSearchOpen={toggleSearch} onAssistantOpen={toggleAssistant} />
-              <Desktop wallpaperFit={wallpaperFit} letterboxBg={wallpaperFit === "fit" || wallpaperFit === "center" ? (useLightWallpaper ? wallpaperLightFallback : wallpaperFallback) : undefined} />
+              <Desktop />
               <Dock onLaunchpadOpen={toggleLaunchpad} />
               <Launchpad open={launchpadOpen} onClose={() => setLaunchpadOpen(false)} onOpenApp={(wid) => setActiveWindowId(wid)} />
               <SearchPalette open={searchOpen} onClose={() => setSearchOpen(false)} onOpenApp={(wid) => setActiveWindowId(wid)} />

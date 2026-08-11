@@ -207,9 +207,6 @@ const WALLPAPER_FIT_KEY = "taos-wallpaper-fit:";
 function wallpaperFitKey(): string {
   return WALLPAPER_FIT_KEY + getDeviceId();
 }
-export function wallpaperFitToClass(fit: WallpaperFit): string {
-  return `data-wallpaper-fit="${fit}"`;
-}
 export function loadWallpaperFit(): WallpaperFit {
   try {
     const raw = localStorage.getItem(wallpaperFitKey());

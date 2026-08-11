@@ -1,10 +1,5 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { useThemeStore, loadWallpaperFit } from "../theme-store";
-import {
-  WALLPAPER_FIT_OPTIONS,
-  wallpaperFitToClass,
-  type WallpaperFit,
-} from "../theme-store";
 
 const reset = () => {
   useThemeStore.setState({
@@ -37,32 +32,6 @@ describe("wallpaper-fit (per-device, CSS-driven)", () => {
   beforeEach(() => {
     reset();
     localStorage.clear();
-  });
-
-  /* ------------------------------------------------------------------ */
-  /*  wallpaperFitToClass — the fit-to-CSS mapping                       */
-  /* ------------------------------------------------------------------ */
-
-  describe("wallpaperFitToClass", () => {
-    const expected: Record<WallpaperFit, string> = {
-      fill: 'data-wallpaper-fit="fill"',
-      fit: 'data-wallpaper-fit="fit"',
-      stretch: 'data-wallpaper-fit="stretch"',
-      center: 'data-wallpaper-fit="center"',
-      tile: 'data-wallpaper-fit="tile"',
-    };
-
-    it.each(WALLPAPER_FIT_OPTIONS)(
-      "maps %s to its CSS data attribute",
-      (fit) => {
-        expect(wallpaperFitToClass(fit)).toBe(expected[fit]);
-      }
-    );
-
-    it("returns a distinct value for every option", () => {
-      const classes = WALLPAPER_FIT_OPTIONS.map(wallpaperFitToClass);
-      expect(new Set(classes).size).toBe(WALLPAPER_FIT_OPTIONS.length);
-    });
   });
 
   /* ------------------------------------------------------------------ */
@@ -105,15 +74,13 @@ describe("wallpaper-fit (per-device, CSS-driven)", () => {
 
   it("defaults to fill when no preference is stored", () => {
     localStorage.clear();
-    useThemeStore.setState({ wallpaperFit: "fill" });
-    expect(useThemeStore.getState().wallpaperFit).toBe("fill");
+    expect(loadWallpaperFit()).toBe("fill");
   });
 
   it("ignores an invalid stored value and falls back to fill", () => {
     localStorage.setItem("taos-wallpaper-device-id", "bad-device");
     localStorage.setItem("taos-wallpaper-fit:bad-device", "not-a-real-fit");
-    useThemeStore.setState({ wallpaperFit: "fill" });
-    expect(useThemeStore.getState().wallpaperFit).toBe("fill");
+    expect(loadWallpaperFit()).toBe("fill");
   });
 
   /* ------------------------------------------------------------------ */
@@ -132,20 +99,5 @@ describe("wallpaper-fit (per-device, CSS-driven)", () => {
     expect(useThemeStore.getState().wallpaperFit).toBe("center");
     useThemeStore.getState().setWallpaperFit("fill");
     expect(useThemeStore.getState().wallpaperFit).toBe("fill");
-  });
-
-  /* ------------------------------------------------------------------ */
-  /*  Key derivation — per-device isolation at the key level              */
-  /* ------------------------------------------------------------------ */
-
-  it("derives a different localStorage key for each device id", () => {
-    const ids = ["alpha", "bravo", "charlie"];
-    const keys = ids.map((id) => "taos-wallpaper-fit:" + id);
-    expect(new Set(keys).size).toBe(3);
-  });
-
-  it("does not include the server-synced user id in the localStorage key", () => {
-    const key = "taos-wallpaper-fit:" + localStorage.getItem("taos-wallpaper-device-id")!;
-    expect(key).not.toContain("taos.user.id");
   });
 });

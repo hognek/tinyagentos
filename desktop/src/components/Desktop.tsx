@@ -23,7 +23,7 @@ type ContextMenuState = {
   y: number;
 } | null;
 
-export function Desktop({ wallpaperFit, letterboxBg }: { wallpaperFit?: string; letterboxBg?: string }) {
+export function Desktop() {
   const windows = useProcessStore((s) => s.windows);
   const { openWindow, reclampAllWindows } = useProcessStore();
   const wallpaperImage = useThemeStore((s) => s.wallpaperImage);
@@ -38,13 +38,13 @@ export function Desktop({ wallpaperFit, letterboxBg }: { wallpaperFit?: string; 
   const wallpaperOverlayText = useThemeStore((s) => s.wallpaperOverlayText);
   const showOverlayText = useThemeStore((s) => s.showOverlayText);
   const reduceEffects = useThemeStore((s) => s.reduceEffects);
+  const wallpaperFit = useThemeStore((s) => s.wallpaperFit);
   const isAnimated = wallpaperKind === "animated";
   // Invert the wallpaper with the theme: use the light variant when present.
   const useLight = scheme === "light" && !!wallpaperLightImage;
   const effImage = useLight ? wallpaperLightImage : wallpaperImage;
   const effMobile = useLight ? wallpaperLightMobileImage : wallpaperMobileImage;
   const effFallback = useLight ? wallpaperLightFallback : wallpaperFallback;
-  const bgColor = letterboxBg ?? effFallback;
   const { showWidgets, toggleWidgets } = useWidgetStore();
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
   const [wallpaperPickerOpen, setWallpaperPickerOpen] = useState(false);
@@ -159,7 +159,7 @@ export function Desktop({ wallpaperFit, letterboxBg }: { wallpaperFit?: string; 
   return (
     <div
       className="taos-wallpaper relative flex-1 overflow-hidden"
-      style={{ backgroundColor: bgColor, ["--wallpaper-desktop" as never]: isAnimated ? "none" : effImage, ["--wallpaper-mobile" as never]: isAnimated ? "none" : effMobile }}
+      style={{ backgroundColor: effFallback, ["--wallpaper-desktop" as never]: isAnimated ? "none" : effImage, ["--wallpaper-mobile" as never]: isAnimated ? "none" : effMobile }}
       data-wallpaper-fit={wallpaperFit || undefined}
       onContextMenu={handleContextMenu}
       data-desktop-surface
