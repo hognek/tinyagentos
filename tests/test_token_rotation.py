@@ -241,7 +241,7 @@ class TestRotateTokensRoute:
 
     @pytest.mark.asyncio
     async def test_nonadmin_cannot_rotate_others_agent(self, agent_app, app):
-        """A non-admin, non-owner rotating someone ELSE'S agent → 403."""
+        """A non-admin, non-owner rotating someone ELSE'S agent → 404 (existence-hiding)."""
         # First user owns an agent.
         owner_client, owner_uid = _make_nonadmin_client(
             app, app.state.auth, username="owner2", full_name="Owner Two",
@@ -260,22 +260,22 @@ class TestRotateTokensRoute:
             resp = await intruder_client.post(
                 f"/api/agents/registry/{cid}/rotate-tokens"
             )
-            assert resp.status_code == 403
+            assert resp.status_code == 404
 
     @pytest.mark.asyncio
     async def test_empty_userid_agent_is_admin_only(self, agent_app, app):
         """An agent_registry row with user_id='' can ONLY be rotated by admin.
 
-        Non-admin sessions get 403 because require_owner_or_admin compares
-        the session's user_id against an empty string (owner match fails)
-        and the session is not admin.
+        Non-admin sessions get 404 (existence-hiding): the owner match
+        against an empty string fails, the session is not admin, and the
+        route answers exactly as it would for an unknown id.
         """
         # Register an agent with the default user_id="" (admin-only).
         cid, _token = await _register_and_mint(app, user_id="admin")
         r = await app.state.agent_registry.get(cid)
         assert r["user_id"] == ""
 
-        # A non-admin session trying to rotate it must get 403.
+        # A non-admin session trying to rotate it must get the not-found 404.
         nonadmin_client, _uid = _make_nonadmin_client(
             app, app.state.auth, username="randouser", full_name="Rando",
             password="password123",
@@ -284,7 +284,7 @@ class TestRotateTokensRoute:
             resp = await nonadmin_client.post(
                 f"/api/agents/registry/{cid}/rotate-tokens"
             )
-            assert resp.status_code == 403
+            assert resp.status_code == 404
 
     @pytest.mark.asyncio
     async def test_rotate_nonexistent_returns_404(self, agent_app):

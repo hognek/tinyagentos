@@ -258,4 +258,4 @@ class TestUpdateOrgFields:
             )
         finally:
             await member_client.aclose()
-        assert resp.status_code == 403
+        assert resp.status_code == 404

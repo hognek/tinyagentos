@@ -846,12 +846,12 @@ class TestPatchRegistryRoute:
             user_id="other-user-uid",
         )
         cid = rec["canonical_id"]
-        # member tries to patch another user's entry → 403
+        # member tries to patch another user's entry → 404 (existence-hiding)
         resp = await gov_member_client.patch(
             f"/api/agents/registry/{cid}",
             json={"display_name": "Hijacked"},
         )
-        assert resp.status_code == 403
+        assert resp.status_code == 404
 
     async def test_patch_empty_body_is_noop(self, gov_client, tmp_data_dir):
         client, _ = gov_client
