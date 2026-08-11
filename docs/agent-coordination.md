@@ -396,6 +396,15 @@ that SAME canonical_id instead:
 - `POST /api/agents/registry/{canonical_id}/scope-requests/{req_id}/deny`:
   owner/admin only.
 
+All owner-gated registry routes are existence-hiding (#2106): an authenticated
+caller who is not the owner gets the same 404 body as a nonexistent
+`canonical_id`, on the scope-request create/approve/deny routes above and on
+registry PATCH, DELETE (revoke), rotate-tokens, and `PUT /api/agents/{id}/org`.
+Agents must not treat a 404 from these routes as proof an id does not exist,
+and must not expect a 403 to distinguish "exists, not yours". Admin-only
+lifecycle routes (approve/reject/suspend/reactivate) still 403 non-admins
+before any lookup, which discloses nothing.
+
 Requested scopes are validated against the same closed `VALID_SCOPES` vocabulary
 as the consent flow. `project_tasks` and the canvas scopes still require an
 explicit `project_id`; `decisions_read` / `decisions_write` (and the other global
