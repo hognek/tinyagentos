@@ -33,7 +33,7 @@ from pydantic import BaseModel, field_validator
 
 from tinyagentos.agent_registry_store import mint_registry_token
 from tinyagentos.agent_token_auth import check_agent_scope
-from tinyagentos.auth_context import CurrentUser, current_user, require_owner_or_admin
+from tinyagentos.auth_context import CurrentUser, current_user
 
 logger = logging.getLogger(__name__)
 
@@ -612,13 +612,15 @@ async def patch_registry_entry(
 
     Allowed fields: display_name, handle, role, capabilities.
     Status, framework, user_id, and timestamps are immutable.
-    Only the owning user or an admin may update an entry.
+    Only the owning user or an admin may update an entry; anyone else gets
+    the same 404 as an unknown id (existence-hiding, as on GET).
     """
     store = _get_store(request)
     record = await store.get(canonical_id)
     if record is None:
         return JSONResponse({"error": "not found"}, status_code=404)
-    require_owner_or_admin(user, record["user_id"])
+    if not user.is_admin and user.user_id != record["user_id"]:
+        return JSONResponse({"error": "not found"}, status_code=404)
     old_name = record.get("display_name") or ""
     try:
         updated = await store.update(
@@ -664,13 +666,15 @@ async def revoke_registry_entry(
 ):
     """Revoke a registry entry (sets revoked_at, does not delete).
 
-    Only the owning user or an admin may revoke an entry.
+    Only the owning user or an admin may revoke an entry; anyone else gets
+    the same 404 as an unknown id (existence-hiding, as on GET).
     """
     store = _get_store(request)
     record = await store.get(canonical_id)
     if record is None:
         return JSONResponse({"error": "not found or already revoked"}, status_code=404)
-    require_owner_or_admin(user, record["user_id"])
+    if not user.is_admin and user.user_id != record["user_id"]:
+        return JSONResponse({"error": "not found or already revoked"}, status_code=404)
     before_status = record.get("status") or "active"
     revoked = await store.revoke(canonical_id)
     await _audit_governance(
@@ -778,7 +782,8 @@ async def rotate_tokens(
     record = await store.get(canonical_id)
     if record is None:
         return JSONResponse({"error": "not found"}, status_code=404)
-    require_owner_or_admin(user, record["user_id"])
+    if not user.is_admin and user.user_id != record["user_id"]:
+        return JSONResponse({"error": "not found"}, status_code=404)
 
     ts = int(time.time())
     before_iat = record.get("token_min_iat") or 0
@@ -841,7 +846,8 @@ async def update_org_fields(
     record = await store.get(canonical_id)
     if record is None:
         return JSONResponse({"error": "not found"}, status_code=404)
-    require_owner_or_admin(user, record["user_id"])
+    if not user.is_admin and user.user_id != record["user_id"]:
+        return JSONResponse({"error": "not found"}, status_code=404)
 
     if body.role is None and body.title is None and body.reports_to is None:
         # An all-None body is a no-op write; reject it rather than returning a
