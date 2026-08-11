@@ -222,7 +222,17 @@ the proxy returns 502 (the read proxies degrade to an empty 200 instead).
 A registered external agent authenticates with its registry JWT
 (`Authorization: Bearer`) and reaches exactly the routes its granted SCOPES
 allow, nothing else: the middleware allowlist is a closed set, no skeleton key.
-The surface, by scope:
+
+A SEPARATE credential class exists for the Agent-as-a-Model surface:
+`GET /v1/models` and `POST /v1/chat/completions` are reachable without a
+session using a CONSENT KEY (`Authorization: Bearer sk-taosagent-...`, minted
+by an owner via `/api/agent-model-keys`), which the route itself validates —
+no key, no resolution, OpenAI-shaped 401 otherwise. Only those two exact
+method+path pairs pass the middleware; any other `/v1` path stays
+session-gated. `POST /v1/chat/completions` returns 501 for a valid key until
+the opencode host-server turn seam lands (decided 2026-06-23, unbuilt).
+
+The registry-JWT surface, by scope:
 
 - **project_tasks** (the kanban board): `GET /api/projects/{pid}/tasks`,
   `.../tasks/ready`, `.../tasks/{id}`, `.../tasks/{id}/comments` (GET + POST),
