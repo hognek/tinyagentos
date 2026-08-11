@@ -173,10 +173,13 @@
 }
 
 /* Wallpaper sizing
-   ----------------
-   Desktop fills the viewport (cover crops edges if aspect mismatches).
-   Mobile/portrait scales the full image in (contain) so pieces like the
-   'taOS' letters near the edges of a wide wallpaper aren't clipped.
+    ----------------
+    Desktop fills the viewport (cover crops edges if aspect mismatches).
+    Mobile/portrait scales the full image in (contain) so pieces like the
+    'taOS' letters near the edges of a wide wallpaper aren't clipped.
+
+    User choice: data-wallpaper-fit attribute on .taos-wallpaper overrides
+    the default cover behaviour. Per-device, persisted in localStorage.
 */
 .taos-wallpaper {
   background-image: var(--wallpaper-desktop);
@@ -199,6 +202,28 @@
     background-size: cover;
   }
 }
+
+/* Wallpaper fit options — attribute-driven, no inline styles */
+.taos-wallpaper[data-wallpaper-fit="fill"] {
+  background-size: cover;
+}
+.taos-wallpaper[data-wallpaper-fit="fit"] {
+  background-size: contain;
+}
+.taos-wallpaper[data-wallpaper-fit="stretch"] {
+  background-size: 100% 100%;
+}
+.taos-wallpaper[data-wallpaper-fit="center"] {
+  background-size: auto;
+  background-position: center;
+}
+.taos-wallpaper[data-wallpaper-fit="tile"] {
+  background-size: auto;
+  background-repeat: repeat;
+}
+/* Letterbox bars for fit/center need no rule here: every .taos-wallpaper
+   element sets the wallpaper fallback colour as an inline background, and
+   an inline style always wins over anything this sheet could declare. */
 
 /* React-grid-layout dark theme overrides for widget system */
 .react-grid-item.react-grid-placeholder {
