@@ -961,12 +961,25 @@ async def _authorize_scope_request_creation(
 
     from tinyagentos.agent_token_auth import check_agent_identity
 
-    agent_cid = await check_agent_identity(request)
+    try:
+        agent_cid = await check_agent_identity(request)
+    except HTTPException as exc:
+        # A malformed or inactive-agent token must learn no more than an
+        # anonymous caller: letting check_agent_identity's 401/403 surface
+        # here would pair with the earlier 404-on-unknown to form an
+        # existence oracle (unknown target 404, existing target 401/403).
+        logger.info(
+            "scope request create 404-bad-credentials for %s (%s)",
+            canonical_id, exc.detail,
+        )
+        raise HTTPException(
+            status_code=404, detail="agent not found or not active"
+        ) from None
     if agent_cid is not None and agent_cid == canonical_id:
         return
 
     logger.info(
-        "scope request create 403-not-owner for %s by %s",
+        "scope request create 404-not-owner for %s by %s",
         canonical_id, uid,
     )
     raise HTTPException(status_code=404, detail="agent not found or not active")
@@ -1073,7 +1086,7 @@ async def approve_scope_request(
         raise HTTPException(status_code=404, detail="agent not found or not active")
     if not (user.is_admin or user.user_id == record["user_id"]):
         logger.info(
-            "scope request approve 403-not-owner for %s by %s",
+            "scope request approve 404-not-owner for %s by %s",
             canonical_id, user.user_id,
         )
         raise HTTPException(status_code=404, detail="agent not found or not active")
@@ -1199,7 +1212,7 @@ async def deny_scope_request(
         raise HTTPException(status_code=404, detail="agent not found")
     if not (user.is_admin or user.user_id == record["user_id"]):
         logger.info(
-            "scope request deny 403-not-owner for %s by %s",
+            "scope request deny 404-not-owner for %s by %s",
             canonical_id, user.user_id,
         )
         raise HTTPException(status_code=404, detail="agent not found")

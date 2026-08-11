@@ -717,3 +717,41 @@ async def test_deny_scope_request_non_owner_and_nonexistent_identical(
         assert resp_owner.content == resp_nonexistent.content
     finally:
         await env.close()
+
+
+@pytest.mark.asyncio
+async def test_create_scope_request_inactive_token_no_existence_oracle(
+    client, monkeypatch, tmp_path
+):
+    """A suspended agent's (validly signed) token must get the SAME response
+    for an existing target as for a nonexistent one. Before the fix,
+    check_agent_identity's 403 surfaced only when the target existed (an
+    unknown target 404s first), disclosing existence through the
+    credential-error path."""
+    env = await _wire(client, monkeypatch, tmp_path)
+    try:
+        cid_target = await _register_active(env, handle="@target", display="target")
+        cid_b = await _register_active(env, handle="@suspended", display="suspended")
+        token_b = env.agent_token(cid_b)
+        await env.registry.set_status(cid_b, "suspended", actor="test")
+
+        app = client._transport.app
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as bare:
+            resp_existing = await bare.post(
+                f"/api/agents/registry/{cid_target}/scope-requests",
+                headers={"Authorization": f"Bearer {token_b}"},
+                json={"requested_scopes": ["a2a_send"]},
+            )
+            resp_missing = await bare.post(
+                "/api/agents/registry/does-not-exist/scope-requests",
+                headers={"Authorization": f"Bearer {token_b}"},
+                json={"requested_scopes": ["a2a_send"]},
+            )
+
+        assert resp_existing.status_code == resp_missing.status_code == 404
+        assert resp_existing.content == resp_missing.content
+        assert await env.scope_store.count_pending_for(cid_target) == 0
+    finally:
+        await env.close()
