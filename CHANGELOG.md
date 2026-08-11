@@ -7,20 +7,119 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
 
 ## [Unreleased]
 
+## [1.0.0-beta.48] - 2026-08-11
+
+### Added
+
+- Quarantined task cards surface their strike count and latest strike on the
+  task-detail response, and a lead can un-quarantine a card via
+  `POST /api/projects/{pid}/tasks/{tid}/unquarantine`, clearing its strikes (#2333).
+
+- **Hailo-10H HEF model catalog**: five NPU-accelerated model manifests
+  (DeepSeek-R1-Distill-Qwen 1.5B, Llama 3.2 3B, Qwen2 1.5B, Qwen2.5 1.5B,
+  Qwen2.5 Coder 1.5B) now resolve and install via `hailo-ollama` on
+  Raspberry Pi 5 + AI HAT+2, and downloaded `.hef` files show up in the
+  local-files and orphan scans (#2338).
+
+- The Agents app registry panel shows each agent's handle (alias) and lets the
+  owner or an admin edit it inline, saved via
+  `PATCH /api/agents/registry/{canonical_id}`. A leading `@` is display syntax
+  and is stripped before save (#2349).
+
+- Wallpaper fit options in Settings -> Desktop & Dock: fill, fit, stretch,
+  center, and tile. The choice is persisted per device (localStorage, keyed
+  by a locally minted device id that is never sent to the server), so each
+  screen keeps the fit that suits its aspect ratio (#2357).
+
+- **Agent loop infrastructure**: new `tinyagentos.agent_loop.AgentLoop` library
+  for subagent delegation and safe-point message queuing. Landed as
+  standalone infrastructure; wired into the chat router and taOS agent
+  routes in #tsk-icpt4i (#tsk-rl2lfb).
+
+- **CI**: store-wiring-gate workflow and `scripts/check_store_wiring.py` guard.
+  A PR that adds a new BaseStore subclass without wiring it into
+  `tinyagentos/app.py` now fails CI and names the unreachable class and file.
+  Routes reach stores ONLY via `request.app.state`, so an unwired store is
+  dead code. Only newly added classes are policed; a
+  `Store-Unwired-Intentionally: <ClassName>, <why>` trailer in the PR body
+  waives a named class for stores genuinely constructed elsewhere (tsk-n3w5mh).
+
+- **Docs**: mechanical-simple-auditable design law added to the agent manual
+  (`01-rules.md`), with a worked example anonymised as "an agent". Also trimmed
+  verbose prose in the image-prompting guide to stay within the compiled manual
+  character budget.
+
+### Changed
+
+- CI's `spa-build` job runs on Node 22 (was 20, now past end-of-life). Also
+  unblocks the jsdom 30 upgrade, which requires Node >= 22.13 (#2353).
+
+- **Agent loop wiring**: `AgentLoop` is now the single per-agent serialization
+  owner. `AgentChatRouter` drives OpenClaw ACP turns through a per-agent
+  `AgentLoop` (replacing the per-agent lock) and the turn-holder drives
+  messages queued mid-turn at its safe point. The desktop taOS agent chat
+  endpoint serializes on one `AgentLoop` too -- fixing a race where two
+  concurrent POSTs shared the opencode session with no serialization --
+  queueing concurrent messages and surfacing them in the turn-holder's stream
+  tail. New `GET /api/taos-agent/status` endpoint returns the desktop loop's
+  status scoped to state / current turn / queue depth / subagent descriptors
+  (subagent result/error payloads stay server-side) (#tsk-icpt4i).
+
+### Fixed
+
+- Project list entries: `get_entry` no longer reads cursor metadata after the
+  cursor closes, and a failed reorder now rolls back its partial updates so a
+  later unrelated write cannot commit a half-applied ordering (tsk-u23vjy,
+  fix-forward of #2183).
+
+- The Agent-as-a-Model surface (`GET /v1/models`, `POST /v1/chat/completions`)
+  is now reachable by external OpenAI-compatible clients: the auth middleware
+  passes exactly those two routes through to their own consent-key check
+  instead of rejecting every session-less caller before the handler ran. All
+  other `/v1` paths remain session-gated (tsk-hfs6zv).
+
+- **PWA refresh loop after a browser auto-update**: `/auth/status`, `/auth/me`
+  and the chat/canvas/terminal/web-chat WebSocket handlers now apply the same
+  session User-Agent binding check as the API middleware. Previously a session
+  created before a browser update kept reading as authenticated on
+  `/auth/status` while every `/api/*` call was rejected, so the desktop shell
+  remounted in a loop; the WebSocket endpoints conversely accepted a cookie
+  the APIs refused.
+
+- **Catalog manifests' `context_window` was silently dropped**: `AppManifest`
+  declared no `context_window` field and `from_dict` never read the YAML
+  value, so every manifest loaded as 0 and the chat context-window budget code
+  always fell back to the 4000-token "unknown window" default. The field now
+  loads onto `AppManifest` (0 reserved for unknown), so real windows -- e.g.
+  rkllm 4096, qwen 32768 -- drive the #1740 budget math. (#2338, #1740)
+
 ### Security
+
+- Memory routes reject any `agent` value that is not a single plain path
+  component (separators, `.`/`..`, NUL all 400): the caller-controlled name
+  becomes a filesystem path component of the qmd `dbPath`, and a traversal
+  value could previously address SQLite files outside `agent-memory/` (#2352).
+
+- All owner-gated agent-registry routes are now existence-hiding: a caller who
+  does not own an agent gets the same 404 as a nonexistent id, on the
+  scope-request create/approve/deny routes and on registry PATCH, revoke,
+  rotate-tokens, and org update. Previously a 403-vs-404 difference disclosed
+  whether an agent id existed (issue #2106, reported by hognek) (#2356).
+
+- **CI**: `secret-ignores-gate` workflow and `scripts/check_secret_ignores.py` now
+  assert, on push to `master`/`dev`/`release/*` and on PRs to those branches, that the
+  committed `.gitignore` still contains every secret-protection rule (`*.key`,
+  `*.p8`, `identity.json`, `*credentials.json`, `*creds*.json`, the `*_private.*` key
+  shapes, `secrets/`, `data/hub/`, and more) and that known secret-shaped paths
+  are all reported ignored by `git check-ignore`. Closes the "promotion must be
+  verified, not assumed" gap from #2171/#2173. Removing any one pattern is
+  proven to fail the gate by a parametrized test (tsk-laezfg).
 
 - **Desktop deps**: bump `dompurify` 3.4.12 -> 3.4.13 (GHSA-55q2-fjhq-7xh7,
   moderate) and `nanoid` 5.1.11 -> 5.1.16 (CVE-2026-67214, high) in
   `desktop/package-lock.json`; lock-only, both already within the declared
   ranges. Split out of Dependabot #2331, whose grouped jsdom 30 bump fails
   spa-build (jsdom 30 requires Node >=22.13; CI pins Node 20).
-
-### Added
-
-- **Docs**: mechanical-simple-auditable design law added to the agent manual
-  (`01-rules.md`), with a worked example anonymised as "an agent". Also trimmed
-  verbose prose in the image-prompting guide to stay within the compiled manual
-  character budget.
 
 ## [1.0.0-beta.47] - 2026-08-09
 
