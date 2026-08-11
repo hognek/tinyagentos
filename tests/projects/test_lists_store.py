@@ -327,3 +327,71 @@ async def test_concurrent_add_entry_distinct_positions(entries_store, monkeypatc
 
     positions = {e1["position"], e2["position"]}
     assert len(positions) == 2, f"expected distinct positions, got {positions}"
+
+
+# ---------------------------------------------------------------------------
+# tsk-u23vjy (fix-forward of the closed duplicate PR #2183, re-scoped to what
+# is real on dev): of the card's four defects, position-0 collision is already
+# fixed by the atomic INSERT (#2265, concurrency test above) and NULL list_id
+# rows are impossible (schema: list_id TEXT NOT NULL). The two below remain.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_get_entry_reads_description_before_cursor_closes(entries_store):
+    e = await entries_store.add_entry(
+        list_id="lst-1", project_id="prj-1", text="Test entry",
+        original_text="Test entry", author_kind="agent", author_id="agent-1",
+    )
+    result = await entries_store.get_entry(e["id"])
+    assert result is not None
+    assert result["id"] == e["id"]
+    assert result["text"] == "Test entry"
+
+
+@pytest.mark.asyncio
+async def test_reorder_entries_rolls_back_on_exception(entries_store, monkeypatch):
+    """If an UPDATE raises partway, the earlier UPDATEs must be rolled back --
+    otherwise they sit pending on the shared connection and the next unrelated
+    commit() flushes a half-applied reorder."""
+    a = await entries_store.add_entry(
+        list_id="lst-1", project_id="prj-1", text="A", original_text="A",
+        author_kind="agent", author_id="agent-1",
+    )
+    b = await entries_store.add_entry(
+        list_id="lst-1", project_id="prj-1", text="B", original_text="B",
+        author_kind="agent", author_id="agent-1",
+    )
+
+    real_execute = entries_store._db.execute
+    update_calls = 0
+
+    async def failing_execute(sql, params=()):
+        nonlocal update_calls
+        if sql.startswith("UPDATE project_list_entries SET position"):
+            update_calls += 1
+            if update_calls == 2:
+                raise RuntimeError("boom")
+        return await real_execute(sql, params)
+
+    monkeypatch.setattr(entries_store._db, "execute", failing_execute)
+
+    with pytest.raises(RuntimeError):
+        await entries_store.reorder_entries(
+            "prj-1", "lst-1",
+            [{"id": a["id"], "position": 1}, {"id": b["id"], "position": 0}],
+        )
+    monkeypatch.undo()
+
+    # The half-applied first UPDATE must be gone immediately...
+    a_after = await entries_store.get_entry(a["id"])
+    b_after = await entries_store.get_entry(b["id"])
+    assert a_after["position"] == 0
+    assert b_after["position"] == 1
+
+    # ...and must NOT resurface when an unrelated write commits later.
+    await entries_store.add_entry(
+        list_id="lst-2", project_id="prj-1", text="Unrelated",
+        original_text="Unrelated", author_kind="agent", author_id="agent-1",
+    )
+    a_final = await entries_store.get_entry(a["id"])
+    assert a_final["position"] == 0
