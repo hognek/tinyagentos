@@ -197,6 +197,7 @@ export function App() {
   const wallpaperOverlayText = useThemeStore((s) => s.wallpaperOverlayText);
   const showOverlayText = useThemeStore((s) => s.showOverlayText);
   const reduceEffects = useThemeStore((s) => s.reduceEffects);
+  const wallpaperFit = useThemeStore((s) => s.wallpaperFit);
   const isAnimatedWallpaper = wallpaperKind === "animated";
   const useLightWallpaper = scheme === "light" && !!wallpaperLightImage;
   const effWallpaperImage = useLightWallpaper ? wallpaperLightImage : wallpaperImage;
@@ -257,6 +258,16 @@ export function App() {
   // effects on a struggling device, so low-end hardware is smooth out of the
   // box (#58). An explicit user choice is always honored and never overridden.
   usePerfAutoDetect();
+
+  // Persist a stable per-browser-profile device id (never sent to the server)
+  // so the per-device wallpaper-fit preference is isolated from other devices.
+  useEffect(() => {
+    const KEY = "taos-wallpaper-device-id";
+    if (typeof window === "undefined") return;
+    if (!localStorage.getItem(KEY)) {
+      localStorage.setItem(KEY, crypto.randomUUID());
+    }
+  }, []);
 
   // Sync the persistent backend notification feed into the bell (desktop and
   // mobile both render NotificationCentre under this component).
@@ -384,7 +395,7 @@ export function App() {
             <div className="h-screen w-screen flex flex-col overflow-hidden bg-shell-bg text-shell-text">
               <EffectsLayer />
               <TopBar onSearchOpen={toggleSearch} onAssistantOpen={toggleAssistant} />
-              <Desktop />
+              <Desktop wallpaperFit={wallpaperFit} letterboxBg={wallpaperFit === "fit" || wallpaperFit === "center" ? (useLightWallpaper ? wallpaperLightFallback : wallpaperFallback) : undefined} />
               <Dock onLaunchpadOpen={toggleLaunchpad} />
               <Launchpad open={launchpadOpen} onClose={() => setLaunchpadOpen(false)} onOpenApp={(wid) => setActiveWindowId(wid)} />
               <SearchPalette open={searchOpen} onClose={() => setSearchOpen(false)} onOpenApp={(wid) => setActiveWindowId(wid)} />
@@ -407,7 +418,7 @@ export function App() {
     <ShortcutProvider>
       <SystemShortcuts toggleSearch={toggleSearch} toggleLaunchpad={toggleLaunchpad} toggleAssistant={toggleAssistant} />
       <LoginGate>
-    <div className={`taos-wallpaper taos-mobile-root relative h-screen w-screen flex flex-col text-shell-text${isBrowserMobile ? " taos-browser" : ""}`} style={{ backgroundColor: effWallpaperFallback, ["--wallpaper-desktop" as never]: isAnimatedWallpaper ? "none" : effWallpaperImage, ["--wallpaper-mobile" as never]: isAnimatedWallpaper ? "none" : effWallpaperMobile }}>
+    <div className={`taos-wallpaper taos-mobile-root relative h-screen w-screen flex flex-col text-shell-text${isBrowserMobile ? " taos-browser" : ""}`} data-wallpaper-fit={wallpaperFit || undefined} style={{ backgroundColor: effWallpaperFallback, ["--wallpaper-desktop" as never]: isAnimatedWallpaper ? "none" : effWallpaperImage, ["--wallpaper-mobile" as never]: isAnimatedWallpaper ? "none" : effWallpaperMobile }}>
       {isAnimatedWallpaper && !reduceEffects && wallpaperComponent === "particles" && <ParticlesWallpaper />}
       {showOverlayText && wallpaperOverlayText && <WallpaperTextOverlay text={wallpaperOverlayText} />}
       <EffectsLayer />

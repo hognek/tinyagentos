@@ -173,10 +173,13 @@
 }
 
 /* Wallpaper sizing
-   ----------------
-   Desktop fills the viewport (cover crops edges if aspect mismatches).
-   Mobile/portrait scales the full image in (contain) so pieces like the
-   'taOS' letters near the edges of a wide wallpaper aren't clipped.
+    ----------------
+    Desktop fills the viewport (cover crops edges if aspect mismatches).
+    Mobile/portrait scales the full image in (contain) so pieces like the
+    'taOS' letters near the edges of a wide wallpaper aren't clipped.
+
+    User choice: data-wallpaper-fit attribute on .taos-wallpaper overrides
+    the default cover behaviour. Per-device, persisted in localStorage.
 */
 .taos-wallpaper {
   background-image: var(--wallpaper-desktop);
@@ -185,19 +188,38 @@
   background-size: cover;
 }
 @media (max-width: 767px), (orientation: portrait) {
-  /* On phones we switch to a portrait-cropped image if the wallpaper
-     provides one.
-
-     Sizing is `cover`, NOT `100% 100%`. Stretching both axes distorted the
-     image on any display whose aspect ratio did not match the asset, and
-     `(orientation: portrait)` matches every screen where height >= width,
-     which includes SQUARE displays: a square device took the phone branch and
-     had a wide wallpaper squashed into it (reported 2026-08-02). `cover` fills
-     the screen and crops the overflow instead of deforming the picture. */
   .taos-wallpaper {
     background-image: var(--wallpaper-mobile, var(--wallpaper-desktop));
     background-size: cover;
   }
+}
+
+/* Wallpaper fit options — attribute-driven, no inline styles */
+.taos-wallpaper[data-wallpaper-fit="fill"] {
+  background-size: cover;
+}
+.taos-wallpaper[data-wallpaper-fit="fit"] {
+  background-size: contain;
+}
+.taos-wallpaper[data-wallpaper-fit="stretch"] {
+  background-size: 100% 100%;
+}
+.taos-wallpaper[data-wallpaper-fit="center"] {
+  background-size: auto;
+  background-position: center;
+}
+.taos-wallpaper[data-wallpaper-fit="tile"] {
+  background-size: auto;
+  background-repeat: repeat;
+}
+
+/* Letterbox bars for fit and center — use the wallpaper fallback so bars
+   blend with the image instead of showing a jarring default colour. */
+.taos-wallpaper[data-wallpaper-fit="fit"] {
+  background-color: var(--wallpaper-fallback);
+}
+.taos-wallpaper[data-wallpaper-fit="center"] {
+  background-color: var(--wallpaper-fallback);
 }
 
 /* React-grid-layout dark theme overrides for widget system */
