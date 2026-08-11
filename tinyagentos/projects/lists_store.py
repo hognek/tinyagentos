@@ -174,8 +174,9 @@ class ProjectListEntriesStore(BaseStore):
             row = await cur.fetchone()
             if row is None:
                 return None
-        keys = [d[0] for d in cur.description]
-        return dict(zip(keys, row))
+            # cur.description is only guaranteed while the cursor is open.
+            keys = [d[0] for d in cur.description]
+            return dict(zip(keys, row))
 
     async def list_entries(
         self,
@@ -259,16 +260,25 @@ class ProjectListEntriesStore(BaseStore):
         return cursor.rowcount == 1
 
     async def reorder_entries(self, project_id: str, list_id: str, entries: list[dict]) -> bool:
-        for entry in entries:
-            cursor = await self._db.execute(
-                "UPDATE project_list_entries SET position = ?, updated_at = ? "
-                "WHERE id = ? AND project_id = ? AND list_id = ?",
-                (entry["position"], time.time(), entry["id"], project_id, list_id),
-            )
-            if cursor.rowcount == 0:
-                await self._db.rollback()
-                return False
-        await self._db.commit()
+        try:
+            for entry in entries:
+                cursor = await self._db.execute(
+                    "UPDATE project_list_entries SET position = ?, updated_at = ? "
+                    "WHERE id = ? AND project_id = ? AND list_id = ?",
+                    (entry["position"], time.time(), entry["id"], project_id, list_id),
+                )
+                if cursor.rowcount == 0:
+                    await self._db.rollback()
+                    return False
+            await self._db.commit()
+        except BaseException:
+            # Without this, the UPDATEs already issued stay pending on the
+            # shared connection and the next unrelated commit() flushes a
+            # half-applied reorder. BaseException, not Exception: task
+            # cancellation (CancelledError) must also roll back, and commit()
+            # itself is inside the guard for the same reason.
+            await self._db.rollback()
+            raise
         return True
 
     async def _get_next_position(self, project_id: str, list_id: str) -> int:
