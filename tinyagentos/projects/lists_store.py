@@ -270,13 +270,15 @@ class ProjectListEntriesStore(BaseStore):
                 if cursor.rowcount == 0:
                     await self._db.rollback()
                     return False
-        except Exception:
+            await self._db.commit()
+        except BaseException:
             # Without this, the UPDATEs already issued stay pending on the
             # shared connection and the next unrelated commit() flushes a
-            # half-applied reorder. Roll back, then re-raise.
+            # half-applied reorder. BaseException, not Exception: task
+            # cancellation (CancelledError) must also roll back, and commit()
+            # itself is inside the guard for the same reason.
             await self._db.rollback()
             raise
-        await self._db.commit()
         return True
 
     async def _get_next_position(self, project_id: str, list_id: str) -> int:

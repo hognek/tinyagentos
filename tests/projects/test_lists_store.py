@@ -395,3 +395,74 @@ async def test_reorder_entries_rolls_back_on_exception(entries_store, monkeypatc
     )
     a_final = await entries_store.get_entry(a["id"])
     assert a_final["position"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reorder_entries_rolls_back_on_cancellation(entries_store, monkeypatch):
+    """CancelledError is not an Exception; the rollback guard must still fire."""
+    a = await entries_store.add_entry(
+        list_id="lst-1", project_id="prj-1", text="A", original_text="A",
+        author_kind="agent", author_id="agent-1",
+    )
+    b = await entries_store.add_entry(
+        list_id="lst-1", project_id="prj-1", text="B", original_text="B",
+        author_kind="agent", author_id="agent-1",
+    )
+
+    real_execute = entries_store._db.execute
+    update_calls = 0
+
+    async def cancelling_execute(sql, params=()):
+        nonlocal update_calls
+        if sql.startswith("UPDATE project_list_entries SET position"):
+            update_calls += 1
+            if update_calls == 2:
+                raise asyncio.CancelledError()
+        return await real_execute(sql, params)
+
+    monkeypatch.setattr(entries_store._db, "execute", cancelling_execute)
+
+    with pytest.raises(asyncio.CancelledError):
+        await entries_store.reorder_entries(
+            "prj-1", "lst-1",
+            [{"id": a["id"], "position": 1}, {"id": b["id"], "position": 0}],
+        )
+    monkeypatch.undo()
+
+    await entries_store.add_entry(
+        list_id="lst-2", project_id="prj-1", text="Unrelated",
+        original_text="Unrelated", author_kind="agent", author_id="agent-1",
+    )
+    assert (await entries_store.get_entry(a["id"]))["position"] == 0
+    assert (await entries_store.get_entry(b["id"]))["position"] == 1
+
+
+@pytest.mark.asyncio
+async def test_reorder_entries_rolls_back_on_commit_failure(entries_store, monkeypatch):
+    a = await entries_store.add_entry(
+        list_id="lst-1", project_id="prj-1", text="A", original_text="A",
+        author_kind="agent", author_id="agent-1",
+    )
+    b = await entries_store.add_entry(
+        list_id="lst-1", project_id="prj-1", text="B", original_text="B",
+        author_kind="agent", author_id="agent-1",
+    )
+
+    async def failing_commit():
+        raise RuntimeError("commit boom")
+
+    monkeypatch.setattr(entries_store._db, "commit", failing_commit)
+
+    with pytest.raises(RuntimeError):
+        await entries_store.reorder_entries(
+            "prj-1", "lst-1",
+            [{"id": a["id"], "position": 1}, {"id": b["id"], "position": 0}],
+        )
+    monkeypatch.undo()
+
+    await entries_store.add_entry(
+        list_id="lst-2", project_id="prj-1", text="Unrelated",
+        original_text="Unrelated", author_kind="agent", author_id="agent-1",
+    )
+    assert (await entries_store.get_entry(a["id"]))["position"] == 0
+    assert (await entries_store.get_entry(b["id"]))["position"] == 1
