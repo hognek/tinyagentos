@@ -870,7 +870,7 @@ class TestRegistryWriteExistenceHiding:
                 "/api/agents/registry/does-not-exist", json={"display_name": "Stolen"}
             )
         assert resp_owned.status_code == resp_missing.status_code == 404
-        assert resp_owned.json() == resp_missing.json()
+        assert resp_owned.content == resp_missing.content
         # And the record was not modified.
         check = await registry_client.get(f"/api/agents/registry/{cid}")
         assert check.json()["display_name"] == "Hidden Agent"
@@ -881,7 +881,7 @@ class TestRegistryWriteExistenceHiding:
             resp_owned = await mallory.delete(f"/api/agents/registry/{cid}")
             resp_missing = await mallory.delete("/api/agents/registry/does-not-exist")
         assert resp_owned.status_code == resp_missing.status_code == 404
-        assert resp_owned.json() == resp_missing.json()
+        assert resp_owned.content == resp_missing.content
         # And the record was not revoked.
         check = await registry_client.get(f"/api/agents/registry/{cid}")
         assert check.status_code == 200
@@ -899,7 +899,7 @@ class TestRegistryWriteExistenceHiding:
                 "/api/agents/registry/does-not-exist/rotate-tokens"
             )
         assert resp_owned.status_code == resp_missing.status_code == 404
-        assert resp_owned.json() == resp_missing.json()
+        assert resp_owned.content == resp_missing.content
 
     async def test_org_put_non_owner_and_nonexistent_identical(
         self, app, registry_client
@@ -913,4 +913,4 @@ class TestRegistryWriteExistenceHiding:
                 "/api/agents/does-not-exist/org", json={"role": "usurper"}
             )
         assert resp_owned.status_code == resp_missing.status_code == 404
-        assert resp_owned.json() == resp_missing.json()
+        assert resp_owned.content == resp_missing.content

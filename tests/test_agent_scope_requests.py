@@ -629,14 +629,16 @@ async def test_create_scope_request_non_owner_and_nonexistent_identical(
                 f"/api/agents/registry/{cid}/scope-requests",
                 json={"requested_scopes": ["memory_read"]},
             )
-
-        resp_nonexistent = await client.post(
-            "/api/agents/registry/does-not-exist/scope-requests",
-            json={"requested_scopes": ["memory_read"]},
-        )
+            # Same caller for the nonexistent probe: an admin would 404 on a
+            # missing id too, but the contract under test is what ONE
+            # unprivileged caller can distinguish.
+            resp_nonexistent = await carol_client.post(
+                "/api/agents/registry/does-not-exist/scope-requests",
+                json={"requested_scopes": ["memory_read"]},
+            )
 
         assert resp_owner.status_code == resp_nonexistent.status_code == 404
-        assert resp_owner.json() == resp_nonexistent.json()
+        assert resp_owner.content == resp_nonexistent.content
     finally:
         await env.close()
 
@@ -669,14 +671,13 @@ async def test_approve_scope_request_non_owner_and_nonexistent_identical(
                 f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/approve",
                 json={"granted_scopes": ["memory_read"]},
             )
-
-        resp_nonexistent = await client.post(
-            "/api/agents/registry/does-not-exist/scope-requests/does-not-exist/approve",
-            json={"granted_scopes": ["memory_read"]},
-        )
+            resp_nonexistent = await carol_client.post(
+                "/api/agents/registry/does-not-exist/scope-requests/does-not-exist/approve",
+                json={"granted_scopes": ["memory_read"]},
+            )
 
         assert resp_owner.status_code == resp_nonexistent.status_code == 404
-        assert resp_owner.json() == resp_nonexistent.json()
+        assert resp_owner.content == resp_nonexistent.content
     finally:
         await env.close()
 
@@ -708,12 +709,11 @@ async def test_deny_scope_request_non_owner_and_nonexistent_identical(
             resp_owner = await carol_client.post(
                 f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/deny",
             )
-
-        resp_nonexistent = await client.post(
-            "/api/agents/registry/does-not-exist/scope-requests/does-not-exist/deny",
-        )
+            resp_nonexistent = await carol_client.post(
+                "/api/agents/registry/does-not-exist/scope-requests/does-not-exist/deny",
+            )
 
         assert resp_owner.status_code == resp_nonexistent.status_code == 404
-        assert resp_owner.json() == resp_nonexistent.json()
+        assert resp_owner.content == resp_nonexistent.content
     finally:
         await env.close()

@@ -618,8 +618,10 @@ async def patch_registry_entry(
     store = _get_store(request)
     record = await store.get(canonical_id)
     if record is None:
+        logger.info("registry patch 404-unknown for %s", canonical_id)
         return JSONResponse({"error": "not found"}, status_code=404)
     if not user.is_admin and user.user_id != record["user_id"]:
+        logger.info("registry patch 404-not-owner for %s by %s", canonical_id, user.user_id)
         return JSONResponse({"error": "not found"}, status_code=404)
     old_name = record.get("display_name") or ""
     try:
@@ -672,8 +674,10 @@ async def revoke_registry_entry(
     store = _get_store(request)
     record = await store.get(canonical_id)
     if record is None:
+        logger.info("registry revoke 404-unknown for %s", canonical_id)
         return JSONResponse({"error": "not found or already revoked"}, status_code=404)
     if not user.is_admin and user.user_id != record["user_id"]:
+        logger.info("registry revoke 404-not-owner for %s by %s", canonical_id, user.user_id)
         return JSONResponse({"error": "not found or already revoked"}, status_code=404)
     before_status = record.get("status") or "active"
     revoked = await store.revoke(canonical_id)
@@ -781,8 +785,10 @@ async def rotate_tokens(
     store = _get_store(request)
     record = await store.get(canonical_id)
     if record is None:
+        logger.info("registry rotate-tokens 404-unknown for %s", canonical_id)
         return JSONResponse({"error": "not found"}, status_code=404)
     if not user.is_admin and user.user_id != record["user_id"]:
+        logger.info("registry rotate-tokens 404-not-owner for %s by %s", canonical_id, user.user_id)
         return JSONResponse({"error": "not found"}, status_code=404)
 
     ts = int(time.time())
@@ -845,8 +851,10 @@ async def update_org_fields(
     store = _get_store(request)
     record = await store.get(canonical_id)
     if record is None:
+        logger.info("registry org update 404-unknown for %s", canonical_id)
         return JSONResponse({"error": "not found"}, status_code=404)
     if not user.is_admin and user.user_id != record["user_id"]:
+        logger.info("registry org update 404-not-owner for %s by %s", canonical_id, user.user_id)
         return JSONResponse({"error": "not found"}, status_code=404)
 
     if body.role is None and body.title is None and body.reports_to is None:
