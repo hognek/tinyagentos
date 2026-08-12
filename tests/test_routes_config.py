@@ -26,6 +26,34 @@ class TestConfigPage:
         config = load_config(tmp_data_dir / "config.yaml")
         assert config.server["port"] == 9999
 
+    async def test_save_config_round_trips_lora_ingest_proxy_url(
+        self, client, tmp_data_dir
+    ):
+        """GET returns the key, so PUTting that same YAML back must keep it.
+
+        The config editor is a read-edit-write loop: any field the PUT handler
+        forgets to rebuild is silently wiped the first time the user saves an
+        unrelated setting.
+        """
+        new_yaml = yaml.dump({
+            "server": {"host": "0.0.0.0", "port": 6969},
+            "backends": [],
+            "qmd": {"url": "http://localhost:7832"},
+            "agents": [],
+            "metrics": {"poll_interval": 60, "retention_days": 7},
+            "lora_ingest_proxy_url": "http://proxy.example:3128",
+        })
+        resp = await client.put("/api/config", json={"yaml": new_yaml})
+        assert resp.status_code == 200
+
+        config = load_config(tmp_data_dir / "config.yaml")
+        assert config.lora_ingest_proxy_url == "http://proxy.example:3128"
+
+        # And it survives the next read of the API surface.
+        resp = await client.get("/api/config")
+        parsed = yaml.safe_load(resp.json()["yaml"])
+        assert parsed["lora_ingest_proxy_url"] == "http://proxy.example:3128"
+
     async def test_save_invalid_yaml_fails(self, client):
         resp = await client.put("/api/config", json={"yaml": ": : : bad [["})
         assert resp.status_code == 400
