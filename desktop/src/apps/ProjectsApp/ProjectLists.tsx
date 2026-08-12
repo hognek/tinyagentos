@@ -22,10 +22,19 @@ export function ProjectLists({ project }: { project: Project }) {
   const quickInputRef = useRef<HTMLInputElement>(null);
 
   const refreshLists = useCallback(() => {
-    return projectsApi.lists.list(project.id).catch(() => {
-      setError("Could not load lists.");
-      return [] as ProjectList[];
-    });
+    // Sets state, like refreshEntries below. It used to only RETURN the lists,
+    // so createList/deleteList awaited a fetch whose result was discarded -- a
+    // created list never appeared in the rail and a deleted one never left it,
+    // because the mount effect was the only caller of setLists.
+    return projectsApi.lists.list(project.id)
+      .then((ls) => {
+        setLists(ls);
+        return ls;
+      })
+      .catch(() => {
+        setError("Could not load lists.");
+        return [] as ProjectList[];
+      });
   }, [project.id]);
 
   const refreshEntries = useCallback(() => {

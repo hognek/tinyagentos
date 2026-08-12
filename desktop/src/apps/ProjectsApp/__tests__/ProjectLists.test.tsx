@@ -20,9 +20,13 @@ function ok(data: unknown) {
 
 describe("ProjectLists", () => {
   let fetchMock: ReturnType<typeof vi.fn>;
+  let listsData: { id: string; project_id: string; title: string; description: string; status: string; created_by: string; created_at: number; updated_at: number }[];
   let entriesData: { id: string; list_id: string; project_id: string; text: string; original_text: string; category: string | null; status: string; done: number; author_kind: string; author_id: string; edited_by: string | null; position: number; created_at: number; updated_at: number }[];
 
   beforeEach(() => {
+    listsData = [
+      { id: "lst-1", project_id: "p1", title: "Shopping", description: "", status: "active", created_by: "u1", created_at: 0, updated_at: 0 },
+    ];
     entriesData = [
       { id: "ent-1", list_id: "lst-1", project_id: "p1", text: "Milk", original_text: "Milk", category: "groceries", status: "new", done: 0, author_kind: "user", author_id: "u1", edited_by: null, position: 0, created_at: 0, updated_at: 0 },
       { id: "ent-2", list_id: "lst-1", project_id: "p1", text: "Bread", original_text: "Whole grain bread", category: null, status: "actioned", done: 1, author_kind: "user", author_id: "u1", edited_by: "u1", position: 1, created_at: 0, updated_at: 0 },
@@ -33,9 +37,18 @@ describe("ProjectLists", () => {
     fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url === "/api/projects/p1/lists") {
         if (init?.method === "POST") {
-          return Promise.resolve(ok({ id: "lst-new", project_id: "p1", title: "New list", description: "", status: "active", created_by: "u1", created_at: 0, updated_at: 0 }));
+          // The mock has to behave like the server: a created list is in the
+          // NEXT list response. It used to return a fixed array, so a test
+          // could not tell a refreshed rail from a stale one.
+          const created = { id: "lst-new", project_id: "p1", title: "New list", description: "", status: "active", created_by: "u1", created_at: 0, updated_at: 0 };
+          listsData.push(created);
+          return Promise.resolve(ok(created));
         }
-        return Promise.resolve(ok({ items: [{ id: "lst-1", project_id: "p1", title: "Shopping", description: "", status: "active", created_by: "u1", created_at: 0, updated_at: 0 }] }));
+        return Promise.resolve(ok({ items: [...listsData] }));
+      }
+      // A freshly created list serves an empty entry set, like the real route.
+      if (url === "/api/projects/p1/lists/lst-new/entries") {
+        return Promise.resolve(ok({ items: [] }));
       }
       if (url === "/api/projects/p1/lists/lst-1/entries") {
         if (init?.method === "POST") {
@@ -54,6 +67,7 @@ describe("ProjectLists", () => {
         return Promise.resolve(ok({ ...entry }));
       }
       if (url === "/api/projects/p1/lists/lst-1" && init?.method === "DELETE") {
+        listsData = listsData.filter((l) => l.id !== "lst-1");
         return Promise.resolve(ok({ ok: true }));
       }
       if (url.startsWith("/api/projects/p1/lists/lst-1/entries/") && init?.method === "DELETE") {
@@ -117,5 +131,32 @@ describe("ProjectLists", () => {
     const checkbox = screen.getByLabelText(/mark milk as done/i);
     fireEvent.click(checkbox);
     await waitFor(() => expect(screen.getByText("Milk").className).toContain("line-through"));
+  });
+
+  // The rail is what the user reads to know their list exists. Both of these
+  // failed before the fix: refreshLists() fetched and threw the result away
+  // (only the mount effect ever called setLists), so a created list never
+  // appeared and a deleted one never left.
+  it("a created list appears in the rail", async () => {
+    vi.stubGlobal("prompt", vi.fn(() => "New list"));
+    await act(async () => {
+      render(<ProjectLists project={fakeProject} />);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Create new list"));
+    });
+    await waitFor(() => expect(screen.getAllByText("New list").length).toBeGreaterThanOrEqual(1));
+  });
+
+  it("a deleted list disappears from the rail", async () => {
+    vi.stubGlobal("confirm", vi.fn(() => true));
+    await act(async () => {
+      render(<ProjectLists project={fakeProject} />);
+    });
+    expect(screen.getAllByText("Shopping").length).toBeGreaterThanOrEqual(1);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Delete Shopping"));
+    });
+    await waitFor(() => expect(screen.queryByText("Shopping")).not.toBeInTheDocument());
   });
 });
