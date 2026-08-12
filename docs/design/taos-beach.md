@@ -85,11 +85,22 @@ retired. If an agent has no project it cannot ask for a sandbox.
 ## 2. States
 
 ```
-requested ──approve──> approved ──> provisioning ──> running ──> stopped ──> destroying ──> destroyed
-    │                                    │              │  ▲                      ▲
-    │                                    │              │  └──── start ───────────┘
-    └──refuse──> refused                 └── failed ────┴──> expired ─────────────┘
+                      ┌──────────────── retry ─────────────┐
+                      │                                    │
+requested ─approve─> approved ─claim─> provisioning ─ok─> running ─stop─> stopped
+    │                                       │               │  ▲            │
+    │                                       └──error──> failed │            │
+    └─refuse─> refused                                    ▲    │            │
+                                                          └────┘            │
+                              TTL / idle ────> expired <────────────────────┘
+                                                  │
+   any of {running, stopped, expired, failed} ─destroy─> destroying ──> destroyed
 ```
+
+Read the edges, not the layout: `failed` is reachable only from `provisioning`, and `retry`
+returns it to `approved` (never straight to `provisioning`, so the quota re-check in §4
+always runs). `expired` is reachable from `running` and from `stopped`. `destroying` is
+reachable from all four live-or-parked states, and `destroyed` only from `destroying`.
 
 - `requested` — row exists, nothing has been created. The only state an agent can reach on
   its own.
@@ -271,10 +282,16 @@ input_schema:
   memory_mb:   {type: integer, default: 1024}
   cpu_cores:   {type: integer, default: 1}
   disk_gib:    {type: integer, default: 5}
-  ports:       {type: array,   items: {type: integer}, default: []}
+  ports:       {type: array,   items: {type: integer}, default: []}   # CONTAINER ports
   ttl_hours:   {type: integer, default: 24}
   reason:      {type: string,  required: true}
 ```
+
+An agent names **container** ports only — a flat list of integers. It never chooses a host
+port: `allocate_host_port` does that at provision time and the result comes back in the
+sandbox's `host_ports` map. That is why this schema is a list of integers while the backend
+signature in §7 takes `(host, container)` pairs; the pairing is formed by the provisioner,
+not requested by the caller.
 
 Per-framework adapters carry no logic beyond shape translation:
 
@@ -350,8 +367,9 @@ ships:
    `add_proxy_device` (§7) — separate PR, lands first.
 2. `BeachStore` with both tables, the single-flight claim, and the quota sum.
 3. Provisioner over `get_backend()`, with the failure path that destroys partial containers.
-4. Routes: create, list, get, approve, refuse, start, stop, destroy, exec, logs, quota.
-   Grants can wait for Phase 2 if the cut needs narrowing; nothing else can.
+4. Routes: create, list, get, approve, refuse, start, stop, destroy, exec, logs, quota,
+   and both grant routes. Sharing is not an extra — "request, share, spin up" is the ask —
+   so grants ship in Phase 1 with everything else in §5.
 5. `sandbox_request` and `sandbox_admin` in `_ALLOWED_SCOPES` plus the agent route allowlist.
 6. Decisions integration for approval, and audit records on every transition.
 7. TTL expiry and the reconciliation pass.
