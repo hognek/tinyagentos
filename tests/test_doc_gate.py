@@ -457,8 +457,12 @@ class TestModificationTriggersGate:
         assert dg.evaluate_rules(changed, messages, ROUTES_MODIFY_CONFIG) == []
 
     def test_modified_test_file_does_not_trigger(self):
-        """Modifying a test file is never structural, even with on_modify."""
-        changed = [("M", "tests/test_agents.py")]
+        """Modifying a test file is never structural, even with on_modify.
+
+        The path must MATCH the rule's glob, otherwise the test passes for the
+        wrong reason -- it would pass with the exemption deleted.
+        """
+        changed = [("M", "tinyagentos/routes/test_agents.py")]
         assert dg.evaluate_rules(changed, [], ROUTES_MODIFY_CONFIG) == []
 
 
@@ -509,9 +513,14 @@ class TestBroadChangelogRequired:
         assert dg.evaluate_rules(changed, messages, BROAD_CHANGELOG_CONFIG) == []
 
     def test_test_file_under_tinyagentos_exempt(self):
-        """A test file under tinyagentos/ is not a structural change."""
-        changed = [("M", "tests/test_agents.py")]
-        assert dg.evaluate_rules(changed, [], BROAD_CHANGELOG_CONFIG) == []
+        """A test file under tinyagentos/ is not a structural change.
+
+        `tests/` is outside the rule's globs, so it cannot prove the exemption;
+        these paths are inside them.
+        """
+        for path in ("tinyagentos/test_helpers.py", "desktop/src/apps/Foo/Foo.test.tsx"):
+            changed = [("M", path)]
+            assert dg.evaluate_rules(changed, [], BROAD_CHANGELOG_CONFIG) == [], path
 
     def test_doc_file_under_tinyagentos_still_triggers(self):
         """A non-test doc file under tinyagentos/ should still require changelog."""

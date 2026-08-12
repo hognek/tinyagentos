@@ -92,9 +92,10 @@ hint = "the agent-token route allowlist changed; update the agent-facing API sur
 # doc inside the directory the gate went green on a change carrying no changelog
 # at all.
 #
-# Broadened to cover every code change under tinyagentos/ or desktop/src/ that
-# is not test-only: any such change requires a CHANGELOG.md edit or a new
-# changelog.d/ fragment in the same PR.
+# Broadened to cover every NON-TEST change under tinyagentos/ or desktop/src/,
+# not only code: a doc or asset under those trees triggers it too (the test
+# suite pins tinyagentos/README.md as a trigger). Any such change requires a
+# CHANGELOG.md edit or a new changelog.d/ fragment in the same PR.
 [[rules]]
 name = "user-visible-changelog"
 on_modify = true

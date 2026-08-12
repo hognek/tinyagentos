@@ -270,13 +270,16 @@ for the following trees:
 | A manifest under `app-catalog/` is added, removed, or modified | `README.md` |
 | `tinyagentos/auth_middleware.py` is added, removed, or modified | `docs/agent-coordination.md` |
 
-In addition, **any code change under `tinyagentos/` or `desktop/src/`** (except
-test-only changes) requires a changelog entry: either a line in `CHANGELOG.md`
+In addition, **any non-test change under `tinyagentos/` or `desktop/src/`**
+(docs and assets under those trees included, not only code) requires a
+changelog entry: either a line in `CHANGELOG.md`
 or a new file under `changelog.d/` (preferred, avoids merge conflicts on the
 shared `[Unreleased]` anchor).
 
-Agent-facing changes (agent registry, token auth, scope requests, agent routes,
-MCP surface) also require touching the agent manual under `docs/agent-manual/`.
+Agent-facing changes (agent registry, token auth, the scope-requests store,
+`tinyagentos/routes/agent_*.py`, and the MCP surface) also require a doc:
+either a page under `docs/agent-manual/` or `docs/agent-coordination.md`
+satisfies the rule.
 
 ### Test-file exemption
 
@@ -290,7 +293,7 @@ If your PR trips a rule and there is genuinely nothing to document (or you
 already covered it elsewhere), add a trailer line to a commit message instead of
 editing a doc:
 
-```
+```text
 Docs-Reviewed: no user-facing change, internal refactor only
 ```
 
