@@ -145,3 +145,80 @@ async def test_chat_missing_model_is_openai_shaped_400(client):
     assert resp.status_code == 400
     # OpenAI envelope, not FastAPI's default {"detail": [...]} 422.
     assert resp.json()["error"]["type"] == "invalid_request_error"
+
+
+# ---------------------------------------------------------------------------
+# Middleware passthrough (tsk-hfs6zv): an EXTERNAL client (no session cookie)
+# must reach the /v1 handlers, whose consent-key check is the credential.
+# Before the exemption, the session gate 401d these requests before the
+# handler ran, so the surface was unreachable from outside by design-gap.
+# ---------------------------------------------------------------------------
+
+from httpx import ASGITransport, AsyncClient
+
+
+@pytest.fixture
+def bare_client(client):
+    """Session-less client against the same app: what an external
+    OpenAI-compatible caller looks like."""
+    app = client._transport.app
+    return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+@pytest.mark.asyncio
+async def test_external_models_reaches_route_auth(bare_client):
+    """No session, no key: the 401 must be the ROUTE's OpenAI envelope,
+    not the middleware's generic 401."""
+    async with bare_client as c:
+        resp = await c.get("/v1/models")
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "invalid_api_key"
+
+
+@pytest.mark.asyncio
+async def test_external_chat_completions_reaches_route_auth(bare_client):
+    async with bare_client as c:
+        resp = await c.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer sk-taosagent-bogus"},
+            json={"model": "agent-a", "messages": [{"role": "user", "content": "hi"}]},
+        )
+    assert resp.status_code == 401
+    assert resp.json()["error"]["code"] == "invalid_api_key"
+
+
+@pytest.mark.asyncio
+async def test_external_valid_key_lists_models_end_to_end(client, bare_client):
+    """A minted consent key authenticates an external caller through the
+    middleware all the way to a 200 model list."""
+    store = client._transport.app.state.agent_model_keys
+    token, _ = await store.mint("u1", ["agent-a"], ["memory_read"])
+    async with bare_client as c:
+        resp = await c.get("/v1/models", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200, resp.text
+    assert [m["id"] for m in resp.json()["data"]] == ["agent-a"]
+
+
+@pytest.mark.asyncio
+async def test_unlisted_v1_path_stays_session_gated(bare_client):
+    """The exemption is exact-path: any other /v1 path must still hit the
+    session gate, not fall through as a public 404."""
+    async with bare_client as c:
+        resp = await c.get("/v1/other")
+    assert resp.status_code == 401
+    # The middleware's generic 401 ({"error": "Authentication required"}),
+    # never the route's OpenAI envelope ({"error": {"code": ...}}).
+    assert not isinstance(resp.json().get("error"), dict)
+
+
+@pytest.mark.asyncio
+async def test_wrong_method_on_exempt_path_stays_gated(bare_client):
+    """Method-sensitivity: POST /v1/models and GET /v1/chat/completions are
+    not exempt."""
+    async with bare_client as c:
+        r1 = await c.post("/v1/models")
+        r2 = await c.get("/v1/chat/completions")
+    assert r1.status_code == 401
+    assert r2.status_code == 401
+    for r in (r1, r2):
+        assert not isinstance(r.json().get("error"), dict)

@@ -6,6 +6,7 @@ GET  /api/taos-agent/config                    → {model, permitted_models, per
 PUT  /api/taos-agent/permitted-models          → validate + persist permitted_models; re-scope the agent key
 PUT  /api/taos-agent/persona                   → persist persona (system-prompt override)
 POST /api/taos-agent/chat                      → streams chat completion via opencode (NDJSON)
+GET  /api/taos-agent/status                    → scoped agent-loop status (state, turn, queue, subagents)
 POST /api/taos-agent/attachments/upload        → accepts a file, returns a persistent attachment record
 GET  /api/taos-agent/attachments/files/{name}  → serve a stored attachment
 
@@ -26,6 +27,7 @@ import json
 import logging
 import mimetypes
 import re
+import sys
 import uuid
 from pathlib import Path
 
@@ -34,8 +36,10 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel
 
 from tinyagentos.adapters.opencode_adapter import OpenCodeAdapter, OpenCodeConfig
+from tinyagentos.agent_loop import AgentLoop, LoopAction
 from tinyagentos.opencode_runtime import OpenCodeBinaryNotFoundError
 from tinyagentos.taos_agent_runtime import ensure_taos_opencode_server
+from tinyagentos.task_utils import _create_supervised_task
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -427,7 +431,10 @@ async def chat(request: Request, body: ChatRequest):
             queue.put_nowait({"error": reply.get("error", "error")})
             queue.put_nowait(_DONE)
         elif kind == "final":
-            queue.put_nowait(_DONE)
+            # Stream termination is owned by _drive's finally block so
+            # messages queued during the turn can be surfaced before the
+            # final done frame.
+            pass
 
     cfg = OpenCodeConfig(
         base_url=server.base_url,
@@ -470,23 +477,78 @@ async def chat(request: Request, body: ChatRequest):
             "data_b64": base64.b64encode(data).decode(),
         })
 
+    # One AgentLoop owns serialization for the desktop taOS agent: two
+    # concurrent POSTs previously raced on the shared opencode session
+    # (app_state.taos_opencode_session_id) with no serialization at all.
+    # Created lazily on app.state like the opencode server/session id.
+    agent_loop: AgentLoop | None = getattr(app_state, "taos_agent_loop", None)
+    if agent_loop is None:
+        agent_loop = AgentLoop()
+        app_state.taos_agent_loop = agent_loop
+
+    trace_id = uuid.uuid4().hex
+    action = await agent_loop.handle_message(text, msg_id=trace_id)
+    if action is LoopAction.QUEUED:
+        # The agent is mid-turn: the message is queued (never dropped) and
+        # the turn-holder surfaces it at its safe point in _drive's finally.
+        # Full multi-turn redrive in this endpoint is out of scope — the
+        # queued message is surfaced into the turn-holder's stream, not
+        # driven as its own turn.
+        async def _queued_stream():
+            yield json.dumps({
+                "delta": (
+                    "[The taOS agent is still working on a previous message. "
+                    "Your message has been queued and will appear at the end "
+                    "of the current response; the agent does not act on it as "
+                    "its own turn, so resend it if you need a full answer.]"
+                ),
+            }) + "\n"
+            yield json.dumps({"done": True}) + "\n"
+
+        return StreamingResponse(
+            _queued_stream(),
+            media_type="application/x-ndjson",
+        )
+
     async def _drive() -> None:
         try:
             await adapter.ensure_session()
             app_state.taos_opencode_session_id = adapter.session_id
-            trace_id = uuid.uuid4().hex
             await adapter.prompt(text, trace_id=trace_id, attachments=attachments)
             await adapter.close()
         except Exception as exc:
             logger.exception("taos-agent: drive task error")
             queue.put_nowait({"error": str(exc)})
         finally:
+            # The safe point MUST be reached even when the turn raises or is
+            # cancelled — skipping it would wedge the loop in WORKING forever.
+            try:
+                queued_msgs = await agent_loop.reach_safe_point()
+            except Exception:
+                logger.exception("taos-agent: reach_safe_point failed")
+                queued_msgs = []
+            # Surface messages queued while the turn ran so they are never
+            # silently dropped. Redriving them as their own turns is out of
+            # scope here; they land in this stream's tail.
+            for m in queued_msgs:
+                queue.put_nowait({
+                    "delta": f"\n[queued message received while working: {m.content}]\n",
+                })
             queue.put_nowait(_DONE)
 
-    drive_task = asyncio.create_task(_drive())
+    # Supervised: _drive's finally is the ONLY thing standing between the
+    # agent loop's WORKING and IDLE states, so a GC'd drive task (asyncio
+    # keeps only weak refs) would wedge the desktop agent in WORKING forever.
+    # Same rationale as AgentChatRouter._acp_tasks.
+    _drive_tasks = getattr(app_state, "_background_tasks", None)
+    if _drive_tasks is None:
+        drive_task = asyncio.create_task(_drive())
+    else:
+        drive_task = _create_supervised_task(_drive(), _drive_tasks)
 
     async def _generate():
         content_frame_yielded = False
+        leftovers: list = []
         try:
             while True:
                 item = await queue.get()
@@ -510,6 +572,25 @@ async def chat(request: Request, body: ChatRequest):
                 exc = drive_task.exception()
                 if exc is not None:
                     logger.error("taos-agent: drive task raised %r", exc)
+            # The sink's early _DONE on the error path strands anything behind
+            # it in the queue - including the queued-message frames _drive's
+            # finally emits. Collect them here (drive_task has settled, so the
+            # queue is final); they are yielded AFTER this finally, which a
+            # client disconnect (GeneratorExit) naturally skips - log those so
+            # a dropped queued message is at least visible.
+            while not queue.empty():
+                item = queue.get_nowait()
+                if item is not _DONE:
+                    leftovers.append(item)
+            if leftovers and isinstance(sys.exc_info()[1], GeneratorExit):
+                logger.warning(
+                    "taos-agent: client disconnected with %d undelivered frame(s): %r",
+                    len(leftovers), leftovers,
+                )
+        for item in leftovers:
+            if "error" not in item:
+                content_frame_yielded = True
+            yield json.dumps(item) + "\n"
         if not content_frame_yielded:
             yield json.dumps({
                 "error": (
@@ -523,3 +604,37 @@ async def chat(request: Request, body: ChatRequest):
         _generate(),
         media_type="application/x-ndjson",
     )
+
+
+@router.get("/api/taos-agent/status")
+async def get_status(request: Request):
+    """Return the desktop agent loop's status, scoped for the UI.
+
+    Only ``state``, ``current_turn_id``, ``queued_count`` and, per subagent,
+    ``id`` / ``task`` / ``state`` / ``started_at`` are exposed. Subagent
+    ``result`` / ``error`` payloads are deliberately stripped — they stay
+    server-side.
+    """
+    agent_loop: AgentLoop | None = getattr(request.app.state, "taos_agent_loop", None)
+    if agent_loop is None:
+        return JSONResponse({
+            "state": "idle",
+            "current_turn_id": None,
+            "queued_count": 0,
+            "subagents": [],
+        })
+    full = agent_loop.status()
+    return JSONResponse({
+        "state": full["state"],
+        "current_turn_id": full["current_turn_id"],
+        "queued_count": full["queued_count"],
+        "subagents": [
+            {
+                "id": s["id"],
+                "task": s["task"],
+                "state": s["state"],
+                "started_at": s["started_at"],
+            }
+            for s in full["subagents"]
+        ],
+    })

@@ -47,6 +47,7 @@ class AppManifest:
     hardware_tiers: dict = field(default_factory=dict)
     config_schema: list = field(default_factory=list)
     variants: list = field(default_factory=list)   # models only
+    context_window: int = 0                        # model token context window; 0 = unknown
     capabilities: list = field(default_factory=list)
     lifecycle: dict = field(default_factory=dict)
     manifest_dir: Path | None = None
@@ -75,6 +76,7 @@ class AppManifest:
             hardware_tiers=data.get("hardware_tiers", {}),
             config_schema=data.get("config_schema", []),
             variants=data.get("variants", []),
+            context_window=data.get("context_window", 0),
             capabilities=data.get("capabilities", []),
             lifecycle=data.get("lifecycle", {}),
             manifest_dir=manifest_dir,

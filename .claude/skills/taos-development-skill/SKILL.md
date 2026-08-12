@@ -148,7 +148,7 @@ uv run pytest tests/ --ignore=tests/e2e -n auto
 - Uses `uv sync --frozen` and `pytest -n auto`
 - Also required: `spa-build` (npm build + tsc + **vitest** - a desktop type error or failing
   component test fails CI), a "Verify app starts" `create_app` import smoke, `lint`
-  (`compileall`), and `cla`. The doc-gate is a separate workflow.
+  (`compileall`), and `cla`. The doc-gate and store-wiring gate are separate workflows.
 
 ## CLA - HUMAN signs
 
@@ -437,6 +437,43 @@ Docs-Reviewed: no user-facing change, internal refactor only
 
 Run `scripts/install-git-hooks.sh` to enable local hooks (`.githooks/pre-commit` and
 `.githooks/commit-msg`) so the gate runs before you push.
+
+## Store wiring gate
+
+A gate (`.github/workflows/store-wiring-gate.yml`, running `scripts/check_store_wiring.py`)
+blocks PRs that add a new `BaseStore` subclass without wiring it into `tinyagentos/app.py`.
+Routes reach stores ONLY via `request.app.state`, so an unwired store is unreachable dead
+code. The check is name-level (the class name must appear in `app.py`) and polices only
+classes added by the PR - pre-existing orphans are skipped.
+
+For a store genuinely constructed elsewhere (tests, CLI, workers), waive it with a PR-body
+trailer, which is logged by the gate:
+```
+Store-Unwired-Intentionally: <ClassName>, <why>
+```
+
+## Secret-ignores gate
+
+A gate (`.github/workflows/secret-ignores-gate.yml`, running `scripts/check_secret_ignores.py`)
+verifies that the committed `.gitignore` still protects known secret-shaped paths on every
+promotion target. A `.gitignore` rule is the kind of file a rebase conflict can quietly drop
+during a dev->master promotion while every test stays green and nothing builds red, so the
+protection is asserted here, not assumed. The gate runs on push to `master`, `dev` and
+`release/*` (a dropped rule fails the branch it lands on) and on PRs to those branches (a
+conflict-resolution loss fails before the merge, since the merge commit's `.gitignore` is what
+is checked).
+
+Two signals, defense in depth:
+
+- Every required protection rule must appear verbatim as an active line of `.gitignore`
+  (`*.key`, `identity.json`, `*.p8`, `*credentials.json`, `*creds*.json`, the `*_private.*`
+  key shapes, `secrets/`, `data/hub/`, and the rest listed in `REQUIRED_PATTERNS` in the
+  script). Comment prose and narrower sibling rules do not satisfy a rule.
+- A set of secret-shaped paths (`data/hub/identity.json`, `foo.key`, `creds.json`, `x.p8`,
+  `y_credentials.json`, ...) must all be reported ignored by `git check-ignore`.
+
+Removing any one protection pattern turns the gate red -- proven by a parametrized test that
+drops each pattern from a copy of the real `.gitignore` and asserts the guard fails.
 
 ## Upstream conventions (from CONTRIBUTING.md)
 

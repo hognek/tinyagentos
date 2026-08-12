@@ -22,6 +22,20 @@ As additional accelerator classes are onboarded onto verified install paths (RK3
 
 The same policy applies to every class. There is no "trust the upstream" tier.
 
+### Documented exception: Hailo `.hef` model binaries (decided 2026-08-10)
+
+The five Hailo-8/10 `.hef` catalog models download from Hailo's own CDN
+(`dev-public.hailo.ai`) rather than a taOS-controlled mirror. This is a
+deliberate, decided exception, not an oversight: the `.hef` files are
+vendor-format binaries for Hailo's own runtime, and redistribution rights for
+a public mirror are unverified, so mirroring them would trade an availability
+risk for a legal one. Integrity is still covered the same way as everywhere
+else: every Hailo manifest pins the file's SHA256 and the download hard-fails
+on mismatch. If the CDN ever pulls a file, we mirror at that point, with the
+pinned digest proving fidelity to the original. A vendor's own CDN is the one
+"upstream" whose identity the no-trust-the-upstream rule was not aimed at;
+the pinned hash still removes any need to trust its contents.
+
 ## When we update the mirror
 
 The mirror is updated **only after re-verifying the new version end-to-end against a clean install** of taOS on the target hardware. Specifically:

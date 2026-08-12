@@ -222,13 +222,30 @@ the proxy returns 502 (the read proxies degrade to an empty 200 instead).
 A registered external agent authenticates with its registry JWT
 (`Authorization: Bearer`) and reaches exactly the routes its granted SCOPES
 allow, nothing else: the middleware allowlist is a closed set, no skeleton key.
-The surface, by scope:
+
+A SEPARATE credential class exists for the Agent-as-a-Model surface:
+`GET /v1/models` and `POST /v1/chat/completions` are reachable without a
+session using a CONSENT KEY (`Authorization: Bearer sk-taosagent-...`, minted
+by an owner via `/api/agent-model-keys`), which the route itself validates —
+no key, no resolution, OpenAI-shaped 401 otherwise. Only those two exact
+method+path pairs pass the middleware; any other `/v1` path stays
+session-gated. `POST /v1/chat/completions` returns 501 for a valid key until
+the opencode host-server turn seam lands (decided 2026-06-23, unbuilt).
+
+The registry-JWT surface, by scope:
 
 - **project_tasks** (the kanban board): `GET /api/projects/{pid}/tasks`,
   `.../tasks/ready`, `.../tasks/{id}`, `.../tasks/{id}/comments` (GET + POST),
   `POST .../tasks/{id}/(claim|release|close|reopen)`, and
   `GET /api/projects/tasks/{id}/context`. This is read + lifecycle + comments
   only. Granting project_tasks also makes the agent a project member.
+  `POST .../tasks/{id}/claimable` is also reachable, but LEAD-only: the
+  route (`_authorize_project_lead`) refuses a plain project_tasks worker.
+  It adds/removes the `claimable` label in place, preserving all other labels,
+  so it does not widen the scope into free field edits (cf. PATCH).
+  `POST .../tasks/{id}/unquarantine` is also reachable, but LEAD-only: the
+  route (`_authorize_project_lead`) refuses a plain project_tasks worker.
+  It returns a quarantined card to the open pool and clears its strikes.
 - **project_tasks_create**: `POST /api/projects/{pid}/tasks` (author new cards).
   This is a SEPARATE scope from project_tasks and is off by default; grant it
   explicitly when an agent needs to create cards.
@@ -388,6 +405,15 @@ that SAME canonical_id instead:
   new identity is created.
 - `POST /api/agents/registry/{canonical_id}/scope-requests/{req_id}/deny`:
   owner/admin only.
+
+All owner-gated registry routes are existence-hiding (#2106): an authenticated
+caller who is not the owner gets the same 404 body as a nonexistent
+`canonical_id`, on the scope-request create/approve/deny routes above and on
+registry PATCH, DELETE (revoke), rotate-tokens, and `PUT /api/agents/{id}/org`.
+Agents must not treat a 404 from these routes as proof an id does not exist,
+and must not expect a 403 to distinguish "exists, not yours". Admin-only
+lifecycle routes (approve/reject/suspend/reactivate) still 403 non-admins
+before any lookup, which discloses nothing.
 
 Requested scopes are validated against the same closed `VALID_SCOPES` vocabulary
 as the consent flow. `project_tasks` and the canvas scopes still require an

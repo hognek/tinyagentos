@@ -1211,3 +1211,53 @@ class TestSessionClientBinding:
         # No user_agent param => skip check
         user_id = mgr.validate_session(token)
         assert user_id == rec["id"]
+
+
+class TestAuthStatusUserAgentSymmetry:
+    """/auth/status and /auth/me must apply the SAME User-Agent binding check
+    as the API middleware. When they diverge, a session whose UA hash no
+    longer matches (browser auto-update rotates the UA string) reads
+    authenticated on /auth/status while every /api/* call 401s, and the SPA's
+    LoginGate remount-loops on the contradiction (beta.46 PWA refresh loop,
+    2026-08-10)."""
+
+    @pytest.mark.asyncio
+    async def test_status_rejects_session_with_rotated_user_agent(self, app, auth_client):
+        app.state.auth.set_password("passw0rd")
+        resp = await auth_client.post(
+            "/auth/login",
+            data={"password": "passw0rd"},
+            headers={"user-agent": "TaosPWA/1.0 (old browser)"},
+            follow_redirects=False,
+        )
+        assert "taos_session" in resp.headers.get("set-cookie", "")
+        # Same UA -> still authenticated.
+        ok = await auth_client.get(
+            "/auth/status", headers={"user-agent": "TaosPWA/1.0 (old browser)"}
+        )
+        assert ok.json()["authenticated"] is True
+        # Rotated UA (browser updated) -> the middleware would 401 every API
+        # call, so status must agree and report unauthenticated.
+        rotated = await auth_client.get(
+            "/auth/status", headers={"user-agent": "TaosPWA/2.0 (updated browser)"}
+        )
+        assert rotated.json()["authenticated"] is False
+
+    @pytest.mark.asyncio
+    async def test_me_rejects_session_with_rotated_user_agent(self, app, auth_client):
+        app.state.auth.set_password("passw0rd")
+        resp = await auth_client.post(
+            "/auth/login",
+            data={"password": "passw0rd"},
+            headers={"user-agent": "TaosPWA/1.0 (old browser)"},
+            follow_redirects=False,
+        )
+        assert "taos_session" in resp.headers.get("set-cookie", "")
+        ok = await auth_client.get(
+            "/auth/me", headers={"user-agent": "TaosPWA/1.0 (old browser)"}
+        )
+        assert ok.status_code != 401
+        rotated = await auth_client.get(
+            "/auth/me", headers={"user-agent": "TaosPWA/2.0 (updated browser)"}
+        )
+        assert rotated.status_code == 401

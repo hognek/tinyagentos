@@ -106,6 +106,29 @@ class TestAppManifest:
         assert m.weights_license == "CC-BY-NC 4.0"
         assert m.license_class == "non-commercial"
 
+    def test_context_window_survives_when_present(self, tmp_path):
+        """A model manifest declaring ``context_window`` must surface it on the
+        loaded AppManifest object, not silently drop it to 0 (#1740 loader bug)."""
+        d = tmp_path / "models" / "rkllm-model"
+        d.mkdir(parents=True)
+        (d / "manifest.yaml").write_text(yaml.dump({
+            "id": "rkllm-model",
+            "name": "RKLLM Model",
+            "type": "model",
+            "version": "1.0.0",
+            "variants": [{"id": "w8a8", "format": "rkllm", "size_mb": 2040,
+                          "download_url": "https://example.com/x.rkllm"}],
+            "context_window": 4096,
+        }))
+        m = AppManifest.from_file(d / "manifest.yaml")
+        assert m.context_window == 4096
+
+    def test_context_window_defaults_to_zero_when_absent(self, catalog_dir):
+        """A manifest without ``context_window`` (e.g. a service) must report 0,
+        preserving the unknown-window semantics consumers rely on."""
+        m = AppManifest.from_file(catalog_dir / "services" / "gitea" / "manifest.yaml")
+        assert m.context_window == 0
+
 
 class TestAppRegistry:
     def test_load_catalog(self, registry):

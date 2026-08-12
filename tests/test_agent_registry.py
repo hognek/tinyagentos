@@ -829,3 +829,88 @@ def test_allowed_scopes_includes_project_doc_review():
 def test_allowed_scopes_includes_observatory_control():
     """observatory_control must be in the mint allowlist so internal agents can be granted it."""
     assert "observatory_control" in _ALLOWED_SCOPES
+
+
+# ---------------------------------------------------------------------------
+# Existence-hiding: non-owner vs non-existent must be byte-identical
+# (same contract the scope-request routes assert in
+# tests/test_agent_scope_requests.py; GET already had it, these four
+# write routes gained it in the same pass)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestRegistryWriteExistenceHiding:
+    async def _non_owner_client(self, app):
+        """Session client for a real NON-admin user who owns nothing."""
+        code = app.state.auth.add_user_invite("mallory", "admin")
+        app.state.auth.complete_invite("mallory", code, "Mallory", "", "malpass123")
+        record = app.state.auth.find_user("mallory")
+        session = app.state.auth.create_session(user_id=record["id"], long_lived=True)
+        return AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies={"taos_session": session},
+        )
+
+    async def _register(self, registry_client):
+        resp = await registry_client.post(
+            "/api/agents/registry/register",
+            json={"framework": "openclaw", "display_name": "Hidden Agent"},
+        )
+        assert resp.status_code == 200
+        return resp.json()["canonical_id"]
+
+    async def test_patch_non_owner_and_nonexistent_identical(self, app, registry_client):
+        cid = await self._register(registry_client)
+        async with await self._non_owner_client(app) as mallory:
+            resp_owned = await mallory.patch(
+                f"/api/agents/registry/{cid}", json={"display_name": "Stolen"}
+            )
+            resp_missing = await mallory.patch(
+                "/api/agents/registry/does-not-exist", json={"display_name": "Stolen"}
+            )
+        assert resp_owned.status_code == resp_missing.status_code == 404
+        assert resp_owned.content == resp_missing.content
+        # And the record was not modified.
+        check = await registry_client.get(f"/api/agents/registry/{cid}")
+        assert check.json()["display_name"] == "Hidden Agent"
+
+    async def test_delete_non_owner_and_nonexistent_identical(self, app, registry_client):
+        cid = await self._register(registry_client)
+        async with await self._non_owner_client(app) as mallory:
+            resp_owned = await mallory.delete(f"/api/agents/registry/{cid}")
+            resp_missing = await mallory.delete("/api/agents/registry/does-not-exist")
+        assert resp_owned.status_code == resp_missing.status_code == 404
+        assert resp_owned.content == resp_missing.content
+        # And the record was not revoked.
+        check = await registry_client.get(f"/api/agents/registry/{cid}")
+        assert check.status_code == 200
+        assert not check.json().get("revoked_at")
+
+    async def test_rotate_tokens_non_owner_and_nonexistent_identical(
+        self, app, registry_client
+    ):
+        cid = await self._register(registry_client)
+        async with await self._non_owner_client(app) as mallory:
+            resp_owned = await mallory.post(
+                f"/api/agents/registry/{cid}/rotate-tokens"
+            )
+            resp_missing = await mallory.post(
+                "/api/agents/registry/does-not-exist/rotate-tokens"
+            )
+        assert resp_owned.status_code == resp_missing.status_code == 404
+        assert resp_owned.content == resp_missing.content
+
+    async def test_org_put_non_owner_and_nonexistent_identical(
+        self, app, registry_client
+    ):
+        cid = await self._register(registry_client)
+        async with await self._non_owner_client(app) as mallory:
+            resp_owned = await mallory.put(
+                f"/api/agents/{cid}/org", json={"role": "usurper"}
+            )
+            resp_missing = await mallory.put(
+                "/api/agents/does-not-exist/org", json={"role": "usurper"}
+            )
+        assert resp_owned.status_code == resp_missing.status_code == 404
+        assert resp_owned.content == resp_missing.content

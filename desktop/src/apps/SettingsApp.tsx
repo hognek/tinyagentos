@@ -27,6 +27,7 @@ import {
 import { useShortcuts } from "@/hooks/use-shortcut-registry";
 import { useIsMobile } from "@/hooks/use-is-mobile";
 import { useThemeStore } from "@/stores/theme-store";
+import { WALLPAPER_FIT_OPTIONS } from "@/stores/theme-store";
 import { useDockStore } from "@/stores/dock-store";
 import { ThemesPanel } from "@/apps/SettingsApp/ThemesPanel";
 import { safeFetch, ProgressBar, RestartProgressModal } from "@/apps/SettingsApp/_shared";
@@ -762,6 +763,8 @@ export function DesktopDockSection() {
   const wallpaperLightImage = useThemeStore((s) => s.wallpaperLightImage);
   const wallpaperLightFallback = useThemeStore((s) => s.wallpaperLightFallback);
   const scheme = useThemeStore((s) => s.scheme);
+  const wallpaperFit = useThemeStore((s) => s.wallpaperFit);
+  const setWallpaperFit = useThemeStore((s) => s.setWallpaperFit);
   const getWallpapers = useThemeStore((s) => s.getWallpapers);
   const [showPicker, setShowPicker] = useState(false);
 
@@ -806,6 +809,26 @@ export function DesktopDockSection() {
             >
               Change…
             </Button>
+          </div>
+        </Card>
+
+        <Card className="p-4">
+          <p className="text-sm font-medium mb-3">Wallpaper fit</p>
+          <p className="text-xs text-shell-text-tertiary mb-3">
+            How the wallpaper fills the screen. Fit and center use the wallpaper fallback colour for the letterbox bars.
+          </p>
+          <div className="flex flex-wrap gap-2" role="group" aria-label="Wallpaper fit">
+            {WALLPAPER_FIT_OPTIONS.map((fit) => (
+              <Button
+                key={fit}
+                variant={wallpaperFit === fit ? "secondary" : "outline"}
+                size="sm"
+                onClick={() => setWallpaperFit(fit)}
+                aria-pressed={wallpaperFit === fit}
+              >
+                {fit.charAt(0).toUpperCase() + fit.slice(1)}
+              </Button>
+            ))}
           </div>
         </Card>
 

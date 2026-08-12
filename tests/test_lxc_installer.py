@@ -24,6 +24,17 @@ INSTALL_CONFIG = {
 }
 
 
+GENERIC_INSTALL_CONFIG = {
+    "method": "lxc",
+    "image": "images:debian/bookworm",
+    "service_name": "taosr1",
+    "ports": [8080],
+    "ui_port": 8080,
+    "ui_path": "/",
+    "state_paths": ["/var/lib/taosr1"],
+}
+
+
 # ---------------------------------------------------------------------------
 # LXCInstaller unit tests
 # ---------------------------------------------------------------------------
@@ -639,3 +650,160 @@ class TestInstallRouteBackendSelection:
         data = resp.json()
         assert "container_error" in data
         assert "container gone" in data["container_error"]
+
+
+# ---------------------------------------------------------------------------
+# Generic (non-Gitea) LXC service install acceptance tests
+# ---------------------------------------------------------------------------
+
+
+class TestLXCInstallerGenericService:
+    """Acceptance tests for a generic (non-Gitea) LXC service install.
+
+    The installer is today hard-wired to Gitea: it writes gitea.service,
+    downloads a binary from dl.gitea.com, renders /etc/gitea/app.ini and
+    unconditionally requires admin_password. A manifest that declares only
+    image, service_name, ports, ui_port, ui_path and state_paths should not be
+    forced through that Gitea path. Each test pins one piece of the behaviour
+    the generic path MUST provide once it lands. They are xfail(strict=True):
+    green today by failing as expected, and the moment the implementation
+    ships they XPASS, which strict mode flips into a failure that forces the
+    marker to be removed.
+    """
+
+    async def _run_generic_install(
+        self,
+        captured_cmds: list,
+        *,
+        admin_password: str = "secret",
+        host_port: int = 13000,
+    ) -> tuple[dict, AsyncMock]:
+        installer = LXCInstaller()
+        proxy_mock = AsyncMock(return_value={"success": True})
+
+        async def fake_exec(container_name, cmd, timeout=300):
+            captured_cmds.append(cmd)
+            if "hostname" in cmd or "-I" in cmd:
+                return (0, "10.0.0.2")
+            return (0, "")
+
+        with (
+            patch(
+                "tinyagentos.installers.lxc_installer.containers.container_exists",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+            patch(
+                "tinyagentos.installers.lxc_installer.containers.create_container",
+                new_callable=AsyncMock,
+                return_value={"success": True},
+            ),
+            patch(
+                "tinyagentos.installers.lxc_installer.containers.exec_in_container",
+                side_effect=fake_exec,
+            ),
+            patch(
+                "tinyagentos.installers.lxc_installer.containers.add_proxy_device",
+                proxy_mock,
+            ),
+            patch(
+                "tinyagentos.installers.lxc_installer.allocate_host_port",
+                return_value=host_port,
+            ),
+        ):
+            result = await installer.install(
+                "taosr1",
+                GENERIC_INSTALL_CONFIG,
+                admin_password=admin_password,
+                taos_username="jay",
+                taos_email="jay@example.com",
+            )
+        return result, proxy_mock
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(
+        strict=True,
+        reason="generic LXC install path not implemented; owned by @hermes",
+    )
+    async def test_systemd_unit_named_from_service_name(self):
+        captured: list[list[str]] = []
+        await self._run_generic_install(captured)
+        full_cmds = [" ".join(c) for c in captured]
+        assert any(
+            "/etc/systemd/system/taosr1.service" in cmd for cmd in full_cmds
+        ), "systemd unit must be named from service_name (taosr1.service)"
+        assert not any(
+            "/etc/systemd/system/gitea.service" in cmd for cmd in full_cmds
+        ), "must not write the Gitea-specific gitea.service unit"
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(
+        strict=True,
+        reason="generic LXC install path not implemented; owned by @hermes",
+    )
+    async def test_no_gitea_binary_download(self):
+        captured: list[list[str]] = []
+        await self._run_generic_install(captured)
+        full_cmds = [" ".join(c) for c in captured]
+        assert not any(
+            "dl.gitea.com" in cmd for cmd in full_cmds
+        ), "must not make any request to dl.gitea.com"
+        assert not any(
+            "wget" in cmd and "gitea" in cmd.lower()
+            for cmd in full_cmds
+        ), "must not issue a Gitea binary download command"
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(
+        strict=True,
+        reason="generic LXC install path not implemented; owned by @hermes",
+    )
+    async def test_no_app_ini_written(self):
+        captured: list[list[str]] = []
+        await self._run_generic_install(captured)
+        full_cmds = [" ".join(c) for c in captured]
+        assert not any(
+            "app.ini" in cmd for cmd in full_cmds
+        ), "must not write /etc/gitea/app.ini for a generic service"
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(
+        strict=True,
+        reason="generic LXC install path not implemented; owned by @hermes",
+    )
+    async def test_declared_ports_are_published(self):
+        captured: list[list[str]] = []
+        _, proxy_mock = await self._run_generic_install(captured)
+        assert proxy_mock.call_count == 1, (
+            "add_proxy_device should be called once for the declared port"
+        )
+        connect = proxy_mock.call_args.kwargs.get("connect")
+        assert connect == "tcp:127.0.0.1:8080", (
+            f"proxy device must publish the declared port 8080 (ui_port), "
+            f"got connect={connect!r}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(
+        strict=True,
+        reason="generic LXC install path not implemented; owned by @hermes",
+    )
+    async def test_state_paths_created_in_container(self):
+        captured: list[list[str]] = []
+        await self._run_generic_install(captured)
+        full_cmds = [" ".join(c) for c in captured]
+        assert any(
+            "/var/lib/taosr1" in cmd for cmd in full_cmds
+        ), "state_paths must be created inside the container (/var/lib/taosr1)"
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(
+        strict=True,
+        reason="generic LXC install path not implemented; owned by @hermes",
+    )
+    async def test_admin_password_not_required_without_admin_user(self):
+        captured: list[list[str]] = []
+        result, _ = await self._run_generic_install(captured, admin_password="")
+        assert result["success"] is True, (
+            "generic manifest with no admin user should not require admin_password"
+        )

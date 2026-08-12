@@ -265,7 +265,13 @@ async def webchat_ws(websocket: WebSocket, agent_name: str):
     """WebSocket endpoint for web chat."""
     auth_mgr = websocket.app.state.auth
     token = websocket.cookies.get("taos_session", "")
-    user_id = auth_mgr.validate_session(token) if token else None
+    user_id = (
+        auth_mgr.validate_session(
+            token, user_agent=websocket.headers.get("user-agent", "")
+        )
+        if token
+        else None
+    )
     if user_id is None:
         await websocket.close(code=1008)
         return

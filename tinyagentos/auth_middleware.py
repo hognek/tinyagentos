@@ -86,6 +86,10 @@ _AGENT_TASK_ROUTES = (
     # a plain project_tasks worker is refused. Toggles only the "claimable"
     # label, so it does not widen the scope into free field edits (cf. PATCH).
     ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/claimable$")),
+    # Un-quarantine curation: same LEAD-only gate as claimable above
+    # (_authorize_project_lead). Returns a quarantined card to the open pool
+    # and clears its strikes (see StrikeStore / unquarantine_task).
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/unquarantine$")),
 )
 
 # Project doc-review stamp store routes an agent may reach with its own registry
@@ -283,6 +287,15 @@ _CLUSTER_HEARTBEAT = "/api/cluster/heartbeat"
 _INVITE_REDEEM = "/api/projects/invites/redeem"
 _INVITE_INFO_PREFIX = "/i/"
 
+# Agent-model OpenAI-compatible surface (routes/agent_model_api.py): the
+# consent key IS the credential and the ROUTE enforces it — it never resolves
+# a model without a valid key and answers 401 in an OpenAI error envelope
+# otherwise (proven by tests/test_routes_agent_model_api.py). The middleware
+# exempts EXACTLY the two mounted routes, method-sensitive; every other /v1
+# path stays session-gated so the exemption cannot become a skeleton key.
+_AGENT_MODEL_MODELS = "/v1/models"
+_AGENT_MODEL_CHAT = "/v1/chat/completions"
+
 # Local-only shutdown drain: the systemd ExecStop hook (taos-graceful-stop)
 # POSTs this from localhost with no session cookie and no token, so it was
 # getting 401 and the in-app drain never ran. We exempt it ONLY for loopback
@@ -401,6 +414,12 @@ def _is_exempt(method: str, path: str) -> bool:
     # contract. The browser-friendly /i/ exact path stays session-gated so a
     # logged-out admin is not exposed, but the invite id form is exempt.
     if method == "GET" and path.startswith(_INVITE_INFO_PREFIX) and "/" not in path[len(_INVITE_INFO_PREFIX):]:
+        return True
+    # Agent-model surface — consent-key auth lives in the route (see the
+    # constants block above). Exact paths only; /v1/anything-else stays gated.
+    if method == "GET" and path == _AGENT_MODEL_MODELS:
+        return True
+    if method == "POST" and path == _AGENT_MODEL_CHAT:
         return True
     return False
 

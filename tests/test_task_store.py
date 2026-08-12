@@ -2,6 +2,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tinyagentos.board_audit import BoardAuditLog
 from tinyagentos.projects import task_store as task_store_mod
 from tinyagentos.projects.task_store import ProjectTaskStore
 
@@ -344,6 +345,26 @@ async def test_held_task_none_after_close(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_claim_after_close_and_reopen(tmp_path):
+    """Red-first: claim -> close -> reopen -> claim by another worker must succeed after fix.
+    
+    This test verifies that reopen_task properly clears claimed_by/claimed_at,
+    making a task claimable again after it was claimed, closed, and reopened.
+    """
+    s = await _store(tmp_path)
+    task = await s.create_task("prj-1", "Task", "alice")
+    await s.claim_task(task["id"], "worker-1")
+    await s.close_task(task["id"], "worker-1")
+    await s.reopen_task(task["id"], "alice")
+    ok = await s.claim_task(task["id"], "worker-2")
+    assert ok is True
+    fetched = await s.get_task(task["id"])
+    assert fetched["claimed_by"] == "worker-2"
+    assert fetched["status"] == "claimed"
+    await s.close()
+
+
+@pytest.mark.asyncio
 async def test_update_task_title(tmp_path):
     s = await _store(tmp_path)
     task = await s.create_task("prj-1", "Old title", "alice")
@@ -599,3 +620,74 @@ async def test_no_broker_no_error(tmp_path):
     await s.claim_task(task["id"], "worker-1")
     await s.close_task(task["id"], "worker-1")
     await s.close()
+
+
+@pytest.mark.asyncio
+async def test_quarantine_claimed_task_records_actual_from_status(tmp_path):
+    audit = BoardAuditLog(tmp_path / "audit.db")
+    await audit.init()
+    s = ProjectTaskStore(tmp_path / "tasks.db", audit=audit)
+    await s.init()
+    try:
+        task = await s.create_task("prj-1", "Task", "alice")
+        await s.claim_task(task["id"], "worker-1")
+        ok = await s.quarantine_task(task["id"], "system")
+        assert ok is True
+        history = await audit.history(task["id"])
+        quarantined = [h for h in history if h["event"] == "task.quarantined"]
+        assert len(quarantined) == 1
+        assert quarantined[0]["from_status"] == "claimed"
+    finally:
+        await s.close()
+        await audit.close()
+
+
+@pytest.mark.asyncio
+async def test_quarantine_unclaimed_task_records_from_status_open(tmp_path):
+    """Open-path assertion: unclaimed task -> audit from_status='open'.
+
+    This test verifies that quarantine_task records from_status='open' when
+    called on an unclaimed task, complementing the existing claimed-task test.
+    """
+    audit = BoardAuditLog(tmp_path / "audit.db")
+    await audit.init()
+    s = ProjectTaskStore(tmp_path / "tasks.db", audit=audit)
+    await s.init()
+    try:
+        task = await s.create_task("prj-1", "Task", "alice")
+        ok = await s.quarantine_task(task["id"], "system")
+        assert ok is True
+        history = await audit.history(task["id"])
+        quarantined = [h for h in history if h["event"] == "task.quarantined"]
+        assert len(quarantined) == 1
+        assert quarantined[0]["from_status"] == "open"
+    finally:
+        await s.close()
+        await audit.close()
+
+
+@pytest.mark.asyncio
+async def test_quarantine_after_reopen_records_from_status_open(tmp_path):
+    """Quarantine-after-reopen records from_status='open'.
+
+    This test verifies that quarantine_task records from_status='open' when
+    called on a reopened task (that was previously claimed, closed, and reopened).
+    """
+    audit = BoardAuditLog(tmp_path / "audit.db")
+    await audit.init()
+    s = ProjectTaskStore(tmp_path / "tasks.db", audit=audit)
+    await s.init()
+    try:
+        task = await s.create_task("prj-1", "Task", "alice")
+        await s.claim_task(task["id"], "worker-1")
+        await s.close_task(task["id"], "worker-1")
+        await s.reopen_task(task["id"], "alice")
+        ok = await s.quarantine_task(task["id"], "system")
+        assert ok is True
+        history = await audit.history(task["id"])
+        quarantined = [h for h in history if h["event"] == "task.quarantined"]
+        assert len(quarantined) == 1
+        assert quarantined[0]["from_status"] == "open"
+    finally:
+        await s.close()
+        await audit.close()
