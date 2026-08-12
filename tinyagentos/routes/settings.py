@@ -885,6 +885,121 @@ async def _stash_local_source_changes(project_dir) -> bool:
     return True
 
 
+# Core capability identifiers every healthy taOSmd /health has served since the
+# capabilities field existed. Deliberately a SUBSET: newer servers add
+# capabilities, and the check must not fail on additions.
+REQUIRED_TAOSMD_CAPABILITIES = frozenset({"a2a.v1", "collections.v1", "search.v1"})
+
+# Post-restart verification pacing. Module constants so tests can collapse the
+# wait instead of patching sleep.
+_TAOSMD_VERIFY_RETRIES = 10
+_TAOSMD_VERIFY_DELAY = 2.0
+
+
+async def _verify_taosmd_running(request: Request) -> str | None:
+    """Verify the RUNNING taOSmd answers a real /health, or say why not.
+
+    Returns None on success, else a human-readable failure reason. Asserts in
+    order: (a) HTTP 200 whose Content-Type is application/json — a text/html
+    200 is the SPA catch-all answering the wrong port and MUST fail; (b) the
+    core capability identifiers are present in the body. Never status alone.
+    """
+    url = request.app.state.config.memory_url
+    try:
+        client = request.app.state.http_client
+        resp = await client.get(
+            f"{url}/health", timeout=httpx.Timeout(5.0, connect=3.0)
+        )
+    except (httpx.RequestError, httpx.InvalidURL) as exc:
+        return f"taOSmd /health unreachable at {url}: {exc}"
+    if resp.status_code != 200:
+        return f"taOSmd /health returned HTTP {resp.status_code} (expected 200)"
+    content_type = resp.headers.get("content-type", "")
+    if not content_type.startswith("application/json"):
+        return (
+            f"taOSmd /health Content-Type is {content_type or 'missing'!r}, not "
+            "application/json — a text/html 200 means the SPA catch-all "
+            "answered, not the memory service"
+        )
+    try:
+        body = resp.json()
+    except ValueError:
+        return "taOSmd /health claimed application/json but the body does not parse"
+    caps = body.get("capabilities") if isinstance(body, dict) else None
+    if not isinstance(caps, list):
+        return "taOSmd /health body has no capabilities list"
+    missing = REQUIRED_TAOSMD_CAPABILITIES - set(caps)
+    if missing:
+        return f"taOSmd /health is missing capability identifiers: {sorted(missing)}"
+    return None
+
+
+async def _announce_taosmd_restart(text: str) -> bool:
+    """Post a system notice to the A2A bus BEFORE its process restarts.
+
+    A bus restart drops every SSE subscriber; without this notice the agent
+    leads diagnose a phantom outage. Best-effort: an already-down bus must not
+    block the update — there is nobody connected left to warn.
+    """
+    from tinyagentos.routes.a2a_bus import _bus_url
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.post(
+                f"{_bus_url()}/a2a/send",
+                json={"from": "system", "thread": "build", "body": text},
+            )
+            resp.raise_for_status()
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("taOSmd restart announcement failed: %s", exc)
+        return False
+
+
+async def _update_local_taosmd(request: Request) -> dict:
+    """Bring a locally-hosted taOSmd checkout to latest and restart its service.
+
+    Returns a report dict the update response carries verbatim:
+      {"skipped": <why>}    — legal no-op (remote taOSmd, or hooks unset)
+      {"updated": True, "output": ..., "announced": bool, "restarted": True}
+      {"error": <why>}      — hard failure; the caller must fail the update
+    """
+    import shlex
+
+    config = request.app.state.config
+    if not _is_local_url(config.memory_url):
+        return {"skipped": "memory_url is not local; update taOSmd on its own host"}
+    taosmd_dir = (config.taosmd_dir or "").strip()
+    if not taosmd_dir:
+        return {"skipped": "taosmd_dir not configured"}
+    if not (Path(taosmd_dir) / ".git").exists():
+        return {"error": f"taosmd_dir {taosmd_dir!r} is not a git checkout"}
+    restart_cmd = (config.taosmd_restart_cmd or "").strip()
+    if not restart_cmd:
+        # A configured checkout without a restart command would pull code the
+        # running service never loads — a silent half-update, worse than none.
+        return {
+            "error": "taosmd_dir is set but taosmd_restart_cmd is not; refusing "
+            "a pull the running service would never load"
+        }
+    rc, out = await _run_capture(["git", "pull", "--ff-only"], cwd=taosmd_dir)
+    if rc != 0:
+        return {"error": f"taOSmd git pull failed: {out.strip()[-1500:]}"}
+    announced = await _announce_taosmd_restart(
+        "SYSTEM: taOSmd updating to latest via Settings-update; the A2A bus "
+        "restarts momentarily and SSE subscribers must reconnect."
+    )
+    rc, restart_out = await _run_capture(shlex.split(restart_cmd), cwd=taosmd_dir, timeout=120.0)
+    if rc != 0:
+        return {"error": f"taOSmd restart command failed (rc {rc}): {restart_out.strip()[-1500:]}"}
+    return {
+        "updated": True,
+        "output": out.strip()[-1500:],
+        "announced": announced,
+        "restarted": True,
+    }
+
+
 @router.post("/api/settings/update")
 async def apply_update(request: Request):
     """Pull latest TinyAgentOS code from GitHub."""
@@ -1011,6 +1126,39 @@ async def apply_update(request: Request):
             status_code=500,
         )
 
+    # Bring a locally-hosted taOSmd to latest in the SAME action (tsk-jjkukj):
+    # two components, one deploy route, one place to look when it fails. A
+    # skip (remote taOSmd, hooks unset) is reported, never silent; a failure
+    # fails the update loudly — a silent half-update is worse than no update.
+    taosmd_report = await _update_local_taosmd(request)
+    if "error" in taosmd_report:
+        return JSONResponse(
+            {
+                "error": f"taOSmd update FAILED — update aborted: {taosmd_report['error']}",
+                "git_output": output.strip(),
+            },
+            status_code=500,
+        )
+    if taosmd_report.get("updated"):
+        # Verify the RUNNING server came back serving real JSON with the core
+        # capability identifiers — never trust the restart exit status alone.
+        verify_reason = None
+        for attempt in range(_TAOSMD_VERIFY_RETRIES):
+            verify_reason = await _verify_taosmd_running(request)
+            if verify_reason is None:
+                break
+            if attempt < _TAOSMD_VERIFY_RETRIES - 1:
+                await asyncio.sleep(_TAOSMD_VERIFY_DELAY)
+        if verify_reason is not None:
+            return JSONResponse(
+                {
+                    "error": f"taOSmd update verification FAILED: {verify_reason}",
+                    "git_output": output.strip(),
+                    "taosmd": taosmd_report,
+                },
+                status_code=500,
+            )
+
     # Always restart after a successful update.
     import asyncio as _asyncio
     from tinyagentos.routes.system import _do_restart
@@ -1019,10 +1167,19 @@ async def apply_update(request: Request):
         "status": "restarting",
         "output": output.strip(),
         "stashed_local_changes": stashed_local,
+        "taosmd": taosmd_report,
         "message": (
-            "Update applied. Local source changes were stashed (recover with `git stash pop`). Restarting now…"
-            if stashed_local
-            else "Update applied. Restarting now…"
+            (
+                "Update applied. Local source changes were stashed (recover with `git stash pop`). "
+                if stashed_local
+                else "Update applied. "
+            )
+            + (
+                "taOSmd updated and verified against the running service. "
+                if taosmd_report.get("updated")
+                else ""
+            )
+            + "Restarting now…"
         ),
     }
 
