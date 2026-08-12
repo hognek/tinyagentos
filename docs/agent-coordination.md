@@ -548,11 +548,13 @@ same posture as `/api/memory`.
 Files land under `models_root()/loras/<slug>/`; `GET /api/models` excludes that
 subtree, so adapters never appear as loadable models.
 
-Ingest is direct-connection by default. Civitai answers HTTP 451 to some
-regions; the config key `lora_ingest_proxy_url` (empty by default) is passed to
-this fetcher only, with `trust_env=False` so an ambient `HTTPS_PROXY` cannot
-redirect it. With no proxy configured the ingest fails loudly, records the
-actionable error on the row, and leaves no file on disk.
+Ingest is direct-connection by default, which is all a host outside a blocked
+region needs. Civitai answers HTTP 451 to some regions; the config key
+`lora_ingest_proxy_url` (empty by default) is passed to this fetcher only, with
+`trust_env=False` so an ambient `HTTPS_PROXY` cannot redirect it. When the
+direct request is refused that way and no proxy is set, the ingest fails
+loudly, records the actionable error on the row, and leaves no file on disk —
+it never stores an error page as a `.safetensors`.
 
 A Civitai URL added to the Library takes the same path: `detect_kind` tags it
 `url:civitai` and `CivitaiProcessor` runs the identical ingest job, linking the
