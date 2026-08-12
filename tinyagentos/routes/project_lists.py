@@ -41,8 +41,13 @@ class UpdateEntryIn(BaseModel):
     position: int | None = None
 
 
+class ReorderEntryIn(BaseModel):
+    id: str
+    position: int
+
+
 class ReorderIn(BaseModel):
-    entries: list[dict]
+    entries: list[ReorderEntryIn]
 
 
 async def _authorize_lists_actor(
@@ -96,9 +101,8 @@ async def create_list(
     auth = await _authorize_lists_actor(request, pstore, project_id)
     if isinstance(auth, JSONResponse):
         return auth
-    actor_id, is_agent, _project = auth
+    actor_id, _is_agent, _project = auth
     store = request.app.state.project_lists_store
-    author_kind = "agent" if is_agent else "user"
     lst = await store.create_list(
         project_id=project_id,
         title=payload.title,
@@ -303,10 +307,12 @@ async def reorder_entries(
     lst = await lst_store.get_list(list_id)
     if lst is None or lst["project_id"] != project_id:
         return JSONResponse({"error": "list not found"}, status_code=404)
-    ok = await store.reorder_entries(project_id, list_id, payload.entries)
-    await pstore.log_activity(
-        project_id, actor_id, "entry.reordered", {"list_id": list_id}
+    ok = await store.reorder_entries(
+        project_id, list_id, [e.model_dump() for e in payload.entries]
     )
     if not ok:
         return JSONResponse({"error": "reorder failed"}, status_code=400)
+    await pstore.log_activity(
+        project_id, actor_id, "entry.reordered", {"list_id": list_id}
+    )
     return {"ok": True}

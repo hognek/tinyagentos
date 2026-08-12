@@ -6,8 +6,9 @@ Pin the dual-auth contract for /api/projects/{id}/lists and entries:
    2. An approved agent token (scope project_lists) bound to project A can
       CRUD lists and entries ONLY for project A; a token bound elsewhere
       collapses into an existence-hiding 404.
-   3. A token missing the project_lists scope is rejected 401; an
-      unauthenticated (no session, no token) request is 401.
+   3. A token missing the project_lists scope is rejected 403 (it proved who it
+      is, it just may not do this); an unauthenticated request - no session and
+      no token - is 401.
    4. An unknown scope is rejected at mint.
 """
 from __future__ import annotations
@@ -330,3 +331,36 @@ class TestAgentScopeGating:
         async with _bare(ctx.app) as bare:
             resp = await bare.get(f"/api/projects/{pid}/lists")
         assert resp.status_code == 401, resp.text
+
+
+@pytest.mark.asyncio
+class TestReorderContract:
+    """A failed reorder must be reported as failed, and a malformed reorder body
+    must be rejected by validation rather than crashing the store."""
+
+    async def test_failed_reorder_logs_no_activity(self, ctx):
+        pid = await _new_project(ctx, "alpha")
+        created = await ctx.client.post(
+            f"/api/projects/{pid}/lists", json={"title": "A", "description": ""}
+        )
+        lst_id = created.json()["id"]
+        resp = await ctx.client.post(
+            f"/api/projects/{pid}/lists/{lst_id}/entries/reorder",
+            json={"entries": [{"id": "ent-nope", "position": 0}]},
+        )
+        assert resp.status_code == 400, resp.text
+        activity = await ctx.app.state.project_store.list_activity(pid)
+        kinds = [a["kind"] for a in activity]
+        assert "entry.reordered" not in kinds, kinds
+
+    async def test_malformed_reorder_entry_is_422(self, ctx):
+        pid = await _new_project(ctx, "alpha")
+        created = await ctx.client.post(
+            f"/api/projects/{pid}/lists", json={"title": "A", "description": ""}
+        )
+        lst_id = created.json()["id"]
+        resp = await ctx.client.post(
+            f"/api/projects/{pid}/lists/{lst_id}/entries/reorder",
+            json={"entries": [{"id": "ent-1"}]},
+        )
+        assert resp.status_code == 422, resp.text

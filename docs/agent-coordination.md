@@ -284,6 +284,25 @@ The registry-JWT surface, by scope:
   project binding, and a token bound to a DIFFERENT project gets a 404 rather
   than a 403, so it cannot confirm that another project exists. The note's
   author is taken from the verified token, never from the request body.
+- **project_lists**: read and write a project's checklist lists and their
+  entries. Lists: `GET /api/projects/{pid}/lists` (list),
+  `POST /api/projects/{pid}/lists` (create), `GET|PATCH|DELETE
+  /api/projects/{pid}/lists/{lid}`. Entries:
+  `GET|POST /api/projects/{pid}/lists/{lid}/entries`,
+  `PATCH|DELETE /api/projects/{pid}/lists/{lid}/entries/{eid}`, and
+  `POST /api/projects/{pid}/lists/{lid}/entries/reorder` (body
+  `{"entries": [{"id": ..., "position": ...}]}` - every element needs both
+  fields or the request is rejected 422). One scope covers read and write,
+  mirroring project_notes. The routes key off the project ID, resolve it
+  through the same `_get_owned_project` helper as the task routes, and verify
+  the JWT + grant + project binding inside the handler. Status contract, which
+  the middleware allowlist does not decide: an agent token that holds no
+  `project_lists` grant gets **403**; a token whose grant is bound to a
+  DIFFERENT project gets **404**, so it cannot confirm another project exists;
+  a request with neither session nor token gets 401. A reorder naming an entry
+  that is not in this list/project changes nothing, returns 400, and logs no
+  activity. The entry author is taken from the verified token, never from the
+  request body.
 - **canvas_read**: `GET .../canvas/elements`, `.../canvas/watch-projection`,
   `.../canvas/snapshot.png|.tldr`, `.../canvas/stream`. **canvas_write**: `POST .../canvas/elements`,
   `PATCH|DELETE .../canvas/elements/{id}`.
