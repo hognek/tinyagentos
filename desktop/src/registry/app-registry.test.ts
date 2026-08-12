@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { getApp, getOrRegisterServiceApp, getAllApps, prefetchApp, resolveApp } from "./app-registry";
+import { getApp, getOrRegisterServiceApp, getAllApps, getLaunchableApps, prefetchApp, resolveApp } from "./app-registry";
 
 describe("resolveApp (deep-navigation token resolver)", () => {
   it("resolves an exact app id", () => {
@@ -57,5 +57,20 @@ describe("prefetchApp", () => {
 
   it("is a no-op for unknown apps and never throws", () => {
     expect(() => prefetchApp("does-not-exist")).not.toThrow();
+  });
+});
+
+describe("LoRA Studio launcher visibility", () => {
+  // An `optional: true` app only renders if its id is in the backend
+  // OPTIONAL_FRONTEND_APPS allowlist (routes/apps.py). LoRA Studio is not in it,
+  // so marking it optional made the app invisible in the launcher while every
+  // component test still passed. Lock it in as an always-on app.
+  it("is launchable with no optional apps installed", () => {
+    const ids = getLaunchableApps(new Set()).map((a) => a.id);
+    expect(ids).toContain("lora-studio");
+  });
+
+  it("is not marked optional", () => {
+    expect(getApp("lora-studio")?.optional).toBeFalsy();
   });
 });

@@ -3,11 +3,17 @@
 # Read by scripts/check_doc_gate.py. Rules are data: add more [[rules]]
 # entries here to cover new feature areas without touching the script.
 #
-# Precision over recall: `when_changed` only triggers a rule on a structural
-# change (a file added or deleted, or a plain modification when the rule sets
-# `on_modify = true`), and every glob below is scoped to the specific tree it
-# names. This is deliberate -- a noisy gate gets disabled, so false positives
-# are worse than an occasional missed doc update.
+# Two trigger modes:
+#   when_changed  -- fires on structural add/delete by default; set
+#                    `on_modify = true` to also count plain modifications.
+#   require_doc   -- any changed file matching these globs satisfies the rule.
+#
+# Test paths (test_*.py, *.test.*, *.spec.*, __tests__/) are never structural
+# and are always excluded from triggering.
+#
+# The Docs-Reviewed: trailer is an explicit escape hatch: when present in a
+# commit message, the gate prints which commit used it and who authored it,
+# then passes all rules for that PR.
 
 [gate]
 trailer = "Docs-Reviewed:"
@@ -41,27 +47,31 @@ hint = "a desktop app was added or removed"
 
 [[rules]]
 name = "routes"
+on_modify = true
 when_changed = ["tinyagentos/routes/*.py"]
 require_doc = ["docs/agent-coordination.md"]
-hint = "an API route module was added or removed"
+hint = "an API route module was added, removed, or modified"
 
 [[rules]]
 name = "installers"
+on_modify = true
 when_changed = ["tinyagentos/installers/*", "scripts/install*"]
 require_doc = ["README.md"]
-hint = "an installer was added or removed"
+hint = "an installer was added, removed, or modified"
 
 [[rules]]
 # The repo's catalog tree is app-catalog/, not catalog/ (there is no
 # catalog/ directory in this repo). Scoped to the real path so the rule can
 # actually fire instead of being permanently dead config.
 name = "catalog"
+on_modify = true
 when_changed = ["app-catalog/**"]
 require_doc = ["README.md"]
-hint = "a catalog manifest was added or removed"
+hint = "a catalog manifest was added, removed, or modified"
 
 [[rules]]
 name = "agent-api"
+on_modify = true
 when_changed = ["tinyagentos/auth_middleware.py"]
 require_doc = ["docs/agent-coordination.md"]
 hint = "the agent-token route allowlist changed; update the agent-facing API surface (or add a Docs-Reviewed trailer explaining why not)"
@@ -81,10 +91,15 @@ hint = "the agent-token route allowlist changed; update the agent-facing API sur
 # PR that merely touched the README satisfy the rule. Verified by probe: with the
 # doc inside the directory the gate went green on a change carrying no changelog
 # at all.
+#
+# Broadened to cover every NON-TEST change under tinyagentos/ or desktop/src/,
+# not only code: a doc or asset under those trees triggers it too (the test
+# suite pins tinyagentos/README.md as a trigger). Any such change requires a
+# CHANGELOG.md edit or a new changelog.d/ fragment in the same PR.
 [[rules]]
 name = "user-visible-changelog"
 on_modify = true
-when_changed = ["tinyagentos/routes/*.py", "desktop/src/apps/*/**", "desktop/src/App.tsx", "desktop/src/components/**", "desktop/src/stores/**", "tinyagentos/installers/*"]
+when_changed = ["tinyagentos/**", "desktop/src/**"]
 require_doc = ["CHANGELOG.md", "changelog.d/*.md"]
 hint = "user-visible behaviour changed; add a changelog.d/<pr>-<slug>.md fragment (preferred) or a CHANGELOG.md line (or add a Docs-Reviewed trailer explaining why not)"
 
@@ -92,7 +107,7 @@ hint = "user-visible behaviour changed; add a changelog.d/<pr>-<slug>.md fragmen
 [[rules]]
 name = "agent-manual"
 on_modify = true
-when_changed = ["tinyagentos/agent_registry*.py", "tinyagentos/agent_token_auth.py", "tinyagentos/routes/agent_*.py", "tinyagentos/mcp/**"]
+when_changed = ["tinyagentos/agent_registry*.py", "tinyagentos/agent_token_auth.py", "tinyagentos/agent_scope_requests_store.py", "tinyagentos/routes/agent_*.py", "tinyagentos/mcp/**"]
 require_doc = ["docs/agent-manual/*.md", "docs/agent-coordination.md"]
 hint = "agent-facing behaviour changed; review the agent manual or coordination doc (or add a Docs-Reviewed trailer explaining why not)"
 

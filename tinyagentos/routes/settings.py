@@ -221,6 +221,7 @@ async def save_config_endpoint(request: Request, body: ConfigUpdate, validate_on
         taosmd_dir=str(data.get("taosmd_dir", "") or ""),
         taosmd_restart_cmd=str(data.get("taosmd_restart_cmd", "") or ""),
         github_app_id=str(data.get("github_app_id", "") or ""),
+        lora_ingest_proxy_url=str(data.get("lora_ingest_proxy_url", "") or ""),
         config_path=request.app.state.config_path,
     )
     errors = validate_config(new_config)
@@ -347,6 +348,7 @@ async def restore_backup(request: Request, file: UploadFile):
                 taosmd_dir=str(data.get("taosmd_dir", "") or ""),
                 taosmd_restart_cmd=str(data.get("taosmd_restart_cmd", "") or ""),
                 github_app_id=str(data.get("github_app_id", "") or ""),
+                lora_ingest_proxy_url=str(data.get("lora_ingest_proxy_url", "") or ""),
                 config_path=config_path,
             )
             request.app.state.config = new_config
