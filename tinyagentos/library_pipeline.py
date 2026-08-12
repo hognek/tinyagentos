@@ -600,6 +600,27 @@ class WebProcessor(Processor):
         return artifacts
 
 
+def _read_lora_proxy_url(config_path: Path) -> str:
+    """Read ``lora_ingest_proxy_url`` from config.yaml without side effects.
+
+    Deliberately not ``load_config()``: that function persists a legacy
+    litellm_port pin when one is missing, which would make a background
+    Library ingest rewrite the user's configuration file.
+    """
+    if not config_path.exists():
+        return ""
+    try:
+        import yaml
+
+        data = yaml.safe_load(config_path.read_text()) or {}
+    except Exception:
+        logger.warning("Could not read %s for the LoRA ingest proxy", config_path, exc_info=True)
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    return str(data.get("lora_ingest_proxy_url", "") or "")
+
+
 class CivitaiProcessor(Processor):
     """Civitai model-page URL processor -- delegates to the LoRA Studio ingest job.
 
@@ -620,7 +641,6 @@ class CivitaiProcessor(Processor):
         if not source_url:
             return artifacts
 
-        from tinyagentos.config import load_config
         from tinyagentos.lora_store import LoraStore
         from tinyagentos.routes.lora_studio import (
             CivitaiUrlError,
@@ -644,10 +664,11 @@ class CivitaiProcessor(Processor):
                 civitai_model_id=model_id, civitai_version_id=version_id,
             )
 
-            proxy_url = ""
-            config_path = data_dir / "config.yaml"
-            if config_path.exists():
-                proxy_url = load_config(config_path).lora_ingest_proxy_url
+            # Read the single key directly rather than via load_config():
+            # load_config persists a legacy litellm_port pin as a side effect,
+            # so calling it here would let a background ingest rewrite the
+            # user's config.yaml.
+            proxy_url = _read_lora_proxy_url(data_dir / "config.yaml")
 
             # Any failure raises -- let it propagate so run_pipeline marks
             # this library item as "error", same as YouTubeProcessor.

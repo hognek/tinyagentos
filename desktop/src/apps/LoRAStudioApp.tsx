@@ -193,7 +193,11 @@ export function LoRAStudioApp({ windowId: _windowId }: { windowId: string }) {
       setListError("Failed to retry ingest.");
       return;
     }
-    setItems((prev) => prev.map((i) => (i.id === id ? updated : i)));
+    // The route returns {id, status} only -- merge it so the card keeps its
+    // name, previews, tags, and metadata while the re-ingest runs.
+    setItems((prev) =>
+      prev.map((i) => (i.id === id ? { ...i, status: updated.status, error: null } : i)),
+    );
   }, []);
 
   /* ------------------------------ render ------------------------------ */

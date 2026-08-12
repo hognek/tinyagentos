@@ -20,7 +20,7 @@ import json
 import logging
 import re
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, urlparse
 
 import httpx
@@ -195,15 +195,39 @@ def _pick_version(model_json: dict, explicit_version_id: int | None) -> dict:
 
 
 def _pick_file(version: dict) -> dict:
+    """Pick the .safetensors file to archive, preferring the primary one.
+
+    The extension is checked on BOTH passes: Civitai can mark a non-safetensors
+    file (a .bin pickle, a training config) as primary, and archiving that would
+    contradict both this function's error message and what LoRA Studio stores.
+    """
     files = version.get("files") or []
     for f in files:
-        if f.get("primary"):
+        if f.get("primary") and _is_safetensors(f):
             return f
     for f in files:
-        name = (f.get("name") or "").lower()
-        if name.endswith(".safetensors"):
+        if _is_safetensors(f):
             return f
     raise CivitaiIngestError("No .safetensors file found on this model version")
+
+
+def _is_safetensors(file_entry: dict) -> bool:
+    return (file_entry.get("name") or "").lower().endswith(".safetensors")
+
+
+def _safe_filename(raw: str, fallback: str) -> str:
+    """Reduce a Civitai-supplied file name to a single safe path component.
+
+    The name comes from a remote API response, so it is untrusted: an absolute
+    path or one containing ``..`` would otherwise escape ``loras_root()`` when
+    joined to the LoRA directory (``Path("/a") / "/tmp/x"`` is ``/tmp/x``), and
+    an escaped file is invisible to both the failure cleanup and the delete
+    route, which are anchored on that root.
+    """
+    name = PurePosixPath(str(raw or "").replace("\\", "/")).name.strip()
+    if not name or name in {".", ".."} or set(name) == {"."}:
+        return fallback
+    return name
 
 
 async def _download_previews(images: list[dict], lora_dir: Path, proxy_url: str) -> list[str]:
@@ -282,7 +306,7 @@ async def run_civitai_ingest(store: LoraStore, lora_id: str, proxy_url: str) -> 
         download_url = file_info.get("downloadUrl", "")
         if not download_url:
             raise CivitaiIngestError("Civitai file entry has no downloadUrl")
-        filename = file_info.get("name") or f"{slug}.safetensors"
+        filename = _safe_filename(file_info.get("name"), f"{slug}.safetensors")
 
         # 4. Download the safetensors file (SHA256-verified) through the proxy.
         lora_dir.mkdir(parents=True, exist_ok=True)
@@ -485,10 +509,11 @@ async def retry_lora(request: Request, lora_id: str):
     row = await store.get(lora_id)
     if not row:
         return JSONResponse({"error": f"LoRA {lora_id!r} not found"}, status_code=404)
-    if row.get("status") != "failed":
+    # Atomic failed -> pending: the loser of a concurrent retry gets the 409
+    # instead of scheduling a second job into the same LoRA directory.
+    if not await store.claim_retry(lora_id):
         return JSONResponse({"error": "LoRA is not in a failed state"}, status_code=409)
 
-    await store.update(lora_id, status="pending", error="")
     _schedule(request, _run_ingest_background(store, lora_id, _proxy_url(request)))
 
     return JSONResponse({"id": lora_id, "status": "pending"}, status_code=202)

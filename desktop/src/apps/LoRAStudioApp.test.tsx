@@ -206,4 +206,41 @@ describe("LoRAStudioApp", () => {
 
     vi.useRealTimers();
   });
+  it("surfaces a list failure instead of the empty state", async () => {
+    // A failed GET must not look identical to an empty archive: fetchJson's
+    // silent fallback made "server is down" render as "No LoRAs yet".
+    vi.stubGlobal(
+      "fetch",
+      mockFetch({ "GET /api/loras": { ok: false, status: 500, body: {} } }),
+    );
+    renderApp();
+    await flush();
+
+    expect(screen.getByText(/Failed to load LoRAs/i)).toBeTruthy();
+    expect(screen.queryByText("No LoRAs yet")).toBeNull();
+  });
+
+  it("keeps the card's details when retry returns only {id, status}", async () => {
+    vi.stubGlobal(
+      "fetch",
+      mockFetch({
+        "GET /api/loras": { ok: true, body: { loras: [FAILED_LORA] } },
+        "POST /api/loras/lora-geo-blocked/retry": {
+          ok: true,
+          status: 202,
+          body: { id: "lora-geo-blocked", status: "pending" },
+        },
+      }),
+    );
+    renderApp();
+    await flush();
+
+    fireEvent.click(screen.getByLabelText("Open LoRA: Geo Blocked LoRA"));
+    fireEvent.click(screen.getByLabelText("Retry ingest"));
+    await flush();
+
+    // The retry response carries no name/tags/previews -- replacing the row
+    // with it would blank the card until the next poll.
+    expect(screen.getAllByText("Geo Blocked LoRA").length).toBeGreaterThan(0);
+  });
 });

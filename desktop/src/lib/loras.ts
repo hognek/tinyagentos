@@ -32,30 +32,19 @@ export interface LoraItem {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Helpers                                                            */
-/* ------------------------------------------------------------------ */
-
-async function fetchJson<T>(url: string, fallback: T, init?: RequestInit): Promise<T> {
-  try {
-    const headers = new Headers(init?.headers);
-    headers.set("Accept", "application/json");
-    const res = await fetch(url, { ...init, headers });
-    if (!res.ok) return fallback;
-    const ct = res.headers.get("content-type") ?? "";
-    if (!ct.includes("application/json")) return fallback;
-    return await res.json();
-  } catch {
-    return fallback;
-  }
-}
-
-/* ------------------------------------------------------------------ */
 /*  Items                                                              */
 /* ------------------------------------------------------------------ */
 
+// Throws on HTTP, content-type, and transport failures. A failed list must be
+// distinguishable from an empty archive: swallowing it would render the "No
+// LoRAs yet" empty state over a server error and drop the rows already shown.
 export async function listLoras(status?: LoraStatus): Promise<LoraItem[]> {
   const qs = status ? `?status=${encodeURIComponent(status)}` : "";
-  const data = await fetchJson<{ loras: LoraItem[] }>(`/api/loras${qs}`, { loras: [] });
+  const res = await fetch(`/api/loras${qs}`, { headers: { Accept: "application/json" } });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const ct = res.headers.get("content-type") ?? "";
+  if (!ct.includes("application/json")) throw new Error("Unexpected response type");
+  const data = (await res.json()) as { loras?: LoraItem[] };
   return Array.isArray(data.loras) ? data.loras : [];
 }
 
@@ -108,7 +97,13 @@ export async function ingestLora(url: string): Promise<LoraItem | null> {
   }
 }
 
-export async function retryLora(id: string): Promise<LoraItem | null> {
+// The retry route answers with the id and the new status only, NOT a full row.
+export interface LoraRetryResult {
+  id: string;
+  status: LoraStatus;
+}
+
+export async function retryLora(id: string): Promise<LoraRetryResult | null> {
   try {
     const res = await fetch(`/api/loras/${encodeURIComponent(id)}/retry`, withCsrf({
       method: "POST",

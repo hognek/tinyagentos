@@ -131,6 +131,22 @@ class LoraStore(BaseStore):
         )
         await self._db.commit()
 
+    async def claim_retry(self, lora_id: str) -> bool:
+        """Atomically move a ``failed`` row back to ``pending``.
+
+        Returns True for the caller that won the transition and False for
+        everyone else, so a double-clicked Retry (or two concurrent requests)
+        can never schedule two ingest jobs writing into the same LoRA
+        directory. Read-then-update in the route could not guarantee that.
+        """
+        cursor = await self._db.execute(
+            "UPDATE loras SET status = 'pending', error = '', updated_at = ? "
+            "WHERE id = ? AND status = 'failed'",
+            (time.time(), lora_id),
+        )
+        await self._db.commit()
+        return cursor.rowcount == 1
+
     async def delete(self, lora_id: str) -> None:
         await self._db.execute("DELETE FROM loras WHERE id = ?", (lora_id,))
         await self._db.commit()

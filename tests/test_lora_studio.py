@@ -7,6 +7,7 @@ at the module under test so no real network I/O ever happens.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 from pathlib import Path
@@ -654,3 +655,180 @@ class TestLibraryHook:
                 await lora_store.close()
         finally:
             await lib_store.close()
+
+
+# ---------------------------------------------------------------------------
+# File selection and untrusted file names (bot findings, PR #2374)
+# ---------------------------------------------------------------------------
+
+
+class TestPickFile:
+    def test_primary_non_safetensors_is_skipped(self):
+        """Civitai marks training data and pickles primary on some versions.
+
+        Archiving a primary .bin would contradict both the error message this
+        function raises and what LoRA Studio claims to store.
+        """
+        version = {
+            "files": [
+                {"primary": True, "name": "training-data.zip"},
+                {"primary": False, "name": "real-lora.safetensors"},
+            ]
+        }
+        assert ls._pick_file(version)["name"] == "real-lora.safetensors"
+
+    def test_primary_safetensors_still_wins(self):
+        version = {
+            "files": [
+                {"primary": False, "name": "other.safetensors"},
+                {"primary": True, "name": "primary.safetensors"},
+            ]
+        }
+        assert ls._pick_file(version)["name"] == "primary.safetensors"
+
+    def test_no_safetensors_anywhere_raises(self):
+        version = {"files": [{"primary": True, "name": "model.bin"}]}
+        with pytest.raises(CivitaiIngestError, match="No .safetensors file"):
+            ls._pick_file(version)
+
+
+class TestUntrustedFileName:
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("../../evil.safetensors", "evil.safetensors"),
+            ("/tmp/evil.safetensors", "evil.safetensors"),
+            ("..\\..\\evil.safetensors", "evil.safetensors"),
+            ("nested/dir/ok.safetensors", "ok.safetensors"),
+            ("", "fallback.safetensors"),
+            ("..", "fallback.safetensors"),
+            (None, "fallback.safetensors"),
+        ],
+    )
+    def test_safe_filename_reduces_to_one_component(self, raw, expected):
+        assert ls._safe_filename(raw, "fallback.safetensors") == expected
+
+    @pytest.mark.asyncio
+    async def test_traversing_file_name_stays_inside_loras_root(
+        self, lora_store, isolated_loras_root, monkeypatch
+    ):
+        """A hostile Civitai response must not write outside loras_root().
+
+        An escaped file is also invisible to the failure cleanup and to
+        DELETE /api/loras/{id}, both of which are anchored on that root.
+        """
+        model_json = json.loads(json.dumps(CIVITAI_MODEL_JSON))
+        model_json["modelVersions"][0]["files"][0]["name"] = (
+            "../../../escaped.safetensors"
+        )
+        lora_id = "lora-test-2851174"
+        await lora_store.create_pending(
+            lora_id, source_url="https://civitai.com/models/2851174/test-lora",
+            civitai_model_id=2851174, civitai_version_id=None,
+        )
+        _patch_get(monkeypatch, _civitai_response(200, model_json))
+        monkeypatch.setattr(ls, "download_file", _fake_download_ok)
+
+        await run_civitai_ingest(lora_store, lora_id, proxy_url="")
+
+        row = await lora_store.get(lora_id)
+        assert row["status"] == "ready"
+        written = Path(row["file_path"]).resolve()
+        # relative_to raises if the file landed outside the archive root.
+        written.relative_to(isolated_loras_root.resolve())
+        assert row["file_name"] == "escaped.safetensors"
+        assert not (isolated_loras_root.parent.parent / "escaped.safetensors").exists()
+
+
+class TestRetryIsAtomic:
+    @pytest.mark.asyncio
+    async def test_claim_retry_wins_once(self, lora_store):
+        await lora_store.create_pending(
+            "lora-atomic", source_url="https://civitai.com/models/7",
+            civitai_model_id=7, civitai_version_id=None,
+        )
+        await lora_store.update("lora-atomic", status="failed", error="boom")
+
+        assert await lora_store.claim_retry("lora-atomic") is True
+        # Second caller loses: the row is no longer failed.
+        assert await lora_store.claim_retry("lora-atomic") is False
+
+        row = await lora_store.get("lora-atomic")
+        assert row["status"] == "pending"
+        assert row["error"] == ""
+
+    @pytest.mark.asyncio
+    async def test_claim_retry_ignores_unknown_row(self, lora_store):
+        assert await lora_store.claim_retry("lora-does-not-exist") is False
+
+    @pytest.mark.asyncio
+    async def test_concurrent_retries_schedule_one_job(self, client, app, monkeypatch):
+        """Two retries in flight must not start two downloads into one directory."""
+        scheduled = []
+
+        async def _record(store, lora_id, proxy_url):
+            scheduled.append(lora_id)
+
+        monkeypatch.setattr(ls, "_run_ingest_background", _record)
+
+        store = app.state.lora_store
+        await store.create_pending(
+            "lora-race", source_url="https://civitai.com/models/8",
+            civitai_model_id=8, civitai_version_id=None,
+        )
+        await store.update("lora-race", status="failed", error="boom")
+
+        results = await asyncio.gather(
+            client.post("/api/loras/lora-race/retry"),
+            client.post("/api/loras/lora-race/retry"),
+        )
+        codes = sorted(r.status_code for r in results)
+        assert codes == [202, 409]
+        assert len(scheduled) == 1
+
+    @pytest.mark.asyncio
+    async def test_civitai_processor_never_rewrites_config(
+        self, isolated_loras_root, monkeypatch, tmp_path
+    ):
+        """A background Library ingest must not write to the user's config.
+
+        load_config() persists a legacy litellm_port pin when the key is
+        absent, so reading the proxy value through it turned an ingest into a
+        config write. The processor reads the single key directly instead.
+        """
+        from tinyagentos.library_pipeline import CivitaiProcessor
+        from tinyagentos.library_store import LibraryStore
+
+        lib_store = LibraryStore(tmp_path / "library.db")
+        await lib_store.init()
+        storage_dir = tmp_path / "library"
+        storage_dir.mkdir()
+        config_path = tmp_path / "config.yaml"
+        # No server.litellm_port -- exactly the legacy shape load_config pins.
+        config_path.write_text("server: {}\nlora_ingest_proxy_url: ''\n")
+        before = config_path.read_text()
+
+        try:
+            item_id = await lib_store.create_item(
+                kind="url:civitai",
+                source_url="https://civitai.com/models/2851174/test-lora",
+            )
+            item = await lib_store.get_item(item_id)
+            _patch_get(monkeypatch, _civitai_response(200, CIVITAI_MODEL_JSON))
+            monkeypatch.setattr(ls, "download_file", _fake_download_ok)
+
+            await CivitaiProcessor(lib_store, storage_dir).process(item)
+
+            assert config_path.read_text() == before
+        finally:
+            await lib_store.close()
+
+    def test_read_lora_proxy_url_reads_the_key(self, tmp_path):
+        from tinyagentos.library_pipeline import _read_lora_proxy_url
+
+        path = tmp_path / "config.yaml"
+        path.write_text("server: {}\nlora_ingest_proxy_url: http://proxy:3128\n")
+        assert _read_lora_proxy_url(path) == "http://proxy:3128"
+        assert _read_lora_proxy_url(tmp_path / "missing.yaml") == ""
+        (tmp_path / "bad.yaml").write_text(": : not [ yaml")
+        assert _read_lora_proxy_url(tmp_path / "bad.yaml") == ""
