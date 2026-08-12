@@ -429,6 +429,9 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     doc_review_store = DocReviewStore(data_dir / "projects.db")
     from tinyagentos.projects.notes_store import ProjectNotesStore
     project_notes_store = ProjectNotesStore(data_dir / "projects.db")
+    from tinyagentos.projects.lists_store import ProjectListsStore, ProjectListEntriesStore
+    project_lists_store = ProjectListsStore(data_dir / "projects.db")
+    project_list_entries_store = ProjectListEntriesStore(data_dir / "projects.db")
     from tinyagentos.decisions.decision_store import DecisionStore
     decision_store = DecisionStore(data_dir / "decisions.db")
     from tinyagentos.governance.policy_store import ExecutionPolicyStore
@@ -598,6 +601,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await project_canvas_store.init()
         await doc_review_store.init()
         await project_notes_store.init()
+        await project_lists_store.init()
+        await project_list_entries_store.init()
         await decision_store.init()
         await execution_policy_store.init()
         await shared_docs_store.init()
@@ -1465,6 +1470,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await project_canvas_store.close()
         await doc_review_store.close()
         await project_notes_store.close()
+        await project_lists_store.close()
+        await project_list_entries_store.close()
         await project_invite_store.close()
         await strike_store.close()
         await project_task_store.close()
@@ -1632,6 +1639,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.project_canvas_store = project_canvas_store
     app.state.doc_review_store = doc_review_store
     app.state.project_notes_store = project_notes_store
+    app.state.project_lists_store = project_lists_store
+    app.state.project_list_entries_store = project_list_entries_store
     app.state.decision_store = decision_store
     app.state.execution_policies = execution_policy_store
     app.state.shared_docs_store = shared_docs_store
