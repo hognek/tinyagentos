@@ -39,6 +39,12 @@ const MockEventSourceCtor = vi.fn().mockImplementation(function (this: any, url:
   lastEs = this as MockEventSource;
 });
 
+// The real EventSource carries these as static members, and the hook compares
+// readyState against them. Without them both sides of `es.readyState ===
+// EventSource.CLOSED` are undefined, so every disconnect assertion below
+// passes no matter what the hook does.
+Object.assign(MockEventSourceCtor, { CONNECTING: 0, OPEN: 1, CLOSED: 2 });
+
 beforeEach(() => {
   vi.stubGlobal("EventSource", MockEventSourceCtor);
   MockEventSourceCtor.mockClear();
@@ -224,5 +230,56 @@ describe("useOsEvents", () => {
     });
 
     expect(onEvent).not.toHaveBeenCalled();
+  });
+
+  it("reopens the stream with the new kinds when kinds changes", () => {
+    const { rerender } = renderHook(
+      ({ kinds }: { kinds: string[] }) => useOsEvents(kinds, () => {}),
+      { initialProps: { kinds: ["projects.task.changed"] } },
+    );
+    expect(MockEventSourceCtor).toHaveBeenLastCalledWith(
+      "/api/os/events?kinds=projects.task.changed",
+    );
+    const first = lastEs;
+
+    rerender({ kinds: ["projects.task.changed", "notifications.new"] });
+
+    expect(first?.close).toHaveBeenCalled();
+    expect(MockEventSourceCtor).toHaveBeenLastCalledWith(
+      "/api/os/events?kinds=projects.task.changed%2Cnotifications.new",
+    );
+  });
+
+  it("does not reopen the stream when kinds is a new array with the same contents", () => {
+    const { rerender } = renderHook(
+      ({ kinds }: { kinds: string[] }) => useOsEvents(kinds, () => {}),
+      { initialProps: { kinds: ["projects.task.changed"] } },
+    );
+    expect(MockEventSourceCtor).toHaveBeenCalledTimes(1);
+
+    rerender({ kinds: ["projects.task.changed"] });
+
+    expect(MockEventSourceCtor).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports disconnected while the stream is only CONNECTING", () => {
+    const { result } = renderHook(() =>
+      useOsEvents(["projects.task.changed"], () => {}),
+    );
+
+    act(() => {
+      lastEs?.onopen?.();
+    });
+    expect(result.current.connected).toBe(true);
+
+    act(() => {
+      if (lastEs) {
+        lastEs.readyState = EventSource.CONNECTING;
+        lastEs._fireError();
+      }
+    });
+
+    expect(result.current.connected).toBe(false);
+    expect(result.current.stale).toBe(true);
   });
 });

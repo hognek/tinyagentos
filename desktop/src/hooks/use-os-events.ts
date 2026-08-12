@@ -81,20 +81,30 @@ export function useOsEvents(kinds: string[], onEvent: OsEventHandler): {
     };
 
     es.onerror = () => {
-      if (!stoppedRef.current && es.readyState === EventSource.CLOSED) {
+      if (stoppedRef.current) return;
+      // Whatever the readyState, an error means we are not receiving events.
+      // Only a CLOSED stream is ours to reconnect: while CONNECTING the
+      // browser is already retrying, and scheduling our own reconnect on top
+      // of that would open a second stream.
+      setConnected(false);
+      setStale(true);
+      if (es.readyState === EventSource.CLOSED) {
         const delay = Math.min(
           RECONNECT_DELAY_MS * 2 ** reconnectAttemptsRef.current,
           MAX_RECONNECT_DELAY_MS,
         );
         reconnectAttemptsRef.current += 1;
-        setConnected(false);
-        setStale(true);
         reconnectTimerRef.current = setTimeout(() => {
           if (!stoppedRef.current) connect();
         }, delay);
       }
     };
   }, []);
+
+  // Reconnect when the caller's kinds change: the URL is built once per
+  // connection, so without this a widened kinds list keeps streaming the old
+  // server-side filter and the new kinds never arrive.
+  const kindsKey = kinds.join(",");
 
   useEffect(() => {
     stoppedRef.current = false;
@@ -107,7 +117,7 @@ export function useOsEvents(kinds: string[], onEvent: OsEventHandler): {
       setConnected(false);
       setStale(true);
     };
-  }, [connect]);
+  }, [connect, kindsKey]);
 
   return { connected, stale };
 }

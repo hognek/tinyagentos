@@ -523,6 +523,44 @@ Route module `tinyagentos/routes/device_pair_requests.py`:
 Approval or denial of a pair request is surfaced to the user through the Decisions app;
 agents must not grant pairing directly.
 
+## OS change-event stream (`GET /api/os/events`, session-only)
+
+Route module `tinyagentos/routes/os_events.py`. A Server-Sent Events stream of
+typed OS-level change events, behind the session cookie: the path is NOT in
+`EXEMPT_PATHS`, so `AuthMiddleware` 401s an unauthenticated request before the
+handler runs, and no registry scope reaches it — a scoped agent token cannot
+subscribe. `503` while `app.state.event_bus` is still starting.
+
+- `?kinds=a,b,c` — comma-separated allowlist of event kinds. Omitted or empty
+  means every kind. Filtering is applied server-side per frame.
+- Frame shape is `data: {"kind": ..., "id": ..., "ts": ...}` and nothing else.
+  **The payload never crosses the wire** — `id` is the event's trace id, so a
+  subscriber learns that something changed and must refetch to learn what.
+- A comment frame `:keepalive` is sent every 10 s so proxies do not close an
+  idle stream.
+- Frames deliberately carry **no SSE `id:` line**. An `id:` is what makes a
+  browser send `Last-Event-ID` on reconnect, and this endpoint ignores that
+  header: resume is best-effort through the EventBus replay buffer (the last
+  32 events per channel, delivered on subscribe).
+- At most 256 events are buffered per connection. Past that the OLDEST
+  buffered event is dropped and the client is sent
+  `{"kind": "events.lagged", "dropped": N}` — its cue to refetch rather than
+  assume it saw everything. The relay never blocks, because a blocked relay
+  would stall delivery for the rest of the connection while the bus kept
+  filling queues nobody drains.
+
+Both the subscriptions and the relay tasks are created INSIDE the response
+generator, not in the handler body. An async generator closed without ever
+being iterated never runs its body, so a `finally` there can only undo setup
+that also happened there; setting up in the handler leaked a subscription per
+client that disconnected before the stream started.
+
+The desktop side is `desktop/src/hooks/use-os-events.ts`:
+`useOsEvents(kinds, onEvent)` holds one connection, returns `connected` /
+`stale`, dedupes by event id, reconnects with exponential backoff, and reopens
+the stream when `kinds` changes (the URL is fixed for the life of a
+connection, so a widened list needs a new one).
+
 ## LoRA Studio routes (session-only, no agent scope)
 
 Route module `tinyagentos/routes/lora_studio.py`. These are OWNER routes: they

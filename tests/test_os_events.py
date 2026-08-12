@@ -280,3 +280,65 @@ async def test_stream_two_subscribers_both_receive():
     assert "payload" not in evt1
     assert evt0["id"] is not None
     assert evt1["id"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Teardown: setup must be paired with the generator that tears it down
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_response_closed_without_streaming_leaks_nothing():
+    """A response that is never streamed must leave no bus subscription behind.
+
+    StreamingResponse's body_iterator is an async generator, and an async
+    generator that is closed without ever being iterated never runs its body --
+    so its ``finally`` never runs either. Any subscribe() done in the handler
+    body rather than inside the generator is therefore unpaired whenever the
+    client disconnects between the handler returning and the stream starting.
+    """
+    from tinyagentos.routes.os_events import os_events
+
+    bus = EventBus()
+    req = MagicMock()
+    req.state.user_id = "user-1"
+    req.app.state.event_bus = bus
+    req.query_params = {}
+
+    resp = await os_events(req)
+    await resp.body_iterator.aclose()
+
+    leaked = {ch: len(qs) for ch, qs in bus._queues.items() if qs}
+    assert leaked == {}, f"leftover bus subscriptions: {leaked}"
+
+
+@pytest.mark.asyncio
+async def test_relay_drops_oldest_and_counts_the_drop():
+    """The real relay never blocks: at the bound it discards the OLDEST event
+    and counts the drop, so the connection degrades into a reported gap rather
+    than stalling delivery for every later event."""
+    from tinyagentos.routes.os_events import _relay
+
+    src: asyncio.Queue = asyncio.Queue()
+    dst: asyncio.Queue = asyncio.Queue(maxsize=2)
+    lag = {"dropped": 0}
+    for i in range(4):
+        src.put_nowait(SystemEvent(kind=f"k{i}", source="s", targets=[], payload={}))
+
+    task = asyncio.create_task(_relay(src, dst, lag))
+    try:
+        await asyncio.wait_for(_until(lambda: src.empty() and lag["dropped"] == 2), 3.0)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert dst.qsize() == 2
+    assert [dst.get_nowait().kind, dst.get_nowait().kind] == ["k2", "k3"]
+
+
+async def _until(pred, interval: float = 0.01):
+    while not pred():
+        await asyncio.sleep(interval)

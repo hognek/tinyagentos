@@ -17,13 +17,20 @@ Query params:
 Reconnect / resume: the EventBus replay buffer (last 32 events per channel)
 is delivered to new subscribers automatically on subscribe(), so recent
 events are re-streamed on every (re)connect.  This is best-effort, not
-precise replay via Last-Event-ID.
+precise replay via Last-Event-ID -- and so frames deliberately carry NO SSE
+``id:`` line, which is what would make a browser send Last-Event-ID at all.
+
+Backpressure: at most 256 events are buffered per connection.  A client that
+falls further behind loses the OLDEST buffered events and is then sent a
+``{"kind": "events.lagged", "dropped": N}`` frame, its cue to refetch state
+rather than assume it saw everything.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import time
 
 from fastapi import APIRouter
 from fastapi.requests import Request
@@ -32,6 +39,33 @@ from fastapi.responses import JSONResponse, StreamingResponse
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Upper bound on events buffered for one connection. The bus itself hands out
+# unbounded queues, so without a cap a client that stops reading grows the
+# process's memory with every event forever.
+_MERGED_MAXSIZE = 256
+
+
+async def _relay(src: asyncio.Queue, dst: asyncio.Queue, lag: dict) -> None:
+    """Move events from a channel queue into the merged queue, never blocking.
+
+    When *dst* is full the OLDEST event is discarded to make room and the
+    drop is counted, so a slow client degrades into a gap it is told about
+    rather than stalling the relay (which would silently stop delivery for
+    the whole connection and pin both channel queues in memory).
+    """
+    while True:
+        ev = await src.get()
+        while True:
+            try:
+                dst.put_nowait(ev)
+                break
+            except asyncio.QueueFull:
+                try:
+                    dst.get_nowait()
+                    lag["dropped"] += 1
+                except asyncio.QueueEmpty:  # pragma: no cover - dst cannot be both full and empty
+                    break
 
 
 @router.get("/api/os/events")
@@ -63,25 +97,37 @@ async def os_events(request: Request):
     )
 
     user_ch = f"user:{user_id}"
-    user_q = await event_bus.subscribe(user_ch)
-    bcast_q = await event_bus.subscribe("broadcast")
-
-    # Merge both channels into a single queue so the generator has one await.
-    merged: asyncio.Queue = asyncio.Queue()
-
-    async def _relay(src: asyncio.Queue) -> None:
-        while True:
-            ev = await src.get()
-            await merged.put(ev)
-
-    relay_tasks = [
-        asyncio.create_task(_relay(user_q), name="os-events-relay-user"),
-        asyncio.create_task(_relay(bcast_q), name="os-events-relay-bcast"),
-    ]
 
     async def gen():
-        seq = 0
+        # Subscribe and start the relays INSIDE the generator, not in the
+        # handler body. An async generator that is closed without ever being
+        # iterated never runs its body, so a finally in here can only undo
+        # setup that also happened in here. Done in the handler, a client that
+        # disconnects between the handler returning and StreamingResponse
+        # starting to stream leaked two EventBus subscriptions and two
+        # never-cancelled relay tasks per occurrence -- and the bus keeps
+        # feeding those queues forever, since nothing ever drains them.
+        user_q = None
+        bcast_q = None
+        relay_tasks: list[asyncio.Task] = []
         try:
+            user_q = await event_bus.subscribe(user_ch)
+            bcast_q = await event_bus.subscribe("broadcast")
+
+            # Merge both channels into a single queue so the generator has one
+            # await. Bounded: see _relay for the overflow behaviour.
+            merged: asyncio.Queue = asyncio.Queue(maxsize=_MERGED_MAXSIZE)
+            lag = {"dropped": 0}
+
+            relay_tasks = [
+                asyncio.create_task(
+                    _relay(user_q, merged, lag), name="os-events-relay-user"
+                ),
+                asyncio.create_task(
+                    _relay(bcast_q, merged, lag), name="os-events-relay-bcast"
+                ),
+            ]
+
             while True:
                 if await request.is_disconnected():
                     return
@@ -90,9 +136,18 @@ async def os_events(request: Request):
                 except asyncio.TimeoutError:
                     yield ":keepalive\n\n"
                     continue
+                if lag["dropped"]:
+                    dropped, lag["dropped"] = lag["dropped"], 0
+                    yield "data: " + json.dumps(
+                        {
+                            "kind": "events.lagged",
+                            "id": None,
+                            "ts": time.time(),
+                            "dropped": dropped,
+                        }
+                    ) + "\n\n"
                 if allowed_kinds is not None and event.kind not in allowed_kinds:
                     continue
-                seq += 1
                 data = json.dumps(
                     {
                         "kind": event.kind,
@@ -100,13 +155,19 @@ async def os_events(request: Request):
                         "ts": event.ts,
                     }
                 )
-                yield f"id: {seq}\ndata: {data}\n\n"
+                # No SSE "id:" line: emitting one makes a browser send
+                # Last-Event-ID on reconnect, which this endpoint ignores --
+                # resume is best-effort via the bus replay buffer.
+                yield f"data: {data}\n\n"
         finally:
             for t in relay_tasks:
                 t.cancel()
-            await asyncio.gather(*relay_tasks, return_exceptions=True)
-            await event_bus.unsubscribe(user_ch, user_q)
-            await event_bus.unsubscribe("broadcast", bcast_q)
+            if relay_tasks:
+                await asyncio.gather(*relay_tasks, return_exceptions=True)
+            if user_q is not None:
+                await event_bus.unsubscribe(user_ch, user_q)
+            if bcast_q is not None:
+                await event_bus.unsubscribe("broadcast", bcast_q)
 
     # Cache-Control: no-cache + X-Accel-Buffering: no prevent nginx/proxies
     # from buffering the stream (which would coalesce or delay events).
