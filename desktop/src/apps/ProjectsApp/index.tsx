@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { projectsApi, type Project } from "@/lib/projects";
 import { useProcessStore } from "@/stores/process-store";
 import { getApp } from "@/registry/app-registry";
 import { useIsMobile } from "../../hooks/use-is-mobile";
+import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
 import { MobileSplitView } from "../../components/mobile/MobileSplitView";
 import { ProjectList } from "./ProjectList";
 import { ProjectWorkspace } from "./ProjectWorkspace";
@@ -36,15 +37,11 @@ export function ProjectsApp({
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const isMobile = useIsMobile();
 
-  const refresh = async () => {
+  const refresh = useCallback(async () => {
     try {
       const list = await projectsApi.list("active");
       setProjects(list);
       setError(null);
-      // Mobile shows the project list as its own screen; auto-selecting
-      // the first project would slide the user straight into the detail
-      // view and skip the list. Desktop's split layout shows both at once,
-      // so picking up the first project is a useful default there.
       const stillExists = selectedId && list.some((p) => p.id === selectedId);
       if (!stillExists && !isMobile) {
         setSelectedId(list.length > 0 ? list[0]!.id : null);
@@ -54,11 +51,13 @@ export function ProjectsApp({
     } catch (e) {
       setError(String(e));
     }
-  };
+  }, [selectedId, isMobile]);
 
   useEffect(() => {
     refresh();
-  }, []);
+  }, [refresh]);
+
+  useRefreshOnFocus(refresh);
 
   const selected = projects.find((p) => p.id === selectedId) ?? null;
 

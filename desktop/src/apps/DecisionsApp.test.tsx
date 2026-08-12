@@ -282,4 +282,26 @@ describe("DecisionsApp", () => {
     expect(steps[0].textContent).toContain("Original tldraw replacement pick");
     expect(steps[1].textContent).toContain("Revised tldraw replacement pick");
   });
+
+  it("refreshes when the window regains focus", async () => {
+    const fetchMock = mockFetch({
+      "GET /api/decisions?status=pending": { ok: true, body: [] },
+      "GET /api/decisions?status=answered": { ok: true, body: [] },
+      "GET /api/agents/auth-requests?status=pending": { ok: true, body: { requests: [] } },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<DecisionsApp windowId="w1" />);
+    await flush();
+
+    const pendingCalls = (url: string) =>
+      fetchMock.mock.calls.filter((c) => c[0] === url).length;
+    const initialPending = pendingCalls("/api/decisions?status=pending");
+
+    window.dispatchEvent(new Event("focus"));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 1100));
+    });
+
+    expect(pendingCalls("/api/decisions?status=pending")).toBe(initialPending + 1);
+  });
 });

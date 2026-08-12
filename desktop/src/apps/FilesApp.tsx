@@ -37,6 +37,7 @@ import { resolveAgentEmoji } from "@/lib/agent-emoji";
 import { projectsApi, type DocReviewState } from "@/lib/projects";
 import { useDragSource } from "@/shell/dnd/use-drag-source";
 import { DocViewer } from "@/apps/ProjectsApp/files/DocViewer";
+import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -657,6 +658,8 @@ export function FilesApp({
   useEffect(() => {
     fetchFiles(currentPath);
   }, [currentPath, fetchFiles]);
+
+  useRefreshOnFocus(fetchFiles);
 
   // Live updates via SSE — supports both the user workspace and per-agent
   // workspaces. Shared folders don't expose a watch stream, so the SSE setup

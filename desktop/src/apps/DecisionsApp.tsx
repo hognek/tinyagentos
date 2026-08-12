@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import { Button, Textarea } from "@/components/ui";
 import { ConsentActions } from "@/components/ConsentActions";
+import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
 
 type DecisionType =
   | "single_select"
@@ -537,6 +538,8 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
   useEffect(() => {
     load();
   }, [load]);
+
+  useRefreshOnFocus(load);
 
   const answer = useCallback(
     async (id: string, value: string | string[]) => {

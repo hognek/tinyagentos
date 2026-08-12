@@ -72,6 +72,7 @@ import remarkGfm from "remark-gfm";
 import { SearchPanel } from "./chat/SearchPanel";
 import { ChannelSidebar } from "./chat/ChannelSidebar";
 import { A2aBusMessageView, useBusChannels } from "./chat/A2aBusPanel";
+import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -933,6 +934,8 @@ export function MessagesApp({
       }
     };
   }, [fetchChannels, fetchArchivedChannels, fetchAgentLists, connectWs]);
+
+  useRefreshOnFocus(fetchChannels);
 
   /* ---- keep unreadRef in sync with the unread state without re-running
    * the channel-selection effect (which would re-capture the pending count). ---- */

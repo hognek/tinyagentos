@@ -22,6 +22,11 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
   surface (`agent_scope_requests_store.py`, `agent_auth_requests.py`, and
   related token-auth files) now require `docs/agent-manual/` to be touched.
 
+- A shared `useRefreshOnFocus` hook re-runs a supplied refetch when the
+  desktop window regains focus or document visibility returns to visible,
+  debouncing within ~1s to coalesce focus flapping. It is adopted by Projects,
+  Agents, Messages, Files, Notifications, Cluster, and Decisions.
+
 ### Changed
 
 - The Docs-Reviewed trailer override is now logged in CI output: when a commit
