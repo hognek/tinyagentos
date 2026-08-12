@@ -21,6 +21,20 @@ export function ProjectLists({ project }: { project: Project }) {
   const [submitting, setSubmitting] = useState(false);
   const quickInputRef = useRef<HTMLInputElement>(null);
 
+  // Drop the previous project's selection DURING RENDER, not in an effect.
+  // ProjectWorkspace renders <ProjectLists project={project} /> unkeyed and is
+  // itself unkeyed, so a project switch reuses this component. Resetting in an
+  // effect is too late: the entries effect re-runs in the same commit (its deps
+  // include project.id) and would fetch
+  // /api/projects/<new>/lists/<old-list-id>/entries first. This is React's
+  // adjust-state-on-prop-change pattern and it runs before any effect.
+  const [prevProjectId, setPrevProjectId] = useState(project.id);
+  if (prevProjectId !== project.id) {
+    setPrevProjectId(project.id);
+    setSelectedListId(null);
+    setEntries([]);
+  }
+
   const refreshLists = useCallback(() => {
     // Sets state, like refreshEntries below. It used to only RETURN the lists,
     // so createList/deleteList awaited a fetch whose result was discarded -- a
@@ -58,7 +72,14 @@ export function ProjectLists({ project }: { project: Project }) {
       .then((ls) => {
         if (!cancelled) {
           setLists(ls);
-          if (!selectedListId && ls.length > 0) setSelectedListId(ls[0]!.id);
+          // Keep the selection only if it belongs to THIS project's lists.
+          // ProjectWorkspace renders <ProjectLists project={project} /> with no
+          // key and is itself unkeyed, so switching project does not remount:
+          // the previous project's selectedListId survived and the entries
+          // effect then fetched /api/projects/<new>/lists/<old-id>/entries.
+          // The functional form also avoids depending on a stale closure value.
+          setSelectedListId((prev) =>
+            prev && ls.some((l) => l.id === prev) ? prev : (ls[0]?.id ?? null));
         }
       })
       .catch(() => {
@@ -79,10 +100,12 @@ export function ProjectLists({ project }: { project: Project }) {
   }, [selectedListId, refreshEntries]);
 
   const createList = async () => {
-    const title = prompt("New list name");
+    // Trim BEFORE the empty check: "   " is truthy, so a whitespace-only
+    // answer used to reach the API as an empty title.
+    const title = prompt("New list name")?.trim();
     if (!title) return;
     try {
-      const created = await projectsApi.lists.create(project.id, { title: title.trim() });
+      const created = await projectsApi.lists.create(project.id, { title });
       await refreshLists();
       setSelectedListId(created.id);
     } catch (err) {

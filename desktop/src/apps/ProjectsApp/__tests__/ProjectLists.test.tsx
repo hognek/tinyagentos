@@ -35,6 +35,12 @@ describe("ProjectLists", () => {
     ];
 
     fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url === "/api/projects/p2/lists") {
+        return Promise.resolve(ok({ items: [{ id: "lst-p2", project_id: "p2", title: "Other project list", description: "", status: "active", created_by: "u1", created_at: 0, updated_at: 0 }] }));
+      }
+      if (url === "/api/projects/p2/lists/lst-p2/entries") {
+        return Promise.resolve(ok({ items: [] }));
+      }
       if (url === "/api/projects/p1/lists") {
         if (init?.method === "POST") {
           // The mock has to behave like the server: a created list is in the
@@ -146,6 +152,35 @@ describe("ProjectLists", () => {
       fireEvent.click(screen.getByLabelText("Create new list"));
     });
     await waitFor(() => expect(screen.getAllByText("New list").length).toBeGreaterThanOrEqual(1));
+  });
+
+  it("switching project does not keep the previous project's selected list", async () => {
+    // Neither ProjectWorkspace nor ProjectLists is keyed by project, so the
+    // component is reused across a switch and the old selection survived.
+    let view: ReturnType<typeof render>;
+    await act(async () => {
+      view = render(<ProjectLists project={fakeProject} />);
+    });
+    await act(async () => {
+      view!.rerender(<ProjectLists project={{ ...fakeProject, id: "p2", slug: "p2", name: "P2" }} />);
+    });
+    await waitFor(() => expect(screen.getAllByText("Other project list").length).toBeGreaterThanOrEqual(1));
+    // the old project's entries must not still be on screen
+    expect(screen.queryByText("Milk")).not.toBeInTheDocument();
+    const badFetch = fetchMock.mock.calls.find(([u]) => String(u) === "/api/projects/p2/lists/lst-1/entries");
+    expect(badFetch).toBeUndefined();
+  });
+
+  it("a whitespace-only list name creates nothing", async () => {
+    vi.stubGlobal("prompt", vi.fn(() => "   "));
+    await act(async () => {
+      render(<ProjectLists project={fakeProject} />);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Create new list"));
+    });
+    const posted = fetchMock.mock.calls.find(([u, i]) => String(u) === "/api/projects/p1/lists" && (i as RequestInit | undefined)?.method === "POST");
+    expect(posted).toBeUndefined();
   });
 
   it("a deleted list disappears from the rail", async () => {
