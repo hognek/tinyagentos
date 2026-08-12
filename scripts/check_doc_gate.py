@@ -54,8 +54,9 @@ EXIT_CONFIG_ERROR = 3
 # exist in the repo itself. `-` is in the lookbehind for the same reason:
 # home-dir slugs like "-*-tinyagentos/memory/MEMORY.md" embed a repo prefix
 # after a hyphen, and the glob `*` sits BEFORE the match so the glob filter
-# never sees it.
-_TOKEN_RE = re.compile(r"(?<![\w/-])(?:scripts|tinyagentos|docs|desktop)/[^\s`\"'|]+")
+# never sees it. `)` and `]` are excluded from the token body so a markdown
+# link's closing bracket ends the token instead of gluing the URL on.
+_TOKEN_RE = re.compile(r"(?<![\w/-])(?:scripts|tinyagentos|docs|desktop)/[^\s`\"'|)\]]+")
 
 # Chars that mark a token as a glob pattern or a <placeholder> rather than a
 # concrete repo path -- these are never asserted to exist.
@@ -63,6 +64,12 @@ _GLOB_OR_PLACEHOLDER_CHARS = set("*?[]{}<>$~")
 
 # Trailing punctuation that is prose/markdown decoration, not part of the path.
 _TRAILING_PUNCT = ".,;:!?)]}'\"`"
+
+# A line-citation suffix: `:123`, `:12-20`, `:1,5-9`, and repeated groups so
+# file:line:col (ripgrep, compiler output) collapses in one pass. Applied
+# AFTER the trailing-punct strip — the anchor is defeated by a trailing full
+# stop or comma otherwise, and citations ending a sentence are the common case.
+_LINE_SUFFIX_RE = re.compile(r"(?::[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*)+$")
 
 
 def _clean_token(raw: str) -> str | None:
@@ -75,6 +82,7 @@ def _clean_token(raw: str) -> str | None:
             token = token.split(sep, 1)[0]
     while token and token[-1] in _TRAILING_PUNCT:
         token = token[:-1]
+    token = _LINE_SUFFIX_RE.sub("", token)
     if not token:
         return None
     if any(c in _GLOB_OR_PLACEHOLDER_CHARS for c in token):
