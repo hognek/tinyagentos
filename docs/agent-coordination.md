@@ -531,8 +531,13 @@ typed OS-level change events, behind the session cookie: the path is NOT in
 handler runs, and no registry scope reaches it — a scoped agent token cannot
 subscribe. `503` while `app.state.event_bus` is still starting.
 
-- `?kinds=a,b,c` — comma-separated allowlist of event kinds. Omitted or empty
-  means every kind. Filtering is applied server-side per frame.
+- `?kinds=a,b,c` — comma-separated allowlist of event kinds. Omitted, empty, or
+  naming no kind at all (`?kinds=`, `?kinds=%20`, `?kinds=,`) means every kind:
+  the allowlist is derived first and an empty one means "no filter", because a
+  truthy-but-blank parameter otherwise built a set that matched nothing and the
+  stream delivered silence. Filtering happens as events enter the per-connection
+  buffer, not as they leave it, so an unrequested kind can never occupy a slot
+  and evict something the subscriber did ask for.
 - Frame shape is `data: {"kind": ..., "id": ..., "ts": ...}` and nothing else.
   **The payload never crosses the wire** — `id` is the event's trace id, so a
   subscriber learns that something changed and must refetch to learn what.
@@ -545,7 +550,11 @@ subscribe. `503` while `app.state.event_bus` is still starting.
 - At most 256 events are buffered per connection. Past that the OLDEST
   buffered event is dropped and the client is sent
   `{"kind": "events.lagged", "dropped": N}` — its cue to refetch rather than
-  assume it saw everything. The relay never blocks, because a blocked relay
+  assume it saw everything. This is a CONTROL frame, not a change
+  notification: its `id` is null, and the hook delivers it even when the
+  caller asked for a narrow `kinds` list (a subscriber to one kind still needs
+  to learn it may have missed some of that kind) and never dedupes it, since a
+  null id would make every lag frame after the first look already-seen. The relay never blocks, because a blocked relay
   would stall delivery for the rest of the connection while the bus kept
   filling queues nobody drains.
 

@@ -342,3 +342,94 @@ async def test_relay_drops_oldest_and_counts_the_drop():
 async def _until(pred, interval: float = 0.01):
     while not pred():
         await asyncio.sleep(interval)
+
+
+@pytest.mark.asyncio
+async def test_relay_drops_unrequested_kinds_before_they_take_a_slot():
+    """Filtering happens in the relay, not at the yield.
+
+    Filtering later would let a busy unrelated kind evict the events this
+    subscriber asked for and then report a lag it never actually suffered.
+    """
+    from tinyagentos.routes.os_events import _relay
+
+    src: asyncio.Queue = asyncio.Queue()
+    dst: asyncio.Queue = asyncio.Queue(maxsize=2)
+    lag = {"dropped": 0}
+    for kind in ("noise", "noise", "noise", "wanted"):
+        src.put_nowait(SystemEvent(kind=kind, source="s", targets=[], payload={}))
+
+    task = asyncio.create_task(_relay(src, dst, lag, {"wanted"}))
+    try:
+        await asyncio.wait_for(_until(lambda: src.empty() and dst.qsize() == 1), 3.0)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert dst.get_nowait().kind == "wanted"
+    assert lag["dropped"] == 0, "unrequested kinds must not be reported as a lag"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("qs", [b"", b"kinds=", b"kinds=%20%20", b"kinds=%2C"])
+async def test_blank_kinds_parameter_delivers_every_kind(qs):
+    """A kinds parameter that names no kind must not filter everything out.
+
+    `?kinds=   ` is truthy, so deriving the allowlist from the raw string built
+    an EMPTY set that matched nothing and the stream delivered zero events.
+    Driven through the real app so the assertion is about behaviour.
+    """
+    app = _make_app()
+    bus: EventBus = app.state.event_bus
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "headers": [(b"accept", b"text/event-stream")],
+        "scheme": "http",
+        "path": "/api/os/events",
+        "raw_path": b"/api/os/events",
+        "query_string": qs,
+        "server": ("testserver", 80),
+        "client": ("127.0.0.1", 1234),
+        "root_path": "",
+        "state": State(),
+    }
+    scope["state"].user_id = "user-1"
+    scope["state"].is_admin = False
+
+    lines: list[str] = []
+    done = asyncio.Event()
+
+    async def receive():
+        await done.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message["type"] == "http.response.body":
+            for line in message.get("body", b"").decode().split("\n"):
+                if line.rstrip("\r").startswith("data:"):
+                    lines.append(line.rstrip("\r"))
+                    done.set()
+
+    task = asyncio.create_task(app(scope, receive, send))
+    await asyncio.sleep(0.2)
+    await bus.broadcast(
+        SystemEvent(kind="anything.at.all", source="system", targets=["broadcast"], payload={})
+    )
+    try:
+        await asyncio.wait_for(done.wait(), timeout=3.0)
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    assert lines, f"blank kinds ({qs!r}) delivered nothing"
+    assert json.loads(lines[0][5:].strip())["kind"] == "anything.at.all"

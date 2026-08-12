@@ -282,4 +282,28 @@ describe("useOsEvents", () => {
     expect(result.current.connected).toBe(false);
     expect(result.current.stale).toBe(true);
   });
+  it("delivers events.lagged even when it is not in the caller's kinds", () => {
+    const onEvent = vi.fn();
+    renderHook(() => useOsEvents(["projects.task.changed"], onEvent));
+
+    act(() => {
+      lastEs?._fire({ kind: "events.lagged", id: null, ts: 1, dropped: 7 });
+    });
+
+    expect(onEvent).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "events.lagged", dropped: 7 }),
+    );
+  });
+
+  it("does not dedupe successive events.lagged frames (their id is null)", () => {
+    const onEvent = vi.fn();
+    renderHook(() => useOsEvents([], onEvent));
+
+    act(() => {
+      lastEs?._fire({ kind: "events.lagged", id: null, ts: 1, dropped: 2 });
+      lastEs?._fire({ kind: "events.lagged", id: null, ts: 2, dropped: 5 });
+    });
+
+    expect(onEvent).toHaveBeenCalledTimes(2);
+  });
 });

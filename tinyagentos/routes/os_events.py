@@ -46,16 +46,25 @@ router = APIRouter()
 _MERGED_MAXSIZE = 256
 
 
-async def _relay(src: asyncio.Queue, dst: asyncio.Queue, lag: dict) -> None:
+async def _relay(
+    src: asyncio.Queue, dst: asyncio.Queue, lag: dict, allowed_kinds: set | None = None
+) -> None:
     """Move events from a channel queue into the merged queue, never blocking.
 
     When *dst* is full the OLDEST event is discarded to make room and the
     drop is counted, so a slow client degrades into a gap it is told about
     rather than stalling the relay (which would silently stop delivery for
     the whole connection and pin both channel queues in memory).
+
+    The kind filter is applied HERE rather than at the yield, so an unwanted
+    kind never occupies one of the bounded slots. Filtering later would let a
+    busy unrelated kind evict the events this subscriber actually asked for
+    and report a lag that, from the subscriber's point of view, never happened.
     """
     while True:
         ev = await src.get()
+        if allowed_kinds is not None and ev.kind not in allowed_kinds:
+            continue
         while True:
             try:
                 dst.put_nowait(ev)
@@ -89,12 +98,14 @@ async def os_events(request: Request):
     if event_bus is None:
         return JSONResponse({"detail": "Service starting"}, status_code=503)
 
+    # An all-whitespace kinds parameter is truthy but names no kind. Deriving
+    # the set FIRST and treating an empty one as "no filter" keeps `?kinds=` and
+    # `?kinds=   ` behaving the way the docstring promises; testing the raw
+    # string instead produced an empty allowlist that matched nothing, so the
+    # stream silently delivered zero events.
     kinds_param = request.query_params.get("kinds", "")
-    allowed_kinds = (
-        {k.strip() for k in kinds_param.split(",") if k.strip()}
-        if kinds_param
-        else None
-    )
+    _requested = {k.strip() for k in kinds_param.split(",") if k.strip()}
+    allowed_kinds = _requested or None
 
     user_ch = f"user:{user_id}"
 
@@ -121,10 +132,12 @@ async def os_events(request: Request):
 
             relay_tasks = [
                 asyncio.create_task(
-                    _relay(user_q, merged, lag), name="os-events-relay-user"
+                    _relay(user_q, merged, lag, allowed_kinds),
+                    name="os-events-relay-user",
                 ),
                 asyncio.create_task(
-                    _relay(bcast_q, merged, lag), name="os-events-relay-bcast"
+                    _relay(bcast_q, merged, lag, allowed_kinds),
+                    name="os-events-relay-bcast",
                 ),
             ]
 
@@ -146,8 +159,8 @@ async def os_events(request: Request):
                             "dropped": dropped,
                         }
                     ) + "\n\n"
-                if allowed_kinds is not None and event.kind not in allowed_kinds:
-                    continue
+                # No kind filter here: _relay already dropped everything this
+                # subscriber did not ask for, before it could take a slot.
                 data = json.dumps(
                     {
                         "kind": event.kind,

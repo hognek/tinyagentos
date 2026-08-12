@@ -2,9 +2,19 @@ import { useEffect, useState, useCallback, useRef } from "react";
 
 export type OsEvent = {
   kind: string;
-  id: string;
+  /** Trace id of the source event. Null on control frames, which describe the
+   *  stream itself rather than a change that happened in it. */
+  id: string | null;
   ts: number;
+  /** Only on `events.lagged`: how many events were dropped before this frame. */
+  dropped?: number;
 };
+
+/** Control frame: the server dropped events for this connection because the
+ *  client fell behind. It is NOT a change notification, so it bypasses the
+ *  caller's kind filter — a subscriber that asked for one kind still has to
+ *  learn it may have missed some of that kind. */
+export const LAGGED_KIND = "events.lagged";
 
 type OsEventHandler = (event: OsEvent) => void;
 
@@ -46,7 +56,7 @@ export function useOsEvents(kinds: string[], onEvent: OsEventHandler): {
     const es = new EventSource(url);
     esRef.current = es;
 
-    const alreadySeen = (id: string | undefined): boolean => {
+    const alreadySeen = (id: string | null | undefined): boolean => {
       if (!id) return false;
       if (seenRef.current.has(id)) return true;
       seenRef.current.add(id);
@@ -73,6 +83,12 @@ export function useOsEvents(kinds: string[], onEvent: OsEventHandler): {
       }
       if (!event || typeof event !== "object") return;
       if (!event.kind) return;
+      if (event.kind === LAGGED_KIND) {
+        // Always delivered, and never deduped: its id is null, so every lag
+        // frame after the first would otherwise collapse into "already seen".
+        onEventRef.current(event);
+        return;
+      }
       if (kindsRef.current.length > 0 && !kindsRef.current.includes(event.kind)) {
         return;
       }
