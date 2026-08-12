@@ -364,3 +364,43 @@ class TestReorderContract:
             json={"entries": [{"id": "ent-1"}]},
         )
         assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.asyncio
+class TestSessionNonOwner:
+    async def test_session_non_owner_cannot_tell_the_project_exists(self, ctx):
+        """A signed-in NON-ADMIN who does not own the project gets the same 404
+        as for a project that does not exist.
+
+        `_get_owned_project` decides this by comparing ids, so no second user
+        record is needed (and `setup_user` refuses one once a user exists). The
+        route is called directly because the only session the test client can
+        present is the owner's.
+        """
+        from tinyagentos.routes.project_lists import list_lists
+
+        pid = await _new_project(ctx, "alpha")
+        intruder = SimpleNamespace(
+            app=ctx.app,
+            state=SimpleNamespace(user_id="not-the-owner", is_admin=False),
+        )
+
+        resp = await list_lists(pid, intruder)
+
+        assert resp.status_code == 404
+        assert b"not found" in bytes(resp.body)
+
+    async def test_owner_still_reaches_the_route(self, ctx):
+        """Guard against the assertion above passing for the wrong reason: the
+        same call shape with the OWNER's id must succeed."""
+        from tinyagentos.routes.project_lists import list_lists
+
+        pid = await _new_project(ctx, "alpha")
+        owner = SimpleNamespace(
+            app=ctx.app,
+            state=SimpleNamespace(user_id=ctx.uid, is_admin=False),
+        )
+
+        result = await list_lists(pid, owner)
+
+        assert result == {"items": []}
