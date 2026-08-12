@@ -106,6 +106,32 @@ _AGENT_DOC_REVIEW_ROUTES = (
     ("PUT", re.compile(rf"^/api/projects/{_SEG}/doc-review/(.+)$")),
 )
 
+# Project lists routes an agent may reach with its own registry JWT
+# (scope project_lists, verified + project-bound by the route).  These
+# are DYNAMIC paths (/api/projects/{pid}/lists...), so a (method,
+# compiled-regex) allowlist is used instead.  The token only reaches the
+# handler, which then verifies the JWT + grant + project binding; nothing
+# else is reachable by the token.
+_AGENT_LISTS_ROUTES = (
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/lists$")),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/lists$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/lists/{_SEG}$")),
+    ("PATCH", re.compile(rf"^/api/projects/{_SEG}/lists/{_SEG}$")),
+    ("DELETE", re.compile(rf"^/api/projects/{_SEG}/lists/{_SEG}$")),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/lists/{_SEG}/entries$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/lists/{_SEG}/entries$")),
+    ("PATCH", re.compile(rf"^/api/projects/{_SEG}/lists/{_SEG}/entries/{_SEG}$")),
+    ("DELETE", re.compile(rf"^/api/projects/{_SEG}/lists/{_SEG}/entries/{_SEG}$")),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/lists/{_SEG}/entries/reorder$")),
+)
+
+
+def _is_agent_lists_path(method: str, path: str) -> bool:
+    """True only for the exact subset of list routes a project_lists token may
+    reach.  Strict method + anchored-regex match; everything else is excluded."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_LISTS_ROUTES)
+
+
 # Project notes store routes an agent may reach with its own registry JWT
 # (scope project_notes, verified + project-bound by the route).  The token only
 # reaches the handler, which then verifies the JWT + grant + project binding;
@@ -496,6 +522,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             or _is_agent_task_path(request.method, path)
             or _is_agent_doc_review_path(request.method, path)
             or _is_agent_notes_path(request.method, path)
+            or _is_agent_lists_path(request.method, path)
             or _is_agent_canvas_path(request.method, path)
             or _is_agent_decisions_path(request.method, path)
             or _is_agent_files_path(request.method, path)
