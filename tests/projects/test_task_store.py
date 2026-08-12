@@ -153,6 +153,36 @@ async def test_reopen_task_is_noop_when_not_closed(store):
 
 
 @pytest.mark.asyncio
+async def test_unquarantine_returns_claimed_task_to_claimable_pool(store):
+    t = await store.create_task(project_id="p", title="A", created_by="u")
+    await store.claim_task(t["id"], claimer_id="agent-1")
+    assert await store.quarantine_task(t["id"], actor="lead") is True
+    assert await store.unquarantine_task(t["id"], actor="lead") is True
+    back = await store.get_task(t["id"])
+    assert back["status"] == "open"
+    # unquarantined task must return to the claimable pool, so the old claimer clears
+    assert back["claimed_by"] is None
+    assert back["claimed_at"] is None
+    # the pool must be real: claim_task requires claimed_by IS NULL, so a stale
+    # claimer would leave the card open-but-unclaimable forever
+    assert await store.claim_task(t["id"], claimer_id="agent-2") is True
+
+
+@pytest.mark.asyncio
+async def test_update_task_status_open_returns_task_to_claimable_pool(store):
+    # Same class via the generic edit path: the owner/admin PATCH route can
+    # set status='open' on a claimed card directly through update_task.
+    t = await store.create_task(project_id="p", title="A", created_by="u")
+    await store.claim_task(t["id"], claimer_id="agent-1")
+    await store.update_task(t["id"], status="open")
+    back = await store.get_task(t["id"])
+    assert back["status"] == "open"
+    assert back["claimed_by"] is None
+    assert back["claimed_at"] is None
+    assert await store.claim_task(t["id"], claimer_id="agent-2") is True
+
+
+@pytest.mark.asyncio
 async def test_add_relationship_and_list(store):
     a = await store.create_task(project_id="p", title="A", created_by="u")
     b = await store.create_task(project_id="p", title="B", created_by="u")
