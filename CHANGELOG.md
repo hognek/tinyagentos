@@ -7,6 +7,27 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
 
 ## [Unreleased]
 
+### Added
+
+- Doc-gate now triggers on plain modifications (not only add/delete) for
+  behaviour-bearing trees: routes, installers, app-catalog, and auth_middleware.
+  A modified route file now requires `docs/agent-coordination.md` to be touched
+  in the same PR.
+
+- A new CHANGELOG rule covers every code change under `tinyagentos/` or
+  `desktop/src/` that is not test-only: such changes require a `CHANGELOG.md`
+  edit or a new `changelog.d/` fragment.
+
+- Agent-facing coverage is broadened: changes to the agent identity and scope
+  surface (`agent_scope_requests_store.py`, `agent_auth_requests.py`, and
+  related token-auth files) now require `docs/agent-manual/` to be touched.
+
+### Changed
+
+- The Docs-Reviewed trailer override is now logged in CI output: when a commit
+  carries the trailer, the gate prints the commit hash, author, and trailer
+  text. The escape hatch still works exactly as before.
+
 ## [1.0.0-beta.48] - 2026-08-11
 
 ### Added

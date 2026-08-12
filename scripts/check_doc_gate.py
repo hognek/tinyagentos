@@ -315,6 +315,37 @@ def _git_commit_messages(base_ref: str) -> list[str]:
     return [m for m in out.split("\x00") if m.strip()]
 
 
+def _git_commits_with_messages(base_ref: str) -> list[tuple[str, str, str]]:
+    """Return (hash, author_name, message_body) for each commit in the range."""
+    # %x1e terminates each commit record and %x1f separates the three fields
+    # inside it. A record terminator distinct from the field separator is what
+    # makes this parseable: with one separator for both, the flat split cannot
+    # tell a new commit's hash from the previous commit's body.
+    out = _run_git(["log", f"{base_ref}..HEAD", "--format=%H%x1f%an%x1f%B%x1e"])
+    commits: list[tuple[str, str, str]] = []
+    for record in out.split("\x1e"):
+        if not record.strip():
+            continue
+        fields = record.lstrip("\n").split("\x1f")
+        if len(fields) < 3:
+            continue
+        commit_hash, author, body = fields[0], fields[1], fields[2]
+        commits.append((commit_hash.strip(), author, body))
+    return commits
+
+
+def _log_trailer_usage(commits: list[tuple[str, str, str]], trailer: str) -> None:
+    """Print a log line for each commit that carries a non-empty trailer."""
+    for commit_hash, author, message in commits:
+        for line in message.splitlines():
+            stripped = line.strip()
+            if stripped.startswith(trailer) and stripped[len(trailer):].strip():
+                short_hash = commit_hash[:8]
+                why = stripped[len(trailer):].strip()
+                print(f"doc-gate: trailer override used in {short_hash} by {author}: {why}")
+                break
+
+
 def get_trailer(config: dict) -> str:
     """Single source of truth for the commit-message trailer prefix, shared
     by the diff-gate check and the hooks (via the print-trailer command)."""
@@ -365,7 +396,9 @@ def main(argv: list[str] | None = None) -> int:
         commit_messages: list[str] = []
     else:
         changed = _git_changed_base(args.base)
-        commit_messages = _git_commit_messages(args.base)
+        commits_meta = _git_commits_with_messages(args.base)
+        commit_messages = [msg for _hash, _author, msg in commits_meta]
+        _log_trailer_usage(commits_meta, get_trailer(config))
 
     failures = evaluate_rules(changed, commit_messages, config)
     return _report(failures)
