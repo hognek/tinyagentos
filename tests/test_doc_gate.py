@@ -186,6 +186,36 @@ class TestCheckReferencedPaths:
         failures = dg.check_referenced_paths(tmp_path, ["README.md"], {})
         assert failures == []
 
+    @pytest.mark.parametrize(
+        "prose",
+        [
+            "See scripts/foo.sh:123. That is the place.",   # sentence-ending stop
+            "In scripts/foo.sh:123, the loop starts.",       # list/apposition comma
+            "grep hit at scripts/foo.sh:12:34 today",        # file:line:col
+            "the range (scripts/foo.sh:12-20) covers it",    # paren-closed range
+            "multi scripts/foo.sh:1,5-9 selection",          # comma range list
+        ],
+    )
+    def test_citation_shapes_with_punctuation_are_ignored(self, tmp_path: Path, prose):
+        """The four shapes that false-positived when the suffix strip ran
+        BEFORE the trailing-punct loop (lead block on #2307): the punct
+        defeats an end-anchored regex. Each proved red on the pre-reorder
+        commit."""
+        (tmp_path / "scripts").mkdir()
+        (tmp_path / "scripts" / "foo.sh").write_text("#!/bin/sh\n")
+        (tmp_path / "README.md").write_text(prose + "\n")
+        failures = dg.check_referenced_paths(tmp_path, ["README.md"], {})
+        assert failures == []
+
+    def test_colon_in_real_filename_is_preserved(self, tmp_path: Path):
+        """A path legitimately containing a colon is NOT truncated - only
+        numeric line-citation suffixes are stripped."""
+        (tmp_path / "docs").mkdir()
+        (tmp_path / "docs" / "weird:name.md").write_text("x\n")
+        (tmp_path / "README.md").write_text("See docs/weird:name.md here.\n")
+        failures = dg.check_referenced_paths(tmp_path, ["README.md"], {})
+        assert failures == []
+
     def test_markdown_link_url_not_consumed_as_path(self, tmp_path: Path):
         """A markdown link whose URL points to another repo must not have the
         URL consumed as part of the path token."""

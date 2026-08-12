@@ -65,6 +65,12 @@ _GLOB_OR_PLACEHOLDER_CHARS = set("*?[]{}<>$~")
 # Trailing punctuation that is prose/markdown decoration, not part of the path.
 _TRAILING_PUNCT = ".,;:!?)]}'\"`"
 
+# A line-citation suffix: `:123`, `:12-20`, `:1,5-9`, and repeated groups so
+# file:line:col (ripgrep, compiler output) collapses in one pass. Applied
+# AFTER the trailing-punct strip — the anchor is defeated by a trailing full
+# stop or comma otherwise, and citations ending a sentence are the common case.
+_LINE_SUFFIX_RE = re.compile(r"(?::[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*)+$")
+
 
 def _clean_token(raw: str) -> str | None:
     """Normalize a raw regex match into a bare repo-relative path, or None
@@ -74,9 +80,9 @@ def _clean_token(raw: str) -> str | None:
     for sep in ("#", "?", "::"):
         if sep in token:
             token = token.split(sep, 1)[0]
-    token = re.sub(r":[0-9]+(?:-[0-9]+)?(?:,[0-9]+(?:-[0-9]+)?)*$", "", token)
     while token and token[-1] in _TRAILING_PUNCT:
         token = token[:-1]
+    token = _LINE_SUFFIX_RE.sub("", token)
     if not token:
         return None
     if any(c in _GLOB_OR_PLACEHOLDER_CHARS for c in token):
