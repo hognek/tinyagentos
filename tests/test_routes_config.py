@@ -1,6 +1,6 @@
 import pytest
 import yaml
-from tinyagentos.config import load_config
+from tinyagentos.config import load_config, save_config_locked
 
 
 @pytest.mark.asyncio
@@ -77,4 +77,78 @@ class TestConfigPage:
         config = load_config(tmp_data_dir / "config.yaml")
         assert config.metrics["poll_interval"] == 120
         assert config.metrics["retention_days"] == 14
+
+    async def test_save_config_round_trips_archive(self, client, app):
+        app.state.config.archive = {"target": "path:/tmp/archive"}
+        try:
+            resp = await client.get("/api/config")
+            data = yaml.safe_load(resp.json()["yaml"])
+            data["server"]["port"] = 9999
+            resp = await client.put("/api/config", json={"yaml": yaml.dump(data)})
+            assert resp.status_code == 200, resp.json()
+            assert app.state.config.archive == {"target": "path:/tmp/archive"}
+            resp = await client.get("/api/config")
+            round_tripped = yaml.safe_load(resp.json()["yaml"])
+            assert round_tripped["archive"] == {"target": "path:/tmp/archive"}
+        finally:
+            app.state.config.archive = {"target": "pool:"}
+
+    async def test_save_config_round_trips_archived_agents(self, client, app):
+        app.state.config.archived_agents = [{"name": "old-agent", "status": "archived"}]
+        try:
+            resp = await client.get("/api/config")
+            data = yaml.safe_load(resp.json()["yaml"])
+            data["server"]["port"] = 9999
+            resp = await client.put("/api/config", json={"yaml": yaml.dump(data)})
+            assert resp.status_code == 200, resp.json()
+            assert app.state.config.archived_agents == [{"name": "old-agent", "status": "archived"}]
+            resp = await client.get("/api/config")
+            round_tripped = yaml.safe_load(resp.json()["yaml"])
+            assert round_tripped["archived_agents"] == [{"name": "old-agent", "status": "archived"}]
+        finally:
+            app.state.config.archived_agents = []
+
+    async def test_save_config_round_trips_github_app_id(self, client, app):
+        app.state.config.github_app_id = "123456"
+        try:
+            resp = await client.get("/api/config")
+            data = yaml.safe_load(resp.json()["yaml"])
+            data["server"]["port"] = 9999
+            resp = await client.put("/api/config", json={"yaml": yaml.dump(data)})
+            assert resp.status_code == 200, resp.json()
+            assert app.state.config.github_app_id == "123456"
+            resp = await client.get("/api/config")
+            round_tripped = yaml.safe_load(resp.json()["yaml"])
+            assert round_tripped["github_app_id"] == "123456"
+        finally:
+            app.state.config.github_app_id = ""
+
+    async def test_save_config_preserves_all_to_dict_keys(self, client, app):
+        config = app.state.config
+        config.archive = {"target": "path:/tmp/archive"}
+        config.archived_agents = [{"name": "old-agent"}]
+        config.github_app_id = "123456"
+        config.webhooks = [{"url": "http://example.com/hook", "type": "generic"}]
+        config.memory_url = "http://localhost:9999"
+        config.taosmd_dir = "/srv/taosmd"
+        config.taosmd_restart_cmd = "systemctl restart taosmd"
+        expected_keys = set(config.to_dict().keys())
+        try:
+            resp = await client.get("/api/config")
+            data = yaml.safe_load(resp.json()["yaml"])
+            data["server"]["port"] = 8888
+            resp = await client.put("/api/config", json={"yaml": yaml.dump(data)})
+            assert resp.status_code == 200, resp.json()
+            resp = await client.get("/api/config")
+            round_tripped = yaml.safe_load(resp.json()["yaml"])
+            missing = sorted(expected_keys - set(round_tripped.keys()))
+            assert not missing, f"PUT /api/config dropped keys: {missing}"
+        finally:
+            app.state.config.archive = {"target": "pool:"}
+            app.state.config.archived_agents = []
+            app.state.config.github_app_id = ""
+            app.state.config.webhooks = []
+            app.state.config.memory_url = "http://localhost:7900"
+            app.state.config.taosmd_dir = ""
+            app.state.config.taosmd_restart_cmd = ""
 
