@@ -166,3 +166,53 @@ class TestEvaluateRulesEdgeCases:
         changed = [("M", "tinyagentos/routes/themes.py")]
         failures = evaluate_rules(changed, [], config)
         assert failures == []
+
+
+class TestReferencedPathsScan:
+    """Invariants layer: glob expansion, tombstones, extractor precision."""
+
+    def _write(self, root: Path, rel: str, text: str) -> None:
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text)
+
+    def test_glob_scan_targets_are_expanded(self, tmp_path):
+        """docs/runbooks/*.md style entries must scan every matching file."""
+        self._write(tmp_path, "docs/runbooks/one.md", "see tinyagentos/nope.py")
+        self._write(tmp_path, "docs/runbooks/two.md", "all good here")
+        fails = _MOD.check_referenced_paths(
+            tmp_path, ["docs/runbooks/*.md"], {}
+        )
+        assert len(fails) == 1 and "docs/runbooks/one.md" in fails[0]
+
+    def test_ignore_tokens_tombstone(self, tmp_path):
+        """A doc explaining a removal may name the removed file - but ONLY
+        the listed tombstone is exempt, other dead paths still fail."""
+        self._write(
+            tmp_path, "docs/guide.md",
+            "docs/STATUS.md was removed. Also see tinyagentos/gone.py",
+        )
+        cfg = {"invariants": {"ignore_tokens": ["docs/STATUS.md"]}}
+        fails = _MOD.check_referenced_paths(tmp_path, ["docs/guide.md"], cfg)
+        assert len(fails) == 1 and "tinyagentos/gone.py" in fails[0]
+        # Red half: without the tombstone the STATUS.md mention fails too.
+        fails = _MOD.check_referenced_paths(tmp_path, ["docs/guide.md"], {})
+        assert len(fails) == 2
+
+    def test_missing_scan_target_is_skipped(self, tmp_path):
+        """A local-only (gitignored) doc absent from the tree is skipped."""
+        fails = _MOD.check_referenced_paths(tmp_path, ["docs/AGENT_HANDOFF.md"], {})
+        assert fails == []
+
+    def test_extractor_strips_symbol_suffix(self):
+        toks = _MOD.extract_path_tokens(
+            "wire it in tinyagentos/routes/__init__.py::register_all_routers()"
+        )
+        assert toks == ["tinyagentos/routes/__init__.py"]
+
+    def test_extractor_ignores_hyphen_glued_prefix(self):
+        """A repo prefix embedded in a home-dir slug is not a repo path."""
+        toks = _MOD.extract_path_tokens(
+            "read ~/.claude/projects/-home-x-tinyagentos/memory/MEMORY.md at start"
+        )
+        assert toks == []
