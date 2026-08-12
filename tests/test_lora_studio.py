@@ -786,6 +786,8 @@ class TestRetryIsAtomic:
         assert codes == [202, 409]
         assert len(scheduled) == 1
 
+
+class TestLibraryHookConfigSideEffects:
     @pytest.mark.asyncio
     async def test_civitai_processor_never_rewrites_config(
         self, isolated_loras_root, monkeypatch, tmp_path

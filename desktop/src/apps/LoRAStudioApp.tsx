@@ -265,11 +265,15 @@ export function LoRAStudioApp({ windowId: _windowId }: { windowId: string }) {
           {loading ? (
             [0, 1, 2, 3].map((i) => <Skeleton key={i} />)
           ) : items.length === 0 ? (
-            <div className="col-span-full flex flex-col items-center justify-center gap-2 py-16 text-shell-text-tertiary">
-              <Layers size={40} className="opacity-30" />
-              <p className="text-sm">No LoRAs yet</p>
-              <p className="text-xs">Paste a Civitai model URL above to ingest one.</p>
-            </div>
+            // The empty state claims the archive IS empty, so it must not
+            // stand in for a failed load -- the error banner says that.
+            listError ? null : (
+              <div className="col-span-full flex flex-col items-center justify-center gap-2 py-16 text-shell-text-tertiary">
+                <Layers size={40} className="opacity-30" />
+                <p className="text-sm">No LoRAs yet</p>
+                <p className="text-xs">Paste a Civitai model URL above to ingest one.</p>
+              </div>
+            )
           ) : (
             items.map((item) => {
               const sel = item.id === selectedId;
