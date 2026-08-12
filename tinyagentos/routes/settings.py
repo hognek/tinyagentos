@@ -216,6 +216,8 @@ async def save_config_endpoint(request: Request, body: ConfigUpdate, validate_on
         metrics=data.get("metrics", {}),
         webhooks=data.get("webhooks", []),
         memory_url=data.get("memory_url", "http://localhost:7900"),
+        taosmd_dir=str(data.get("taosmd_dir", "") or ""),
+        taosmd_restart_cmd=str(data.get("taosmd_restart_cmd", "") or ""),
         config_path=request.app.state.config_path,
     )
     errors = validate_config(new_config)
@@ -337,6 +339,8 @@ async def restore_backup(request: Request, file: UploadFile):
                 metrics=data.get("metrics", {}),
                 webhooks=data.get("webhooks", []),
                 memory_url=data.get("memory_url", "http://localhost:7900"),
+                taosmd_dir=str(data.get("taosmd_dir", "") or ""),
+                taosmd_restart_cmd=str(data.get("taosmd_restart_cmd", "") or ""),
                 config_path=config_path,
             )
             request.app.state.config = new_config
@@ -928,6 +932,8 @@ async def _verify_taosmd_running(request: Request) -> str | None:
     caps = body.get("capabilities") if isinstance(body, dict) else None
     if not isinstance(caps, list):
         return "taOSmd /health body has no capabilities list"
+    if not all(isinstance(c, str) for c in caps):
+        return "taOSmd /health capabilities list contains non-string entries"
     missing = REQUIRED_TAOSMD_CAPABILITIES - set(caps)
     if missing:
         return f"taOSmd /health is missing capability identifiers: {sorted(missing)}"
@@ -982,6 +988,12 @@ async def _update_local_taosmd(request: Request) -> dict:
             "error": "taosmd_dir is set but taosmd_restart_cmd is not; refusing "
             "a pull the running service would never load"
         }
+    try:
+        restart_argv = shlex.split(restart_cmd)
+    except ValueError as exc:
+        return {"error": f"taosmd_restart_cmd is not parseable shell syntax: {exc}"}
+    if not restart_argv:
+        return {"error": "taosmd_restart_cmd parses to an empty command"}
     rc, out = await _run_capture(["git", "pull", "--ff-only"], cwd=taosmd_dir)
     if rc != 0:
         return {"error": f"taOSmd git pull failed: {out.strip()[-1500:]}"}
@@ -989,7 +1001,7 @@ async def _update_local_taosmd(request: Request) -> dict:
         "SYSTEM: taOSmd updating to latest via Settings-update; the A2A bus "
         "restarts momentarily and SSE subscribers must reconnect."
     )
-    rc, restart_out = await _run_capture(shlex.split(restart_cmd), cwd=taosmd_dir, timeout=120.0)
+    rc, restart_out = await _run_capture(restart_argv, cwd=taosmd_dir, timeout=120.0)
     if rc != 0:
         return {"error": f"taOSmd restart command failed (rc {rc}): {restart_out.strip()[-1500:]}"}
     return {

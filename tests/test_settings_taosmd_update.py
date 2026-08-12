@@ -102,6 +102,14 @@ class TestVerifyTaosmdRunning:
         assert reason is not None and "unreachable" in reason
 
     @pytest.mark.asyncio
+    async def test_fails_named_on_non_string_capability_entries(self):
+        """Unhashable/odd entries must yield a NAMED reason, not a TypeError."""
+        body = {"status": "ok", "capabilities": [{"cap": "a2a.v1"}, "search.v1"]}
+        req = _fake_request(_FakeResp(200, "application/json", body))
+        reason = await _verify_taosmd_running(req)
+        assert reason is not None and "non-string" in reason
+
+    @pytest.mark.asyncio
     async def test_passes_on_real_health_shape(self):
         req = _fake_request(_FakeResp(200, "application/json", REAL_HEALTH_BODY))
         assert await _verify_taosmd_running(req) is None
@@ -133,6 +141,23 @@ class TestUpdateLocalTaosmd:
         (tmp_path / ".git").mkdir()
         req = _fake_request(taosmd_dir=str(tmp_path))
         report = await _update_local_taosmd(req)
+        assert "taosmd_restart_cmd" in report["error"]
+
+    @pytest.mark.asyncio
+    async def test_errors_named_on_unparseable_restart_cmd(self, tmp_path):
+        """An unmatched quote must be a NAMED error before anything runs."""
+        (tmp_path / ".git").mkdir()
+        req = _fake_request(taosmd_dir=str(tmp_path),
+                            taosmd_restart_cmd="systemctl restart 'taosmd")
+        report = await _update_local_taosmd(req)
+        assert "not parseable" in report["error"]
+
+    @pytest.mark.asyncio
+    async def test_errors_named_on_whitespace_restart_cmd(self, tmp_path):
+        (tmp_path / ".git").mkdir()
+        req = _fake_request(taosmd_dir=str(tmp_path), taosmd_restart_cmd="  ")
+        report = await _update_local_taosmd(req)
+        # Whitespace-only strips to empty -> caught by the unset check.
         assert "taosmd_restart_cmd" in report["error"]
 
     @pytest.mark.asyncio
@@ -263,6 +288,31 @@ class TestApplyUpdateTaosmdContract:
         assert data["status"] == "restarting"
         assert data["taosmd"]["updated"] is True
         assert "taOSmd updated and verified" in data["message"]
+
+    @pytest.mark.asyncio
+    async def test_config_save_round_trip_preserves_taosmd_settings(self, client, app):
+        """PUT /api/config rebuilds AppConfig field-by-field; the taOSmd hooks
+        must survive the round trip, not silently drop (CodeRabbit find)."""
+        import yaml as _yaml
+
+        resp = await client.get("/api/config")
+        data = _yaml.safe_load(resp.json()["yaml"])
+        data["taosmd_dir"] = "/srv/taosmd"
+        data["taosmd_restart_cmd"] = "systemctl restart taosmd"
+        try:
+            resp = await client.put(
+                "/api/config", json={"yaml": _yaml.dump(data)}
+            )
+            assert resp.status_code == 200, resp.json()
+            assert app.state.config.taosmd_dir == "/srv/taosmd"
+            assert app.state.config.taosmd_restart_cmd == "systemctl restart taosmd"
+            resp = await client.get("/api/config")
+            round_tripped = _yaml.safe_load(resp.json()["yaml"])
+            assert round_tripped["taosmd_dir"] == "/srv/taosmd"
+            assert round_tripped["taosmd_restart_cmd"] == "systemctl restart taosmd"
+        finally:
+            app.state.config.taosmd_dir = ""
+            app.state.config.taosmd_restart_cmd = ""
 
     @pytest.mark.asyncio
     async def test_update_still_succeeds_when_taosmd_not_configured(self, client):
