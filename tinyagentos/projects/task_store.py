@@ -287,6 +287,12 @@ class ProjectTaskStore(BaseStore):
                 patch["element_id"] = element_id
         if not sets:
             return
+        # A generic edit back to 'open' must also clear the claimer (as the
+        # dedicated to-open transitions do): claim_task requires
+        # claimed_by IS NULL, so a stale claimer leaves the card unclaimable.
+        if status == "open":
+            sets.append("claimed_by = ?"); params.append(None); patch["claimed_by"] = None
+            sets.append("claimed_at = ?"); params.append(None); patch["claimed_at"] = None
         sets.append("updated_at = ?"); params.append(time.time())
         params.append(task_id)
         await self._db.execute(
