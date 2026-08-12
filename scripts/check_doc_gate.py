@@ -51,8 +51,11 @@ EXIT_CONFIG_ERROR = 3
 # matching a prefix that is actually embedded inside a larger path (e.g. the
 # "tinyagentos/" inside "/home/<user>/tinyagentos/data/" in a deploy-layout
 # table), which would otherwise falsely flag deploy-time paths that never
-# exist in the repo itself.
-_TOKEN_RE = re.compile(r"(?<![\w/])(?:scripts|tinyagentos|docs|desktop)/[^\s`\"'|]+")
+# exist in the repo itself. `-` is in the lookbehind for the same reason:
+# home-dir slugs like "-*-tinyagentos/memory/MEMORY.md" embed a repo prefix
+# after a hyphen, and the glob `*` sits BEFORE the match so the glob filter
+# never sees it.
+_TOKEN_RE = re.compile(r"(?<![\w/-])(?:scripts|tinyagentos|docs|desktop)/[^\s`\"'|]+")
 
 # Chars that mark a token as a glob pattern or a <placeholder> rather than a
 # concrete repo path -- these are never asserted to exist.
@@ -66,7 +69,8 @@ def _clean_token(raw: str) -> str | None:
     """Normalize a raw regex match into a bare repo-relative path, or None
     if it should be ignored (glob, placeholder, anchor/query fragment)."""
     token = raw
-    for sep in ("#", "?"):
+    # "::" is a symbol reference (file.py::function), not part of the path.
+    for sep in ("#", "?", "::"):
         if sep in token:
             token = token.split(sep, 1)[0]
     while token and token[-1] in _TRAILING_PUNCT:
@@ -119,20 +123,41 @@ def _validate_config(config: dict) -> None:
     scan = invariants.get("referenced_paths_scan", [])
     if not isinstance(scan, list):
         raise ValueError("'invariants.referenced_paths_scan' must be a list")
+    ignore = invariants.get("ignore_tokens", [])
+    if not isinstance(ignore, list):
+        raise ValueError("'invariants.ignore_tokens' must be a list")
 
 
 def check_referenced_paths(repo_root: Path, files_to_scan: list[str], config: dict) -> list[str]:
     """Layer A: every scripts/tinyagentos/docs/desktop path token mentioned in
     the configured doc set must exist on disk. A scan-target file that itself
     does not exist (e.g. a local-only, gitignored doc) is silently skipped
-    rather than treated as a failure."""
-    failures: list[str] = []
+    rather than treated as a failure.
+
+    Scan entries may be globs (``docs/agent-manual/*.md``) — expanded against
+    the working tree, so a newly added manual page or skill is scanned without
+    a config edit. ``invariants.ignore_tokens`` lists tokens that are
+    deliberate tombstones (docs that EXPLAIN a file was removed must be able
+    to name it without failing the gate forever).
+    """
+    ignore = set(config.get("invariants", {}).get("ignore_tokens", []))
+    expanded: list[str] = []
     for rel in files_to_scan:
+        if any(c in "*?[]" for c in rel):
+            expanded.extend(
+                sorted(str(p.relative_to(repo_root)) for p in repo_root.glob(rel) if p.is_file())
+            )
+        else:
+            expanded.append(rel)
+    failures: list[str] = []
+    for rel in expanded:
         doc_path = repo_root / rel
         if not doc_path.is_file():
             continue
         text = doc_path.read_text(encoding="utf-8", errors="ignore")
         for token in extract_path_tokens(text):
+            if token in ignore:
+                continue
             if not (repo_root / token).exists():
                 failures.append(f"{rel} references '{token}' which does not exist in the repo")
     return failures
