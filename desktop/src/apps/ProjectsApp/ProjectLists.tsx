@@ -20,6 +20,10 @@ export function ProjectLists({ project }: { project: Project }) {
   const [quickText, setQuickText] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const quickInputRef = useRef<HTMLInputElement>(null);
+  // Current selection, readable from inside an async closure that captured an
+  // older one. Assigned during render so it is correct before any effect runs.
+  const selectedListIdRef = useRef<string | null>(selectedListId);
+  selectedListIdRef.current = selectedListId;
 
   // Drop the previous project's selection DURING RENDER, not in an effect.
   // ProjectWorkspace renders <ProjectLists project={project} /> unkeyed and is
@@ -53,8 +57,14 @@ export function ProjectLists({ project }: { project: Project }) {
 
   const refreshEntries = useCallback(() => {
     if (!selectedListId) return Promise.resolve([] as ProjectListEntry[]);
-    return projectsApi.lists.entries.list(project.id, selectedListId)
+    const forListId = selectedListId;
+    return projectsApi.lists.entries.list(project.id, forListId)
       .then((ents) => {
+        // Drop a response whose list is no longer selected. Two quick clicks
+        // race, and the slower fetch used to land last and show one list's
+        // entries under another's heading. The ref is the CURRENT selection;
+        // this closure's own copy is stale by definition.
+        if (forListId !== selectedListIdRef.current) return ents;
         setEntries(ents);
         return ents;
       })

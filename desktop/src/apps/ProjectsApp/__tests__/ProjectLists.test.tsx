@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, act, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, act, fireEvent, waitFor, within } from "@testing-library/react";
 import type { Project } from "@/lib/projects";
 import { ProjectLists } from "../ProjectLists";
 
@@ -151,7 +151,12 @@ describe("ProjectLists", () => {
     await act(async () => {
       fireEvent.click(screen.getByLabelText("Create new list"));
     });
-    await waitFor(() => expect(screen.getAllByText("New list").length).toBeGreaterThanOrEqual(1));
+    // Scope to the rail: the entries header renders the selected list's title
+    // too, so a whole-document match could pass while the rail stayed stale.
+    await waitFor(() => {
+      const rail = screen.getByLabelText("Project lists");
+      expect(within(rail).getByText("New list")).toBeInTheDocument();
+    });
   });
 
   it("switching project does not keep the previous project's selected list", async () => {
@@ -181,6 +186,44 @@ describe("ProjectLists", () => {
     });
     const posted = fetchMock.mock.calls.find(([u, i]) => String(u) === "/api/projects/p1/lists" && (i as RequestInit | undefined)?.method === "POST");
     expect(posted).toBeUndefined();
+  });
+
+  it("a slow entries response for a deselected list does not overwrite the current one", async () => {
+    // Deterministic race: lst-1's fetch is held open, the user picks lst-2,
+    // then lst-1's response lands last. Without the guard it wins and shows
+    // one list's entries under the other's heading.
+    let releaseSlow: (() => void) | null = null;
+    const slow = new Promise<void>((res) => { releaseSlow = () => res(); });
+    const raceFetch = vi.fn((url: string) => {
+      if (url === "/api/projects/p1/lists") {
+        return Promise.resolve(ok({ items: [
+          { id: "lst-1", project_id: "p1", title: "Shopping", description: "", status: "active", created_by: "u1", created_at: 0, updated_at: 0 },
+          { id: "lst-2", project_id: "p1", title: "Chores", description: "", status: "active", created_by: "u1", created_at: 0, updated_at: 0 },
+        ] }));
+      }
+      if (url === "/api/projects/p1/lists/lst-1/entries") {
+        return slow.then(() => ok({ items: [{ id: "e-slow", list_id: "lst-1", project_id: "p1", text: "STALE MILK", original_text: "STALE MILK", category: null, status: "new", done: 0, author_kind: "user", author_id: "u1", edited_by: null, position: 0, created_at: 0, updated_at: 0 }] }));
+      }
+      if (url === "/api/projects/p1/lists/lst-2/entries") {
+        return Promise.resolve(ok({ items: [{ id: "e-fast", list_id: "lst-2", project_id: "p1", text: "Sweep floor", original_text: "Sweep floor", category: null, status: "new", done: 0, author_kind: "user", author_id: "u1", edited_by: null, position: 0, created_at: 0, updated_at: 0 }] }));
+      }
+      return Promise.resolve(ok({ items: [] }));
+    });
+    vi.stubGlobal("fetch", raceFetch);
+
+    await act(async () => {
+      render(<ProjectLists project={fakeProject} />);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Chores"));
+    });
+    await waitFor(() => expect(screen.getByText("Sweep floor")).toBeInTheDocument());
+    await act(async () => {
+      releaseSlow!();
+      await slow;
+    });
+    expect(screen.queryByText("STALE MILK")).not.toBeInTheDocument();
+    expect(screen.getByText("Sweep floor")).toBeInTheDocument();
   });
 
   it("a deleted list disappears from the rail", async () => {
