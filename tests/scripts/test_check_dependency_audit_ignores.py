@@ -135,18 +135,20 @@ class TestRunPipAudit:
         assert findings[0]["package"] == "pip"
         assert findings[0]["id"] == "CVE-2026-3219"
 
-    def test_invalid_json_returns_empty(self, check_mod, tmp_path: Path) -> None:
+    def test_invalid_json_is_cannot_see_not_empty(self, check_mod, tmp_path: Path) -> None:
+        """Unparseable output used to fold into findings=[] (fail-open); it
+        is a cannot-see state and must surface as None."""
         fake = _fake_completed(returncode=1, stdout="not json")
         with patch.object(check_mod.subprocess, "run", return_value=fake):
-            findings, _ = check_mod.run_pip_audit(tmp_path)
-        assert findings == []
+            findings, raw = check_mod.run_pip_audit(tmp_path)
+        assert findings is None and "unparseable" in raw
 
     def test_pip_audit_not_found(self, check_mod, tmp_path: Path) -> None:
         with patch.object(
             check_mod.subprocess, "run", side_effect=FileNotFoundError
         ):
             findings, output = check_mod.run_pip_audit(tmp_path)
-        assert findings == []
+        assert findings is None
         assert "not found" in output
 
 
@@ -154,6 +156,7 @@ class TestMain:
     def test_tool_dep_skips_upgrade_check(self, check_mod, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
         sec = tmp_path / "security"
         sec.mkdir()
+        (tmp_path / "uv.lock").write_text("")  # main() refuses to run without it
         ignore = sec / "pip-audit-ignore.toml"
         ignore.write_text(
             '[[ignore]]\npackage = "pip"\nid = "CVE-2026-3219"\ncheck_upgrade = false\n'
@@ -184,6 +187,7 @@ class TestMain:
     def test_unlisted_finding_goes_red(self, check_mod, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
         sec = tmp_path / "security"
         sec.mkdir()
+        (tmp_path / "uv.lock").write_text("")  # main() refuses to run without it
         ignore = sec / "pip-audit-ignore.toml"
         ignore.write_text(
             '[[ignore]]\npackage = "pip"\nid = "CVE-2026-3219"\ncheck_upgrade = false\n'
@@ -201,6 +205,7 @@ class TestMain:
     def test_droppable_ignore_goes_red(self, check_mod, tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
         sec = tmp_path / "security"
         sec.mkdir()
+        (tmp_path / "uv.lock").write_text("")  # main() refuses to run without it
         ignore = sec / "pip-audit-ignore.toml"
         ignore.write_text('[[ignore]]\npackage = "cryptography"\nid = "CVE-2026-69247"\n')
         with patch.object(check_mod.shutil, "which", return_value="/usr/bin/uv"):
@@ -211,3 +216,50 @@ class TestMain:
         assert rc == 1
         assert "DROPPABLE: cryptography (CVE-2026-69247)" in captured.out
         assert "FAIL: ignore list is stale or incomplete" in captured.out
+
+
+class TestCannotSeeIsNotOk:
+    """A checker that cannot read its inputs must exit 2, never report
+    'current'. Both cases below reported OK rc 0 before the fix (found
+    running the checker with a mislocated ignore file: every probe fell
+    into NO FIX YET and the run printed 'OK: ignore list is current')."""
+
+    def test_main_errors_when_lockfile_missing(
+        self, check_mod, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        sec = tmp_path / "security"
+        sec.mkdir()
+        # NO uv.lock in this project - that is the case under test.
+        ignore = sec / "pip-audit-ignore.toml"
+        ignore.write_text('[[ignore]]\npackage = "httpx"\nid = "X-1"\n')
+        with patch.object(check_mod.shutil, "which", return_value="/usr/bin/tool"):
+            rc = check_mod.main(["--ignore-file", str(ignore)])
+        assert rc == 2
+        # Pin the REASON: rc 2 must come from the lockfile guard, not a
+        # downstream cannot-see (e.g. pip-audit missing) that also exits 2.
+        assert "uv.lock not found" in capsys.readouterr().err
+
+    def test_unparseable_pip_audit_output_is_error(self, check_mod, tmp_path: Path) -> None:
+        with patch.object(
+            check_mod.subprocess, "run",
+            return_value=_fake_completed(returncode=0, stdout="this is not json"),
+        ):
+            findings, raw = check_mod.run_pip_audit(tmp_path)
+        assert findings is None and "unparseable" in raw
+
+    def test_pip_audit_timeout_is_error(self, check_mod, tmp_path: Path) -> None:
+        with patch.object(
+            check_mod.subprocess, "run",
+            side_effect=check_mod.subprocess.TimeoutExpired(cmd="pip-audit", timeout=120),
+        ):
+            findings, raw = check_mod.run_pip_audit(tmp_path)
+        assert findings is None and "timed out" in raw
+
+    def test_empty_output_exit_zero_is_still_no_findings(self, check_mod, tmp_path: Path) -> None:
+        """The REAL no-findings shape (exit 0, empty stdout) stays OK."""
+        with patch.object(
+            check_mod.subprocess, "run",
+            return_value=_fake_completed(returncode=0, stdout=""),
+        ):
+            findings, raw = check_mod.run_pip_audit(tmp_path)
+        assert findings == []

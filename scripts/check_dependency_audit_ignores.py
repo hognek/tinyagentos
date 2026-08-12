@@ -64,7 +64,11 @@ def check_upgrade_resolves(package: str, project_root: Path) -> tuple[bool, str]
             backup.unlink()
 
 
-def run_pip_audit(project_root: Path) -> tuple[list[dict], str]:
+def run_pip_audit(project_root: Path) -> tuple[list[dict] | None, str]:
+    """Return (findings, raw_output). ``findings`` is ``None`` when the audit
+    could not be READ (unparseable output, timeout, missing binary) — a
+    cannot-see state the caller must fail on, never fold into "no findings".
+    An empty stdout with exit 0 is pip-audit's real no-findings shape."""
     cmd = ["pip-audit", "--format", "json"]
     try:
         result = subprocess.run(
@@ -79,18 +83,20 @@ def run_pip_audit(project_root: Path) -> tuple[list[dict], str]:
         if stdout:
             try:
                 data = json.loads(stdout)
-                for dep in data.get("dependencies", []):
-                    for vuln in dep.get("vulns", []):
-                        findings.append(
-                            {"package": dep.get("name"), "id": vuln.get("id")}
-                        )
             except json.JSONDecodeError:
-                pass
+                return None, "unparseable pip-audit output: " + stdout[:300]
+            for dep in data.get("dependencies", []):
+                for vuln in dep.get("vulns", []):
+                    findings.append(
+                        {"package": dep.get("name"), "id": vuln.get("id")}
+                    )
+        elif result.returncode != 0:
+            return None, "pip-audit failed with no output: " + (result.stderr or f"exit {result.returncode}")[:300]
         return findings, result.stdout + result.stderr
     except FileNotFoundError:
-        return [], "pip-audit not found"
+        return None, "pip-audit not found"
     except subprocess.TimeoutExpired:
-        return [], "pip-audit timed out"
+        return None, "pip-audit timed out"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -113,6 +119,16 @@ def main(argv: list[str] | None = None) -> int:
     ignore_list = load_ignore_list(args.ignore_file)
     ignore_ids = {entry["id"] for entry in ignore_list}
     project_root = args.ignore_file.resolve().parent.parent
+    # Cannot-see is not OK: without the lockfile every upgrade probe lands in
+    # the benign NO FIX YET bucket and the run reports "current" while having
+    # verified nothing. Same exit code as a missing tool — an environment
+    # error, distinct from 1 (list genuinely stale).
+    if not (project_root / "uv.lock").is_file():
+        print(
+            f"error: uv.lock not found under {project_root} — cannot verify the ignore list; refusing to report OK",
+            file=sys.stderr,
+        )
+        return 2
 
     unresolved: list[tuple[str, str, str]] = []
     droppable: list[tuple[str, str, str]] = []
@@ -144,7 +160,10 @@ def main(argv: list[str] | None = None) -> int:
 
     print()
     print("=== pip-audit check ===")
-    findings, _ = run_pip_audit(project_root)
+    findings, raw = run_pip_audit(project_root)
+    if findings is None:
+        print(f"error: pip-audit result unreadable — {raw[:300]}", file=sys.stderr)
+        return 2
     unlisted = [f for f in findings if f["id"] not in ignore_ids]
     if unlisted:
         for f in unlisted:
