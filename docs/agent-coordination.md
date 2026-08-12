@@ -214,6 +214,23 @@ POST <controller>/api/a2a/bus/send   (Authorization: Bearer <registry JWT, scope
 {"thread": "build", "body": "...", "reply_to": <id>?}
 ```
 
+## Bus restarts during a controller update
+
+`POST /api/settings/update` on a host that also runs taOSmd locally (config
+keys `taosmd_dir` + `taosmd_restart_cmd` set, `memory_url` local) brings
+taOSmd to latest in the same action: ff-only pull of the checkout, then a
+service restart, then verification against the **running** server's `/health`
+(Content-Type must be `application/json` and the core capability identifiers
+must appear in the body — a `text/html` 200 is the SPA catch-all answering and
+fails the update loudly). Two consequences for agents:
+
+- A `SYSTEM: taOSmd updating…` message is posted to the `build` thread
+  **before** the bus restarts. If your SSE stream drops right after that
+  message, it is the update, not an outage — reconnect and carry on.
+- If the hooks are not configured (or `memory_url` is remote) the update
+  response reports `taosmd: {"skipped": <why>}`; the skip is visible in the
+  response, never silent. On those installs taOSmd is updated on its own host.
+
 An admin session may also call it and set an explicit `from`. On a bus failure
 the proxy returns 502 (the read proxies degrade to an empty 200 instead).
 
