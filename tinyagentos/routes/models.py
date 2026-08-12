@@ -62,9 +62,15 @@ def get_downloaded_models(models_dir: Path) -> list[dict]:
         if f.suffix.lower() not in _MODEL_FILE_SUFFIXES:
             continue
         try:
-            rel = str(f.relative_to(models_dir))
+            rel_path = f.relative_to(models_dir)
         except ValueError:
-            rel = f.name
+            rel_path = Path(f.name)
+        # LoRA Studio owns models_root()/loras/<slug>/ -- adapters aren't
+        # standalone runnable models, so this scan must not surface them
+        # (they'd otherwise appear loadable in the Models app).
+        if rel_path.parts and rel_path.parts[0] == "loras":
+            continue
+        rel = str(rel_path)
         results.append({
             "filename": f.name,
             "relative_path": rel,

@@ -54,6 +54,9 @@ def detect_kind(source_url: str = "", content_type: str = "",
                                               "https://youtu.be/",
                                               "https://m.youtube.com/")):
             return "url:youtube"
+        from tinyagentos.routes.lora_studio import is_civitai_url
+        if is_civitai_url(source_url):
+            return "url:civitai"
         if any(lower.startswith(p) for p in ("https://", "http://")):
             return "url:web"
 
@@ -597,6 +600,76 @@ class WebProcessor(Processor):
         return artifacts
 
 
+class CivitaiProcessor(Processor):
+    """Civitai model-page URL processor -- delegates to the LoRA Studio ingest job.
+
+    A url:civitai library item never gets its own file storage; the LoRA row
+    (and its safetensors + previews) lives under models_root()/loras/, owned
+    by LoRA Studio. This processor creates that row, runs the same ingest
+    job POST /api/loras/ingest uses, and links the resulting lora_id back
+    onto the library item.
+
+    Unlike WebProcessor, the 10 MB cap does not apply here -- LoRA
+    safetensors files are routinely hundreds of MB.
+    """
+
+    async def process(self, item: dict) -> list[dict]:
+        item_id = item["id"]
+        source_url = item.get("source_url", "")
+        artifacts: list[dict] = []
+        if not source_url:
+            return artifacts
+
+        from tinyagentos.config import load_config
+        from tinyagentos.lora_store import LoraStore
+        from tinyagentos.routes.lora_studio import (
+            CivitaiUrlError,
+            lora_slug,
+            parse_civitai_url,
+            run_civitai_ingest,
+        )
+
+        try:
+            model_id, url_slug, version_id = parse_civitai_url(source_url)
+        except CivitaiUrlError as e:
+            raise ValueError(str(e)) from e
+
+        lora_id = f"lora-{lora_slug(url_slug, model_id)}"
+        data_dir = self.storage_dir.parent
+        lora_store = LoraStore(data_dir / "loras.db")
+        await lora_store.init()
+        try:
+            await lora_store.create_pending(
+                lora_id, source_url=source_url,
+                civitai_model_id=model_id, civitai_version_id=version_id,
+            )
+
+            proxy_url = ""
+            config_path = data_dir / "config.yaml"
+            if config_path.exists():
+                proxy_url = load_config(config_path).lora_ingest_proxy_url
+
+            # Any failure raises -- let it propagate so run_pipeline marks
+            # this library item as "error", same as YouTubeProcessor.
+            await run_civitai_ingest(lora_store, lora_id, proxy_url)
+            row = await lora_store.get(lora_id)
+        finally:
+            await lora_store.close()
+
+        if row and not item.get("title") and row.get("name"):
+            await self.store.update_item(item_id, title=row["name"])
+
+        meta = {"lora_id": lora_id, "status": (row or {}).get("status", "")}
+        await self.store.add_artifact(item_id, kind="lora", path="", meta=meta)
+        artifacts.append({"kind": "lora", "path": "", "meta": meta})
+
+        stored_meta = json.loads(item.get("meta_json", "{}"))
+        stored_meta["lora_id"] = lora_id
+        await self.store.update_item(item_id, meta_json=stored_meta)
+
+        return artifacts
+
+
 def _extract_readable_text(html: str, source_url: str = "") -> str:
     """Extract the main readable content from an HTML page.
 
@@ -640,6 +713,7 @@ _PROCESSORS: dict[str, type[Processor]] = {
     "image": ImageProcessor,
     "url:youtube": YouTubeProcessor,
     "url:web": WebProcessor,
+    "url:civitai": CivitaiProcessor,
 }
 
 

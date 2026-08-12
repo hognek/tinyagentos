@@ -68,6 +68,10 @@ class AppConfig:
     taosmd_restart_cmd: str = ""
     wallhaven_api_key: str | None = None
     github_app_id: str = ""
+    # Explicit, opt-in proxy for LoRA Studio's Civitai ingest fetcher only
+    # (httpx.AsyncClient(proxy=...) per-request). Empty = direct connection.
+    # Nothing else in taOS reads this field or changes its egress behaviour.
+    lora_ingest_proxy_url: str = ""
     config_path: Path | None = None
 
     def to_dict(self) -> dict:
@@ -93,6 +97,8 @@ class AppConfig:
             d["taosmd_restart_cmd"] = self.taosmd_restart_cmd
         if self.github_app_id:
             d["github_app_id"] = self.github_app_id
+        if self.lora_ingest_proxy_url:
+            d["lora_ingest_proxy_url"] = self.lora_ingest_proxy_url
         return d
 
 # rkllama's taOS default port moved from the upstream 8080 to 7833. Installs
@@ -204,6 +210,7 @@ def load_config(path: Path) -> AppConfig:
         taosmd_dir=str(data.get("taosmd_dir", "") or ""),
         taosmd_restart_cmd=str(data.get("taosmd_restart_cmd", "") or ""),
         github_app_id=str(data.get("github_app_id", "") or ""),
+        lora_ingest_proxy_url=str(data.get("lora_ingest_proxy_url", "") or ""),
         config_path=path,
         wallhaven_api_key=wallhaven_api_key,
     )

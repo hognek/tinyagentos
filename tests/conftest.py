@@ -409,6 +409,10 @@ async def client(app, tmp_data_dir):
     if song_store._db is not None:
         await song_store.close()
     await song_store.init()
+    lora_store = app.state.lora_store
+    if lora_store._db is not None:
+        await lora_store.close()
+    await lora_store.init()
     design_docs = app.state.design_docs
     if design_docs._db is not None:
         await design_docs.close()
@@ -507,6 +511,7 @@ async def client(app, tmp_data_dir):
     await office_docs.close()
     await web_sites.close()
     await song_store.close()
+    await lora_store.close()
     await design_docs.close()
     await coding_session_store.close()
     await feedback_store.close()
