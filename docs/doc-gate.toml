@@ -13,7 +13,25 @@
 trailer = "Docs-Reviewed:"
 
 [invariants]
-referenced_paths_scan = ["README.md", "docs/agent-coordination.md", "docs/agent-manual/index.md"]
+# Globs are expanded against the working tree, so new manual pages, runbooks
+# and skills are scanned without a config edit. Nested READMEs under app
+# trees are deliberately NOT scanned: their relative `scripts/` links point
+# inside their own directory and would false-positive against the repo root.
+referenced_paths_scan = [
+    "README.md",
+    "CONTRIBUTING.md",
+    "docs/agent-coordination.md",
+    "docs/AGENT_HANDOFF.md",
+    "docs/RELEASING.md",
+    "docs/contributor-pitfalls.md",
+    "docs/agent-manual/*.md",
+    "docs/runbooks/*.md",
+    ".claude/skills/*/SKILL.md",
+    "tinyagentos/worker/README.md",
+]
+# Deliberate tombstones: docs that explain a file was REMOVED must be able to
+# name it without failing the gate forever.
+ignore_tokens = ["docs/STATUS.md"]
 
 [[rules]]
 name = "apps"
@@ -87,3 +105,30 @@ on_modify = true
 when_changed = [".github/workflows/*.yml", "pyproject.toml", "CONTRIBUTING.md"]
 require_doc = [".claude/skills/taos-development-skill/*.md", "docs/*.md"]
 hint = "CI, packaging or contribution rules changed; review the contributor skill and docs (or add a Docs-Reviewed trailer explaining why not)"
+
+# The OS-native agent drives the desktop ONLY through the surfaces the
+# taos-agent skill and the OS-control manual page describe. When those routes
+# change shape, an undocumented agent surface is a broken agent.
+[[rules]]
+name = "taos-agent-skill"
+on_modify = true
+when_changed = ["tinyagentos/routes/desktop.py", "tinyagentos/routes/desktop_control.py", "tinyagentos/routes/taos_agent.py"]
+require_doc = [".claude/skills/taos-agent/*.md", "docs/agent-manual/*.md"]
+hint = "the agent-facing desktop-driving surface changed; review the taos-agent skill and the OS-control manual pages (or add a Docs-Reviewed trailer explaining why not)"
+
+# Update/release machinery drifts from its runbooks silently: the beta.48
+# promotion (2026-08-12) needed a sync-branch pattern RELEASING.md did not
+# describe, and pi_update-style tooling broke against a moved deploy path.
+[[rules]]
+name = "release-runbook"
+on_modify = true
+when_changed = ["tinyagentos/update_runner.py", "tinyagentos/auto_update.py", "tinyagentos/restart_orchestrator.py", "scripts/collate_changelog.py"]
+require_doc = ["docs/RELEASING.md", "docs/runbooks/*.md", "docs/UPDATE_BREAKAGE_LOG.md", "docs/*.md"]
+hint = "update/release machinery changed; review docs/RELEASING.md and the runbooks (or add a Docs-Reviewed trailer explaining why not)"
+
+# The worker README is the operator-facing contract for worker nodes.
+[[rules]]
+name = "worker-readme"
+when_changed = ["tinyagentos/worker/**"]
+require_doc = ["tinyagentos/worker/README.md"]
+hint = "a worker component was added or removed; update tinyagentos/worker/README.md (or add a Docs-Reviewed trailer explaining why not)"
