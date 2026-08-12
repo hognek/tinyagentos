@@ -132,6 +132,18 @@ uv run pytest tests/test_<changed_module>.py tests/<related>/ -v
 uv run pytest tests/ --ignore=tests/e2e -n auto
 ```
 
+### Dependency-audit ignore hygiene
+
+`security/pip-audit-ignore.toml` suppresses advisories that have no released
+fix. `scripts/check_dependency_audit_ignores.py` (run by
+`.github/workflows/security.yml` on PRs and a Monday cron) re-evaluates the
+list every run so it cannot rot: it probes `uv lock --upgrade-package` per
+ignored package to see whether a fixed version now resolves, and runs
+`pip-audit` WITHOUT the ignore flags to catch any finding not on the list.
+If it fires: a resolvable fix means take the upgrade and drop the entry; a
+new advisory means triage it, never blanket-add it. Entries for tool-level
+deps the project does not pin set `check_upgrade = false`.
+
 ### Test conventions
 
 - `conftest.py`: `tmp_data_dir` fixture creates temp config + SQLite
