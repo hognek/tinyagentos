@@ -428,16 +428,28 @@ normalized form (`1.0.0bN`). Only pyproject vs uv.lock is test-gated
 
 ## Documentation gate
 
-A gate blocks PRs that add or remove certain feature code without a matching doc update
-(configured in `docs/doc-gate.toml`):
+A gate blocks PRs that change certain feature code without a matching doc update
+(configured in `docs/doc-gate.toml`). Rules marked **any change** also fire on a plain
+modification; the rest fire only when a matching file is added or deleted. Test files
+(`test_*.py`, `*.test.*`, `*.spec.*`, `__tests__/`) never trigger any rule.
 
-| Change | Requires editing |
-|--------|-----------------|
-| Desktop app under `desktop/src/apps/` added/removed | `README.md` |
-| Route module under `tinyagentos/routes/` added/removed | `docs/agent-coordination.md` |
-| Installer under `tinyagentos/installers/` or `scripts/install*` added/removed | `README.md` |
-| Manifest under `app-catalog/` added/removed | `README.md` |
-| `tinyagentos/auth_middleware.py` (agent-token route allowlist) changed | `docs/agent-coordination.md` |
+| Change | Fires on | Requires editing |
+|--------|----------|-----------------|
+| Desktop app under `desktop/src/apps/` | add/remove | `README.md` |
+| Route module under `tinyagentos/routes/` | any change | `docs/agent-coordination.md` |
+| Installer under `tinyagentos/installers/` or `scripts/install*` | any change | `README.md` |
+| Manifest under `app-catalog/` | any change | `README.md` |
+| `tinyagentos/auth_middleware.py` (agent-token route allowlist) | any change | `docs/agent-coordination.md` |
+| Anything under `tinyagentos/` or `desktop/src/` | any change | `CHANGELOG.md` or a `changelog.d/*.md` fragment |
+| Agent registry, token auth, scope-requests store, `routes/agent_*.py`, `tinyagentos/mcp/` | any change | `docs/agent-manual/*.md` or `docs/agent-coordination.md` |
+| `.github/workflows/*.yml`, `pyproject.toml`, `CONTRIBUTING.md` | any change | this skill or `docs/*.md` |
+| `routes/desktop.py`, `routes/desktop_control.py`, `routes/taos_agent.py` | any change | `.claude/skills/taos-agent/*.md` or `docs/agent-manual/*.md` |
+| `update_runner.py`, `auto_update.py`, `restart_orchestrator.py`, `scripts/collate_changelog.py` | any change | `docs/RELEASING.md`, a runbook, or another `docs/*.md` |
+| `tinyagentos/worker/` | add/remove | `tinyagentos/worker/README.md` |
+
+The changelog rule is the one that catches most PRs: any non-test change under
+`tinyagentos/` or `desktop/src/` needs a `changelog.d/<pr>-<slug>.md` fragment (preferred
+over editing `CHANGELOG.md` directly, which conflicts between PRs).
 
 `.github/workflows/doc-gate.yml` is authoritative (a local `--no-verify` does not bypass it) and
 also runs `scripts/check_schema_migrations.py` (the SCHEMA-before-migrations guard, see Pitfalls).
@@ -446,6 +458,10 @@ If your PR trips a rule and there is genuinely nothing to document, add a traile
 ```
 Docs-Reviewed: no user-facing change, internal refactor only
 ```
+The trailer passes **every** rule for that PR, so it is an escape hatch, not a shortcut:
+the gate prints `doc-gate: trailer override used in <sha> by <author>: <why>` in its CI
+log for each commit that carries one, and that line is reviewable. A reviewer may ask for
+a real doc instead.
 
 Run `scripts/install-git-hooks.sh` to enable local hooks (`.githooks/pre-commit` and
 `.githooks/commit-msg`) so the gate runs before you push.

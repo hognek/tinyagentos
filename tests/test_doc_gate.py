@@ -559,3 +559,41 @@ class TestTrailerLogged:
         assert "aaa11111" in captured.out
         assert "bbb22222" in captured.out
 
+
+
+class TestCommitsWithMessagesParsing:
+    """The producer half of the trailer audit.
+
+    The tests above hand-build the tuples, so they pass whether or not
+    anything can actually produce them. These drive the parser with the exact
+    bytes `git log --format=%H%x1f%an%x1f%B%x1f` emits.
+    """
+
+    LOG_FORMAT_OUTPUT = (
+        "abc1234567890\x1fJohn Doe\x1ffix: something\n\nDocs-Reviewed: internal refactor\n\x1e"
+        "\ndef4567890123\x1fJane Roe\x1ffeat: another thing\n\x1e"
+    )
+
+    def _parse(self, monkeypatch, out):
+        monkeypatch.setattr(dg, "_run_git", lambda args: out)
+        return dg._git_commits_with_messages("origin/dev")
+
+    def test_parses_one_record_per_commit(self, monkeypatch):
+        commits = self._parse(monkeypatch, self.LOG_FORMAT_OUTPUT)
+        assert len(commits) == 2
+        assert [c[0] for c in commits] == ["abc1234567890", "def4567890123"]
+        assert [c[1] for c in commits] == ["John Doe", "Jane Roe"]
+        assert "Docs-Reviewed: internal refactor" in commits[0][2]
+        assert "Docs-Reviewed" not in commits[1][2]
+
+    def test_parsed_commits_reach_the_log(self, monkeypatch, capsys):
+        """End to end over the seam: real log bytes must produce a log line."""
+        commits = self._parse(monkeypatch, self.LOG_FORMAT_OUTPUT)
+        dg._log_trailer_usage(commits, "Docs-Reviewed:")
+        captured = capsys.readouterr()
+        assert "trailer override" in captured.out
+        assert "John Doe" in captured.out
+        assert "Jane Roe" not in captured.out
+
+    def test_empty_range_is_empty(self, monkeypatch):
+        assert self._parse(monkeypatch, "") == []

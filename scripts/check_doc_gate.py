@@ -317,25 +317,20 @@ def _git_commit_messages(base_ref: str) -> list[str]:
 
 def _git_commits_with_messages(base_ref: str) -> list[tuple[str, str, str]]:
     """Return (hash, author_name, message_body) for each commit in the range."""
-    out = _run_git(["log", f"{base_ref}..HEAD", "--format=%H%x1f%an%x1f%B%x1f"])
+    # %x1e terminates each commit record and %x1f separates the three fields
+    # inside it. A record terminator distinct from the field separator is what
+    # makes this parseable: with one separator for both, the flat split cannot
+    # tell a new commit's hash from the previous commit's body.
+    out = _run_git(["log", f"{base_ref}..HEAD", "--format=%H%x1f%an%x1f%B%x1e"])
     commits: list[tuple[str, str, str]] = []
-    for block in out.split("\x1f"):
-        block = block.strip()
-        if not block:
+    for record in out.split("\x1e"):
+        if not record.strip():
             continue
-        parts = block.split("\x1f", 1)
-        if len(parts) < 2:
+        fields = record.lstrip("\n").split("\x1f")
+        if len(fields) < 3:
             continue
-        commit_hash = parts[0]
-        rest = parts[1]
-        newline_idx = rest.find("\n")
-        if newline_idx >= 0:
-            author = rest[:newline_idx]
-            body = rest[newline_idx + 1:]
-        else:
-            author = rest
-            body = ""
-        commits.append((commit_hash, author, body))
+        commit_hash, author, body = fields[0], fields[1], fields[2]
+        commits.append((commit_hash.strip(), author, body))
     return commits
 
 
