@@ -421,3 +421,141 @@ class TestConfigErrorExitCode:
         assert dg.EXIT_CONFIG_ERROR != 1
         assert dg.EXIT_CONFIG_ERROR != 2
 
+
+ROUTES_MODIFY_CONFIG = {
+    "gate": {"trailer": "Docs-Reviewed:"},
+    "rules": [
+        {
+            "name": "routes",
+            "on_modify": True,
+            "when_changed": ["tinyagentos/routes/*.py"],
+            "require_doc": ["docs/agent-coordination.md"],
+            "hint": "an API route module was added, removed, or modified",
+        },
+    ],
+}
+
+
+class TestModificationTriggersGate:
+    def test_modification_to_route_fails_without_doc(self):
+        """A plain modification to a route with no doc edit FAILS the gate."""
+        changed = [("M", "tinyagentos/routes/agents.py")]
+        failures = dg.evaluate_rules(changed, [], ROUTES_MODIFY_CONFIG)
+        assert len(failures) == 1
+        assert failures[0].startswith("routes -- ")
+
+    def test_modification_to_route_passes_with_doc_edit(self):
+        changed = [
+            ("M", "tinyagentos/routes/agents.py"),
+            ("M", "docs/agent-coordination.md"),
+        ]
+        assert dg.evaluate_rules(changed, [], ROUTES_MODIFY_CONFIG) == []
+
+    def test_modification_to_route_passes_with_trailer(self):
+        changed = [("M", "tinyagentos/routes/agents.py")]
+        messages = ["feat: modify agents route\n\nDocs-Reviewed: internal refactor\n"]
+        assert dg.evaluate_rules(changed, messages, ROUTES_MODIFY_CONFIG) == []
+
+    def test_modified_test_file_does_not_trigger(self):
+        """Modifying a test file is never structural, even with on_modify."""
+        changed = [("M", "tests/test_agents.py")]
+        assert dg.evaluate_rules(changed, [], ROUTES_MODIFY_CONFIG) == []
+
+
+BROAD_CHANGELOG_CONFIG = {
+    "gate": {"trailer": "Docs-Reviewed:"},
+    "rules": [
+        {
+            "name": "user-visible-changelog",
+            "on_modify": True,
+            "when_changed": ["tinyagentos/**", "desktop/src/**"],
+            "require_doc": ["CHANGELOG.md", "changelog.d/*.md"],
+            "hint": "user-visible behaviour changed",
+        },
+    ],
+}
+
+
+class TestBroadChangelogRequired:
+    def test_tinyagentos_modification_requires_changelog(self):
+        changed = [("M", "tinyagentos/app.py")]
+        failures = dg.evaluate_rules(changed, [], BROAD_CHANGELOG_CONFIG)
+        assert len(failures) == 1
+        assert failures[0].startswith("user-visible-changelog -- ")
+
+    def test_desktop_src_modification_requires_changelog(self):
+        changed = [("M", "desktop/src/components/Foo.tsx")]
+        failures = dg.evaluate_rules(changed, [], BROAD_CHANGELOG_CONFIG)
+        assert len(failures) == 1
+        assert failures[0].startswith("user-visible-changelog -- ")
+
+    def test_changelog_fragment_satisfies_broad_rule(self):
+        changed = [
+            ("M", "tinyagentos/app.py"),
+            ("A", "changelog.d/1234-fix.md"),
+        ]
+        assert dg.evaluate_rules(changed, [], BROAD_CHANGELOG_CONFIG) == []
+
+    def test_changelog_md_edit_satisfies_broad_rule(self):
+        changed = [
+            ("M", "tinyagentos/app.py"),
+            ("M", "CHANGELOG.md"),
+        ]
+        assert dg.evaluate_rules(changed, [], BROAD_CHANGELOG_CONFIG) == []
+
+    def test_trailer_satisfies_broad_rule(self):
+        changed = [("M", "tinyagentos/app.py")]
+        messages = ["feat: update app\n\nDocs-Reviewed: no user-facing change\n"]
+        assert dg.evaluate_rules(changed, messages, BROAD_CHANGELOG_CONFIG) == []
+
+    def test_test_file_under_tinyagentos_exempt(self):
+        """A test file under tinyagentos/ is not a structural change."""
+        changed = [("M", "tests/test_agents.py")]
+        assert dg.evaluate_rules(changed, [], BROAD_CHANGELOG_CONFIG) == []
+
+    def test_doc_file_under_tinyagentos_still_triggers(self):
+        """A non-test doc file under tinyagentos/ should still require changelog."""
+        changed = [("M", "tinyagentos/README.md")]
+        failures = dg.evaluate_rules(changed, [], BROAD_CHANGELOG_CONFIG)
+        assert len(failures) == 1
+
+
+class TestTrailerLogged:
+    def test_trailer_usage_is_logged(self, capsys):
+        commits = [
+            ("abc1234567890", "John Doe", "fix: something\n\nDocs-Reviewed: internal refactor\n"),
+        ]
+        dg._log_trailer_usage(commits, "Docs-Reviewed:")
+        captured = capsys.readouterr()
+        assert "trailer override" in captured.out
+        assert "John Doe" in captured.out
+        assert "abc12345" in captured.out
+
+    def test_no_trailer_no_log(self, capsys):
+        commits = [
+            ("abc1234567890", "John Doe", "fix: something\n"),
+        ]
+        dg._log_trailer_usage(commits, "Docs-Reviewed:")
+        captured = capsys.readouterr()
+        assert captured.out == ""
+
+    def test_empty_trailer_text_not_logged(self, capsys):
+        commits = [
+            ("abc1234567890", "John Doe", "fix: something\n\nDocs-Reviewed:\n"),
+        ]
+        dg._log_trailer_usage(commits, "Docs-Reviewed:")
+        captured = capsys.readouterr()
+        assert captured.out == ""
+
+    def test_multiple_trailer_commits_all_logged(self, capsys):
+        commits = [
+            ("aaa1111111111", "Alice", "feat: add feature\n\nDocs-Reviewed: new feature\n"),
+            ("bbb2222222222", "Bob", "fix: bug\n\nDocs-Reviewed: bug fix\n"),
+        ]
+        dg._log_trailer_usage(commits, "Docs-Reviewed:")
+        captured = capsys.readouterr()
+        assert "Alice" in captured.out
+        assert "Bob" in captured.out
+        assert "aaa11111" in captured.out
+        assert "bbb22222" in captured.out
+
