@@ -117,17 +117,16 @@ async def _try_handshake(
         return
 
     username = directory_resp.get("username") or directory_resp.get("target") or ""
-    if not username:
-        # Can't form a contact_id without a username.
-        return
 
-    # NOTE: contact_id is derived from the directory-supplied username, not the
-    # verified fingerprint.  This means TOFU key-pinning is bound to a
-    # peer-controllable name — a peer that changes its username between the
-    # request and accept flows could create a shadow contact.  Future designs
-    # should consider binding to a canonical fingerprint-based identifier
-    # (e.g. hub:{fingerprint}) with username as a display column.
-    contact_id = f"hub:{username}"
+    # contact_id is keyed on the peer's signing-key fingerprint — the canonical
+    # author identifier (see hub/store.py) — never the peer-controlled username.
+    # A username collision or rename therefore can neither overwrite a pinned
+    # contact's key material nor fragment the same peer across two contact rows.
+    if not peer_fingerprint:
+        # Without a fingerprint there is nothing stable to pin TOFU against;
+        # skip the handshake rather than key on a mutable name.
+        return
+    contact_id = f"hub:{peer_fingerprint}"
 
     # Pubkeys: directory first, then local hub_authors cache.
     ed25519_pub = directory_resp.get("signing_pubkey") or ""
@@ -528,29 +527,23 @@ async def block_peer(
 
     # Cascade to contacts: revoke the peer link so the blocked contact can no
     # longer authenticate on the peer channel (A2 subscribe-to-block).
-    # Resolve the peer fingerprint to a contact_id first via the hub_authors
-    # cache, then fall back to a direct fingerprint lookup on the contacts
-    # table when the author row is missing or stale.
+    # Resolve the peer via its signing-key fingerprint — the canonical contact
+    # key — rather than the hub_authors username cache, which is peer-controlled
+    # and can be stale (renamed since the contact was pinned).  A present-but-
+    # stale username row must never break revocation.
     contacts_store = getattr(request.app.state, "contacts_store", None)
     if contacts_store is not None:
         try:
-            author = await store.get_author(peer)
+            contact = await contacts_store.get_contact_by_fingerprint(peer)
             cid = None
-            if author and author.get("username"):
-                cid = f"hub:{author['username']}"
+            if contact:
+                cid = contact["contact_id"]
                 await contacts_store.revoke_peer_link(cid)
             else:
-                # Fall back to the fingerprint pinned on the contacts row
-                # (independent of the volatile hub_authors cache).
-                contact = await contacts_store.get_contact_by_fingerprint(peer)
-                if contact:
-                    await contacts_store.revoke_peer_link(contact["contact_id"])
-                    cid = contact["contact_id"]
-                else:
-                    logger.warning(
-                        "hub block: could not resolve fingerprint %s to a "
-                        "contact; peer link may still be active", peer,
-                    )
+                logger.warning(
+                    "hub block: could not resolve fingerprint %s to a "
+                    "contact; peer link may still be active", peer,
+                )
             # Mark the contact as blocked so the UI reflects the distinct
             # status rather than leaving it at the prior accepted state.
             if cid is not None:

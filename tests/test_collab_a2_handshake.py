@@ -105,6 +105,14 @@ _PEER_USERNAME = "remotepeer"
 _PEER_SIGNING_PUB = "ab" * 32  # 64-char fake Ed25519 pubkey
 _PEER_ENCRYPTION_PUB = "cd" * 32  # 64-char fake X25519 pubkey
 
+# A second, distinct peer that shares _PEER_USERNAME's username but has a
+# different signing key (hence a different fingerprint).  Used to prove the
+# contact key is fingerprint-based: a username collision must not overwrite
+# the first contact's pinned key material.
+_PEER2_FP = "b9c61610704cb9b9ea441aa8afe5d7d8e852a30f918001cda5c19951ffb62aad"  # SHA-256 of _PEER2_SIGNING_PUB
+_PEER2_SIGNING_PUB = "ef" * 32
+_PEER2_ENCRYPTION_PUB = "fe" * 32
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -193,7 +201,7 @@ class TestFriendAcceptHandshake:
 
         # Verify contact row was created
         store = app_with_contacts.state.contacts_store
-        contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
+        contact = await store.get_contact(f"hub:{_PEER_FP}")
         assert contact is not None, "contact should be created on accept"
         assert contact["hub_username"] == _PEER_USERNAME
         assert contact["display_name"] == "Remote Peer"
@@ -202,7 +210,7 @@ class TestFriendAcceptHandshake:
         assert contact["status"] == "active"
 
         # Verify peer link was established
-        link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
+        link = await store.get_peer_link(f"hub:{_PEER_FP}")
         assert link is not None, "peer link should be established on accept"
         assert link["endpoints"] == [{"kind": "hub", "url": "https://peer.example.com:6969", "priority": 0}]
         # inbound_token should be a fresh token
@@ -250,7 +258,7 @@ class TestFriendAcceptHandshake:
         assert resp.status_code == 200
 
         store = app_with_contacts.state.contacts_store
-        contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
+        contact = await store.get_contact(f"hub:{_PEER_FP}")
         assert contact is not None
         assert contact["ed25519_pub"] == _PEER_SIGNING_PUB
         assert contact["x25519_pub"] == _PEER_ENCRYPTION_PUB
@@ -279,9 +287,9 @@ class TestFriendAcceptHandshake:
         assert data["state"] == "accepted"
 
         store = app_with_contacts.state.contacts_store
-        contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
+        contact = await store.get_contact(f"hub:{_PEER_FP}")
         assert contact is None, "no contact should be created without pubkeys"
-        link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
+        link = await store.get_peer_link(f"hub:{_PEER_FP}")
         assert link is None, "no peer link should be established without pubkeys"
 
     async def test_accept_handles_non_list_endpoints(
@@ -308,7 +316,7 @@ class TestFriendAcceptHandshake:
         assert resp.status_code == 200
 
         store = app_with_contacts.state.contacts_store
-        link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
+        link = await store.get_peer_link(f"hub:{_PEER_FP}")
         assert link is not None
         assert link["endpoints"] == [{"kind": "hub", "url": "https://peer.example.com:6969", "priority": 0}]
 
@@ -338,12 +346,12 @@ class TestFriendAcceptHandshake:
         assert resp.status_code == 200
 
         store = app_with_contacts.state.contacts_store
-        first_link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
+        first_link = await store.get_peer_link(f"hub:{_PEER_FP}")
         first_established = first_link["established_at"]
 
         # Simulate a revocation so we can verify re-establish actually clears it.
-        await store.revoke_peer_link(f"hub:{_PEER_USERNAME}")
-        revoked_link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
+        await store.revoke_peer_link(f"hub:{_PEER_FP}")
+        revoked_link = await store.get_peer_link(f"hub:{_PEER_FP}")
         assert revoked_link["revoked_at"] is not None, "revocation must stick"
 
         # Second accept with different endpoints — should re-establish and clear
@@ -354,7 +362,7 @@ class TestFriendAcceptHandshake:
         )
         assert resp2.status_code == 200
 
-        link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
+        link = await store.get_peer_link(f"hub:{_PEER_FP}")
         assert link is not None
         assert link["endpoints"] == [{"kind": "hub", "url": "https://second.example.com:6969", "priority": 0}]
         assert link["revoked_at"] is None, "re-establish must clear revocation"
@@ -384,6 +392,75 @@ class TestFriendAcceptHandshake:
         assert resp.status_code == 200
         assert resp.json()["state"] == "accepted"
 
+    async def test_accept_same_username_second_peer_does_not_overwrite(
+        self, client_with_contacts, app_with_contacts, monkeypatch
+    ):
+        """A second peer sharing an existing contact's username must pin its own
+        fingerprint-keyed contact without overwriting the first's key material."""
+        store = app_with_contacts.state.contacts_store
+
+        # First peer: username "remotepeer", fingerprint _PEER_FP.
+        dir_resp_1 = {
+            "peer": _PEER_FP,
+            "username": _PEER_USERNAME,
+            "display_name": "Remote One",
+            "signing_pubkey": _PEER_SIGNING_PUB,
+            "encryption_pubkey": _PEER_ENCRYPTION_PUB,
+            "endpoints": ["https://one.example.com:6969"],
+        }
+
+        async def handler1(method, url, **kw):
+            return _fake_dir_resp(body=dir_resp_1)
+
+        _patch_account_proxy(monkeypatch, handler1)
+        resp = await client_with_contacts.post(
+            "/api/hub/friends/requests/test-rid-dup1/accept",
+            json={"peer_fingerprint": _PEER_FP},
+        )
+        assert resp.status_code == 200
+
+        first = await store.get_contact(f"hub:{_PEER_FP}")
+        assert first is not None
+        assert first["ed25519_pub"] == _PEER_SIGNING_PUB
+        assert first["x25519_pub"] == _PEER_ENCRYPTION_PUB
+
+        # Second peer: SAME username, different fingerprint + key material.
+        dir_resp_2 = {
+            "peer": _PEER2_FP,
+            "username": _PEER_USERNAME,
+            "display_name": "Remote Two",
+            "signing_pubkey": _PEER2_SIGNING_PUB,
+            "encryption_pubkey": _PEER2_ENCRYPTION_PUB,
+            "endpoints": ["https://two.example.com:6969"],
+        }
+
+        async def handler2(method, url, **kw):
+            return _fake_dir_resp(body=dir_resp_2)
+
+        _patch_account_proxy(monkeypatch, handler2)
+        resp2 = await client_with_contacts.post(
+            "/api/hub/friends/requests/test-rid-dup2/accept",
+            json={"peer_fingerprint": _PEER2_FP},
+        )
+        assert resp2.status_code == 200
+
+        # The first contact's pins are intact — NOT overwritten by the name twin.
+        first_again = await store.get_contact(f"hub:{_PEER_FP}")
+        assert first_again is not None
+        assert first_again["ed25519_pub"] == _PEER_SIGNING_PUB
+        assert first_again["x25519_pub"] == _PEER_ENCRYPTION_PUB
+        assert first_again["peer_fingerprint"] == _PEER_FP
+
+        # The second peer got its own distinct, fingerprint-keyed contact.
+        second = await store.get_contact(f"hub:{_PEER2_FP}")
+        assert second is not None
+        assert second["ed25519_pub"] == _PEER2_SIGNING_PUB
+        assert second["x25519_pub"] == _PEER2_ENCRYPTION_PUB
+        assert second["peer_fingerprint"] == _PEER2_FP
+
+        # Both share a username but are distinct contacts.
+        assert second["hub_username"] == first_again["hub_username"] == _PEER_USERNAME
+
 
 # ---------------------------------------------------------------------------
 # Tests: block -> cascade to contacts
@@ -399,7 +476,7 @@ class TestBlockCascade:
         # First, create a contact and peer link so there's something to revoke.
         store = app_with_contacts.state.contacts_store
         await store.add_contact(
-            contact_id=f"hub:{_PEER_USERNAME}",
+            contact_id=f"hub:{_PEER_FP}",
             hub_username=_PEER_USERNAME,
             display_name="Remote",
             ed25519_pub=_PEER_SIGNING_PUB,
@@ -407,7 +484,7 @@ class TestBlockCascade:
             peer_fingerprint=_PEER_FP,
         )
         await store.establish_peer_link(
-            contact_id=f"hub:{_PEER_USERNAME}",
+            contact_id=f"hub:{_PEER_FP}",
             inbound_token=generate_peer_token(),
             outbound_token=generate_peer_token(),
         )
@@ -445,11 +522,11 @@ class TestBlockCascade:
         assert data["state"] == "blocked"
 
         # Verify peer link is revoked
-        link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
+        link = await store.get_peer_link(f"hub:{_PEER_FP}")
         assert link["revoked_at"] is not None
 
         # Verify contact is blocked
-        contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
+        contact = await store.get_contact(f"hub:{_PEER_FP}")
         assert contact["status"] == "blocked"
 
     async def test_block_cascade_handles_missing_contacts_store(
@@ -480,7 +557,7 @@ class TestBlockCascade:
 
         # Create contact + peer link with fingerprint, but do NOT seed hub_authors.
         await store.add_contact(
-            contact_id=f"hub:{_PEER_USERNAME}",
+            contact_id=f"hub:{_PEER_FP}",
             hub_username=_PEER_USERNAME,
             display_name="Remote",
             ed25519_pub=_PEER_SIGNING_PUB,
@@ -488,7 +565,7 @@ class TestBlockCascade:
             peer_fingerprint=_PEER_FP,
         )
         await store.establish_peer_link(
-            contact_id=f"hub:{_PEER_USERNAME}",
+            contact_id=f"hub:{_PEER_FP}",
             inbound_token=generate_peer_token(),
             outbound_token=generate_peer_token(),
         )
@@ -509,11 +586,71 @@ class TestBlockCascade:
         assert resp.json()["state"] == "blocked"
 
         # Verify peer link is revoked (fingerprint fallback worked)
-        link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
+        link = await store.get_peer_link(f"hub:{_PEER_FP}")
         assert link["revoked_at"] is not None
 
         # Verify contact is blocked
-        contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
+        contact = await store.get_contact(f"hub:{_PEER_FP}")
+        assert contact["status"] == "blocked"
+
+    async def test_block_cascade_revokes_when_cached_username_stale(
+        self, client_with_contacts, app_with_contacts, monkeypatch
+    ):
+        """Block revokes the peer link even when the hub_authors username cache
+        is present-but-stale (renamed since the contact was pinned)."""
+        store = app_with_contacts.state.contacts_store
+
+        # Contact pinned under the fingerprint, with the ORIGINAL username.
+        await store.add_contact(
+            contact_id=f"hub:{_PEER_FP}",
+            hub_username="original-name",
+            display_name="Remote",
+            ed25519_pub=_PEER_SIGNING_PUB,
+            x25519_pub=_PEER_ENCRYPTION_PUB,
+            peer_fingerprint=_PEER_FP,
+        )
+        await store.establish_peer_link(
+            contact_id=f"hub:{_PEER_FP}",
+            inbound_token=generate_peer_token(),
+            outbound_token=generate_peer_token(),
+        )
+
+        # Seed hub_authors with a DIFFERENT (stale) username for the same
+        # fingerprint — the peer renamed after the contact was pinned.
+        from tinyagentos.hub.store import HubStore
+
+        hub_store = HubStore(
+            Path(app_with_contacts.state.data_dir) / "hub" / "hub.db"
+        )
+        try:
+            await hub_store.init()
+            await hub_store.upsert_author(
+                _PEER_FP,
+                username="renamed-later",
+                signing_pubkey=_PEER_SIGNING_PUB,
+                encryption_pubkey=_PEER_ENCRYPTION_PUB,
+            )
+        finally:
+            await hub_store.close()
+
+        async def handler(method, url, **kw):
+            if "/api/hub/edges/revoke" in url:
+                return _fake_dir_resp(body={"status": "revoked"})
+            return _fake_dir_resp(body={})
+
+        _patch_account_proxy(monkeypatch, handler)
+
+        resp = await client_with_contacts.post(
+            "/api/hub/friends/block",
+            json={"peer_fingerprint": _PEER_FP},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["state"] == "blocked"
+
+        # Revocation resolved via the fingerprint, not the stale username.
+        link = await store.get_peer_link(f"hub:{_PEER_FP}")
+        assert link["revoked_at"] is not None
+        contact = await store.get_contact(f"hub:{_PEER_FP}")
         assert contact["status"] == "blocked"
 
 
@@ -552,9 +689,9 @@ class TestSecurityRegression:
         assert resp.status_code == 200
 
         store = app_with_contacts.state.contacts_store
-        contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
+        contact = await store.get_contact(f"hub:{_PEER_FP}")
         assert contact is None, "imposter pubkey must not create a contact"
-        link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
+        link = await store.get_peer_link(f"hub:{_PEER_FP}")
         assert link is None, "imposter pubkey must not create a peer link"
 
     async def test_authz_rejection_no_handshake(
@@ -581,9 +718,9 @@ class TestSecurityRegression:
         assert data["state"] == "rejected"
 
         store = app_with_contacts.state.contacts_store
-        contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
+        contact = await store.get_contact(f"hub:{_PEER_FP}")
         assert contact is None, "403 must not create a contact"
-        link = await store.get_peer_link(f"hub:{_PEER_USERNAME}")
+        link = await store.get_peer_link(f"hub:{_PEER_FP}")
         assert link is None, "403 must not create a peer link"
 
     async def test_block_guard_prevent_reaccept_resurrection(
@@ -595,7 +732,7 @@ class TestSecurityRegression:
 
         # Create a contact and peer link, then block.
         await store.add_contact(
-            contact_id=f"hub:{_PEER_USERNAME}",
+            contact_id=f"hub:{_PEER_FP}",
             hub_username=_PEER_USERNAME,
             display_name="Remote",
             ed25519_pub=_PEER_SIGNING_PUB,
@@ -603,11 +740,11 @@ class TestSecurityRegression:
             peer_fingerprint=_PEER_FP,
         )
         await store.establish_peer_link(
-            contact_id=f"hub:{_PEER_USERNAME}",
+            contact_id=f"hub:{_PEER_FP}",
             inbound_token=generate_peer_token(),
             outbound_token=generate_peer_token(),
         )
-        await store.set_contact_status(f"hub:{_PEER_USERNAME}", "blocked")
+        await store.set_contact_status(f"hub:{_PEER_FP}", "blocked")
 
         # Also add REL_BLOCK on hub relationships — the accept guard
         # checks has_edge(peer, REL_BLOCK) at the hub layer, not the
@@ -644,7 +781,7 @@ class TestSecurityRegression:
         assert resp.status_code == 200
 
         # Contact must still be blocked — NOT resurrected to active
-        contact = await store.get_contact(f"hub:{_PEER_USERNAME}")
+        contact = await store.get_contact(f"hub:{_PEER_FP}")
         assert contact is not None
         assert contact["status"] == "blocked", (
             "blocked contact must not be resurrected by re-accept"
