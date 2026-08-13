@@ -606,3 +606,91 @@ class TestCommitsWithMessagesParsing:
 
     def test_empty_range_is_empty(self, monkeypatch):
         assert self._parse(monkeypatch, "") == []
+
+
+# A config mirroring the real interaction between the routes rule and the
+# user-visible-changelog rule: a route addition triggers BOTH rules, so the
+# changelog fragment satisfies the latter while only a doc edit can satisfy the
+# former. This is the shape that lets the deletion bypass hide -- the
+# user-visible-changelog rule is always satisfiable, so a deleted routes
+# require_doc only shows as a bug once every OTHER rule is also satisfied.
+ROUTES_AND_CHANGELOG_CONFIG = {
+    "gate": {"trailer": "Docs-Reviewed:"},
+    "rules": [
+        {
+            "name": "routes",
+            "on_modify": True,
+            "when_changed": ["tinyagentos/routes/*.py"],
+            "require_doc": ["docs/agent-coordination.md"],
+            "hint": "an API route module was added, removed, or modified",
+        },
+        {
+            "name": "user-visible-changelog",
+            "on_modify": True,
+            "when_changed": ["tinyagentos/**", "desktop/src/**"],
+            "require_doc": ["CHANGELOG.md", "changelog.d/*.md"],
+            "hint": "user-visible behaviour changed",
+        },
+    ],
+}
+
+
+def _failure_names(failures: list[str]) -> list[str]:
+    return [f.split(" -- ")[0] for f in failures]
+
+
+class TestDeletedRequireDocDoesNotSatisfy:
+    """A deleted require_doc must NOT satisfy a rule.
+
+    Bug: scripts/check_doc_gate.py line 247 ``all_paths`` discarded the git
+    status, so a ``git rm``'d require_doc was treated as having satisfied the
+    rule. These tests assert on the rule NAME in the failures list, not just
+    the exit code: with only the route add + doc deletion (no changelog
+    fragment) the routes failure is masked by a coinciding user-visible-changelog
+    failure, so an exit-code-only assertion stays green even while the bug is
+    live. Red-first: criterion 1 fails before the fix, passes after.
+    """
+
+    def test1_delete_require_doc_routes_still_fails(self):
+        """Criterion 1: add a when_changed path + delete the require_doc +
+        satisfy every other rule -- the routes rule MUST appear in failures."""
+        changed = [
+            ("A", "tinyagentos/routes/zzz_probe.py"),
+            ("D", "docs/agent-coordination.md"),
+            ("A", "changelog.d/9999-probe.md"),
+        ]
+        failures = dg.evaluate_rules(changed, [], ROUTES_AND_CHANGELOG_CONFIG)
+        names = _failure_names(failures)
+        assert "routes" in names
+        assert "user-visible-changelog" not in names
+
+    def test2_edit_require_doc_passes(self):
+        """Criterion 2: add a when_changed path + genuinely edit the require_doc
+        -> clean. Guards against fixing this by deadening satisfaction entirely."""
+        changed = [
+            ("A", "tinyagentos/routes/zzz_probe.py"),
+            ("M", "docs/agent-coordination.md"),
+            ("A", "changelog.d/9999-probe.md"),
+        ]
+        failures = dg.evaluate_rules(changed, [], ROUTES_AND_CHANGELOG_CONFIG)
+        assert failures == []
+
+    def test3_add_require_doc_as_new_file_passes(self):
+        """Criterion 3: add a when_changed path + ADD the require_doc as a new
+        file -> clean."""
+        changed = [
+            ("A", "tinyagentos/routes/zzz_probe.py"),
+            ("A", "docs/agent-coordination.md"),
+            ("A", "changelog.d/9999-probe.md"),
+        ]
+        failures = dg.evaluate_rules(changed, [], ROUTES_AND_CHANGELOG_CONFIG)
+        assert failures == []
+
+    def test4_delete_when_changed_path_still_triggers(self):
+        """Criterion 4: delete a when_changed path -- still triggers the rule,
+        unchanged from today. The triggering path must keep deletions; only
+        the satisfaction path must exclude them."""
+        changed = [("D", "tinyagentos/routes/zzz_probe.py")]
+        failures = dg.evaluate_rules(changed, [], ROUTES_AND_CHANGELOG_CONFIG)
+        names = _failure_names(failures)
+        assert "routes" in names
