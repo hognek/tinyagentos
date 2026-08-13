@@ -42,6 +42,10 @@ export function ProjectsApp({
       const list = await projectsApi.list("active");
       setProjects(list);
       setError(null);
+      // Mobile shows the project list as its own screen; auto-selecting
+      // the first project would slide the user straight into the detail
+      // view and skip the list. Desktop's split layout shows both at once,
+      // so picking up the first project is a useful default there.
       const stillExists = selectedId && list.some((p) => p.id === selectedId);
       if (!stillExists && !isMobile) {
         setSelectedId(list.length > 0 ? list[0]!.id : null);
@@ -53,9 +57,13 @@ export function ProjectsApp({
     }
   }, [selectedId, isMobile]);
 
+  // Mount only. `refresh` is derived from selectedId, so depending on its
+  // identity re-lists every project on each selection; the focus hook keeps
+  // its own latest-callback ref, so it still runs the current closure.
   useEffect(() => {
-    refresh();
-  }, [refresh]);
+    void refresh();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useRefreshOnFocus(refresh);
 
