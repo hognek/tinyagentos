@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
 import {
   StickyNote,
   Plus,
@@ -1047,6 +1048,8 @@ function DocsApp({ config }: { config: DocKindConfig }) {
   useEffect(() => {
     loadNotes();
   }, [loadNotes]);
+
+  useRefreshOnFocus(loadNotes);
 
   function handleCreated(doc: NoteDoc) {
     setNotes((prev) => [doc, ...prev]);
