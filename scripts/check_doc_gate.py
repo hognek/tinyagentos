@@ -41,10 +41,13 @@ DEFAULT_TRAILER = "Docs-Reviewed:"
 # for argparse, never our own code), 3 a config error (broken, missing, or
 # unparseable config).  3 is kept off 2 so a typo'd flag is never mistaken for
 # a bad config: a misconfigured gate must be distinguishable from both a real
-# documentation-drift violation and a usage mistake.
+# documentation-drift violation and a usage mistake.  4 is a git infrastructure
+# failure (missing ref, network error, shallow clone, etc.) so it is never
+# confused with a rule violation.
 EXIT_OK = 0
 EXIT_VIOLATION = 1
 EXIT_CONFIG_ERROR = 3
+EXIT_GIT_ERROR = 4
 
 # A path-like token: one of the four known repo prefixes followed by a run of
 # non-whitespace / non-quoting characters. The negative lookbehind stops us
@@ -281,11 +284,22 @@ def evaluate_rules(
     return failures
 
 
-def _run_git(args: list[str]) -> str:
-    result = subprocess.run(
-        ["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, check=True,
-    )
-    return result.stdout
+class GitCommandError(Exception):
+    """Raised when a git command fails, so infrastructure failures are
+    distinguishable from genuine doc-gate violations."""
+
+
+def _run_git(args: list[str], ref: str | None = None) -> str:
+    try:
+        result = subprocess.run(
+            ["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+        )
+        return result.stdout
+    except subprocess.CalledProcessError:
+        msg = f"git {' '.join(args)} failed"
+        if ref:
+            msg += f" (ref: {ref})"
+        raise GitCommandError(msg) from None
 
 
 def _parse_name_status(output: str) -> list[tuple[str, str]]:
@@ -307,11 +321,11 @@ def _git_changed_staged() -> list[tuple[str, str]]:
 
 
 def _git_changed_base(base_ref: str) -> list[tuple[str, str]]:
-    return _parse_name_status(_run_git(["diff", "--name-status", f"{base_ref}...HEAD"]))
+    return _parse_name_status(_run_git(["diff", "--name-status", f"{base_ref}...HEAD"], ref=base_ref))
 
 
 def _git_commit_messages(base_ref: str) -> list[str]:
-    out = _run_git(["log", f"{base_ref}..HEAD", "--format=%B%x00"])
+    out = _run_git(["log", f"{base_ref}..HEAD", "--format=%B%x00"], ref=base_ref)
     return [m for m in out.split("\x00") if m.strip()]
 
 
@@ -321,7 +335,7 @@ def _git_commits_with_messages(base_ref: str) -> list[tuple[str, str, str]]:
     # inside it. A record terminator distinct from the field separator is what
     # makes this parseable: with one separator for both, the flat split cannot
     # tell a new commit's hash from the previous commit's body.
-    out = _run_git(["log", f"{base_ref}..HEAD", "--format=%H%x1f%an%x1f%B%x1e"])
+    out = _run_git(["log", f"{base_ref}..HEAD", "--format=%H%x1f%an%x1f%B%x1e"], ref=base_ref)
     commits: list[tuple[str, str, str]] = []
     for record in out.split("\x1e"):
         if not record.strip():
@@ -391,14 +405,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # diff-gate
-    if args.staged:
-        changed = _git_changed_staged()
-        commit_messages: list[str] = []
-    else:
-        changed = _git_changed_base(args.base)
-        commits_meta = _git_commits_with_messages(args.base)
-        commit_messages = [msg for _hash, _author, msg in commits_meta]
-        _log_trailer_usage(commits_meta, get_trailer(config))
+    try:
+        if args.staged:
+            changed = _git_changed_staged()
+            commit_messages: list[str] = []
+        else:
+            changed = _git_changed_base(args.base)
+            commits_meta = _git_commits_with_messages(args.base)
+            commit_messages = [msg for _hash, _author, msg in commits_meta]
+            _log_trailer_usage(commits_meta, get_trailer(config))
+    except GitCommandError as e:
+        print(f"doc-gate: git error: {e}", file=sys.stderr)
+        return EXIT_GIT_ERROR
 
     failures = evaluate_rules(changed, commit_messages, config)
     return _report(failures)
