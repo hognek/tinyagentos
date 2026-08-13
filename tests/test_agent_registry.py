@@ -578,6 +578,29 @@ class TestAgentRegistryRoutes:
         assert set(entry.keys()) == {"canonical_id", "revoked_at"}
         assert entry["revoked_at"] is not None
 
+    async def test_revoked_feed_scoped_to_agent_identities_only(self, registry_client):
+        """Guard: the revocation feed covers agent identities only.
+
+        Decided 2026-08-13. Human credential withdrawal lives in the
+        session/auth layer, not this feed. Each entry must have exactly
+        canonical_id and revoked_at.
+        """
+        reg_resp = await registry_client.post(
+            "/api/agents/registry/register",
+            json={"framework": "openclaw", "display_name": "Boundary"},
+        )
+        cid = reg_resp.json()["canonical_id"]
+        await registry_client.delete(f"/api/agents/registry/{cid}")
+
+        resp = await registry_client.get("/api/agents/registry/revoked")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "revoked" in data
+        assert len(data["revoked"]) >= 1
+        entry = next(e for e in data["revoked"] if e["canonical_id"] == cid)
+        assert set(entry.keys()) == {"canonical_id", "revoked_at"}
+        assert entry["revoked_at"] is not None
+
     async def test_revoked_route_not_captured_as_canonical_id(self, registry_client):
         """Route ordering regression: /revoked must hit the feed, not the single-entry route."""
         resp = await registry_client.get("/api/agents/registry/revoked")

@@ -801,7 +801,14 @@ class AgentRegistryStore(BaseStore):
         return [_row_to_dict(r) for r in rows]
 
     async def list_revoked(self) -> list[dict]:
-        """Return [{canonical_id, revoked_at}] for all revoked entries (back-compat feed)."""
+        """Return [{canonical_id, revoked_at}] for all revoked agent identities.
+
+        This feed is deliberately scoped to agent identities only, as decided on
+        2026-08-13. Human credential withdrawal is handled through the
+        session/auth layer and does not appear here. Do not extend this feed to
+        include human principals or subject_type fields without a new design
+        decision.
+        """
         if self._db is None:
             raise RuntimeError("AgentRegistryStore not initialised")
         cursor = await self._db.execute(
