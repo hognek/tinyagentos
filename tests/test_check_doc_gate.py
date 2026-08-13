@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import importlib.util
+import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -269,3 +271,45 @@ class TestReferencedPathsScan:
             "read ~/.claude/projects/-home-x-tinyagentos/memory/MEMORY.md at start"
         )
         assert toks == []
+
+
+class TestGitCommandErrorHandling:
+    """Git infrastructure failures must never be confused with rule violations."""
+
+    def test_nonexistent_base_ref_exits_git_error(self, capsys):
+        """A bad --base ref should produce the new exit code with a clear message."""
+        error = subprocess.CalledProcessError(
+            128,
+            ["git", "diff", "--name-status", "origin/no-such-ref...HEAD"],
+        )
+        error.stderr = "fatal: bad revision 'origin/no-such-ref'\n"
+        
+        with patch.object(_MOD.subprocess, "run", side_effect=error):
+            code = _MOD.main(["diff-gate", "--base", "origin/no-such-ref"])
+            assert code == _MOD.EXIT_GIT_ERROR
+            captured = capsys.readouterr()
+            assert "diff" in captured.err
+            assert "origin/no-such-ref" in captured.err
+            assert "Traceback" not in captured.err
+
+    def test_genuine_violation_still_exits_1(self, capsys):
+        """A real rule violation must still exit 1."""
+        mock_result_diff = MagicMock()
+        mock_result_diff.stdout = "A\ttinyagentos/routes/themes.py\n"
+        mock_result_log = MagicMock()
+        mock_result_log.stdout = "\x00"
+        
+        with patch.object(_MOD.subprocess, "run", side_effect=[mock_result_diff, mock_result_log]):
+            code = _MOD.main(["diff-gate", "--base", "origin/HEAD"])
+            assert code == _MOD.EXIT_VIOLATION
+
+    def test_clean_run_still_exits_0(self, capsys):
+        """A clean run must still exit 0."""
+        mock_result_diff = MagicMock()
+        mock_result_diff.stdout = ""
+        mock_result_log = MagicMock()
+        mock_result_log.stdout = "\x00"
+        
+        with patch.object(_MOD.subprocess, "run", side_effect=[mock_result_diff, mock_result_log]):
+            code = _MOD.main(["diff-gate", "--base", "origin/HEAD"])
+            assert code == _MOD.EXIT_OK
