@@ -19,12 +19,20 @@ describe("useRefreshOnFocus", () => {
     const refetch = vi.fn().mockResolvedValue(undefined);
     let capturedFocus: (() => void) | null = null;
     let capturedVisibility: (() => void) | null = null;
+    let focusHandler: (() => void) | null = null;
+    let visibilityHandler: (() => void) | null = null;
 
     vi.spyOn(window, "addEventListener").mockImplementation((event, fn) => {
-      if (event === "focus") capturedFocus = fn as () => void;
+      if (event === "focus") {
+        capturedFocus = fn as () => void;
+        focusHandler = fn as () => void;
+      }
     });
     vi.spyOn(document, "addEventListener").mockImplementation((event, fn) => {
-      if (event === "visibilitychange") capturedVisibility = fn as () => void;
+      if (event === "visibilitychange") {
+        capturedVisibility = fn as () => void;
+        visibilityHandler = fn as () => void;
+      }
     });
 
     renderHook(() => useRefreshOnFocus(refetch));
@@ -41,6 +49,7 @@ describe("useRefreshOnFocus", () => {
     });
 
     expect(refetch).toHaveBeenCalledTimes(1);
+    expect(refetch).toHaveBeenCalledWith();
   });
 
   it("visibility change triggers refetch when becoming visible", async () => {
@@ -116,12 +125,24 @@ describe("useRefreshOnFocus", () => {
   it("cleans up listeners on unmount", () => {
     const removeFocusSpy = vi.spyOn(window, "removeEventListener");
     const removeVisibilitySpy = vi.spyOn(document, "removeEventListener");
+    let focusHandler: (() => void) | null = null;
+    let visibilityHandler: (() => void) | null = null;
+
+    vi.spyOn(window, "addEventListener").mockImplementation((event, fn) => {
+      if (event === "focus") focusHandler = fn as () => void;
+    });
+    vi.spyOn(document, "addEventListener").mockImplementation((event, fn) => {
+      if (event === "visibilitychange") visibilityHandler = fn as () => void;
+    });
 
     const { unmount } = renderHook(() => useRefreshOnFocus(vi.fn()));
 
+    expect(focusHandler).toBeDefined();
+    expect(visibilityHandler).toBeDefined();
+
     unmount();
 
-    expect(removeFocusSpy).toHaveBeenCalledWith("focus", expect.any(Function));
-    expect(removeVisibilitySpy).toHaveBeenCalledWith("visibilitychange", expect.any(Function));
+    expect(removeFocusSpy).toHaveBeenCalledWith("focus", focusHandler);
+    expect(removeVisibilitySpy).toHaveBeenCalledWith("visibilitychange", visibilityHandler);
   });
 });
