@@ -12,8 +12,8 @@ from tinyagentos.base_store import BaseStore
 
 CONTACTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS contacts (
-    contact_id        TEXT PRIMARY KEY,       -- "hub:{username}" e.g. "hub:hogne"
-    hub_username      TEXT NOT NULL UNIQUE,
+    contact_id        TEXT PRIMARY KEY,       -- "hub:{fingerprint}" — canonical key, never the username
+    hub_username      TEXT NOT NULL,          -- display column; not unique (distinct peers may share a name)
     display_name      TEXT NOT NULL,
     ed25519_pub       TEXT NOT NULL,          -- pinned at friend-accept
     x25519_pub        TEXT NOT NULL,
@@ -99,6 +99,63 @@ class ContactsStore(BaseStore):
             )
             await self._db.commit()
 
+        # Drop the legacy UNIQUE constraint on hub_username.  Contacts are now
+        # keyed on the peer's signing-key fingerprint (contact_id = "hub:{fp}"),
+        # so username is a non-unique display column: two distinct peers may
+        # share a name without one overwriting the other's pinned key material.
+        # SQLite refuses to drop an inline UNIQUE auto-index, so we rebuild the
+        # table without it (same pattern as db_migrations' namespace rebuild).
+        if await self._hub_username_unique_index_exists():
+            await self._db.execute("BEGIN")
+            try:
+                await self._db.execute(
+                    "CREATE TABLE contacts_new ("
+                    "    contact_id        TEXT PRIMARY KEY,"
+                    "    hub_username      TEXT NOT NULL,"
+                    "    display_name      TEXT NOT NULL,"
+                    "    ed25519_pub       TEXT NOT NULL,"
+                    "    x25519_pub        TEXT NOT NULL,"
+                    "    peer_fingerprint  TEXT NOT NULL DEFAULT '',"
+                    "    status            TEXT NOT NULL DEFAULT 'pending',"
+                    "    local_crm_id      TEXT,"
+                    "    created_at        REAL NOT NULL,"
+                    "    revoked_at        REAL"
+                    ")"
+                )
+                await self._db.execute(
+                    "INSERT INTO contacts_new "
+                    "(contact_id, hub_username, display_name, ed25519_pub, x25519_pub, "
+                    " peer_fingerprint, status, local_crm_id, created_at, revoked_at) "
+                    "SELECT contact_id, hub_username, display_name, ed25519_pub, x25519_pub, "
+                    " peer_fingerprint, status, local_crm_id, created_at, revoked_at "
+                    "FROM contacts"
+                )
+                await self._db.execute("DROP TABLE contacts")
+                await self._db.execute(
+                    "ALTER TABLE contacts_new RENAME TO contacts"
+                )
+                await self._db.commit()
+            except BaseException:
+                await self._db.rollback()
+                raise
+
+    async def _hub_username_unique_index_exists(self) -> bool:
+        """True when the legacy UNIQUE auto-index on hub_username still exists."""
+        for idx in await (
+            await self._db.execute("PRAGMA index_list('contacts')")
+        ).fetchall():
+            # index_list row: (seq, name, unique, origin, partial)
+            if idx[2] and idx[3] == "u":
+                cols = [
+                    r[2]
+                    for r in await (
+                        await self._db.execute(f"PRAGMA index_info('{idx[1]}')")
+                    ).fetchall()
+                ]
+                if cols == ["hub_username"]:
+                    return True
+        return False
+
     # ------------------------------------------------------------------
     # contacts
     # ------------------------------------------------------------------
@@ -166,8 +223,9 @@ class ContactsStore(BaseStore):
         """Look up a contact by its peer signing-key fingerprint.
 
         Returns the contact row, or None if no contact is pinned to this
-        fingerprint.  Used by the block cascade as a fallback when the
-        hub_authors cache is missing or stale.
+        fingerprint.  This is the canonical lookup: the contact is keyed on the
+        fingerprint (the stable, peer-independent identifier), so it is the
+        primary path for the block cascade and any revocation flow.
         """
         if not peer_fingerprint:
             return None
