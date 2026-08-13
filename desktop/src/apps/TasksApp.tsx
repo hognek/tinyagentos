@@ -97,7 +97,10 @@ export function TasksApp({ windowId: _windowId }: { windowId: string }) {
         }
       }
     } catch { /* fall through */ }
-    setTasks([]);
+    // Keep whatever is on screen. This path now runs on every window focus, so
+    // wiping here turns a transient backend blip into "No scheduled routines"
+    // over routines that exist. At mount `tasks` is already [], so the empty
+    // state still renders exactly as before.
     setLoading(false);
   }, []);
 
