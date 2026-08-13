@@ -20,7 +20,6 @@ import {
 } from "@/lib/models";
 import { useProcessStore } from "@/stores/process-store";
 import { getApp } from "@/registry/app-registry";
-import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
