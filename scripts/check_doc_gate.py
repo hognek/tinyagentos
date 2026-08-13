@@ -13,8 +13,9 @@ Two layers:
                 globs. By default only added/deleted files (status A/D) are
                 structural; set `on_modify = true` on a rule to also count
                 plain modifications (status M) for that rule. Any changed
-                file (any status) can *satisfy* a rule if it matches a
-                require_doc glob.
+                file (any status) can *trigger* a rule. Only ADDED or MODIFIED
+                files (status A/M) can *satisfy* a rule by matching a
+                require_doc glob; a deleted require_doc does NOT count.
 
 Config lives in docs/doc-gate.toml. Rules are data, not code: add more by
 editing the TOML, no changes to this file required.
@@ -235,16 +236,17 @@ def evaluate_rules(
     By default only status "A" (added) or "D" (deleted) files count as
     structural change for triggering a rule. When a rule sets `on_modify =
     true`, status "M" (plain modification) also counts for that rule.
-    Any changed file (any status) can satisfy a rule if it matches a
-    require_doc glob. Test paths are never structural and are always
-    excluded.
+    Any added or modified file can satisfy a rule if it matches a
+    require_doc glob; a deleted require_doc does NOT count. Trigger scope (A/D,
+    plus M when on_modify is set) is separate from satisfaction scope (A/M only).
+    Test paths are never structural and are always excluded.
     commit_messages: full text of each commit message in range (empty list
     when there is no finalized commit yet, i.e. --staged mode).
     """
     trailer = get_trailer(config)
     rules = config.get("rules", [])
 
-    all_paths = [path for _status, path in changed_status]
+    all_paths = [path for status, path in changed_status if status in ("A", "M")]
 
     trailer_present = any(
         line.strip().startswith(trailer) and line.strip()[len(trailer):].strip()
