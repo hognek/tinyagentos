@@ -659,7 +659,13 @@ export function FilesApp({
     fetchFiles(currentPath);
   }, [currentPath, fetchFiles]);
 
-  useRefreshOnFocus(fetchFiles);
+  // fetchFiles defaults its path to the workspace root, and the hook calls its
+  // refetch with no arguments — so it has to be handed the current directory.
+  const refreshCurrentDir = useCallback(
+    () => fetchFiles(currentPath),
+    [fetchFiles, currentPath],
+  );
+  useRefreshOnFocus(refreshCurrentDir);
 
   // Live updates via SSE — supports both the user workspace and per-agent
   // workspaces. Shared folders don't expose a watch stream, so the SSE setup

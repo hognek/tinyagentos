@@ -304,4 +304,51 @@ describe("DecisionsApp", () => {
 
     expect(pendingCalls("/api/decisions?status=pending")).toBe(initialPending + 1);
   });
+
+  it("keeps decisions on screen while the focus refresh is in flight", async () => {
+    vi.stubGlobal(
+      "fetch",
+      mockFetch({
+        "GET /api/decisions?status=pending": { ok: true, body: [singleSelect] },
+        "GET /api/decisions?status=answered": { ok: true, body: [] },
+        "GET /api/agents/auth-requests?status=pending": { ok: true, body: { requests: [] } },
+      }),
+    );
+    render(<DecisionsApp windowId="w1" />);
+    await flush();
+    expect(screen.getByText(singleSelect.question)).toBeTruthy();
+
+    // Hold the refresh open so the in-flight state is observable rather than
+    // racing past: a background refetch must not blank what the user is
+    // reading, and this app already has load({ silent: true }) for that.
+    const held: Array<() => void> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            held.push(() =>
+              resolve({
+                ok: true,
+                status: 200,
+                json: () => Promise.resolve([]),
+              }),
+            );
+          }),
+      ),
+    );
+
+    window.dispatchEvent(new Event("focus"));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 1100));
+    });
+
+    expect(screen.queryByText("Loading...")).toBeNull();
+    expect(screen.getByText(singleSelect.question)).toBeTruthy();
+
+    await act(async () => {
+      held.forEach((release) => release());
+      await new Promise((r) => setTimeout(r, 0));
+    });
+  });
 });

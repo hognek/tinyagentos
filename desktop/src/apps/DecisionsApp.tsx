@@ -539,7 +539,10 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
     load();
   }, [load]);
 
-  useRefreshOnFocus(load);
+  // Silent: a background refresh must not swap the decisions the user is
+  // reading for the loading placeholder.
+  const refreshSilently = useCallback(() => load({ silent: true }), [load]);
+  useRefreshOnFocus(refreshSilently);
 
   const answer = useCallback(
     async (id: string, value: string | string[]) => {
