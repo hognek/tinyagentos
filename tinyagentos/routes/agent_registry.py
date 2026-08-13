@@ -505,7 +505,12 @@ async def get_pubkey(request: Request):
 
 @router.get("/api/agents/registry/revoked")
 async def list_revoked_entries(request: Request):
-    """Return the global revocation feed: [{canonical_id, revoked_at}, ...].
+    """Return the global revocation feed for agent identities: [{canonical_id, revoked_at}, ...].
+
+    This feed is scoped to agent identities only, as decided on 2026-08-13.
+    Human credential withdrawal is handled through the session/auth layer and
+    does not appear here. Do not extend this feed to include human principals
+    or subject_type fields without a new design decision.
 
     Accessible to admin sessions/local-token OR a registry JWT whose
     canonical_id holds an active ``registry_feeds_read`` grant.  The grant is
