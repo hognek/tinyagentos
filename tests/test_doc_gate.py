@@ -584,7 +584,10 @@ class TestCommitsWithMessagesParsing:
     )
 
     def _parse(self, monkeypatch, out):
-        monkeypatch.setattr(dg, "_run_git", lambda args: out)
+        # Accepts ref= because _run_git now takes it: callers pass the base ref
+        # so a git failure can name it. A double that does not accept the real
+        # signature fails with TypeError and says nothing about the parser.
+        monkeypatch.setattr(dg, "_run_git", lambda args, ref=None: out)
         return dg._git_commits_with_messages("origin/dev")
 
     def test_parses_one_record_per_commit(self, monkeypatch):
