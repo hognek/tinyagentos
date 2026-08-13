@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
+import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
 import { Brain, Search, Download, Trash2, HardDrive, X, Cloud } from "lucide-react";
 import {
   Button,
