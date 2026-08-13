@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from "react";
+import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
 import { CalendarClock, Plus, Edit, Trash2, Play, Pause, X } from "lucide-react";
 import {
   Button,
@@ -121,6 +122,8 @@ export function TasksApp({ windowId: _windowId }: { windowId: string }) {
     fetchTasks();
     fetchPresets();
   }, [fetchTasks, fetchPresets]);
+
+  useRefreshOnFocus(fetchTasks);
 
   useEffect(() => {
     (async () => {

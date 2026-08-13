@@ -1,0 +1,1 @@
+- Adopted `useRefreshOnFocus` in Tasks, Activity, Models, and Notes so each window refetches its current data on focus without requiring a reopen.
