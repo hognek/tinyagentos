@@ -19,6 +19,7 @@ import {
 } from "@/lib/models";
 import { useProcessStore } from "@/stores/process-store";
 import { getApp } from "@/registry/app-registry";
+import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -265,6 +266,9 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
   // response commit state.
   const fetchSeqRef = useRef(0);
 
+  const downloadedRef = useRef(downloaded);
+  downloadedRef.current = downloaded;
+
   const fetchModels = useCallback(async () => {
     const seq = ++fetchSeqRef.current;
     // Kick off cluster workers + providers in parallel with /api/models so the
@@ -408,10 +412,10 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
       /* ignore */
     }
     if (seq !== fetchSeqRef.current) return;
-    // No real models reachable anywhere (backend down AND no providers/workers
-    // configured) — leave the lists empty so the clear "No models yet" empty
-    // state renders instead of misleading mock cards. This is what makes the
-    // `isFallback && downloaded.length === 0` empty state actually reachable.
+    if (downloadedRef.current.length > 0) {
+      setLoading(false);
+      return;
+    }
     setDownloaded([]);
     setAvailable([]);
     setIsFallback(true);
@@ -421,6 +425,8 @@ export function ModelsApp({ windowId: _windowId }: { windowId: string }) {
   useEffect(() => {
     fetchModels();
   }, [fetchModels]);
+
+  useRefreshOnFocus(fetchModels);
 
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<Record<string, string>>({});
