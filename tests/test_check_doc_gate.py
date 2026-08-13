@@ -168,6 +168,59 @@ class TestEvaluateRulesEdgeCases:
         assert failures == []
 
 
+class TestEvaluateRulesRenameCopy:
+    """Rename (R) and copy (C) must trigger rules but must not satisfy require_doc."""
+
+    def test_rename_triggers_rule_by_name(self):
+        """A rename of a when_changed path must trigger the rule."""
+        config = _base_config()
+        changed = [("R", "tinyagentos/routes/themes.py")]
+        failures = evaluate_rules(changed, [], config)
+        assert len(failures) == 1
+        assert "test_route" in failures[0]
+
+    def test_copy_triggers_rule_by_name(self):
+        """A copy of a when_changed path must trigger the rule."""
+        config = _base_config()
+        changed = [("C", "tinyagentos/routes/themes.py")]
+        failures = evaluate_rules(changed, [], config)
+        assert len(failures) == 1
+        assert "test_route" in failures[0]
+
+    def test_deletion_still_triggers_rule(self):
+        """A deletion of a when_changed path must still trigger the rule (pinning)."""
+        config = _base_config()
+        changed = [("D", "tinyagentos/routes/themes.py")]
+        failures = evaluate_rules(changed, [], config)
+        assert len(failures) == 1
+        assert "test_route" in failures[0]
+
+    def test_rename_does_not_satisfy_require_doc(self):
+        """Renaming the require_doc does NOT satisfy it (pinning).
+
+        If the satisfaction set were widened to include R, this would pass
+        silently and the assertion below would fail.
+        """
+        config = _base_config()
+        changed = [
+            ("R", "tinyagentos/routes/themes.py"),
+            ("R", "CHANGELOG.md"),
+        ]
+        failures = evaluate_rules(changed, [], config)
+        assert len(failures) == 1
+        assert "test_route" in failures[0]
+
+    def test_rename_with_doc_added_passes(self):
+        """A route rename with the required doc added passes."""
+        config = _base_config()
+        changed = [
+            ("R", "tinyagentos/routes/themes.py"),
+            ("A", "CHANGELOG.md"),
+        ]
+        failures = evaluate_rules(changed, [], config)
+        assert failures == []
+
+
 class TestReferencedPathsScan:
     """Invariants layer: glob expansion, tombstones, extractor precision."""
 

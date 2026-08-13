@@ -9,13 +9,13 @@ Two layers:
                  scripts/, tinyagentos/, docs/, desktop/ path mentioned in the
                  configured doc set actually exists on disk.
   diff-gate   -- path -> doc rule engine (Layer B). A configured rule fires
-                when a *structural* change matches one of its `when_changed`
-                globs. By default only added/deleted files (status A/D) are
-                structural; set `on_modify = true` on a rule to also count
-                plain modifications (status M) for that rule. Any changed
-                file (any status) can *trigger* a rule. Only ADDED or MODIFIED
-                files (status A/M) can *satisfy* a rule by matching a
-                require_doc glob; a deleted require_doc does NOT count.
+                 when a *structural* change matches one of its `when_changed`
+                 globs. By default added, deleted, renamed, and copied files
+                 (status A/D/R/C) are structural; set `on_modify = true` on a
+                 rule to also count plain modifications (status M) for that
+                 rule. Only ADDED or MODIFIED files (status A/M) can *satisfy*
+                 a rule by matching a require_doc glob; a renamed, copied, or
+                 deleted require_doc does NOT count.
 
 Config lives in docs/doc-gate.toml. Rules are data, not code: add more by
 editing the TOML, no changes to this file required.
@@ -264,7 +264,7 @@ def evaluate_rules(
 
         rule_structural_paths = [
             path for status, path in changed_status
-            if (status in ("A", "D") or (on_modify and status == "M"))
+            if (status in ("A", "D", "R", "C") or (on_modify and status == "M"))
             and not _is_test_path(path)
         ]
 
