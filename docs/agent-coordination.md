@@ -76,7 +76,8 @@ Minted by `ensure_native_agent_identity()` in `tinyagentos/native_agent_identity
 
 **Scopes are deliberately minimal.** Bus participation only. Anything further goes through the normal user-mediated scope-request flow; a first-boot mint that silently granted file or task access would be a privilege grant nobody approved.
 
-**Two boundaries worth knowing before you build on this:**
+**Three boundaries worth knowing before you build on this:**
 
 - The token does **not** authenticate desktop control. `/api/desktop/*` resolves the acting user from a session, and the middleware sets `user_id = None` for registry JWTs, so a registry token arrives there as nobody. Desktop control still uses the session or the host local token.
+- **The revocation feed covers agent identities only, and that is a decision rather than a gap.** `GET /api/agents/registry/revoked` reads `agent_registry` and returns `{canonical_id, revoked_at}` per entry. Human credential withdrawal is handled through the session/auth layer, so humans will never appear here. Decided 2026-08-13, after a downstream spec was written assuming the opposite. If you are building something that needs to learn a *human's* credential was withdrawn, this feed is the wrong source and the requirement should be raised rather than implemented against it — `tests/test_agent_registry.py::test_revoked_feed_shape` fails if the feed is widened, deliberately.
 - **Nothing in the chat runtime reads the token yet.** The identity is minted; wiring it into what the agent sends is a separate change. It is deliberately absent from the agent manual until then — the manual is injected into the agent's prompt and sits at its size ceiling, so it should not describe a capability the agent does not yet have.

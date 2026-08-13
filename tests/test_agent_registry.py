@@ -560,7 +560,15 @@ class TestAgentRegistryRoutes:
     # -- Revoked feed --------------------------------------------------------
 
     async def test_revoked_feed_shape(self, registry_client):
-        """GET /api/agents/registry/revoked returns {revoked: [{canonical_id, revoked_at}]}."""
+        """GET /api/agents/registry/revoked returns {revoked: [{canonical_id, revoked_at}]}.
+
+        The exact-keys assertion below is a deliberate scope guard, not just a shape
+        check. Decided 2026-08-13: the revocation feed covers agent identities ONLY,
+        and human credential withdrawal is handled through the session/auth layer.
+        Adding a principal_kind or subject_type field to the feed will fail here, which
+        is the point -- widening it is a design decision that must be taken explicitly
+        rather than arrived at by editing a serializer.
+        """
         reg_resp = await registry_client.post(
             "/api/agents/registry/register",
             json={"framework": "openclaw", "display_name": "To Revoke"},
@@ -573,29 +581,6 @@ class TestAgentRegistryRoutes:
         data = resp.json()
         assert "revoked" in data
         assert isinstance(data["revoked"], list)
-        assert len(data["revoked"]) >= 1
-        entry = next(e for e in data["revoked"] if e["canonical_id"] == cid)
-        assert set(entry.keys()) == {"canonical_id", "revoked_at"}
-        assert entry["revoked_at"] is not None
-
-    async def test_revoked_feed_scoped_to_agent_identities_only(self, registry_client):
-        """Guard: the revocation feed covers agent identities only.
-
-        Decided 2026-08-13. Human credential withdrawal lives in the
-        session/auth layer, not this feed. Each entry must have exactly
-        canonical_id and revoked_at.
-        """
-        reg_resp = await registry_client.post(
-            "/api/agents/registry/register",
-            json={"framework": "openclaw", "display_name": "Boundary"},
-        )
-        cid = reg_resp.json()["canonical_id"]
-        await registry_client.delete(f"/api/agents/registry/{cid}")
-
-        resp = await registry_client.get("/api/agents/registry/revoked")
-        assert resp.status_code == 200
-        data = resp.json()
-        assert "revoked" in data
         assert len(data["revoked"]) >= 1
         entry = next(e for e in data["revoked"] if e["canonical_id"] == cid)
         assert set(entry.keys()) == {"canonical_id", "revoked_at"}
