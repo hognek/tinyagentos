@@ -16,6 +16,7 @@ import {
   STATUS_PILL_CLASS,
   STATUS_LABEL,
 } from "@/lib/cluster";
+import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
 
 type SortKey = "name" | "status" | "last_seen";
 
@@ -566,6 +567,8 @@ export function ClusterApp({ windowId: _windowId }: { windowId: string }) {
     const interval = setInterval(fetchWorkers, 10_000);
     return () => clearInterval(interval);
   }, [fetchWorkers]);
+
+  useRefreshOnFocus(fetchWorkers);
 
   const sortedWorkers = useMemo(() => {
     const list = [...workers];
