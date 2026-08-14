@@ -1,3 +1,5 @@
+> **Status (2026-08-14): Not implemented.** The file paths referenced below are proposed, not present in the codebase.
+
 # Unified GPU Work Queue — Design Specification
 
 - **Issue:** #1864 ("Follow-up: model loads as evictable submit_gpu tasks (arbiter Option B)"), evolved per owner direction into a broader feature.
