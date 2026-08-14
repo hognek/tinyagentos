@@ -180,7 +180,7 @@ The UI is a React SPA (`desktop/`) built with Vite. Static assets are served fro
 ### Tests
 
 - Use pytest; fixtures live in `tests/conftest.py` - use them
-- Mirror the module structure: `tinyagentos/routes/agents.py` -> `tests/test_agents.py`
+- Mirror the module structure: `tinyagentos/routes/agents.py` -> `tests/test_routes_agents.py`
 - All PRs must pass CI before merge
 
 ### Commits
