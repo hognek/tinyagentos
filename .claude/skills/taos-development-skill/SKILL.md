@@ -149,7 +149,7 @@ deps the project does not pin set `check_upgrade = false`.
 - `conftest.py`: `tmp_data_dir` fixture creates temp config + SQLite
 - `app` fixture: `create_app(data_dir=tmp_data_dir)`
 - `client` fixture: `AsyncClient(transport=ASGITransport(app=app))` - async HTTP test client
-- Module mirroring: `tests/test_agents.py` tests `routes/agents.py`
+- Module mirroring: `tests/test_routes_agents.py` tests `routes/agents.py`
 - SPA stubs: conftest creates stub `index.html`/`sw.js` so tests don't need `npm run build`
 - E2E (Playwright) tests excluded from CI and local gate
 
