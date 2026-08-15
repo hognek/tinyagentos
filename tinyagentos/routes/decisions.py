@@ -295,8 +295,12 @@ async def list_decisions(
 async def list_decisions_as_agent(request: Request):
     """Agent-facing list: filter by from_agent (the asking agent).  Only
     returns decisions whose project the agent holds an active decisions_write
-    grant for; a global (null-project) grant shows all.  The store layer
-    enforces the from_agent binding so there is no cross-agent leakage."""
+    grant for.  A global (null-project) grant means null-project decisions
+    only, matching _resolve_decision_actor's posting rule; otherwise, only
+    decisions from allowed projects are returned.  The store layer enforces
+    the from_agent binding so there is no cross-agent leakage, and the
+    project filter is pushed into the store query so the limit applies
+    AFTER scoping."""
     from datetime import datetime, timezone
     from tinyagentos.agent_token_auth import check_agent_scope, _grant_unexpired
 
@@ -315,11 +319,24 @@ async def list_decisions_as_agent(request: Request):
     }
 
     store = request.app.state.decision_store
-    items = await store.list(from_agent=canonical_id, limit=500)
-    # A global (null-project) grant shows all; otherwise filter to decisions
-    # whose project_id is in the allowed set.
-    if None not in allowed_projects:
-        items = [d for d in items if d.get("project_id") in allowed_projects]
+    # A global (null-project) grant means null-project decisions only,
+    # matching _resolve_decision_actor's posting rule.
+    # The project filter is pushed into the store query so the limit applies
+    # AFTER scoping (issue #2194).
+    if None in allowed_projects:
+        # Global grant: only null-project decisions
+        items = await store.list(from_agent=canonical_id, project_id=None, limit=500)
+    else:
+        # Per-project grants: only those projects.
+        # Push the project filter into the store query so the limit applies
+        # after scoping. If there is exactly one allowed project, use it
+        # directly; otherwise fall back to Python filtering after the fetch.
+        if len(allowed_projects) == 1:
+            project_id = allowed_projects.pop()
+            items = await store.list(from_agent=canonical_id, project_id=project_id, limit=500)
+        else:
+            items = await store.list(from_agent=canonical_id, limit=500)
+            items = [d for d in items if d.get("project_id") in allowed_projects]
     return {"items": items}
 
 
