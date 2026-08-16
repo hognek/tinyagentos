@@ -543,7 +543,9 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
   // lastAnsweredId. Re-fetch only for our own decision to avoid noise.
   useEffect(() => {
     if (lastAnsweredId === block.decision_id && decision?.status === "pending") {
-      fetchDecision();
+      // Propagate fetchDecision's cancel-cleanup so a re-fetch still in
+      // flight at unmount cannot set state afterwards.
+      return fetchDecision();
     }
   }, [lastAnsweredId, block.decision_id, decision?.status]);
 

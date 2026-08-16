@@ -29,6 +29,7 @@ const baseDecision = {
 describe("DecisionBlock", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     useDecisionEventsStore.setState({ answeredEpoch: 0, lastAnsweredId: null });
   });
 

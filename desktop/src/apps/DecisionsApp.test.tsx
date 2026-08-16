@@ -6,7 +6,7 @@ import {
   waitFor,
   within,
 } from "@testing-library/react";
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { DecisionsApp } from "./DecisionsApp";
 import { useDecisionEventsStore } from "@/stores/decision-events-store";
 
@@ -52,6 +52,10 @@ describe("DecisionsApp", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
     useDecisionEventsStore.setState({ answeredEpoch: 0, lastAnsweredId: null });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
   });
 
   it("renders pending decisions with the recommended option highlighted", async () => {
