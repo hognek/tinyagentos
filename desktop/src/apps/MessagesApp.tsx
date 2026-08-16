@@ -542,7 +542,7 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
       });
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
-        const detail = data?.detail;
+        const detail = data?.error ?? data?.detail;
         throw new Error(
           typeof detail === "string" ? detail : "Could not record answer.",
         );
@@ -657,7 +657,7 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
               className="w-full resize-none rounded border border-shell-border bg-shell-surface px-2 py-1.5 text-[12px] text-shell-text placeholder:text-shell-text-tertiary"
               rows={3}
               value={answer}
-              onChange={(e) => setAnswer(e.target.value.trim())}
+              onChange={(e) => setAnswer(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
