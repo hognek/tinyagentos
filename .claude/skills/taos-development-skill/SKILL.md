@@ -160,7 +160,8 @@ deps the project does not pin set `check_upgrade = false`.
 - Uses `uv sync --frozen` and `pytest -n auto`
 - Also required: `spa-build` (npm build + tsc + **vitest** - a desktop type error or failing
   component test fails CI), a "Verify app starts" `create_app` import smoke, `lint`
-  (`compileall`), and `cla`. The doc-gate and store-wiring gate are separate workflows.
+  (`compileall`), and `cla`. The doc-gate, store-wiring gate, and bot-review gate are
+  separate workflows.
 
 ## CLA - HUMAN signs
 
@@ -218,6 +219,13 @@ After pushing a PR and marking it ready, automated bots review it. The reliable 
 no-op, so never treat a CodeRabbit pass alone as evidence of review (its findings, when it does
 run, still get folded). Qodo (`qodo-code-review`) appears on old PRs but is paused. Address all
 findings **before** surfacing the PR for human maintainer review.
+
+The rate-limited no-op is now also machine-gated: `.github/workflows/bot-review-gate.yml`
+(implementation in `scripts/check_bot_review.py`) fails the `bot-review-gate` check when the
+only CodeRabbit output on a PR is a rate-limit stub, and a companion `re-run-on-stub-comment`
+job re-runs the gate against the PR head SHA when a stub comment lands *after* the initial
+run went green. A red `bot-review-gate` check means the PR has no substantive CodeRabbit
+review yet — wait for (or retrigger) a real review; do not merge on the stub.
 
 ### Procedure
 
