@@ -1,0 +1,37 @@
+name: Bot review gate
+
+# Blocks merges when the only CodeRabbit output on a PR is a rate-limit stub —
+# a comment that only announces the plan quota was exhausted instead of
+# producing an actual review. This catches the "fake-green" condition where
+# 33 PRs merged with nothing but a CodeRabbit rate-limit notice in one week
+# (see the 2026-08-16 bot-review retrospective audit). CodeRabbit's own
+# "Review rate limited" check passes by design, so it cannot catch this --
+# this gate inspects the comment body instead.
+#
+# See scripts/check_bot_review.py for the implementation.
+
+on:
+  pull_request:
+    branches: [master, dev]
+
+jobs:
+  bot-review-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Check for rate-limited CodeRabbit stub
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # The check exits 1 (FAIL) when the only CodeRabbit output is a
+          # rate-limit stub. Exiting non-zero fails the workflow, blocking
+          # the merge on the PR's branch protection rule.
+          python scripts/check_bot_review.py "${{ github.event.pull_request.number }}"
