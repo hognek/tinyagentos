@@ -520,15 +520,17 @@ as the consent flow. The project-bound scopes -- `project_tasks`,
 the canvas scopes (`canvas_read`, `canvas_write`) and the files scopes
 (`files_read`, `files_write`) -- all require an explicit, operator-validated
 `project_id` on approval (see `_PROJECT_SCOPES` in
-`tinyagentos/routes/agent_auth_requests.py`). A project-bound grant minted
-unbound (`project_id=None`, via `defer_binding` or an omitted picker) is inert:
-`check_agent_scope_for_project` only authorizes a grant whose `project_id`
-equals the requested project, and the project-bound routes take their
-`project_id` from the URL, so such a grant matches nothing and authorizes
-nothing -- the operator sees a successful approval while the agent silently has
-no access. `project_notes` joined this set in the beta.47 promote (#2320): it was
-previously grantable without a `project_id`, which minted an inert note grant;
-it now follows the same rule as `project_tasks`. `decisions_read` /
+`tinyagentos/routes/agent_auth_requests.py`). Omitting the project picker for
+one of these scopes is rejected with 400; the only way to mint a project-bound
+grant unbound (`project_id=None`) is the explicit `defer_binding` opt-in, and
+such a grant is inert until bound: `check_agent_scope_for_project` only
+authorizes a grant whose `project_id` equals the requested project, and the
+project-bound routes take their `project_id` from the URL, so an unbound grant
+matches nothing and authorizes nothing until assign-agent later binds it.
+`project_notes` joined this set in the beta.47 promote (#2320): it was
+previously grantable without a `project_id`, which minted an inert note grant
+the operator believed was usable; it now follows the same rule as
+`project_tasks`. `decisions_read` /
 `decisions_write` (and the other global scopes) may be granted globally
 (`project_id=None`) or per-project. Creation
 surfaces a bell notification (`source: agent_scope_requests`) to the owner/admin,

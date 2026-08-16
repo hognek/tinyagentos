@@ -78,6 +78,12 @@ class TestProjectNotesScopeBinding:
             f"got {resp.status_code}. Response: {resp.text}"
         )
 
+        # The rejection must also leave no side effects: the whole point of the
+        # fix is that no inert grant reaches the store.
+        assert await grants.list_grants(reg["canonical_id"]) == [], (
+            "a rejected approval must not mint any grant"
+        )
+
         await registry.close()
         await auth_store.close()
         await grants.close()
