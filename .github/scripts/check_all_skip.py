@@ -35,7 +35,7 @@ def get_test_outcomes(test_files: list[str]) -> dict[str, dict]:
     """Run pytest -rs on each test file and return skip/pass/fail counts.
 
     Returns: {filename: {"total": int, "skipped": int, "passed": int, "failed": int,
-                       "skip_reasons": [str], "import_guards": [str]}}
+                       "import_guards": [str]}}
     """
     results: dict[str, dict] = {}
 
@@ -48,6 +48,18 @@ def get_test_outcomes(test_files: list[str]) -> dict[str, dict]:
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True)
 
+        # rc 0=pass, 1=test failures, 5=no tests collected: all parseable.
+        # Anything else (2=interrupted/collection error, 3=internal, 4=usage)
+        # means the outcome counts below would be garbage — fail loudly
+        # instead of letting a broken file sail through as "0 outcomes".
+        if proc.returncode not in (0, 1, 5):
+            print(
+                f"::error::pytest exited {proc.returncode} on {filepath} "
+                f"(collection error or crash) — cannot judge skip status.\n"
+                f"{proc.stdout[-2000:]}{proc.stderr[-2000:]}"
+            )
+            sys.exit(1)
+
         # Parse stdout for summary lines like "4 passed, 2 skipped, 1 failed"
         # and individual test outcomes like "test_name SKIPPED"
         output = proc.stdout + proc.stderr
@@ -56,7 +68,6 @@ def get_test_outcomes(test_files: list[str]) -> dict[str, dict]:
         skipped = 0
         passed = 0
         failed = 0
-        skip_reasons: list[str] = []
         import_guards: list[str] = []
 
         # Count from summary line: "X passed, Y skipped, Z failed"
@@ -103,7 +114,6 @@ def get_test_outcomes(test_files: list[str]) -> dict[str, dict]:
             "skipped": skipped,
             "passed": passed,
             "failed": failed,
-            "skip_reasons": skip_reasons,
             "import_guards": import_guards,
         }
 
@@ -128,12 +138,6 @@ def _parse_guards_from_file(filepath: str) -> list[str]:
     for match in re.finditer(r"pytest\.skip\(['\"]([^'\"]*)['\"]\)", content):
         reason = match.group(1).strip()
         guards.append(f"skip:{reason}")
-
-    # Also catch multi-line pytest.skip with string after
-    # e.g., pytest.skip("reason")
-    for match in re.finditer(r"pytest\.skip\([^)]*\)", content):
-        # Already handled above if simple string; skip complex cases
-        pass
 
     return guards
 
