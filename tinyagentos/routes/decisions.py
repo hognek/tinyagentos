@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field, model_validator
 from tinyagentos.auth_context import CurrentUser
 from tinyagentos.decisions.decision_store import DECISION_TYPES, PRIORITIES
 from tinyagentos.device_auth import current_user_or_device
+from tinyagentos.events.bus import SystemEvent
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,35 @@ async def _route_answer_to_agent(decision: dict, value, note: str | None = None)
     except Exception:
         # Delivery is best-effort; do not fail the answer on a bus hiccup.
         pass
+
+
+async def _publish_answer_event(request: Request, decision: dict) -> None:
+    """Best-effort: push a ``decision.answered`` event to SSE clients so every open
+    surface (the chat thread that rendered the block, plus the Decisions app)
+    updates live without a refresh.
+
+    Reuses the existing EventBus broadcast that powers notification push; it never
+    runs consent side effects and never breaks the answer if the emitter is absent
+    (e.g. on hosts where the event bus has not been started) or fails.
+    """
+    bus = getattr(request.app.state, "event_bus", None)
+    if bus is None:
+        return
+    payload = dict(decision) if isinstance(decision, dict) else {"id": decision.get("id")}
+    payload["decision_id"] = payload.get("id")
+    try:
+        await bus.broadcast(SystemEvent(
+            kind="decision.answered",
+            source="decisions",
+            targets=["user"],
+            payload=payload,
+        ))
+    except Exception:
+        logger.warning(
+            "decision.answered SSE broadcast failed for %s",
+            decision.get("id"),
+            exc_info=True,
+        )
 
 
 class OptionIn(BaseModel):
@@ -509,6 +539,10 @@ async def answer_decision(decision_id: str, body: AnswerIn, request: Request, us
     )
     if updated is None:
         return JSONResponse({"error": "already answered or not pending"}, status_code=409)
+    # Broadcast a live event so open chat threads and the Decisions app resolve
+    # the card in place. Best-effort: never break the recorded answer on a
+    # notification hiccup.
+    await _publish_answer_event(request, updated)
     # Each kind-specific handler runs its side effect and returns True if it
     # already routed a reply to the asking agent (a more informative,
     # kind-specific message). Only route the generic answer when none did, so
@@ -818,6 +852,9 @@ async def answer_decision_as_agent(
     )
     if updated is None:
         return JSONResponse({"error": "already answered or not pending"}, status_code=409)
+
+    # Broadcast live so open surfaces (chat + Decisions app) resolve in place.
+    await _publish_answer_event(request, updated)
 
     # Route the answer to the A2A bus so the asking agent can pick it up.
     # Consent side effects (app/execution/delegation grants) are intentionally

@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 
@@ -832,3 +834,126 @@ async def test_other_answer_routes_to_agent_with_note(client, monkeypatch):
     assert "@taOS-dev" in posted["json"]["body"]
     assert "custom" in posted["json"]["body"]
     assert "(note: caveat)" in posted["json"]["body"]
+
+
+# ---------------------------------------------------------------------------
+# W2: first-answer-wins + live propagation
+# --------------------------------------------------------------------------- #
+
+
+class _NoOpAsyncClient:
+    """Stub httpx.AsyncClient so _route_answer_to_agent does not hit the network."""
+
+    def __init__(self, *a, **k):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, json=None):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_double_answer_first_wins(client, monkeypatch):
+    """First-answer-wins hard requirement: two answers fired concurrently to
+    the same decision must record exactly one answer; the loser is rejected
+    cleanly with 409, never a 500, a silent overwrite, or a duplicate row."""
+    import tinyagentos.routes.decisions as dmod
+
+    monkeypatch.setattr(dmod.httpx, "AsyncClient", _NoOpAsyncClient)
+
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@taOS-dev", "question": "deploy?", "type": "approve_deny",
+    })
+    assert resp.status_code == 200, resp.text
+    did = resp.json()["id"]
+
+    # Fire both answers concurrently. Both pass the store.get() auth gate (they
+    # see status='pending'), but only one UPDATE ... WHERE status='pending' can
+    # commit at the SQLite layer; the loser gets rowcount=0 -> None -> 409.
+    r1, r2 = await asyncio.gather(
+        client.post(f"/api/decisions/{did}/answer", json={"value": "approve"}),
+        client.post(f"/api/decisions/{did}/answer", json={"value": "deny"}),
+    )
+
+    statuses = sorted([r1.status_code, r2.status_code])
+    assert statuses == [200, 409], (
+        f"expected one 200 and one 409, got {statuses}: {r1.text} / {r2.text}"
+    )
+
+    # Exactly one answer persisted in the store.
+    app = client._transport.app
+    stored = await app.state.decision_store.get(did)
+    assert stored["status"] == "answered"
+    winner = "approve" if r1.status_code == 200 else "deny"
+    assert stored["answer"]["value"] == winner
+    assert stored["answer"]["answered_by"]  # attributed to a real user
+
+
+@pytest.mark.asyncio
+async def test_answer_broadcasts_decision_answered_sse(client, monkeypatch):
+    """Answering a decision broadcasts a 'decision.answered' event on the
+    EventBus broadcast channel, so open SSE clients (chat + Decisions app)
+    resolve the card live without a refresh."""
+    from tinyagentos.events.bus import EventBus
+
+    import tinyagentos.routes.decisions as dmod
+
+    monkeypatch.setattr(dmod.httpx, "AsyncClient", _NoOpAsyncClient)
+
+    app = client._transport.app
+    bus = EventBus()
+    app.state.event_bus = bus
+    bcast_q = await bus.subscribe("broadcast")
+
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@taOS-dev", "question": "q", "type": "approve_deny",
+    })
+    did = resp.json()["id"]
+
+    resp = await client.post(f"/api/decisions/{did}/answer", json={"value": "approve"})
+    assert resp.status_code == 200
+
+    ev = bcast_q.get_nowait()
+    assert ev.kind == "decision.answered"
+    assert ev.payload["decision_id"] == did
+    assert ev.payload["answer"]["value"] == "approve"
+    assert ev.targets == ["user"]
+
+
+@pytest.mark.asyncio
+async def test_second_answer_409_no_duplicate_event(client, monkeypatch):
+    """A rejected (second) answer must not broadcast a second event.
+    Only the winning answer publishes decision.answered; the 409 loser is silent."""
+    from tinyagentos.events.bus import EventBus
+
+    import tinyagentos.routes.decisions as dmod
+
+    monkeypatch.setattr(dmod.httpx, "AsyncClient", _NoOpAsyncClient)
+
+    app = client._transport.app
+    bus = EventBus()
+    app.state.event_bus = bus
+    bcast_q = await bus.subscribe("broadcast")
+
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@taOS-dev", "question": "q", "type": "approve_deny",
+    })
+    did = resp.json()["id"]
+
+    first = await client.post(f"/api/decisions/{did}/answer", json={"value": "approve"})
+    assert first.status_code == 200
+    second = await client.post(f"/api/decisions/{did}/answer", json={"value": "deny"})
+    assert second.status_code == 409
+
+    # Exactly one decision.answered event was published.
+    count = 0
+    while not bcast_q.empty():
+        ev = bcast_q.get_nowait()
+        if ev.kind == "decision.answered":
+            count += 1
+    assert count == 1

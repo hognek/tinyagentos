@@ -702,3 +702,32 @@ async def test_agent_multi_select_other_plus_option_accepted(client):
         )
     assert resp.status_code == 200, resp.text
     assert resp.json()["answer"]["value"] == ["a", "custom"]
+
+
+@pytest.mark.asyncio
+async def test_agent_cannot_answer_via_human_path(client):
+    """An agent with a bearer JWT must NEVER be able to answer its own question
+    via the human path POST /api/decisions/{id}/answer. That route is not in
+    _AGENT_DECISIONS_ROUTES, so the auth middleware does not pass the Bearer
+    through, current_user_or_device falls through to require_device (which
+    rejects a non-device token), and the request 401s. The answer is always
+    attributed to the real user identity (session/device), never the agent."""
+    app = client._transport.app
+    pid = await _new_project(client)
+    cid, token = await _mint_agent(app, pid, ("decisions_write",))
+
+    # Agent creates its own decision
+    async with _agent_client(app, token) as ac:
+        resp = await ac.post("/api/decisions", json=_decision_body(project_id=pid))
+    assert resp.status_code == 200, resp.text
+    did = resp.json()["id"]
+
+    # Agent attempts to answer via the human path with its bearer token
+    async with _agent_client(app, token) as ac:
+        resp = await ac.post(f"/api/decisions/{did}/answer", json={"value": "approve"})
+    assert resp.status_code == 401, resp.text
+
+    # The decision is still pending — no answer was recorded by the agent.
+    stored = await app.state.decision_store.get(did)
+    assert stored["status"] == "pending"
+    assert stored["answer"] is None

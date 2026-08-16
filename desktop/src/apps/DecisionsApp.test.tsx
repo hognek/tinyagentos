@@ -8,6 +8,7 @@ import {
 } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { DecisionsApp } from "./DecisionsApp";
+import { useDecisionEventsStore } from "@/stores/decision-events-store";
 
 function mockFetch(
   responses: Record<string, { ok: boolean; status?: number; body: unknown }>,
@@ -50,6 +51,7 @@ const singleSelect = {
 describe("DecisionsApp", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    useDecisionEventsStore.setState({ answeredEpoch: 0, lastAnsweredId: null });
   });
 
   it("renders pending decisions with the recommended option highlighted", async () => {
@@ -431,6 +433,44 @@ describe("DecisionsApp", () => {
     await act(async () => {
       held.forEach((release) => release());
       await new Promise((r) => setTimeout(r, 0));
+    });
+  });
+
+  it("refreshes the list live when a decision is answered from another surface", async () => {
+    // Initially the decision is pending; after the SSE event it moves to answered.
+    let answeredElsewhere = false;
+    const fetchMock = vi.fn().mockImplementation((input: string, init?: RequestInit) => {
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method === "GET" && input === "/api/decisions?status=pending") {
+        const body = answeredElsewhere ? [] : [singleSelect];
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(body) });
+      }
+      if (method === "GET" && input === "/api/decisions?status=answered") {
+        const answered = answeredElsewhere
+          ? [{ ...singleSelect, status: "answered", answer: { value: "excalidraw", answered_by: "jay" } }]
+          : [];
+        return Promise.resolve({ ok: true, json: () => Promise.resolve(answered) });
+      }
+      if (method === "GET" && input === "/api/agents/auth-requests?status=pending") {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ requests: [] }) });
+      }
+      return Promise.resolve({ ok: true, json: () => Promise.resolve([]) });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<DecisionsApp windowId="w1" />);
+    await flush();
+
+    // The pending decision is visible
+    await waitFor(() => expect(screen.getByText(/which canvas engine/i)).toBeTruthy());
+
+    // Simulate an SSE decision.answered event for this decision
+    answeredElsewhere = true;
+    useDecisionEventsStore.getState().recordAnswered("dec-1");
+
+    // After the silent re-fetch, the pending list is empty
+    await waitFor(() => {
+      expect(screen.queryByText(/which canvas engine/i)).toBeNull();
     });
   });
 });
