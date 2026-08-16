@@ -73,6 +73,13 @@ _AGENT_TASK_ROUTES = (
     ("GET", re.compile(rf"^/api/projects/tasks/{_SEG}/context$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/comments$")),
     ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/comments$")),
+    # Task checklist items (list + create), gated by project_tasks_create in the
+    # handler (_authorize_task_actor). Reaching the handler is not
+    # authorisation: it then verifies the JWT, the project binding, and that
+    # scope. There is no archive route, so nothing beyond list + create is
+    # listed here.
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/checklist-items$")),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/checklist-items$")),
     ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/(claim|release|close|reopen)$")),
     # PATCH (free task-field mutation) was intentionally NOT here: it is broader
     # than the "read + lifecycle + comments" the project_tasks scope documents.
