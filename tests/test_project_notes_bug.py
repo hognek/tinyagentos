@@ -13,9 +13,17 @@ class TestProjectNotesScopeBinding:
         """project_notes granted without a project_id must be rejected (400),
         since project_notes now requires project binding like project_tasks.
 
-        This was the CR-Critical finding: project_notes was not in _PROJECT_SCOPES,
-        so it could be granted unbound (no project_id), making it usable cross-project.
-        After the fix, project_notes is in _PROJECT_SCOPES and this is properly rejected.
+        This was the CR-Critical finding (#2320): project_notes was not in
+        _PROJECT_SCOPES, so it could be granted unbound (no project_id). That did
+        NOT make the grant usable cross-project: check_agent_scope_for_project
+        (agent_token_auth.py:205) only authorizes a grant whose project_id EQUALS
+        the requested project, and the four project_notes routes are all
+        project-bound (the project_id comes from the URL), so an unbound grant
+        matched nothing and authorized nothing. The real defect was that the
+        operator saw a successful approval that minted an INERT grant -- the
+        agent silently had no access at all, not access to every project. After the
+        fix, project_notes is in _PROJECT_SCOPES and approving it without a
+        project_id is rejected with 400 instead of minting an inert grant.
         """
         from tinyagentos.routes.agent_auth_requests import _PROJECT_SCOPES, VALID_SCOPES
 
@@ -66,8 +74,8 @@ class TestProjectNotesScopeBinding:
         )
 
         assert resp.status_code == 400, (
-            f"Fix verified: project_notes approved without project_id got 400, "
-            f"as expected. Response: {resp.text}"
+            f"project_notes approved without project_id must be rejected with 400, "
+            f"got {resp.status_code}. Response: {resp.text}"
         )
 
         await registry.close()

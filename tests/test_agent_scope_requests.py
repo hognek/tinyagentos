@@ -571,6 +571,7 @@ def test_project_scope_set_is_a_single_definition():
         "project_tasks_create",
         "project_tasks_update",
         "project_lists",
+        "project_notes",
         "canvas_read",
         "canvas_write",
         "files_read",
