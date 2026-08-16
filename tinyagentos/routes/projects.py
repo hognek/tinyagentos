@@ -480,8 +480,8 @@ class CreateTaskIn(_TaskRequestModelMixin, BaseModel):
     element_id: str | None = None
 
     @model_validator(mode="after")
-    def _assert_body_for_claimable(self) -> self:
-        labels = self.labels or []
+    def _assert_body_for_claimable(self) -> CreateTaskIn:
+        labels = self.labels
         has_claimable = any(l.strip().lower() == "claimable" for l in labels)
         if has_claimable and not self.body.strip():
             raise ValueError(
