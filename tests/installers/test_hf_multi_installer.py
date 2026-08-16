@@ -450,3 +450,98 @@ class TestCombinedHashVerification:
         assert result["success"] is True
         names = sorted(p.name for p in downloaded)
         assert names == ["config.json", "tokenizer.json"]
+
+
+class TestPinAwareListing:
+    @pytest.mark.asyncio
+    async def test_nonexistent_revision_returns_error(self, tmp_path, monkeypatch):
+        """A nonexistent revision must 404 on the revision-path endpoint,
+        surfacing as an install error rather than silently returning main's
+        listing."""
+        monkeypatch.setenv("TAOS_MODELS_ROOT", str(tmp_path / "models"))
+
+        class _NotFoundClient:
+            async def __aenter__(self): return self
+            async def __aexit__(self, *exc): return False
+            async def get(self, *a, **kw):
+                import httpx
+                resp = httpx.Response(404, text="revision not found")
+                raise httpx.HTTPStatusError(
+                    "404 Not Found", request=None, response=resp
+                )
+            async def aclose(self): return None
+
+        with patch(
+            "tinyagentos.installers.hf_multi_installer.httpx.AsyncClient",
+            return_value=_NotFoundClient(),
+        ):
+            result = await HFMultiInstaller().install(
+                "x", {"backend": "mlc-llm"},
+                variant={
+                    "id": "q4f16",
+                    "hf_repo": "google/paligemma2-3b-mix-224",
+                    "multi_file": True,
+                    "hf_revision": "0" * 40,
+                },
+            )
+
+        assert result["success"] is False
+        assert "failed to list files" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_lfs_sha256_mismatch_returns_failure(self, tmp_path, monkeypatch):
+        """When the listing carries lfs.sha256, a mismatch between the pinned
+        hash and the on-disk file must fail the install with success=False."""
+        monkeypatch.setenv("TAOS_MODELS_ROOT", str(tmp_path / "models"))
+
+        listing_with_lfs = {
+            "siblings": [
+                {
+                    "rfilename": "model.safetensors",
+                    "size": 100,
+                    "lfs": {"sha256": "abcd" * 16},
+                },
+            ]
+        }
+
+        async def fake_download(url, dest, expected_sha256=None, on_progress=None):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"wrong-content")
+
+        with patch("tinyagentos.installers.hf_multi_installer.httpx.AsyncClient",
+                   return_value=_stub_listing_client(listing_with_lfs)), \
+             patch("tinyagentos.installers.hf_multi_installer.download_file",
+                   side_effect=fake_download):
+            result = await HFMultiInstaller().install(
+                "x", {"backend": "mlc-llm"},
+                variant={"id": "q4", "hf_repo": "a/b", "multi_file": True},
+            )
+
+        assert result["success"] is False
+        assert "sha256 mismatch" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_changed_size_flips_file_set_hash(self, tmp_path, monkeypatch):
+        """file_set_hash must depend on file sizes, not just filenames.
+        Changing one size must produce a different hash, proving sizes
+        participate in the pin."""
+        monkeypatch.setenv("TAOS_MODELS_ROOT", str(tmp_path / "models"))
+
+        selected_a = [
+            {"rfilename": "config.json", "size": 1234},
+            {"rfilename": "tokenizer.json", "size": 5678},
+        ]
+        selected_b = [
+            {"rfilename": "config.json", "size": 1234},
+            {"rfilename": "tokenizer.json", "size": 9999},
+        ]
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            target_dir = Path(tmp)
+            hash_a = _compute_combined_hash(target_dir, selected_a)
+            hash_b = _compute_combined_hash(target_dir, selected_b)
+
+        assert hash_a != hash_b, (
+            "file_set_hash must change when a file size changes"
+        )

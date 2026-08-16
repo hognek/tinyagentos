@@ -155,17 +155,29 @@ def test_paligemma_2_file_set_hash_recompute_matches():
 
     fixture = {
         "siblings": [
-            {"rfilename": ".gitattributes", "size": 0},
-            {"rfilename": "README.md", "size": 0},
-            {"rfilename": "config.json", "size": 0},
-            {"rfilename": "generation_config.json", "size": 0},
-            {"rfilename": "model-00001-of-00002.safetensors", "size": 0},
-            {"rfilename": "model-00002-of-00002.safetensors", "size": 0},
-            {"rfilename": "model.safetensors.index.json", "size": 0},
-            {"rfilename": "preprocessor_config.json", "size": 0},
-            {"rfilename": "special_tokens_map.json", "size": 0},
-            {"rfilename": "tokenizer.json", "size": 0},
-            {"rfilename": "tokenizer_config.json", "size": 0},
+            {"rfilename": ".gitattributes", "size": 1570},
+            {"rfilename": "README.md", "size": 27964},
+            {"rfilename": "config.json", "size": 1332},
+            {"rfilename": "generation_config.json", "size": 173},
+            {
+                "rfilename": "model-00001-of-00002.safetensors",
+                "size": 4993319560,
+                "lfs": {"sha256": "d66f653b186abdd1b3b092ac3d45efe94ddeda852615f8bf6766888e6ba7acc6"},
+            },
+            {
+                "rfilename": "model-00002-of-00002.safetensors",
+                "size": 1071263816,
+                "lfs": {"sha256": "94ab5acf581f2afb3fe558bf98152ec572e4d66c6180fce4dae825e3b8ef4a9a"},
+            },
+            {"rfilename": "model.safetensors.index.json", "size": 75145},
+            {"rfilename": "preprocessor_config.json", "size": 424},
+            {"rfilename": "special_tokens_map.json", "size": 733},
+            {
+                "rfilename": "tokenizer.json",
+                "size": 34600820,
+                "lfs": {"sha256": "172fab587d68c56b63eb3620057c62dfd15e503079ff7fce584692e3fd5bf4da"},
+            },
+            {"rfilename": "tokenizer_config.json", "size": 242593},
         ]
     }
 
@@ -212,10 +224,10 @@ def test_paligemma_2_file_set_hash_recompute_matches():
             continue
         selected.append(f)
 
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmp:
-            target_dir = Path(tmp)
-            computed = _compute_combined_hash(target_dir, selected)
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        target_dir = Path(tmp)
+        computed = _compute_combined_hash(target_dir, selected)
 
     assert computed == expected, (
         f"file_set_hash mismatch: manifest has {expected}, recompute gave {computed}"

@@ -21,7 +21,7 @@ variants:
     include_patterns:
       - "*.safetensors"
       - "*.json"
-    file_set_hash: ffae4ed8a7b9cf155a05b22736c939fc144177d1c3451e821ec198ef1d6536ec
+    file_set_hash: dc0bd00a293a77b9315be9665f027df044166366bf01d1e0d8c7c64b9512a9aa
     requires:
       backends:
         - id: transformers

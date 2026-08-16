@@ -47,7 +47,7 @@ from tinyagentos.installers.model_paths import (
 
 logger = logging.getLogger(__name__)
 
-HF_API = "https://huggingface.co/api/models/{repo}"
+HF_API = "https://huggingface.co/api/models/{repo}/revision/{rev}?blobs=true"
 HF_FILE = "https://huggingface.co/{repo}/resolve/{rev}/{path}"
 
 DEFAULT_EXCLUDE_PATTERNS = (
@@ -71,8 +71,7 @@ async def list_hf_repo_files(
     own_client = client is None
     c = client or httpx.AsyncClient(timeout=30, follow_redirects=True)
     try:
-        params = {"revision": revision} if revision and revision != "main" else None
-        resp = await c.get(HF_API.format(repo=repo), params=params)
+        resp = await c.get(HF_API.format(repo=repo, rev=revision))
         resp.raise_for_status()
         data = resp.json()
     finally:
@@ -86,18 +85,17 @@ async def list_hf_repo_files(
         rfilename = s.get("rfilename")
         if not rfilename:
             continue
-        # Some HF entries return size as None, missing, or a string. Coerce
-        # defensively — failing the whole listing because one sibling has a
-        # weird size field would be a poor reason to abort an install.
         raw_size = s.get("size", 0)
         try:
             size = int(raw_size) if raw_size is not None else 0
         except (TypeError, ValueError):
             size = 0
+        lfs_info = s.get("lfs") if isinstance(s.get("lfs"), dict) else None
         out.append({
             "rfilename": rfilename,
             "size": size,
-            "lfs": bool(s.get("lfs")) if "lfs" in s else False,
+            "lfs": bool(lfs_info) if lfs_info else False,
+            "lfs_sha256": (lfs_info.get("sha256") if lfs_info else None),
         })
     return out
 
@@ -130,16 +128,28 @@ def _file_excluded(rfilename: str, patterns: list[str]) -> bool:
     return False
 
 
+def _verify_lfs_sha256(local: Path, expected_hex: str) -> bool:
+    """Return True when the local file's SHA256 matches ``expected_hex``."""
+    h = hashlib.sha256()
+    with local.open("rb") as fh:
+        while True:
+            chunk = fh.read(1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest() == expected_hex
+
+
 def _compute_combined_hash(target_dir: Path, selected: list[dict]) -> str:
     """Compute a combined SHA256 over the downloaded files.
 
     Hashes each file's full relative path and size in deterministic order so
     the manifest's ``file_set_hash`` can be verified after the transfer.
     Boundaries are length-delimited with NUL bytes so the same filename at
-    different depths cannot collide.  Size comes from the HF repo tree API
-    (the ``selected`` records), not from local stat, so the expected value
-    can be computed offline from the listing and the pin is independent of
-    download implementation details.
+    different depths cannot collide.  Size comes from the HF repo ``blobs=true``
+    listing (the ``selected`` records), not from local stat, so the expected
+    value can be computed offline and the pin is independent of download
+    implementation details.
     """
     hasher = hashlib.sha256()
     for f in sorted(selected, key=lambda x: x["rfilename"]):
@@ -269,6 +279,7 @@ class HFMultiInstaller(AppInstaller):
         for f in selected:
             rfilename = f["rfilename"]
             file_size = f["size"]
+            lfs_sha256 = f.get("lfs_sha256")
 
             # Path traversal guard: HF rfilenames should always be repo-
             # relative, but a hostile API response (or a corrupted cache)
@@ -308,6 +319,16 @@ class HFMultiInstaller(AppInstaller):
                         on_progress(downloaded_bytes, total_bytes)
                     except Exception:  # noqa: BLE001
                         pass
+                if lfs_sha256 and local.stat().st_size > 0:
+                    if not _verify_lfs_sha256(local, lfs_sha256):
+                        return {
+                            "success": False,
+                            "error": (
+                                f"sha256 mismatch for existing file {repo}/{rfilename}"
+                            ),
+                            "downloaded_bytes": downloaded_bytes,
+                            "target_dir": str(target_dir),
+                        }
                 written.append(f)
                 continue
 
@@ -327,6 +348,16 @@ class HFMultiInstaller(AppInstaller):
                     "downloaded_bytes": downloaded_bytes,
                     "target_dir": str(target_dir),
                 }
+            if lfs_sha256 and local.stat().st_size > 0:
+                if not _verify_lfs_sha256(local, lfs_sha256):
+                    return {
+                        "success": False,
+                        "error": (
+                            f"sha256 mismatch for {repo}/{rfilename}"
+                        ),
+                        "downloaded_bytes": downloaded_bytes,
+                        "target_dir": str(target_dir),
+                    }
             written.append(f)
 
         expected_file_set_hash = variant.get("file_set_hash")
