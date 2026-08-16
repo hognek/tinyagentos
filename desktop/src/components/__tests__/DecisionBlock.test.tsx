@@ -312,6 +312,62 @@ describe("DecisionBlock", () => {
     expect(container.textContent).not.toContain("open");
   });
 
+  it("types multiple chars in free-text textarea does not post on change, submits full text on Enter", async () => {
+    // --- Open direction (status: "pending") ---
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        ...baseDecision,
+        id: "dec-7",
+        question: "Any notes?",
+        type: "free_text",
+        options: [],
+        status: "pending",
+        answer: null,
+        created_at: 1700000000,
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const block: DecisionContentBlock = {
+      kind: "decision",
+      decision_id: "dec-7",
+    };
+    const { container } = render(<DecisionBlock block={block} />);
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-decision-block="true"]')).not.toBeNull();
+    });
+
+    const textarea = container.querySelector("textarea");
+    expect(textarea).not.toBeNull();
+
+    // Record initial fetch call (the useEffect fetch that renders the decision)
+    const initialCallCount = fetchMock.mock.calls.length;
+
+    // Type multiple characters - fetch MUST NOT be called additionally on change
+    fireEvent.change(textarea, { target: { value: "yes please" } });
+
+    // Only the initial useEffect fetch should have been called; no extra call from onChange
+    expect(fetchMock.mock.calls.length).toBe(initialCallCount);
+
+    // Press Enter (without Shift) to submit - should post exactly once with full text
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false });
+    await waitFor(() => {
+      // Find all POST calls to /answer
+      const answerCalls = fetchMock.mock.calls.filter(
+        ([url]) => url.endsWith("/answer") && fetchMock.mock.instances ? true : true
+      );
+      // There should be exactly one POST to /answer
+      const postCalls = answerCalls.filter(([url]) => url === "/api/decisions/dec-7/answer");
+      expect(postCalls.length).toBe(1);
+      // The POST body should contain the FULL typed text "yes please"
+      const postCall = postCalls[0];
+      const body = JSON.parse(postCall[1].body);
+      expect(body.value).toBe("yes please");
+    });
+  });
+
   it("shows error state when the decision fetch fails", async () => {
     mockDecisionFetch(null, false);
 

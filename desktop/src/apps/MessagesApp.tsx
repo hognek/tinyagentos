@@ -7,6 +7,7 @@ import {
   X,
   AtSign,
   ChevronDown,
+  ChevronRight,
   PanelRight,
   Archive,
   CircleDot,
@@ -497,6 +498,8 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
   const [decision, setDecision] = useState<DecisionData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [answer, setAnswer] = useState("");
+  const [answerError, setAnswerError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -607,7 +610,9 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
                 type="button"
                 onClick={() => {
                   if (!isOpen) return;
-                  answerDecision(opt.value);
+                  answerDecision(opt.value).catch((e) =>
+                    setAnswerError(`Failed to answer: ${e.message}`)
+                  );
                 }}
                 disabled={!isOpen}
                 className={[
@@ -646,22 +651,48 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
       {/* free_text pending: show a textarea for answering */}
       {isOpen && decision.type === "free_text" && (
         <div className="mt-2 px-3">
-          <textarea
-            placeholder="Type your answer..."
-            className="w-full resize-none rounded border border-shell-border bg-shell-surface px-2 py-1.5 text-[12px] text-shell-text placeholder:text-shell-text-tertiary"
-            rows={3}
-            onChange={(e) => {
-              if (!isOpen) return;
-              answerDecision(e.target.value.trim());
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
+          <div className="flex flex-col gap-2">
+            <textarea
+              placeholder="Type your answer..."
+              className="w-full resize-none rounded border border-shell-border bg-shell-surface px-2 py-1.5 text-[12px] text-shell-text placeholder:text-shell-text-tertiary"
+              rows={3}
+              value={answer}
+              onChange={(e) => setAnswer(e.target.value.trim())}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  if (!isOpen) return;
+                  const trimmed = e.currentTarget.value.trim();
+                  if (trimmed) {
+                    answerDecision(trimmed).catch((e) =>
+                      setAnswerError(`Failed to answer: ${e.message}`)
+                    );
+                  }
+                }
+              }}
+            />
+            <button
+              onClick={() => {
                 if (!isOpen) return;
-                answerDecision(e.currentTarget.value.trim());
-              }
-            }}
-          />
+                const trimmed = answer.trim();
+                if (trimmed) {
+                  answerDecision(trimmed).catch((e) =>
+                    setAnswerError(`Failed to answer: ${e.message}`)
+                  );
+                }
+              }}
+              disabled={!answer || answer.trim() === ""}
+              className="flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[12px] text-shell-text hover:text-shell-text-hover hover:bg-shell-surface-focus focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+              aria-label="Submit answer"
+            >
+              <ChevronRight size={12} aria-hidden="true" /> Submit
+            </button>
+          </div>
+          {answerError && (
+            <div className="mt-2 text-[12px] text-red-400" role="alert">
+              {answerError}
+            </div>
+          )}
         </div>
       )}
 
@@ -721,8 +752,6 @@ export function dayLabel(ts: string | number): string {
   // before noon, and a diff of 1.04 days is one calendar day after.)
   const localMidnight = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate());
   const diffDays = Math.round((localMidnight(now).getTime() - localMidnight(d).getTime()) / 86400000);
-  if (diffDays === 0) return "Today";
-  if (diffDays === 1) return "Yesterday";
   if (diffDays === 0) return "Today";
   if (diffDays === 1) return "Yesterday";
   return d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
