@@ -42,6 +42,14 @@ assert len(KNOWN_TARGETS) >= 6, (
 
 _SHA256_ALLOWLIST: set[str] = set()
 
+# Patterns that indicate a download_url points to a single shard of a sharded
+# model.  Variants whose download_url matches one of these patterns MUST also
+# declare hf_repo + multi_file: true so the installer fetches the full shard
+# set rather than a single fragment.
+_SHARDED_URL_PATTERNS = [
+    re.compile(r"model-\d+-of-\d+\.safetensors"),
+]
+
 
 def test_model_manifests_are_resolvable_and_integrity_pinned():
     root = Path(__file__).resolve().parent.parent / "app-catalog"
@@ -84,6 +92,17 @@ def test_model_manifests_are_resolvable_and_integrity_pinned():
                 errors.append(
                     f"{mid}/{vid}: download_url must be a non-empty https URL (got {url!r})"
                 )
+            else:
+                for pat in _SHARDED_URL_PATTERNS:
+                    if pat.search(url):
+                        hf_repo = variant.get("hf_repo")
+                        multi_file = variant.get("multi_file")
+                        if not hf_repo or not multi_file:
+                            errors.append(
+                                f"{mid}/{vid}: sharded download_url {url!r} requires "
+                                f"hf_repo + multi_file: true"
+                            )
+                        break
             # Rule 4: size_mb is a positive int.
             size_mb = variant.get("size_mb")
             if not isinstance(size_mb, int) or size_mb <= 0:

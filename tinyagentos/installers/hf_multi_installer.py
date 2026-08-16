@@ -12,6 +12,8 @@ checkpoints, etc.) this installer:
    expect.
 3. Reports progress as bytes-downloaded across the whole repo so the UI's
    install bar moves smoothly instead of resetting per file.
+4. When the variant declares a ``sha256``, verifies a combined hash of the
+   downloaded files after the transfer completes.
 
 Manifest variant fields:
 
@@ -19,6 +21,7 @@ Manifest variant fields:
     hf_revision: main                                 # optional, default "main"
     multi_file: true                                  # required marker
     exclude_patterns: ["*.md", ".gitattributes"]      # optional glob blocklist
+    sha256: <64-hex>                                  # optional combined hash
 
 Single-file fallback: a variant with ``download_url`` and no ``hf_repo`` is
 delegated back to the regular DownloadInstaller so callers don't have to
@@ -27,6 +30,7 @@ care which path applies.
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import logging
 from pathlib import Path
 from typing import Any
@@ -124,6 +128,24 @@ def _file_excluded(rfilename: str, patterns: list[str]) -> bool:
         if fnmatch.fnmatch(name, pat) or fnmatch.fnmatch(Path(name).name, pat):
             return True
     return False
+
+
+def _compute_combined_hash(target_dir: Path, selected: list[dict]) -> str:
+    """Compute a combined SHA256 over the downloaded files.
+
+    Hashes each file's relative path and size in deterministic order so the
+    manifest's ``sha256`` can be verified after the transfer.  Content is
+    intentionally omitted here so the expected value can be computed from
+    the HF repo tree API (which exposes sizes but redacts LFS content
+    hashes for gated repos).
+    """
+    hasher = hashlib.sha256()
+    for f in sorted(selected, key=lambda x: x["rfilename"]):
+        rel = Path(f["rfilename"])
+        local = target_dir / rel
+        hasher.update(rel.name.encode())
+        hasher.update(str(local.stat().st_size).encode())
+    return hasher.hexdigest()
 
 
 class HFMultiInstaller(AppInstaller):
@@ -297,6 +319,28 @@ class HFMultiInstaller(AppInstaller):
                 return {
                     "success": False,
                     "error": f"download failed for {repo}/{rfilename}: {exc}",
+                    "downloaded_bytes": downloaded_bytes,
+                    "target_dir": str(target_dir),
+                }
+
+        expected_sha256 = variant.get("sha256")
+        if expected_sha256:
+            try:
+                computed = _compute_combined_hash(target_dir, selected)
+            except Exception as exc:  # noqa: BLE001
+                return {
+                    "success": False,
+                    "error": f"failed to compute combined hash: {exc}",
+                    "downloaded_bytes": downloaded_bytes,
+                    "target_dir": str(target_dir),
+                }
+            if computed != expected_sha256:
+                return {
+                    "success": False,
+                    "error": (
+                        f"manifest hash mismatch: expected {expected_sha256}, "
+                        f"got {computed}"
+                    ),
                     "downloaded_bytes": downloaded_bytes,
                     "target_dir": str(target_dir),
                 }

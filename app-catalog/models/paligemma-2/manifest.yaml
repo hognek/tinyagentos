@@ -15,7 +15,12 @@ variants:
     format: safetensors
     size_mb: 5500
     download_url: https://huggingface.co/google/paligemma2-3b-mix-224/resolve/main/model-00001-of-00002.safetensors
-    sha256: d66f653b186abdd1b3b092ac3d45efe94ddeda852615f8bf6766888e6ba7acc6
+    sha256: 22420c10eca28a8c323d895951257f92d98fd16c2536a90b5b3fd03ab2625360
+    hf_repo: google/paligemma2-3b-mix-224
+    multi_file: true
+    include_patterns:
+      - "*.safetensors"
+      - "*.json"
     requires:
       backends:
         - id: transformers

@@ -11,6 +11,7 @@ import pytest
 
 from tinyagentos.installers.hf_multi_installer import (
     HFMultiInstaller,
+    _compute_combined_hash,
     _file_excluded,
     _safe_relative_path,
     list_hf_repo_files,
@@ -317,3 +318,79 @@ class TestProgressAggregation:
         # Final value should be at least the sum of the per-file totals
         # (100 bytes × 3 included files = 300)
         assert max(cumulative) >= 300
+
+
+class TestCombinedHashVerification:
+    @pytest.mark.asyncio
+    async def test_combined_hash_matches(self, tmp_path, monkeypatch, fake_repo_listing):
+        """When the variant declares sha256, the installer must verify a
+        combined hash of the downloaded files after the transfer."""
+        monkeypatch.setenv("TAOS_MODELS_ROOT", str(tmp_path / "models"))
+        installer = HFMultiInstaller()
+
+        async def fake_download(url, dest, expected_sha256=None, on_progress=None):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"fake")
+
+        with patch("tinyagentos.installers.hf_multi_installer.httpx.AsyncClient",
+                   return_value=_stub_listing_client(fake_repo_listing)), \
+             patch("tinyagentos.installers.hf_multi_installer.download_file",
+                   side_effect=fake_download):
+            target_dir = tmp_path / "models" / "mlc-llm" / "llama" / "llama-3-8b-mlc"
+            selected = [
+                {"rfilename": "config.json", "size": 1234},
+                {"rfilename": "model.safetensors", "size": 1048576, "lfs": True},
+                {"rfilename": "tokenizer.json", "size": 5678},
+            ]
+            # Compute expected hash from what fake_download will write.
+            for f in selected:
+                rel = Path(f["rfilename"])
+                local = target_dir / rel
+                local.parent.mkdir(parents=True, exist_ok=True)
+                local.write_bytes(b"fake")
+            expected = _compute_combined_hash(target_dir, selected)
+            # Clean the dir so install() re-creates the files.
+            for f in selected:
+                local = target_dir / Path(f["rfilename"])
+                if local.exists():
+                    local.unlink()
+            result = await installer.install(
+                "llama-3-8b-mlc",
+                install_config={"backend": "mlc-llm"},
+                variant={
+                    "id": "q4f16",
+                    "hf_repo": "mlc-ai/Llama-3-8B-Instruct-q4f16_1-MLC",
+                    "multi_file": True,
+                    "sha256": expected,
+                },
+            )
+
+        assert result["success"] is True
+
+    @pytest.mark.asyncio
+    async def test_combined_hash_mismatch_fails(self, tmp_path, monkeypatch, fake_repo_listing):
+        """A wrong sha256 in the variant must fail the install."""
+        monkeypatch.setenv("TAOS_MODELS_ROOT", str(tmp_path / "models"))
+        installer = HFMultiInstaller()
+
+        async def fake_download(url, dest, expected_sha256=None, on_progress=None):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"fake")
+
+        with patch("tinyagentos.installers.hf_multi_installer.httpx.AsyncClient",
+                   return_value=_stub_listing_client(fake_repo_listing)), \
+             patch("tinyagentos.installers.hf_multi_installer.download_file",
+                   side_effect=fake_download):
+            result = await installer.install(
+                "llama-3-8b-mlc",
+                install_config={"backend": "mlc-llm"},
+                variant={
+                    "id": "q4f16",
+                    "hf_repo": "mlc-ai/Llama-3-8B-Instruct-q4f16_1-MLC",
+                    "multi_file": True,
+                    "sha256": "a" * 64,
+                },
+            )
+
+        assert result["success"] is False
+        assert "manifest hash mismatch" in result["error"]
