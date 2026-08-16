@@ -836,10 +836,27 @@ async def test_create_with_unknown_key_tags_warns(client, caplog):
             f"/api/projects/{pid}/tasks",
             json={"title": "T", "tags": ["bug"]},
         )
-    assert resp.status_code == 200
-    warns = [r for r in caplog.records if "unknown keys" in r.message]
-    assert warns, "expected a warning for unknown key tags"
-    msg = warns[0].message
-    assert "CreateTaskIn" in msg
-    assert "tags" in msg
+    assert resp.status_code == 422
+    err = resp.json()
+    assert "extra" in str(err).lower() or "validation" in str(err).lower() or "unknown" in str(err).lower()
+
+
+@pytest.mark.asyncio
+async def test_create_with_description_instead_of_body_returns_422(client, caplog):
+    """POST with 'description' instead of 'body' must be rejected with 422.
+
+    This catches the defect where sending "description" (a field that silently
+    vanishes) resulted in a card with an empty body - the only channel that
+    reaches a lane. Now it is rejected early.
+    """
+    pid = (await client.post("/api/projects", json={"name": "A", "slug": "a"})).json()["id"]
+
+    with caplog.at_level(logging.WARNING, logger=_LOGGER):
+        resp = await client.post(
+            f"/api/projects/{pid}/tasks",
+            json={"title": "T", "description": "do the thing", "labels": ["claimable"]},
+        )
+    assert resp.status_code == 422
+    body = resp.json()
+    assert "body" in str(body).lower() or "description" in str(body).lower() or "extra" in str(body).lower()
 

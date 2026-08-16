@@ -469,6 +469,8 @@ class _TaskRequestModelMixin:
 
 
 class CreateTaskIn(_TaskRequestModelMixin, BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     title: str
     body: str = ""
     priority: int = 0
@@ -476,6 +478,16 @@ class CreateTaskIn(_TaskRequestModelMixin, BaseModel):
     assignee_id: str | None = None
     parent_task_id: str | None = None
     element_id: str | None = None
+
+    @model_validator(mode="after")
+    def _assert_body_for_claimable(self) -> self:
+        labels = self.labels or []
+        has_claimable = any(l.strip().lower() == "claimable" for l in labels)
+        if has_claimable and not self.body.strip():
+            raise ValueError(
+                "Claimable cards must have a non-empty body"
+            )
+        return self
 
 
 class UpdateTaskIn(_TaskRequestModelMixin, BaseModel):
