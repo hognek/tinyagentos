@@ -78,8 +78,8 @@ Catalog entries with `format: hef` + `backend: [hailo-ollama]`. Pulled via `hail
 | `qwen2-1.5b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | |
 | `qwen2.5-1.5b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | |
 | `qwen2.5-coder-1.5b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | |
-| `qwen3` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | 1.7B variant |
-| `llama3.2-1b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | |
+| `qwen3-1.7b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | 1.7B variant |
+| `llama-3.2-1b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | |
 | `deepseek-r1-1.5b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | reasoning |
 
 ## LLM models — GGUF format (rk-llama.cpp / Ollama / llama.cpp)

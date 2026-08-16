@@ -27,16 +27,9 @@ def _is_stride2_algorithmic(hef_h10h: str) -> bool:
     whether they form a repeating 6-char pattern like abcdef.
     """
     nibbles = hef_h10h[::2]  # 32-char string from even positions
-    # Check for a strong repeating 6-char pattern
     first6 = nibbles[:6]
-    if len(set(first6)) <= 3:
-        # Very few unique chars in the first window → likely algorithmic
-        return True
-    # Check if the whole 32-char string is built from repeats of first6
     expected = (first6 * (32 // 6 + 1))[:32]
-    if nibbles == expected:
-        return True
-    return False
+    return nibbles == expected
 
 # Known target enums -- the resolver only accepts values produced by
 # hardware_to_targets in tinyagentos/cluster/capabilities.py. DERIVED from

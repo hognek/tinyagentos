@@ -31,9 +31,24 @@ variants:
       - cpu
       min_ram_mb: 2048
   sha256: 6f85a640a97cf2bf5b8e764087b1e83da0fdb51d7c9fab7d0fece9385611df83
+- id: a8w4
+  name: A8W4 HEF (1.6GB, NPU)
+  format: hef
+  size_mb: 1600
+  min_ram_mb: 0
+  install:
+    method: hailo-ollama-pull
+  requires:
+    backends:
+    - id: hailo-ollama
+      targets:
+      - hailo
+      min_ram_mb: 2048
 hardware_tiers:
+  arm-npu-8gb:
+    recommended: a8w4
   arm-npu-16gb:
-    recommended: q4_k_m
+    recommended: a8w4
   arm-cpu-8gb:
     recommended: q4_k_m
   x86-vulkan-4gb:

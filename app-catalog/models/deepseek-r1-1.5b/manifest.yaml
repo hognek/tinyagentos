@@ -14,7 +14,6 @@ variants:
   format: hef
   size_mb: 2261
   min_ram_mb: 0
-  hef_h10h: 9c4506dda44d0a1730d939d4049a3cbf72d5179a88762ca551363db087adb38f
   install:
     method: hailo-ollama-pull
   requires:

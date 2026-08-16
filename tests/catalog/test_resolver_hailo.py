@@ -38,7 +38,7 @@ def _x86_cpu_only_hardware() -> dict:
 
 class TestHailoManifestResolves:
     def test_pi5_hailo_resolves_qwen25_1_5b_hef_to_hailo_ollama(self):
-        manifest = _load_manifest("qwen2.5-1.5b-instruct-hef")
+        manifest = _load_manifest("qwen2.5-1.5b")
         targets = hardware_to_targets(_pi5_hailo_hardware())
         assert "hailo" in targets, (
             "Pi 5 + Hailo-10H hardware profile did not produce a 'hailo' "
@@ -59,7 +59,7 @@ class TestHailoManifestResolves:
         assert result.backend_id == "hailo-ollama"
 
     def test_cpu_only_x86_cannot_resolve_hailo_manifest(self):
-        manifest = _load_manifest("qwen2.5-1.5b-instruct-hef")
+        manifest = _load_manifest("qwen2.5-1.5b")
         targets = hardware_to_targets(_x86_cpu_only_hardware())
         device = DeviceCapability(
             device_id="x86-cpu-only",
@@ -82,10 +82,11 @@ class TestHailoNewManifestsResolve:
         "model_id",
         [
             "qwen2.5-1.5b",
-            "qwen3",
+            "qwen3-1.7b",
             "qwen2.5-coder-1.5b",
             "qwen2-1.5b",
-            "llama3.2-1b",
+            "llama-3.2-1b",
+            "llama-3.2-3b",
             "deepseek-r1-1.5b",
         ],
     )
@@ -110,10 +111,11 @@ class TestHailoNewManifestsResolve:
         "model_id",
         [
             "qwen2.5-1.5b",
-            "qwen3",
+            "qwen3-1.7b",
             "qwen2.5-coder-1.5b",
             "qwen2-1.5b",
-            "llama3.2-1b",
+            "llama-3.2-1b",
+            "llama-3.2-3b",
             "deepseek-r1-1.5b",
         ],
     )
