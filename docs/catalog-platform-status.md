@@ -20,6 +20,7 @@ this doc records what's actually verified working.
 
 | Tier | Description | Example device |
 |---|---|---|
+| **Pi-NPU-8GB** | Raspberry Pi 5 8GB with AI HAT+2 (Hailo-10H NPU) via hailo-ollama | Pi 5 + AI HAT+2 |
 | **Pi-NPU-16GB** | Rockchip RK3588 with 16GB unified memory + NPU | Orange Pi 5 Plus 16GB |
 | **Pi-NPU-32GB** | RK3588 with 32GB | Orange Pi 5 Max |
 | **Mac-MLX** | Apple Silicon (M1/M2/M3/M4) with MLX-served models | MacBook Pro M-series |
@@ -78,8 +79,6 @@ Catalog entries with `format: hef` + `backend: [hailo-ollama]`. Pulled via `hail
 | `qwen2-1.5b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | |
 | `qwen2.5-1.5b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | |
 | `qwen2.5-coder-1.5b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | |
-| `qwen3-1.7b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | 1.7B variant |
-| `llama-3.2-1b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | |
 | `llama-3.2-3b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | |
 | `deepseek-r1-1.5b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | reasoning |
 

@@ -125,12 +125,32 @@ def test_model_manifests_are_resolvable_and_integrity_pinned():
                     f"stray variant-level keys {stray_tier_keys}"
                 )
             if "hardware_tiers" in variant:
-                hw_tiers = variant["hardware_tiers"]
-                if not isinstance(hw_tiers, dict) or not hw_tiers:
-                    errors.append(
-                        f"{mid}/{vid}: hardware_tiers present but not a non-empty "
-                        f"mapping (got {hw_tiers!r})"
-                    )
+                # hardware_tiers is read at MANIFEST scope only
+                # (cluster/capabilities.py, config.py); a variant-level block
+                # is dead data that looks live -- exactly how PR #2453's
+                # regression slipped past a variant-shape check.
+                errors.append(
+                    f"{mid}/{vid}: hardware_tiers must sit at manifest scope, "
+                    f"not inside a variant (nothing reads it here)"
+                )
+        # Rule 6: manifest-scope hardware_tiers, when present, must be a
+        # non-empty mapping, and tier keys must not sit stray at manifest
+        # level either.
+        stray_manifest_tier_keys = [
+            k for k in manifest if _TIER_KEY_RE.match(k)
+        ]
+        if stray_manifest_tier_keys:
+            errors.append(
+                f"{mid}: tier key must nest under hardware_tiers; "
+                f"stray manifest-level keys {stray_manifest_tier_keys}"
+            )
+        if "hardware_tiers" in manifest:
+            hw_tiers = manifest["hardware_tiers"]
+            if not isinstance(hw_tiers, dict) or not hw_tiers:
+                errors.append(
+                    f"{mid}: hardware_tiers present but not a non-empty "
+                    f"mapping (got {hw_tiers!r})"
+                )
     assert errors == [], (
         "model manifest integrity failures:\n" + "\n".join(errors)
     )

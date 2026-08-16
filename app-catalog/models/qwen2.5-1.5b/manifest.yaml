@@ -46,17 +46,17 @@ variants:
       targets:
       - hailo
       min_ram_mb: 2048
-  hardware_tiers:
-    arm-cpu-8gb:
-      recommended: q4_k_m
-    arm-npu-8gb:
-      recommended: a8w4
-    arm-npu-16gb:
-      recommended: a8w4
-    x86-vulkan-4gb:
-      recommended: q4_k_m
-    cpu-only:
-      recommended: q4_k_m
-    x86-vulkan-2gb:
-      recommended: q4_k_m
+hardware_tiers:
+  arm-cpu-8gb:
+    recommended: q4_k_m
+  arm-npu-8gb:
+    recommended: a8w4
+  arm-npu-16gb:
+    recommended: a8w4
+  x86-vulkan-4gb:
+    recommended: q4_k_m
+  cpu-only:
+    recommended: q4_k_m
+  x86-vulkan-2gb:
+    recommended: q4_k_m
 context_window: 32768
