@@ -711,6 +711,43 @@ user had set. This has now happened twice: `archive`, `archived_agents` and
 key set against what survives a round trip and fails if one is forgotten.
 Never fix such a leak by removing the field from `to_dict()`: `save_config()`
 serialises from there, so that makes the setting unpersistable.
+## Cluster node revoke, block and unblock (admin-only)
+
+Route module `tinyagentos/routes/cluster.py`. **Admin session only**
+(`_require_admin`); no registry scope reaches these, so an agent token cannot
+revoke a node. These are the node analogue of the device bearer revoke/block
+routes documented above.
+
+- `POST /api/cluster/workers/{name}/revoke` -- kills the node's HMAC signing key,
+  so subsequent register and heartbeat requests are rejected. The node **may
+  re-pair** through the normal announce/confirm/claim flow to obtain a fresh key.
+  Answers `{"revoked": true, "changed": <bool>}`.
+- `POST /api/cluster/workers/{name}/block` -- revokes the key AND refuses
+  re-pairing until an admin unblocks. **The distinction from revoke is the gate
+  it acts at**: a blocked node is turned away at the PAIRING gate, not merely at
+  the auth gate, so it cannot come back on its own.
+- `POST /api/cluster/workers/{name}/unblock` -- clears the blocked flag only.
+  **The old signing key stays dead**, so the node still has to re-pair for a
+  fresh one. Unblock is permission to return, not restoration of access.
+
+Behaviour common to all three:
+
+- `404` when the node is absent from the PAIRING store, meaning it was never
+  paired. A node that is in the worker registry but has never paired answers
+  `404` here.
+- `503` when the pairing store is unavailable, kept distinct from `404` so a
+  missing subsystem is never reported as a missing node.
+- revoke and block mark the in-memory worker **offline immediately** so the
+  scheduler stops routing tasks to it, rather than waiting out the heartbeat
+  timeout. The worker stays REGISTERED and therefore still visible in
+  `GET /api/cluster/workers`, which is what makes it unblockable from the UI.
+
+**Blocked devices keep consuming a per-user slot.** `list_for_user` returns rows
+where `revoked=0 OR blocked=1`, so a blocked device counts against
+`_MAX_DEVICES_PER_USER` until it is unblocked, at which point the row falls out
+and the slot frees. Deliberate: a blocked device is a retained safety valve the
+owner can still see and act on.
+
 ## Identity rules
 
 Work as jaylfc on all git and GitHub activity. Do not add AI attribution to
