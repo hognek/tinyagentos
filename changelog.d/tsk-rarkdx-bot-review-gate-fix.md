@@ -1,0 +1,2 @@
+### Fixed
+- The `bot-review-gate` workflow no longer crashes on `issue_comment` events: the `bot-review-gate` job is guarded to run only on `pull_request` and `pull_request_review` events (where `github.event.pull_request.number` resolves), and a new `re-run-on-stub-comment` job re-runs the gate for the PR head SHA when a CodeRabbit rate-limit stub comment lands after the initial green run. Inert `branches` filters on `pull_request_review` and `issue_comment` triggers have been removed.

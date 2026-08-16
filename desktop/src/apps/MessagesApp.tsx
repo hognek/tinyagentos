@@ -7,6 +7,7 @@ import {
   X,
   AtSign,
   ChevronDown,
+  ChevronRight,
   PanelRight,
   Archive,
   CircleDot,
@@ -497,6 +498,8 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
   const [decision, setDecision] = useState<DecisionData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [answer, setAnswer] = useState("");
+  const [answerError, setAnswerError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -521,6 +524,41 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
     return () => { cancelled = true; };
   }, [block.decision_id]);
 
+  async function answerDecision(
+    value: string | string[],
+    otherValue?: string,
+    note?: string
+  ) {
+    if (!decision || decision.status !== "pending") return;
+    const body: Record<string, unknown> = { value };
+    if (otherValue !== undefined) body.other_value = otherValue;
+    if (note !== undefined) body.note = note;
+    
+    try {
+      const res = await fetch(`/api/decisions/${decision.id}/answer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const detail = data?.error ?? data?.detail;
+        throw new Error(
+          typeof detail === "string" ? detail : "Could not record answer.",
+        );
+      }
+      // Refresh the decision to get the updated state (including answer)
+      const updatedRes = await fetch(`/api/decisions/${decision.id}`);
+      if (updatedRes.ok) {
+        const updated = await updatedRes.json();
+        setDecision(updated as DecisionData);
+      }
+    } catch (e) {
+      console.error("Failed to answer decision:", e);
+      throw e;
+    }
+  }
+
   if (loading) {
     return (
       <div className="flex items-center gap-2 text-[12px] text-shell-text-tertiary py-2">
@@ -538,7 +576,7 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
     );
   }
 
-  if (!decision) return <></>;
+  if (!decision) return <></>
 
   const isOpen = decision.status === "pending";
   const isAnswered = decision.status === "answered";
@@ -562,7 +600,7 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
         </span>
       </div>
 
-      {/* options (disabled -- read-only) */}
+      {/* options (clickable for answering) */}
       {showOptions && (
         <div className="mt-2 flex flex-col gap-1.5 px-3">
           {decision.options!.map((opt) => {
@@ -570,11 +608,20 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
               <button
                 key={opt.value}
                 type="button"
-                disabled
+                onClick={() => {
+                  if (!isOpen) return;
+                  answerDecision(opt.value).catch((e) =>
+                    setAnswerError(`Failed to answer: ${e.message}`)
+                  );
+                }}
+                disabled={!isOpen}
                 className={[
-                  "flex w-full flex-col gap-0.5 rounded-lg border px-3 py-1.5 text-left",
+                  "flex w-full flex-col gap-0.5 rounded-lg border px-3 py-1.5 text-left transition-colors",
                   "disabled:cursor-not-allowed disabled:opacity-60",
-                  "border-shell-border bg-shell-bg-deep text-shell-text-secondary",
+                  isOpen
+                    ? "border-shell-border bg-shell-surface hover:border-shell-border-strong"
+                    : "border-shell-border bg-shell-bg-deep text-shell-text-secondary",
+                  "cursor-pointer",
                 ].join(" ")}
               >
                 <span className="text-sm">{opt.label}</span>
@@ -601,16 +648,51 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
         </div>
       )}
 
-      {/* free_text pending: show a disabled textarea placeholder */}
+      {/* free_text pending: show a textarea for answering */}
       {isOpen && decision.type === "free_text" && (
         <div className="mt-2 px-3">
-          <textarea
-            readOnly
-            disabled
-            placeholder="awaiting free-text answer"
-            className="w-full resize-none rounded border border-shell-border bg-shell-bg-deep px-2 py-1.5 text-[12px] text-shell-text-tertiary"
-            rows={3}
-          />
+          <div className="flex flex-col gap-2">
+            <textarea
+              placeholder="Type your answer..."
+              className="w-full resize-none rounded border border-shell-border bg-shell-surface px-2 py-1.5 text-[12px] text-shell-text placeholder:text-shell-text-tertiary"
+              rows={3}
+              value={answer}
+              onChange={(e) => setAnswer(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  if (!isOpen) return;
+                  const trimmed = e.currentTarget.value.trim();
+                  if (trimmed) {
+                    answerDecision(trimmed).catch((e) =>
+                      setAnswerError(`Failed to answer: ${e.message}`)
+                    );
+                  }
+                }
+              }}
+            />
+            <button
+              onClick={() => {
+                if (!isOpen) return;
+                const trimmed = answer.trim();
+                if (trimmed) {
+                  answerDecision(trimmed).catch((e) =>
+                    setAnswerError(`Failed to answer: ${e.message}`)
+                  );
+                }
+              }}
+              disabled={!answer || answer.trim() === ""}
+              className="flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[12px] text-shell-text hover:text-shell-text-hover hover:bg-shell-surface-focus focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
+              aria-label="Submit answer"
+            >
+              <ChevronRight size={12} aria-hidden="true" /> Submit
+            </button>
+          </div>
+          {answerError && (
+            <div className="mt-2 text-[12px] text-red-400" role="alert">
+              {answerError}
+            </div>
+          )}
         </div>
       )}
 

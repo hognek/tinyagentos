@@ -50,6 +50,22 @@ _SHARDED_URL_PATTERNS = [
     re.compile(r"model-\d+-of-\d+\.safetensors"),
 ]
 
+# Known-fabricated sha256 placeholders that must never appear in a real
+# manifest.  This class of error has recurred twice (#2425, #2451) because
+# an LLM-generated placeholder digest looks hex-valid.  A denylist gate is
+# the only reliable stop -- a prompt did not stop it, a gate will.
+_FABRICATED_SHA256_DENYLIST: set[str] = {
+    # llama-3.2-1b/a8w4 -- blocked in PR #2425
+    "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2",
+    # qwen3-1.7b/a8w4 -- blocked in PR #2425
+    "d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c3d4e5",
+}
+
+# Variant-level keys that belong inside hardware_tiers, not as stray
+# siblings.  If they appear at variant level, hardware_tiers parsed as null
+# and the model is silently treated as unrestricted.
+_TIER_KEY_RE = re.compile(r"^(arm|x86|cpu)-")
+
 
 def test_model_manifests_are_resolvable_and_integrity_pinned():
     root = Path(__file__).resolve().parent.parent / "app-catalog"
@@ -79,9 +95,11 @@ def test_model_manifests_are_resolvable_and_integrity_pinned():
                         errors.append(
                             f"{mid}/{vid}: backend {backend.get('id')!r} has unknown targets {unknown}"
                         )
-            # Rule 2: single-file variants must pin a content sha256;
-            # multi-file variants must NOT carry a metadata hash under that
-            # key — they use file_set_hash instead.
+            # Rule 2: single-file variants must pin a content sha256 that is
+            # a 64-char lowercase hex string and not a known-fabricated
+            # placeholder digest (denylist -- this class has recurred twice
+            # and a prompt did not stop it).  multi-file variants must NOT
+            # carry a metadata hash under that key — they use file_set_hash.
             multi_file = variant.get("multi_file") is True
             sha256 = variant.get("sha256")
             if multi_file:
@@ -90,12 +108,16 @@ def test_model_manifests_are_resolvable_and_integrity_pinned():
                         f"{mid}/{vid}: multi_file variants must not declare sha256 "
                         f"(use file_set_hash for metadata pin); got {sha256!r}"
                     )
-            else:
-                if not re.fullmatch(r"[0-9a-f]{64}", sha256 or ""):
-                    if not allowed_sha256:
-                        errors.append(
-                            f"{mid}/{vid}: sha256 must be a 64-char lowercase hex string (got {sha256!r})"
-                        )
+            elif sha256 in _FABRICATED_SHA256_DENYLIST:
+                errors.append(
+                    f"{mid}/{vid}: sha256 {sha256[:16]}... is a known-fabricated "
+                    f"placeholder (blocked in PR #2425)"
+                )
+            elif not re.fullmatch(r"[0-9a-f]{64}", sha256 or ""):
+                if not allowed_sha256:
+                    errors.append(
+                        f"{mid}/{vid}: sha256 must be a 64-char lowercase hex string (got {sha256!r})"
+                    )
             # Rule 2b: multi_file variants must carry a 64-char lowercase
             # hex file_set_hash (metadata hash, not content SHA256).
             if multi_file:
@@ -105,7 +127,7 @@ def test_model_manifests_are_resolvable_and_integrity_pinned():
                         f"{mid}/{vid}: multi_file variants require a 64-char "
                         f"lowercase hex file_set_hash (got {file_set_hash!r})"
                     )
-            # Rule 3: download_url is non-empty and parses as https.
+            # Rule 3: download_url must be a non-empty https URL.
             url = variant.get("download_url", "")
             if not url or not url.startswith("https://"):
                 errors.append(
@@ -122,11 +144,49 @@ def test_model_manifests_are_resolvable_and_integrity_pinned():
                                 f"hf_repo + multi_file: true"
                             )
                         break
-            # Rule 4: size_mb is a positive int.
+            # Rule 4: size_mb must be a positive int.
             size_mb = variant.get("size_mb")
             if not isinstance(size_mb, int) or size_mb <= 0:
                 errors.append(
                     f"{mid}/{vid}: size_mb must be a positive int (got {size_mb!r})"
+                )
+            # Rule 5: tier keys (^(arm|x86|cpu)-) must nest under
+            # hardware_tiers, not sit as stray siblings.  If
+            # hardware_tiers is present it must be a non-empty mapping.
+            stray_tier_keys = [
+                k for k in variant if _TIER_KEY_RE.match(k)
+            ]
+            if stray_tier_keys:
+                errors.append(
+                    f"{mid}/{vid}: tier key must nest under hardware_tiers; "
+                    f"stray variant-level keys {stray_tier_keys}"
+                )
+            if "hardware_tiers" in variant:
+                # hardware_tiers is read at MANIFEST scope only
+                # (cluster/capabilities.py, config.py); a variant-level block
+                # is dead data that looks live -- exactly how PR #2453's
+                # regression slipped past a variant-shape check.
+                errors.append(
+                    f"{mid}/{vid}: hardware_tiers must sit at manifest scope, "
+                    f"not inside a variant (nothing reads it here)"
+                )
+        # Rule 6: manifest-scope hardware_tiers, when present, must be a
+        # non-empty mapping, and tier keys must not sit stray at manifest
+        # level either.
+        stray_manifest_tier_keys = [
+            k for k in manifest if _TIER_KEY_RE.match(k)
+        ]
+        if stray_manifest_tier_keys:
+            errors.append(
+                f"{mid}: tier key must nest under hardware_tiers; "
+                f"stray manifest-level keys {stray_manifest_tier_keys}"
+            )
+        if "hardware_tiers" in manifest:
+            hw_tiers = manifest["hardware_tiers"]
+            if not isinstance(hw_tiers, dict) or not hw_tiers:
+                errors.append(
+                    f"{mid}: hardware_tiers present but not a non-empty "
+                    f"mapping (got {hw_tiers!r})"
                 )
     assert errors == [], (
         "model manifest integrity failures:\n" + "\n".join(errors)
