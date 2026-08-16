@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import aiosqlite
+import asyncio
 
 from tinyagentos.base_store import BaseStore
 
@@ -97,6 +98,10 @@ class DevicePairRequestsStore(BaseStore):
     """Persistent store for device pairing (consent) requests."""
 
     SCHEMA = SCHEMA
+
+    def __init__(self, db_path):
+        super().__init__(db_path)
+        self._create_lock = asyncio.Lock()
 
     async def init(self) -> None:
         await super().init()

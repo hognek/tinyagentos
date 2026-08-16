@@ -600,6 +600,9 @@ each other's work.
 Route module `tinyagentos/routes/device_pair_requests.py`:
 
 - `POST /api/devices/pair-requests` creates a pairing request for a device.
+  Returns `409 Conflict` when no instance admin exists (the request can never be
+  approved). The pending cap is enforced atomically so concurrent requests cannot
+  exceed it.
 - `GET /api/devices/pair-requests/{pair_request_id}` returns its status.
 
 Approval or denial of a pair request is surfaced to the user through the Decisions app;
