@@ -50,13 +50,12 @@ class TestDevicePairSecurity:
                 json={"platform": "ios", "display_name": "racer"},
             )
 
-        results = await asyncio.gather(*[_create() for _ in range(5)], return_exceptions=True)
-        statuses = [
-            r.status_code for r in results if not isinstance(r, Exception)
-        ]
-        successes = [s for s in statuses if s == 200]
-        assert len(successes) <= 1, (
-            f"cap race: {len(successes)} requests succeeded past the cap"
+        # No return_exceptions: a server-side crash must fail the test, not
+        # empty the status list into a vacuous pass.
+        results = await asyncio.gather(*[_create() for _ in range(5)])
+        statuses = sorted(r.status_code for r in results)
+        assert statuses == [200, 429, 429, 429, 429], (
+            f"cap race: expected exactly one success at the cap, got {statuses}"
         )
 
     async def test_pair_request_requires_admin_presence(self, client, app):
@@ -72,8 +71,9 @@ class TestDevicePairSecurity:
             "/api/devices/pair-requests",
             json={"platform": "ios", "display_name": "Orphan"},
         )
-        assert resp.status_code != 200, (
-            "pair request must not succeed when no admin exists to approve it"
+        assert resp.status_code == 409, (
+            "pair request must be rejected with 409 when no admin exists to "
+            f"approve it, got {resp.status_code}"
         )
 
     async def test_forged_display_name_cannot_impersonate_approved_device(

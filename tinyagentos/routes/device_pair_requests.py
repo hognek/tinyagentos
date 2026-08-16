@@ -118,25 +118,10 @@ async def create_pair_request(request: Request, body: CreatePairRequest):
     requester_ip = _requester_ip(request)
     display = (body.display_name or "").strip() or body.platform
 
-    lock = getattr(store, "_create_lock", None)
-    if lock is not None:
-        async with lock:
-            pending_count = await store.count_pending()
-            if pending_count >= _PENDING_CAP:
-                raise HTTPException(
-                    status_code=429,
-                    detail=(
-                        f"too many pending pair requests ({pending_count} pending; "
-                        f"resolve existing requests first)"
-                    ),
-                )
-            record = await store.create(
-                platform=body.platform,
-                display_name=display,
-                verify_code=verify_code,
-                requester_ip=requester_ip,
-            )
-    else:
+    # The lock is what makes the cap atomic; a store without it must fail
+    # loudly rather than fall back to the racy count-then-create this fix
+    # removed.
+    async with store._create_lock:
         pending_count = await store.count_pending()
         if pending_count >= _PENDING_CAP:
             raise HTTPException(
