@@ -298,9 +298,15 @@ async def list_decisions_as_agent(request: Request):
     grant for.  A global (null-project) grant means null-project decisions
     only, matching _resolve_decision_actor's posting rule; otherwise, only
     decisions from allowed projects are returned.  The store layer enforces
-    the from_agent binding so there is no cross-agent leakage, and the
-    project filter is pushed into the store query so the limit applies
-    AFTER scoping."""
+    the from_agent binding so there is no cross-agent leakage.
+
+    LIMIT INTERACTION, and it is not uniform across the three paths: the global
+    and single-project paths push the project filter INTO the store query, so the
+    limit applies AFTER scoping (issue #2194).  The two-or-more-project path
+    cannot express that as one query, so it still fetches up to `limit` rows for
+    the agent and filters in Python afterwards; an agent holding grants on
+    several projects and carrying more than `limit` decisions in total can still
+    lose allowed-project rows to the limit there."""
     from datetime import datetime, timezone
     from tinyagentos.agent_token_auth import check_agent_scope, _grant_unexpired
 
@@ -322,7 +328,8 @@ async def list_decisions_as_agent(request: Request):
     # A global (null-project) grant means null-project decisions only,
     # matching _resolve_decision_actor's posting rule.
     # The project filter is pushed into the store query so the limit applies
-    # AFTER scoping (issue #2194).
+    # AFTER scoping (issue #2194) -- for the global and single-project paths.
+    # The multi-project fallback below still filters after the fetch.
     if None in allowed_projects:
         # Global grant: only null-project decisions
         items = await store.list(from_agent=canonical_id, project_id=None, limit=500)
