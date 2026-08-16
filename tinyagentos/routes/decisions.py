@@ -289,7 +289,12 @@ async def list_decisions(
     store = request.app.state.decision_store
     # Non-admins see only their own decisions; admins see all.
     uid = None if user.is_admin else user.user_id
-    items = await store.list(status=status, project_id=project_id, user_id=uid, limit=limit)
+    # Only forward project_id when the caller specified one; an absent query
+    # param means "no project filter", which is the store's default (_UNSET).
+    kwargs: dict[str, object] = {"status": status, "user_id": uid, "limit": limit}
+    if project_id is not None:
+        kwargs["project_id"] = project_id
+    items = await store.list(**kwargs)
     return {"items": items}
 
 

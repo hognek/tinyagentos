@@ -46,6 +46,12 @@ CREATE INDEX IF NOT EXISTS idx_decisions_user ON decisions(user_id, status);
 
 _JSON_FIELDS = ("options", "answer", "metadata")
 
+# Sentinel for "argument not supplied" -- distinguished from an explicit None,
+# which means "match NULL project_id" (IS NULL) rather than "no filter".
+# A bare ``project_id = ?`` with a NULL parameter matches nothing in SQL, so
+# callers that want null-project rows must emit IS NULL instead.
+_UNSET = object()
+
 
 def _row_to_decision(row, description) -> dict:
     d = dict(zip([c[0] for c in description], row))
@@ -124,7 +130,7 @@ class DecisionStore(BaseStore):
         self,
         *,
         status: str | None = None,
-        project_id: str | None = None,
+        project_id: str | None | object = _UNSET,
         user_id: str | None = None,
         limit: int = 200,
         from_agent: str | None = None,
@@ -133,7 +139,11 @@ class DecisionStore(BaseStore):
         if status is not None:
             conds.append("status = ?")
             params.append(status)
-        if project_id is not None:
+        if project_id is _UNSET:
+            pass  # no project filter
+        elif project_id is None:
+            conds.append("project_id IS NULL")
+        else:
             conds.append("project_id = ?")
             params.append(project_id)
         if user_id is not None:

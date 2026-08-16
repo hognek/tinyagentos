@@ -554,6 +554,46 @@ async def test_agent_list_respects_project_grants(client):
     assert items[0]["project_id"] == pid_b
 
 
+@pytest.mark.asyncio
+async def test_agent_global_grant_lists_only_null_project_decisions(client):
+    """A global (null-project) grant must list only OS-level (null-project)
+    decisions, never project-scoped ones -- matching _resolve_decision_actor's
+    posting rule and the per-project isolation enforced on read/answer.
+
+    This is the agent-list counterpart to the global-grant post/answer
+    isolation tests above.  It FAILS if the store treats project_id=None as
+    'no filter' instead of 'IS NULL': the project-scoped decision leaks."""
+    app = client._transport.app
+    pid = await _new_project(client)
+    cid, token = await _mint_agent(app, None, ("decisions_write",))
+
+    # OS-level decision (project_id=None) attributed to the agent.
+    resp = await client.post(
+        "/api/decisions",
+        json=_decision_body(project_id=None, from_agent=cid),
+    )
+    assert resp.status_code == 200, resp.text
+
+    # Project-scoped decision attributed to the SAME agent.
+    resp = await client.post(
+        "/api/decisions",
+        json=_decision_body(project_id=pid, from_agent=cid),
+    )
+    assert resp.status_code == 200, resp.text
+
+    # Agent lists its own decisions with a global grant.
+    async with _agent_client(app, token) as ac:
+        resp = await ac.get("/api/decisions/agent")
+    assert resp.status_code == 200, resp.text
+    items = resp.json()["items"]
+    # Only the null-project decision should be visible under a global grant.
+    assert len(items) == 1, (
+        f"global grant leaked project-scoped decisions: {items}"
+    )
+    assert items[0]["project_id"] is None
+    assert items[0]["from_agent"] == cid
+
+
 class TestAuthRunsBeforeBodyValidation:
     """A bad bearer must 401 before Pydantic body validation can 422.
 
