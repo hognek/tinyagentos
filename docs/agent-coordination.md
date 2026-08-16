@@ -97,6 +97,12 @@ Three traps in writing that check, all of which have bitten someone here:
 - So split on NUL and require an exact element (or an exact env assignment),
   then verify AFTER the signal that whatever you meant to keep alive still
   advances its own liveness file.
+- The check and the signal are two operations on a NUMBER, so they race: if the
+  process exits between them, Linux can recycle that pid and the `kill` lands on
+  something unrelated. Reading `/proc/$pid/environ` first narrows the window, it
+  does not close it, and neither does the post-signal liveness check. Where it
+  matters, signal through something that owns the process rather than through its
+  pid: `systemctl --user kill <unit>` for a unit-owned watcher.
 
 Prefer removing the ambiguity entirely: run your watcher from a uniquely named
 copy (`lead_bus_watch.sh`, `taosmd_bus_watch.sh`) so no one else's pattern can
@@ -357,14 +363,26 @@ The registry-JWT surface, by scope:
   and the trash restore/purge/empty routes. NOTE: the files routes key on the
   project SLUG in the path, not the id.
 - **decisions_write**: `POST /api/decisions` (raise a human-in-the-loop
-  decision). Listing/answering decisions stays session-only.
-- **observatory_control**: read/write the Observatory fleet dials
-  (`/api/observatory/pause|throttle|approval-mode|fleet`). Writes require a
-  global (null-project) grant; reads admit any active grant. Admin session and
-  local token are always allowed.
-- **a2a_send / a2a_receive**: the authenticated bus proxy above
-  (`/api/a2a/bus/send|messages|channels|stream`), which forces `from` to the
-  agent's own handle.
+  decision), `POST /api/decisions/{id}/answer/agent` (mirror an answer),
+  `GET /api/decisions/{id}/agent` (read its own), `GET /api/decisions/agent`
+  (list its own). The GENERAL routes stay session-only -- `GET /api/decisions`,
+  `GET /api/decisions/{id}`, `GET /api/decisions/{id}/history` and
+  `POST /api/decisions/{id}/answer`. The agent set is a separate, narrower
+  allowlist distinguished by the `/agent` suffix
+  (`_is_agent_decisions_path` in `tinyagentos/auth_middleware.py`).
+- **observatory_control**: the Observatory fleet dials.
+  `GET|POST /api/observatory/pause`, `GET|POST /api/observatory/throttle`,
+  `GET|POST /api/observatory/approval-mode`, and `GET /api/observatory/fleet`
+  (read-only, there is no POST). Writes require a global (null-project) grant;
+  reads admit any active grant. Admin session and local token are always
+  allowed.
+- **a2a_receive**: the bus READ routes only -- `GET /api/a2a/bus/channels`,
+  `GET /api/a2a/bus/messages`, `GET /api/a2a/bus/stream`.
+  **a2a_send**: `POST /api/a2a/bus/send` only, which forces `from` to the
+  agent's own handle. These are two separate allowlists in
+  `tinyagentos/auth_middleware.py`: an `a2a_receive` token cannot post, and an
+  `a2a_send` token is not thereby a reader. Do not describe them as one scope
+  covering four routes.
 
 Access is per-project: a token is authorized for a project only when the agent
 holds an active grant + membership there; a request for a project it has no
@@ -679,7 +697,10 @@ cookie plus the CSRF double-submit on writes; no registry scope reaches them.
 - `GET /api/config` -- `{"yaml": "<serialised AppConfig>"}`.
 - `PUT /api/config` -- body `{"yaml": "..."}`, optional `?validate_only=true` to
   check without saving. Answers `400` with `details` when validation fails.
-- `POST /api/settings/restore` -- restores a backup file into the live config.
+- `POST /api/restore` -- multipart `file`, restores a backup tarball into the
+  data dir. **The path is `/api/restore`, NOT `/api/settings/restore`**, even
+  though the handler sits in `routes/settings.py` beside the `/api/settings/*`
+  routes.
 
 **Both write paths REBUILD `AppConfig` field by field**, and a field missing
 from either rebuild is silently dropped on the next save, wiping whatever the
