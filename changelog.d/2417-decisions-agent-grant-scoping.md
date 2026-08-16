@@ -1,0 +1,2 @@
+### Fixed
+- `GET /api/decisions/agent` now scopes an agent's decision list consistently with how it is allowed to raise them: a global (null-project) grant returns null-project decisions rather than every project's, matching the posting rule. The project filter is also pushed into the store query for the global and single-project cases so the row limit applies after scoping instead of before it (#2194, #2417).
