@@ -69,6 +69,19 @@ Pre-loaded by `install-rknpu.sh` (separate from Store install path):
 | `qwen3-reranker-0.6b` | ✅ | ✅ | embedded in rkllama default load |
 | `qmd-query-expansion` | ✅ | ✅ | embedded in rkllama default load |
 
+## LLM models — HEF format (Hailo-10H NPU)
+
+Catalog entries with `format: hef` + `backend: [hailo-ollama]`. Pulled via `hailo-ollama pull` (Ollama-compatible `/api/pull`).
+
+| Model | Pi-NPU-8GB | Pi-NPU-16GB | Source | Notes |
+|---|---|---|---|---|
+| `qwen2-1.5b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | |
+| `qwen2.5-1.5b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | |
+| `qwen2.5-coder-1.5b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | |
+| `qwen3` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | 1.7B variant |
+| `llama3.2-1b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | |
+| `deepseek-r1-1.5b` | ⏳ | ⏳ | dev-public.hailo.ai/v5.1.1 | reasoning |
+
 ## LLM models — GGUF format (rk-llama.cpp / Ollama / llama.cpp)
 
 GGUF-format models route through the resolver's `requires.backends` list — manifests pick `rk-llama-cpp` for Pi NPU and fall back to `ollama` / `llama-cpp` on other tiers.

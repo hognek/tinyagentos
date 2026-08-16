@@ -71,19 +71,36 @@ def test_model_manifests_are_resolvable_and_integrity_pinned():
                         errors.append(
                             f"{mid}/{vid}: backend {backend.get('id')!r} has unknown targets {unknown}"
                         )
-            # Rule 2: sha256 is a 64-char lowercase hex string.
-            sha256 = variant.get("sha256")
-            if not re.fullmatch(r"[0-9a-f]{64}", sha256 or ""):
-                if not allowed_sha256:
+            # Rule 2a: for HEF variants installed via hailo-ollama-pull, the
+            # content hash lives in hef_h10h (not sha256); skip the sha256
+            # check and enforce hef_h10h instead.
+            is_hef_ollama_pull = (
+                variant.get("format") == "hef"
+                and (variant.get("install") or {}).get("method") == "hailo-ollama-pull"
+            )
+            if is_hef_ollama_pull:
+                hef_h10h = variant.get("hef_h10h")
+                if not re.fullmatch(r"[0-9a-f]{64}", hef_h10h or ""):
                     errors.append(
-                        f"{mid}/{vid}: sha256 must be a 64-char lowercase hex string (got {sha256!r})"
+                        f"{mid}/{vid}: hef_h10h must be a 64-char lowercase hex string "
+                        f"(got {hef_h10h!r})"
                     )
-            # Rule 3: download_url is non-empty and parses as https.
-            url = variant.get("download_url", "")
-            if not url or not url.startswith("https://"):
-                errors.append(
-                    f"{mid}/{vid}: download_url must be a non-empty https URL (got {url!r})"
-                )
+            else:
+                sha256 = variant.get("sha256")
+                if not re.fullmatch(r"[0-9a-f]{64}", sha256 or ""):
+                    if not allowed_sha256:
+                        errors.append(
+                            f"{mid}/{vid}: sha256 must be a 64-char lowercase hex string (got {sha256!r})"
+                        )
+            # Rule 3a: HEF hailo-ollama-pull variants do not carry a plain
+            # download_url (the model is pulled via the backend). All other
+            # variants still require a non-empty https download_url.
+            if not is_hef_ollama_pull:
+                url = variant.get("download_url", "")
+                if not url or not url.startswith("https://"):
+                    errors.append(
+                        f"{mid}/{vid}: download_url must be a non-empty https URL (got {url!r})"
+                    )
             # Rule 4: size_mb is a positive int.
             size_mb = variant.get("size_mb")
             if not isinstance(size_mb, int) or size_mb <= 0:
