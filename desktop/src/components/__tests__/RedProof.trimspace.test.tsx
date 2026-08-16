@@ -20,6 +20,15 @@ function pendingFreeText(id: string) {
   return { ...baseFreeTextDecision, id, question: "Any notes?" };
 }
 
+function answeredFreeText(id: string, answerValue = "some answer") {
+  return {
+    ...baseFreeTextDecision,
+    id,
+    status: "answered" as const,
+    answer: { value: answerValue, answered_by: "someone", answered_at: 1700000001 },
+  };
+}
+
 describe("RED PROOF: controlled textarea trim-on-change", () => {
   afterEach(() => {
     vi.restoreAllMocks();
@@ -121,12 +130,13 @@ describe("RED PROOF: controlled textarea trim-on-change", () => {
   });
 });
 
-describe("RED PROOF: server error reason surfaced in alert", () => {
+describe("RED PROOF: 409 refetch + non-409 error surfacing", () => {
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  it("surfaces the exact 409 server error message in role=alert", async () => {
+  it("409 refetches and flips the block to the answered state (no alert)", async () => {
+    let getCalls = 0;
     const fetchMock = vi.fn().mockImplementation(async (url: string, options?: RequestInit) => {
       if (options?.method === "POST") {
         return {
@@ -135,13 +145,51 @@ describe("RED PROOF: server error reason surfaced in alert", () => {
           json: async () => ({ error: "already answered or not pending" }),
         };
       }
-      return { ok: true, status: 200, json: async () => pendingFreeText("dec-err") };
+      getCalls++;
+      if (getCalls === 1) {
+        return { ok: true, status: 200, json: async () => pendingFreeText("dec-409") };
+      }
+      return { ok: true, status: 200, json: async () => answeredFreeText("dec-409") };
     });
     vi.stubGlobal("fetch", fetchMock);
 
     const block: DecisionContentBlock = {
       kind: "decision",
-      decision_id: "dec-err",
+      decision_id: "dec-409",
+    };
+    const { container } = render(<DecisionBlock block={block} />);
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-decision-block="true"]')).not.toBeNull();
+    });
+
+    const textarea = container.querySelector("textarea") as HTMLTextAreaElement;
+
+    fireEvent.change(textarea, { target: { value: "some answer" } });
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false });
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("answered:");
+    });
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+  });
+
+  it("surfaces the exact non-409 server error message in role=alert", async () => {
+    const fetchMock = vi.fn().mockImplementation(async (url: string, options?: RequestInit) => {
+      if (options?.method === "POST") {
+        return {
+          ok: false,
+          status: 500,
+          json: async () => ({ error: "boom" }),
+        };
+      }
+      return { ok: true, status: 200, json: async () => pendingFreeText("dec-500") };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const block: DecisionContentBlock = {
+      kind: "decision",
+      decision_id: "dec-500",
     };
     const { container } = render(<DecisionBlock block={block} />);
 
@@ -157,7 +205,7 @@ describe("RED PROOF: server error reason surfaced in alert", () => {
     await waitFor(() => {
       const alert = container.querySelector('[role="alert"]');
       expect(alert).not.toBeNull();
-      expect(alert!.textContent).toContain("already answered or not pending");
+      expect(alert!.textContent).toContain("boom");
     });
   });
 });

@@ -530,11 +530,11 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
     setAnswerError(null);
   }, [block.decision_id]);
 
-async function answerDecision(
+  async function answerDecision(
     value: string | string[],
     otherValue?: string,
     note?: string
-) {
+  ) {
     setAnswerError(null);
     if (!decision || decision.status !== "pending") return;
     setSubmitting(true);
@@ -557,8 +557,11 @@ async function answerDecision(
           if (updatedRes.ok) {
             const updated = await updatedRes.json();
             setDecision(updated as DecisionData);
+          } else {
+            setAnswerError(
+              "This decision was already answered -- refresh to see the outcome",
+            );
           }
-          setSubmitting(false);
           return;
         }
         throw new Error(
@@ -578,6 +581,7 @@ async function answerDecision(
       }
     } catch (e) {
       console.error("Failed to answer decision:", e);
+      throw e;
     } finally {
       setSubmitting(false);
     }
