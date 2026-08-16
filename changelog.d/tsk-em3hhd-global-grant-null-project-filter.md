@@ -1,0 +1,2 @@
+### Fixed
+- `GET /api/decisions/agent` no longer leaks project-scoped decisions to an agent holding only a global (null-project) `decisions_write` grant. The store layer now treats an explicit `project_id=None` as `IS NULL` instead of silently omitting the filter, so a global grant returns null-project decisions only. The human-facing `GET /api/decisions` route preserves its existing "no project filter" behaviour when `project_id` is absent from the query string.

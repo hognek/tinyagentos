@@ -739,6 +739,47 @@ user had set. This has now happened twice: `archive`, `archived_agents` and
 key set against what survives a round trip and fails if one is forgotten.
 Never fix such a leak by removing the field from `to_dict()`: `save_config()`
 serialises from there, so that makes the setting unpersistable.
+## Agent memory mode (deploy + `PATCH /api/agents/{slug}/memory`, session-only)
+
+Route module `tinyagentos/routes/agents.py`. Owner routes behind the session
+cookie; no registry scope reaches them.
+
+Every agent carries a `memory_mode` alongside its `memory_plugin`, deciding which
+memory systems the framework runtime is told to use:
+
+| value | meaning |
+|---|---|
+| `both` | framework-native memory AND taOSmd (the default) |
+| `framework` | the framework's own memory only |
+| `taosmd` | taOSmd only |
+
+- **`framework` is ADVISORY today, not enforced.** The mode tells the agent
+  runtime what to use; it does **not** yet stop the controller from involving
+  taOSmd. A `framework`-mode deploy still registers the agent with taOSmd
+  (`routes/agents.py`) and still splices taOSmd rules into `AGENTS.md`
+  (`deployer.py`, gated on the agent FRAMEWORK, not on this field). So a taOSmd
+  outage can still block a `framework` deploy, and the agent still receives
+  taOSmd rules. **Do not choose `framework` expecting isolation from taOSmd.**
+  Tracked as `tsk-6tfpun`; this note comes out when the mode is enforced.
+- `POST /api/agents/deploy` takes `memory_mode` on the body, defaulting to
+  `both`. It is persisted on the agent record and **injected into the agent's
+  environment as `TAOS_MEMORY_MODE`** at deploy time, so the runtime honours it
+  without a second push. **Deploy validates the pair before any side effect:**
+  an unknown `memory_mode` or `memory_plugin` answers `400` naming the valid
+  set, and so does a contradictory pair such as
+  `{"memory_plugin": "none", "memory_mode": "taosmd"}`, which asks for taOSmd-only
+  memory with the taOSmd plugin switched off. No agent is created on rejection.
+- `PATCH /api/agents/{slug}/memory` takes `{memory_plugin, memory_mode?}`.
+  `memory_plugin` must be one of `taosmd` or `none`; `memory_mode` must be one of
+  `both`, `framework` or `taosmd`. Either invalid value answers `400` naming the
+  valid set; an unknown slug answers `404`. **Deploy and PATCH share one
+  validator**, so a body rejected on one route is rejected on the other.
+- **`memory_mode` is OPTIONAL on the PATCH and omitting it leaves the stored
+  value alone.** Only `memory_plugin` is required, so a caller that wants to
+  change the plugin without disturbing the mode simply leaves it out.
+- Agents deployed before this field existed are backfilled to `both` by
+  `config.py` when the config loads, so an older agent record without the key
+  reads as the default rather than as empty.
 ## Cluster node revoke, block and unblock (admin-only)
 
 Route module `tinyagentos/routes/cluster.py`. **Admin session only**
@@ -816,3 +857,22 @@ A `single_select` or `multi_select` decision can be answered off-menu by sending
 Work as jaylfc on all git and GitHub activity. Do not add AI attribution to
 commits, PRs, or issues. Do not use em dashes in any output: use commas, colons,
 or "--".
+
+## Agent-token API surface (Bearer allowlist)
+
+The auth middleware keeps an explicit allowlist of routes a registry JWT
+(agent Bearer token) may reach; everything else on `/api` requires a user
+session. When you change the allowlist in `tinyagentos/auth_middleware.py`,
+record the change here so the agent-facing surface stays reviewable in one
+place.
+
+Task checklist items (added with the OS-owned objective checklist, #2415):
+
+- `GET /api/projects/{project_id}/tasks/{task_id}/checklist-items` -- list;
+  Bearer-reachable so the handler's `project_tasks_create` scope check runs
+  instead of the middleware refusing 401 at the gate.
+- `POST /api/projects/{project_id}/tasks/{task_id}/checklist-items` -- create;
+  same scope check.
+- `DELETE` and per-item subpaths (`.../checklist-items/{item_id}`) stay
+  session-only: no agent-reachable handler exists, and the allowlist must not
+  widen past list + create.

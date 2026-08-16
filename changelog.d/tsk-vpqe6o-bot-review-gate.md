@@ -1,0 +1,2 @@
+### Fixed
+- CodeRabbit login filter now includes `coderabbitai[bot]` so that `collect_coderabbit_items` correctly identifies CodeRabbit output on PRs where CodeRabbit posts as `coderabbitai[bot]` (instead of only matching `coderabbit[bot]` and `coderabbitai`)
