@@ -15,6 +15,29 @@ from pathlib import Path
 
 import yaml
 
+
+def _is_stride2_algorithmic(hef_h10h: str) -> bool:
+    """Check if hef_h10h has a stride-2 nibble algorithmic pattern.
+
+    Real measured .hef digests score 0-3/62 on this check;
+    fabricated algorithmic sequences score ~54/62 (as seen in
+    PR #2425's llama3.2-1b and qwen3 values).
+
+    We inspect every other nibble (positions 0,2,4,...,62) and check
+    whether they form a repeating 6-char pattern like abcdef.
+    """
+    nibbles = hef_h10h[::2]  # 32-char string from even positions
+    # Check for a strong repeating 6-char pattern
+    first6 = nibbles[:6]
+    if len(set(first6)) <= 3:
+        # Very few unique chars in the first window → likely algorithmic
+        return True
+    # Check if the whole 32-char string is built from repeats of first6
+    expected = (first6 * (32 // 6 + 1))[:32]
+    if nibbles == expected:
+        return True
+    return False
+
 # Known target enums -- the resolver only accepts values produced by
 # hardware_to_targets in tinyagentos/cluster/capabilities.py. DERIVED from
 # that source file rather than hardcoded: a literal copy silently drifts the
@@ -80,11 +103,18 @@ def test_model_manifests_are_resolvable_and_integrity_pinned():
             )
             if is_hef_ollama_pull:
                 hef_h10h = variant.get("hef_h10h")
-                if not re.fullmatch(r"[0-9a-f]{64}", hef_h10h or ""):
-                    errors.append(
-                        f"{mid}/{vid}: hef_h10h must be a 64-char lowercase hex string "
-                        f"(got {hef_h10h!r})"
-                    )
+                if hef_h10h is not None:
+                    if _is_stride2_algorithmic(hef_h10h):
+                        errors.append(
+                            f"{mid}/{vid}: hef_h10h must not have a stride-2 "
+                            f"algorithmic pattern (got {hef_h10h!r})"
+                        )
+                    elif not re.fullmatch(r"[0-9a-f]{64}", hef_h10h):
+                        errors.append(
+                            f"{mid}/{vid}: hef_h10h must be a 64-char lowercase hex string "
+                            f"(got {hef_h10h!r})"
+                        )
+                # If hef_h10h is absent (field being dropped), no error
             else:
                 sha256 = variant.get("sha256")
                 if not re.fullmatch(r"[0-9a-f]{64}", sha256 or ""):

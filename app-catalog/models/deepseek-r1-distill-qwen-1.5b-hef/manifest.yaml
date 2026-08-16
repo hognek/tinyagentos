@@ -13,8 +13,9 @@ variants:
   name: A8W4 HEF (2.2GB, NPU)
   format: hef
   size_mb: 2261
+  install:
+    method: hailo-ollama-pull
   download_url: https://dev-public.hailo.ai/v5.1.1/blob/DeepSeek-R1-Distill-Qwen-1.5B.hef
-  sha256: 9c4506dda44d0a1730d939d4049a3cbf72d5179a88762ca551363db087adb38f
   requires:
     backends:
     - id: hailo-ollama

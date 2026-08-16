@@ -14,8 +14,9 @@ variants:
   name: A8W4 HEF (1.7GB, NPU)
   format: hef
   size_mb: 1675
+  install:
+    method: hailo-ollama-pull
   download_url: https://dev-public.hailo.ai/v5.1.1/blob/Qwen2.5-Coder-1.5B-Instruct.hef
-  sha256: 88aa7633ebe3385452430ae19f2b459b5a00791cab035576a3262a41ec1350f5
   requires:
     backends:
     - id: hailo-ollama
