@@ -154,9 +154,9 @@ class TestClassify:
         assert "real CodeRabbit review" in message
 
     def test_latest_not_stub_but_no_real_review(self, check_mod) -> None:
-        """If the latest CR output is not a stub signature (even when no
-        real reviews exist), the check does not fail -- there is no stub
-        masquerading as a review."""
+        """If any CR output is a stub signature (even when no real reviews
+        exist), the check fails -- a stub masquerading as a review is
+        fake-green."""
         items = [
             check_mod.CRItem(
                 id=1, body="review limit reached", is_review=False,
@@ -166,8 +166,39 @@ class TestClassify:
             ),
         ]
         exit_code, message = check_mod.classify(items)
-        assert exit_code == 0
-        assert "absent, not stubbed" in message
+        assert exit_code == 1
+        assert "FAIL" in message
+
+    def test_collect_coderabbit_items_with_coderabbitai_bot(self, check_mod) -> None:
+        """Test that collect_coderabbit_items correctly identifies
+        coderabbitai[bot] login from raw API-shaped JSON, with only
+        _api_get mocked (the narrow filter scope)."""
+        call_count = 0
+
+        def _api_get_side_effect(url, token=None):
+            nonlocal call_count
+            call_count += 1
+            # Return API-shaped JSON with coderabbitai[bot] login
+            # for the first call only; subsequent calls return empty
+            # to avoid duplicate collection from three endpoints.
+            if call_count == 1:
+                return [
+                    {
+                        "id": 1,
+                        "user": {"login": "coderabbitai[bot]"},
+                        "body": "Some review comment",
+                        "state": "COMMENTED",
+                        "created_at": "2024-01-01T00:00:00Z",
+                    }
+                ]
+            return []
+
+        with patch.object(check_mod, "_api_get", side_effect=_api_get_side_effect):
+            items = check_mod.collect_coderabbit_items("jaylfc", "taOS", 2412)
+        assert len(items) == 1
+        assert items[0].id == 1
+        assert items[0].body == "Some review comment"
+        assert items[0].is_review is True
 
     def test_message_echoes_exit_code(self, check_mod) -> None:
         items = [

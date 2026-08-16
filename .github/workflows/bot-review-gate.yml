@@ -13,6 +13,10 @@ name: Bot review gate
 on:
   pull_request:
     branches: [master, dev]
+  pull_request_review:
+    branches: [master, dev]
+  issue_comment:
+    branches: [master, dev]
 
 jobs:
   bot-review-gate:

@@ -42,6 +42,7 @@ API = "https://api.github.com"
 CODERABBIT_LOGINS = frozenset({
     "coderabbit[bot]",
     "coderabbitai",
+    "coderabbitai[bot]",
 })
 
 # Signature of a CodeRabbit rate-limit stub. From the CodeRabbit docs
@@ -231,7 +232,7 @@ def classify(items: list[CRItem]) -> tuple[int, str]:
     - (0, "PASS (absent, ...)")  -- CodeRabbit is entirely absent.
     - (1, "FAIL ...")            -- only rate-limit stubs exist.
     - (0, "PASS ...")            -- CR output exists but is neither a stub
-                                    nor substantive (edge case, not fake-green).
+                                  nor substantive (edge case, not fake-green).
     """
     if not items:
         return EXIT_OK, "PASS (absent, not stubbed): no CodeRabbit output on this PR"
@@ -243,18 +244,16 @@ def classify(items: list[CRItem]) -> tuple[int, str]:
             f"(exit {EXIT_OK})"
         )
 
-    # No real review threads. Check whether the latest CR output matches
-    # the rate-limit signature -- that is the fake-green condition.
-    latest = items[-1]
-    if is_rate_limit_stub(latest.body):
+    # No real review threads. Check whether ANY CR output is a rate-limit
+    # stub -- that is the fake-green condition.
+    if any(is_rate_limit_stub(i.body) for i in items):
         return EXIT_STUB, (
-            f"FAIL: only CodeRabbit output is a rate-limit stub "
-            f"(latest CR item id={latest.id}) (exit {EXIT_STUB})"
+            f"FAIL: only CodeRabbit output is a rate-limit stub (exit {EXIT_STUB})"
         )
 
-    # CR output exists but no real review threads and latest is not a
-    # recognizable stub. Absence of a real review is still not
-    # fake-green: there is no stub masquerading as a review.
+    # CR output exists but no real review threads and no recognizable stub.
+    # Absence of a real review is still not fake-green: there is no stub
+    # masquerading as a review.
     return EXIT_OK, (
         f"PASS (absent, not stubbed): CodeRabbit output present but not a "
         f"rate-limit stub (exit {EXIT_OK})"
