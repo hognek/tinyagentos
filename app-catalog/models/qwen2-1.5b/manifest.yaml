@@ -1,4 +1,4 @@
-id: qwen2-1.5b-instruct-hef
+id: qwen2-1.5b
 name: Qwen2 1.5B Instruct (HEF)
 type: model
 version: 2.0.0
@@ -12,8 +12,9 @@ variants:
   name: A8W4 HEF (1.6GB, NPU)
   format: hef
   size_mb: 1600
-  download_url: https://dev-public.hailo.ai/v5.1.1/blob/Qwen2-1.5B-Instruct.hef
+  min_ram_mb: 0
   sha256: ab056548c60945cdf4fb30ca43fc7aeed2b9ffc751ad8d4c201dc4c4ab31e86a
+  download_url: https://dev-public.hailo.ai/v5.1.1/blob/Qwen2-1.5B-Instruct.hef
   requires:
     backends:
     - id: hailo-ollama
@@ -26,3 +27,4 @@ hardware_tiers:
   arm-npu-16gb:
     recommended: a8w4
 context_window: 2048
+

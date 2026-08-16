@@ -43,18 +43,22 @@ router = APIRouter()
 _KNOWN_BACKENDS = {
     "rkllama", "rk-llama-cpp", "ollama", "llama-cpp",
     "mlx", "vllm", "comfyui", "transformers",
+    "hailo-ollama",
 }
 
 # Backend ID → install method known to get_installer().
 # rkllama has a purpose-built installer (calls /api/pull, manages symlinks,
 # restarts systemd units). rk-llama-cpp models are downloaded to disk and
 # loaded by the rk-llama-cpp runtime on demand, same as other backends.
+# hailo-ollama is Ollama-compatible, so it reuses the ollama installer which
+# calls POST /api/pull on the hailo-ollama daemon (port 7836).
 # Future per-backend installers (OllamaInstaller using `ollama pull`, etc.)
 # can land as follow-ups; download is the safest default in the meantime.
 _BACKEND_TO_METHOD: dict[str, str] = {
     "rkllama": "rkllama",
     "rk-llama-cpp": "rkllamacpp",
     "ollama": "ollama",
+    "hailo-ollama": "ollama",
     "llama-cpp": "download",
     "mlx": "download",
     "vllm": "download",
@@ -1022,7 +1026,10 @@ async def install_app(request: Request):
             },
             status_code=422,
         )
-    model_installer = get_installer(install_method)
+    model_installer = get_installer(
+        install_method,
+        **({"host": "http://localhost:7836"} if result.backend_id == "hailo-ollama" else {}),
+    )
     install_config = dict(getattr(manifest, "install", None) or {})
     install_config["backend"] = result.backend_id
 

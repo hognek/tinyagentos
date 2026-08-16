@@ -540,3 +540,98 @@ class TestGetDeviceCapabilityDisk:
         cap = await get_device_capability(req, None)
         assert cap.total_ram_mb == 15958
         assert cap.total_vram_mb == 24576
+
+
+class TestHailoDaemonHost:
+    """The hailo-ollama backend must receive the hailo daemon host (7836),
+    not the Ollama default (11434)."""
+
+    @pytest.mark.asyncio
+    async def test_hailo_ollama_installer_receives_hailo_host(self, client):
+        """get_installer is called with host=http://localhost:7836 for hailo-ollama."""
+        hailo_manifest = MagicMock()
+        hailo_manifest.id = "llama-3.2-3b"
+        hailo_manifest.type = "model"
+        hailo_manifest.variants = [
+            {
+                "id": "a8w4",
+                "size_mb": 3214,
+                "download_url": "https://dev-public.hailo.ai/v5.1.1/blob/Llama-3_2-3B-Instruct.hef",
+                "sha256": "7fc9c7723282482cc3acf08244212668f8b7684deb792b791504ab7f68a83708",
+                "requires": {
+                    "backends": [
+                        {"id": "hailo-ollama", "targets": ["hailo"], "min_ram_mb": 3072},
+                    ],
+                },
+            },
+        ]
+        hailo_manifest.context_window = 2048
+        hailo_manifest.hardware_tiers = {}
+        hailo_manifest.install = {}
+        hailo_manifest.version = "3.2.0"
+
+        hailo_backend = MagicMock()
+        hailo_backend.id = "hailo-ollama"
+        hailo_backend.type = "service"
+        hailo_backend.install = {"method": "ollama"}
+        hailo_backend.requires = {}
+        hailo_backend.hardware_tiers = {}
+        hailo_backend.version = "1.0.0"
+
+        registry = MagicMock()
+        registry.get_app = MagicMock(side_effect=lambda app_id: {
+            "llama-3.2-3b": hailo_manifest,
+            "hailo-ollama": hailo_backend,
+        }.get(app_id))
+        registry.get = MagicMock(side_effect=lambda app_id: {
+            "llama-3.2-3b": hailo_manifest,
+            "hailo-ollama": hailo_backend,
+        }.get(app_id))
+        registry.mark_installed = MagicMock()
+        registry.list_available = MagicMock(return_value=[])
+        client._transport.app.state.registry = registry
+
+        mock_installed_apps = MagicMock()
+        mock_installed_apps.install = AsyncMock(return_value=None)
+        mock_installed_apps.update_runtime_location = AsyncMock(return_value=None)
+        client._transport.app.state.installed_apps = mock_installed_apps
+
+        mock_installer = MagicMock()
+        mock_installer.install = AsyncMock(return_value={"success": True})
+        mock_get = MagicMock(return_value=mock_installer)
+
+        pi5_hailo = DeviceCapability(
+            device_id="pi5-hailo",
+            targets=("hailo", "cpu"),
+            total_ram_mb=8192,
+            total_vram_mb=0,
+            free_disk_mb=50_000,
+            installed_backends=(),
+        )
+
+        with patch(
+            "tinyagentos.routes.store_install.get_device_capability",
+            new=AsyncMock(return_value=pi5_hailo),
+        ), patch(
+            "tinyagentos.routes.store_install.get_installer",
+            mock_get,
+        ):
+            r = await client.post("/api/store/install-v2", json={
+                "manifest_id": "llama-3.2-3b",
+                "variant_id": "a8w4",
+            })
+
+        assert r.status_code == 200
+        model_call = next(
+            (
+                call
+                for call in mock_get.call_args_list
+                if call.args and call.args[0] == "ollama"
+                and call.kwargs.get("host") == "http://localhost:7836"
+            ),
+            None,
+        )
+        assert model_call is not None, (
+            f"expected a get_installer call with method='ollama' and "
+            f"host='http://localhost:7836', got {mock_get.call_args_list!r}"
+        )
