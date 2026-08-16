@@ -323,7 +323,7 @@ class TestProgressAggregation:
 class TestCombinedHashVerification:
     @pytest.mark.asyncio
     async def test_combined_hash_matches(self, tmp_path, monkeypatch, fake_repo_listing):
-        """When the variant declares sha256, the installer must verify a
+        """When the variant declares file_set_hash, the installer must verify a
         combined hash of the downloaded files after the transfer."""
         monkeypatch.setenv("TAOS_MODELS_ROOT", str(tmp_path / "models"))
         installer = HFMultiInstaller()
@@ -361,7 +361,7 @@ class TestCombinedHashVerification:
                     "id": "q4f16",
                     "hf_repo": "mlc-ai/Llama-3-8B-Instruct-q4f16_1-MLC",
                     "multi_file": True,
-                    "sha256": expected,
+                    "file_set_hash": expected,
                 },
             )
 
@@ -369,7 +369,7 @@ class TestCombinedHashVerification:
 
     @pytest.mark.asyncio
     async def test_combined_hash_mismatch_fails(self, tmp_path, monkeypatch, fake_repo_listing):
-        """A wrong sha256 in the variant must fail the install."""
+        """A wrong file_set_hash in the variant must fail the install."""
         monkeypatch.setenv("TAOS_MODELS_ROOT", str(tmp_path / "models"))
         installer = HFMultiInstaller()
 
@@ -388,9 +388,65 @@ class TestCombinedHashVerification:
                     "id": "q4f16",
                     "hf_repo": "mlc-ai/Llama-3-8B-Instruct-q4f16_1-MLC",
                     "multi_file": True,
-                    "sha256": "a" * 64,
+                    "file_set_hash": "a" * 64,
                 },
             )
 
         assert result["success"] is False
         assert "manifest hash mismatch" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_combined_hash_skips_unwritten_files(self, tmp_path, monkeypatch):
+        """Files skipped by _safe_relative_path or already-present must not
+        raise FileNotFoundError in the post-download hash; only files that
+        were actually written are included in the combined hash."""
+        monkeypatch.setenv("TAOS_MODELS_ROOT", str(tmp_path / "models"))
+        installer = HFMultiInstaller()
+
+        bad_listing = {
+            "siblings": [
+                {"rfilename": "../../../etc/passwd", "size": 100},
+                {"rfilename": "config.json", "size": 1234},
+                {"rfilename": "tokenizer.json", "size": 5678},
+            ]
+        }
+
+        downloaded: list[Path] = []
+
+        async def fake_download(url, dest, expected_sha256=None, on_progress=None):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"fake")
+            downloaded.append(dest)
+
+        with patch("tinyagentos.installers.hf_multi_installer.httpx.AsyncClient",
+                   return_value=_stub_listing_client(bad_listing)), \
+             patch("tinyagentos.installers.hf_multi_installer.download_file",
+                   side_effect=fake_download):
+            target_dir = tmp_path / "models" / "mlc-llm" / "llama" / "llama-3-8b-mlc"
+            written = [
+                {"rfilename": "config.json", "size": 1234},
+                {"rfilename": "tokenizer.json", "size": 5678},
+            ]
+            for f in written:
+                local = target_dir / Path(f["rfilename"])
+                local.parent.mkdir(parents=True, exist_ok=True)
+                local.write_bytes(b"fake")
+            expected = _compute_combined_hash(target_dir, written)
+            for f in written:
+                local = target_dir / Path(f["rfilename"])
+                if local.exists():
+                    local.unlink()
+            result = await installer.install(
+                "llama-3-8b-mlc",
+                install_config={"backend": "mlc-llm"},
+                variant={
+                    "id": "q4f16",
+                    "hf_repo": "mlc-ai/Llama-3-8B-Instruct-q4f16_1-MLC",
+                    "multi_file": True,
+                    "file_set_hash": expected,
+                },
+            )
+
+        assert result["success"] is True
+        names = sorted(p.name for p in downloaded)
+        assert names == ["config.json", "tokenizer.json"]

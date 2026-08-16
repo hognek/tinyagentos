@@ -12,8 +12,8 @@ checkpoints, etc.) this installer:
    expect.
 3. Reports progress as bytes-downloaded across the whole repo so the UI's
    install bar moves smoothly instead of resetting per file.
-4. When the variant declares a ``sha256``, verifies a combined hash of the
-   downloaded files after the transfer completes.
+ 4. When the variant declares a ``file_set_hash``, verifies a combined hash of the
+    downloaded files after the transfer completes.
 
 Manifest variant fields:
 
@@ -21,7 +21,7 @@ Manifest variant fields:
     hf_revision: main                                 # optional, default "main"
     multi_file: true                                  # required marker
     exclude_patterns: ["*.md", ".gitattributes"]      # optional glob blocklist
-    sha256: <64-hex>                                  # optional combined hash
+    file_set_hash: <64-hex>                           # optional combined metadata hash
 
 Single-file fallback: a variant with ``download_url`` and no ``hf_repo`` is
 delegated back to the regular DownloadInstaller so callers don't have to
@@ -133,18 +133,21 @@ def _file_excluded(rfilename: str, patterns: list[str]) -> bool:
 def _compute_combined_hash(target_dir: Path, selected: list[dict]) -> str:
     """Compute a combined SHA256 over the downloaded files.
 
-    Hashes each file's relative path and size in deterministic order so the
-    manifest's ``sha256`` can be verified after the transfer.  Content is
-    intentionally omitted here so the expected value can be computed from
-    the HF repo tree API (which exposes sizes but redacts LFS content
-    hashes for gated repos).
+    Hashes each file's full relative path and size in deterministic order so
+    the manifest's ``file_set_hash`` can be verified after the transfer.
+    Boundaries are length-delimited with NUL bytes so the same filename at
+    different depths cannot collide.  Size comes from the HF repo tree API
+    (the ``selected`` records), not from local stat, so the expected value
+    can be computed offline from the listing and the pin is independent of
+    download implementation details.
     """
     hasher = hashlib.sha256()
     for f in sorted(selected, key=lambda x: x["rfilename"]):
         rel = Path(f["rfilename"])
-        local = target_dir / rel
-        hasher.update(rel.name.encode())
-        hasher.update(str(local.stat().st_size).encode())
+        hasher.update(str(rel).encode())
+        hasher.update("\0".encode())
+        hasher.update(str(f["size"]).encode())
+        hasher.update("\0".encode())
     return hasher.hexdigest()
 
 
@@ -262,6 +265,7 @@ class HFMultiInstaller(AppInstaller):
         # Resolve target_dir once for boundary checks below.
         target_resolved = target_dir.resolve()
 
+        written: list[dict] = []
         for f in selected:
             rfilename = f["rfilename"]
             file_size = f["size"]
@@ -293,10 +297,10 @@ class HFMultiInstaller(AppInstaller):
 
             url = HF_FILE.format(repo=repo, rev=revision, path=rfilename)
             if local.exists():
-                # Skip files we've already downloaded — sha verification
-                # not in this iteration; HF resolve URLs are immutable per
-                # revision so a present file is a present file. Surface
-                # the byte count anyway so the aggregate progress is right.
+                # Skip files we've already downloaded — file_set_hash
+                # verification covers the final set, so a present file is
+                # a present file. Surface the byte count anyway so the
+                # aggregate progress is right.
                 downloaded_bytes += file_size
                 per_file_prev[rfilename] = file_size
                 if on_progress is not None:
@@ -304,6 +308,7 @@ class HFMultiInstaller(AppInstaller):
                         on_progress(downloaded_bytes, total_bytes)
                     except Exception:  # noqa: BLE001
                         pass
+                written.append(f)
                 continue
 
             try:
@@ -322,11 +327,12 @@ class HFMultiInstaller(AppInstaller):
                     "downloaded_bytes": downloaded_bytes,
                     "target_dir": str(target_dir),
                 }
+            written.append(f)
 
-        expected_sha256 = variant.get("sha256")
-        if expected_sha256:
+        expected_file_set_hash = variant.get("file_set_hash")
+        if expected_file_set_hash:
             try:
-                computed = _compute_combined_hash(target_dir, selected)
+                computed = _compute_combined_hash(target_dir, written)
             except Exception as exc:  # noqa: BLE001
                 return {
                     "success": False,
@@ -334,11 +340,11 @@ class HFMultiInstaller(AppInstaller):
                     "downloaded_bytes": downloaded_bytes,
                     "target_dir": str(target_dir),
                 }
-            if computed != expected_sha256:
+            if computed != expected_file_set_hash:
                 return {
                     "success": False,
                     "error": (
-                        f"manifest hash mismatch: expected {expected_sha256}, "
+                        f"manifest hash mismatch: expected {expected_file_set_hash}, "
                         f"got {computed}"
                     ),
                     "downloaded_bytes": downloaded_bytes,
