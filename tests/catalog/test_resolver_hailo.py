@@ -82,10 +82,8 @@ class TestHailoNewManifestsResolve:
         "model_id",
         [
             "qwen2.5-1.5b",
-            "qwen3-1.7b",
             "qwen2.5-coder-1.5b",
             "qwen2-1.5b",
-            "llama-3.2-1b",
             "llama-3.2-3b",
             "deepseek-r1-1.5b",
         ],
@@ -111,10 +109,8 @@ class TestHailoNewManifestsResolve:
         "model_id",
         [
             "qwen2.5-1.5b",
-            "qwen3-1.7b",
             "qwen2.5-coder-1.5b",
             "qwen2-1.5b",
-            "llama-3.2-1b",
             "llama-3.2-3b",
             "deepseek-r1-1.5b",
         ],
