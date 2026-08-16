@@ -521,6 +521,41 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
     return () => { cancelled = true; };
   }, [block.decision_id]);
 
+  async function answerDecision(
+    value: string | string[],
+    otherValue?: string,
+    note?: string
+  ) {
+    if (!decision || decision.status !== "pending") return;
+    const body: Record<string, unknown> = { value };
+    if (otherValue !== undefined) body.other_value = otherValue;
+    if (note !== undefined) body.note = note;
+    
+    try {
+      const res = await fetch(`/api/decisions/${decision.id}/answer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const detail = data?.detail;
+        throw new Error(
+          typeof detail === "string" ? detail : "Could not record answer.",
+        );
+      }
+      // Refresh the decision to get the updated state (including answer)
+      const updatedRes = await fetch(`/api/decisions/${decision.id}`);
+      if (updatedRes.ok) {
+        const updated = await updatedRes.json();
+        setDecision(updated as DecisionData);
+      }
+    } catch (e) {
+      console.error("Failed to answer decision:", e);
+      throw e;
+    }
+  }
+
   if (loading) {
     return (
       <div className="flex items-center gap-2 text-[12px] text-shell-text-tertiary py-2">
@@ -538,7 +573,7 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
     );
   }
 
-  if (!decision) return <></>;
+  if (!decision) return <></>
 
   const isOpen = decision.status === "pending";
   const isAnswered = decision.status === "answered";
@@ -562,7 +597,7 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
         </span>
       </div>
 
-      {/* options (disabled -- read-only) */}
+      {/* options (clickable for answering) */}
       {showOptions && (
         <div className="mt-2 flex flex-col gap-1.5 px-3">
           {decision.options!.map((opt) => {
@@ -570,11 +605,18 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
               <button
                 key={opt.value}
                 type="button"
-                disabled
+                onClick={() => {
+                  if (!isOpen) return;
+                  answerDecision(opt.value);
+                }}
+                disabled={!isOpen}
                 className={[
-                  "flex w-full flex-col gap-0.5 rounded-lg border px-3 py-1.5 text-left",
+                  "flex w-full flex-col gap-0.5 rounded-lg border px-3 py-1.5 text-left transition-colors",
                   "disabled:cursor-not-allowed disabled:opacity-60",
-                  "border-shell-border bg-shell-bg-deep text-shell-text-secondary",
+                  isOpen
+                    ? "border-shell-border bg-shell-surface hover:border-shell-border-strong"
+                    : "border-shell-border bg-shell-bg-deep text-shell-text-secondary",
+                  "cursor-pointer",
                 ].join(" ")}
               >
                 <span className="text-sm">{opt.label}</span>
@@ -601,15 +643,24 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
         </div>
       )}
 
-      {/* free_text pending: show a disabled textarea placeholder */}
+      {/* free_text pending: show a textarea for answering */}
       {isOpen && decision.type === "free_text" && (
         <div className="mt-2 px-3">
           <textarea
-            readOnly
-            disabled
-            placeholder="awaiting free-text answer"
-            className="w-full resize-none rounded border border-shell-border bg-shell-bg-deep px-2 py-1.5 text-[12px] text-shell-text-tertiary"
+            placeholder="Type your answer..."
+            className="w-full resize-none rounded border border-shell-border bg-shell-surface px-2 py-1.5 text-[12px] text-shell-text placeholder:text-shell-text-tertiary"
             rows={3}
+            onChange={(e) => {
+              if (!isOpen) return;
+              answerDecision(e.target.value.trim());
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                if (!isOpen) return;
+                answerDecision(e.currentTarget.value.trim());
+              }
+            }}
           />
         </div>
       )}
@@ -670,6 +721,8 @@ export function dayLabel(ts: string | number): string {
   // before noon, and a diff of 1.04 days is one calendar day after.)
   const localMidnight = (x: Date) => new Date(x.getFullYear(), x.getMonth(), x.getDate());
   const diffDays = Math.round((localMidnight(now).getTime() - localMidnight(d).getTime()) / 86400000);
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
   if (diffDays === 0) return "Today";
   if (diffDays === 1) return "Yesterday";
   return d.toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" });
