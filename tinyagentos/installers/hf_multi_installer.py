@@ -319,7 +319,11 @@ class HFMultiInstaller(AppInstaller):
                         on_progress(downloaded_bytes, total_bytes)
                     except Exception:  # noqa: BLE001
                         pass
-                if lfs_sha256 and local.stat().st_size > 0:
+                # No size guard here: file_set_hash is computed from the
+                # listing, not local disk, so this sha check is the ONLY
+                # verification of local content — a 0-byte leftover from a
+                # crashed run must fail it, not skip it.
+                if lfs_sha256:
                     if not _verify_lfs_sha256(local, lfs_sha256):
                         return {
                             "success": False,
@@ -348,7 +352,7 @@ class HFMultiInstaller(AppInstaller):
                     "downloaded_bytes": downloaded_bytes,
                     "target_dir": str(target_dir),
                 }
-            if lfs_sha256 and local.stat().st_size > 0:
+            if lfs_sha256:
                 if not _verify_lfs_sha256(local, lfs_sha256):
                     return {
                         "success": False,

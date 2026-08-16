@@ -545,3 +545,77 @@ class TestPinAwareListing:
         assert hash_a != hash_b, (
             "file_set_hash must change when a file size changes"
         )
+
+    @pytest.mark.asyncio
+    async def test_empty_downloaded_file_fails_sha_check(self, tmp_path, monkeypatch):
+        """A download that lands 0 bytes (disk full, truncated write, empty
+        200 body) must FAIL sha verification, not skip it. file_set_hash is
+        computed from the listing, not local disk, so the per-file sha is the
+        only check on what actually landed."""
+        monkeypatch.setenv("TAOS_MODELS_ROOT", str(tmp_path / "models"))
+
+        listing_with_lfs = {
+            "siblings": [
+                {
+                    "rfilename": "model.safetensors",
+                    "size": 100,
+                    "lfs": {"sha256": "abcd" * 16},
+                },
+            ]
+        }
+
+        async def fake_empty_download(url, dest, expected_sha256=None, on_progress=None):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"")
+
+        with patch("tinyagentos.installers.hf_multi_installer.httpx.AsyncClient",
+                   return_value=_stub_listing_client(listing_with_lfs)), \
+             patch("tinyagentos.installers.hf_multi_installer.download_file",
+                   side_effect=fake_empty_download):
+            result = await HFMultiInstaller().install(
+                "x", {"backend": "mlc-llm"},
+                variant={"id": "q4", "hf_repo": "a/b", "multi_file": True},
+            )
+
+        assert result["success"] is False, (
+            "a 0-byte downloaded file must fail sha verification, not pass unverified"
+        )
+        assert "sha256 mismatch" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_existing_empty_file_fails_sha_check(self, tmp_path, monkeypatch):
+        """A pre-existing 0-byte file (crashed earlier run) must fail sha
+        verification on the resume path, not be treated as already installed."""
+        models_root = tmp_path / "models"
+        monkeypatch.setenv("TAOS_MODELS_ROOT", str(models_root))
+
+        listing_with_lfs = {
+            "siblings": [
+                {
+                    "rfilename": "model.safetensors",
+                    "size": 100,
+                    "lfs": {"sha256": "abcd" * 16},
+                },
+            ]
+        }
+
+        async def fail_if_called(url, dest, expected_sha256=None, on_progress=None):
+            raise AssertionError("existing file must not be re-downloaded silently")
+
+        with patch("tinyagentos.installers.hf_multi_installer.httpx.AsyncClient",
+                   return_value=_stub_listing_client(listing_with_lfs)), \
+             patch("tinyagentos.installers.hf_multi_installer.download_file",
+                   side_effect=fail_if_called):
+            installer = HFMultiInstaller()
+            target = installer._target_dir("mlc-llm", "x")
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "model.safetensors").write_bytes(b"")
+            result = await installer.install(
+                "x", {"backend": "mlc-llm"},
+                variant={"id": "q4", "hf_repo": "a/b", "multi_file": True},
+            )
+
+        assert result["success"] is False, (
+            "a 0-byte existing file must fail sha verification on resume"
+        )
+        assert "sha256 mismatch" in result["error"]
