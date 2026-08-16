@@ -500,6 +500,7 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
   const [error, setError] = useState<string | null>(null);
   const [answer, setAnswer] = useState("");
   const [answerError, setAnswerError] = useState<string | null>(null);
+  const [submitting, setSubmitting] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -524,12 +525,19 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
     return () => { cancelled = true; };
   }, [block.decision_id]);
 
-  async function answerDecision(
+  useEffect(() => {
+    setAnswer("");
+    setAnswerError(null);
+  }, [block.decision_id]);
+
+async function answerDecision(
     value: string | string[],
     otherValue?: string,
     note?: string
-  ) {
+) {
+    setAnswerError(null);
     if (!decision || decision.status !== "pending") return;
+    setSubmitting(true);
     const body: Record<string, unknown> = { value };
     if (otherValue !== undefined) body.other_value = otherValue;
     if (note !== undefined) body.note = note;
@@ -543,6 +551,16 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
       if (!res.ok) {
         const data = await res.json().catch(() => ({}));
         const detail = data?.error ?? data?.detail;
+        // 409 = someone else answered first; refetch so the block flips to answered
+        if (res.status === 409) {
+          const updatedRes = await fetch(`/api/decisions/${decision.id}`);
+          if (updatedRes.ok) {
+            const updated = await updatedRes.json();
+            setDecision(updated as DecisionData);
+          }
+          setSubmitting(false);
+          return;
+        }
         throw new Error(
           typeof detail === "string" ? detail : "Could not record answer.",
         );
@@ -552,10 +570,16 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
       if (updatedRes.ok) {
         const updated = await updatedRes.json();
         setDecision(updated as DecisionData);
+      } else {
+        // Refresh failed: answer was recorded, don't show "Failed to answer"
+        // (the SSE broker path will also correct it)
+        setSubmitting(false);
+        setAnswerError(null);
       }
     } catch (e) {
       console.error("Failed to answer decision:", e);
-      throw e;
+    } finally {
+      setSubmitting(false);
     }
   }
 
@@ -609,12 +633,12 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
                 key={opt.value}
                 type="button"
                 onClick={() => {
-                  if (!isOpen) return;
+                  if (!isOpen || submitting) return;
                   answerDecision(opt.value).catch((e) =>
                     setAnswerError(`Failed to answer: ${e.message}`)
                   );
                 }}
-                disabled={!isOpen}
+                disabled={!isOpen || submitting}
                 className={[
                   "flex w-full flex-col gap-0.5 rounded-lg border px-3 py-1.5 text-left transition-colors",
                   "disabled:cursor-not-allowed disabled:opacity-60",
@@ -661,7 +685,7 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey) {
                   e.preventDefault();
-                  if (!isOpen) return;
+                  if (!isOpen || submitting) return;
                   const trimmed = e.currentTarget.value.trim();
                   if (trimmed) {
                     answerDecision(trimmed).catch((e) =>
@@ -673,7 +697,7 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
             />
             <button
               onClick={() => {
-                if (!isOpen) return;
+                if (!isOpen || submitting) return;
                 const trimmed = answer.trim();
                 if (trimmed) {
                   answerDecision(trimmed).catch((e) =>
@@ -681,7 +705,7 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
                   );
                 }
               }}
-              disabled={!answer || answer.trim() === ""}
+              disabled={!answer || answer.trim() === "" || submitting}
               className="flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-[12px] text-shell-text hover:text-shell-text-hover hover:bg-shell-surface-focus focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/40"
               aria-label="Submit answer"
             >
