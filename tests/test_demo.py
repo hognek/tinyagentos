@@ -1,4 +1,4 @@
-"""Demo test file for all-skip check."""
+"""Demo test file for all-skip check - ALL tests skip."""
 
 import pytest
 
@@ -12,9 +12,4 @@ def test_placeholder_importorskip():
 def test_placeholder_skip():
     """This test will skip via pytest.skip."""
     pytest.skip("This module not available yet")
-    assert True
-
-# Test 3: A normal passing test - should pass
-def test_actual_test():
-    """A normal test that passes."""
     assert True
