@@ -15,22 +15,6 @@ from pathlib import Path
 
 import yaml
 
-
-def _is_stride2_algorithmic(hef_h10h: str) -> bool:
-    """Check if hef_h10h has a stride-2 nibble algorithmic pattern.
-
-    Real measured .hef digests score 0-3/62 on this check;
-    fabricated algorithmic sequences score ~54/62 (as seen in
-    PR #2425's llama3.2-1b and qwen3 values).
-
-    We inspect every other nibble (positions 0,2,4,...,62) and check
-    whether they form a repeating 6-char pattern like abcdef.
-    """
-    nibbles = hef_h10h[::2]  # 32-char string from even positions
-    first6 = nibbles[:6]
-    expected = (first6 * (32 // 6 + 1))[:32]
-    return nibbles == expected
-
 # Known target enums -- the resolver only accepts values produced by
 # hardware_to_targets in tinyagentos/cluster/capabilities.py. DERIVED from
 # that source file rather than hardcoded: a literal copy silently drifts the
@@ -69,8 +53,6 @@ def test_model_manifests_are_resolvable_and_integrity_pinned():
         allowed_sha256 = mid in _SHA256_ALLOWLIST
         for variant in manifest.get("variants") or []:
             vid = variant.get("id", "<missing>")
-            # Rule 1: requires.backends non-empty; every entry has non-empty
-            # targets whose values are drawn from the known enum set.
             backends = ((variant.get("requires") or {}).get("backends")) or []
             if not backends:
                 errors.append(f"{mid}/{vid}: requires.backends is empty")
@@ -87,44 +69,17 @@ def test_model_manifests_are_resolvable_and_integrity_pinned():
                         errors.append(
                             f"{mid}/{vid}: backend {backend.get('id')!r} has unknown targets {unknown}"
                         )
-            # Rule 2a: for HEF variants installed via hailo-ollama-pull, the
-            # content hash lives in hef_h10h (not sha256); skip the sha256
-            # check and enforce hef_h10h instead.
-            is_hef_ollama_pull = (
-                variant.get("format") == "hef"
-                and (variant.get("install") or {}).get("method") == "hailo-ollama-pull"
-            )
-            if is_hef_ollama_pull:
-                hef_h10h = variant.get("hef_h10h")
-                if hef_h10h is not None:
-                    if _is_stride2_algorithmic(hef_h10h):
-                        errors.append(
-                            f"{mid}/{vid}: hef_h10h must not have a stride-2 "
-                            f"algorithmic pattern (got {hef_h10h!r})"
-                        )
-                    elif not re.fullmatch(r"[0-9a-f]{64}", hef_h10h):
-                        errors.append(
-                            f"{mid}/{vid}: hef_h10h must be a 64-char lowercase hex string "
-                            f"(got {hef_h10h!r})"
-                        )
-                # If hef_h10h is absent (field being dropped), no error
-            else:
-                sha256 = variant.get("sha256")
-                if not re.fullmatch(r"[0-9a-f]{64}", sha256 or ""):
-                    if not allowed_sha256:
-                        errors.append(
-                            f"{mid}/{vid}: sha256 must be a 64-char lowercase hex string (got {sha256!r})"
-                        )
-            # Rule 3a: HEF hailo-ollama-pull variants do not carry a plain
-            # download_url (the model is pulled via the backend). All other
-            # variants still require a non-empty https download_url.
-            if not is_hef_ollama_pull:
-                url = variant.get("download_url", "")
-                if not url or not url.startswith("https://"):
+            sha256 = variant.get("sha256")
+            if not re.fullmatch(r"[0-9a-f]{64}", sha256 or ""):
+                if not allowed_sha256:
                     errors.append(
-                        f"{mid}/{vid}: download_url must be a non-empty https URL (got {url!r})"
+                        f"{mid}/{vid}: sha256 must be a 64-char lowercase hex string (got {sha256!r})"
                     )
-            # Rule 4: size_mb is a positive int.
+            url = variant.get("download_url", "")
+            if not url or not url.startswith("https://"):
+                errors.append(
+                    f"{mid}/{vid}: download_url must be a non-empty https URL (got {url!r})"
+                )
             size_mb = variant.get("size_mb")
             if not isinstance(size_mb, int) or size_mb <= 0:
                 errors.append(

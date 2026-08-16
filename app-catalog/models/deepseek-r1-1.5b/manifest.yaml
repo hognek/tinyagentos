@@ -14,17 +14,18 @@ variants:
   format: hef
   size_mb: 2261
   min_ram_mb: 0
-  install:
-    method: hailo-ollama-pull
+  sha256: 9c4506dda44d0a1730d939d4049a3cbf72d5179a88762ca551363db087adb38f
+  download_url: https://dev-public.hailo.ai/v5.1.1/blob/DeepSeek-R1-Distill-Qwen-1.5B.hef
   requires:
     backends:
     - id: hailo-ollama
       targets:
       - hailo
       min_ram_mb: 2048
-hardware_tiers:
+  hardware_tiers:
   arm-npu-8gb:
     recommended: a8w4
   arm-npu-16gb:
     recommended: a8w4
-context_window: 2048
+  context_window: 2048
+

@@ -15,17 +15,18 @@ variants:
   format: hef
   size_mb: 1675
   min_ram_mb: 0
-  install:
-    method: hailo-ollama-pull
+  sha256: 88aa7633ebe3385452430ae19f2b459b5a00791cab035576a3262a41ec1350f5
+  download_url: https://dev-public.hailo.ai/v5.1.1/blob/Qwen2.5-Coder-1.5B-Instruct.hef
   requires:
     backends:
     - id: hailo-ollama
       targets:
       - hailo
       min_ram_mb: 2048
-hardware_tiers:
+  hardware_tiers:
   arm-npu-8gb:
     recommended: a8w4
   arm-npu-16gb:
     recommended: a8w4
-context_window: 2048
+  context_window: 2048
+

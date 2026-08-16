@@ -1026,7 +1026,10 @@ async def install_app(request: Request):
             },
             status_code=422,
         )
-    model_installer = get_installer(install_method)
+    model_installer = get_installer(
+        install_method,
+        **({"host": "http://localhost:7836"} if result.backend_id == "hailo-ollama" else {}),
+    )
     install_config = dict(getattr(manifest, "install", None) or {})
     install_config["backend"] = result.backend_id
 
