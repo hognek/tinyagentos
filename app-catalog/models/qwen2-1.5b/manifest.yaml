@@ -22,9 +22,9 @@ variants:
       - hailo
       min_ram_mb: 2048
   hardware_tiers:
-  arm-npu-8gb:
-    recommended: a8w4
-  arm-npu-16gb:
-    recommended: a8w4
+    arm-npu-8gb:
+      recommended: a8w4
+    arm-npu-16gb:
+      recommended: a8w4
   context_window: 2048
 

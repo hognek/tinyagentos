@@ -31,30 +31,9 @@ variants:
       - cpu
       min_ram_mb: 2048
   sha256: 6f85a640a97cf2bf5b8e764087b1e83da0fdb51d7c9fab7d0fece9385611df83
-- id: a8w4
-  name: A8W4 HEF (1.6GB, NPU)
-  format: hef
-  size_mb: 1600
-  min_ram_mb: 0
-  sha256: a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2
-  download_url: https://dev-public.hailo.ai/v5.1.1/blob/Llama-3_2-1B-Instruct.hef
-  context_window: 2048
-  requires:
-    backends:
-    - id: hailo-ollama
-      targets:
-      - hailo
-      min_ram_mb: 2048
-  hardware_tiers:
-    arm-npu-8gb:
-      recommended: a8w4
-    arm-npu-16gb:
-      recommended: a8w4
 hardware_tiers:
-  arm-npu-8gb:
-    recommended: a8w4
   arm-npu-16gb:
-    recommended: a8w4
+    recommended: q4_k_m
   arm-cpu-8gb:
     recommended: q4_k_m
   x86-vulkan-4gb:

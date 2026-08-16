@@ -1,2 +1,2 @@
 ### Fixed
-- Removed unverified hef_h10h/sha256 fields from model manifests and added install.method: hailo-ollama-pull; integrity test now catches stride-2 algorithmic patterns in hef_h10h via _is_stride2_algorithmic check
+- Removed the install.method: hailo-ollama-pull carve-out from the model manifest integrity test; every variant (including HEF/hailo-ollama) must now carry a 64-char lowercase hex sha256 and a non-empty https download_url. The _is_stride2_algorithmic detector that supported the deleted carve-out has been removed.

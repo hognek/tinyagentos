@@ -622,8 +622,16 @@ class TestHailoDaemonHost:
             })
 
         assert r.status_code == 200
-        model_call = mock_get.call_args_list[1]
-        assert model_call.args[0] == "ollama"
-        assert model_call.kwargs.get("host") == "http://localhost:7836", (
-            f"hailo-ollama installer must receive hailo host on :7836, got {model_call.kwargs!r}"
+        model_call = next(
+            (
+                call
+                for call in mock_get.call_args_list
+                if call.args and call.args[0] == "ollama"
+                and call.kwargs.get("host") == "http://localhost:7836"
+            ),
+            None,
+        )
+        assert model_call is not None, (
+            f"expected a get_installer call with method='ollama' and "
+            f"host='http://localhost:7836', got {mock_get.call_args_list!r}"
         )
