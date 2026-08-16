@@ -130,7 +130,7 @@ class DecisionStore(BaseStore):
         self,
         *,
         status: str | None = None,
-        project_id: str | None = _UNSET,
+        project_id: str | None | object = _UNSET,
         user_id: str | None = None,
         limit: int = 200,
         from_agent: str | None = None,
