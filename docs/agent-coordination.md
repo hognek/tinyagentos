@@ -857,3 +857,22 @@ A `single_select` or `multi_select` decision can be answered off-menu by sending
 Work as jaylfc on all git and GitHub activity. Do not add AI attribution to
 commits, PRs, or issues. Do not use em dashes in any output: use commas, colons,
 or "--".
+
+## Agent-token API surface (Bearer allowlist)
+
+The auth middleware keeps an explicit allowlist of routes a registry JWT
+(agent Bearer token) may reach; everything else on `/api` requires a user
+session. When you change the allowlist in `tinyagentos/auth_middleware.py`,
+record the change here so the agent-facing surface stays reviewable in one
+place.
+
+Task checklist items (added with the OS-owned objective checklist, #2415):
+
+- `GET /api/projects/{project_id}/tasks/{task_id}/checklist-items` -- list;
+  Bearer-reachable so the handler's `project_tasks_create` scope check runs
+  instead of the middleware refusing 401 at the gate.
+- `POST /api/projects/{project_id}/tasks/{task_id}/checklist-items` -- create;
+  same scope check.
+- `DELETE` and per-item subpaths (`.../checklist-items/{item_id}`) stay
+  session-only: no agent-reachable handler exists, and the allowlist must not
+  widen past list + create.
