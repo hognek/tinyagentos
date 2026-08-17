@@ -877,3 +877,74 @@ describe("ChannelSidebar — accent rail", () => {
     expect(btn.style.borderLeft).not.toContain("accent-line");
   });
 });
+
+/* ------------------------------------------------------------------ */
+/*  Selected-channel accent rail                                       */
+/* ------------------------------------------------------------------ */
+
+describe("ChannelSidebar — selected accent rail", () => {
+  const projectGroup = {
+    id: "proj-1",
+    name: "My Project",
+    channels: [makeChannel({ id: "pc-1", name: "proj-general" })],
+  };
+
+  it("shows the accent rail on the selected project channel (desktop)", () => {
+    render(
+      <ChannelSidebar
+        {...buildProps({ projectGroups: [projectGroup], selectedChannel: "pc-1" })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: "Channel proj-general" });
+    expect(btn).toHaveClass("border-l-2", "border-accent-line");
+  });
+
+  it("shows the accent rail on the selected project channel (mobile)", () => {
+    render(
+      <ChannelSidebar
+        {...buildProps({
+          isMobile: true,
+          projectGroups: [projectGroup],
+          projectsExpanded: true,
+          projectChannelExpanded: { "proj-1": true },
+          selectedChannel: "pc-1",
+        })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: "Channel proj-general" });
+    expect(btn.getAttribute("style")).toContain(
+      "border-left: 3px solid var(--color-accent-line)",
+    );
+  });
+
+  it("shows the accent rail on the selected archived channel (desktop)", () => {
+    render(
+      <ChannelSidebar
+        {...buildProps({
+          archivedChannels: [makeChannel({ id: "arc-1", name: "old-chan" })],
+          archivedExpanded: true,
+          selectedChannel: "arc-1",
+        })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: "Archived channel old-chan" });
+    expect(btn).toHaveClass("border-l-2", "border-accent-line");
+  });
+
+  it("shows the accent rail on the selected archived channel (mobile)", () => {
+    render(
+      <ChannelSidebar
+        {...buildProps({
+          isMobile: true,
+          archivedChannels: [makeChannel({ id: "arc-1", name: "old-chan" })],
+          archivedExpanded: true,
+          selectedChannel: "arc-1",
+        })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: "Archived channel old-chan" });
+    expect(btn.getAttribute("style")).toContain(
+      "border-left: 3px solid var(--color-accent-line)",
+    );
+  });
+});

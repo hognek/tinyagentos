@@ -538,7 +538,7 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                       }
                       className={`w-full text-left text-xs py-1 px-2 rounded flex items-center gap-1.5 ${
                         selectedChannel === ch.id
-                          ? "bg-white/10"
+                          ? "bg-white/10 border-l-2 border-accent-line"
                           : "hover:bg-white/5"
                       }`}
                     >
@@ -843,6 +843,10 @@ function ProjectsSectionMobile({
                             ? "var(--color-shell-surface-active)"
                             : "none",
                         border: "none",
+                        borderLeft:
+                          selectedChannel === ch.id
+                            ? "3px solid var(--color-accent-line)"
+                            : "none",
                         borderBottom:
                           idx === arr.length - 1
                             ? "none"
@@ -1019,6 +1023,10 @@ function ArchivedSection({
                           ? "var(--color-shell-surface-active)"
                           : "none",
                       border: "none",
+                      borderLeft:
+                        selectedChannel === ch.id
+                          ? "3px solid var(--color-accent-line)"
+                          : "none",
                       cursor: "pointer",
                       color: "inherit",
                       textAlign: "left" as const,
@@ -1135,7 +1143,9 @@ function ArchivedSection({
                   selectedChannel === ch.id ? "secondary" : "ghost"
                 }
                 onClick={() => onSelectChannel(ch.id)}
-                className="flex-1 justify-start h-auto py-1.5 pl-3 pr-1 text-[13px] rounded-none font-normal min-w-0"
+                className={`flex-1 justify-start h-auto py-1.5 pl-3 pr-1 text-[13px] rounded-none font-normal min-w-0 ${
+                  selectedChannel === ch.id ? "border-l-2 border-accent-line" : ""
+                }`}
                 aria-label={`Archived channel ${ch.name}`}
               >
                 <Archive

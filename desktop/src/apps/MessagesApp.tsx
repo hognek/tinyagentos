@@ -58,7 +58,7 @@ import {
   readLastChannel,
   writeLastChannel,
 } from "./MessagesApp.a2aSelection";
-import { bucketAgentChannels, computeAgentPresence, type AgentPresence } from "./MessagesApp.agentSections";
+import { bucketAgentChannels, buildAgentPresence } from "./MessagesApp.agentSections";
 import {
   pickWatchAgent,
   computeStallInfo,
@@ -2069,16 +2069,11 @@ export function MessagesApp({
   /* ------------------------------------------------------------------ */
   // Working slugs come from live WS thinking events on bound channels.
   const workingSlugs = new Set(typingAgents.map((a) => a.slug));
-  const agentPresence: Record<string, AgentPresence> = {};
-  for (const ch of dmSections.live) {
-    const bound = (ch.settings as { taostalk_agent?: string } | undefined)?.taostalk_agent;
-    agentPresence[ch.id] = (bound && workingSlugs.has(bound))
-      ? computeAgentPresence("running", true)
-      : computeAgentPresence("running", false);
-  }
-  for (const ch of [...dmSections.suspended, ...dmSections.archived]) {
-    agentPresence[ch.id] = computeAgentPresence(undefined, false);
-  }
+  const agentPresence = buildAgentPresence(
+    dmSections,
+    [...grouped.topic, ...grouped.group],
+    workingSlugs,
+  );
 
   /* ---------------------------------------------------------------- */
   /*  Channel list — iOS 26 grouped on mobile, flat sidebar on desktop */
@@ -2117,8 +2112,8 @@ export function MessagesApp({
       busSelected={busSelected}
       onSelectBusChannel={selectBusChannel}
       formatRelativeTime={relativeTime}
-       agentPresence={agentPresence}
-     />
+      agentPresence={agentPresence}
+    />
   );
 
   /* ---------------------------------------------------------------- */
