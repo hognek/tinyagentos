@@ -1001,33 +1001,38 @@ class ClusterManager:
                 # Fenced controller — release all leases, cancel arbiter tasks,
                 # mark all workers offline and stop routing.
                 for worker in list(self._workers.values()):
-                    if worker.name != "local" and worker.status in ("online", "update-available"):
+                    if worker.name == "local":
+                        continue
+                    if worker.status in ("online", "update-available"):
                         worker.status = "offline"
                         logger.info("Worker '%s' marked offline (controller fenced)", worker.name)
-                        # Release any active leases for this worker's resources.
-                        # Match on the exact worker name (not a resource_id
-                        # prefix) so "gpu-node" and "gpu-node-2" don't collide.
-                        async with self._lease_lock:
-                            offline_lids = [
-                                lid for lid, lease in self._leases.items()
-                                if (parsed := self._parse_resource_id(lease.resource_id))
-                                and parsed[0] == worker.name
-                            ]
-                            for lid in offline_lids:
-                                self._leases.pop(lid, None)
-                                logger.debug("Lease %s released — worker %s fenced", lid, worker.name)
-                        # Cancel any running GPU arbiter tasks for the
-                        # released leases (taOS cross-cutting wiring).
-                        if offline_lids and self._gpu_arbiter is not None:
-                            try:
-                                cancelled, already_done = await self._gpu_arbiter.cancel_running_for_leases(set(offline_lids))
-                                logger.info(
-                                    "Controller fenced: arbiter cancelled %d tasks, %d already done",
-                                    cancelled, already_done)
-                            except Exception:
-                                logger.exception(
-                                    "gpu-arbiter: cancel for fenced controller of '%s' failed",
-                                    worker.name)
+                    # Release any active leases for this worker's resources —
+                    # for every non-local worker regardless of status: a
+                    # draining worker can still hold leases, and the fenced
+                    # branch skips the normal stale-drain cleanup below.
+                    # Match on the exact worker name (not a resource_id
+                    # prefix) so "gpu-node" and "gpu-node-2" don't collide.
+                    async with self._lease_lock:
+                        offline_lids = [
+                            lid for lid, lease in self._leases.items()
+                            if (parsed := self._parse_resource_id(lease.resource_id))
+                            and parsed[0] == worker.name
+                        ]
+                        for lid in offline_lids:
+                            self._leases.pop(lid, None)
+                            logger.debug("Lease %s released — worker %s fenced", lid, worker.name)
+                    # Cancel any running GPU arbiter tasks for the
+                    # released leases (taOS cross-cutting wiring).
+                    if offline_lids and self._gpu_arbiter is not None:
+                        try:
+                            cancelled, already_done = await self._gpu_arbiter.cancel_running_for_leases(set(offline_lids))
+                            logger.info(
+                                "Controller fenced: arbiter cancelled %d tasks, %d already done",
+                                cancelled, already_done)
+                        except Exception:
+                            logger.exception(
+                                "gpu-arbiter: cancel for fenced controller of '%s' failed",
+                                worker.name)
                 await asyncio.sleep(5)
                 continue
             now = time.time()
