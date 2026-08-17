@@ -106,6 +106,15 @@ def main(argv: list[str]) -> int:
     if UNRELEASED not in text:
         print(f"collate-changelog: {CHANGELOG.name} has no '{UNRELEASED}' anchor", file=sys.stderr)
         return 1
+
+    version_header = f"## [{args.version}]"
+    if version_header in text:
+        print(f"collate-changelog: {args.version} section already present in {CHANGELOG.name}, consuming leftover fragments", file=sys.stderr)
+        for path in consumed:
+            path.unlink()
+        print(f"collate-changelog: consumed {len(consumed)} leftover fragment(s) for {args.version}")
+        return 0
+
     # Insert directly BELOW [Unreleased] so Unreleased stays empty and on top,
     # which is what the release train expects on the next cycle.
     anchor = UNRELEASED + "\n"

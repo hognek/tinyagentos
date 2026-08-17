@@ -114,3 +114,35 @@ def test_missing_unreleased_anchor_fails_loudly_and_keeps_fragments(repo: Path):
     assert mod.main(["1.0.0-beta.47"]) == 1
     # The fragment survives a failed run so nothing is lost.
     assert (repo / "changelog.d" / "2295-z.md").exists()
+
+
+def test_rerun_after_partial_unlink_failure_is_idempotent(repo: Path, monkeypatch):
+    mod = _load(repo)
+    (repo / "changelog.d" / "2291-notes.md").write_text("- Notes area (#2291).\n", encoding="utf-8")
+
+    fail_once = True
+    import pathlib
+
+    _real_unlink = pathlib.Path.unlink
+
+    def fake_unlink(self):
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise OSError("simulated unlink failure")
+        _real_unlink(self)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", fake_unlink)
+
+    # First run: writes the section, then fails on unlink (exception propagates).
+    with pytest.raises(OSError, match="simulated unlink failure"):
+        mod.main(["1.0.0-beta.47", "--date", "2026-08-05"])
+
+    # Second run: fragment is still present, so without idempotency the section
+    # would be inserted a second time.
+    assert mod.main(["1.0.0-beta.47", "--date", "2026-08-05"]) == 0
+
+    text = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+    assert text.count("## [1.0.0-beta.47]") == 1
+    assert "- Notes area (#2291)." in text
+    assert not (repo / "changelog.d" / "2291-notes.md").exists()
