@@ -74,3 +74,34 @@ describe("LoRA Studio launcher visibility", () => {
     expect(getApp("lora-studio")?.optional).toBeFalsy();
   });
 });
+
+describe("file handler tiering", () => {
+  const handlerIds = ["text-editor", "image-viewer", "media-player"];
+
+  it("handler apps are absent from launcher listings", () => {
+    const ids = getLaunchableApps(new Set()).map((a) => a.id);
+    for (const id of handlerIds) {
+      expect(ids, `handler app "${id}" should not be in launcher`).not.toContain(id);
+    }
+  });
+
+  it("handler apps are still openable programmatically via getApp", () => {
+    for (const id of handlerIds) {
+      expect(getApp(id)?.id).toBe(id);
+    }
+  });
+
+  it("handler apps are still openable programmatically via resolveApp", () => {
+    for (const id of handlerIds) {
+      expect(resolveApp(id)?.id).toBe(id);
+    }
+  });
+
+  it("handler apps have tier 4 and handler:true in the manifest", () => {
+    for (const id of handlerIds) {
+      const app = getApp(id);
+      expect(app?.tier).toBe(4);
+      expect(app?.handler).toBe(true);
+    }
+  });
+});

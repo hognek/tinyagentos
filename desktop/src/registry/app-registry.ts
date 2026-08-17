@@ -94,9 +94,9 @@ const apps: AppManifest[] = [
   // Single Browser app. The proxy vs real-Neko-streamed engine is a per-tab
   // toggle inside it (BrowserModeToggle / LiveBrowserView), not a separate app.
   { id: "browser", name: "Browser", icon: "globe", category: "os", component: () => import("@/apps/BrowserApp").then((m) => ({ default: m.BrowserApp })), defaultSize: { w: 1024, h: 700 }, minSize: { w: 600, h: 400 }, singleton: false, pinned: false, launchpadOrder: 23 },
-  { id: "media-player", name: "Media Player", icon: "play-circle", category: "os", component: () => import("@/apps/MediaPlayerApp").then((m) => ({ default: m.MediaPlayerApp })), defaultSize: { w: 800, h: 500 }, minSize: { w: 400, h: 300 }, singleton: false, pinned: false, launchpadOrder: 24 },
-  { id: "text-editor", name: "Text Editor", icon: "file-text", category: "os", component: () => import("@/apps/TextEditorApp").then((m) => ({ default: m.TextEditorApp })), defaultSize: { w: 800, h: 550 }, minSize: { w: 400, h: 300 }, singleton: false, pinned: false, launchpadOrder: 25 },
-  { id: "image-viewer", name: "Image Viewer", icon: "eye", category: "os", component: () => import("@/apps/ImageViewerApp").then((m) => ({ default: m.ImageViewerApp })), defaultSize: { w: 800, h: 600 }, minSize: { w: 400, h: 300 }, singleton: false, pinned: false, launchpadOrder: 26 },
+  { id: "media-player", name: "Media Player", icon: "play-circle", category: "os", component: () => import("@/apps/MediaPlayerApp").then((m) => ({ default: m.MediaPlayerApp })), defaultSize: { w: 800, h: 500 }, minSize: { w: 400, h: 300 }, singleton: false, pinned: false, launchpadOrder: 24, tier: 4, handler: true },
+  { id: "text-editor", name: "Text Editor", icon: "file-text", category: "os", component: () => import("@/apps/TextEditorApp").then((m) => ({ default: m.TextEditorApp })), defaultSize: { w: 800, h: 550 }, minSize: { w: 400, h: 300 }, singleton: false, pinned: false, launchpadOrder: 25, tier: 4, handler: true },
+  { id: "image-viewer", name: "Image Viewer", icon: "eye", category: "os", component: () => import("@/apps/ImageViewerApp").then((m) => ({ default: m.ImageViewerApp })), defaultSize: { w: 800, h: 600 }, minSize: { w: 400, h: 300 }, singleton: false, pinned: false, launchpadOrder: 26, tier: 4, handler: true },
   { id: "terminal", name: "Terminal", icon: "terminal", category: "os", component: () => import("@/apps/TerminalApp").then((m) => ({ default: m.TerminalApp })), defaultSize: { w: 800, h: 500 }, minSize: { w: 400, h: 250 }, singleton: false, pinned: false, launchpadOrder: 27 },
 
   // Games
@@ -160,7 +160,9 @@ export function getOptionalApps(): AppManifest[] {
  * installed optional app ids (from /api/apps/optional/installed).
  */
 export function getLaunchableApps(installedOptional: Set<string>): AppManifest[] {
-  return getAllApps().filter((a) => !a.optional || installedOptional.has(a.id));
+  return getAllApps().filter(
+    (a) => (!a.optional || installedOptional.has(a.id)) && a.tier !== 4 && a.handler !== true,
+  );
 }
 
 const prefetched = new Set<string>();
