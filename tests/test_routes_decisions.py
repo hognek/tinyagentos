@@ -895,10 +895,12 @@ async def test_concurrent_double_answer_first_wins(client, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_answer_broadcasts_decision_answered_sse(client, monkeypatch):
-    """Answering a decision broadcasts a 'decision.answered' event on the
-    EventBus broadcast channel, so open SSE clients (chat + Decisions app)
-    resolve the card live without a refresh."""
+async def test_answer_publishes_decision_answered_to_owner_channel(client, monkeypatch):
+    """Answering a decision publishes a 'decision.answered' event on the
+    OWNER's user:<id> channel (which their SSE stream subscribes to), and
+    NOT on the broadcast channel: the payload is the full decision record,
+    and broadcast + the replay buffer would hand it to every other
+    authenticated user."""
     from tinyagentos.events.bus import EventBus
 
     import tinyagentos.routes.decisions as dmod
@@ -914,15 +916,22 @@ async def test_answer_broadcasts_decision_answered_sse(client, monkeypatch):
         "from_agent": "@taOS-dev", "question": "q", "type": "approve_deny",
     })
     did = resp.json()["id"]
+    owner = (await app.state.decision_store.get(did))["user_id"]
+    assert owner  # the decision must be owned for this test to mean anything
+    owner_q = await bus.subscribe(f"user:{owner}")
 
     resp = await client.post(f"/api/decisions/{did}/answer", json={"value": "approve"})
     assert resp.status_code == 200
 
-    ev = bcast_q.get_nowait()
+    ev = owner_q.get_nowait()
     assert ev.kind == "decision.answered"
     assert ev.payload["decision_id"] == did
     assert ev.payload["answer"]["value"] == "approve"
     assert ev.targets == ["user"]
+
+    # Scoping: nothing decision-shaped may reach the broadcast channel.
+    while not bcast_q.empty():
+        assert bcast_q.get_nowait().kind != "decision.answered"
 
 
 @pytest.mark.asyncio
@@ -938,12 +947,13 @@ async def test_second_answer_409_no_duplicate_event(client, monkeypatch):
     app = client._transport.app
     bus = EventBus()
     app.state.event_bus = bus
-    bcast_q = await bus.subscribe("broadcast")
 
     resp = await client.post("/api/decisions", json={
         "from_agent": "@taOS-dev", "question": "q", "type": "approve_deny",
     })
     did = resp.json()["id"]
+    owner = (await app.state.decision_store.get(did))["user_id"]
+    owner_q = await bus.subscribe(f"user:{owner}")
 
     first = await client.post(f"/api/decisions/{did}/answer", json={"value": "approve"})
     assert first.status_code == 200
@@ -952,8 +962,8 @@ async def test_second_answer_409_no_duplicate_event(client, monkeypatch):
 
     # Exactly one decision.answered event was published.
     count = 0
-    while not bcast_q.empty():
-        ev = bcast_q.get_nowait()
+    while not owner_q.empty():
+        ev = owner_q.get_nowait()
         if ev.kind == "decision.answered":
             count += 1
     assert count == 1

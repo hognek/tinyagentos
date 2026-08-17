@@ -74,17 +74,25 @@ async def _publish_answer_event(request: Request, decision: dict) -> None:
     surface (the chat thread that rendered the block, plus the Decisions app)
     updates live without a refresh.
 
-    Reuses the existing EventBus broadcast that powers notification push; it never
-    runs consent side effects and never breaks the answer if the emitter is absent
-    (e.g. on hosts where the event bus has not been started) or fails.
+    Published to the owner's ``user:<id>`` channel, NOT broadcast: the payload is
+    the full decision record and the list/get routes scope decisions per user, so
+    a broadcast would hand every connected user (and, via the replay buffer,
+    every late connector) other users' decision content. An ownerless decision
+    is skipped -- live update is best-effort and the apps refetch on focus.
+    It never runs consent side effects and never breaks the answer if the
+    emitter is absent (e.g. on hosts where the event bus has not been started)
+    or fails.
     """
     bus = getattr(request.app.state, "event_bus", None)
     if bus is None:
         return
     payload = dict(decision) if isinstance(decision, dict) else {"id": decision.get("id")}
     payload["decision_id"] = payload.get("id")
+    owner = str(payload.get("user_id") or "").strip()
+    if not owner:
+        return
     try:
-        await bus.broadcast(SystemEvent(
+        await bus.publish_to(f"user:{owner}", SystemEvent(
             kind="decision.answered",
             source="decisions",
             targets=["user"],

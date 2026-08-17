@@ -714,7 +714,7 @@ async def test_agent_cannot_answer_via_human_path(client):
     attributed to the real user identity (session/device), never the agent."""
     app = client._transport.app
     pid = await _new_project(client)
-    cid, token = await _mint_agent(app, pid, ("decisions_write",))
+    _cid, token = await _mint_agent(app, pid, ("decisions_write",))
 
     # Agent creates its own decision
     async with _agent_client(app, token) as ac:
