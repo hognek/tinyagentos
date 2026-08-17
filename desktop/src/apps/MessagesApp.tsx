@@ -2,7 +2,6 @@ import React, { useState, useEffect, useRef, useCallback, useId } from "react";
 import {
   MessageCircle,
   Hash,
-  Users,
   Plus,
   X,
   AtSign,
@@ -10,9 +9,9 @@ import {
   ChevronRight,
   PanelRight,
   Archive,
-  CircleDot,
-  PauseCircle,
-  AlertTriangle,
+   Bot,
+   CircleDot,
+   AlertTriangle,
   Loader2,
   Check,
   Clock,
@@ -59,7 +58,7 @@ import {
   readLastChannel,
   writeLastChannel,
 } from "./MessagesApp.a2aSelection";
-import { bucketAgentChannels } from "./MessagesApp.agentSections";
+import { bucketAgentChannels, computeAgentPresence, type AgentPresence } from "./MessagesApp.agentSections";
 import {
   pickWatchAgent,
   computeStallInfo,
@@ -1957,9 +1956,11 @@ export function MessagesApp({
     group: channels.filter((c) => c.type === "group" && inSidebarSection(c)),
   };
 
-  // Split DM channels into agent lifecycle buckets (Live / Suspended /
-  // Archived) so deleted-agent DMs no longer mix in with live ones. Plain
-  // user DMs and a2a channels stay under nonAgent (their original placement).
+  // DM channels are bucketed by agent lifecycle (live/suspended/archived)
+  // so we can compute per-channel presence. In the sidebar they are
+  // consolidated into one "Agents-DMs" group with a presence dot, rather
+  // than split across separate lifecycle sections. Plain user DMs and a2a
+  // channels stay under nonAgent ("Direct Messages").
   const dmSections = bucketAgentChannels(grouped.dm, liveAgents, archivedAgents);
 
   const allChannels = [...channels, ...archivedChannels];
@@ -2045,18 +2046,17 @@ export function MessagesApp({
   /*  Sections definition (shared between mobile + desktop lists)     */
   /* ---------------------------------------------------------------- */
 
-  // Agent DMs are grouped by lifecycle so live, suspended, and
-  // archived/deleted agents are visually separated. Empty buckets are
-  // omitted so the list stays compact. Plain user DMs and a2a channels
-  // (nonAgent) keep their original "Direct Messages" placement.
+  // Agent DMs are consolidated into a single "Agents-DMs" group; their
+  // live/working/idle state is conveyed by a per-channel presence dot
+  // (computed above from registry status + thinking events) rather than
+  // by splitting them across separate lifecycle sections. Plain user DMs
+  // and a2a channels stay under nonAgent ("Direct Messages"). Topic and
+  // group channels are merged into one "Channels" group.
   const SECTIONS = [
-    { label: "Live", icon: <CircleDot size={13} />, items: dmSections.live },
-    { label: "Suspended", icon: <PauseCircle size={13} />, items: dmSections.suspended },
-    { label: "Archived Agents", icon: <Archive size={13} />, items: dmSections.archived },
+    { label: "Channels", icon: <Hash size={13} />, items: [...grouped.topic, ...grouped.group] },
+    { label: "Agents-DMs", icon: <Bot size={13} />, items: [...dmSections.live, ...dmSections.suspended, ...dmSections.archived] },
     { label: "Direct Messages", icon: <AtSign size={13} />, items: dmSections.nonAgent },
-    { label: "Topics", icon: <Hash size={13} />, items: grouped.topic },
-    { label: "Groups", icon: <Users size={13} />, items: grouped.group },
-  ].filter((s) => s.items.length > 0 || s.label === "Topics" || s.label === "Groups");
+  ].filter((s) => s.items.length > 0 || s.label === "Channels");
 
   const allEmpty =
     channelsLoaded &&
@@ -2064,12 +2064,21 @@ export function MessagesApp({
     archivedChannels.length === 0 &&
     projectGroups.length === 0;
 
-  const thinkingChannelIds: string[] = channels
-    .filter((ch) => {
-      const bound = (ch.settings as { taostalk_agent?: string } | undefined)?.taostalk_agent;
-      return bound && typingAgents.some((a) => a.slug === bound);
-    })
-    .map((ch) => ch.id);
+  /* ------------------------------------------------------------------ */
+  /*  Agent presence map for sidebar dots (live/working/idle)           */
+  /* ------------------------------------------------------------------ */
+  // Working slugs come from live WS thinking events on bound channels.
+  const workingSlugs = new Set(typingAgents.map((a) => a.slug));
+  const agentPresence: Record<string, AgentPresence> = {};
+  for (const ch of dmSections.live) {
+    const bound = (ch.settings as { taostalk_agent?: string } | undefined)?.taostalk_agent;
+    agentPresence[ch.id] = (bound && workingSlugs.has(bound))
+      ? computeAgentPresence("running", true)
+      : computeAgentPresence("running", false);
+  }
+  for (const ch of [...dmSections.suspended, ...dmSections.archived]) {
+    agentPresence[ch.id] = computeAgentPresence(undefined, false);
+  }
 
   /* ---------------------------------------------------------------- */
   /*  Channel list — iOS 26 grouped on mobile, flat sidebar on desktop */
@@ -2108,8 +2117,8 @@ export function MessagesApp({
       busSelected={busSelected}
       onSelectBusChannel={selectBusChannel}
       formatRelativeTime={relativeTime}
-      thinkingChannelIds={thinkingChannelIds}
-    />
+       agentPresence={agentPresence}
+     />
   );
 
   /* ---------------------------------------------------------------- */

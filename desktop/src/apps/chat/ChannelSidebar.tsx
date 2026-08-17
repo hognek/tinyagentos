@@ -13,7 +13,7 @@ import {
 import { Button } from "@/components/ui";
 import { MessageAvatar } from "./MessageAvatar";
 import { A2aBusSection, type BusChannel } from "./A2aBusPanel";
-import type { Channel, LiveAgent, ArchivedAgentEntry, ProjectGroup, WsStatus } from "./types";
+import type { Channel, LiveAgent, ArchivedAgentEntry, ProjectGroup, WsStatus, AgentPresence } from "./types";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -61,8 +61,8 @@ export interface ChannelSidebarProps {
   onSelectBusChannel: (channel: string) => void;
   /** Relative time formatter. */
   formatRelativeTime: (ts: number | string, nowMs: number) => string;
-  /** Channel ids whose bound taostalk_agent is currently thinking (live badge). */
-  thinkingChannelIds: string[];
+   /** Per-channel agent presence: "live" | "working" | "idle", keyed by channel id. */
+   agentPresence: Record<string, AgentPresence>;
 }
 
 /* ------------------------------------------------------------------ */
@@ -97,9 +97,9 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
     bus,
     busSelected,
     onSelectBusChannel,
-    formatRelativeTime,
-    thinkingChannelIds,
-  } = props;
+     formatRelativeTime,
+     agentPresence,
+   } = props;
 
   if (isMobile) {
     return (
@@ -184,25 +184,28 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                               ? "Agent coordination — mention @<slug> to hand off."
                               : undefined
                           }
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 12,
-                            width: "100%",
-                            padding: "11px 14px",
-                            background:
-                              selectedChannel === ch.id
-                                ? "var(--color-shell-surface-active)"
-                                : "none",
-                            border: "none",
-                            borderBottom:
-                              idx === arr.length - 1
-                                ? "none"
-                                : "1px solid var(--color-shell-border)",
-                            cursor: "pointer",
-                            color: "inherit",
-                            textAlign: "left" as const,
-                          }}
+                           style={{
+                             display: "flex",
+                             alignItems: "center",
+                             gap: 12,
+                             width: "100%",
+                             padding: "11px 14px",
+                             background:
+                               selectedChannel === ch.id
+                                 ? "var(--color-shell-surface-active)"
+                                 : "none",
+                             border: "none",
+                             borderLeft: selectedChannel === ch.id
+                               ? "3px solid var(--color-accent-line)"
+                               : "none",
+                             borderBottom:
+                               idx === arr.length - 1
+                                 ? "none"
+                                 : "1px solid var(--color-shell-border)",
+                             cursor: "pointer",
+                             color: "inherit",
+                             textAlign: "left" as const,
+                           }}
                         >
                           {agentMember ? (
                             <MessageAvatar
@@ -271,16 +274,10 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                                >
                                  {ch.name}
                                </span>
-                               {thinkingChannelIds.includes(ch.id) && (
-                                 <span
-                                   className="relative inline-flex h-1.5 w-1.5 shrink-0"
-                                   role="img"
-                                   aria-label="Agent is thinking"
-                                 >
-                                   <span className="taos-status-pulse absolute inset-0 rounded-full bg-amber-400" />
-                                   <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-amber-400" />
-                                 </span>
-                               )}
+                                 {(() => {
+                                   const presence = agentPresence[ch.id];
+                                   return presence ? <PresenceDot presence={presence} /> : null;
+                                 })()}
                                {ch.last_message_at && (
                                 <span
                                   style={{
@@ -452,62 +449,56 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                       : undefined;
                   const count = unread[ch.id] ?? 0;
                   return (
-                    <button
-                      key={ch.id}
-                      type="button"
-                      onClick={() => onSelectChannel(ch.id)}
-                      aria-pressed={selectedChannel === ch.id}
-                      className={`w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[10px] text-left transition-colors ${
-                        selectedChannel === ch.id
-                          ? "bg-shell-surface-active"
-                          : "hover:bg-shell-surface-hover"
-                      }`}
-                      aria-label={`Channel ${ch.name}`}
-                      title={
-                        isA2A
-                          ? "Agent coordination — mention @<slug> to hand off."
-                          : undefined
-                      }
-                    >
-                      {agentMember ? (
-                        <MessageAvatar
-                          size={30}
-                          authorId={agentMember}
-                          displayName={agentMember}
-                          kind="agent"
-                        />
-                      ) : isA2A ? (
-                        <span className="shrink-0 grid place-items-center w-[30px] h-[30px] rounded-[9px] bg-accent-soft border border-accent-line text-accent-strong">
-                          <Bot size={15} aria-hidden />
-                        </span>
-                      ) : (
-                        <span className="shrink-0 grid place-items-center w-[30px] h-[30px] rounded-[9px] bg-shell-surface-active text-shell-text-secondary">
-                          {ch.type === "group" ? (
-                            <Users size={15} aria-hidden />
-                          ) : (
-                            <Hash size={15} aria-hidden />
-                          )}
-                        </span>
-                      )}
-                       <span
-                         className={`truncate flex-1 text-[14px] tracking-tight ${
-                           count > 0
-                             ? "font-bold text-shell-text"
-                             : "font-semibold text-shell-text"
-                         }`}
-                       >
-                         {ch.name}
-                       </span>
-                       {thinkingChannelIds.includes(ch.id) && (
-                         <span
-                           className="relative inline-flex h-1.5 w-1.5 shrink-0"
-                           role="img"
-                           aria-label="Agent is thinking"
-                         >
-                           <span className="taos-status-pulse absolute inset-0 rounded-full bg-amber-400" />
-                           <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-amber-400" />
+                     <button
+                       key={ch.id}
+                       type="button"
+                       onClick={() => onSelectChannel(ch.id)}
+                       aria-pressed={selectedChannel === ch.id}
+                       className={`w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[10px] text-left transition-colors ${
+                         selectedChannel === ch.id
+                           ? "bg-shell-surface-active border-l-2 border-accent-line"
+                           : "hover:bg-shell-surface-hover"
+                       }`}
+                       aria-label={`Channel ${ch.name}`}
+                       title={
+                         isA2A
+                           ? "Agent coordination — mention @<slug> to hand off."
+                           : undefined
+                       }
+                     >
+                       {agentMember ? (
+                         <MessageAvatar
+                           size={30}
+                           authorId={agentMember}
+                           displayName={agentMember}
+                           kind="agent"
+                         />
+                       ) : isA2A ? (
+                         <span className="shrink-0 grid place-items-center w-[30px] h-[30px] rounded-[9px] bg-accent-soft border border-accent-line text-accent-strong">
+                           <Bot size={15} aria-hidden />
+                         </span>
+                       ) : (
+                         <span className="shrink-0 grid place-items-center w-[30px] h-[30px] rounded-[9px] bg-shell-surface-active text-shell-text-secondary">
+                           {ch.type === "group" ? (
+                             <Users size={15} aria-hidden />
+                           ) : (
+                             <Hash size={15} aria-hidden />
+                           )}
                          </span>
                        )}
+                        <span
+                          className={`truncate flex-1 text-[14px] tracking-tight ${
+                            count > 0
+                              ? "font-bold text-shell-text"
+                              : "font-semibold text-shell-text"
+                          }`}
+                        >
+                          {ch.name}
+                        </span>
+                         {(() => {
+                           const presence = agentPresence[ch.id];
+                           return presence ? <PresenceDot presence={presence} /> : null;
+                         })()}
                        {count > 0 && (
                         <span className="shrink-0 bg-unread text-white text-[10px] font-bold rounded-full min-w-[18px] h-[18px] flex items-center justify-center px-1 tabular-nums">
                           {count}
@@ -597,7 +588,41 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
 }
 
 /* ------------------------------------------------------------------ */
-/*  Internal sub-components                                            */
+/*  Presence dot                                                        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Small status dot shown next to agent DM channel names in the sidebar.
+ * - working: amber with a pulse animation (agent is actively generating).
+ * - live:   emerald solid (agent is running and available).
+ * - idle:   muted gray (agent is paused, stopped, or otherwise unavailable).
+ */
+function PresenceDot({ presence }: { presence: AgentPresence }) {
+  const is = (presence === "live") ? (
+    <span
+      className="relative inline-flex h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-400"
+      role="img"
+      aria-label="Agent is live"
+    />
+  ) : presence === "working" ? (
+    <span
+      className="relative inline-flex h-1.5 w-1.5 shrink-0"
+      role="img"
+      aria-label="Agent is working"
+    >
+      <span className="taos-status-pulse absolute inset-0 rounded-full bg-amber-400" />
+      <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-amber-400" />
+    </span>
+  ) : (
+    <span
+      className="relative inline-flex h-1.5 w-1.5 shrink-0 rounded-full bg-shell-text-tertiary"
+      role="img"
+      aria-label="Agent is idle"
+    />
+  );
+  return is;
+}
+
 /* ------------------------------------------------------------------ */
 
 function ConnectionStatus({ wsStatus }: { wsStatus: WsStatus }) {

@@ -46,6 +46,27 @@ export interface AgentSections<C> {
   nonAgent: C[];
 }
 
+/**
+ * Agent presence states for sidebar display.
+ * - "working" -- agent is actively thinking / running a tool.
+ * - "live"    -- agent is registered as running and available.
+ * - "idle"    -- agent is paused, stopped, failed, or otherwise unavailable.
+ */
+export type AgentPresence = "live" | "working" | "idle";
+
+/**
+ * Map a registry agent status + working flag to a sidebar presence state.
+ * Pure function -- exported for unit testing.
+ */
+export function computeAgentPresence(
+  status: string | undefined,
+  isWorking: boolean,
+): AgentPresence {
+  if (isWorking) return "working";
+  if (status === "running") return "live";
+  return "idle";
+}
+
 /** The agent identity a DM channel points at: its name or its non-"user" member. */
 function channelAgentKeys<C extends AgentSectionChannel>(ch: C): string[] {
   const keys = [ch.name];

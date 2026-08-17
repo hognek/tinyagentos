@@ -1,9 +1,11 @@
 import { describe, it, expect } from "vitest";
 import {
   bucketAgentChannels,
+  computeAgentPresence,
   type AgentSectionChannel,
   type AgentSectionLiveAgent,
   type AgentSectionArchivedAgent,
+  type AgentPresence,
 } from "./MessagesApp.agentSections";
 
 const dm = (
@@ -126,5 +128,34 @@ describe("bucketAgentChannels", () => {
     expect(result.suspended.map((c) => c.name)).toEqual(["paused-one"]);
     expect(result.archived.map((c) => c.name).sort()).toEqual(["archived-one", "orphan-one"]);
     expect(result.nonAgent.map((c) => c.name)).toEqual(["coord"]);
+  });
+});
+
+describe("computeAgentPresence", () => {
+  it("returns 'working' when the agent is working regardless of status", () => {
+    expect(computeAgentPresence("running", true)).toBe("working");
+    expect(computeAgentPresence("paused", true)).toBe("working");
+    expect(computeAgentPresence("stopped", true)).toBe("working");
+    expect(computeAgentPresence(undefined, true)).toBe("working");
+  });
+
+  it("returns 'live' when the agent is running and not working", () => {
+    expect(computeAgentPresence("running", false)).toBe("live");
+  });
+
+  it("returns 'idle' when the agent is paused and not working", () => {
+    expect(computeAgentPresence("paused", false)).toBe("idle");
+  });
+
+  it("returns 'idle' when the agent is stopped and not working", () => {
+    expect(computeAgentPresence("stopped", false)).toBe("idle");
+  });
+
+  it("returns 'idle' when the agent status is undefined and not working", () => {
+    expect(computeAgentPresence(undefined, false)).toBe("idle");
+  });
+
+  it("returns 'working' takes precedence over 'live'", () => {
+    expect(computeAgentPresence("running", true)).toBe("working");
   });
 });
