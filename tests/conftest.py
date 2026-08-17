@@ -234,8 +234,10 @@ def _patch_aiosqlite_daemon_threads():
 # to run (see tsk-2nvear).
 #
 # This guard catches the shape at session start with a single loud error and
-# prints __file__ / __path__ / the resolved package set so the cause is
-# observable, not inferred.
+# prints name==version, __file__ / __path__ / __spec__ /
+# submodule_search_locations / the resolved package set so the cause is
+# observable, not asserted. Both candidate causes (stale install vs. version
+# bump) are named; the version discriminates.
 #
 # Each entry maps a module name to the attributes that MUST be present on it
 # whenever the module is importable.  A module that is genuinely absent
@@ -280,12 +282,23 @@ def _check_core_deps(
     return problems
 
 
+def _module_version(mod_name: str) -> str:
+    """Return the installed distribution version for *mod_name*, or
+    ``"unknown"`` if no matching distribution is found."""
+    import importlib.metadata
+    try:
+        return importlib.metadata.version(mod_name)
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
+
+
 def _verify_core_deps() -> None:
     """Fail loudly at session start if a core dependency is
     importable-but-attribute-less.
 
-    Prints ``__file__``, ``__path__``, ``__spec__`` and the resolved package
-    set so the cause is observable, not inferred.
+    Prints ``name==version``, ``__file__``, ``__path__``, ``__spec__``,
+    and ``submodule_search_locations`` for each reported module so the
+    cause is observable, not asserted.
     """
     import importlib.metadata
 
@@ -295,25 +308,35 @@ def _verify_core_deps() -> None:
 
     lines = [
         "CORE DEP GUARD: importable-but-attribute-less dependencies detected.",
-        "A package directory is present on sys.path but its public API is",
-        "absent (stale namespace package or incomplete install). This would",
-        "surface as hundreds of opaque AttributeError failures in tests.",
+        "Observation: an importable module lacks an attribute its contract",
+        "requires. Candidate causes: a stale or partial install (empty",
+        "namespace package on sys.path) or a version bump that moved or",
+        "removed the API. The version and import path discriminate between",
+        "them; both are reported below so neither cause is assumed.",
         "",
         "Diagnosis:",
     ]
     for mod_name, missing_attrs, mod in problems:
-        lines.append(f"  module: {mod_name}")
+        version = _module_version(mod_name)
+        spec = getattr(mod, "__spec__", None)
+        search_locs = (
+            getattr(spec, "submodule_search_locations", None) if spec else None
+        )
+        lines.append(f"  module: {mod_name}=={version}")
         lines.append(f"    missing attributes: {', '.join(missing_attrs)}")
         lines.append(f"    __file__ = {getattr(mod, '__file__', None)!r}")
         lines.append(f"    __path__ = {getattr(mod, '__path__', None)!r}")
-        lines.append(f"    __spec__ = {getattr(mod, '__spec__', None)!r}")
+        lines.append(f"    __spec__ = {spec!r}")
+        lines.append(f"    submodule_search_locations = {search_locs!r}")
     dists = sorted(
-        (d.metadata["Name"] or "") for d in importlib.metadata.distributions()
+        (f"{(d.metadata['Name'] or 'unknown')}=={d.version}"
+         for d in importlib.metadata.distributions()),
+        key=lambda s: s.lower(),
     )
     lines.append("")
     lines.append("Installed packages:")
-    for name in dists:
-        lines.append(f"  {name}")
+    for dist in dists:
+        lines.append(f"  {dist}")
     raise RuntimeError("\n".join(lines))
 
 

@@ -137,9 +137,32 @@ class TestCoreDepGuard:
                 assert "some_attribute" in msg
                 assert "__file__" in msg
                 assert "__path__" in msg
+                assert "submodule_search_locations" in msg
                 assert "Installed packages:" in msg
             finally:
                 _CORE_DEP_CONTRACTS.clear()
                 _CORE_DEP_CONTRACTS.update(original)
         finally:
             self._remove_stale_namespace(tmp_path, "another_stale_pkg")
+
+    def test_diagnostic_contains_version_for_reported_module(self):
+        """The diagnostic must print name==version for a module it reports
+        on.  A raise-only assertion cannot catch a missing version -- the
+        guard already raises today, which is why the output itself must be
+        tested."""
+        import importlib.metadata
+
+        original = dict(_CORE_DEP_CONTRACTS)
+        _CORE_DEP_CONTRACTS.clear()
+        _CORE_DEP_CONTRACTS.update({
+            "idna": ("_nonexistent_attr_for_test",),
+        })
+        try:
+            with pytest.raises(RuntimeError) as exc_info:
+                _verify_core_deps()
+            msg = str(exc_info.value)
+            expected_version = importlib.metadata.version("idna")
+            assert f"idna=={expected_version}" in msg
+        finally:
+            _CORE_DEP_CONTRACTS.clear()
+            _CORE_DEP_CONTRACTS.update(original)
