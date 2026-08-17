@@ -6,6 +6,7 @@ is skipped (via pytest.importorskip or pytest.skip).  An escape hatch
 trailer in the PR body waives the check.
 """
 
+import ast
 import json
 import os
 import re
@@ -133,6 +134,7 @@ def get_test_outcomes(test_files: list[str]) -> dict[str, dict]:
             "passed": passed,
             "failed": failed,
             "import_guards": import_guards,
+            "defined_tests": _count_defined_tests(filepath),
         }
 
     return results
@@ -158,6 +160,25 @@ def _parse_guards_from_file(filepath: str) -> list[str]:
         guards.append(f"skip:{reason}")
 
     return guards
+
+
+def _count_defined_tests(filepath: str) -> int:
+    """Count def test_* functions defined in a file using AST."""
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception:
+        return 0
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        return 0
+    count = 0
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("test_"):
+                count += 1
+    return count
 
 
 def get_pr_body() -> str:
@@ -246,10 +267,18 @@ def main() -> int:
     for filepath, info in results.items():
         skip_count = info["skipped"]
         total = info["total"]
+        defined_tests = info["defined_tests"]
         guards = info["import_guards"]
 
         if total == 0:
-            print(f"WARNING: {filepath} has 0 test outcomes, skipping check")
+            if defined_tests > 0:
+                print(
+                    f"FAIL: {filepath} — collection yielded 0 of "
+                    f"{defined_tests} defined tests"
+                )
+                any_fail = True
+            else:
+                print(f"WARNING: {filepath} has 0 test outcomes, skipping check")
             continue
 
         if skip_count == total:
