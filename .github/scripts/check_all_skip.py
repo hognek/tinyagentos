@@ -313,11 +313,20 @@ def main() -> int:
     zero_collected_files = sum(
         1 for info in results.values() if info["total"] == 0 and info["defined_tests"] > 0
     )
+    # The error line must mirror exactly the conditions that set any_fail:
+    # a WAIVED all-skip file did not fail, so it must not be counted here
+    # (all_skip_files keeps including waived files for the OK-branch note).
+    unwaived_all_skip = sum(
+        1 for filepath, info in results.items()
+        if info["total"] > 0
+        and info["skipped"] == info["total"]
+        and not has_escape_hatch(pr_body, filepath)
+    )
 
     if any_fail:
         parts = []
-        if all_skip_files > 0:
-            parts.append(f"{all_skip_files} file(s) have all tests skipping")
+        if unwaived_all_skip > 0:
+            parts.append(f"{unwaived_all_skip} file(s) have all tests skipping")
         if zero_collected_files > 0:
             parts.append(f"{zero_collected_files} file(s) yielded no collected tests")
         print(f"\n::error:: {', '.join(parts)} — see above for details")
