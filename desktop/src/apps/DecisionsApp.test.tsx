@@ -433,4 +433,68 @@ describe("DecisionsApp", () => {
       await new Promise((r) => setTimeout(r, 0));
     });
   });
+
+  it("last-started load wins over an older stale response", async () => {
+    const olderPending = [singleSelect];
+    const newerPending: Decision[] = [];
+    let callCount = 0;
+    const heldResolvers: Array<() => void> = [];
+
+    const fetchMock = vi.fn().mockImplementation((input: string) => {
+      callCount++;
+      if (callCount <= 3) {
+        return new Promise((resolve) => {
+          heldResolvers.push(() =>
+            resolve({
+              ok: true,
+              status: 200,
+              json: () => {
+                if (input.includes("status=pending") && !input.includes("auth-requests"))
+                  return Promise.resolve(olderPending);
+                if (input.includes("status=answered"))
+                  return Promise.resolve([]);
+                return Promise.resolve({ requests: [] });
+              },
+            }),
+          );
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => {
+          if (input.includes("status=pending") && !input.includes("auth-requests"))
+            return Promise.resolve(newerPending);
+          if (input.includes("status=answered"))
+            return Promise.resolve([]);
+          return Promise.resolve({ requests: [] });
+        },
+      });
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+    render(<DecisionsApp windowId="w1" />);
+
+    // Mount load A starts but its fetches are held pending.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+
+    // Focus refresh triggers load B after the 1 s debounce.
+    window.dispatchEvent(new Event("focus"));
+
+    // Wait for load B to land.
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 1200));
+    });
+
+    // Now release the held load A with older data.
+    await act(async () => {
+      heldResolvers.forEach((r) => r());
+      await new Promise((r) => setTimeout(r, 0));
+    });
+
+    // The rendered list must still reflect load B's newer data, not load A's stale data.
+    expect(screen.queryByText(singleSelect.question)).toBeNull();
+  });
 });

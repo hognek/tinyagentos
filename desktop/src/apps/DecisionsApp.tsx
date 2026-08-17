@@ -589,8 +589,10 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
   const [answered, setAnswered] = useState<Decision[]>([]);
   const [authRequests, setAuthRequests] = useState<AuthRequest[]>([]);
   const [loading, setLoading] = useState(true);
+  const latestSeq = useRef(0);
 
   const load = useCallback(async (opts?: { silent?: boolean }) => {
+    const seq = ++latestSeq.current;
     if (!opts?.silent) setLoading(true);
     try {
       const [pRes, aRes, rRes] = await Promise.all([
@@ -600,9 +602,11 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
       ]);
       // Only overwrite a list when its request actually succeeded; a transient
       // failure must not blank out decisions the user can still act on.
-      if (pRes.ok) setPending(asDecisionList(await pRes.json()));
-      if (aRes.ok) setAnswered(asDecisionList(await aRes.json()));
-      if (rRes.ok) {
+      if (pRes.ok && seq === latestSeq.current)
+        setPending(asDecisionList(await pRes.json()));
+      if (aRes.ok && seq === latestSeq.current)
+        setAnswered(asDecisionList(await aRes.json()));
+      if (rRes.ok && seq === latestSeq.current) {
         const data = await rRes.json();
         const reqs = (data?.requests ?? data ?? []) as AuthRequest[];
         setAuthRequests(Array.isArray(reqs) ? reqs : []);
@@ -610,7 +614,7 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
     } catch {
       // Network error: keep whatever was last loaded in place.
     } finally {
-      if (!opts?.silent) setLoading(false);
+      if (!opts?.silent && seq === latestSeq.current) setLoading(false);
     }
   }, []);
 
