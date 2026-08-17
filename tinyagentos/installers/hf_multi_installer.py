@@ -317,8 +317,11 @@ class HFMultiInstaller(AppInstaller):
                 if on_progress is not None:
                     try:
                         on_progress(downloaded_bytes, total_bytes)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "hf-multi: on_progress raised %s while skipping "
+                            "existing %s, continuing", exc, rfilename,
+                        )
                 # No size guard here: file_set_hash is computed from the
                 # listing, not local disk, so this sha check is the ONLY
                 # verification of local content — a 0-byte leftover from a
