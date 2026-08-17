@@ -663,12 +663,22 @@ class TestClusterManagerPersistence:
             required_vram_mb=1024,
         )
 
-        cancel_mock = AsyncMock(return_value=(1, 0))
+        cancel_mock = AsyncMock()
+        cancel_mock.cancel_running_for_leases.return_value = (1, 0)
         mgr._gpu_arbiter = cancel_mock
 
         await store.increment_generation()
         durable_gen = await store.current_generation()
         assert durable_gen > mgr.generation
+
+        # start() already spawned a _monitor_loop task; cancel it so only
+        # the loop instance below runs, else both can enter the fenced
+        # branch and double-call the arbiter cancel.
+        mgr._monitor_task.cancel()
+        try:
+            await mgr._monitor_task
+        except asyncio.CancelledError:
+            pass
 
         task = asyncio.create_task(mgr._monitor_loop())
         try:
