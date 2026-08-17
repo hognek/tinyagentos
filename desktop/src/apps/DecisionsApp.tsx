@@ -590,8 +590,10 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
   const [answered, setAnswered] = useState<Decision[]>([]);
   const [authRequests, setAuthRequests] = useState<AuthRequest[]>([]);
   const [loading, setLoading] = useState(true);
+  const latestSeq = useRef(0);
 
   const load = useCallback(async (opts?: { silent?: boolean }) => {
+    const seq = ++latestSeq.current;
     if (!opts?.silent) setLoading(true);
     try {
       const [pRes, aRes, rRes] = await Promise.all([
@@ -601,16 +603,29 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
       ]);
       // Only overwrite a list when its request actually succeeded; a transient
       // failure must not blank out decisions the user can still act on.
-      if (pRes.ok) setPending(asDecisionList(await pRes.json()));
-      if (aRes.ok) setAnswered(asDecisionList(await aRes.json()));
+      // The seq re-check must sit AFTER each awaited json() parse — a newer
+      // load can start while a body is still streaming, and a check placed
+      // before the await would let the stale body land anyway.
+      if (pRes.ok) {
+        const next = asDecisionList(await pRes.json());
+        if (seq === latestSeq.current) setPending(next);
+      }
+      if (aRes.ok) {
+        const next = asDecisionList(await aRes.json());
+        if (seq === latestSeq.current) setAnswered(next);
+      }
       if (rRes.ok) {
         const data = await rRes.json();
         const reqs = (data?.requests ?? data ?? []) as AuthRequest[];
-        setAuthRequests(Array.isArray(reqs) ? reqs : []);
+        if (seq === latestSeq.current) setAuthRequests(Array.isArray(reqs) ? reqs : []);
       }
     } catch {
       // Network error: keep whatever was last loaded in place.
     } finally {
+      // Deliberately NOT seq-guarded: loading tracks this non-silent call's
+      // own lifecycle. Only the mount load is non-silent; if a silent focus
+      // refresh outraces it, a guarded clear would leave "Loading..." stuck
+      // forever with data already on screen.
       if (!opts?.silent) setLoading(false);
     }
   }, []);
