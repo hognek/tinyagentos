@@ -1,0 +1,183 @@
+FINDING #1 | bot=cr sev=🟠 Major minor=False id=3744184930
+LOC: .claude/skills/taos-agent/SKILL.md:89
+SUMMARY: Pin the controller installer to a release commit and add verification before running it as root.
+PROMPT: Prompt for AI Agents 
+
+```
+Verify each finding against current code. Fix only still-valid issues, skip the
+rest with a brief reason, keep changes minimal, and validate.
+
+In @.claude/skills/taos-agent/SKILL.md around lines 88 - 89, Update the
+controller installation instructions around the quoted curl command to use an
+immutable release artifact or pinned release commit instead of master, verify
+its checksum or signature before execution, and avoid piping the downloaded
+script directly to sudo bash. For beta releases, provide a non-pipeline
+download-and-verify flow, and document the specific point and purpose of root
+privileges.
+```
+
+FINDING #2 | bot=cr sev=🟠 Major minor=False id=3744184935
+LOC: desktop/src/lib/knowledge.ts:66
+SUMMARY: Restore CSRF wrapping in the JSON request helpers.
+PROMPT: Prompt for AI Agents 
+
+```
+Verify each finding against current code. Fix only still-valid issues, skip the
+rest with a brief reason, keep changes minimal, and validate.
+
+In `@desktop/src/lib/knowledge.ts` around lines 64 - 66, Restore CSRF wrapping for
+the final same-origin JSON request in postJson at
+desktop/src/lib/knowledge.ts:64-66 by applying withCsrf to the merged init
+before fetch, adding its import if needed. Apply the same final-init wrapping in
+the POST caller at desktop/src/lib/github.ts:82-84, ensuring both mutating
+requests include X-CSRF-Token without changing handling for non-mutating or
+external URLs.
+```
+
+FINDING #3 | bot=cr sev=🟠 Major minor=False id=3744184941
+LOC: scripts/check_doc_gate.py:121
+SUMMARY: Validate rule and invariant member types.
+PROMPT: Prompt for AI Agents 
+
+```
+Verify each finding against current code. Fix only still-valid issues, skip the
+rest with a brief reason, keep changes minimal, and validate.
+
+In `@scripts/check_doc_gate.py` around lines 96 - 121, Extend _validate_config to
+validate each rule member: require name, when_changed, require_doc, hint, and
+on_modify to be strings when present, rejecting invalid values with ValueError
+so callers return EXIT_CONFIG_ERROR. Also iterate over
+invariants.referenced_paths_scan and require every entry to be a string,
+preserving existing structural checks and defaults.
+```
+
+FINDING #4 | bot=cr sev=🟠 Major minor=False id=3744184944
+LOC: scripts/collate_changelog.py:116
+SUMMARY: Make insertion and fragment cleanup safe to retry.
+PROMPT: prompt for AI agents 
+
+```
+Verify each finding against current code. Fix only still-valid issues, skip the
+rest with a brief reason, keep changes minimal, and validate.
+
+In `@scripts/collate_changelog.py` around lines 105 - 116, Make the insertion
+logic in the changelog collation flow robust when [Unreleased] has no trailing
+newline, and verify exactly one insertion occurred before deleting consumed
+fragments. Before inserting, detect whether the target version section already
+exists and skip insertion when it does, so retries cannot duplicate releases;
+only perform fragment cleanup after confirming the changelog was successfully
+updated or already contains that version section.
+```
+
+FINDING #5 | bot=cr sev=🟠 Major minor=False id=3744184948
+LOC: tinyagentos/agent_token_auth.py:119
+SUMMARY: Apply token rotation to `check_agent_identity`.
+PROMPT: prompt for AI agents 
+
+```
+Verify each finding against current code. Fix only still-valid issues, skip the
+rest with a brief reason, keep changes minimal, and validate.
+
+In `@tinyagentos/agent_token_auth.py` around lines 115 - 119, Extract the
+active-token and token_min_iat cutoff validation from _verify_agent_scope into a
+shared helper, preserving the existing 401 behavior for superseded tokens.
+Invoke this helper from both _verify_agent_scope and check_agent_identity so
+rotated tokens are rejected in identity-gated flows, and add a regression test
+covering a superseded token passed to check_agent_identity.
+```
+
+FINDING #7 | bot=cr sev=🟠 Major minor=False id=3744184953
+LOC: tinyagentos/routes/agent_registry.py:785
+SUMMARY: Use a rotation value with finer resolution than integer-second `iat`.
+PROMPT: Prompt for AI Agents 
+
+```
+Verify each finding against current code. Fix only still-valid issues, skip the
+rest with a brief reason, keep changes minimal, and validate.
+
+In `@tinyagentos/routes/agent_registry.py` around lines 783 - 785, Update
+tinyagentos/routes/agent_registry.py:783-785 in the token-rotation flow around
+bump_token_min_iat to use a signed monotonic token version or higher-resolution
+issued-at cutoff, rather than integer-second time.time(), so tokens minted
+before rotation in the same second are rejected. Update
+tests/test_token_rotation.py:166-174 to control the clock and verify that a
+pre-rotation same-second token is rejected while a post-rotation token is
+accepted.
+```
+
+FINDING #8 | bot=cr sev=🟠 Major minor=False id=3744184955
+LOC: tinyagentos/routes/device_pair_requests.py:179
+SUMMARY: A pairing request that cannot raise a Decision still returns 200 and consumes a cap slot.
+PROMPT: prompt for AI agents 
+
+```
+Verify each finding against current code. Fix only still-valid issues, skip the
+rest with a brief reason, keep changes minimal, and validate.
+
+In `@tinyagentos/routes/device_pair_requests.py` around lines 137 - 179, Require
+an available decision_store and non-empty admin_id before creating the pairing
+request or calling decision_store.create in the device-pairing route. If either
+prerequisite is missing, fail the request with a clear client-facing error
+instead of returning pair_request_id and verify_code; preserve the existing
+best-effort notification and success response only when approval can proceed.
+```
+
+FINDING #9 | bot=kilo sev=CRITICAL minor=False id=3744229727
+LOC: tests/conftest.py:511
+SUMMARY: CRITICAL:
+
+FINDING #10 | bot=kilo sev=WARNING minor=False id=3744229729
+LOC: tinyagentos/routes/device_pair_requests.py:46
+SUMMARY: WARNING:
+
+FINDING #11 | bot=kilo sev=WARNING minor=False id=3744229731
+LOC: tinyagentos/routes/notifications.py:54
+SUMMARY: WARNING:
+
+FINDING #12 | bot=kilo sev=WARNING minor=False id=3744229733
+LOC: tinyagentos/routes/device_pair_requests.py:175
+SUMMARY: WARNING:
+
+FINDING #13 | bot=kilo sev=WARNING minor=False id=3744229734
+LOC: tinyagentos/device_pair_requests_store.py:243
+SUMMARY: WARNING:
+
+FINDING #14 | bot=kilo sev=WARNING minor=False id=3744229735
+LOC: desktop/src/apps/LibraryApp.tsx:1230
+SUMMARY: WARNING:
+
+FINDING #15 | bot=kilo sev=WARNING minor=False id=3744229739
+LOC: desktop/src/apps/LibraryApp.tsx:149
+SUMMARY: WARNING:
+
+FINDING #16 | bot=kilo sev=WARNING minor=False id=3744229740
+LOC: desktop/src/apps/LibraryApp.tsx:1257
+SUMMARY: WARNING:
+
+FINDING #17 | bot=kilo sev=SUGGESTION minor=True id=3744229741
+LOC: desktop/src/apps/chat/ChannelSidebar.tsx:274
+SUMMARY: SUGGESTION:
+
+FINDING #18 | bot=kilo sev=SUGGESTION minor=True id=3744229742
+LOC: desktop/src/apps/chat/ChannelSidebar.tsx:501
+SUMMARY: SUGGESTION:
+
+FINDING #19 | bot=kilo sev=WARNING minor=False id=3744229745
+LOC: desktop/src/apps/chat/__tests__/render-helpers.test.tsx:107
+SUMMARY: WARNING:
+
+FINDING #20 | bot=kilo sev=WARNING minor=False id=3744229747
+LOC: desktop/src/components/ToolCallBlock.tsx:62
+SUMMARY: WARNING:
+
+FINDING #21 | bot=kilo sev=CRITICAL minor=False id=3744229752
+LOC: tinyagentos/routes/agent_registry.py:785
+SUMMARY: CRITICAL:
+
+FINDING #22 | bot=kilo sev=SUGGESTION minor=True id=3744229754
+LOC: tinyagentos/routes/agent_registry.py:785
+SUMMARY: SUGGESTION:
+
+FINDING #23 | bot=kilo sev=WARNING minor=False id=3744229757
+LOC: .claude/skills/taos-agent/SKILL.md:113
+SUMMARY: WARNING:
