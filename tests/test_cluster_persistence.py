@@ -737,3 +737,73 @@ class TestTaskRouterCircuitBreaker:
         assert data == {"result": "ok"}
         assert name == "w2"
         assert mock_client.post.call_count == 2
+
+    async def test_cooldown_readmits_worker_after_window(self):
+        """End-to-end circuit breaker cooldown recovery (taOS #640 Fix 3).
+
+        Driven entirely through ``route_request`` (the real caller), NOT by
+        poking FailureTracker directly:
+
+          1. breaker trips — two 5xx failures (threshold=2) trip w1.
+          2. worker excluded — route_request skips w1, makes no HTTP call,
+             returns (None, None) because there are no healthy fallbacks.
+          3. window elapses — fake clock advances past window_seconds.
+          4. router re-admits — route_request retries w1, gets a 200, clears
+             the circuit, and returns the response + worker name.
+
+        Complements ``test_clears_failure_on_success`` which only proves
+        record_success clears immediately. This proves the *time-based*
+        sliding-window recovery lets the router re-attempt a previously
+        excluded worker.
+        """
+        clock = [1000.0]
+
+        ft = FailureTracker(failure_threshold=2, window_seconds=60.0)
+        ft._time_func = lambda: clock[0]
+
+        mgr = ClusterManager(failure_tracker=ft)
+        await mgr.register_worker(
+            _make_worker("w1", capabilities=["chat"], load=0.1, url="http://w1:8000")
+        )
+
+        mock_client = AsyncMock(spec=httpx.AsyncClient)
+        router = TaskRouter(mgr, mock_client)
+
+        def _fail_500():
+            resp = MagicMock()
+            resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+                "500", request=MagicMock(), response=MagicMock(status_code=500)
+            )
+            return resp
+
+        def _ok_200():
+            resp = MagicMock()
+            resp.raise_for_status.return_value = None
+            resp.json.return_value = {"result": "ok"}
+            return resp
+
+        # Phase 1 — trip the breaker via real route_request failures.
+        mock_client.post.side_effect = [_fail_500(), _fail_500()]
+        await router.route_request("chat", "POST", "/v1/chat/completions", {})
+        await router.route_request("chat", "POST", "/v1/chat/completions", {})
+        assert ft.is_tripped("w1")
+        assert mock_client.post.call_count == 2
+
+        # Phase 2 — worker is excluded: route_request skips w1 entirely
+        # (no HTTP call) and returns (None, None) because w1 is the only worker.
+        calls_before = mock_client.post.call_count
+        data, name = await router.route_request("chat", "POST", "/v1/chat/completions", {})
+        assert data is None
+        assert name is None
+        assert mock_client.post.call_count == calls_before
+
+        # Phase 3 — window elapses via fake clock (no sleep).
+        clock[0] += 61.0
+
+        # Phase 4 — router re-attempts w1 and re-admits it.
+        mock_client.post.side_effect = [_ok_200()]
+        data, name = await router.route_request("chat", "POST", "/v1/chat/completions", {})
+        assert data == {"result": "ok"}
+        assert name == "w1"
+        assert mock_client.post.call_count == calls_before + 1
+        assert not ft.is_tripped("w1")
