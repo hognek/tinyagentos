@@ -667,8 +667,8 @@ class TestTargetRemoteValidation:
         mock_get.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_target_remote_with_port_and_path_rejected(self, client, fake_registry):
-        """Any target_remote carrying ':' or '/' is rejected at the boundary."""
+    async def test_target_remote_with_port_and_at_sign_rejected(self, client, fake_registry):
+        """Any target_remote carrying ':' or '@' is rejected at the boundary."""
         client._transport.app.state.registry = fake_registry
         with patch(
             "tinyagentos.routes.store_install.get_installer"
@@ -677,6 +677,22 @@ class TestTargetRemoteValidation:
                 "manifest_id": "qwen2.5-3b",
                 "variant_id": "q4_k_m",
                 "target_remote": "10.0.0.1:443@attacker.com",
+            })
+        assert r.status_code == 400
+        assert r.json()["reason"] == "invalid_target_remote"
+        mock_get.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_nonstring_target_remote_rejected_cleanly(self, client, fake_registry):
+        """A non-string target_remote (e.g. JSON 123) must 400, not crash 500."""
+        client._transport.app.state.registry = fake_registry
+        with patch(
+            "tinyagentos.routes.store_install.get_installer"
+        ) as mock_get:
+            r = await client.post("/api/store/install-v2", json={
+                "manifest_id": "qwen2.5-3b",
+                "variant_id": "q4_k_m",
+                "target_remote": 123,
             })
         assert r.status_code == 400
         assert r.json()["reason"] == "invalid_target_remote"

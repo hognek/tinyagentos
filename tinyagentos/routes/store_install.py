@@ -743,7 +743,21 @@ async def install_app(request: Request):
     body = await request.json()
     manifest_id = body.get("manifest_id") or body.get("app_id")
     variant_id = body.get("variant_id", "auto")
-    target_remote = body.get("target_remote") or None
+    raw_target_remote = body.get("target_remote")
+    if raw_target_remote is not None and not isinstance(raw_target_remote, str):
+        # JSON allows any type here; a truthy non-string (123, true, [...])
+        # would crash the regex below with TypeError → 500. Reject cleanly.
+        return JSONResponse(
+            {
+                "error": (
+                    "target_remote must be a string, 'local', or omitted; "
+                    f"got {type(raw_target_remote).__name__}"
+                ),
+                "reason": "invalid_target_remote",
+            },
+            status_code=400,
+        )
+    target_remote = raw_target_remote or None
     force = bool(body.get("force", False))
 
     # Boundary validation — reject hostile target_remote before it is
