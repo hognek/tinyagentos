@@ -494,7 +494,74 @@ describe("DecisionsApp", () => {
       await new Promise((r) => setTimeout(r, 0));
     });
 
+    // Guard against a vacuous pass: if the mount load's loss of the race left
+    // `loading` stuck true, the list is not rendered at all and the stale-data
+    // assert below would pass no matter what state holds.
+    expect(screen.queryByText("Loading...")).toBeNull();
     // The rendered list must still reflect load B's newer data, not load A's stale data.
+    expect(screen.queryByText(singleSelect.question)).toBeNull();
+  });
+
+  it("stale response held at json() parse must not overwrite a newer load", async () => {
+    // Unlike the test above, load A's FETCHES resolve immediately — it is the
+    // awaited json() parse that is held. The seq guard has already been
+    // evaluated by then, so a check placed before the await cannot catch this.
+    const olderPending = [singleSelect];
+    const newerPending: Decision[] = [];
+    let callCount = 0;
+    const heldJsonResolvers: Array<() => void> = [];
+
+    const fetchMock = vi.fn().mockImplementation((input: string) => {
+      callCount++;
+      const bodyFor = (data: Decision[] | never[]) => {
+        if (input.includes("status=pending") && !input.includes("auth-requests")) return data;
+        if (input.includes("status=answered")) return [];
+        return { requests: [] };
+      };
+      if (callCount <= 3) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: () =>
+            new Promise((resolve) => {
+              heldJsonResolvers.push(() => resolve(bodyFor(olderPending)));
+            }),
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve(bodyFor(newerPending)),
+      });
+    });
+
+    vi.stubGlobal("fetch", fetchMock);
+    render(<DecisionsApp windowId="w1" />);
+
+    // Load A's fetches resolve; A is now suspended inside await json().
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 50));
+    });
+
+    // Focus refresh triggers load B after the 1 s debounce; B completes fully.
+    window.dispatchEvent(new Event("focus"));
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 1200));
+    });
+
+    // Release A's held json() bodies with the older data. A awaits the three
+    // bodies sequentially, so each release lets it register the next held
+    // json(); drain until none remain so A runs to completion (incl. finally).
+    await act(async () => {
+      while (heldJsonResolvers.length > 0) {
+        heldJsonResolvers.splice(0).forEach((r) => r());
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    });
+
+    // Same vacuity guard as above: the list must actually be rendered.
+    expect(screen.queryByText("Loading...")).toBeNull();
+    // B's newer (empty) list must survive; A's stale parse must not land.
     expect(screen.queryByText(singleSelect.question)).toBeNull();
   });
 });
