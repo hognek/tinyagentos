@@ -222,6 +222,101 @@ def _patch_aiosqlite_daemon_threads():
     _core.Connection.__init__ = _patched_init
 
 
+# ---------------------------------------------------------------------------
+# Core-dependency integrity guard.
+#
+# A stale or incomplete package install -- an empty directory left on sys.path
+# that Python treats as a PEP 420 namespace package, or a partially-written
+# artifact -- makes a module importable but missing its public API.  anyio
+# calls sniffio.current_async_library on every async test; a partial sniffio
+# raises AttributeError instead of ModuleNotFoundError, so the failure
+# surfaces as 500+ identical tracebacks attributed to whichever PR happened
+# to run (see tsk-2nvear).
+#
+# This guard catches the shape at session start with a single loud error and
+# prints __file__ / __path__ / the resolved package set so the cause is
+# observable, not inferred.
+#
+# Each entry maps a module name to the attributes that MUST be present on it
+# whenever the module is importable.  A module that is genuinely absent
+# (ModuleNotFoundError) is fine -- code paths that need it already guard the
+# import.  Only the importable-but-attribute-less shape is a defect.
+# ---------------------------------------------------------------------------
+
+_CORE_DEP_CONTRACTS: dict[str, tuple[str, ...]] = {
+    "sniffio": ("current_async_library", "AsyncLibraryNotFoundError"),
+    "anyio": ("run", "create_task_group", "from_thread"),
+    "httpx": ("AsyncClient", "Client", "Response"),
+    "httpcore": ("ConnectionPool", "AsyncConnectionPool", "Response"),
+    "idna": ("encode", "decode"),
+    "certifi": ("where",),
+    "pydantic": ("BaseModel", "TypeAdapter"),
+    "sqlcipher3": ("dbapi2", "connect"),
+    "fastapi": ("FastAPI", "APIRouter"),
+}
+
+
+def _check_core_deps(
+    contracts: dict[str, tuple[str, ...]] | None = None,
+) -> list[tuple[str, tuple[str, ...], object]]:
+    """Return a list of importable-but-attribute-less core dependencies.
+
+    Each problem is a ``(module_name, missing_attrs, module)`` tuple. An empty
+    list means every module is either absent (fine) or fully present (fine).
+    """
+    if contracts is None:
+        contracts = _CORE_DEP_CONTRACTS
+    import importlib
+
+    problems: list[tuple[str, tuple[str, ...], object]] = []
+    for mod_name, required_attrs in contracts.items():
+        try:
+            mod = importlib.import_module(mod_name)
+        except ModuleNotFoundError:
+            continue
+        missing = tuple(a for a in required_attrs if not hasattr(mod, a))
+        if missing:
+            problems.append((mod_name, missing, mod))
+    return problems
+
+
+def _verify_core_deps() -> None:
+    """Fail loudly at session start if a core dependency is
+    importable-but-attribute-less.
+
+    Prints ``__file__``, ``__path__``, ``__spec__`` and the resolved package
+    set so the cause is observable, not inferred.
+    """
+    import importlib.metadata
+
+    problems = _check_core_deps()
+    if not problems:
+        return
+
+    lines = [
+        "CORE DEP GUARD: importable-but-attribute-less dependencies detected.",
+        "A package directory is present on sys.path but its public API is",
+        "absent (stale namespace package or incomplete install). This would",
+        "surface as hundreds of opaque AttributeError failures in tests.",
+        "",
+        "Diagnosis:",
+    ]
+    for mod_name, missing_attrs, mod in problems:
+        lines.append(f"  module: {mod_name}")
+        lines.append(f"    missing attributes: {', '.join(missing_attrs)}")
+        lines.append(f"    __file__ = {getattr(mod, '__file__', None)!r}")
+        lines.append(f"    __path__ = {getattr(mod, '__path__', None)!r}")
+        lines.append(f"    __spec__ = {getattr(mod, '__spec__', None)!r}")
+    dists = sorted(
+        (d.metadata["Name"] or "") for d in importlib.metadata.distributions()
+    )
+    lines.append("")
+    lines.append("Installed packages:")
+    for name in dists:
+        lines.append(f"  {name}")
+    raise RuntimeError("\n".join(lines))
+
+
 def pytest_configure(config):
     """Stub the SPA bundle so the test suite doesn't depend on a real
     `npm run build`. Two tests need actual files on disk to exercise
@@ -247,6 +342,12 @@ def pytest_configure(config):
     # CI, not just on 3.14.  The SIGSEGV on 3.14 macOS has the same root
     # cause.  daemon=True is safe for all supported versions.
     _patch_aiosqlite_daemon_threads()
+
+    # Fail loudly if a core transitive dependency is importable but
+    # attribute-less (stale namespace package, incomplete install).
+    # Catches the sniffio/anyio breakage shape before it turns into 500+
+    # opaque AttributeErrors scattered across unrelated tests.
+    _verify_core_deps()
 
 
 @pytest.fixture
