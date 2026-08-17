@@ -35,9 +35,10 @@ def resolve_base_ref(base_ref: str) -> str:
 
 def find_changed_test_files(base_ref: str) -> list[str]:
     """Return test files (test_*.py) changed between base_ref and HEAD."""
-    # git diff --name-only <base>..HEAD
+    # git diff --name-only <base>..HEAD; exclude deleted files — pytest on a
+    # missing path exits 4 and would fail the gate on any test-file deletion
     result = subprocess.run(
-        ["git", "diff", "--name-only", f"{base_ref}..HEAD"],
+        ["git", "diff", "--name-only", "--diff-filter=d", f"{base_ref}..HEAD"],
         capture_output=True,
         text=True,
     )
@@ -219,8 +220,10 @@ def has_escape_hatch(pr_body: str, filepath: str) -> bool:
         m = re.match(r"Tests-Skipped-Intentionally:\s*(.+)", stripped)
         if m:
             trailer_claim = m.group(1).strip()
-            # The trailer claims a file and why; if it mentions this file's basename, waive it
-            if basename in trailer_claim:
+            # "<file>, <why>": exact basename match plus a non-empty reason,
+            # so a waiver for test_x.py.bak cannot waive test_x.py
+            claimed_file, _, reason = trailer_claim.partition(",")
+            if claimed_file.strip() == basename and reason.strip():
                 return True
     return False
 
