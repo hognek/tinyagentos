@@ -91,8 +91,16 @@ class ClusterManager:
 
     async def register_worker(
         self, info: WorkerInfo, generation: int | None = None
-    ) -> None:
-        # Snapshot capabilities before adding worker
+    ) -> tuple[bool, str]:
+        """Register a worker, returning (ok, reason).
+
+        On success ``ok`` is True and ``reason`` is the empty string.
+        On refusal ``ok`` is False and ``reason`` is one of:
+
+        - ``"fenced"`` -- this controller instance has been superseded.
+        - ``"stale_generation"`` -- the worker echoed a generation that does
+          not match the controller's current generation.
+        """
         caps_before = set()
         if self._capabilities:
             caps_before = {k for k, v in self._capabilities.get_all_capabilities().items() if v["available"]}
@@ -103,7 +111,7 @@ class ClusterManager:
         # taOS #640: controller fence — if this instance has been superseded
         # by another controller, reject all registrations (CodeRabbit PR #1928).
         if self._fenced:
-            return
+            return (False, "fenced")
         # taOS #640: split-brain protection — reject registration from a
         # worker that echoes a different generation (another active controller).
         # Legacy workers that don't send generation get a pass (None).
@@ -112,7 +120,7 @@ class ClusterManager:
                 "Registration from '%s' rejected: generation %s != controller %s",
                 info.name, generation, self._generation,
             )
-            return
+            return (False, "stale_generation")
 
         prev_status = self._workers[info.name].status if info.name in self._workers else None
 
@@ -189,6 +197,7 @@ class ClusterManager:
         task = asyncio.create_task(_promote_bg())
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+        return (True, "")
 
     def kv_quant_union(self) -> list[str]:
         """Return the set-union of KV cache quant types across all online workers.
