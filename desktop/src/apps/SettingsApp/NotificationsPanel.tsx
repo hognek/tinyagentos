@@ -25,6 +25,7 @@ export function NotificationsPanel() {
   const [prefs, setPrefs] = useState<NotifPref[] | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
     fetch("/api/notifications/prefs")
@@ -33,7 +34,8 @@ export function NotificationsPanel() {
         if (data && Array.isArray(data)) setPrefs(data);
         else setError("Could not load notification preferences.");
       })
-      .catch(() => setError("Could not reach backend."));
+      .catch(() => setError("Could not reach backend."))
+      .finally(() => setLoaded(true));
   }, []);
 
   const toggle = async (eventType: string, muted: boolean) => {
@@ -62,11 +64,29 @@ export function NotificationsPanel() {
     }
   };
 
-  if (!prefs) {
+  if (!loaded) {
     return (
       <section aria-label="Notification settings">
         <h2 className="text-lg font-semibold mb-5">Notifications</h2>
         <p className="text-sm text-shell-text-tertiary">Loading...</p>
+      </section>
+    );
+  }
+
+  if (!prefs) {
+    return (
+      <section aria-label="Notification settings">
+        <h2 className="text-lg font-semibold mb-2">Notifications</h2>
+        <p className="text-sm text-shell-text-tertiary mb-5">
+          Choose which notification types to receive. Disabled types are suppressed
+          everywhere -- no in-app notification, no web push.
+        </p>
+
+        {error && (
+          <p className="mb-3 text-xs text-amber-400 flex items-center gap-1.5">
+            {error}
+          </p>
+        )}
       </section>
     );
   }
