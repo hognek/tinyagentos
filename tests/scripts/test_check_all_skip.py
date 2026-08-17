@@ -173,7 +173,7 @@ class TestMainAllSkipStillFails:
                 "defined_tests": 3,
             }
         }
-        pr_body = "Tests-Skipped-Intentionally: tests/test_foo.py, landing ahead of code\n"
+        pr_body = "Tests-Skipped-Intentionally: test_foo.py, landing ahead of code\n"
         with patch.object(check_mod, "resolve_base_ref", return_value="origin/dev"):
             with patch.object(check_mod, "get_test_outcomes", return_value=results):
                 with patch.object(check_mod, "find_changed_test_files", return_value=["tests/test_foo.py"]):
