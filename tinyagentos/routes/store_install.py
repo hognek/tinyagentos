@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import urlparse
@@ -45,6 +46,13 @@ _KNOWN_BACKENDS = {
     "mlx", "vllm", "comfyui", "transformers",
     "hailo-ollama",
 }
+
+# Strict hostname charset for target_remote fallback. Rejects host/path/port
+# injection (":", "/", "?", "#", "@") so an authenticated caller cannot steer
+# a pull at an arbitrary daemon URL (SSRF-shaped) or route an install to a
+# typo'd host silently. A bare hostname still passes so registry-less
+# installs (e.g. ad-hoc worker hostnames) keep working.
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # Backend ID → install method known to get_installer().
 # rkllama has a purpose-built installer (calls /api/pull, manages symlinks,
@@ -735,8 +743,48 @@ async def install_app(request: Request):
     body = await request.json()
     manifest_id = body.get("manifest_id") or body.get("app_id")
     variant_id = body.get("variant_id", "auto")
-    target_remote = body.get("target_remote") or None
+    raw_target_remote = body.get("target_remote")
+    if raw_target_remote is not None and not isinstance(raw_target_remote, str):
+        # JSON allows any type here; a truthy non-string (123, true, [...])
+        # would crash the regex below with TypeError → 500. Reject cleanly.
+        return JSONResponse(
+            {
+                "error": (
+                    "target_remote must be a string, 'local', or omitted; "
+                    f"got {type(raw_target_remote).__name__}"
+                ),
+                "reason": "invalid_target_remote",
+            },
+            status_code=400,
+        )
+    target_remote = raw_target_remote or None
     force = bool(body.get("force", False))
+
+    # Boundary validation — reject hostile target_remote before it is
+    # interpolated into any backend daemon URL by resolve_rkllama_url or the
+    # lxc <target_remote>:<name> addressing. An authenticated caller must not
+    # be able to inject an arbitrary host/path/port (SSRF-shaped) or silently
+    # route an install to an unregistered worker via a degenerate stub
+    # capability. Accepted values:
+    #   * None / empty / "local"  -> local install
+    #   * a registered cluster worker id (cluster.get_worker() non-None)
+    #   * a bare hostname matching _HOSTNAME_RE (registry-less installs)
+    if target_remote and target_remote != "local":
+        cluster = getattr(request.app.state, "cluster_manager", None)
+        is_known_worker = False
+        if cluster is not None and hasattr(cluster, "get_worker"):
+            is_known_worker = cluster.get_worker(target_remote) is not None
+        if not is_known_worker and not _HOSTNAME_RE.match(target_remote):
+            return JSONResponse(
+                {
+                    "error": (
+                        "target_remote must be 'local' or a registered worker id; "
+                        f"got {target_remote!r}"
+                    ),
+                    "reason": "invalid_target_remote",
+                },
+                status_code=400,
+            )
 
     # Progress store — opened up here so both legacy and v2 paths can
     # tag work-in-flight that the frontend polls for. Importing here
