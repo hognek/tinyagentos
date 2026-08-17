@@ -2,6 +2,7 @@ import { render, screen, waitFor, fireEvent } from "@testing-library/react";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { DecisionBlock } from "@/apps/MessagesApp";
 import type { DecisionContentBlock } from "@/apps/MessagesApp";
+import { useDecisionEventsStore } from "@/stores/decision-events-store";
 
 function mockDecisionFetch(decision: unknown, ok = true) {
   const fn = vi.fn().mockResolvedValue({
@@ -28,6 +29,8 @@ const baseDecision = {
 describe("DecisionBlock", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    useDecisionEventsStore.setState({ answeredEpoch: 0, lastAnsweredId: null });
   });
 
   it("renders question, type label, and enabled option buttons for a pending single_select, and activating one submits the answer; when not open, buttons are disabled", async () => {
@@ -452,6 +455,89 @@ describe("DecisionBlock", () => {
 
     // First answer is retained in the UI - verify answer is displayed
     expect(container2.textContent).toContain("answered: React");
+  });
+
+  it("resolves live from SSE when the decision is answered in another surface", async () => {
+    // Simulate an SSE decision.answered event: the fetch mock returns pending
+    // first (initial render), then answered once the event fires.
+    const pending = {
+      ...baseDecision,
+      id: "dec-sse",
+      question: "Pick a colour?",
+      type: "single_select",
+      options: [{ label: "Red", value: "red" }, { label: "Blue", value: "blue" }],
+      status: "pending" as const,
+      answer: null,
+    };
+    const answered = {
+      ...pending,
+      status: "answered" as const,
+      answer: { value: "red", answered_by: "jay", answered_at: 1700000100 },
+    };
+
+    let resolved = false;
+    const fetchMock = vi.fn().mockImplementation(() =>
+      Promise.resolve({ ok: true, json: async () => (resolved ? answered : pending) }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const block: DecisionContentBlock = { kind: "decision", decision_id: "dec-sse" };
+    const { container } = render(<DecisionBlock block={block} />);
+
+    // Initial render shows the pending state
+    await waitFor(() => {
+      expect(container.querySelector('[data-decision-block="true"]')).not.toBeNull();
+    });
+    expect(container.textContent).toContain("open");
+
+    // Simulate the SSE handler receiving a decision.answered event for this decision
+    resolved = true;
+    useDecisionEventsStore.getState().recordAnswered("dec-sse");
+
+    // Component re-fetches and shows the answered state live
+    await waitFor(() => {
+      expect(container.textContent).not.toContain("open");
+      expect(container.textContent).toContain("answered: Red");
+      expect(container.textContent).toContain("answered by jay");
+    });
+
+    // Exactly two GET requests: the initial render + the SSE-triggered re-fetch
+    const decisionFetches = fetchMock.mock.calls.filter(
+      (c) => c[0] === "/api/decisions/dec-sse",
+    );
+    expect(decisionFetches.length).toBe(2);
+  });
+
+  it("ignores SSE events for other decisions (no re-fetch)", async () => {
+    const pending = {
+      ...baseDecision,
+      id: "dec-own",
+      question: "Own question?",
+      type: "single_select",
+      options: [{ label: "Red", value: "red" }],
+      status: "pending" as const,
+      answer: null,
+    };
+    const fetchMock = mockDecisionFetch(pending);
+
+    const block: DecisionContentBlock = {
+      kind: "decision",
+      decision_id: "dec-own",
+    };
+    const { container } = render(<DecisionBlock block={block} />);
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-decision-block="true"]')).not.toBeNull();
+    });
+
+    const before = fetchMock.mock.calls.length;
+
+    // Event for a DIFFERENT decision should not trigger a re-fetch
+    useDecisionEventsStore.getState().recordAnswered("dec-other");
+
+    // No additional fetch should occur
+    await new Promise((r) => setTimeout(r, 50));
+    expect(fetchMock.mock.calls.length).toBe(before);
   });
 
   it("double-click while in-flight produces exactly ONE POST", async () => {

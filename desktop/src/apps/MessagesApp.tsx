@@ -76,6 +76,7 @@ import { SearchPanel } from "./chat/SearchPanel";
 import { ChannelSidebar } from "./chat/ChannelSidebar";
 import { A2aBusMessageView, useBusChannels } from "./chat/A2aBusPanel";
 import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
+import { useDecisionEventsStore } from "@/stores/decision-events-store";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -489,10 +490,19 @@ function resolveAnswerLabel(d: DecisionData): string | null {
 }
 
 /**
- * DecisionBlock -- read-only renderer for a `{kind:"decision", decision_id}`
+ * DecisionBlock -- inline renderer for a `{kind:"decision", decision_id}`
  * content block. Fetches the decision from the Decisions API and renders the
- * question, options (disabled), type, and current state (open / answered).
- * No click-to-answer: the operator answers from the Decisions app.
+ * question, options (as click-to-answer buttons when pending), type, and
+ * current state (open / answered).
+ *
+ * Answering posts to the SAME path the Decisions app uses
+ * (POST /api/decisions/{id}/answer), so first-answer-wins is enforced server-side
+ * and the answer is attributed to the real user identity (session cookie).
+ *
+ * Live propagation: subscribes to the decision-events store, which the global
+ * SSE handler (useEventStream) updates on every `decision.answered` broadcast.
+ * When another surface (e.g. the Decisions app) answers this decision, the
+ * block re-fetches and resolves in place without a refresh.
  */
 export function DecisionBlock({ block }: { block: DecisionContentBlock }): React.ReactElement {
   const [decision, setDecision] = useState<DecisionData | null>(null);
@@ -502,7 +512,9 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
   const [answerError, setAnswerError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
-  useEffect(() => {
+  const lastAnsweredId = useDecisionEventsStore((s) => s.lastAnsweredId);
+
+  function fetchDecision() {
     let cancelled = false;
     fetch(`/api/decisions/${block.decision_id}`)
       .then((r) => (r.ok ? r.json() : null))
@@ -523,7 +535,20 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [block.decision_id]);
+  }
+
+  useEffect(fetchDecision, [block.decision_id]);
+
+  // Live propagation: when another surface (Decisions app) answers this
+  // decision while it is still pending, the SSE handler bumps
+  // lastAnsweredId. Re-fetch only for our own decision to avoid noise.
+  useEffect(() => {
+    if (lastAnsweredId === block.decision_id && decision?.status === "pending") {
+      // Propagate fetchDecision's cancel-cleanup so a re-fetch still in
+      // flight at unmount cannot set state afterwards.
+      return fetchDecision();
+    }
+  }, [lastAnsweredId, block.decision_id, decision?.status]);
 
   useEffect(() => {
     setAnswer("");
