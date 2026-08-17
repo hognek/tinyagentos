@@ -515,9 +515,24 @@ lifecycle routes (approve/reject/suspend/reactivate) still 403 non-admins
 before any lookup, which discloses nothing.
 
 Requested scopes are validated against the same closed `VALID_SCOPES` vocabulary
-as the consent flow. `project_tasks` and the canvas scopes still require an
-explicit `project_id`; `decisions_read` / `decisions_write` (and the other global
-scopes) may be granted globally (`project_id=None`) or per-project. Creation
+as the consent flow. The project-bound scopes -- `project_tasks`,
+`project_tasks_create`, `project_tasks_update`, `project_lists`, `project_notes`,
+the canvas scopes (`canvas_read`, `canvas_write`) and the files scopes
+(`files_read`, `files_write`) -- all require an explicit, operator-validated
+`project_id` on approval (see `_PROJECT_SCOPES` in
+`tinyagentos/routes/agent_auth_requests.py`). Omitting the project picker for
+one of these scopes is rejected with 400; the only way to mint a project-bound
+grant unbound (`project_id=None`) is the explicit `defer_binding` opt-in, and
+such a grant is inert until bound: `check_agent_scope_for_project` only
+authorizes a grant whose `project_id` equals the requested project, and the
+project-bound routes take their `project_id` from the URL, so an unbound grant
+matches nothing and authorizes nothing until assign-agent later binds it.
+`project_notes` joined this set in the beta.47 promote (#2320): it was
+previously grantable without a `project_id`, which minted an inert note grant
+the operator believed was usable; it now follows the same rule as
+`project_tasks`. `decisions_read` /
+`decisions_write` (and the other global scopes) may be granted globally
+(`project_id=None`) or per-project. Creation
 surfaces a bell notification (`source: agent_scope_requests`) to the owner/admin,
 retired when the request is decided.
 
@@ -600,6 +615,9 @@ each other's work.
 Route module `tinyagentos/routes/device_pair_requests.py`:
 
 - `POST /api/devices/pair-requests` creates a pairing request for a device.
+  Returns `409 Conflict` when no instance admin exists (the request can never be
+  approved). The pending cap is enforced atomically so concurrent requests cannot
+  exceed it.
 - `GET /api/devices/pair-requests/{pair_request_id}` returns its status.
 
 Approval or denial of a pair request is surfaced to the user through the Decisions app;

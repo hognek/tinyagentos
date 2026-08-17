@@ -539,4 +539,228 @@ describe("DecisionBlock", () => {
     await new Promise((r) => setTimeout(r, 50));
     expect(fetchMock.mock.calls.length).toBe(before);
   });
+
+  it("double-click while in-flight produces exactly ONE POST", async () => {
+    // --- Open decision with single option ---
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        ...baseDecision,
+        question: "Pick a framework",
+        type: "single_select",
+        options: [
+          { label: "React", value: "react" },
+          { label: "Vue", value: "vue" },
+        ],
+        context: "ui library",
+        status: "pending",
+        answer: null,
+        created_at: 1700000000,
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const block: DecisionContentBlock = {
+      kind: "decision",
+      decision_id: "dec-1",
+    };
+    const { container } = render(<DecisionBlock block={block} />);
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-decision-block="true"]')).not.toBeNull();
+    });
+
+    // Click first option (React) - first answer
+    const enabledBtns = container.querySelectorAll('button:not([disabled])');
+    fireEvent.click(enabledBtns[0]);
+
+    // Immediately double-click the same button while first POST is in-flight.
+    // The submitting state should prevent a second POST.
+    fireEvent.click(enabledBtns[0]);
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-decision-block="true"]')).not.toBeNull();
+    });
+
+    // Verify only one POST to /answer was made (double-click is prevented
+    // by the submitting state disabling buttons)
+    const answerCalls = fetchMock.mock.calls.filter(
+      ([url]) => url === "/api/decisions/dec-1/answer"
+    );
+    expect(answerCalls.length).toBe(1);
+  });
+
+  it("double-click while in-flight produces exactly ONE POST (free_text via Enter key)", async () => {
+    // --- Open free_text decision ---
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        ...baseDecision,
+        id: "dec-8",
+        question: "Any notes?",
+        type: "free_text",
+        options: [],
+        status: "pending",
+        answer: null,
+        created_at: 1700000000,
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const block: DecisionContentBlock = {
+      kind: "decision",
+      decision_id: "dec-8",
+    };
+    const { container } = render(<DecisionBlock block={block} />);
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-decision-block="true"]')).not.toBeNull();
+    });
+
+    const textarea = container.querySelector("textarea");
+    expect(textarea).not.toBeNull();
+
+    // Type some text and press Enter twice rapidly while in-flight.
+    // The submitting state should prevent a second POST.
+    fireEvent.change(textarea, { target: { value: "test answer" } });
+    
+    // First Enter key press
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false });
+    
+    // Second Enter key press while still in-flight - should be blocked by submitting state
+    fireEvent.keyDown(textarea, { key: "Enter", shiftKey: false });
+    await waitFor(() => {
+      expect(container.querySelector('[data-decision-block="true"]')).not.toBeNull();
+    });
+
+    // Verify only one POST to /answer was made
+    const answerCalls = fetchMock.mock.calls.filter(
+      ([url]) => url === "/api/decisions/dec-8/answer"
+    );
+    expect(answerCalls.length).toBe(1);
+  });
+
+  it("409 path triggers a refetch so block flips to answered state", async () => {
+    // --- Open decision with single option ---
+    // The GET mock MUST be request-ordered: the first GET (initial load)
+    // returns the pending decision so the option button is live and the
+    // POST actually runs; only the post-409 refetch returns the answered
+    // state. A url-matched mock that returned "answered" for every GET made
+    // this test pass without ever exercising conflict recovery.
+    const pendingDec1 = {
+      ...baseDecision,
+      id: "dec-1",
+      question: "Pick a framework",
+      type: "single_select",
+      options: [
+        { label: "React", value: "react" },
+        { label: "Vue", value: "vue" },
+      ],
+      context: "ui library",
+      status: "pending",
+      answer: null,
+      created_at: 1700000000,
+    };
+    const answeredDec1 = {
+      ...pendingDec1,
+      status: "answered",
+      answer: { value: "react", answered_by: "jay", answered_at: 1700000100 },
+    };
+    let decisionGets = 0;
+    const fetchMock = vi.fn().mockImplementation(async (req) => {
+      const url = req.url ?? req;
+      if (typeof url === "string" && url.endsWith("/answer")) {
+        // Answer POST returns 409 (someone else answered first)
+        return { status: 409, ok: false, json: async () => ({ error: "already answered" }) };
+      }
+      decisionGets += 1;
+      return {
+        ok: true,
+        json: async () => (decisionGets === 1 ? pendingDec1 : answeredDec1),
+      };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const block: DecisionContentBlock = {
+      kind: "decision",
+      decision_id: "dec-1",
+    };
+    const { container } = render(<DecisionBlock block={block} />);
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-decision-block="true"]')).not.toBeNull();
+    });
+
+    // Click first option - this will get a 409 from the server
+    // (simulating someone else already answered first)
+    // Use container.querySelector to find the first button
+    const button = container.querySelector('button');
+    fireEvent.click(button);
+
+    // After the 409 handler refetches, the decision should flip to answered
+    // The refetched decision should have status "answered"
+    await waitFor(() => {
+      expect(container.textContent).toContain("answered: React");
+      expect(container.textContent).not.toContain("open");
+    });
+
+    // The POST must actually have run -- guards against the block starting
+    // out answered (disabled button, no-op click, vacuous pass).
+    const answerCalls = fetchMock.mock.calls.filter(([req]) => {
+      const url = req.url ?? req;
+      return typeof url === "string" && url.endsWith("/answer");
+    });
+    expect(answerCalls.length).toBe(1);
+  });
+
+  it("shows the conflict fallback when the 409 refetch rejects", async () => {
+    const pendingDec2 = {
+      ...baseDecision,
+      id: "dec-2",
+      question: "Pick a framework",
+      type: "single_select",
+      options: [
+        { label: "React", value: "react" },
+        { label: "Vue", value: "vue" },
+      ],
+      context: "ui library",
+      status: "pending",
+      answer: null,
+      created_at: 1700000000,
+    };
+    let decisionGets = 0;
+    const fetchMock = vi.fn().mockImplementation(async (req) => {
+      const url = req.url ?? req;
+      if (typeof url === "string" && url.endsWith("/answer")) {
+        return { status: 409, ok: false, json: async () => ({ error: "already answered" }) };
+      }
+      decisionGets += 1;
+      if (decisionGets === 1) {
+        return { ok: true, json: async () => pendingDec2 };
+      }
+      // Post-409 refetch dies on the network: the user must still learn
+      // their answer lost the race, not see a generic "Failed to answer".
+      throw new TypeError("network down");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const block: DecisionContentBlock = {
+      kind: "decision",
+      decision_id: "dec-2",
+    };
+    const { container } = render(<DecisionBlock block={block} />);
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-decision-block="true"]')).not.toBeNull();
+    });
+
+    const button = container.querySelector('button');
+    fireEvent.click(button);
+
+    await waitFor(() => {
+      const alert = container.querySelector('[role="alert"]');
+      expect(alert).not.toBeNull();
+      expect(alert.textContent).toContain("already answered");
+    });
+  });
 });
