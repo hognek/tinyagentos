@@ -627,3 +627,21 @@ class TestPrHeadControlAndConflicts:
         assert conflicted
         assert violations == []
         assert waived == set()
+
+    def test_merge_tree_tool_error_is_loud_not_skipped(self, tmp_path: Path):
+        """rc>1 from merge-tree (invalid ref, missing object) is a tooling
+        failure, not a conflict: the gate must raise, never report
+        conflicted=True and exit 0."""
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        _commit_file(
+            repo,
+            "tinyagentos/foo.py",
+            "def function_a():\n    pass\n",
+            "init: add function_a",
+        )
+
+        with pytest.raises(RuntimeError, match="merge-tree"):
+            cds.check_deleted_symbols(
+                "main", repo, pr_head_sha="0000000000000000000000000000000000000000"
+            )

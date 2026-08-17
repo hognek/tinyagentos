@@ -40,6 +40,7 @@ import argparse
 import ast
 import io
 import os
+import re
 import subprocess
 import sys
 import tarfile
@@ -126,9 +127,21 @@ def _merge_tree(base_ref: str, pr_head_sha: str, repo_root: Path = REPO_ROOT) ->
         ["git", "merge-tree", "--write-tree", base_ref, pr_head_sha],
         cwd=repo_root, capture_output=True, text=True,
     )
-    if result.returncode != 0:
+    first_line = result.stdout.splitlines()[0].strip() if result.stdout else ""
+    oid_on_stdout = bool(re.fullmatch(r"[0-9a-f]{40,64}", first_line))
+    if result.returncode == 0 and oid_on_stdout:
+        return first_line
+    if result.returncode == 1 and oid_on_stdout:
+        # A genuine conflict still prints the merge-tree OID first; a bad ref
+        # ("not something we can merge") exits 1 with EMPTY stdout, so rc alone
+        # cannot distinguish them.
         return None
-    return result.stdout.strip()
+    # Anything else is a tooling failure (invalid ref, missing object, usage
+    # error). The gate must fail loudly here, not skip as "conflicted".
+    raise RuntimeError(
+        f"git merge-tree --write-tree {base_ref} {pr_head_sha} failed "
+        f"(rc={result.returncode}): {result.stderr.strip()}"
+    )
 
 
 def _find_adding_commit(
