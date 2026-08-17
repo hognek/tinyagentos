@@ -16,6 +16,12 @@ The ``verify_code`` is a human-comparison nonce (F3): it is persisted only so
 the Decision text can display it for the approving user, and is NEVER returned
 by ``get``/poll -- the route layer strips it. It is never server-checked and no
 endpoint accepts it as input.
+
+Concurrency scope: the pending-cap check-then-insert is serialized by an
+in-process lock (``_create_lock``), which is sound because taOS serves from a
+single process (``uvicorn.run`` with an app object -- no worker forking). If
+multi-process serving is ever introduced, the cap check must move into a
+single transactional INSERT ... WHERE (SELECT COUNT ...) statement.
 """
 
 import uuid
