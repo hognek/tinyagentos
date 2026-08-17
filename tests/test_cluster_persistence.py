@@ -15,7 +15,7 @@ import pytest
 from tinyagentos.cluster.failure_tracker import FailureTracker
 from tinyagentos.cluster.manager import ClusterManager, HEARTBEAT_TIMEOUT
 from tinyagentos.cluster.router import TaskRouter
-from tinyagentos.cluster.worker_protocol import WorkerInfo
+from tinyagentos.cluster.worker_protocol import GpuLease, WorkerInfo
 from tinyagentos.cluster.worker_registry_store import WorkerRegistryStore
 
 
@@ -641,6 +641,52 @@ class TestClusterManagerPersistence:
 
         await mgr_a.stop()
         await store.close()
+
+    async def test_fenced_controller_releases_leases_and_cancels_arbiter(self, tmp_path):
+        """A fenced controller must release GPU leases and cancel in-flight
+        arbiter tasks for its workers, mirroring the sibling termination
+        branches. Driven by the REAL monitor loop (not a re-implemented check)."""
+        store = await self._new_store(tmp_path)
+        mgr = ClusterManager(worker_registry_store=store)
+        await mgr.start()
+        assert mgr.generation >= 1
+
+        await mgr.register_worker(_make_worker("gpu-box", capabilities=["chat"]))
+        assert mgr.get_worker("gpu-box").status == "online"
+
+        lease_id = "l_gpu_box_0"
+        mgr._leases[lease_id] = GpuLease(
+            lease_id=lease_id,
+            resource_id="gpu-box:gpu-cuda-0",
+            caller="test-caller",
+            expires_at=time.time() + 3600,
+            required_vram_mb=1024,
+        )
+
+        cancel_mock = AsyncMock(return_value=(1, 0))
+        mgr._gpu_arbiter = cancel_mock
+
+        await store.increment_generation()
+        durable_gen = await store.current_generation()
+        assert durable_gen > mgr.generation
+
+        task = asyncio.create_task(mgr._monitor_loop())
+        try:
+            await asyncio.sleep(0.05)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        assert mgr.get_worker("gpu-box").status == "offline"
+        assert lease_id not in mgr._leases
+        cancel_mock.cancel_running_for_leases.assert_called_once_with({lease_id})
+
+        await mgr.stop()
+        await store.close()
+
 
 # ── TaskRouter circuit breaker tests (Fix 3) ───────────────────────────
 
