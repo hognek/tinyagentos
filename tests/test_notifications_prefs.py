@@ -10,10 +10,7 @@ async def test_get_prefs_returns_all_event_types_with_correct_defaults(client):
     prefs = r.json()
     assert len(prefs) == len(NotificationStore.EVENT_TYPES)
     assert {p["event_type"] for p in prefs} == set(NotificationStore.EVENT_TYPES)
-    task_claimed = next(p for p in prefs if p["event_type"] == "task.claimed")
-    assert task_claimed["muted"] is True
-    others = [p for p in prefs if p["event_type"] != "task.claimed"]
-    for pref in others:
+    for pref in prefs:
         assert pref["muted"] is False
 
 

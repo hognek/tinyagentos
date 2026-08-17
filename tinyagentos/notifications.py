@@ -61,7 +61,7 @@ class NotificationStore(BaseStore):
         "training.complete", "training.failed", "app.installed", "app.failed",
         "disk_quota", "task.claimed", "task.closed",
     ]
-    _DEFAULT_MUTED: set[str] = {"task.claimed"}
+    _DEFAULT_MUTED: set[str] = set()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -97,8 +97,6 @@ class NotificationStore(BaseStore):
 
     async def _dispatch_push(self, row: dict) -> None:
         """Run the web-push sender, isolating every failure from add()."""
-        if row.get("source") in self._DEFAULT_MUTED:
-            return
         try:
             await self._push_sender(row)
         except Exception:
@@ -164,7 +162,7 @@ class NotificationStore(BaseStore):
                 user id, web-push delivery fans out only to that user's
                 subscriptions.
         """
-        if source in self._DEFAULT_MUTED or await self._is_event_muted(source):
+        if await self._is_event_muted(source):
             return
         ts = int(time.time())
         data_json = json.dumps(data) if data is not None else None
@@ -313,7 +311,7 @@ class NotificationStore(BaseStore):
             row = await cursor.fetchone()
         if row is not None:
             return bool(row[0])
-        return event_type in self._DEFAULT_MUTED
+        return False
 
     async def set_event_muted(self, event_type: str, muted: bool) -> None:
         await self._db.execute(
@@ -329,6 +327,6 @@ class NotificationStore(BaseStore):
             rows = await cursor.fetchall()
         stored = {r[0]: bool(r[1]) for r in rows}
         return [
-            {"event_type": et, "muted": stored.get(et, et in self._DEFAULT_MUTED)}
+            {"event_type": et, "muted": stored.get(et, False)}
             for et in self.EVENT_TYPES
         ]

@@ -309,3 +309,32 @@ async def test_unmuted_event_type_is_dispatched(tmp_path):
         assert seen_push[0]["title"] == "Task closed"
     finally:
         await store.close()
+
+
+@pytest.mark.asyncio
+async def test_default_on_event_type_delivered_without_prefs(tmp_path):
+    store = NotificationStore(tmp_path / "notif.db")
+    await store.init()
+    try:
+        seen_push: list[dict] = []
+
+        async def push_sender(row: dict) -> None:
+            seen_push.append(row)
+
+        store.set_push_sender(push_sender)
+
+        await store.add(
+            "Task claimed",
+            "task-42 claimed by worker-1",
+            level="info",
+            source="task.claimed",
+        )
+        await asyncio.sleep(0)
+
+        items = await store.list()
+        assert len(items) == 1
+        assert items[0]["title"] == "Task claimed"
+        assert len(seen_push) == 1
+        assert seen_push[0]["title"] == "Task claimed"
+    finally:
+        await store.close()
