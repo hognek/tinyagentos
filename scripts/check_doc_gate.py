@@ -115,7 +115,12 @@ def _validate_config(config: dict) -> None:
     A config that parses as valid TOML but has the wrong shape (e.g.
     ``rules = "not a list"``) is a config error, not a runtime crash: surface
     it as EXIT_CONFIG_ERROR rather than letting it die in the rule loop with
-    an AttributeError."""
+    an AttributeError. Also validates that rule members have correct types
+    (name, when_changed, require_doc, hint are strings, when_changed and
+    require_doc lists contain only strings, on_modify is boolean). Validates
+    that invariants.referenced_paths_scan and ignore_tokens contain only
+    strings.
+    """
     if not isinstance(config, dict):
         raise ValueError("config root must be a table")
     rules = config.get("rules", [])
@@ -124,6 +129,25 @@ def _validate_config(config: dict) -> None:
     for i, rule in enumerate(rules):
         if not isinstance(rule, dict):
             raise ValueError(f"rules[{i}] must be a table")
+        # Validate rule members
+        if "name" in rule and not isinstance(rule["name"], str):
+            raise ValueError(f"rules[{i}].name must be a string")
+        if "when_changed" in rule and not isinstance(rule["when_changed"], list):
+            raise ValueError(f"rules[{i}].when_changed must be a list")
+        elif "when_changed" in rule:
+            for j, item in enumerate(rule["when_changed"]):
+                if not isinstance(item, str):
+                    raise ValueError(f"rules[{i}].when_changed[{j}] must be a string")
+        if "require_doc" in rule and not isinstance(rule["require_doc"], list):
+            raise ValueError(f"rules[{i}].require_doc must be a list")
+        elif "require_doc" in rule:
+            for j, item in enumerate(rule["require_doc"]):
+                if not isinstance(item, str):
+                    raise ValueError(f"rules[{i}].require_doc[{j}] must be a string")
+        if "hint" in rule and not isinstance(rule["hint"], str):
+            raise ValueError(f"rules[{i}].hint must be a string")
+        if "on_modify" in rule and not isinstance(rule["on_modify"], bool):
+            raise ValueError(f"rules[{i}].on_modify must be a boolean")
     gate = config.get("gate", {})
     if not isinstance(gate, dict):
         raise ValueError("'gate' must be a table")
@@ -135,9 +159,17 @@ def _validate_config(config: dict) -> None:
     scan = invariants.get("referenced_paths_scan", [])
     if not isinstance(scan, list):
         raise ValueError("'invariants.referenced_paths_scan' must be a list")
+    # Validate scan list entries are strings
+    for j, item in enumerate(scan):
+        if not isinstance(item, str):
+            raise ValueError(f"invariants.referenced_paths_scan[{j}] must be a string")
     ignore = invariants.get("ignore_tokens", [])
     if not isinstance(ignore, list):
         raise ValueError("'invariants.ignore_tokens' must be a list")
+    # Validate ignore list entries are strings
+    for j, item in enumerate(ignore):
+        if not isinstance(item, str):
+            raise ValueError(f"invariants.ignore_tokens[{j}] must be a string")
 
 
 def check_referenced_paths(repo_root: Path, files_to_scan: list[str], config: dict) -> list[str]:
