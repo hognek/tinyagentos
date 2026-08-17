@@ -19,6 +19,7 @@ _MOD = importlib.util.module_from_spec(_SPEC)
 assert _SPEC.loader is not None
 _SPEC.loader.exec_module(_MOD)
 evaluate_rules = _MOD.evaluate_rules
+_validate_config = _MOD._validate_config
 
 
 def _base_config() -> dict:
@@ -313,3 +314,132 @@ class TestGitCommandErrorHandling:
         with patch.object(_MOD.subprocess, "run", side_effect=[mock_result_diff, mock_result_log]):
             code = _MOD.main(["diff-gate", "--base", "origin/HEAD"])
             assert code == _MOD.EXIT_OK
+
+
+class TestConfigValidation:
+    """Tests for the _validate_config function."""
+    
+    def test_valid_config(self):
+        """Test that a valid config passes validation."""
+        valid_config = {
+            "rules": [
+                {
+                    "name": "test-rule",
+                    "when_changed": ["test/*"],
+                    "require_doc": ["README.md"],
+                    "hint": "Test rule",
+                    "on_modify": True
+                }
+            ],
+            "gate": {
+                "trailer": "Docs-Reviewed:"
+            },
+            "invariants": {
+                "referenced_paths_scan": ["file1.md", "file2.md"],
+                "ignore_tokens": ["ignore.md"]
+            }
+        }
+        # Should not raise an exception
+        _validate_config(valid_config)
+    
+    def test_invalid_rule_name_type(self):
+        """Test that non-string name in rule raises error."""
+        invalid_config = {
+            "rules": [
+                {
+                    "name": 123,  # Should be string
+                    "when_changed": ["test/*"],
+                    "require_doc": ["README.md"],
+                    "hint": "Test rule",
+                    "on_modify": True
+                }
+            ]
+        }
+        with pytest.raises(ValueError, match="rules\[0\].name must be a string"):
+            _validate_config(invalid_config)
+    
+    def test_invalid_when_changed_type(self):
+        """Test that non-string in when_changed raises error."""
+        invalid_config = {
+            "rules": [
+                {
+                    "name": "test-rule",
+                    "when_changed": [123],  # Should be string
+                    "require_doc": ["README.md"],
+                    "hint": "Test rule",
+                    "on_modify": True
+                }
+            ]
+        }
+        with pytest.raises(ValueError, match="rules\[0\].when_changed\[0\] must be a string"):
+            _validate_config(invalid_config)
+    
+    def test_invalid_require_doc_type(self):
+        """Test that non-string in require_doc raises error."""
+        invalid_config = {
+            "rules": [
+                {
+                    "name": "test-rule",
+                    "when_changed": ["test/*"],
+                    "require_doc": [123],  # Should be string
+                    "hint": "Test rule",
+                    "on_modify": True
+                }
+            ]
+        }
+        with pytest.raises(ValueError, match="rules\[0\].require_doc\[0\] must be a string"):
+            _validate_config(invalid_config)
+    
+    def test_invalid_hint_type(self):
+        """Test that non-string hint raises error."""
+        invalid_config = {
+            "rules": [
+                {
+                    "name": "test-rule",
+                    "when_changed": ["test/*"],
+                    "require_doc": ["README.md"],
+                    "hint": 123,  # Should be string
+                    "on_modify": True
+                }
+            ]
+        }
+        with pytest.raises(ValueError, match="rules\[0\].hint must be a string"):
+            _validate_config(invalid_config)
+    
+    def test_invalid_on_modify_type(self):
+        """Test that non-boolean on_modify raises error."""
+        invalid_config = {
+            "rules": [
+                {
+                    "name": "test-rule",
+                    "when_changed": ["test/*"],
+                    "require_doc": ["README.md"],
+                    "hint": "Test rule",
+                    "on_modify": "yes"  # Should be boolean
+                }
+            ]
+        }
+        with pytest.raises(ValueError, match="rules\[0\].on_modify must be a boolean"):
+            _validate_config(invalid_config)
+    
+    def test_invalid_referenced_paths_scan_entry_type(self):
+        """Test that non-string in referenced_paths_scan raises error."""
+        invalid_config = {
+            "invariants": {
+                "referenced_paths_scan": [123],  # Should be string
+                "ignore_tokens": []
+            }
+        }
+        with pytest.raises(ValueError, match="invariants.referenced_paths_scan\[0\] must be a string"):
+            _validate_config(invalid_config)
+    
+    def test_invalid_ignore_tokens_entry_type(self):
+        """Test that non-string in ignore_tokens raises error."""
+        invalid_config = {
+            "invariants": {
+                "referenced_paths_scan": [],
+                "ignore_tokens": [123]  # Should be string
+            }
+        }
+        with pytest.raises(ValueError, match="invariants.ignore_tokens\[0\] must be a string"):
+            _validate_config(invalid_config)

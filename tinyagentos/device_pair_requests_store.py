@@ -251,7 +251,7 @@ class DevicePairRequestsStore(BaseStore):
             raise RuntimeError("DevicePairRequestsStore not initialised")
         now_iso = _iso(_now())
         cur = await self._db.execute(
-            "SELECT * FROM device_pair_requests "
+            f"SELECT {_SAFE_COLS} FROM device_pair_requests "
             "WHERE status = 'pending' AND expires_at_ts > ? "
             "ORDER BY created_ts",
             (now_iso,),
