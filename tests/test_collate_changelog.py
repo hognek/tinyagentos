@@ -146,3 +146,48 @@ def test_rerun_after_partial_unlink_failure_is_idempotent(repo: Path, monkeypatc
     assert text.count("## [1.0.0-beta.47]") == 1
     assert "- Notes area (#2291)." in text
     assert not (repo / "changelog.d" / "2291-notes.md").exists()
+
+
+def test_rerun_keeps_fragment_that_landed_after_the_partial_failure(repo: Path, monkeypatch):
+    """A fragment merged between the failed run and the rerun was never folded.
+
+    The rerun must not silently unlink it: its content exists nowhere in
+    CHANGELOG.md, so deleting it loses the release note. Stale (already
+    folded) leftovers are still consumed; the unfolded one is kept and the
+    rerun refuses loudly so the operator folds it under the right version.
+    """
+    mod = _load(repo)
+    (repo / "changelog.d" / "2291-notes.md").write_text("- Notes area (#2291).\n", encoding="utf-8")
+
+    fail_once = True
+    import pathlib
+
+    _real_unlink = pathlib.Path.unlink
+
+    def fake_unlink(self):
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise OSError("simulated unlink failure")
+        _real_unlink(self)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", fake_unlink)
+
+    with pytest.raises(OSError, match="simulated unlink failure"):
+        mod.main(["1.0.0-beta.47", "--date", "2026-08-05"])
+
+    # A new PR merges its fragment between the failed run and the rerun.
+    (repo / "changelog.d" / "2299-new.md").write_text("- Brand new feature (#2299).\n", encoding="utf-8")
+
+    rc = mod.main(["1.0.0-beta.47", "--date", "2026-08-05"])
+    text = (repo / "CHANGELOG.md").read_text(encoding="utf-8")
+
+    # The stale leftover was already folded by the first run: consumed.
+    assert not (repo / "changelog.d" / "2291-notes.md").exists()
+    # The unfolded fragment survives, its content is not lost and not
+    # half-inserted anywhere.
+    assert (repo / "changelog.d" / "2299-new.md").exists()
+    assert "- Brand new feature (#2299)." not in text
+    assert text.count("## [1.0.0-beta.47]") == 1
+    # And the rerun says NO loudly instead of pretending it consumed cleanly.
+    assert rc == 1

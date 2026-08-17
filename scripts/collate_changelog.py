@@ -109,10 +109,23 @@ def main(argv: list[str]) -> int:
 
     version_header = f"## [{args.version}]"
     if version_header in text:
-        print(f"collate-changelog: {args.version} section already present in {CHANGELOG.name}, consuming leftover fragments", file=sys.stderr)
+        # Rerun after a partial failure: only consume fragments whose content
+        # already made it into the changelog. A fragment that landed AFTER the
+        # failed run is folded nowhere -- unlinking it would silently lose its
+        # release note, so keep it and refuse loudly instead.
+        print(f"collate-changelog: {args.version} section already present in {CHANGELOG.name}, consuming folded leftover fragments", file=sys.stderr)
+        unfolded: list[Path] = []
         for path in consumed:
-            path.unlink()
-        print(f"collate-changelog: consumed {len(consumed)} leftover fragment(s) for {args.version}")
+            lines = [ln for section_lines in parse_fragment(path).values() for ln in section_lines]
+            if all(ln in text for ln in lines):
+                path.unlink()
+            else:
+                unfolded.append(path)
+        print(f"collate-changelog: consumed {len(consumed) - len(unfolded)} leftover fragment(s) for {args.version}")
+        if unfolded:
+            for path in unfolded:
+                print(f"collate-changelog: {path.name} is not folded into {CHANGELOG.name} -- kept; rerun with the correct target version", file=sys.stderr)
+            return 1
         return 0
 
     # Insert directly BELOW [Unreleased] so Unreleased stays empty and on top,
