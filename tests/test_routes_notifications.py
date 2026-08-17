@@ -121,3 +121,15 @@ class TestNotificationCreateRoutes:
         assert created["source"] == "review-request"
         assert created["data"] == {"pr": 42}
         assert created["read"] is False
+
+    async def test_admin_create_rejects_invalid_level(self, client):
+        """POST /api/notifications with an unknown level is rejected with 400."""
+        resp = await client.post(
+            "/api/notifications",
+            json={
+                "title": "bad level",
+                "message": "should not be stored",
+                "level": "bogus",
+            },
+        )
+        assert resp.status_code == 400
