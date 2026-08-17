@@ -35,6 +35,7 @@ from tinyagentos.catalog.resolver import (
 from tinyagentos.cluster.capabilities import hardware_to_targets
 from tinyagentos.installers.base import get_installer
 from tinyagentos.installers.lxc_installer import LXCInstaller
+from tinyagentos.installers.ollama_installer import resolve_ollama_url
 from tinyagentos.task_utils import _create_supervised_task
 
 logger = logging.getLogger(__name__)
@@ -1076,7 +1077,7 @@ async def install_app(request: Request):
         )
     model_installer = get_installer(
         install_method,
-        **({"host": "http://localhost:7836"} if result.backend_id == "hailo-ollama" else {}),
+        **({"host": resolve_ollama_url(target_remote, result.backend_id)} if install_method == "ollama" else {}),
     )
     install_config = dict(getattr(manifest, "install", None) or {})
     install_config["backend"] = result.backend_id
