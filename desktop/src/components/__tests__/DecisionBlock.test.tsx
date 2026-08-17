@@ -556,49 +556,41 @@ describe("DecisionBlock", () => {
 
   it("409 path triggers a refetch so block flips to answered state", async () => {
     // --- Open decision with single option ---
+    // The GET mock MUST be request-ordered: the first GET (initial load)
+    // returns the pending decision so the option button is live and the
+    // POST actually runs; only the post-409 refetch returns the answered
+    // state. A url-matched mock that returned "answered" for every GET made
+    // this test pass without ever exercising conflict recovery.
+    const pendingDec1 = {
+      ...baseDecision,
+      id: "dec-1",
+      question: "Pick a framework",
+      type: "single_select",
+      options: [
+        { label: "React", value: "react" },
+        { label: "Vue", value: "vue" },
+      ],
+      context: "ui library",
+      status: "pending",
+      answer: null,
+      created_at: 1700000000,
+    };
+    const answeredDec1 = {
+      ...pendingDec1,
+      status: "answered",
+      answer: { value: "react", answered_by: "jay", answered_at: 1700000100 },
+    };
+    let decisionGets = 0;
     const fetchMock = vi.fn().mockImplementation(async (req) => {
       const url = req.url ?? req;
       if (typeof url === "string" && url.endsWith("/answer")) {
         // Answer POST returns 409 (someone else answered first)
         return { status: 409, ok: false, json: async () => ({ error: "already answered" }) };
       }
-      if (typeof url === "string" && url.endsWith("/dec-1")) {
-        // Refetch GET returns answered state after 409 handling
-        return {
-          ok: true,
-          json: async () => ({
-            ...baseDecision,
-            id: "dec-1",
-            question: "Pick a framework",
-            type: "single_select",
-            options: [
-              { label: "React", value: "react" },
-              { label: "Vue", value: "vue" },
-            ],
-            context: "ui library",
-            status: "answered",
-            answer: { value: "react", answered_by: "jay", answered_at: 1700000100 },
-            created_at: 1700000000,
-          }),
-        };
-      }
-      // Initial decision fetch
+      decisionGets += 1;
       return {
         ok: true,
-        json: async () => ({
-          ...baseDecision,
-          id: "dec-1",
-          question: "Pick a framework",
-          type: "single_select",
-          options: [
-            { label: "React", value: "react" },
-            { label: "Vue", value: "vue" },
-          ],
-          context: "ui library",
-          status: "pending",
-          answer: null,
-          created_at: 1700000000,
-        }),
+        json: async () => (decisionGets === 1 ? pendingDec1 : answeredDec1),
       };
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -624,6 +616,65 @@ describe("DecisionBlock", () => {
     await waitFor(() => {
       expect(container.textContent).toContain("answered: React");
       expect(container.textContent).not.toContain("open");
+    });
+
+    // The POST must actually have run -- guards against the block starting
+    // out answered (disabled button, no-op click, vacuous pass).
+    const answerCalls = fetchMock.mock.calls.filter(([req]) => {
+      const url = req.url ?? req;
+      return typeof url === "string" && url.endsWith("/answer");
+    });
+    expect(answerCalls.length).toBe(1);
+  });
+
+  it("shows the conflict fallback when the 409 refetch rejects", async () => {
+    const pendingDec2 = {
+      ...baseDecision,
+      id: "dec-2",
+      question: "Pick a framework",
+      type: "single_select",
+      options: [
+        { label: "React", value: "react" },
+        { label: "Vue", value: "vue" },
+      ],
+      context: "ui library",
+      status: "pending",
+      answer: null,
+      created_at: 1700000000,
+    };
+    let decisionGets = 0;
+    const fetchMock = vi.fn().mockImplementation(async (req) => {
+      const url = req.url ?? req;
+      if (typeof url === "string" && url.endsWith("/answer")) {
+        return { status: 409, ok: false, json: async () => ({ error: "already answered" }) };
+      }
+      decisionGets += 1;
+      if (decisionGets === 1) {
+        return { ok: true, json: async () => pendingDec2 };
+      }
+      // Post-409 refetch dies on the network: the user must still learn
+      // their answer lost the race, not see a generic "Failed to answer".
+      throw new TypeError("network down");
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const block: DecisionContentBlock = {
+      kind: "decision",
+      decision_id: "dec-2",
+    };
+    const { container } = render(<DecisionBlock block={block} />);
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-decision-block="true"]')).not.toBeNull();
+    });
+
+    const button = container.querySelector('button');
+    fireEvent.click(button);
+
+    await waitFor(() => {
+      const alert = container.querySelector('[role="alert"]');
+      expect(alert).not.toBeNull();
+      expect(alert.textContent).toContain("already answered");
     });
   });
 });

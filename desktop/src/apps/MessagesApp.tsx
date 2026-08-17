@@ -553,15 +553,22 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
         const detail = data?.error ?? data?.detail;
         // 409 = someone else answered first; refetch so the block flips to answered
         if (res.status === 409) {
-          const updatedRes = await fetch(`/api/decisions/${decision.id}`);
-          if (updatedRes.ok) {
-            const updated = await updatedRes.json();
-            setDecision(updated as DecisionData);
-          } else {
-            setAnswerError(
-              "This decision was already answered -- refresh to see the outcome",
-            );
+          // The refetch itself can fail (network reject, invalid JSON) --
+          // fall through to the conflict fallback rather than surfacing a
+          // generic "Failed to answer" for an answer that someone else won.
+          try {
+            const updatedRes = await fetch(`/api/decisions/${decision.id}`);
+            if (updatedRes.ok) {
+              const updated = await updatedRes.json();
+              setDecision(updated as DecisionData);
+              return;
+            }
+          } catch {
+            // fall through
           }
+          setAnswerError(
+            "This decision was already answered -- refresh to see the outcome",
+          );
           return;
         }
         throw new Error(
@@ -716,11 +723,15 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
               <ChevronRight size={12} aria-hidden="true" /> Submit
             </button>
           </div>
-          {answerError && (
-            <div className="mt-2 text-[12px] text-red-400" role="alert">
-              {answerError}
-            </div>
-          )}
+        </div>
+      )}
+
+      {/* submission errors: one shared alert region for option and
+          free-text answers alike (option errors were invisible when this
+          lived inside the free_text branch) */}
+      {answerError && (
+        <div className="mt-2 px-3 text-[12px] text-red-400" role="alert">
+          {answerError}
         </div>
       )}
 
