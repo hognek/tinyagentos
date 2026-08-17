@@ -61,7 +61,6 @@ class NotificationStore(BaseStore):
         "training.complete", "training.failed", "app.installed", "app.failed",
         "disk_quota", "task.claimed", "task.closed",
     ]
-    _DEFAULT_MUTED: set[str] = set()
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)

@@ -4,7 +4,7 @@ from tinyagentos.notifications import NotificationStore
 
 
 @pytest.mark.asyncio
-async def test_get_prefs_returns_all_event_types_with_correct_defaults(client):
+async def test_get_prefs_returns_all_event_types_default_unmuted(client):
     r = await client.get("/api/notifications/prefs")
     assert r.status_code == 200
     prefs = r.json()
