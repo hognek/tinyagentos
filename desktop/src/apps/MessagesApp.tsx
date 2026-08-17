@@ -2071,7 +2071,14 @@ export function MessagesApp({
   const workingSlugs = new Set(typingAgents.map((a) => a.slug));
   const agentPresence = buildAgentPresence(
     dmSections,
-    [...grouped.topic, ...grouped.group],
+    // Bound channels from all three buckets: standalone-mode project
+    // channels are excluded from `grouped`, so include them explicitly or
+    // a working bound project channel renders no dot.
+    [
+      ...grouped.topic,
+      ...grouped.group,
+      ...projectGroups.flatMap((g) => g.channels),
+    ],
     workingSlugs,
   );
 

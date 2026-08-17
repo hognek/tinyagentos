@@ -346,6 +346,7 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
           onSelectChannel={onSelectChannel}
           unread={unread}
           scope={scope}
+          agentPresence={agentPresence}
         />
 
         {/* Archived channels — mobile */}
@@ -552,7 +553,11 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                           }}
                         />
                       )}
-                      {ch.name}
+                      <span className="truncate flex-1">{ch.name}</span>
+                      {(() => {
+                        const presence = agentPresence[ch.id];
+                        return presence ? <PresenceDot presence={presence} /> : null;
+                      })()}
                     </button>
                   ))}
                 </div>
@@ -723,6 +728,7 @@ function ProjectsSectionMobile({
   onSelectChannel,
   unread,
   scope,
+  agentPresence,
 }: {
   projectGroups: ProjectGroup[];
   projectsExpanded: boolean;
@@ -733,6 +739,7 @@ function ProjectsSectionMobile({
   onSelectChannel: (id: string) => void;
   unread: Record<string, number>;
   scope?: { projectId?: string };
+  agentPresence: Record<string, AgentPresence>;
 }) {
   if (scope?.projectId || projectGroups.length === 0) return null;
 
@@ -879,6 +886,10 @@ function ProjectsSectionMobile({
                       >
                         {ch.name}
                       </span>
+                      {(() => {
+                        const presence = agentPresence[ch.id];
+                        return presence ? <PresenceDot presence={presence} /> : null;
+                      })()}
                       {(unread[ch.id] ?? 0) > 0 && (
                         <span
                           style={{

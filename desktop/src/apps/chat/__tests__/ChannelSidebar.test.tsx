@@ -572,6 +572,38 @@ describe("ChannelSidebar — projects", () => {
     expect(screen.getByText(/Projects/)).toBeInTheDocument();
   });
 
+  it("shows a working dot on a working bound project channel (desktop)", () => {
+    render(
+      <ChannelSidebar
+        {...buildProps({
+          projectGroups: [projectGroup],
+          agentPresence: { "pc-1": "working" },
+        })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: "Channel proj-general" });
+    const dot = btn.querySelector(".taos-status-pulse");
+    expect(dot).toBeTruthy();
+    expect(dot).toHaveClass("bg-amber-400");
+  });
+
+  it("shows a working dot on a working bound project channel (mobile)", () => {
+    render(
+      <ChannelSidebar
+        {...buildProps({
+          isMobile: true,
+          projectGroups: [projectGroup],
+          projectsExpanded: true,
+          agentPresence: { "pc-1": "working" },
+        })}
+      />,
+    );
+    const btn = screen.getByRole("button", { name: "Channel proj-general" });
+    const dot = btn.querySelector(".taos-status-pulse");
+    expect(dot).toBeTruthy();
+    expect(dot).toHaveClass("bg-amber-400");
+  });
+
   it("calls onToggleProjects on mobile Projects header click", () => {
     const onToggleProjects = vi.fn();
     render(
