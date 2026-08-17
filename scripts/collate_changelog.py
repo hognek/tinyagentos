@@ -114,10 +114,17 @@ def main(argv: list[str]) -> int:
         # failed run is folded nowhere -- unlinking it would silently lose its
         # release note, so keep it and refuse loudly instead.
         print(f"collate-changelog: {args.version} section already present in {CHANGELOG.name}, consuming folded leftover fragments", file=sys.stderr)
+        # Match against ONLY the target version's section. A bullet that happens
+        # to also appear under an OLDER release must not count as folded --
+        # unlinking on a whole-file match would silently lose the new note,
+        # which is the exact class this branch exists to prevent.
+        start = text.index(version_header)
+        next_header = text.find("\n## [", start + len(version_header))
+        section_text = text[start:] if next_header == -1 else text[start:next_header]
         unfolded: list[Path] = []
         for path in consumed:
             lines = [ln for section_lines in parse_fragment(path).values() for ln in section_lines]
-            if all(ln in text for ln in lines):
+            if all(ln in section_text for ln in lines):
                 path.unlink()
             else:
                 unfolded.append(path)

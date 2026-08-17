@@ -191,3 +191,42 @@ def test_rerun_keeps_fragment_that_landed_after_the_partial_failure(repo: Path, 
     assert text.count("## [1.0.0-beta.47]") == 1
     # And the rerun says NO loudly instead of pretending it consumed cleanly.
     assert rc == 1
+
+
+def test_rerun_keeps_unfolded_fragment_whose_text_matches_an_older_release(repo: Path, monkeypatch):
+    """A late-landing fragment whose bullet also exists under an OLDER release.
+
+    The rerun's folded-check must scope its match to the target version's
+    section: a whole-file match sees the older release's identical bullet,
+    counts the fragment as folded, and unlinks it -- silently losing the new
+    release note.
+    """
+    mod = _load(repo)
+    (repo / "changelog.d" / "2291-notes.md").write_text("- Notes area (#2291).\n", encoding="utf-8")
+
+    fail_once = True
+    import pathlib
+
+    _real_unlink = pathlib.Path.unlink
+
+    def fake_unlink(self):
+        nonlocal fail_once
+        if fail_once:
+            fail_once = False
+            raise OSError("simulated unlink failure")
+        _real_unlink(self)
+
+    monkeypatch.setattr(pathlib.Path, "unlink", fake_unlink)
+
+    with pytest.raises(OSError, match="simulated unlink failure"):
+        mod.main(["1.0.0-beta.47", "--date", "2026-08-05"])
+
+    # A new PR merges a fragment whose text duplicates a bullet ALREADY present
+    # in the older 1.0.0-beta.46 section of the fixture changelog.
+    (repo / "changelog.d" / "2299-new.md").write_text("- older thing (#1).\n", encoding="utf-8")
+
+    rc = mod.main(["1.0.0-beta.47", "--date", "2026-08-05"])
+
+    # The unfolded fragment survives and the rerun refuses loudly.
+    assert (repo / "changelog.d" / "2299-new.md").exists()
+    assert rc == 1
