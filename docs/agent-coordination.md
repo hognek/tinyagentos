@@ -414,6 +414,20 @@ not resolve that 409 by minting a second identity: canonical ids are issued once
 per agent (`{slug}-{YYYYMMDD}-{HHMMSS}`), and a duplicate splits the agent's
 memory and grants across two ids that never reconcile.
 
+The collision guard is not blind to internal handles. Internal driver agents are
+seeded with their raw sigilled handle (`@taOSmd-dev`, `@Hermes`, ...) while the
+consent-approve path registers the slugified claim (`taosmd-dev`, `hermes`), so
+an exact lookup on the slug misses an active internal row that holds the same
+logical handle. The guard therefore chains an exact-then-normalised handle lookup;
+an external-selfjoin approval that collides (via the normalised handle) with an
+identity owned by a foreign origin (`taos-internal` or `taos-deployed`) fails
+closed with **409** instead of reusing that identity's `canonical_id`. A token
+minted for an internal driver id from an unauthenticated consent claim would be a
+straight impersonation of that driver, so the requester must pick a different
+`identity_claim`. A genuine same-origin re-approval (an already-active
+external-selfjoin handle) still reuses the identity per the multi-project rule
+above.
+
 Reserved name prefixes: registration rejects any name whose slug is or starts
 with `user-`, `human-`, `admin-` or `taos-` (including casing, spacing and
 punctuation obfuscations like `U s e r`), so an external agent cannot mint an
