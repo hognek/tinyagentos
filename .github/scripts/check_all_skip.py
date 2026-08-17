@@ -14,6 +14,24 @@ import sys
 from pathlib import Path
 
 
+def resolve_base_ref(base_ref: str) -> str:
+    """Resolve base_ref to a revision that exists in this checkout.
+
+    In Actions, github.event.pull_request.base.ref is a bare branch name
+    ("dev"); the runner checkout has it only as origin/dev.
+    """
+    for candidate in (base_ref, f"origin/{base_ref}"):
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{candidate}^{{commit}}"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return candidate
+    print(f"::error::base ref {base_ref!r} not found (tried {base_ref!r} and 'origin/{base_ref}')")
+    sys.exit(1)
+
+
 def find_changed_test_files(base_ref: str) -> list[str]:
     """Return test files (test_*.py) changed between base_ref and HEAD."""
     # git diff --name-only <base>..HEAD
@@ -205,6 +223,7 @@ def main() -> int:
         # Default to origin/dev if we can't determine
         base_ref = "origin/dev"
 
+    base_ref = resolve_base_ref(base_ref)
     print(f"Using base reference: {base_ref}")
 
     # Find changed test files
