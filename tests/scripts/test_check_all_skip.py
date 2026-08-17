@@ -138,6 +138,41 @@ class TestMainZeroCollectedWithDefinedTests:
         assert "has 0 test outcomes, skipping check" in captured.out
 
 
+    def test_zero_collected_summary_names_violation(
+        self, check_mod, tmp_path: Path, capsys: pytest.CaptureFixture
+    ) -> None:
+        test_file = tmp_path / "test_zc.py"
+        test_file.write_text(
+            "class TestSomething:\n"
+            "    def __init__(self):\n"
+            "        pass\n"
+            "    def test_a(self):\n"
+            "        assert True\n"
+            "    def test_b(self):\n"
+            "        assert True\n"
+        )
+        results = {
+            str(test_file): {
+                "total": 0,
+                "skipped": 0,
+                "passed": 0,
+                "failed": 0,
+                "import_guards": [],
+                "defined_tests": check_mod._count_defined_tests(str(test_file)),
+            }
+        }
+        with patch.object(check_mod, "resolve_base_ref", return_value="origin/dev"):
+            with patch.object(check_mod, "get_test_outcomes", return_value=results):
+                with patch.object(check_mod, "find_changed_test_files", return_value=[str(test_file)]):
+                    with patch.object(check_mod, "get_pr_body", return_value=""):
+                        with patch.object(check_mod.os, "environ", {"BASE_REF": "origin/dev"}):
+                            rc = check_mod.main()
+        captured = capsys.readouterr()
+        assert rc == 1
+        assert "collection yielded 0 of 2 defined tests" in captured.out
+        assert "yielded no collected tests" in captured.out
+
+
 class TestMainAllSkipStillFails:
     def test_all_skips_is_violation(self, check_mod, capsys: pytest.CaptureFixture) -> None:
         results = {
