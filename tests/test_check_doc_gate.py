@@ -224,6 +224,68 @@ class TestEvaluateRulesRenameCopy:
         assert failures == []
 
 
+class TestParseNameStatus:
+    """Parser-level tests for _parse_name_status.
+
+    These tests feed literal multi-line name-status output STRINGS to
+    _parse_name_status (no git repo, no filesystem changes needed). They
+    pin the parser's behaviour so a regression (keeping the full R100 token
+    or taking parts[1] instead of parts[-1]) breaks them immediately.
+    """
+
+    def test_r100_rename(self):
+        """R100<TAB>old/path.py<TAB>new/path.py -> ('R', 'new/path.py')."""
+        output = "R100\told/path.py\tnew/path.py"
+        changed = _MOD._parse_name_status(output)
+        assert changed == [("R", "new/path.py")]
+
+    def test_c75_copy(self):
+        """C75<TAB>src.md<TAB>copy.md -> ('C', 'copy.md')."""
+        output = "C75\tsrc.md\tcopy.md"
+        changed = _MOD._parse_name_status(output)
+        assert changed == [("C", "copy.md")]
+
+    def test_m_single_path(self):
+        """Plain M<TAB>path -> ('M', 'path')."""
+        output = "M\ttinyagentos/routes/themes.py"
+        changed = _MOD._parse_name_status(output)
+        assert changed == [("M", "tinyagentos/routes/themes.py")]
+
+    def test_a_single_path(self):
+        """Plain A<TAB>path -> ('A', 'path')."""
+        output = "A\tsome/file.py"
+        changed = _MOD._parse_name_status(output)
+        assert changed == [("A", "some/file.py")]
+
+    def test_d_single_path(self):
+        """Plain D<TAB>path -> ('D', 'path')."""
+        output = "D\tdeleted/file.py"
+        changed = _MOD._parse_name_status(output)
+        assert changed == [("D", "deleted/file.py")]
+
+    def test_blank_lines_skipped(self):
+        """Blank lines in input are skipped."""
+        output = "\nR100\told.py\tnew.py\n\nA\tfile.py\n"
+        changed = _MOD._parse_name_status(output)
+        assert changed == [("R", "new.py"), ("A", "file.py")]
+
+    def test_composed_r_status_red(self):
+        """Mixed block: R-status when_changed hit with no doc goes RED.
+
+        Parses a realistic mixed name-status block, pipes the result through
+        evaluate_rules, and asserts an R-status change matching a when_changed
+        rule hits a failure (no doc added, no trailer).
+        """
+        config = _base_config()
+        # R rename where the new path matches the rule's when_changed,
+        # plus an unrelated M change.
+        output = "R100\told/routes.py\ttinyagentos/routes/themes.py\nM\tother/file.py\n"
+        changed = _MOD._parse_name_status(output)
+        failures = evaluate_rules(changed, [], config)
+        assert len(failures) == 1
+        assert "test_route" in failures[0]
+
+
 class TestReferencedPathsScan:
     """Invariants layer: glob expansion, tombstones, extractor precision."""
 
