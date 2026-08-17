@@ -61,8 +61,8 @@ export interface ChannelSidebarProps {
   onSelectBusChannel: (channel: string) => void;
   /** Relative time formatter. */
   formatRelativeTime: (ts: number | string, nowMs: number) => string;
-   /** Per-channel agent presence: "live" | "working" | "idle", keyed by channel id. */
-   agentPresence: Record<string, AgentPresence>;
+  /** Per-channel agent presence: "live" | "working" | "idle", keyed by channel id. */
+  agentPresence: Record<string, AgentPresence>;
 }
 
 /* ------------------------------------------------------------------ */
@@ -97,9 +97,9 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
     bus,
     busSelected,
     onSelectBusChannel,
-     formatRelativeTime,
-     agentPresence,
-   } = props;
+    formatRelativeTime,
+    agentPresence,
+  } = props;
 
   if (isMobile) {
     return (
@@ -184,28 +184,28 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                               ? "Agent coordination — mention @<slug> to hand off."
                               : undefined
                           }
-                           style={{
-                             display: "flex",
-                             alignItems: "center",
-                             gap: 12,
-                             width: "100%",
-                             padding: "11px 14px",
-                             background:
-                               selectedChannel === ch.id
-                                 ? "var(--color-shell-surface-active)"
-                                 : "none",
-                             border: "none",
-                             borderLeft: selectedChannel === ch.id
-                               ? "3px solid var(--color-accent-line)"
-                               : "none",
-                             borderBottom:
-                               idx === arr.length - 1
-                                 ? "none"
-                                 : "1px solid var(--color-shell-border)",
-                             cursor: "pointer",
-                             color: "inherit",
-                             textAlign: "left" as const,
-                           }}
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 12,
+                            width: "100%",
+                            padding: "11px 14px",
+                            background:
+                              selectedChannel === ch.id
+                                ? "var(--color-shell-surface-active)"
+                                : "none",
+                            border: "none",
+                            borderLeft: selectedChannel === ch.id
+                              ? "3px solid var(--color-accent-line)"
+                              : "none",
+                            borderBottom:
+                              idx === arr.length - 1
+                                ? "none"
+                                : "1px solid var(--color-shell-border)",
+                            cursor: "pointer",
+                            color: "inherit",
+                            textAlign: "left" as const,
+                          }}
                         >
                           {agentMember ? (
                             <MessageAvatar
@@ -261,24 +261,24 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                                 gap: 8,
                               }}
                             >
-                               <span
-                                 style={{
-                                   flex: 1,
-                                   fontSize: 15,
-                                   fontWeight: count > 0 ? 700 : 600,
-                                   color: "var(--color-shell-text)",
-                                   overflow: "hidden",
-                                   textOverflow: "ellipsis",
-                                   whiteSpace: "nowrap",
-                                 }}
-                               >
-                                 {ch.name}
-                               </span>
-                                 {(() => {
-                                   const presence = agentPresence[ch.id];
-                                   return presence ? <PresenceDot presence={presence} /> : null;
-                                 })()}
-                               {ch.last_message_at && (
+                              <span
+                                style={{
+                                  flex: 1,
+                                  fontSize: 15,
+                                  fontWeight: count > 0 ? 700 : 600,
+                                  color: "var(--color-shell-text)",
+                                  overflow: "hidden",
+                                  textOverflow: "ellipsis",
+                                  whiteSpace: "nowrap",
+                                }}
+                              >
+                                {ch.name}
+                              </span>
+                                {(() => {
+                                  const presence = agentPresence[ch.id];
+                                  return presence ? <PresenceDot presence={presence} /> : null;
+                                })()}
+                              {ch.last_message_at && (
                                 <span
                                   style={{
                                     fontSize: 11,
@@ -449,43 +449,43 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                       : undefined;
                   const count = unread[ch.id] ?? 0;
                   return (
-                     <button
-                       key={ch.id}
-                       type="button"
-                       onClick={() => onSelectChannel(ch.id)}
-                       aria-pressed={selectedChannel === ch.id}
-                       className={`w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[10px] text-left transition-colors ${
-                         selectedChannel === ch.id
-                           ? "bg-shell-surface-active border-l-2 border-accent-line"
-                           : "hover:bg-shell-surface-hover"
-                       }`}
-                       aria-label={`Channel ${ch.name}`}
-                       title={
-                         isA2A
-                           ? "Agent coordination — mention @<slug> to hand off."
-                           : undefined
-                       }
-                     >
-                       {agentMember ? (
-                         <MessageAvatar
-                           size={30}
-                           authorId={agentMember}
-                           displayName={agentMember}
-                           kind="agent"
-                         />
-                       ) : isA2A ? (
-                         <span className="shrink-0 grid place-items-center w-[30px] h-[30px] rounded-[9px] bg-accent-soft border border-accent-line text-accent-strong">
-                           <Bot size={15} aria-hidden />
-                         </span>
-                       ) : (
-                         <span className="shrink-0 grid place-items-center w-[30px] h-[30px] rounded-[9px] bg-shell-surface-active text-shell-text-secondary">
-                           {ch.type === "group" ? (
-                             <Users size={15} aria-hidden />
-                           ) : (
-                             <Hash size={15} aria-hidden />
-                           )}
-                         </span>
-                       )}
+                    <button
+                      key={ch.id}
+                      type="button"
+                      onClick={() => onSelectChannel(ch.id)}
+                      aria-pressed={selectedChannel === ch.id}
+                      className={`w-full flex items-center gap-2.5 px-2.5 py-2 rounded-[10px] text-left transition-colors ${
+                        selectedChannel === ch.id
+                          ? "bg-shell-surface-active border-l-2 border-accent-line"
+                          : "hover:bg-shell-surface-hover"
+                      }`}
+                      aria-label={`Channel ${ch.name}`}
+                      title={
+                        isA2A
+                          ? "Agent coordination — mention @<slug> to hand off."
+                          : undefined
+                      }
+                    >
+                      {agentMember ? (
+                        <MessageAvatar
+                          size={30}
+                          authorId={agentMember}
+                          displayName={agentMember}
+                          kind="agent"
+                        />
+                      ) : isA2A ? (
+                        <span className="shrink-0 grid place-items-center w-[30px] h-[30px] rounded-[9px] bg-accent-soft border border-accent-line text-accent-strong">
+                          <Bot size={15} aria-hidden />
+                        </span>
+                      ) : (
+                        <span className="shrink-0 grid place-items-center w-[30px] h-[30px] rounded-[9px] bg-shell-surface-active text-shell-text-secondary">
+                          {ch.type === "group" ? (
+                            <Users size={15} aria-hidden />
+                          ) : (
+                            <Hash size={15} aria-hidden />
+                          )}
+                        </span>
+                      )}
                         <span
                           className={`truncate flex-1 text-[14px] tracking-tight ${
                             count > 0
@@ -495,11 +495,11 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                         >
                           {ch.name}
                         </span>
-                         {(() => {
-                           const presence = agentPresence[ch.id];
-                           return presence ? <PresenceDot presence={presence} /> : null;
-                         })()}
-                       {count > 0 && (
+                        {(() => {
+                          const presence = agentPresence[ch.id];
+                          return presence ? <PresenceDot presence={presence} /> : null;
+                        })()}
+                      {count > 0 && (
                         <span className="shrink-0 bg-unread text-white text-[10px] font-bold rounded-full min-w-[18px] h-[18px] flex items-center justify-center px-1 tabular-nums">
                           {count}
                         </span>
@@ -592,11 +592,11 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
 /* ------------------------------------------------------------------ */
 
 /**
- * Small status dot shown next to agent DM channel names in the sidebar.
- * - working: amber with a pulse animation (agent is actively generating).
- * - live:   emerald solid (agent is running and available).
- * - idle:   muted gray (agent is paused, stopped, or otherwise unavailable).
- */
+* Small status dot shown next to agent DM channel names in the sidebar.
+* - working: amber with a pulse animation (agent is actively generating).
+* - live:   emerald solid (agent is running and available).
+* - idle:   muted gray (agent is paused, stopped, or otherwise unavailable).
+*/
 function PresenceDot({ presence }: { presence: AgentPresence }) {
   const is = (presence === "live") ? (
     <span
