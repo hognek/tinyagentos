@@ -160,8 +160,14 @@ deps the project does not pin set `check_upgrade = false`.
 - Uses `uv sync --frozen` and `pytest -n auto`
 - Also required: `spa-build` (npm build + tsc + **vitest** - a desktop type error or failing
   component test fails CI), a "Verify app starts" `create_app` import smoke, `lint`
-  (`compileall`), and `cla`. The doc-gate, store-wiring gate, and bot-review gate are
-  separate workflows.
+  (`compileall`), and `cla`. The doc-gate, store-wiring gate, bot-review gate, and
+  distrust-green gate are separate workflows.
+- `check-all-skip` (`.github/workflows/distrust-green-gate.yml`, implementation in
+  `.github/scripts/check_all_skip.py`) fails a PR when a test file it adds or modifies
+  has tests and ALL of them skip (e.g. `pytest.importorskip` on a module that does not
+  exist yet) — green CI that asserts nothing. The failure names the file and the guard.
+  Landing tests ahead of code stays legal via an explicit waiver trailer in the PR body:
+  `Tests-Skipped-Intentionally: <file>, <why>`. Files with SOME skips pass (v1 scope).
 
 ## CLA - HUMAN signs
 
