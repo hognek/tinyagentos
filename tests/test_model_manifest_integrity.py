@@ -42,6 +42,14 @@ assert len(KNOWN_TARGETS) >= 6, (
 
 _SHA256_ALLOWLIST: set[str] = set()
 
+# Patterns that indicate a download_url points to a single shard of a sharded
+# model.  Variants whose download_url matches one of these patterns MUST also
+# declare hf_repo + multi_file: true so the installer fetches the full shard
+# set rather than a single fragment.
+_SHARDED_URL_PATTERNS = [
+    re.compile(r"model-\d+-of-\d+\.safetensors"),
+]
+
 # Known-fabricated sha256 placeholders that must never appear in a real
 # manifest.  This class of error has recurred twice (#2425, #2451) because
 # an LLM-generated placeholder digest looks hex-valid.  A denylist gate is
@@ -87,11 +95,20 @@ def test_model_manifests_are_resolvable_and_integrity_pinned():
                         errors.append(
                             f"{mid}/{vid}: backend {backend.get('id')!r} has unknown targets {unknown}"
                         )
-            # Rule 2: sha256 must be a 64-char lowercase hex string.  It must
-            # also not be a known-fabricated placeholder digest (denylist --
-            # this class has recurred twice and a prompt did not stop it).
+            # Rule 2: single-file variants must pin a content sha256 that is
+            # a 64-char lowercase hex string and not a known-fabricated
+            # placeholder digest (denylist -- this class has recurred twice
+            # and a prompt did not stop it).  multi-file variants must NOT
+            # carry a metadata hash under that key — they use file_set_hash.
+            multi_file = variant.get("multi_file") is True
             sha256 = variant.get("sha256")
-            if sha256 in _FABRICATED_SHA256_DENYLIST:
+            if multi_file:
+                if sha256 is not None:
+                    errors.append(
+                        f"{mid}/{vid}: multi_file variants must not declare sha256 "
+                        f"(use file_set_hash for metadata pin); got {sha256!r}"
+                    )
+            elif sha256 in _FABRICATED_SHA256_DENYLIST:
                 errors.append(
                     f"{mid}/{vid}: sha256 {sha256[:16]}... is a known-fabricated "
                     f"placeholder (blocked in PR #2425)"
@@ -101,12 +118,32 @@ def test_model_manifests_are_resolvable_and_integrity_pinned():
                     errors.append(
                         f"{mid}/{vid}: sha256 must be a 64-char lowercase hex string (got {sha256!r})"
                     )
+            # Rule 2b: multi_file variants must carry a 64-char lowercase
+            # hex file_set_hash (metadata hash, not content SHA256).
+            if multi_file:
+                file_set_hash = variant.get("file_set_hash")
+                if not re.fullmatch(r"[0-9a-f]{64}", file_set_hash or ""):
+                    errors.append(
+                        f"{mid}/{vid}: multi_file variants require a 64-char "
+                        f"lowercase hex file_set_hash (got {file_set_hash!r})"
+                    )
             # Rule 3: download_url must be a non-empty https URL.
             url = variant.get("download_url", "")
             if not url or not url.startswith("https://"):
                 errors.append(
                     f"{mid}/{vid}: download_url must be a non-empty https URL (got {url!r})"
                 )
+            else:
+                for pat in _SHARDED_URL_PATTERNS:
+                    if pat.search(url):
+                        hf_repo = variant.get("hf_repo")
+                        multi_file = variant.get("multi_file") is True
+                        if not hf_repo or not multi_file:
+                            errors.append(
+                                f"{mid}/{vid}: sharded download_url {url!r} requires "
+                                f"hf_repo + multi_file: true"
+                            )
+                        break
             # Rule 4: size_mb must be a positive int.
             size_mb = variant.get("size_mb")
             if not isinstance(size_mb, int) or size_mb <= 0:
@@ -153,4 +190,105 @@ def test_model_manifests_are_resolvable_and_integrity_pinned():
                 )
     assert errors == [], (
         "model manifest integrity failures:\n" + "\n".join(errors)
+    )
+
+
+def test_paligemma_2_file_set_hash_recompute_matches():
+    """The manifest's file_set_hash must equal a recompute from the HF tree
+    listing at the pinned hf_revision. This catches stale/incorrect pins.
+    """
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from tinyagentos.installers.hf_multi_installer import _compute_combined_hash
+
+    manifest_path = (
+        Path(__file__).resolve().parent.parent
+        / "app-catalog" / "models" / "paligemma-2" / "manifest.yaml"
+    )
+    with open(manifest_path) as f:
+        manifest = yaml.safe_load(f)
+    variant = next(v for v in manifest["variants"] if v["id"] == "safetensors-224")
+    hf_repo = variant["hf_repo"]
+    hf_revision = variant["hf_revision"]
+    expected = variant["file_set_hash"]
+
+    fixture = {
+        "siblings": [
+            {"rfilename": ".gitattributes", "size": 1570},
+            {"rfilename": "README.md", "size": 27964},
+            {"rfilename": "config.json", "size": 1332},
+            {"rfilename": "generation_config.json", "size": 173},
+            {
+                "rfilename": "model-00001-of-00002.safetensors",
+                "size": 4993319560,
+                "lfs": {"sha256": "d66f653b186abdd1b3b092ac3d45efe94ddeda852615f8bf6766888e6ba7acc6"},
+            },
+            {
+                "rfilename": "model-00002-of-00002.safetensors",
+                "size": 1071263816,
+                "lfs": {"sha256": "94ab5acf581f2afb3fe558bf98152ec572e4d66c6180fce4dae825e3b8ef4a9a"},
+            },
+            {"rfilename": "model.safetensors.index.json", "size": 75145},
+            {"rfilename": "preprocessor_config.json", "size": 424},
+            {"rfilename": "special_tokens_map.json", "size": 733},
+            {
+                "rfilename": "tokenizer.json",
+                "size": 34600820,
+                "lfs": {"sha256": "172fab587d68c56b63eb3620057c62dfd15e503079ff7fce584692e3fd5bf4da"},
+            },
+            {"rfilename": "tokenizer_config.json", "size": 242593},
+        ]
+    }
+
+    def _stub_client(*_args, **_kwargs):
+        class _Resp:
+            def raise_for_status(self):
+                return None
+            def json(self):
+                return fixture
+        class _Client:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *_exc):
+                return False
+            async def get(self, *_a, **_kw):
+                return _Resp()
+            async def aclose(self):
+                return None
+        return _Client()
+
+    with patch("tinyagentos.installers.hf_multi_installer.httpx.AsyncClient", side_effect=_stub_client):
+        import asyncio
+
+        async def _fetch():
+            from tinyagentos.installers.hf_multi_installer import list_hf_repo_files
+            return await list_hf_repo_files(hf_repo, hf_revision)
+
+        files = asyncio.run(_fetch())
+
+    includes = variant.get("include_patterns") or []
+    excludes = [
+        ".gitattributes", "README.md", "LICENSE", "*.md", ".gitignore",
+    ]
+    import fnmatch
+    from pathlib import Path
+
+    selected = []
+    for f in files:
+        rfilename = f["rfilename"]
+        name = rfilename.lstrip("/")
+        if any(fnmatch.fnmatch(name, p) or fnmatch.fnmatch(Path(name).name, p) for p in excludes):
+            continue
+        if includes and not any(fnmatch.fnmatch(rfilename, p) for p in includes):
+            continue
+        selected.append(f)
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        target_dir = Path(tmp)
+        computed = _compute_combined_hash(target_dir, selected)
+
+    assert computed == expected, (
+        f"file_set_hash mismatch: manifest has {expected}, recompute gave {computed}"
     )

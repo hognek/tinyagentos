@@ -471,6 +471,27 @@ async def download_model(request: Request, body: DownloadRequest):
             "variant_id": body.variant_id,
         }
 
+    # Variants that declare multi_file: true must be installed through
+    # HFMultiInstaller so the full shard set is fetched from the HF repo.
+    # Routing them through the generic single-file download path would only
+    # pull the shard named in download_url and then fail the metadata hash
+    # check (file_set_hash is not a content SHA256).
+    if variant.get("multi_file") is True:
+        from tinyagentos.installers.hf_multi_installer import HFMultiInstaller
+
+        async def _install_and_record(on_progress):
+            return await HFMultiInstaller().install(
+                body.app_id, {}, variant=variant, on_progress=on_progress
+            )
+
+        dm.start_installer_task(download_id, _install_and_record)
+        return {
+            "status": "started",
+            "download_id": download_id,
+            "app_id": body.app_id,
+            "variant_id": body.variant_id,
+        }
+
     models_dir = _models_dir(request)
     fmt = variant.get("format", "bin")
     filename = f"{body.app_id}-{body.variant_id}.{fmt}"
