@@ -133,3 +133,19 @@ class TestNotificationCreateRoutes:
             },
         )
         assert resp.status_code == 400
+        listing = await client.get("/api/notifications")
+        assert all(n["title"] != "bad level" for n in listing.json())
+
+    async def test_admin_create_accepts_success_level(self, client):
+        """'success' is part of the canonical level set (see VALID_LEVELS in
+        tinyagentos/notifications.py; notify_user tool schema and the toast UI
+        both support it) and must not be rejected at the route boundary."""
+        resp = await client.post(
+            "/api/notifications",
+            json={
+                "title": "success level",
+                "message": "stored fine",
+                "level": "success",
+            },
+        )
+        assert resp.status_code == 200

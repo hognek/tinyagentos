@@ -8,6 +8,11 @@ from pathlib import Path
 
 from tinyagentos.base_store import BaseStore
 
+# Canonical notification level vocabulary — single source of truth.
+# The notify_user tool schema, the POST /api/notifications route, and the
+# desktop toast/archive renderers all consume this set.
+VALID_LEVELS = frozenset({"info", "success", "warning", "error"})
+
 logger = logging.getLogger(__name__)
 
 NOTIF_SCHEMA = """

@@ -8,12 +8,12 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, field_validator
 
+from tinyagentos.notifications import VALID_LEVELS
+
 from tinyagentos.auth import get_current_user
 from tinyagentos.routes.auth import _require_admin
 
 router = APIRouter()
-
-_VALID_LEVELS = frozenset({"info", "warning", "error"})
 
 
 def _format_ts(ts: int) -> str:
@@ -68,10 +68,10 @@ async def create_notification(request: Request, body: CreateNotificationRequest)
     ok, err = _require_admin(request)
     if not ok:
         return err
-    if body.level not in _VALID_LEVELS:
+    if body.level not in VALID_LEVELS:
         raise HTTPException(
             status_code=400,
-            detail=f"level must be one of {sorted(_VALID_LEVELS)}",
+            detail=f"level must be one of {sorted(VALID_LEVELS)}",
         )
     store = request.app.state.notifications
     await store.add(
