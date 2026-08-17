@@ -14,6 +14,7 @@ import {
 import { Button, Textarea } from "@/components/ui";
 import { ConsentActions } from "@/components/ConsentActions";
 import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
+import { useDecisionEventsStore } from "@/stores/decision-events-store";
 
 type DecisionType =
   | "single_select"
@@ -637,6 +638,17 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
   // reading for the loading placeholder.
   const refreshSilently = useCallback(() => load({ silent: true }), [load]);
   useRefreshOnFocus(refreshSilently);
+
+  // Live propagation: when a decision is answered from another surface (e.g.
+  // inline in chat), the SSE handler bumps answeredEpoch via the global event
+  // stream. Re-fetch the lists so the card moves from pending to archive
+  // without a refresh.
+  const answeredEpoch = useDecisionEventsStore((s) => s.answeredEpoch);
+  useEffect(() => {
+    if (answeredEpoch > 0) {
+      void refreshSilently();
+    }
+  }, [answeredEpoch, refreshSilently]);
 
   const answer = useCallback(
     async (id: string, value: string | string[], otherValue?: string, note?: string) => {
