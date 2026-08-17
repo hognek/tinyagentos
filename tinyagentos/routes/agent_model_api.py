@@ -95,9 +95,9 @@ async def chat_completions(request: Request):
     """OpenAI /v1/chat/completions for an agent-as-a-model.
 
     Enforces the consent contract: a valid key is required, and the requested
-    model must be one of the agents that key is consented for. Running the turn
-    through the agent's harness is the next slice (pending the seam choice), so a
-    contract-valid request returns 501 rather than a fabricated completion.
+    model must be one of the agents that key is consented for. The turn is then
+    driven through the agent's opencode host-server seam and returned as an
+    OpenAI ChatCompletion envelope.
 
     The body is parsed manually AFTER the auth check (not via a Pydantic
     parameter) for two reasons: auth must take precedence so an unauthenticated
@@ -147,9 +147,13 @@ async def chat_completions(request: Request):
     # agent's opencode server + LiteLLM virtual key -> one turn -> OpenAI shape).
     # The requested `model` is the agent_id; the host runs the taOS agent's
     # opencode server, so we resolve it the same way the chat endpoint does.
-    # `stream` must be an explicit JSON boolean; a string like "false" must
-    # NOT coerce to True (bool("false") is True). Kilo finding.
-    stream = body.get("stream") is True
+    # `stream` must be an explicit JSON boolean: a string like "false" must
+    # not coerce to True (bool("false") is True), and a non-bool must be
+    # rejected rather than silently degraded to non-streaming.
+    raw_stream = body.get("stream")
+    if raw_stream is not None and not isinstance(raw_stream, bool):
+        return _bad_request("'stream' must be a boolean")
+    stream = raw_stream is True
     try:
         reply_text = await _run_agent_turn(request.app.state, model, messages)
     except _BadRequest as e:

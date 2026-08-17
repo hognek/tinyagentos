@@ -7,6 +7,7 @@ app.state so opencode remembers conversation history across requests.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -60,6 +61,21 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
 
     Returns the running :class:`~tinyagentos.opencode_runtime.OpenCodeServer`.
     """
+    lock = getattr(app_state, "taos_opencode_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        app_state.taos_opencode_lock = lock
+
+    # The lock is held from the server-cache lookup through ensure_running():
+    # the existing-server check and the start are separated by several awaits
+    # (stopping other servers, prefs read, key mint), so without it two
+    # concurrent requests both observe `existing is None` and both start a
+    # server on the shared TAOS_OPENCODE_PORT.
+    async with lock:
+        return await _ensure_taos_opencode_server_locked(app_state, model)
+
+
+async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCodeServer:
     # Generate a stable per-process password once.
     if not getattr(app_state, "taos_opencode_password", None):
         app_state.taos_opencode_password = secrets.token_hex(16)

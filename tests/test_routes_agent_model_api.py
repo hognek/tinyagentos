@@ -99,6 +99,22 @@ async def test_chat_rejects_empty_messages(client):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stream", ["true", 1, "false", 0])
+async def test_chat_rejects_non_bool_stream(client, stream):
+    """`stream` must be an explicit JSON boolean; a string/number is rejected
+    with 400 rather than silently coerced to a non-streaming turn."""
+    store = client._transport.app.state.agent_model_keys
+    token, _ = await store.mint("u1", ["agent-a"], [])
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={**_chat_body(model="agent-a"), "stream": stream},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["message"] == "'stream' must be a boolean"
+
+
+@pytest.mark.asyncio
 async def test_chat_turn_returns_openai_envelope_with_mock(client, monkeypatch):
     """Turn slice: a consented request drives one turn and returns the OpenAI
     ChatCompletion shape. The opencode runtime is mocked so the test runs

@@ -113,7 +113,7 @@ class AgentModelKeyStore(BaseStore):
         if not agent_ids:
             raise ValueError("a consent key must grant at least one agent")
         for a in agent_ids:
-            if not _AGENT_ID_RE.match(a):
+            if not _AGENT_ID_RE.fullmatch(a):
                 raise ValueError(
                     f"agent_id {a!r} contains invalid characters; "
                     "only A-Z, a-z, 0-9, '.', '_', '-' are allowed"

@@ -62,7 +62,7 @@ New component: a streaming reverse proxy on the controller, `tinyagentos/routes/
 ```
 
 - `generate_litellm_config` rewrites `api_base` for **local GPU LLM backends** (`LOCAL_TYPES` that are GPU-bound on this host — ollama, rkllama, llama-cpp, vllm, hailo-ollama; set from `tinyagentos/providers/__init__.py:20-58`) from the backend URL to `http://127.0.0.1:{port}/gpu/{backend_name}` (change at `litellm_config.py:259-261`). Cloud providers and remote workers are never rewritten.
-- Controller-internal direct callers (benchmark runner, future agent-as-a-model execution) switch from raw `backend_url` to the gateway URL — or, when running in-process, call the queue API directly and skip the HTTP hop.
+- Controller-internal direct callers (benchmark runner, agent-as-a-model execution) switch from raw `backend_url` to the gateway URL — or, when running in-process, call the queue API directly and skip the HTTP hop.
 - The gateway parses the target model from the request body (`model` field — present on `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/api/pull`, `/api/embed`), admits through the queue, then streams the request/response bytes through unbuffered (same `X-Accel-Buffering: no` discipline as `tinyagentos/routes/event_stream.py:104-112`).
 - **Auth:** LiteLLM and internal callers present the local token (the same `data/.auth_local_token` the LiteLLM callback already reads, `litellm_callback.py:30-47`), passed via a per-model `extra_headers` entry in the generated LiteLLM config. The gateway path is not cookie-exempt; it accepts local-token bearer auth only.
 - Requests whose path has no model semantics (`/api/tags`, `/api/ps`, `/health`, `/api/version`) pass through with **zero** queue interaction.

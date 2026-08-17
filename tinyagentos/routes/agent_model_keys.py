@@ -32,7 +32,7 @@ _AGENT_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
 def _validate_agent_id(v: str) -> str:
-    if not _AGENT_ID_RE.match(v):
+    if not _AGENT_ID_RE.fullmatch(v):
         raise ValueError(
             f"agent_id {v!r} contains invalid characters; "
             "only A-Z, a-z, 0-9, '.', '_', '-' are allowed"

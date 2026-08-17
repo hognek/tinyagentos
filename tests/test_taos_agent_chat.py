@@ -572,6 +572,59 @@ async def test_ensure_server_rescope_failure_keeps_cached_server(tmp_path, monke
     assert len(spawned_cfgs) == 1
 
 
+@pytest.mark.asyncio
+async def test_ensure_server_serializes_concurrent_different_models(tmp_path, monkeypatch):
+    """Two concurrent requests for different models must not both start a
+    server on the shared TAOS_OPENCODE_PORT. Regression for the race where the
+    existing-server check and ensure_running are separated by several awaits,
+    so two requests could both observe `existing is None` and double-start
+    (and the stop-on-model-change path can then clobber a server the other is
+    still starting)."""
+    import tinyagentos.taos_agent_runtime as rt
+
+    alive = {"count": 0, "peak": 0}
+
+    class _FakeServer:
+        def __init__(self, cfg):
+            self._cfg = cfg
+        async def ensure_running(self, **kwargs):
+            alive["count"] += 1
+            alive["peak"] = max(alive["peak"], alive["count"])
+            await asyncio.sleep(0)  # widen the overlap window
+        async def stop(self):
+            alive["count"] -= 1
+        @property
+        def base_url(self):
+            return f"http://127.0.0.1:{self._cfg.port}"
+        def is_running(self):
+            return True
+
+    monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
+
+    async def _mint_key(*args, **kwargs):
+        # Yield here so both coroutines interleave at the key-mint await,
+        # before either caches a server — without the lock both then proceed
+        # to create a server on the shared port (peak alive == 2).
+        await asyncio.sleep(0)
+        return "sk-test"
+
+    mock_proxy = MagicMock()
+    mock_proxy.create_agent_key = _mint_key
+    mock_proxy.is_running.return_value = True
+
+    state = SimpleNamespace(data_dir=tmp_path, llm_proxy=mock_proxy)
+
+    await asyncio.gather(
+        rt.ensure_taos_opencode_server(state, "model-a"),
+        rt.ensure_taos_opencode_server(state, "model-b"),
+    )
+
+    assert alive["peak"] == 1, (
+        f"two servers started concurrently (peak alive={alive['peak']}); "
+        "the lifecycle must be serialized by the app-state lock"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Degraded-birth detection and self-heal
 # ---------------------------------------------------------------------------
