@@ -247,6 +247,86 @@ async def test_chat_missing_model_is_openai_shaped_400(client):
     assert resp.json()["error"]["type"] == "invalid_request_error"
 
 
+@pytest.mark.asyncio
+async def test_chat_multi_turn_forwards_full_history(client, monkeypatch):
+    """Two-turn conversation where turn 2 references turn 1 content: the full
+    history must reach drive_turn so the agent-visible prompt contains turn 1
+    (regression for the bug that forwarded only the last user message)."""
+    import tinyagentos.routes.agent_model_api as api
+
+    class _FakeServer:
+        base_url = "http://127.0.0.1:4188"
+
+    async def _fake_ensure(app_state, agent_id):
+        return _FakeServer()
+
+    captured: list[str] = []
+
+    async def _fake_drive_turn(text, trace_id, sink, *, base_url, model_id,
+                               model_provider_id="litellm", server_password=None,
+                               adapter_factory=None, turn_timeout=300.0):
+        captured.append(text)
+        sink({"kind": "final", "content": f"reply about {text}"})
+
+    monkeypatch.setattr(api, "ensure_taos_opencode_server", _fake_ensure)
+    monkeypatch.setattr(api, "drive_turn", _fake_drive_turn)
+
+    store = client._transport.app.state.agent_model_keys
+    token, _ = await store.mint("u1", ["agent-a"], [])
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "agent-a",
+            "messages": [
+                {"role": "user", "content": "turn 1: remember the word banana"},
+                {"role": "assistant", "content": "I will remember banana."},
+                {"role": "user", "content": "what fruit did I just tell you?"},
+            ],
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert len(captured) == 1
+    # Turn 1 content must be present in the agent-visible prompt.
+    assert "banana" in captured[0]
+    assert "what fruit did I just tell you?" in captured[0]
+
+
+@pytest.mark.asyncio
+async def test_chat_single_message_forwards_only_content(client, monkeypatch):
+    """Fresh-session path (no prior history): a single user message forwards
+    just the message text to drive_turn -- no context prefix, no history
+    wrapping -- preserving the single-turn behaviour."""
+    import tinyagentos.routes.agent_model_api as api
+
+    class _FakeServer:
+        base_url = "http://127.0.0.1:4188"
+
+    async def _fake_ensure(app_state, agent_id):
+        return _FakeServer()
+
+    captured: list[str] = []
+
+    async def _fake_drive_turn(text, trace_id, sink, *, base_url, model_id,
+                               model_provider_id="litellm", server_password=None,
+                               adapter_factory=None, turn_timeout=300.0):
+        captured.append(text)
+        sink({"kind": "final", "content": text})
+
+    monkeypatch.setattr(api, "ensure_taos_opencode_server", _fake_ensure)
+    monkeypatch.setattr(api, "drive_turn", _fake_drive_turn)
+
+    store = client._transport.app.state.agent_model_keys
+    token, _ = await store.mint("u1", ["agent-a"], [])
+    resp = await client.post(
+        "/v1/chat/completions",
+        json={"model": "agent-a", "messages": [{"role": "user", "content": "hello"}]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    assert captured == ["hello"]
+
+
 # ---------------------------------------------------------------------------
 # Middleware passthrough (tsk-hfs6zv): an EXTERNAL client (no session cookie)
 # must reach the /v1 handlers, whose consent-key check is the credential.
