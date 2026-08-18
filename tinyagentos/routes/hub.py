@@ -534,19 +534,30 @@ async def block_peer(
     contacts_store = getattr(request.app.state, "contacts_store", None)
     if contacts_store is not None:
         try:
-            contact = await contacts_store.get_contact_by_fingerprint(peer)
-            cid = None
-            if contact:
-                cid = contact["contact_id"]
-                await contacts_store.revoke_peer_link(cid)
-            else:
+            # Resolve ALL contacts pinned to this fingerprint.  Legacy
+            # username-keyed rows (or a rename mid-flight) can leave several
+            # contacts sharing a fingerprint; revoke each one rather than
+            # silently picking the first.
+            contacts = await contacts_store.get_contacts_by_fingerprint(peer)
+            if not contacts:
                 logger.warning(
                     "hub block: could not resolve fingerprint %s to a "
                     "contact; peer link may still be active", peer,
                 )
-            # Mark the contact as blocked so the UI reflects the distinct
-            # status rather than leaving it at the prior accepted state.
-            if cid is not None:
+            for contact in contacts:
+                cid = contact["contact_id"]
+                revoked = await contacts_store.revoke_peer_link(cid)
+                if not revoked:
+                    # A revoke that matched no peer_link row must not be
+                    # silently treated as success — log it loudly so a
+                    # fail-open regression is visible.
+                    logger.warning(
+                        "hub block: revoke_peer_link matched no peer_link row "
+                        "for contact %s (fingerprint %s); link may already be "
+                        "absent or revoked", cid, peer,
+                    )
+                # Mark the contact as blocked so the UI reflects the distinct
+                # status rather than leaving it at the prior accepted state.
                 try:
                     await contacts_store.set_contact_status(cid, "blocked")
                 except Exception:
