@@ -170,6 +170,20 @@ def _validate_config(config: dict) -> None:
     for j, item in enumerate(ignore):
         if not isinstance(item, str):
             raise ValueError(f"invariants.ignore_tokens[{j}] must be a string")
+    required_sections = invariants.get("required_sections", [])
+    if not isinstance(required_sections, list):
+        raise ValueError("'invariants.required_sections' must be a list")
+    for i, entry in enumerate(required_sections):
+        if not isinstance(entry, dict):
+            raise ValueError(f"invariants.required_sections[{i}] must be a table")
+        if "doc" in entry and not isinstance(entry["doc"], str):
+            raise ValueError(f"invariants.required_sections[{i}].doc must be a string")
+        if "headings" in entry and not isinstance(entry["headings"], list):
+            raise ValueError(f"invariants.required_sections[{i}].headings must be a list")
+        elif "headings" in entry:
+            for j, item in enumerate(entry["headings"]):
+                if not isinstance(item, str):
+                    raise ValueError(f"invariants.required_sections[{i}].headings[{j}] must be a string")
 
 
 def check_referenced_paths(repo_root: Path, files_to_scan: list[str], config: dict) -> list[str]:
@@ -178,7 +192,7 @@ def check_referenced_paths(repo_root: Path, files_to_scan: list[str], config: di
     does not exist (e.g. a local-only, gitignored doc) is silently skipped
     rather than treated as a failure.
 
-    Scan entries may be globs (``docs/agent-manual/*.md``) — expanded against
+    Scan entries may be globs (``docs/agent-manual/*.md``) -- expanded against
     the working tree, so a newly added manual page or skill is scanned without
     a config edit. ``invariants.ignore_tokens`` lists tokens that are
     deliberate tombstones (docs that EXPLAIN a file was removed must be able
@@ -204,6 +218,37 @@ def check_referenced_paths(repo_root: Path, files_to_scan: list[str], config: di
                 continue
             if not (repo_root / token).exists():
                 failures.append(f"{rel} references '{token}' which does not exist in the repo")
+    return failures
+
+
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+
+
+def check_required_sections(repo_root: Path, config: dict) -> list[str]:
+    """Layer A: every doc listed in ``invariants.required_sections`` must
+    contain each of its required headings in the working tree.
+
+    A scan-target file that itself does not exist (e.g. a local-only,
+    gitignored doc) is silently skipped rather than treated as a failure.
+    """
+    failures: list[str] = []
+    for entry in config.get("invariants", {}).get("required_sections", []):
+        doc_rel = entry.get("doc", "")
+        required_headings = entry.get("headings", [])
+        doc_path = repo_root / doc_rel
+        if not doc_path.is_file():
+            continue
+        text = doc_path.read_text(encoding="utf-8", errors="ignore")
+        found_headings: set[str] = set()
+        for line in text.splitlines():
+            m = _HEADING_RE.match(line)
+            if m:
+                found_headings.add(m.group(2).strip())
+        for heading in required_headings:
+            if heading not in found_headings:
+                failures.append(
+                    f"{doc_rel} is missing required section: '{heading}'"
+                )
     return failures
 
 
@@ -432,6 +477,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "invariants":
         files_to_scan = config.get("invariants", {}).get("referenced_paths_scan", [])
         failures = check_referenced_paths(REPO_ROOT, files_to_scan, config)
+        failures.extend(check_required_sections(REPO_ROOT, config))
         return _report(failures)
 
     if args.command == "print-trailer":

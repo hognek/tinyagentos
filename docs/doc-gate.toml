@@ -39,6 +39,21 @@ referenced_paths_scan = [
 # name it without failing the gate forever.
 ignore_tokens = ["docs/STATUS.md"]
 
+[[invariants.required_sections]]
+doc = "docs/agent-coordination.md"
+headings = [
+    "Agent API surface (scoped registry JWT)",
+    "Device bearer self-service (second, narrower passthrough)",
+    "Share destinations (device bearer)",
+    "Requesting more scope for an existing identity (scope requests)",
+    "User resource sharing (share routes)",
+    "Project invite redeem route (link + PIN)",
+    "OS change-event stream (`GET /api/os/events`, session-only)",
+    "LoRA Studio routes (session-only, no agent scope)",
+    "What `GET /api/decisions/agent` returns (grant scoping)",
+    "Agent memory mode (deploy + `PATCH /api/agents/{slug}/memory`, session-only)",
+]
+
 [[rules]]
 name = "apps"
 when_changed = ["desktop/src/apps/*/**"]
