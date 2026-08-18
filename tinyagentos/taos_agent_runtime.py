@@ -12,7 +12,6 @@ import hashlib
 import logging
 import re
 import secrets
-import shutil
 from pathlib import Path
 
 from tinyagentos.litellm_config import get_litellm_master_key
@@ -121,10 +120,11 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
     if existing is None:
         # Stop-on-model-change: all per-model servers share TAOS_OPENCODE_PORT,
         # so only one can bind at a time. Stop any server for a different model
-        # before starting the new one.  Per-model home directories are cleaned
-        # up here so stale configs do not accumulate across model switches
-        # (CodeRabbit review, PR #2195).  Homes are NOT cleaned on ordinary
-        # app shutdown — that would discard conversation history.
+        # before starting the new one.  Home directories are NOT removed on
+        # model switch — the per-model home is the conversation store, and
+        # deleting it would discard history and force a multi-minute SQLite
+        # migration on the next start (the 180s deadline at ensure_running
+        # exists to absorb exactly that one-time migration).
         data_dir = getattr(app_state, "data_dir", None)
         for other_model, other_server in list(servers.items()):
             if other_model != model and other_server is not None:
@@ -139,16 +139,6 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
                 servers.pop(other_model, None)
                 sessions.pop(other_model, None)
                 born_degraded.pop(other_model, None)
-                # Clean up the old model's home directory on model switch.
-                if data_dir is not None:
-                    old_safe = _safe_path_component(other_model)
-                    old_home = data_dir / f"taos-agent-opencode-{old_safe}"
-                    try:
-                        shutil.rmtree(old_home, ignore_errors=True)
-                    except Exception:
-                        logger.debug(
-                            "taos_agent_runtime: error removing old home %s", old_home, exc_info=True
-                        )
         # Clear the legacy session id so the desktop chat path does not feed
         # a stale session from a now-stopped model to the new server.
         app_state.taos_opencode_session_id = None
@@ -247,13 +237,14 @@ async def stop_taos_opencode_server(app_state) -> None:
 
     Home directories are NOT removed here — this runs on every ordinary app
     shutdown; deleting homes would discard conversation history and force a
-    multi-minute SQLite migration on the next start.  Per-model home cleanup
-    only happens on model switch inside ensure_taos_opencode_server.
+    multi-minute SQLite migration on the next start.  Homes are likewise NOT
+    removed on model switch for the same reason: the per-model home is the
+    conversation store, and the switch path stops the server but keeps the home.
     """
     servers = getattr(app_state, "taos_opencode_servers", None)
     if not servers:
         return
-    for model, server in list(servers.items()):
+    for _model, server in list(servers.items()):
         if server is None:
             continue
         try:

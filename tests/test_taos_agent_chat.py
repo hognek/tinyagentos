@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -791,6 +792,68 @@ async def test_ensure_server_model_switch_clears_legacy_session_id(tmp_path, mon
     assert "gpt-4o" not in state.taos_opencode_servers
     assert "gpt-4o" not in state.taos_opencode_sessions
     assert "claude-sonnet" in state.taos_opencode_servers
+
+
+@pytest.mark.asyncio
+async def test_ensure_server_model_switch_preserves_home_directory(tmp_path, monkeypatch):
+    """Switching models stops the old server but must NOT delete the old
+    model's home directory. The per-model home IS the conversation store, so
+    deleting it on model switch discards history and re-pays the one-time SQLite
+    migration the 180s ensure_running deadline exists to absorb. Regression for
+    the stop-on-model-change path that previously ``shutil.rmtree``'d the
+    previous model's home."""
+    import tinyagentos.taos_agent_runtime as rt
+
+    spawned_cfgs: list = []
+
+    class _FakeServer:
+        def __init__(self, cfg):
+            spawned_cfgs.append(cfg)
+            self._cfg = cfg
+
+        async def ensure_running(self, **kwargs):
+            pass
+
+        async def stop(self):
+            pass
+
+        @property
+        def base_url(self):
+            return f"http://127.0.0.1:{self._cfg.port}"
+
+        def is_running(self):
+            return True
+
+    monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
+
+    mock_proxy = MagicMock()
+    mock_proxy.is_running.return_value = True
+    mock_proxy.create_agent_key = AsyncMock(return_value="sk-key-1")
+
+    state = SimpleNamespace(
+        data_dir=tmp_path,
+        llm_proxy=mock_proxy,
+        taos_opencode_password=None,
+        taos_opencode_server=None,
+        taos_opencode_model=None,
+        taos_opencode_session_id=None,
+    )
+
+    # Start model A, then drop a marker file into its home directory.
+    await rt.ensure_taos_opencode_server(state, "gpt-4o")
+    home_a = Path(spawned_cfgs[0].home)
+    home_a.mkdir(parents=True, exist_ok=True)
+    marker = home_a / "conversation-history.sqlite"
+    marker.write_text("precious conversation history")
+
+    # Switch to model B (stops A), then switch back to A.
+    await rt.ensure_taos_opencode_server(state, "claude-sonnet")
+    await rt.ensure_taos_opencode_server(state, "gpt-4o")
+
+    assert marker.exists(), (
+        "model A's home directory was deleted on model switch; the per-model "
+        "home is the conversation store and must survive a stop-on-model-change"
+    )
 
 
 # ---------------------------------------------------------------------------

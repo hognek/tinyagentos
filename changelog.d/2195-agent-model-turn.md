@@ -5,4 +5,4 @@
   OpenAI ChatCompletion envelope) instead of returning 501. Per-agent opencode
   server cache so concurrent agents do not churn a shared singleton. Missing
   user message returns 400 (not 502); `stream` requires an explicit JSON
-  boolean (#2176).
+  boolean (#2195).
