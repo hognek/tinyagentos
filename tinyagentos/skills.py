@@ -824,7 +824,7 @@ class SkillStore(BaseStore):
             # that would otherwise lose completion access.
             await self._db.execute(
                 """INSERT OR IGNORE INTO agent_skills (agent_id, skill_id, enabled, config)
-                   SELECT agent_id, ?, enabled, config
+                   SELECT agent_id, ?, enabled, '{}'
                    FROM agent_skills
                    WHERE skill_id = ?""",
                 (new_id, old_id),
