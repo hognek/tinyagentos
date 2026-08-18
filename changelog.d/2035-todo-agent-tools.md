@@ -1,6 +1,6 @@
 ### Added
 
-- Agent-accessible todo-list tools: `list_lists`, `list_list_items`, `add_todo`, `update_todo`, `delete_todo` (#2035).
+- Agent-accessible todo-list tools: `todo_list_lists`, `todo_add_item`, `todo_set_done` (#2035).
 
 ### Removed
 
