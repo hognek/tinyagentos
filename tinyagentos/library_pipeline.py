@@ -258,286 +258,6 @@ class PdfProcessor(Processor):
         return artifacts
 
 
-class YouTubeProcessor(Processor):
-    """YouTube URL processor — cheap tier: metadata, thumbnail, transcript, chapters.
-
-    Uses yt-dlp via the knowledge_fetchers.youtube module to fetch video
-    metadata and captions without downloading the video file. Produces
-    artifacts that flow into taosmd collections for agent querying.
-
-    The cheap tier (per the design doc, docs/design/library-app.md section 4)
-    covers steps 1-4: canonical link, title, channel, description, thumbnail,
-    duration, upload date, subtitles/transcript, chapters.
-    """
-
-    async def process(self, item: dict) -> list[dict]:
-        item_id = item["id"]
-        source_url = item.get("source_url", "")
-        artifacts: list[dict] = []
-
-        if not source_url:
-            return artifacts
-
-        # Only catch ImportError (missing yt-dlp).  Let fetch errors
-        # propagate so run_pipeline marks the item as "error" — a failed
-        # yt-dlp invocation must not silently look successful.
-        from tinyagentos.knowledge_fetchers.youtube import (
-            fetch,
-            format_timestamp,
-        )
-
-        media_dir = self.storage_dir / "youtube"
-        result = await fetch(source_url, media_dir=media_dir)
-
-        title = result.get("title", "")
-        if title and not item.get("title"):
-            await self.store.update_item(item_id, title=title)
-
-        meta = result.get("metadata", {})
-
-        # Update item meta_json with structured video metadata
-        stored_meta = json.loads(item.get("meta_json", "{}"))
-        stored_meta.update({
-            "video_id": meta.get("video_id", ""),
-            "channel": meta.get("channel", ""),
-            "duration": meta.get("duration"),
-            "views": meta.get("views"),
-            "upload_date": meta.get("upload_date", ""),
-        })
-        await self.store.update_item(item_id, meta_json=stored_meta)
-
-        # Artifact: metadata
-        await self.store.add_artifact(
-            item_id, kind="metadata", path=source_url, meta=meta,
-        )
-        artifacts.append({"kind": "metadata", "path": source_url, "meta": meta})
-
-        # Artifact: thumbnail (if downloaded)
-        thumbnail = result.get("thumbnail")
-        if thumbnail and Path(thumbnail).exists():
-            await self.store.add_artifact(
-                item_id, kind="thumbnail", path=thumbnail,
-                meta={"source": "youtube"},
-            )
-            artifacts.append({
-                "kind": "thumbnail", "path": thumbnail,
-                "meta": {"source": "youtube"},
-            })
-
-        # Artifact: transcript
-        content = result.get("content", "")
-        if content:
-            transcript_dir = self.storage_dir / "transcripts"
-            transcript_dir.mkdir(parents=True, exist_ok=True)
-            transcript_path = transcript_dir / f"{item_id}_transcript.txt"
-            transcript_path.write_text(content, encoding="utf-8")
-
-            transcript_meta = {
-                "char_count": len(content),
-                "language": "en",
-            }
-            await self.store.add_artifact(
-                item_id, kind="transcript", path=str(transcript_path),
-                meta=transcript_meta,
-            )
-            artifacts.append({
-                "kind": "transcript", "path": str(transcript_path),
-                "meta": transcript_meta,
-            })
-
-            # Store preview for item card
-            preview = content[:200]
-            stored_meta["preview"] = preview
-            await self.store.update_item(item_id, meta_json=stored_meta)
-
-        # Artifact: chapters (if available)
-        chapters = meta.get("chapters", [])
-        if chapters:
-            chapters_lines: list[str] = []
-            for ch in chapters:
-                ts = format_timestamp(ch.get("start_time", 0))
-                ch_title = ch.get("title", "")
-                chapters_lines.append(f"[{ts}] {ch_title}")
-
-            chapters_text = "\n".join(chapters_lines)
-            chapters_dir = self.storage_dir / "chapters"
-            chapters_dir.mkdir(parents=True, exist_ok=True)
-            chapters_path = chapters_dir / f"{item_id}_chapters.txt"
-            chapters_path.write_text(chapters_text, encoding="utf-8")
-
-            await self.store.add_artifact(
-                item_id, kind="chapters", path=str(chapters_path),
-                meta={"count": len(chapters)},
-            )
-            artifacts.append({
-                "kind": "chapters", "path": str(chapters_path),
-                "meta": {"count": len(chapters)},
-            })
-
-        return artifacts
-
-
-class WebProcessor(Processor):
-    """Generic web-page URL processor — extracts readable text from HTML.
-
-    Fetches the URL (SSRF-guarded against loopback/link-local/private hosts),
-    then extracts the main content using readability-lxml. Falls back to a
-    simple tag-stripping approach when readability-lxml is not installed.
-
-    Produces a text artifact suitable for taosmd collection indexing so that
-    agents granted the collection can query the page content.
-    """
-
-    async def process(self, item: dict) -> list[dict]:
-        item_id = item["id"]
-        source_url = item.get("source_url", "")
-        artifacts: list[dict] = []
-
-        if not source_url:
-            return artifacts
-
-        # Fetch the page (SSRF-guarded, redirect-safe, size-capped).
-        # Follows the same pattern as knowledge_ingest._download_article:
-        # disable auto-redirects, manually validate each hop against the
-        # SSRF blocklist, and cap total response bytes.
-        import httpx
-        from urllib.parse import urljoin
-
-        from tinyagentos.routes.desktop_browser.ssrf import (
-            SsrfBlockedError,
-            validate_url_or_raise,
-        )
-
-        _MAX_WEB_REDIRECTS = 5
-        _MAX_WEB_BYTES = 10 * 1024 * 1024  # 10 MB
-
-        current_url = source_url
-        resp = None
-        for _hop in range(_MAX_WEB_REDIRECTS + 1):
-            validate_url_or_raise(current_url)
-
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(30),
-                follow_redirects=False,
-            ) as client:
-                resp = await client.get(current_url)
-
-            if resp.is_redirect and resp.headers.get("location"):
-                current_url = urljoin(current_url, resp.headers["location"])
-                continue
-            break
-        else:
-            raise SsrfBlockedError(
-                f"too many redirects fetching {source_url!r}"
-            )
-
-        resp.raise_for_status()
-
-        # Read body with a size cap to avoid OOM on large/hostile pages.
-        body_chunks: list[bytes] = []
-        total = 0
-        async for chunk in resp.aiter_bytes(8192):
-            total += len(chunk)
-            if total > _MAX_WEB_BYTES:
-                raise ValueError(
-                    f"Response body exceeds {_MAX_WEB_BYTES} bytes "
-                    f"for {source_url!r}"
-                )
-            body_chunks.append(chunk)
-        html = b"".join(body_chunks).decode(
-            resp.encoding or "utf-8", errors="replace"
-        )
-
-        if not html:
-            return artifacts
-
-        # Extract readable text
-        content = _extract_readable_text(html, source_url)
-
-        # Extract title from <title> tag if item has no title
-        import html as _html_mod
-        title = item.get("title", "")
-        if not title or title == source_url:
-            import re
-            m = re.search(
-                r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE,
-            )
-            if m:
-                title = _html_mod.unescape(m.group(1)).strip()[:200]
-                await self.store.update_item(item_id, title=title)
-
-        # Artifact: metadata
-        page_meta = {
-            "char_count": len(content),
-            "content_type": resp.headers.get("content-type", ""),
-            "status_code": resp.status_code,
-        }
-        await self.store.add_artifact(
-            item_id, kind="metadata", path=source_url, meta=page_meta,
-        )
-        artifacts.append({
-            "kind": "metadata", "path": source_url, "meta": page_meta,
-        })
-
-        # Artifact: extracted text
-        if content:
-            text_dir = self.storage_dir / "text"
-            text_dir.mkdir(parents=True, exist_ok=True)
-            text_path = text_dir / f"{item_id}_web.txt"
-            text_path.write_text(content, encoding="utf-8")
-
-            text_meta = {
-                "char_count": len(content),
-                "source": "readability",
-            }
-            await self.store.add_artifact(
-                item_id, kind="text", path=str(text_path), meta=text_meta,
-            )
-            artifacts.append({
-                "kind": "text", "path": str(text_path), "meta": text_meta,
-            })
-
-            # Store preview
-            preview = content[:200]
-            stored_meta = json.loads(item.get("meta_json", "{}"))
-            stored_meta["preview"] = preview
-            await self.store.update_item(item_id, meta_json=stored_meta)
-
-        return artifacts
-
-
-def _extract_readable_text(html: str, source_url: str = "") -> str:
-    """Extract the main readable content from an HTML page.
-
-    Uses readability-lxml when available; falls back to simple tag-stripping.
-    """
-    try:
-        from readability import Document
-        doc = Document(html)
-        content = doc.summary()
-        # Strip remaining HTML from readability output
-        import re
-        text = re.sub(r"<[^>]+>", " ", content)
-        text = re.sub(r"\s+", " ", text).strip()
-        if len(text) >= 100:
-            return text
-    except ImportError:
-        logger.debug("readability-lxml not installed — using simple extractor")
-    except Exception:
-        logger.warning("readability extraction failed for %s", source_url,
-                       exc_info=True)
-
-    # Fallback: simple tag-stripping (from knowledge_ingest._extract_text_readability)
-    import re
-    cleaned = re.sub(
-        r"<(script|style)[^>]*>.*?</(script|style)>", "", html,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-    text = re.sub(r"<[^>]+>", " ", cleaned)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
 class ImageProcessor(Processor):
     """Image processor — records dimensions, creates thumbnail.
 
@@ -985,10 +705,19 @@ class HeavyDownloadProcessor(Processor):
 
         p = Path(path)
         if not p.exists():
-            # Try to find the downloaded file
-            candidates = sorted(
-                download_dir.glob("*"), key=lambda x: x.stat().st_mtime, reverse=True
-            )
+            # yt-dlp skips printing a Destination line when the file already
+            # exists, so fall back to locating it on disk.  Scope the search to
+            # THIS item's video id so concurrent downloads of different videos
+            # cannot cross-attribute each other's files.
+            stored_meta = json.loads(item.get("meta_json", "{}"))
+            video_id = stored_meta.get("video_id", "")
+            candidates: list[Path] = []
+            if video_id:
+                candidates = sorted(
+                    (c for c in download_dir.glob(f"{video_id}*") if c.is_file()),
+                    key=lambda x: x.stat().st_mtime,
+                    reverse=True,
+                )
             if candidates:
                 p = candidates[0]
             else:
@@ -1085,7 +814,17 @@ async def run_heavy_pipeline(
             return None
     except Exception:
         logger.exception("Heavy pipeline failed for item %s", item_id)
-        await store.update_item_status(item_id, "error")
+        # Heavy download is OPTIONAL — the item is already 'ready' from the
+        # cheap-tier ingest.  Do not flip it to 'error'; surface the failure on
+        # the heavy_download job instead (queryable via /download/status).
+        try:
+            jobs = await store.get_item_jobs(item_id)
+            if jobs:
+                await store.update_job(
+                    jobs[-1]["id"], state="error", error="Heavy download failed"
+                )
+        except Exception:
+            logger.exception("Failed to record heavy download error for %s", item_id)
         return None
 
 

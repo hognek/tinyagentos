@@ -15,11 +15,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Request, UploadFile, File, Form
-from fastapi.responses import JSONResponse, HTMLResponse
-from fastapi.templating import Jinja2Templates
-
-_TEMPLATES_DIR = Path(__file__).parent.parent / "templates"
-_templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+from fastapi.responses import JSONResponse
 
 from tinyagentos.library_pipeline import run_pipeline
 from tinyagentos.library_collections import handoff_to_collections
@@ -49,11 +45,7 @@ def _track_background_task(coro) -> asyncio.Task:
 
 
 # ---------------------------------------------------------------------------
-# App page
-# ---------------------------------------------------------------------------
 
-
-# ---------------------------------------------------------------------------
 
 def _library_dir_from_app(app) -> Path:
     """Return the library storage directory, creating it if needed."""
@@ -71,9 +63,25 @@ def _library_dir(request: Request) -> Path:
 
 
 async def _get_library_store(request: Request):
-    """Get the LibraryStore from app.state (lazily initialised)."""
+    """Get the LibraryStore from app.state (lazily initialised).
+
+    Uses an asyncio.Lock to close the TOCTOU race where two concurrent
+    requests both see ``store is None`` and both call ``LibraryStore(...)``.
+    """
     store = getattr(request.app.state, "library_store", None)
-    if store is None:
+    if store is not None:
+        return store
+
+    lock = getattr(request.app.state, "_library_store_init_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        request.app.state._library_store_init_lock = lock
+
+    async with lock:
+        store = getattr(request.app.state, "library_store", None)
+        if store is not None:
+            return store
+
         from tinyagentos.library_store import LibraryStore
 
         data_dir = getattr(request.app.state, "data_dir", None)
@@ -165,10 +173,6 @@ async def ingest(
     else:
         _create_supervised_task(coro, task_set)
 
-    if _is_htmx(request):
-        item = await store.get_item(item_id) or {}
-        return HTMLResponse(_render_item_card(item), status_code=202)
-
     return JSONResponse({"item_id": item_id, "status": "pending"}, status_code=202)
 
 
@@ -208,7 +212,30 @@ async def _ingest_task(app, item_id: str, store, storage_dir: Path) -> None:
     # Collections handoff after successful pipeline
     try:
         collections_dir = storage_dir.parent / "collections"
-        await handoff_to_collections(store, item_id, collections_dir)
+        config = getattr(app.state, "config", None)
+        taosmd_url = getattr(config, "memory_url", None) if config else None
+        taosmd_admin_token = None
+        secrets = getattr(app.state, "secrets", None)
+        if secrets:
+            secret = await secrets.get("taosmd-admin-token")
+            if secret:
+                taosmd_admin_token = secret["value"]
+        indexed = await handoff_to_collections(
+            store, item_id, collections_dir,
+            taosmd_url=taosmd_url,
+            taosmd_admin_token=taosmd_admin_token,
+        )
+        if indexed > 0:
+            logger.info(
+                "Collections handoff indexed %d file(s) for item %s",
+                indexed, item_id,
+            )
+        else:
+            logger.debug(
+                "Collections handoff indexed 0 files for item %s "
+                "(no text artifacts or taosmd unavailable)",
+                item_id,
+            )
     except Exception:
         logger.exception("Collections handoff failed for item %s", item_id)
 
@@ -234,151 +261,6 @@ def _detect_kind_from_url(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# HTMX helpers -- return HTML fragments when the HX-Request header is present
-# ---------------------------------------------------------------------------
-
-
-def _is_htmx(request: Request) -> bool:
-    """Return True when the request is from an HTMX component."""
-    return request.headers.get("HX-Request", "").lower() == "true"
-
-
-def _format_bytes(size: int) -> str:
-    """Format a byte count as a human-readable string."""
-    if size < 1024:
-        return f"{size} B"
-    for unit in ("KB", "MB", "GB", "TB"):
-        size /= 1024.0
-        if size < 1024 or unit == "TB":
-            return f"{size:.1f} {unit}"
-    return f"{size:.1f} TB"
-
-
-_STATUS_CSS: dict[str, str] = {
-    "pending": "status-pending",
-    "processing": "status-processing",
-    "ready": "status-ready",
-    "error": "status-error",
-}
-
-
-def _render_item_card(item: dict) -> str:
-    """Return an HTML .item-card <div> for *item*."""
-    import html
-
-    status = item.get("status", "pending")
-    css = _STATUS_CSS.get(status, "status-pending")
-    title = html.escape(item.get("title", "Untitled"))
-    kind = html.escape(item.get("kind", "file"))
-    bytes_val = item.get("bytes") or 0
-    size_str = _format_bytes(bytes_val) if bytes_val else ""
-    item_id = html.escape(item.get("id", ""))
-    source_url = html.escape(item.get("source_url", ""))
-    downloaded = bool(item.get("download_path", ""))
-
-    parts = [
-        f'<div class="item-card" id="item-{item_id}">',
-        f'<div class="info">',
-        f'<h3>{title}</h3>',
-        f'<div class="meta">',
-        f'<span class="status-badge {css}">{html.escape(status)}</span>',
-        f" {kind}",
-    ]
-
-    if size_str:
-        parts.append(f' &middot; <span class="item-size">{size_str}</span>')
-
-    parts.append("</div>")  # .meta
-
-    # YouTube download actions (only for url:youtube items, only when ready)
-    if kind == "url:youtube" and status == "ready" and not downloaded:
-        parts.append(
-            f'<div class="item-actions" style="margin-top:0.5rem">'
-            f'<select class="quality-select" id="quality-{item_id}" '
-            f'  style="font-size:0.8rem;padding:0.15rem 0.3rem">'
-            f'<option value="360">360p</option>'
-            f'<option value="480">480p</option>'
-            f'<option value="720" selected>720p</option>'
-            f'<option value="1080">1080p</option>'
-            f'<option value="best">Best</option>'
-            f'</select> '
-            f'<button class="outline secondary" style="font-size:0.8rem;padding:0.15rem 0.5rem"'
-            f'  hx-post="/api/library/items/{item_id}/download"'
-            f'  hx-include="#quality-{item_id}"'
-            f'  hx-target="#item-{item_id}"'
-            f'  hx-swap="outerHTML"'
-            f'  hx-indicator="#item-{item_id}">'
-            f'⬇ Download'
-            f'</button>'
-            f'</div>'
-        )
-    elif kind == "url:youtube" and downloaded:
-        download_bytes_val = item.get("download_bytes") or 0
-        parts.append(
-            f'<div class="item-actions" style="margin-top:0.5rem;font-size:0.8rem;color:var(--pico-muted-color)">'
-            f'✅ Downloaded ({_format_bytes(download_bytes_val)})'
-            f'</div>'
-        )
-
-    parts.append("</div>")  # .info
-    parts.append("</div>")  # .item-card
-
-    return "".join(parts)
-
-
-def _render_item_list(items: list[dict]) -> str:
-    """Return an HTML fragment wrapping .item-card elements or an empty state."""
-    if not items:
-        return (
-            '<div class="empty-state">'
-            "<p>No items yet. Drop a file or paste a URL above.</p>"
-            "</div>"
-        )
-    return "".join(_render_item_card(item) for item in items)
-
-
-def _render_rules_list(rules: list[dict]) -> str:
-    """Return an HTML fragment listing source rules."""
-    import html as _h
-
-    if not rules:
-        return '<small style="color:var(--pico-muted-color)">No rules. Add one above to auto-download from matching sources.</small>'
-
-    parts: list[str] = ['<ul style="list-style:none;padding:0;margin:0;font-size:0.85rem">']
-    for rule in rules:
-        rid = _h.escape(rule["id"])
-        pat = _h.escape(rule["source_pattern"])
-        qual = _h.escape(rule.get("quality", "720"))
-        auto = "auto" if rule.get("auto_download") else "manual"
-        parts.append(
-            f'<li style="padding:0.3rem 0;border-bottom:1px solid var(--pico-muted-border-color);display:flex;justify-content:space-between;align-items:center">'
-            f'<span><code>{pat}</code> ({qual}p, {auto})</span>'
-            f'<button class="outline secondary" style="font-size:0.7rem;padding:0.1rem 0.3rem"'
-            f'  hx-delete="/api/library/rules/{rid}"'
-            f'  hx-target="#rules-list"'
-            f'  hx-swap="innerHTML">'
-            f'✕</button>'
-            f'</li>'
-        )
-    parts.append("</ul>")
-    return "".join(parts)
-
-
-def _render_storage_summary(summary: dict) -> str:
-    """Return an HTML snippet for the storage summary bar."""
-    total_bytes = summary.get("total_bytes", 0)
-    total_count = summary.get("total_count", 0)
-    if not total_count:
-        return '<small>No items stored yet.</small>'
-
-    return (
-        f'<small>Library storage: {_format_bytes(total_bytes)} '
-        f'across {total_count} item{"s" if total_count != 1 else ""}'
-        f'</small>'
-    )
-
-
-# ---------------------------------------------------------------------------
 # List / Get / Delete
 # ---------------------------------------------------------------------------
 
@@ -394,10 +276,6 @@ async def list_items(
     """List library items, optionally filtered by kind or status."""
     store = await _get_library_store(request)
     items = await store.list_items(kind=kind, status=status, limit=limit, offset=offset)
-
-    if _is_htmx(request):
-        return HTMLResponse(_render_item_list(items))
-
     return {"items": items, "count": len(items)}
 
 
@@ -428,7 +306,8 @@ async def delete_item(request: Request, item_id: str):
         try:
             p.unlink()
         except OSError:
-            pass
+            logger.warning("Failed to remove storage file %s for item %s",
+                           storage_path, item_id)
 
     # Remove artifacts from disk
     artifacts = await store.get_artifacts(item_id)
@@ -438,7 +317,8 @@ async def delete_item(request: Request, item_id: str):
             try:
                 ap.unlink()
             except OSError:
-                pass
+                logger.warning("Failed to remove artifact %s for item %s",
+                               art_path, item_id)
 
     # Remove collections folder
     storage_dir = _library_dir(request)
@@ -448,7 +328,8 @@ async def delete_item(request: Request, item_id: str):
         try:
             shutil.rmtree(item_collection_dir)
         except OSError:
-            pass
+            logger.warning("Failed to remove collection dir %s for item %s",
+                           item_collection_dir, item_id)
 
     await store.delete_item(item_id)
     return {"status": "deleted", "item_id": item_id}
@@ -569,7 +450,9 @@ async def _heavy_download_task(
             logger.info("Heavy download complete for item %s: %s", item_id, result)
     except Exception:
         logger.exception("Heavy download crashed for item %s", item_id)
-        await store.update_item_status(item_id, "error")
+        # Heavy download is OPTIONAL — leave the item 'ready'.  The failure is
+        # surfaced through the heavy_download job state (run_heavy_pipeline
+        # records it) or via this log line.
 
 
 @router.get("/api/library/items/{item_id}/download/status")
@@ -624,10 +507,6 @@ async def list_rules(request: Request):
     """List all source rules."""
     store = await _get_library_store(request)
     rules = await store.list_rules()
-
-    if _is_htmx(request):
-        return HTMLResponse(_render_rules_list(rules))
-
     return {"rules": rules, "count": len(rules)}
 
 
@@ -653,8 +532,4 @@ async def storage_usage(request: Request):
     """Return storage accounting summary for the library."""
     store = await _get_library_store(request)
     summary = await store.get_storage_summary()
-
-    if _is_htmx(request):
-        return HTMLResponse(_render_storage_summary(summary))
-
     return summary
