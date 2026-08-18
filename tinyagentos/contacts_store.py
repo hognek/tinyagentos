@@ -217,6 +217,27 @@ class ContactsStore(BaseStore):
             columns = [desc[0] for desc in cursor.description]
         return _row_to_dict(columns, rows[0]) if rows else None
 
+    async def get_contacts_by_fingerprint(
+        self, peer_fingerprint: str
+    ) -> list[dict]:
+        """Return every contact row pinned to a peer signing-key fingerprint.
+
+        Under fingerprint keying there is at most one row per fingerprint
+        (contact_id == "hub:{fingerprint}"), but legacy username-keyed rows or a
+        mid-flight rename can leave several contacts sharing a fingerprint.
+        Revocation flows must act on ALL matches — never silently pick the
+        first — so this returns the full list rather than ``rows[0]``.
+        """
+        if not peer_fingerprint:
+            return []
+        async with self._db.execute(
+            "SELECT * FROM contacts WHERE peer_fingerprint = ?",
+            (peer_fingerprint,),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description]
+        return [_row_to_dict(columns, r) for r in rows]
+
     async def get_contact_by_fingerprint(
         self, peer_fingerprint: str
     ) -> Optional[dict]:
@@ -226,16 +247,13 @@ class ContactsStore(BaseStore):
         fingerprint.  This is the canonical lookup: the contact is keyed on the
         fingerprint (the stable, peer-independent identifier), so it is the
         primary path for the block cascade and any revocation flow.
+
+        Single-row convenience wrapper around :meth:`get_contacts_by_fingerprint`
+        for flows that expect at most one match; revocation flows should use the
+        plural form so a stale duplicate is never silently skipped.
         """
-        if not peer_fingerprint:
-            return None
-        async with self._db.execute(
-            "SELECT * FROM contacts WHERE peer_fingerprint = ?",
-            (peer_fingerprint,),
-        ) as cursor:
-            rows = await cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description]
-        return _row_to_dict(columns, rows[0]) if rows else None
+        matches = await self.get_contacts_by_fingerprint(peer_fingerprint)
+        return matches[0] if matches else None
 
     async def set_contact_status(self, contact_id: str, status: str) -> None:
         if status not in VALID_CONTACT_STATUSES:
@@ -390,18 +408,26 @@ class ContactsStore(BaseStore):
         )
         await self._db.commit()
 
-    async def revoke_peer_link(self, contact_id: str) -> None:
-        """Revoke the peer link (cascades to block contact)."""
+    async def revoke_peer_link(self, contact_id: str) -> bool:
+        """Revoke the peer link (cascades to block contact).
+
+        Returns True when a peer_link row actually matched the ``contact_id``
+        (i.e. there was a link to revoke), False when the UPDATE matched zero
+        rows.  A safety revoke that matched nothing must never be reported as
+        success, so callers are expected to act on the return value.
+        """
         now = time.time()
-        await self._db.execute(
+        cursor = await self._db.execute(
             "UPDATE peer_links SET revoked_at = ? WHERE contact_id = ?",
             (now, contact_id),
         )
+        matched = (cursor.rowcount or 0) > 0
         await self._db.execute(
             "UPDATE contacts SET status = 'revoked', revoked_at = ? WHERE contact_id = ?",
             (now, contact_id),
         )
         await self._db.commit()
+        return matched
 
 
 # ---------------------------------------------------------------------------
