@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 import re
 import time
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.responses import RedirectResponse
+from starlette.responses import HTMLResponse, RedirectResponse
 
+from tinyagentos.auth import AuthStoreCorruptError
 from tinyagentos.device_store import DEVICE_TOKEN_PREFIX
+
+logger = logging.getLogger(__name__)
 
 EXEMPT_PATHS = {"/auth/login", "/auth/setup", "/auth/status", "/auth/me", "/auth/complete", "/auth/lock", "/api/health", "/api/version", "/setup", "/setup/complete", "/redeem", "/api/desktop/browser/push/vapid-public-key", "/api/desktop/browser/proxy-config", "/sw.js", "/desktop", "/desktop/index.html", "/chat-pwa", "/app.html", "/manifest", "/api/agents/registry/pubkey", "/api/share/destinations"}
 
@@ -459,6 +463,38 @@ def _is_exempt(method: str, path: str) -> bool:
 
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        """Authenticate, or say plainly that we cannot.
+
+        This middleware runs outside Starlette's exception handling, so an
+        AuthStoreCorruptError raised while reading the account store would
+        escape as a bare 500 and the app-level handler would never see it.
+        Catch it here so an unreadable store gets the same honest answer
+        everywhere.
+        """
+        try:
+            return await self._dispatch(request, call_next)
+        except AuthStoreCorruptError:
+            logger.error(
+                "account store unreadable while authenticating %s",
+                request.url.path, exc_info=True,
+            )
+            accept = request.headers.get("accept", "")
+            detail = (
+                "The account store exists but cannot be read. Accounts are not "
+                "lost; restore it from a backup — see "
+                "docs/runbooks/controller-rescue.md."
+            )
+            if "text/html" in accept:
+                return HTMLResponse(
+                    "<h1>Account store unreadable</h1>"
+                    f"<p>{detail}</p>", status_code=503,
+                )
+            return JSONResponse(
+                {"error": "account_store_unreadable", "detail": detail},
+                status_code=503,
+            )
+
+    async def _dispatch(self, request: Request, call_next):
         auth_mgr = request.app.state.auth
         path = request.url.path
 

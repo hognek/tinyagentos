@@ -120,7 +120,10 @@ it overwrote the damaged store and destroyed the real accounts permanently.
 Current releases fail closed — `is_configured()` reports `true` for a store it
 cannot parse, onboarding is refused, and `GET /auth/status` returns
 `"store_error": "unreadable"` — so the screen you see is a genuine fresh
-install, not this failure.
+install, not this failure. Every other request answers **503
+`account_store_unreadable`** rather than a plausible empty result: "no such
+user" and "cannot read the users" are different facts, and a route that
+guesses between them is how the accounts got overwritten in the first place.
 
 Confirm which one you have:
 

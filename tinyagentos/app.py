@@ -1566,6 +1566,30 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
 
     app = FastAPI(title="TinyAgentOS", version="0.1.0", lifespan=lifespan)
 
+    # An unreadable account store must never be answered with a plausible
+    # empty result — "no such user" and "cannot read the users" are different
+    # facts, and conflating them is what produced the 2026-08-21 onboarding
+    # screen. Reads therefore raise, and one handler turns that into a single
+    # honest answer instead of an opaque 500 per route.
+    from fastapi.responses import JSONResponse
+
+    from tinyagentos.auth import AuthStoreCorruptError
+
+    @app.exception_handler(AuthStoreCorruptError)
+    async def _account_store_unreadable(request, exc):  # noqa: ANN001
+        logger.error("account store unreadable serving %s: %s", request.url.path, exc)
+        return JSONResponse(
+            {
+                "error": "account_store_unreadable",
+                "detail": (
+                    "The account store exists but cannot be read. Accounts are "
+                    "not lost; restore it from a backup — see "
+                    "docs/runbooks/controller-rescue.md."
+                ),
+            },
+            status_code=503,
+        )
+
     # Auth middleware — must be added before GZip so it runs first
     from tinyagentos.auth_middleware import AuthMiddleware
     app.add_middleware(AuthMiddleware)
