@@ -7,6 +7,110 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
 
 ## [Unreleased]
 
+## [1.0.0-beta.50] - 2026-08-21
+
+### Added
+
+- Agent-accessible todo-list tools: `todo_list_lists`, `todo_add_item`, `todo_set_done` (#2035).
+- When an agent asks a question over the openclaw chat bridge via `request_decision`, a read-only `{kind:"decision", decision_id}` content block is now attached to the in-flight chat message and rendered inline in the MessagesApp chat. The question text, option list (disabled buttons), decision type, and current state (open or answered with the chosen option, answerer, and timestamp) all show directly in the conversation. Re-opening a thread re-fetches the decision, so an already-answered question renders in its resolved state instead of a stale open prompt. Decisions raised outside a chat context do not produce a block.
+- **Agent-as-a-Model turn execution**: `POST /v1/chat/completions` now drives a
+  real one-shot agent turn (consented agent → opencode host-server seam →
+  OpenAI ChatCompletion envelope) instead of returning 501. Per-agent opencode
+  server cache so concurrent agents do not churn a shared singleton. Missing
+  user message returns 400 (not 502); `stream` requires an explicit JSON
+  boolean (#2195).
+- Cluster nodes can be revoked, blocked and unblocked from the Cluster UI, matching what was already possible for devices. Revoke kills a node's signing key and lets it re-pair; block additionally refuses re-pairing until an admin unblocks it; unblock clears the block but leaves the old key dead, so the node must re-pair for a fresh one. Revoked and blocked nodes are marked offline at once so the scheduler stops routing work to them, while staying visible in the worker list so they can be unblocked (#2410).
+- Select decisions can be answered off-menu: single-select and multi-select decisions accept an `other_value` free-text answer plus an optional `note`, so a decision whose declared options do not fit no longer forces a wrong choice. Declared option values are still validated, combining `value` with `other_value` on a single-select is rejected, and the free-text entry is appended for multi-select (#2412).
+- Hailo-10H .hef model catalog manifests for qwen2.5-1.5b, qwen2.5-coder-1.5b, qwen2-1.5b, llama-3.2-3b, and deepseek-r1-1.5b, using the hailo-ollama backend with pinned sha256 + download_url.
+- Added per-agent `memory_mode` (`both`, `framework`, `taosmd`) surfaced in the Agents deploy wizard, persisted on the agent record, and injected as `TAOS_MEMORY_MODE` at deploy time.
+- Added three onboarding guides in `docs/agent-manual/` (one per mode) and linked them from the manual index. Compiled manual stays under the size budget.
+- Added tests for mode persistence, deploy-time env injection, and the conflict rule (taOSmd authoritative for durable facts, framework memory for live working set).
+- DecisionBlock tests updated to assert new interactive contract: `disabled={!isOpen}` — open decisions render enabled controls that submit answers, and non-open decisions render disabled controls
+- Added first-answer-wins test verifying that submitting a second answer is rejected when decision status is no longer "pending"
+- Marked Text Editor, Image Viewer, and Media Player as file handlers (tier 4) so they no longer appear in the launcher but remain openable programmatically.
+- Files now routes text files to Text Editor, images to Image Viewer, and audio/video to Media Player on double-click or context menu open.
+- Decision blocks in chat now support clickable option buttons for answering decisions directly. Users can select options or enter text answers in the chat interface, which uses the same API endpoint as the Decisions app.
+- Agents can no longer answer their own decisions. The answer endpoint now validates that decisions are answered by the human user assigned to them, not by the agent who created them.
+- First-answer-wins logic ensures that when the same decision is answered concurrently from both the chat and Decisions app surfaces, exactly one answer is recorded. The second answer attempt receives a clean rejection error.
+- Both chat and Decisions app surfaces update live in real-time through the existing broker/SSE machinery. Answering in chat resolves the card in an open Decisions app without requiring a page refresh, and vice versa.
+- Decision answers now propagate live across all open surfaces via SSE. When a decision is answered in one surface (chat or Decisions app), other surfaces update immediately without requiring a page refresh.
+- Concurrency safety: first-answer-wins enforcement via atomic store-level `UPDATE ... WHERE status = 'pending'`. Concurrent answer attempts from multiple surfaces resolve to exactly one recorded answer; subsequent attempts receive a clean 409 response with no duplicate event broadcast.
+- A `scripts/check_bot_review.py` gate that fails (exit 1) when the only CodeRabbit output on a PR is a rate-limit stub, so the merge path no longer treats a passing "Review rate limited" check as a real review. Runs on every PR targeting `master` or `dev` via `.github/workflows/bot-review-gate.yml` (tsk-vzzv62).
+- Chat sidebar regroups channels into Channels, Agents-DMs, and Direct Messages sections with live presence dots (working/live/idle) and an accent rail on the active channel (#tsk-z4wn3x).
+
+### Fixed
+
+- Closing a claimed task is refused unless you are the claim holder, the project lead, the project owner, or a session admin; any other caller now gets 409 instead of silently closing someone else's card (#2287).
+- Notes list now filters by `kind="note"` so todo-list docs no longer leak into the Notes UI (#2325).
+- Fixed invalid JSX `aria-label=Notes` (missing quotes) that blocked the SPA build (#2325).
+- Projects Lists tab no longer uses the browser's native `prompt`, `confirm` and `alert`: creating a list, deleting a list, removing an entry and viewing an entry's original text now use real in-app dialogs, so they are keyboard-accessible, themable and cannot be suppressed by the browser. The rail and entries panel also stack vertically under 768px instead of being squeezed side by side (#2411).
+- `GET /api/decisions/agent` now scopes an agent's decision list consistently with how it is allowed to raise them: a global (null-project) grant returns null-project decisions rather than every project's, matching the posting rule. The project filter is also pushed into the store query for the global and single-project cases so the row limit applies after scoping instead of before it (#2194, #2417).
+- The auth middleware's agent Bearer allowlist now covers `GET`/`POST /api/projects/{project_id}/tasks/{task_id}/checklist-items`, so a registry JWT reaches the handlers' `project_tasks_create` scope check instead of being refused 401 at the gate. Inert until the checklist routes (#2415) merge; DELETE and per-item subpaths stay session-only (#2430).
+- An unclean shutdown could leave `data/.auth_user.json` the right size but full of NUL bytes, which taOS read as "no accounts exist" and answered with the first-run onboarding screen — and completing that form overwrote the real accounts. The account store, session store, legacy password file and local auth token are now written atomically (temp file, fsync, rename, directory fsync), and an account store that exists but cannot be parsed fails closed: the install still reports itself configured, onboarding is refused, and `/auth/status` returns `store_error: "unreadable"` while every other request answers 503 `account_store_unreadable` instead of a plausible empty result. Recovery steps are in `docs/runbooks/controller-rescue.md` (#2502).
+- Fixed hardware_tiers YAML indentation in five HEF manifests (deepseek-r1-1.5b, qwen2-1.5b, qwen2.5-1.5b, qwen2.5-coder-1.5b, qwen3-1.7b) so tier keys nest under hardware_tiers instead of parsing as null.
+- Removed two a8w4 variants with fabricated sha256 pins (llama-3.2-1b/a8w4 and qwen3-1.7b/a8w4) that returned HTTP 404 on their download_url.
+- Extended the model manifest integrity test with a denylist of known-fabricated digests and a hardware_tiers nesting check (no stray tier keys at variant level; hardware_tiers must be a non-empty mapping).
+- A stale or incomplete package install (an empty directory left on `sys.path` that Python treats as a PEP 420 namespace package) can make a transitive dependency like `sniffio` importable but attribute-less. anyio calls `sniffio.current_async_library` on every async test, so the partial module raised `AttributeError: module 'sniffio' has no attribute 'current_async_library'` across 562 unrelated tests on a single shard, reddening a 3-file frontend PR. Measurement confirmed the cause: `sniffio.__file__` was `None` with a `NamespaceLoader` in `__spec__` (the empty-directory signature), and `sniffio` was absent from the resolved package set. The test suite now runs a session-start guard (`_verify_core_deps` in `tests/conftest.py`) that checks a data-driven table of core deps (`sniffio`, `anyio`, `httpx`, `httpcore`, `idna`, `certifi`, `pydantic`, `sqlcipher3`, `fastapi`) and fails loudly at session start with `__file__` / `__path__` / `__spec__` / installed-package diagnostics instead of letting the defect surface as hundreds of opaque tracebacks. The guard is generic -- keyed on the (module, required-attributes) table, not on the string `sniffio` alone -- so any importable-but-attribute-less core dep is caught.
+- `POST /api/store/install-v2` now validates `target_remote` at the API boundary before it is interpolated into backend daemon URLs (`resolve_rkllama_url`, LXC remote addressing). Hostile strings containing `:`, `/`, `?`, `#`, or `@` are rejected with HTTP 400 and a named `invalid_target_remote` reason, preventing SSRF-shaped installs or silent mis-routing to unregistered workers.
+- Removed `tinyagentos/containers.py`, which had been unreachable dead code since the `containers/` package landed. Edits to the shadowed module silently no-opped at runtime; the package copy at `tinyagentos/containers/__init__.py` is what all imports resolve to.
+- The `seed` parameter for `generate_image` is now forwarded from the skill-exec runtime to the image generator and is advertised in the agent-facing tool schema, so reusing a returned seed to iterate on a liked image actually holds the seed instead of silently producing a fresh random one (#tsk-47ix5m).
+- `scripts/collate_changelog.py` is now idempotent across partial failures: if a run dies between writing the new version section and unlinking consumed fragments, a rerun detects the existing `## [<version>]` header and skips the duplicate insert. Only leftover fragments whose content already reached `CHANGELOG.md` are consumed; a fragment that landed after the failed run is kept and the rerun exits non-zero naming it, instead of silently deleting a release note that was never folded.
+- The doc-gate content-blindness defect: a per-doc list of required section headings is now asserted present in the working tree. A `docs/agent-coordination.md` emptied of its protected API-surface sections now fails the `invariants` check instead of passing the gate indefinitely.
+- Image Viewer and Media Player now display the basename of a routed file URL in their title bar: the final URL segment is decoded before the directory path is stripped, so a nested route like `nested/photo.png` no longer leaks into the displayed file name.
+- `list_pending` in `device_pair_requests_store.py` now selects only `_SAFE_COLS` instead of `SELECT *`, preventing leakage of columns outside the allowed set such as `verify_code`.
+- Fixed DecisionBlock free_text textarea no longer posts on every keystroke; onChange now updates local state only, Enter submits once, and a visible Submit button is provided
+- Surface answerDecision errors inline instead of unhandled promise rejections
+- Removed unreachable duplicate conditions in dayLabel
+- `GET /api/decisions/agent` no longer leaks project-scoped decisions to an agent holding only a global (null-project) `decisions_write` grant. The store layer now treats an explicit `project_id=None` as `IS NULL` instead of silently omitting the filter, so a global grant returns null-project decisions only. The human-facing `GET /api/decisions` route preserves its existing "no project filter" behaviour when `project_id` is absent from the query string.
+- Consolidated Hailo-10H HEF variants into existing model manifests (qwen2.5-1.5b, qwen2-1.5b, qwen2.5-coder-1.5b, deepseek-r1-1.5b, llama-3.2-1b, llama-3.2-3b, qwen3-1.7b); dropped unverified hef_h10h pins and removed bare download_urls from hailo-ollama-pull variants.
+- NotificationsPanel now correctly shows error messages when the prefs fetch fails instead of displaying a permanent loading state. Added a `loaded` flag to track when the initial fetch has settled, distinguishing between genuine loading and error states.
+- pin-aware HF listing now uses the revision-path `blobs=true` endpoint so nonexistent revisions 404 and real file sizes are returned
+- per-file `lfs.sha256` verification after download catches corrupted or mismatched shards
+- paligemma-2 `file_set_hash` recomputed with real sizes from the pinned-revision blobs listing
+- Device pair-request creation: enforce the pending cap atomically so concurrent requests cannot bypass it.
+- Device pair-request creation: return 409 Conflict when no instance admin exists, instead of silently creating an unapprovable request.
+- DecisionBlock free_text textarea now stores the raw value and trims only at submit, so trailing spaces and Shift+Enter newlines are no longer eaten on every keystroke
+- DecisionBlock now surfaces the server's exact error reason (e.g. `already answered or not pending`) in the inline alert instead of the generic "Could not record answer."
+- project_notes scope now requires project_id binding when granting via auth request approve, rejecting the unbound approvals that previously minted inert grants (approval looked successful while the agent silently had no notes access)
+- Subagent worker exceptions are now propagated through `await_subagent` instead of being swallowed; a failed subagent raises the original exception at the caller, making failures observable rather than indistinguishable from success.
+- A fenced (superseded) controller now releases GPU leases and cancels in-flight GPU arbiter tasks for its workers, matching the sibling termination branches. Previously it only marked workers offline and skipped the lease release and arbiter cancellation, stranding VRAM leases and allowing arbiter tasks to collide with the winning controller.
+- Deploy wizard no longer lets the user reach the incoherent memory pair (skipped layer + `both`/`taosmd` mode) that triggered a 400 at the end of the wizard: clicking "Skip memory for this agent" now snaps the mode to `framework`, and the `both`/`taosmd` mode buttons are disabled with a "needs the taOSmd memory layer" tooltip while the layer is skipped. The same guard is mirrored in the agent Settings memory tab, which now sends `memory_mode: framework` when switching the plugin off. The server-side validation guard from #2405 remains in place.
+- Folded the five #2422-verified sha256 + download_url pairs into the merged Hailo HEF a8w4 variants across llama-3.2-3b, qwen2-1.5b, qwen2.5-1.5b, qwen2.5-coder-1.5b, and deepseek-r1-1.5b; removed the install.method: hailo-ollama-pull carve-out from the integrity test so every variant now carries a pinned sha256 + https download_url; variant-level context_window 2048 declared on all hef builds so NPU context no longer inherits the model-level 131072/40960/32768 values; hailo-ollama install path now targets the hailo daemon on :7836 instead of Ollama's :11434.
+- Ollama and hailo-ollama installs targeted at a remote worker (`target_remote`) now pull models onto that worker's daemon instead of the controller's localhost; `resolve_ollama_url(target_remote, backend_id)` selects the correct host and port (11434 for ollama, 7836 for hailo-ollama via `TAOS_HAILO_OLLAMA_PORT`) following the same convention as `resolve_rkllama_url`.
+- paligemma-2 manifest: switch from single-shard `download_url` to `hf_repo` + `multi_file: true` so the installer fetches all shards; added combined-hash verification to `HFMultiInstaller` and a sweep-test guard that flags any sharded `download_url` missing the multi-file marker.
+- deleted-symbols CI gate no longer reports false positives on `pull_request` re-runs after the base advances: the merge result is recomputed in-script via `git merge-tree --write-tree <base> <pr-head>` (`scripts/check_deleted_symbols.py`) instead of comparing the event-time test-merge commit checked out as HEAD
+- Llama 3.2 3B Instruct HEF model sha256 corrected in manifest after verification against upstream download
+- Disable option buttons and Submit button while a POST is in flight, preventing duplicate submissions that cause 409 errors
+- Clear answerError at the start of each new submission attempt
+- Distinguish refresh-failure from submit-failure: when POST succeeds but follow-up GET fails, do not show "Failed to answer"
+- On 409 (someone else answered first), refetch the decision so the block flips to its answered state
+- Reset answer and answerError state when block.decision_id changes
+- Split the single large routes doc into compiled per-area fragments in `docs/routes.d/`, with a deterministic compiler script `scripts/build-routes-doc.py`. Resolves merge-conflict collisions when multiple lanes touch routes.
+- Removed the `install.method: hailo-ollama-pull` carve-out from the model manifest integrity test; every variant (including HEF/hailo-ollama) must now carry a 64-char lowercase hex sha256 and a non-empty https download_url. The `_is_stride2_algorithmic` detector that supported the deleted carve-out has been removed.
+- Distrust green gate: CI check now fails PRs where added or modified test files have all tests skipping via `pytest.importorskip` or `pytest.skip`, with an escape hatch for intentional landing tests (`Tests-Skipped-Intentionally` trailer in PR body).
+- Restore error propagation from `answerDecision` so non-409 server failures (500, network errors, 4xx) surface the server-provided reason in the alert region instead of being swallowed
+- Surface a fallback message when the post-409 refetch itself fails, rather than leaving the block pending with no feedback
+- The `bot-review-gate` workflow no longer crashes on `issue_comment` events: the `bot-review-gate` job is guarded to run only on `pull_request` and `pull_request_review` events (where `github.event.pull_request.number` resolves), and a new `re-run-on-stub-comment` job re-runs the gate for the PR head SHA when a CodeRabbit rate-limit stub comment lands after the initial green run. Inert `branches` filters on `pull_request_review` and `issue_comment` triggers have been removed.
+- `POST /api/notifications` now rejects unknown `level` values with a 400 error, matching the canonical level set `{"info", "success", "warning", "error"}` (single source of truth: `VALID_LEVELS` in `tinyagentos/notifications.py`, shared with the `notify_user` tool).
+- `check_all_skip.py` now reports zero-collected violations in the final `::error` annotation alongside all-skip violations, instead of incorrectly claiming "0 file(s) have all tests skipping" when only zero-collected files are present.
+- paligemma-2: pin hf_revision to immutable commit, replace metadata sha256 with file_set_hash for multi-file install verification
+- POST /api/models/download: route multi_file variants through HFMultiInstaller instead of the single-file download path
+- The core-dep integrity guard diagnostic in tests/conftest.py now prints `name==version` for each reported module (instead of bare names), plus resolved `__file__` and whether `__spec__.submodule_search_locations` is set -- the two observations that discriminate a stale/partial install from a version-bump API removal. The error text states the observation and names both candidate causes rather than asserting a stale install as fact. Installed-package lines now include versions.
+- CodeRabbit login filter now includes `coderabbitai[bot]` so that `collect_coderabbit_items` correctly identifies CodeRabbit output on PRs where CodeRabbit posts as `coderabbitai[bot]` (instead of only matching `coderabbit[bot]` and `coderabbitai`)
+- **Dropped the hardcoded mute on `task.claimed` notifications.** The per-type
+  toggle preferences remain, but no event type is silenced by default. A user
+  who has never opened the Notifications pane now receives every event type,
+  including `task.claimed`. A regression test asserts delivery of an
+  unmodified-user `task.claimed` notification, so re-introducing a silent
+  default mute will fail CI.
+- DecisionsApp `load()` now guards each state update with a monotonically increasing request sequence, so a stale in-flight response can no longer overwrite newer data when mount, focus refresh, or SSE-driven reloads overlap
+- `POST /api/cluster/workers` now returns `409 Conflict` when the controller is fenced or the worker echoes a stale generation, instead of incorrectly replying `200 registered` while leaving the worker absent from the registry. This stops superseded controllers from misleading workers into heartbeating against a controller that has no record of them (#tsk-yl23ua).
+- `check_all_skip.py` now treats files with 0 collected outcomes but >0 AST-defined tests as a violation, instead of silently passing the gate.
+
+### Removed
+
+- `notes_set_done` agent tool superseded by the richer todo tools above (#2035).
+
 ## [1.0.0-beta.49] - 2026-08-15
 
 ### Added
