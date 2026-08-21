@@ -1,2 +1,0 @@
-### Fixed
-- The core-dep integrity guard diagnostic in tests/conftest.py now prints `name==version` for each reported module (instead of bare names), plus resolved `__file__` and whether `__spec__.submodule_search_locations` is set -- the two observations that discriminate a stale/partial install from a version-bump API removal. The error text states the observation and names both candidate causes rather than asserting a stale install as fact. Installed-package lines now include versions.

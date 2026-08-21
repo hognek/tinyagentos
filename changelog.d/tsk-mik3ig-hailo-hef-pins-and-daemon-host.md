@@ -1,2 +1,0 @@
-### Fixed
-- Folded the five #2422-verified sha256 + download_url pairs into the merged Hailo HEF a8w4 variants across llama-3.2-3b, qwen2-1.5b, qwen2.5-1.5b, qwen2.5-coder-1.5b, and deepseek-r1-1.5b; removed the install.method: hailo-ollama-pull carve-out from the integrity test so every variant now carries a pinned sha256 + https download_url; variant-level context_window 2048 declared on all hef builds so NPU context no longer inherits the model-level 131072/40960/32768 values; hailo-ollama install path now targets the hailo daemon on :7836 instead of Ollama's :11434.

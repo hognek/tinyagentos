@@ -1,1 +1,0 @@
-- Chat sidebar regroups channels into Channels, Agents-DMs, and Direct Messages sections with live presence dots (working/live/idle) and an accent rail on the active channel (#tsk-z4wn3x).

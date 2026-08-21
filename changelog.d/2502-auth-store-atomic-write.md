@@ -1,3 +1,0 @@
-### Fixed
-
-- An unclean shutdown could leave `data/.auth_user.json` the right size but full of NUL bytes, which taOS read as "no accounts exist" and answered with the first-run onboarding screen — and completing that form overwrote the real accounts. The account store, session store, legacy password file and local auth token are now written atomically (temp file, fsync, rename, directory fsync), and an account store that exists but cannot be parsed fails closed: the install still reports itself configured, onboarding is refused, and `/auth/status` returns `store_error: "unreadable"` while every other request answers 503 `account_store_unreadable` instead of a plausible empty result. Recovery steps are in `docs/runbooks/controller-rescue.md` (#2502).
