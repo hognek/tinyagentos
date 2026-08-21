@@ -8,6 +8,7 @@ from collections import OrderedDict
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from tinyagentos.auth import AuthStoreCorruptError
 from tinyagentos.middleware.csrf import verify_csrf
 
 logger = logging.getLogger(__name__)
@@ -684,6 +685,14 @@ async def auth_status(request: Request):
     """
     auth_mgr = request.app.state.auth
     configured = auth_mgr.is_configured()
+    # An unreadable store reports configured (see AuthManager.is_configured),
+    # so tell the UI *why* it can neither sign in nor onboard instead of
+    # leaving it to guess from a failing login.
+    store_error = None
+    try:
+        auth_mgr._read_users()
+    except AuthStoreCorruptError:
+        store_error = "unreadable"
     token = request.cookies.get("taos_session", "")
     # Pass the request's User-Agent so the stolen-cookie binding check runs
     # here exactly as it does in the API middleware. Without it a session
@@ -697,7 +706,10 @@ async def auth_status(request: Request):
 
     user = None
     needs_onboarding = False
-    if configured and authenticated:
+    # get_user()/session_user() read the same store the probe just failed on,
+    # so consulting them here would raise and turn this endpoint into a 500 --
+    # exactly the answer the store_error field exists to replace.
+    if configured and authenticated and store_error is None:
         user = auth_mgr.get_user(token=token)
         # Check if session user is pending
         if token:
@@ -711,6 +723,7 @@ async def auth_status(request: Request):
         "user": user,
         "multi_user": auth_mgr.is_multi_user(),
         "needs_onboarding": needs_onboarding,
+        "store_error": store_error,
     })
 
 
