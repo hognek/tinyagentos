@@ -14,6 +14,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
 from fastapi import HTTPException, Request
 
+from tinyagentos.atomic_io import atomic_write_text
 from tinyagentos.shortcuts.capabilities import default_caps_for_admin, default_caps_for_new_user
 
 _ph = PasswordHasher()
@@ -22,6 +23,18 @@ _ph = PasswordHasher()
 _hash_upgrade_lock = threading.Lock()
 
 logger = logging.getLogger(__name__)
+
+
+class AuthStoreCorruptError(RuntimeError):
+    """Raised when the account store exists but cannot be parsed.
+
+    A *missing* store means a fresh install; a *corrupt* one means the
+    accounts are still there and we simply cannot read them.  Conflating the
+    two is what turned a truncated ``.auth_user.json`` into a first-run
+    onboarding screen on 2026-08-21 — an unauthenticated caller was one form
+    submission away from claiming the box and overwriting the real users.
+    Callers must fail closed on this rather than treat it as "no users".
+    """
 
 
 class _PersistentSessions:
@@ -55,7 +68,7 @@ class _PersistentSessions:
 
     def _save_pruned(self, data: dict) -> None:
         self._prune_expired(data)
-        self._path.write_text(json.dumps(data))
+        atomic_write_text(self._path, json.dumps(data), mode=0o600)
 
     def _prune_expired(self, data: dict) -> None:
         now = time.time()
@@ -226,30 +239,76 @@ class AuthManager:
     # ------------------------------------------------------------------ #
 
     def _read_users(self) -> dict:
+        """Return the account store, or raise if it is present but unreadable.
+
+        Only a *missing* file yields the empty store — see
+        :class:`AuthStoreCorruptError` for why an unparseable one must not.
+        """
         if self._user_file.exists():
             try:
-                return json.loads(self._user_file.read_text())
-            except (json.JSONDecodeError, OSError):
-                return {"users": [], "current_user_id": None}
+                raw = self._user_file.read_text()
+            except OSError as exc:
+                raise AuthStoreCorruptError(
+                    f"cannot read account store {self._user_file}: {exc}"
+                ) from exc
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise AuthStoreCorruptError(
+                    f"account store {self._user_file} is not valid JSON "
+                    f"({len(raw)} bytes): {exc}"
+                ) from exc
+            if not isinstance(data, dict):
+                raise AuthStoreCorruptError(
+                    f"account store {self._user_file} is a "
+                    f"{type(data).__name__}, expected an object"
+                )
+            return data
         return {"users": [], "current_user_id": None}
 
     def _write_users(self, data: dict) -> None:
-        self._user_file.parent.mkdir(parents=True, exist_ok=True)
-        self._user_file.write_text(json.dumps(data, indent=2))
+        atomic_write_text(
+            self._user_file, json.dumps(data, indent=2), mode=0o600,
+        )
 
     # ------------------------------------------------------------------ #
     #  Predicates                                                          #
     # ------------------------------------------------------------------ #
 
     def is_configured(self) -> bool:
-        return bool(self._read_users().get("users")) or self._password_file.exists()
+        """True when this install already has an account.
+
+        This is the single gate every onboarding path consults, so a store we
+        cannot parse must answer True: the accounts exist, we just cannot read
+        them.  Answering False would offer the create-your-account form to
+        whoever asked.
+        """
+        try:
+            users = self._read_users().get("users")
+        except AuthStoreCorruptError:
+            logger.error(
+                "Account store %s is unreadable; refusing to report this "
+                "install as unconfigured. Recover it with "
+                "'taos recover-password' or restore the file from a backup.",
+                self._user_file,
+            )
+            return True
+        return bool(users) or self._password_file.exists()
 
     def needs_onboarding(self) -> bool:
         return not self.is_configured()
 
     def is_multi_user(self) -> bool:
-        """True when two or more fully-registered users exist."""
-        users = self._read_users().get("users", [])
+        """True when two or more fully-registered users exist.
+
+        A display hint (which login form to render), so an unreadable store
+        degrades to the single-user answer rather than raising — the gate
+        that matters, :meth:`is_configured`, already failed closed.
+        """
+        try:
+            users = self._read_users().get("users", [])
+        except AuthStoreCorruptError:
+            return False
         active = [u for u in users if "password_hash" in u]
         return len(active) >= 2
 
@@ -469,8 +528,9 @@ class AuthManager:
 
     def set_password(self, password: str) -> None:
         """Legacy code path — keeps existing tests + the simple-setup endpoint working."""
-        self._password_file.parent.mkdir(parents=True, exist_ok=True)
-        self._password_file.write_text(hash_password(password))
+        atomic_write_text(
+            self._password_file, hash_password(password), mode=0o600,
+        )
 
     def recover_password(self, new_password: str, username: str | None = None) -> str:
         """Offline recovery: force-set an account's password without the old one.
@@ -757,9 +817,7 @@ class AuthManager:
         if path.exists():
             return path.read_text().strip()
         token = secrets.token_urlsafe(32)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(token)
-        os.chmod(path, 0o600)
+        atomic_write_text(path, token, mode=0o600)
         logger.info("local auth token written to %s", path)
         return token
 
