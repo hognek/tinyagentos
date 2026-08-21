@@ -12,6 +12,7 @@ Two independent defects, tested separately:
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
@@ -52,8 +53,19 @@ class TestCorruptStoreFailsClosed:
 
     @pytest.mark.parametrize(
         "payload",
-        [b"\0" * 901, b"", b"{ truncated", b'["not", "an", "object"]'],
-        ids=["nul-filled", "empty", "truncated-json", "wrong-toplevel-type"],
+        [
+            b"\0" * 901,
+            b"",
+            b"{ truncated",
+            b'["not", "an", "object"]',
+            b"{}",
+            b'{"users": null}',
+            b'{"users": {"jay": {}}}',
+        ],
+        ids=[
+            "nul-filled", "empty", "truncated-json", "wrong-toplevel-type",
+            "empty-object", "null-users", "users-not-a-list",
+        ],
     )
     def test_read_raises_rather_than_returning_empty(self, tmp_path, payload):
         mgr, users_file = _store(tmp_path)
@@ -73,6 +85,17 @@ class TestCorruptStoreFailsClosed:
             mgr.setup_user("attacker", "A", "a@example.com", "hunter2hunter2")
         # Still exactly as we left it — recoverable from a backup.
         assert users_file.read_bytes() == corrupt
+
+    def test_valid_json_missing_the_users_list_does_not_onboard(self, tmp_path):
+        """``{}`` parses fine but would read as "no accounts" — fail closed too."""
+        mgr, users_file = _store(tmp_path)
+        _real_users_file(mgr, users_file)
+        users_file.write_bytes(b"{}")
+        assert mgr.is_configured() is True
+        assert mgr.needs_onboarding() is False
+        with pytest.raises(AuthStoreCorruptError):
+            mgr.setup_user("attacker", "A", "a@example.com", "hunter2hunter2")
+        assert users_file.read_bytes() == b"{}"
 
     def test_multi_user_hint_degrades_instead_of_raising(self, tmp_path):
         mgr, users_file = _store(tmp_path)
@@ -113,6 +136,113 @@ class TestAtomicWrite:
 
         assert target.read_text() == "original"
         assert [p.name for p in tmp_path.iterdir()] == ["state.json"]
+
+
+class TestConcurrency:
+    def test_each_write_uses_its_own_temp_file(self, tmp_path, monkeypatch):
+        """A per-process temp name lets two threads share one inode and splice
+        their bytes. Racing threads hit that only sometimes, so assert the
+        property the fix actually establishes: the temp paths are distinct."""
+        import threading
+
+        target = tmp_path / "state.json"
+        seen: list[str] = []
+        seen_lock = threading.Lock()
+        real_open = os.open
+
+        def record(path, flags, *a, **kw):
+            if str(path).startswith(str(tmp_path)) and ".tmp" in str(path):
+                with seen_lock:
+                    seen.append(str(path))
+            return real_open(path, flags, *a, **kw)
+
+        monkeypatch.setattr(os, "open", record)
+
+        start = threading.Barrier(8)
+        payloads = [f'{{"writer": {i}, "pad": "{"x" * 4000}"}}' for i in range(8)]
+
+        def write(i):
+            start.wait()
+            atomic_write_text(target, payloads[i])
+
+        threads = [threading.Thread(target=write, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(seen) == 8
+        assert len(set(seen)) == 8, "concurrent writers shared a temp path"
+        # Whoever won, the file is exactly one writer's payload — not a splice.
+        assert target.read_text() in payloads
+        assert [p.name for p in tmp_path.iterdir()] == ["state.json"]
+
+    def test_concurrent_user_mutations_do_not_lose_updates(self, tmp_path):
+        """Serialised read-modify-write: every invite survives."""
+        import threading
+
+        mgr, users_file = _store(tmp_path)
+        mgr.setup_user("jay", "Jay", "jay@example.com", "correct horse battery")
+
+        names = [f"invitee{i}" for i in range(12)]
+        start = threading.Barrier(len(names))
+
+        def invite(name):
+            start.wait()
+            mgr.add_user_invite(name, invited_by_username="jay")
+
+        threads = [threading.Thread(target=invite, args=(n,)) for n in names]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        stored = {u["username"] for u in json.loads(users_file.read_text())["users"]}
+        assert stored == {"jay", *names}
+
+
+class TestPartialWrites:
+    def test_short_os_write_still_writes_every_byte(self, tmp_path, monkeypatch):
+        """os.write may write fewer bytes than asked; the loop must finish the job."""
+        real_write = os.write
+
+        def dribble(fd, data):
+            return real_write(fd, bytes(data)[:1])
+
+        monkeypatch.setattr(os, "write", dribble)
+        target = tmp_path / "state.json"
+        payload = '{"v": "' + "y" * 500 + '"}'
+        atomic_write_text(target, payload)
+        assert target.read_text() == payload
+
+    def test_directory_fsync_failure_is_not_swallowed(self, tmp_path, monkeypatch):
+        """A rename we cannot make durable must not report success."""
+        real_fsync = os.fsync
+        target = tmp_path / "state.json"
+
+        def fail_on_dir(fd):
+            if os.path.isdir(f"/proc/self/fd/{fd}") if os.path.exists("/proc/self/fd") \
+                    else False:
+                raise OSError(errno.EIO, "disk gone")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", fail_on_dir)
+        with pytest.raises(OSError):
+            atomic_write_text(target, "payload")
+
+    def test_directory_fsync_unsupported_is_tolerated(self, tmp_path, monkeypatch):
+        """Mounts that cannot fsync a directory are a mount property, not a failure."""
+        real_fsync = os.fsync
+
+        def enotsup_on_dir(fd):
+            if os.path.exists("/proc/self/fd") and os.path.isdir(f"/proc/self/fd/{fd}"):
+                raise OSError(errno.EINVAL, "not supported")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(os, "fsync", enotsup_on_dir)
+        target = tmp_path / "state.json"
+        atomic_write_text(target, "payload")
+        assert target.read_text() == "payload"
 
 
 class TestAuthWritesGoThroughAtomicIo:

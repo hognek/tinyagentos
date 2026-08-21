@@ -22,7 +22,9 @@ NUL-filled one.
 """
 from __future__ import annotations
 
+import errno
 import os
+import secrets
 from pathlib import Path
 
 __all__ = ["atomic_write_text", "atomic_write_bytes"]
@@ -47,13 +49,19 @@ def atomic_write_bytes(path: Path, data: bytes, *, mode: int | None = None) -> N
 
     # Same directory as the target: os.replace is only atomic within a
     # filesystem, and a temp dir may well be a different one (/tmp is
-    # commonly tmpfs).
-    tmp = path.with_name(f".{path.name}.tmp{os.getpid()}")
+    # commonly tmpfs). The random suffix keeps two concurrent writers of the
+    # same target from sharing one temp inode and interleaving their bytes.
+    tmp = path.with_name(f".{path.name}.tmp{secrets.token_hex(8)}")
     try:
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        # O_EXCL: a name this random cannot legitimately exist already, so a
+        # collision means something else is writing and we must not join it.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         fd = os.open(tmp, flags, mode if mode is not None else 0o666)
         try:
-            os.write(fd, data)
+            # os.write is allowed to write fewer bytes than it was given.
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
             os.fsync(fd)
         finally:
             os.close(fd)
@@ -69,17 +77,17 @@ def atomic_write_bytes(path: Path, data: bytes, *, mode: int | None = None) -> N
         raise
 
     # Without this the rename can be lost on a crash even though the file
-    # contents were synced.
-    try:
-        dir_fd = os.open(path.parent, os.O_RDONLY)
-    except OSError:
-        return
+    # contents were synced -- so a failure here means we did not deliver the
+    # durability the caller asked for, and saying nothing would be a lie.
+    # The exception is a filesystem that cannot fsync a directory at all
+    # (some network and union filesystems); that is a property of the mount,
+    # not a failed write.
+    dir_fd = os.open(path.parent, os.O_RDONLY)
     try:
         os.fsync(dir_fd)
-    except OSError:
-        # Some filesystems refuse to fsync a directory handle; the data
-        # fsync above is the part that matters most.
-        pass
+    except OSError as exc:
+        if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.EOPNOTSUPP, errno.EBADF):
+            raise
     finally:
         os.close(dir_fd)
 

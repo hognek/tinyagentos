@@ -706,7 +706,10 @@ async def auth_status(request: Request):
 
     user = None
     needs_onboarding = False
-    if configured and authenticated:
+    # get_user()/session_user() read the same store the probe just failed on,
+    # so consulting them here would raise and turn this endpoint into a 500 --
+    # exactly the answer the store_error field exists to replace.
+    if configured and authenticated and store_error is None:
         user = auth_mgr.get_user(token=token)
         # Check if session user is pending
         if token:

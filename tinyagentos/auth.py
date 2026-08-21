@@ -1,4 +1,5 @@
 from __future__ import annotations
+import functools
 import hashlib
 import json
 import logging
@@ -23,6 +24,22 @@ _ph = PasswordHasher()
 _hash_upgrade_lock = threading.Lock()
 
 logger = logging.getLogger(__name__)
+
+
+def _serialized(method):
+    """Hold the instance's account-store lock for the whole method.
+
+    Every mutator reads the store, edits the parsed dict and writes it back.
+    Atomic writes make each *write* all-or-nothing, but two concurrent
+    read-modify-write cycles still lose one of the two edits -- invite a user
+    while another request renames one and the rename can vanish. Serialising
+    the cycle is the missing half. Re-entrant so a mutator may call another.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._users_lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 class AuthStoreCorruptError(RuntimeError):
@@ -203,6 +220,9 @@ class AuthManager:
         self._user_file = data_dir / ".auth_user.json"
         self._sessions_file = data_dir / ".auth_sessions"
         self._sessions = _PersistentSessions(self._sessions_file)
+        # Serialises read-modify-write cycles on the account store; see
+        # _serialized. Re-entrant so nested mutators do not self-deadlock.
+        self._users_lock = threading.RLock()
         self.session_ttl = 86400 * 7  # 7 days, default
         self.long_session_ttl = 86400 * 30  # 30 days for "stay signed in"
         self._prune_sessions_on_startup()
@@ -262,6 +282,15 @@ class AuthManager:
                 raise AuthStoreCorruptError(
                     f"account store {self._user_file} is a "
                     f"{type(data).__name__}, expected an object"
+                )
+            # Every store this code has ever written carries a list-valued
+            # "users". Anything else -- {}, {"users": null} -- parses as JSON
+            # but would read as "no accounts", which is the exact conclusion
+            # this class exists to prevent.
+            if not isinstance(data.get("users"), list):
+                raise AuthStoreCorruptError(
+                    f"account store {self._user_file} has no 'users' list "
+                    f"(found {type(data.get('users')).__name__})"
                 )
             return data
         return {"users": [], "current_user_id": None}
@@ -414,6 +443,7 @@ class AuthManager:
     #  First-user setup (admin path)                                       #
     # ------------------------------------------------------------------ #
 
+    @_serialized
     def setup_user(self, username: str, full_name: str, email: str, password: str) -> dict:
         users = self._read_users()
         if users.get("users"):
@@ -441,6 +471,7 @@ class AuthManager:
     #  Invite lifecycle                                                    #
     # ------------------------------------------------------------------ #
 
+    @_serialized
     def add_user_invite(self, username: str, invited_by_username: str) -> str:
         """Create a pending user and return a high-entropy invite code."""
         if not username:
@@ -462,6 +493,7 @@ class AuthManager:
         self._write_users(data)
         return code
 
+    @_serialized
     def complete_invite(
         self,
         username: str,
@@ -496,6 +528,7 @@ class AuthManager:
         self._write_users(data)
         return self._public_user(record)
 
+    @_serialized
     def admin_reset_password(self, username: str, by_admin_username: str) -> str:
         """Re-issue an invite code, marking the user pending again."""
         caller = self.find_user(by_admin_username)
@@ -532,6 +565,7 @@ class AuthManager:
             self._password_file, hash_password(password), mode=0o600,
         )
 
+    @_serialized
     def recover_password(self, new_password: str, username: str | None = None) -> str:
         """Offline recovery: force-set an account's password without the old one.
 
@@ -644,6 +678,7 @@ class AuthManager:
             return (True, None)
         return (False, None)
 
+    @_serialized
     def change_password(self, username: str, current_password: str, new_password: str) -> bool:
         """Self-change, requires current password."""
         if not new_password or len(new_password) < 8:
@@ -661,6 +696,7 @@ class AuthManager:
                 return True
         return False
 
+    @_serialized
     def update_profile(self, username: str, full_name: str | None, email: str | None) -> dict:
         """Update own profile fields."""
         data = self._read_users()
@@ -677,6 +713,7 @@ class AuthManager:
                 return self._public_user(u)
         raise ValueError(f"user '{username}' not found")
 
+    @_serialized
     def delete_user(self, username: str, by_admin_username: str) -> None:
         """Remove a user. Admin only, can't delete self, can't delete last admin."""
         caller = self.find_user(by_admin_username)
