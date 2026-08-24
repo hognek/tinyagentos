@@ -109,6 +109,7 @@ class WorkerAgent:
         # silently revert a draining/updating worker back to "online".
         self._lifecycle_status: str | None = None
         self._lifecycle_reason: str | None = None
+        self._generation: int | None = None
 
         from tinyagentos.worker.pairing import default_state_dir, load_signing_key
         self._state_dir = state_dir or default_state_dir()
@@ -551,6 +552,7 @@ class WorkerAgent:
             "kv_cache_quant_k_support": kv_quant.get("k", ["fp16"]),
             "kv_cache_quant_v_support": kv_quant.get("v", ["fp16"]),
             "kv_cache_quant_boundary_layer_protect": bool(kv_quant.get("boundary", False)),
+            "generation": self._generation,
         }
         # Forward the storage-backup marker once. Controller materialises
         # a workspace text file + a notification so the user sees the
@@ -575,6 +577,18 @@ class WorkerAgent:
                     return _NEEDS_REPAIR
                 resp.raise_for_status()
                 self._registered = True
+                # Capture the controller's current generation from the response
+                try:
+                    resp_gen = resp.json().get("generation")
+                    if resp_gen is not None:
+                        self._generation = resp_gen
+                    else:
+                        logger.warning(
+                            "register response carried no generation echo - "
+                            "split-brain layer-2 protection stays disarmed"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"could not read generation from register response: {exc}")
                 logger.info(f"Registered with controller as '{self.name}'")
                 if backup:
                     _delete_storage_backup_marker()
@@ -678,6 +692,7 @@ class WorkerAgent:
                 # Worker-initiated state transitions (taOS #890 C2).
                 "status": status,
                 "drain_reason": drain_reason,
+                "generation": self._generation,
             }
             # Attach worker update-check state so the controller surfaces it
             # in the Resource Manager / cluster view.
@@ -692,6 +707,19 @@ class WorkerAgent:
                     content=body,
                     headers=auth_headers,
                 )
+                # Capture the controller's current generation from the response
+                try:
+                    resp_json = resp.json()
+                    gen = resp_json.get("generation")
+                    if gen is not None:
+                        self._generation = gen
+                    elif self._generation is not None:
+                        logger.warning(
+                            "heartbeat response stopped echoing generation - "
+                            "split-brain layer-2 protection may be degraded"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"could not read generation from heartbeat response: {exc}")
                 return resp.status_code
         except Exception as exc:  # noqa: BLE001
             # Log before swallowing: a payload-build bug (not just a network

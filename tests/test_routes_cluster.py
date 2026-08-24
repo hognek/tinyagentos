@@ -988,3 +988,67 @@ async def test_update_all_workers_admin_gate_rejected(app, tmp_data_dir):
             headers={"content-type": "application/json"},
         )
         assert resp.status_code in (401, 403)
+
+
+@pytest.mark.asyncio
+async def test_generation_echo_and_layer2_protection(client, app):
+    """End-to-end: generation echo enables layer-2 split-brain protection.
+
+    Before the fix: generation is absent from register/heartbeat responses,
+    so the worker never echoes it, self._generation stays None, and the
+    split-brain protection in manager.py:110-115, 294-299 never fires.
+
+    After the fix: the controller echoes the current generation in both
+    responses.  The worker can read it and send it back on heartbeats.
+    When the controller's generation advances (e.g. via
+    increment_generation()), a heartbeat carrying the stale generation
+    is rejected by the layer-2 guard.
+    """
+    import json as _json
+
+    from tinyagentos.cluster.worker_protocol import WorkerInfo
+
+    # Initialise the worker registry store so persistence + generation
+    # counter are available (taOS #640).
+    await app.state.cluster_manager._registry_store.init()
+
+    # Pair and register a worker
+    key = await pair_worker(client, app, "gen-echo-worker", "http://192.168.1.1:9000")
+
+    # ---- Register: verify generation is echoed ----
+    reg_body = _json.dumps({"name": "gen-echo-worker", "url": "http://192.168.1.1:9000"}).encode()
+    headers = sign_worker_request(key, "gen-echo-worker", "POST", "/api/cluster/workers", reg_body)
+    resp = await client.post("/api/cluster/workers", content=reg_body, headers={**headers, "content-type": "application/json"})
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "registered", data
+    assert "generation" in data, f"Generation not echoed in register response: {data}"
+    reg_generation = data["generation"]
+
+    # ---- Heartbeat: verify generation is echoed back ----
+    hb_body = _json.dumps({"name": "gen-echo-worker", "load": 0.3}).encode()
+    headers = sign_worker_request(key, "gen-echo-worker", "POST", "/api/cluster/heartbeat", hb_body)
+    resp = await client.post("/api/cluster/heartbeat", content=hb_body, headers={**headers, "content-type": "application/json"})
+    assert resp.status_code == 200, resp.text
+    hb_data = resp.json()
+    assert hb_data["status"] == "ok", hb_data
+    assert hb_data.get("generation") == reg_generation, (
+        f"Generation not echoed in heartbeat response: got {hb_data.get('generation')}, "
+        f"expected {reg_generation}"
+    )
+
+    # ---- Layer-2 protection: bump generation, send stale generation, verify rejection ----
+    # Advance the controller's generation counter in the store so the previously-
+    # valid generation is now stale.
+    await app.state.cluster_manager._registry_store.increment_generation()
+    await app.state.cluster_manager._registry_store.current_generation()
+    # Sync the in-memory generation so the split-brain guard fires.
+    app.state.cluster_manager._generation = await app.state.cluster_manager._registry_store.current_generation()
+
+    # Send heartbeat with the old (now-stale) generation - layer-2 guard should reject it.
+    stale_hb_body = _json.dumps({"name": "gen-echo-worker", "load": 0.3, "generation": reg_generation}).encode()
+    headers = sign_worker_request(key, "gen-echo-worker", "POST", "/api/cluster/heartbeat", stale_hb_body)
+    resp = await client.post("/api/cluster/heartbeat", content=stale_hb_body, headers={**headers, "content-type": "application/json"})
+    # manager.heartbeat returns False when generation mismatch; route returns 404.
+    assert resp.status_code == 404, f"Expected 404 (generation mismatch rejection), got {resp.status_code}: {resp.text}"
+    assert "not registered" in resp.json().get("error", ""), f"Unexpected error message: {resp.json()}"

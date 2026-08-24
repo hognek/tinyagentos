@@ -404,7 +404,8 @@ async def register_worker(request: Request, body: WorkerRegister):
     await _record_worker_capability(request.app, body.name, body.host_lan_ip, body.hardware)
     if body.pending_storage_backup:
         await _surface_storage_backup(request.app, body.name, body.pending_storage_backup)
-    return {"status": "registered", "name": body.name}
+    cluster = request.app.state.cluster_manager
+    return {"status": "registered", "name": body.name, "generation": cluster.generation}
 
 
 async def _record_worker_capability(app, name: str, host_lan_ip: str, hardware: dict) -> None:
@@ -561,7 +562,8 @@ async def worker_heartbeat(request: Request, body: HeartbeatBody):
     )
     if not ok:
         return JSONResponse({"error": "Worker not registered"}, status_code=404)
-    return {"status": "ok"}
+    cluster = request.app.state.cluster_manager
+    return {"status": "ok", "generation": cluster.generation}
 
 
 @router.delete("/api/cluster/workers/{name}")

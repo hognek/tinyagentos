@@ -834,6 +834,30 @@ where `revoked=0 OR blocked=1`, so a blocked device counts against
 `_MAX_DEVICES_PER_USER` until it is unblocked, at which point the row falls out
 and the slot frees. Deliberate: a blocked device is a retained safety valve the
 owner can still see and act on.
+## Controller generation echo (split-brain protection)
+
+Route module `tinyagentos/routes/cluster.py`, manager logic in
+`tinyagentos/cluster/manager.py`. Every controller instance carries a
+`generation` identifier; a superseded instance is *fenced* and rejects all
+registrations and heartbeats.
+
+- `POST /api/cluster/workers` (register) and `POST /api/cluster/heartbeat`
+  both **echo the controller's current generation** in their response
+  (`"generation"` key alongside the existing `status` field), so a worker
+  always knows which controller instance accepted it.
+- A worker sends that generation back on subsequent requests. A request
+  carrying a generation that does not match the controller's current one is
+  rejected -- registration answers `409` with `{"error": "stale_generation"}`
+  (or `"fenced"`), heartbeat answers `404` -- because it means the worker is
+  talking to (or was adopted by) **another active controller**. Each rejection
+  logs a warning naming the worker and both generations.
+- **Legacy workers that send no generation pass** (`None` is accepted) for
+  backward compatibility, so the protection only binds once both sides speak
+  the protocol.
+- The worker's generation-capture guards **log a warning instead of passing
+  silently** when the controller stops echoing generation; a silent pass
+  would disarm this protection permanently without anyone seeing it.
+
 ## Answering a select decision with free text (`other_value`)
 
 Route module `tinyagentos/routes/decisions.py`. Applies to BOTH answer paths:
