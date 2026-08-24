@@ -582,8 +582,13 @@ class WorkerAgent:
                     resp_gen = resp.json().get("generation")
                     if resp_gen is not None:
                         self._generation = resp_gen
-                except Exception:
-                    pass
+                    else:
+                        logger.warning(
+                            "register response carried no generation echo - "
+                            "split-brain layer-2 protection stays disarmed"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"could not read generation from register response: {exc}")
                 logger.info(f"Registered with controller as '{self.name}'")
                 if backup:
                     _delete_storage_backup_marker()
@@ -708,8 +713,13 @@ class WorkerAgent:
                     gen = resp_json.get("generation")
                     if gen is not None:
                         self._generation = gen
-                except Exception:
-                    pass
+                    elif self._generation is not None:
+                        logger.warning(
+                            "heartbeat response stopped echoing generation - "
+                            "split-brain layer-2 protection may be degraded"
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"could not read generation from heartbeat response: {exc}")
                 return resp.status_code
         except Exception as exc:  # noqa: BLE001
             # Log before swallowing: a payload-build bug (not just a network
