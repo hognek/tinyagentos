@@ -19,6 +19,17 @@ def _task(priority=Priority.BACKGROUND, submitter="t"):
                 preferred_resources=[], priority=priority, submitter=submitter)
 
 
+async def _settle(predicate, timeout: float = 2.0, interval: float = 0.05):
+    """Poll *predicate* every *interval* seconds until it returns true or *timeout* elapses."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while True:
+        if predicate():
+            return
+        if asyncio.get_event_loop().time() >= deadline:
+            raise AssertionError("settle timeout exceeded")
+        await asyncio.sleep(interval)
+
+
 @pytest.mark.asyncio
 async def test_submit_gpu_defaults_backward_compatible():
     arbiter = GpuArbiter(vram_reservation=_mgr(8192))
@@ -36,7 +47,7 @@ async def test_queue_position_global_for_loads():
         t2, required_vram_mb=1024, op="load", model="b", backend_name="b1"))
     f3 = asyncio.ensure_future(arbiter.submit_gpu(
         t3, required_vram_mb=1024, op="load", model="c", backend_name="b1"))
-    await asyncio.sleep(0.05)      # let them enqueue
+    await _settle(lambda: arbiter.queue_position(t1.id) is not None)
     assert arbiter.queue_position(t1.id) == 1
     assert arbiter.queue_position(t2.id) == 2
     assert arbiter.queue_position(t3.id) == 3
@@ -51,7 +62,7 @@ async def test_queue_position_per_model_for_inference():
     fs = [asyncio.ensure_future(arbiter.submit_gpu(
               t, required_vram_mb=1024, op="inference", model=m, backend_name="b1"))
           for t, m in ((ta, "m-a"), (tb, "m-b"), (ta2, "m-a"))]
-    await asyncio.sleep(0.05)
+    await _settle(lambda: arbiter.queue_position(ta.id) is not None)
     assert arbiter.queue_position(ta.id) == 1
     assert arbiter.queue_position(tb.id) == 1   # only m-b entries count
     assert arbiter.queue_position(ta2.id) == 2  # behind ta on m-a
@@ -65,7 +76,7 @@ async def test_queue_snapshot_non_destructive_and_shaped():
     t1 = _task(submitter="pull:x")
     f = asyncio.ensure_future(arbiter.submit_gpu(
         t1, required_vram_mb=1024, op="load", model="qwen", backend_name="b1"))
-    await asyncio.sleep(0.05)
+    await _settle(lambda: arbiter.queue_position(t1.id) is not None)
     snap1 = arbiter.queue_snapshot()
     snap2 = arbiter.queue_snapshot()
     entry = snap1[0]
@@ -84,7 +95,7 @@ async def test_cancel_queued_op_removes_and_cancels_future():
     t1 = _task()
     f = asyncio.ensure_future(arbiter.submit_gpu(
         t1, required_vram_mb=1024, op="load", model="m", backend_name="b1"))
-    await asyncio.sleep(0.05)
+    await _settle(lambda: arbiter.queue_position(t1.id) is not None)
     assert await arbiter.cancel_op(t1.id) is True
     with pytest.raises(asyncio.CancelledError):
         await f
@@ -107,6 +118,65 @@ async def test_cancel_running_op_delegates_to_evict():
     f = asyncio.ensure_future(arbiter.submit_gpu(t1, required_vram_mb=1024))
     await started.wait()
     assert await arbiter.cancel_op(t1.id) is True
-    await asyncio.sleep(0.05)
-    assert mgr.reserved_vram_mb == 0          # reservation released
+    await _settle(lambda: mgr.reserved_vram_mb == 0)
     f.cancel()
+    f.cancel()
+
+
+@pytest.mark.asyncio
+async def test_queue_snapshot_exposes_resource_id():
+    """queue_snapshot() must surface resource_id so fence handlers can discover
+    which queued ops target a fenced node without touching private state."""
+    arbiter = GpuArbiter(vram_reservation=_mgr(0))   # everything queues
+    t1 = _task(submitter="pull:x")
+    f = asyncio.ensure_future(arbiter.submit_gpu(
+        t1, required_vram_mb=1024, op="load", model="qwen",
+        backend_name="b1", resource_id="gpu-node-1:gpu-0"))
+    await asyncio.sleep(0.05)      # let it enqueue
+    snap = arbiter.queue_snapshot()
+    assert len(snap) == 1
+    assert snap[0]["resource_id"] == "gpu-node-1:gpu-0"
+    assert "resource_id" in snap[0]
+    f.cancel()
+
+
+@pytest.mark.asyncio
+async def test_cancel_queued_for_resource_cancels_matching():
+    """cancel_queued_for_resource cancels every queued op for a resource_id,
+    surfacing resource_id in the snapshot and removing entries from the
+    queue. Bulk + selective: only the targeted resource is cancelled."""
+    arbiter = GpuArbiter(vram_reservation=_mgr(0))   # everything queues
+    t_a1 = _task(submitter="a1")
+    t_a2 = _task(submitter="a2")
+    t_b = _task(submitter="b")
+    f_a1 = asyncio.ensure_future(arbiter.submit_gpu(
+        t_a1, required_vram_mb=1024, op="load", model="m1",
+        backend_name="b1", resource_id="gpu-node-1:gpu-0"))
+    f_a2 = asyncio.ensure_future(arbiter.submit_gpu(
+        t_a2, required_vram_mb=1024, op="load", model="m2",
+        backend_name="b1", resource_id="gpu-node-1:gpu-0"))
+    f_b = asyncio.ensure_future(arbiter.submit_gpu(
+        t_b, required_vram_mb=1024, op="load", model="m3",
+        backend_name="b1", resource_id="gpu-node-2:gpu-0"))
+    await asyncio.sleep(0.05)      # let all three enqueue
+    assert len(arbiter.queue_snapshot()) == 3
+
+    cancelled = await arbiter.cancel_queued_for_resource("gpu-node-1:gpu-0")
+    assert cancelled == 2                          # bulk: both gpu-node-1 ops
+
+    # Targeted ops must have their futures cancelled (arbiter cancel semantics
+    # identical to cancel_op).
+    with pytest.raises(asyncio.CancelledError):
+        await f_a1
+    with pytest.raises(asyncio.CancelledError):
+        await f_a2
+
+    # Entries removed from the queue; the non-matching op survives.
+    assert t_a1.id not in arbiter._queued_entries
+    assert t_a2.id not in arbiter._queued_entries
+    assert t_b.id in arbiter._queued_entries
+    snap = arbiter.queue_snapshot()
+    assert [e["task_id"] for e in snap] == [t_b.id]
+    assert snap[0]["resource_id"] == "gpu-node-2:gpu-0"
+
+    f_b.cancel()

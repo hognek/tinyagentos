@@ -91,8 +91,16 @@ class ClusterManager:
 
     async def register_worker(
         self, info: WorkerInfo, generation: int | None = None
-    ) -> None:
-        # Snapshot capabilities before adding worker
+    ) -> tuple[bool, str]:
+        """Register a worker, returning (ok, reason).
+
+        On success ``ok`` is True and ``reason`` is the empty string.
+        On refusal ``ok`` is False and ``reason`` is one of:
+
+        - ``"fenced"`` -- this controller instance has been superseded.
+        - ``"stale_generation"`` -- the worker echoed a generation that does
+          not match the controller's current generation.
+        """
         caps_before = set()
         if self._capabilities:
             caps_before = {k for k, v in self._capabilities.get_all_capabilities().items() if v["available"]}
@@ -103,7 +111,7 @@ class ClusterManager:
         # taOS #640: controller fence — if this instance has been superseded
         # by another controller, reject all registrations (CodeRabbit PR #1928).
         if self._fenced:
-            return
+            return (False, "fenced")
         # taOS #640: split-brain protection — reject registration from a
         # worker that echoes a different generation (another active controller).
         # Legacy workers that don't send generation get a pass (None).
@@ -112,7 +120,7 @@ class ClusterManager:
                 "Registration from '%s' rejected: generation %s != controller %s",
                 info.name, generation, self._generation,
             )
-            return
+            return (False, "stale_generation")
 
         prev_status = self._workers[info.name].status if info.name in self._workers else None
 
@@ -189,6 +197,7 @@ class ClusterManager:
         task = asyncio.create_task(_promote_bg())
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+        return (True, "")
 
     def kv_quant_union(self) -> list[str]:
         """Return the set-union of KV cache quant types across all online workers.
@@ -998,11 +1007,41 @@ class ClusterManager:
                 except Exception:
                     logger.exception("Failed to check durable generation")
             if self._fenced:
-                # Fenced controller — mark all workers offline and stop routing.
+                # Fenced controller — release all leases, cancel arbiter tasks,
+                # mark all workers offline and stop routing.
                 for worker in list(self._workers.values()):
-                    if worker.name != "local" and worker.status in ("online", "update-available"):
+                    if worker.name == "local":
+                        continue
+                    if worker.status in ("online", "update-available"):
                         worker.status = "offline"
                         logger.info("Worker '%s' marked offline (controller fenced)", worker.name)
+                    # Release any active leases for this worker's resources —
+                    # for every non-local worker regardless of status: a
+                    # draining worker can still hold leases, and the fenced
+                    # branch skips the normal stale-drain cleanup below.
+                    # Match on the exact worker name (not a resource_id
+                    # prefix) so "gpu-node" and "gpu-node-2" don't collide.
+                    async with self._lease_lock:
+                        offline_lids = [
+                            lid for lid, lease in self._leases.items()
+                            if (parsed := self._parse_resource_id(lease.resource_id))
+                            and parsed[0] == worker.name
+                        ]
+                        for lid in offline_lids:
+                            self._leases.pop(lid, None)
+                            logger.debug("Lease %s released — worker %s fenced", lid, worker.name)
+                    # Cancel any running GPU arbiter tasks for the
+                    # released leases (taOS cross-cutting wiring).
+                    if offline_lids and self._gpu_arbiter is not None:
+                        try:
+                            cancelled, already_done = await self._gpu_arbiter.cancel_running_for_leases(set(offline_lids))
+                            logger.info(
+                                "Controller fenced: arbiter cancelled %d tasks, %d already done",
+                                cancelled, already_done)
+                        except Exception:
+                            logger.exception(
+                                "gpu-arbiter: cancel for fenced controller of '%s' failed",
+                                worker.name)
                 await asyncio.sleep(5)
                 continue
             now = time.time()

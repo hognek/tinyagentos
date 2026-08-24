@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -527,6 +528,106 @@ class TestBroadChangelogRequired:
         changed = [("M", "tinyagentos/README.md")]
         failures = dg.evaluate_rules(changed, [], BROAD_CHANGELOG_CONFIG)
         assert len(failures) == 1
+
+
+class TestRequiredSections:
+    """RED 1 and RED 2: content assertion for Layer A.
+
+    Before this check the gate was path-only: a doc emptied of its protected
+    sections satisfied every rule as long as the file was touched. These tests
+    pin the new content-aware behaviour.
+    """
+
+    def _cfg(self, headings):
+        return {
+            "invariants": {
+                "required_sections": [
+                    {
+                        "doc": "docs/agent-coordination.md",
+                        "headings": headings,
+                    }
+                ]
+            }
+        }
+
+    def test_all_required_sections_present_passes(self, tmp_path: Path):
+        """RED 2: with all required sections present, the gate is GREEN."""
+        doc = tmp_path / "docs" / "agent-coordination.md"
+        doc.parent.mkdir(parents=True)
+        doc.write_text(
+            "# Working the repo\n\n"
+            "## Agent API surface (scoped registry JWT)\n\n"
+            "## Device bearer self-service (second, narrower passthrough)\n\n"
+            "## OS change-event stream (`GET /api/os/events`, session-only)\n"
+        )
+        failures = dg.check_required_sections(
+            tmp_path,
+            self._cfg([
+                "Agent API surface (scoped registry JWT)",
+                "Device bearer self-service (second, narrower passthrough)",
+                "OS change-event stream (`GET /api/os/events`, session-only)",
+            ]),
+        )
+        assert failures == []
+
+    def test_missing_required_section_fails(self, tmp_path: Path):
+        """RED 1: deleting a required section while the file is present and
+        touched causes the gate to FAIL."""
+        doc = tmp_path / "docs" / "agent-coordination.md"
+        doc.parent.mkdir(parents=True)
+        doc.write_text(
+            "# Working the repo\n\n"
+            "## Device bearer self-service (second, narrower passthrough)\n\n"
+            "## OS change-event stream (`GET /api/os/events`, session-only)\n"
+        )
+        failures = dg.check_required_sections(
+            tmp_path,
+            self._cfg([
+                "Agent API surface (scoped registry JWT)",
+                "Device bearer self-service (second, narrower passthrough)",
+                "OS change-event stream (`GET /api/os/events`, session-only)",
+            ]),
+        )
+        assert len(failures) == 1
+        assert "Agent API surface (scoped registry JWT)" in failures[0]
+        assert "docs/agent-coordination.md" in failures[0]
+
+    def test_missing_scan_target_is_skipped(self, tmp_path: Path):
+        """A required doc that does not exist on disk is skipped, not failed."""
+        failures = dg.check_required_sections(
+            tmp_path,
+            self._cfg(["Agent API surface (scoped registry JWT)"]),
+        )
+        assert failures == []
+
+    def test_empty_required_sections_list_passes(self, tmp_path: Path):
+        """No required_sections configured -> clean."""
+        assert dg.check_required_sections(tmp_path, {"invariants": {}}) == []
+
+    def test_invariants_command_reports_required_section_failure(self, tmp_path):
+        """The invariants command function must report missing required sections."""
+        doc = tmp_path / "docs" / "agent-coordination.md"
+        doc.parent.mkdir(parents=True)
+        doc.write_text(
+            "# Working the repo\n\n"
+            "## Device bearer self-service (second, narrower passthrough)\n"
+        )
+        cfg = {
+            "gate": {"trailer": "Docs-Reviewed:"},
+            "invariants": {
+                "required_sections": [
+                    {
+                        "doc": "docs/agent-coordination.md",
+                        "headings": [
+                            "Agent API surface (scoped registry JWT)",
+                        ],
+                    }
+                ]
+            }
+        }
+        failures = dg.check_required_sections(tmp_path, cfg)
+        assert len(failures) == 1
+        assert "Agent API surface (scoped registry JWT)" in failures[0]
 
 
 class TestTrailerLogged:

@@ -398,7 +398,9 @@ async def register_worker(request: Request, body: WorkerRegister):
         worker_lxc_image_version=body.worker_lxc_image_version,
         signing_key=signing_key,
     )
-    await cluster.register_worker(info, generation=body.generation)
+    ok, reason = await cluster.register_worker(info, generation=body.generation)
+    if not ok:
+        return JSONResponse({"error": reason}, status_code=409)
     await _record_worker_capability(request.app, body.name, body.host_lan_ip, body.hardware)
     if body.pending_storage_backup:
         await _surface_storage_backup(request.app, body.name, body.pending_storage_backup)
