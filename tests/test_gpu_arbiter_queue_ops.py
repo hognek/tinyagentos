@@ -2,8 +2,8 @@
 
 import asyncio
 import pytest
-from tinyagentos.scheduler.gpu_arbiter import GpuArbiter
-from tinyagentos.scheduler.types import Capability, Priority, Task
+from tinyagentos.scheduler.gpu_arbiter import GpuArbiter, _QueuedGpuTask, GpuAdmission
+from tinyagentos.scheduler.types import Capability, NoResourceAvailableError, Priority, Task
 from tinyagentos.vram_reservation import VramReservationManager
 
 
@@ -180,3 +180,72 @@ async def test_cancel_queued_for_resource_cancels_matching():
     assert snap[0]["resource_id"] == "gpu-node-2:gpu-0"
 
     f_b.cancel()
+
+
+@pytest.mark.asyncio
+async def test_queue_full_drop_removes_queued_entry():
+    """When _drain_queue cannot re-queue a retry entry because the queue is
+    full, the dropped task_id must be removed from _queued_entries so it
+    does not appear as a phantom in queue_snapshot() and queue_position()."""
+    arbiter = GpuArbiter(
+        vram_probe=lambda: (0, 16384),
+        max_queue_size=1,
+    )
+
+    t1 = Task(id="t1", capability=Capability.LLM_CHAT,
+              payload=lambda _res: asyncio.sleep(0.05), preferred_resources=[],
+              priority=Priority.BACKGROUND, submitter="t")
+    t2 = Task(id="t2", capability=Capability.LLM_CHAT,
+              payload=lambda _res: asyncio.sleep(0.05), preferred_resources=[],
+              priority=Priority.BACKGROUND, submitter="t")
+
+    loop = asyncio.get_running_loop()
+    f1 = loop.create_future()
+    f2 = loop.create_future()
+    t1._arbiter_future = f1  # type: ignore[attr-defined]
+    t2._arbiter_future = f2  # type: ignore[attr-defined]
+
+    entry1 = _QueuedGpuTask(
+        priority=int(t1.priority), seq=1, task=t1,
+        required_vram_mb=1024, evictable=False,
+    )
+    await arbiter._queue.put(entry1)
+    arbiter._queued_entries[t1.id] = entry1
+
+    original = arbiter._reserve_and_check
+
+    async def yielding_reserve(task_id, required_vram_mb):
+        await asyncio.sleep(0)
+        return GpuAdmission(
+            admitted=False, free_vram_mb=0, required_vram_mb=required_vram_mb,
+            reason="test: no VRAM",
+        )
+
+    arbiter._reserve_and_check = yielding_reserve  # type: ignore[method-assign]
+
+    async def add_t2():
+        entry2 = _QueuedGpuTask(
+            priority=int(t2.priority), seq=2, task=t2,
+            required_vram_mb=1024, evictable=False,
+        )
+        await arbiter._queue.put(entry2)
+        arbiter._queued_entries[t2.id] = entry2
+
+    add_task = asyncio.ensure_future(add_t2())
+
+    try:
+        await arbiter._drain_queue()
+    finally:
+        arbiter._reserve_and_check = original  # type: ignore[method-assign]
+
+    # t2 was the second retry entry, dropped because queue was full (held t1)
+    assert t2.id not in arbiter._queued_entries
+    assert arbiter.queue_position(t2.id) is None
+    assert t2.id not in [e["task_id"] for e in arbiter.queue_snapshot()]
+    assert f2.done()
+    assert isinstance(f2.exception(), NoResourceAvailableError)
+
+    # t1 was the first retry entry, successfully re-queued
+    assert t1.id in arbiter._queued_entries
+
+    f1.cancel()
