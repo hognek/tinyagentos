@@ -68,6 +68,9 @@ DEFAULT_ALLOW_LABEL = "gate-integrity-allow"
 PROTECTED_PREFIXES: tuple[str, ...] = (
     ".github/workflows/",
     ".github/scripts/",
+    "docs/doc-gate.toml",
+    "pyproject.toml",
+    "tests/conftest.py",
 )
 # Every repo gate checker is named `scripts/check_*.py` by convention; that
 # glob captures all current and future gate scripts in one rule so the guard
@@ -227,6 +230,7 @@ def check_gate_integrity(
     allow_label: str = DEFAULT_ALLOW_LABEL,
     token: str | None = None,
 ) -> tuple[int, str]:
+    token = token or _get_token()
     """Fetch a PR's files + labels via the API and classify the integrity.
 
     Returns (exit_code, message). EXIT_ERROR (2) is returned when the GitHub

@@ -42,10 +42,9 @@ jobs:
       contents: read
       pull-requests: read
     steps:
-      # Checkout the BASE branch ONLY. On `pull_request_target` the default
-      # ref would be the merge ref (PR head + base), which is PR-controlled
-      # code -- exactly what we must not run. Pinning `ref` to base_ref
-      # guarantees the base-ref checker (and this workflow) are what execute.
+      # On `pull_request_target` checkout defaults to the base branch,
+      # not the merge ref. Pinning `ref` to base_ref guarantees
+      # the base-ref checker (and this workflow) execute from base.
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.base_ref }}
