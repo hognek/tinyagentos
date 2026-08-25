@@ -807,6 +807,7 @@ class GpuArbiter:
                     # _drain_queue skips cancelled entries at dequeue time.
             else:
                 self._dropped += 1
+                self._queued_entries.pop(entry.task.id, None)
                 future = getattr(entry.task, "_arbiter_future", None)
                 if future is not None and not future.done():
                     future.set_exception(NoResourceAvailableError("queue full, task dropped"))
