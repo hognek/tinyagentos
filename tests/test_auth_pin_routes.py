@@ -164,3 +164,126 @@ class TestStatusAdvertisesPin:
         pin_app.state.auth.clear_pin("tester")
         r = await console.get("/auth/status")
         assert r.json()["pin_available"] is False
+
+
+@pytest.fixture()
+def fresh_app(tmp_path, monkeypatch):
+    """An install with NO user yet, so /auth/setup is live."""
+    from tinyagentos.app import create_app
+
+    monkeypatch.setenv("TINYAGENTOS_DATA_DIR", str(tmp_path))
+    app = create_app()
+    app.state.auth = AuthManager(tmp_path)
+    return app
+
+
+@pytest_asyncio.fixture()
+async def fresh_console(fresh_app):
+    transport = ASGITransport(app=fresh_app, client=("127.0.0.1", 51234))
+    async with AsyncClient(transport=transport, base_url="http://localhost:6969") as c:
+        yield c
+
+
+@pytest_asyncio.fixture()
+async def fresh_lan(fresh_app):
+    transport = ASGITransport(app=fresh_app, client=("192.168.1.10", 51234))
+    async with AsyncClient(transport=transport, base_url="http://taos.local:6969") as c:
+        yield c
+
+
+class TestSetupOffersAPinAtInstall:
+    """Jay's ask is a choice of sign-in method AT INSTALL as well as in
+    Settings. A touchscreen with no keyboard has to be able to leave the
+    first-run wizard with a PIN already usable."""
+
+    @pytest.mark.asyncio
+    async def test_console_setup_offers_a_pin(self, fresh_console):
+        r = await fresh_console.get("/auth/setup")
+        assert r.status_code == 200
+        assert 'id="setup-pin"' in r.text
+
+    @pytest.mark.asyncio
+    async def test_lan_setup_does_not_offer_a_pin(self, fresh_lan):
+        """Off-console a PIN is refused, so offering the field would hand the
+        user a method that cannot work."""
+        r = await fresh_lan.get("/auth/setup")
+        assert r.status_code == 200
+        assert 'id="setup-pin"' not in r.text
+        assert "name=\"pin\"" not in r.text
+
+    @pytest.mark.asyncio
+    async def test_pin_set_at_install_signs_in(self, fresh_app, fresh_console):
+        r = await fresh_console.post("/auth/setup", json={
+            "username": "tester", "full_name": "T", "password": "correct horse battery",
+            "pin": "4913",
+        })
+        assert r.status_code == 200, r.text
+        assert fresh_app.state.auth.has_pin("tester") is True
+        r2 = await fresh_console.post("/auth/pin-login", json={"pin": "4913"})
+        assert r2.status_code == 200
+        assert r2.json()["ok"] is True
+
+    @pytest.mark.asyncio
+    async def test_setup_without_a_pin_still_works(self, fresh_app, fresh_console):
+        """The PIN is optional. Requiring it would be a new way to be locked
+        out, which is the opposite of the point."""
+        r = await fresh_console.post("/auth/setup", json={
+            "username": "tester", "full_name": "T", "password": "correct horse battery",
+        })
+        assert r.status_code == 200
+        assert fresh_app.state.auth.has_pin("tester") is False
+
+    @pytest.mark.asyncio
+    async def test_a_bad_pin_creates_no_account(self, fresh_app, fresh_console):
+        """/auth/setup only works while zero users exist, so an account created
+        alongside a rejected PIN could never be retried — it would answer 409."""
+        r = await fresh_console.post("/auth/setup", json={
+            "username": "tester", "full_name": "T", "password": "correct horse battery",
+            "pin": "12",
+        })
+        assert r.status_code == 400
+        assert fresh_app.state.auth.is_configured() is False
+
+    @pytest.mark.asyncio
+    async def test_lan_cannot_set_a_pin_at_install(self, fresh_app, fresh_lan):
+        r = await fresh_lan.post("/auth/setup", json={
+            "username": "tester", "full_name": "T", "password": "correct horse battery",
+            "pin": "4913",
+        })
+        assert r.status_code == 400
+        assert fresh_app.state.auth.is_configured() is False
+
+    @pytest.mark.asyncio
+    async def test_form_setup_sets_the_pin(self, fresh_app, fresh_console):
+        r = await fresh_console.post("/auth/setup", data={
+            "username": "tester", "full_name": "T", "password": "correct horse battery",
+            "pin": "4913", "auto_login": "1",
+        })
+        assert r.status_code == 303
+        assert fresh_app.state.auth.has_pin("tester") is True
+
+    @pytest.mark.asyncio
+    async def test_form_setup_rejects_a_bad_pin_before_creating_the_user(
+        self, fresh_app, fresh_console
+    ):
+        r = await fresh_console.post("/auth/setup", data={
+            "username": "tester", "full_name": "T", "password": "correct horse battery",
+            "pin": "abcd",
+        })
+        assert r.status_code == 303
+        assert "error=pin" in r.headers["location"]
+        assert fresh_app.state.auth.is_configured() is False
+
+    @pytest.mark.asyncio
+    async def test_form_setup_off_console_drops_the_pin_but_still_onboards(
+        self, fresh_app, fresh_lan
+    ):
+        """The field is not rendered off-console, so anything arriving in it was
+        not typed by this user — drop it rather than fail their onboarding."""
+        r = await fresh_lan.post("/auth/setup", data={
+            "username": "tester", "full_name": "T", "password": "correct horse battery",
+            "pin": "4913",
+        })
+        assert r.status_code == 303
+        assert fresh_app.state.auth.is_configured() is True
+        assert fresh_app.state.auth.has_pin("tester") is False

@@ -321,12 +321,20 @@ OSK_SCRIPT = r"""
     panel.hidden = false;
     document.body.classList.add("osk-open");
     fit();
-    // With the body top-aligned and scrollable, a card taller than the space
-    // left over is still fully reachable — but the field being typed into has
-    // to be the part that is on screen.
-    if (target.scrollIntoView) {
-      try { target.scrollIntoView({ block: "nearest" }); } catch (e) { target.scrollIntoView(); }
-    }
+    reveal();
+  }
+
+  // Bring the focused field clear of the keys. NOT scrollIntoView: that
+  // measures against the viewport, and the panel is position:fixed OVER the
+  // viewport — so "already visible" includes the strip the keyboard is sitting
+  // on, and a field level with the top row is left tucked behind it. Measured
+  // against the panel's own edge instead.
+  function reveal() {
+    if (!target || panel.hidden || !target.getBoundingClientRect) return;
+    var box = target.getBoundingClientRect();
+    var floor = panel.getBoundingClientRect().top - 12;
+    if (box.bottom > floor) window.scrollBy(0, box.bottom - floor);
+    else if (box.top < 12) window.scrollBy(0, box.top - 12);
   }
 
   function hide() {

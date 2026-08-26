@@ -248,3 +248,13 @@ class TestPinPanelChrome:
         buttons are only reachable by scrolling a page that gives no sign it
         scrolls."""
         assert "body.osk-open .card" in login_console
+
+
+class TestFocusedFieldIsClearOfTheKeys:
+    def test_reveal_measures_against_the_panel_not_the_viewport(self):
+        """scrollIntoView treats the strip the keyboard sits on as visible —
+        the panel is position:fixed OVER the viewport — so a field level with
+        the top row is left tucked behind the keys."""
+        assert "scrollIntoView(" not in OSK_SCRIPT  # the call, not the comment
+        assert "panel.getBoundingClientRect().top" in OSK_SCRIPT
+        assert "window.scrollBy" in OSK_SCRIPT

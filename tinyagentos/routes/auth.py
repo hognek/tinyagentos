@@ -8,7 +8,14 @@ from collections import OrderedDict
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from tinyagentos.auth import AuthStoreCorruptError, _PinAttemptLimiter, is_console_origin, validate_pin
+from tinyagentos.auth import (
+    PIN_MAX_LEN,
+    PIN_MIN_LEN,
+    AuthStoreCorruptError,
+    _PinAttemptLimiter,
+    is_console_origin,
+    validate_pin,
+)
 from tinyagentos.middleware.csrf import verify_csrf
 from tinyagentos.routes.onscreen_keyboard import OSK_SCRIPT, osk_assets
 
@@ -461,8 +468,24 @@ def _login_page(
 """
 
 
-def _setup_page(error: str = "") -> str:
+def _setup_page(error: str = "", pin_offered: bool = False) -> str:
     err = f'<p class="error" role="alert">{html.escape(error)}</p>' if error else ""
+    # Offered only when the installer is sitting at the machine's own screen —
+    # a PIN is refused anywhere else (see is_console_origin), so offering it to
+    # a LAN browser would hand the user a sign-in method that cannot work and
+    # would tell that browser a PIN exists on this box. It stays optional: the
+    # password is always set, so nobody can lock themselves out by skipping it,
+    # and it can be added later from Settings.
+    pin_field = f"""
+    <label class="field">
+      <span>PIN for this screen (optional)</span>
+      <input type="password" name="pin" id="setup-pin" inputmode="numeric"
+             autocomplete="off" maxlength="{PIN_MAX_LEN}" pattern="[0-9]*">
+      <span class="hint">{PIN_MIN_LEN}-{PIN_MAX_LEN} digits, for signing in on
+        this device's own screen — handy on a touchscreen with no keyboard.
+        Your password still works everywhere.</span>
+    </label>
+    """ if pin_offered else ""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -497,6 +520,7 @@ def _setup_page(error: str = "") -> str:
       <input type="password" name="password" autocomplete="new-password" minlength="8" required>
       <span class="hint">At least 8 characters.</span>
     </label>
+    {pin_field}
     <label class="checkbox">
       <input type="checkbox" name="auto_login" value="1" checked>
       Stay signed in on this device
@@ -576,8 +600,9 @@ async def setup_page(request: Request, error: str = ""):
         err_text = {
             "username": "Username is required.",
             "password": "Password must be at least 8 characters.",
+            "pin": f"A PIN must be {PIN_MIN_LEN}-{PIN_MAX_LEN} digits, or left blank.",
         }.get(error, "Setup failed. Please try again.")
-    return HTMLResponse(_setup_page(err_text))
+    return HTMLResponse(_setup_page(err_text, pin_offered=_request_is_console(request)))
 
 
 @router.post("/login")
@@ -952,10 +977,26 @@ async def auth_setup(request: Request):
             return JSONResponse({"error": "username is required"}, status_code=400)
         if not password or len(password) < 8:
             return JSONResponse({"error": "password must be at least 8 characters"}, status_code=400)
+        # Validated BEFORE the account is created: a bad PIN must not leave a
+        # half-onboarded install behind, and /setup only works while zero users
+        # exist, so a second attempt would answer 409 rather than retry.
+        pin = (body.get("pin") or "").strip()
+        if pin:
+            if not _request_is_console(request):
+                return JSONResponse(
+                    {"error": "a PIN can only be set from this device's own screen"},
+                    status_code=400,
+                )
+            try:
+                pin = validate_pin(pin)
+            except ValueError as exc:
+                return JSONResponse({"error": str(exc)}, status_code=400)
         try:
             user = auth_mgr.setup_user(username, full_name, email, password)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
+        if pin:
+            auth_mgr.set_pin(username, pin)
         long_lived = bool(body.get("auto_login", True))
         # Look up the newly created record to get the ID
         record = auth_mgr.find_user(username)
@@ -987,10 +1028,23 @@ async def auth_setup(request: Request):
         return RedirectResponse("/auth/setup?error=username", status_code=303)
     if not password or len(password) < 8:
         return RedirectResponse("/auth/setup?error=password", status_code=303)
+    # Same order as the JSON path: reject a bad PIN before creating the account.
+    # Silently DROPPED off-console rather than refused — the field is not even
+    # rendered there, so anything arriving in it was not typed by this user.
+    pin = (form.get("pin") or "").strip()
+    if pin and not _request_is_console(request):
+        pin = ""
+    if pin:
+        try:
+            pin = validate_pin(pin)
+        except ValueError:
+            return RedirectResponse("/auth/setup?error=pin", status_code=303)
     try:
         auth_mgr.setup_user(username, full_name, email, password)
     except ValueError:
         return RedirectResponse("/auth/setup?error=conflict", status_code=303)
+    if pin:
+        auth_mgr.set_pin(username, pin)
 
     record = auth_mgr.find_user(username)
     user_id = record["id"] if record else ""
