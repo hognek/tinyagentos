@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 import threading
 import time
@@ -577,7 +578,14 @@ async def _json_object(request: Request) -> tuple[dict | None, JSONResponse | No
     """
     try:
         body = await request.json()
-    except Exception:
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # Deliberately narrow. request.json() READS the body before it parses
+        # it, so a blanket `except Exception` also swallows body-read failures
+        # (a client disconnecting mid-upload raises ClientDisconnect here) and
+        # reports them to the caller as "your JSON was malformed". That is a
+        # false accusation, and it hides a transport fault behind a 400 that
+        # nobody investigates. A read failure is not the client's syntax error,
+        # so let it propagate.
         return None, JSONResponse({"error": "invalid JSON body"}, status_code=400)
     if not isinstance(body, dict):
         return None, JSONResponse({"error": "invalid JSON body"}, status_code=400)
