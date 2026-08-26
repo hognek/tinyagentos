@@ -8,7 +8,7 @@ from collections import OrderedDict
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
-from tinyagentos.auth import AuthStoreCorruptError
+from tinyagentos.auth import AuthStoreCorruptError, _PinAttemptLimiter, is_console_origin, validate_pin
 from tinyagentos.middleware.csrf import verify_csrf
 
 logger = logging.getLogger(__name__)
@@ -485,6 +485,147 @@ async def login(request: Request):
     return response
 
 
+def _request_is_console(request: Request) -> bool:
+    """Whether this request may use PIN sign-in at all.
+
+    Thin wrapper so every PIN route asks the question exactly one way. The rule
+    itself lives in ``auth.is_console_origin`` and is unit-tested there without
+    needing a request object.
+    """
+    return is_console_origin(
+        request.client.host if request.client else None, request.headers
+    )
+
+
+#: PIN attempts are throttled separately from passwords, keyed by user id.
+#: Sharing ``_login_limiter`` would let PIN failures lock a user out of the
+#: password path -- and since every console request arrives from the same
+#: loopback address, an IP-keyed counter would be one shared bucket for all.
+_pin_limiter = _PinAttemptLimiter()
+
+
+@router.post("/pin-login")
+async def pin_login(request: Request):
+    """Sign in with a PIN. Console-only.
+
+    Refused outright unless the request comes from the device's own screen. The
+    refusal is deliberately indistinguishable from "no PIN is set": telling a
+    remote caller that PIN sign-in exists here, and that it is merely being
+    denied to them, is free reconnaissance for a guesser.
+    """
+    auth_mgr = request.app.state.auth
+    if not _request_is_console(request):
+        return JSONResponse({"error": "PIN sign-in is not available"}, status_code=404)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    username = (body.get("username") or "").strip() or None
+    pin = body.get("pin") or ""
+
+    # Resolve the throttle key before verifying, so a wrong username cannot be
+    # used to sidestep the delay by cycling keys.
+    record = auth_mgr._pin_user(username)
+    limiter_key = (record or {}).get("id") or f"unknown:{username or ''}"
+
+    wait = _pin_limiter.retry_after(limiter_key)
+    if wait > 0:
+        return JSONResponse(
+            {
+                "error": f"Too many incorrect PINs. Try again in {wait} seconds.",
+                "retry_after": wait,
+            },
+            status_code=429,
+            headers={"Retry-After": str(wait)},
+        )
+
+    ok, user_record = auth_mgr.check_pin(pin, username=username)
+    if not ok or user_record is None:
+        _pin_limiter.record_failure(limiter_key)
+        return JSONResponse({"error": "incorrect PIN"}, status_code=401)
+
+    _pin_limiter.reset(limiter_key)
+    auth_mgr.update_last_login(user_record["id"])
+    # A PIN unlocks THIS device, so the session it mints is the long-lived kind
+    # the kiosk needs to survive a reboot without a keyboard being found.
+    token = auth_mgr.create_session(
+        user_id=user_record["id"],
+        long_lived=True,
+        user_agent=request.headers.get("user-agent", ""),
+    )
+    resp = JSONResponse({"ok": True, "user": auth_mgr._public_user(user_record)})
+    resp.set_cookie(
+        "taos_session", token, httponly=True, samesite="strict",
+        max_age=auth_mgr.session_ttl_for(True),
+    )
+    return resp
+
+
+@router.post("/pin", dependencies=[Depends(verify_csrf)])
+async def set_pin(request: Request):
+    """Set or replace the signed-in user's PIN.
+
+    Requires the account PASSWORD in the body even though the caller already
+    holds a session. A PIN is a credential that unlocks the device, so minting
+    one must cost the real credential -- otherwise anyone who walks up to an
+    unlocked screen can quietly add a permanent way back in.
+    """
+    auth_mgr = request.app.state.auth
+    token = request.cookies.get("taos_session", "")
+    user_id = auth_mgr.validate_session(
+        token, user_agent=request.headers.get("user-agent", "")
+    ) if token else None
+    if not user_id:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+
+    user = auth_mgr.get_user_by_id(user_id)
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    username = user.get("username", "")
+
+    ok, _ = auth_mgr.check_password(body.get("password") or "", username=username)
+    if not ok:
+        return JSONResponse({"error": "incorrect password"}, status_code=403)
+
+    try:
+        validate_pin(body.get("pin") or "")
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+    auth_mgr.set_pin(username, body["pin"])
+    _pin_limiter.reset(user_id)
+    return JSONResponse({"ok": True, "has_pin": True})
+
+
+@router.delete("/pin", dependencies=[Depends(verify_csrf)])
+async def delete_pin(request: Request):
+    """Remove the signed-in user's PIN.
+
+    No password required: turning a credential OFF only ever reduces what an
+    attacker could reach, and demanding a typed password to disable PIN would
+    be unperformable on the keyboard-less device this feature serves.
+    """
+    auth_mgr = request.app.state.auth
+    token = request.cookies.get("taos_session", "")
+    user_id = auth_mgr.validate_session(
+        token, user_agent=request.headers.get("user-agent", "")
+    ) if token else None
+    if not user_id:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    user = auth_mgr.get_user_by_id(user_id)
+    if not user:
+        return JSONResponse({"error": "not authenticated"}, status_code=401)
+    removed = auth_mgr.clear_pin(user.get("username", ""))
+    _pin_limiter.reset(user_id)
+    return JSONResponse({"ok": True, "removed": removed, "has_pin": False})
+
+
 @router.post("/logout", dependencies=[Depends(verify_csrf)])
 async def logout(request: Request):
     auth_mgr = request.app.state.auth
@@ -717,6 +858,19 @@ async def auth_status(request: Request):
             if session_user and session_user.get("pending"):
                 needs_onboarding = True
 
+    # Whether the sign-in UI should offer a PIN keypad at all. This is the AND
+    # of "a PIN exists" and "this request is on the console", so a LAN browser
+    # is never told that PIN sign-in exists on this box -- it simply is not
+    # offered one, which matches /auth/pin-login answering 404 off-console.
+    # Reported only to callers who are not yet signed in; there is nothing for
+    # a live session to do with it.
+    pin_available = False
+    if configured and store_error is None and not authenticated:
+        try:
+            pin_available = _request_is_console(request) and auth_mgr.has_pin()
+        except AuthStoreCorruptError:
+            pin_available = False
+
     return JSONResponse({
         "configured": configured,
         "authenticated": authenticated,
@@ -724,6 +878,7 @@ async def auth_status(request: Request):
         "multi_user": auth_mgr.is_multi_user(),
         "needs_onboarding": needs_onboarding,
         "store_error": store_error,
+        "pin_available": pin_available,
     })
 
 
