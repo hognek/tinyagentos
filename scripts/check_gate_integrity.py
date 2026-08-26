@@ -272,7 +272,9 @@ def _detect_repo() -> tuple[str, str]:
         )
         url = result.stdout.strip()
         if "github.com" in url:
-            path = url.split("github.com/", 1)[1].replace(".git", "").strip()
+            # Handles both https://github.com/owner/repo(.git) and
+            # SCP-style git@github.com:owner/repo(.git) remotes.
+            path = url.split("github.com", 1)[1].lstrip(":/").replace(".git", "").strip()
             parts = path.split("/")
             if len(parts) >= 2:
                 return parts[0], parts[1]

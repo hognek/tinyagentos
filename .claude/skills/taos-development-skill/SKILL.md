@@ -174,8 +174,9 @@ deps the project does not pin set `check_upgrade = false`.
   its own gate to always-exit-0 and green-pass the check that gates it. This
   workflow runs on `pull_request_target` from the base ref and inspects the PR
   diff via the GitHub API only -- it never checks out or executes PR code. It
-  fails any PR touching `.github/workflows/`, `.github/scripts/`, or
-  `scripts/check_*.py` unless the PR carries the human-set
+  fails any PR touching `.github/workflows/`, `.github/scripts/`,
+  `scripts/check_*.py`, `docs/doc-gate.toml`, `pyproject.toml`, or
+  `tests/conftest.py` unless the PR carries the human-set
   `gate-integrity-allow` label (the only way to land a legitimate change to CI
   or a gate checker). Add that label yourself; lanes must not add it. Branch
   protection must require "Gate integrity" as a blocking check.

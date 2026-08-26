@@ -23,6 +23,7 @@ closed).
 """
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -282,6 +283,27 @@ class TestMainTokenEnvPropagation:
 
         assert captured["token"] == "ghp_envtoken123"
         assert code == cgi.EXIT_OK
+
+
+class TestDetectRepo:
+    """SCP-style remotes lack the literal `github.com/`, so the old parse
+    raised IndexError and silently fell back to the default owner/repo --
+    a misattribution the caller can never see."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://github.com/acme/widgets.git",
+            "git@github.com:acme/widgets.git",
+            "ssh://git@github.com/acme/widgets.git",
+        ],
+    )
+    def test_detects_owner_repo_across_remote_styles(self, url) -> None:
+        fake = subprocess.CompletedProcess(
+            args=["git"], returncode=0, stdout=url + "\n", stderr="",
+        )
+        with patch("check_gate_integrity.subprocess.run", return_value=fake):
+            assert cgi._detect_repo() == ("acme", "widgets")
 
 
 # ---------------------------------------------------------------------------
