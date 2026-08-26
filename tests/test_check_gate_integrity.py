@@ -43,9 +43,12 @@ def _files_payload(filenames: list[str]) -> list[dict]:
     return [{"filename": f} for f in filenames]
 
 
-def _pr_payload(label_names: list[str]) -> list[dict]:
+def _pr_payload(label_names: list[str], changed_files: int) -> list[dict]:
     # GET /pulls/{n} is a single object; _api_get wraps it in a list.
-    return [{"labels": [{"name": lbl} for lbl in label_names]}]
+    return [{
+        "labels": [{"name": lbl} for lbl in label_names],
+        "changed_files": changed_files,
+    }]
 
 
 def _api_get_routing(files: list[str], labels: list[str]):
@@ -54,8 +57,9 @@ def _api_get_routing(files: list[str], labels: list[str]):
     def _fake(url: str, token: str | None = None, **_: object) -> list:
         if url.endswith("/files"):
             return _files_payload(files)
-        # single-object /pulls/{n} endpoint
-        return _pr_payload(labels)
+        # single-object /pulls/{n} endpoint; changed_files agrees with the
+        # /files listing unless a test overrides the payload deliberately.
+        return _pr_payload(labels, changed_files=len(files))
 
     return _fake
 
@@ -242,6 +246,32 @@ class TestCheckGateIntegrity:
         assert code == cgi.EXIT_OK
         assert "waived" in message
 
+    def test_truncated_file_listing_fails_closed(self) -> None:
+        # GitHub's /files endpoint caps at 3,000 names; beyond that it silently
+        # stops. A listing shorter than the PR's own changed_files count means
+        # the gate cannot see the whole diff -> EXIT_ERROR, never a pass.
+        def _fake(url: str, token: str | None = None, **_: object) -> list:
+            if url.endswith("/files"):
+                return _files_payload(["README.md", "docs/a.md"])
+            return _pr_payload([], changed_files=5)
+
+        with patch("check_gate_integrity._api_get", side_effect=_fake):
+            code, message = cgi.check_gate_integrity("jaylfc", "taOS", 42)
+        assert code == cgi.EXIT_ERROR
+        assert "truncated" in message
+
+    def test_missing_changed_files_count_fails_closed(self) -> None:
+        # Without the changed_files field truncation is undetectable; treat
+        # the payload as cannot-see rather than assuming the listing is whole.
+        def _fake(url: str, token: str | None = None, **_: object) -> list:
+            if url.endswith("/files"):
+                return _files_payload(["README.md"])
+            return [{"labels": []}]
+
+        with patch("check_gate_integrity._api_get", side_effect=_fake):
+            code, _ = cgi.check_gate_integrity("jaylfc", "taOS", 42)
+        assert code == cgi.EXIT_ERROR
+
     def test_infra_failure_fails_closed(self) -> None:
         # cannot-see must not read as clean pass: None from _api_get is an
         # infrastructure error -> EXIT_ERROR.
@@ -268,7 +298,8 @@ class TestCheckGateIntegrity:
 
 class TestMainTokenEnvPropagation:
     def test_main_uses_env_token_when_no_cli_token(self, monkeypatch) -> None:
-        monkeypatch.setenv("GITHUB_TOKEN", "ghp_envtoken123")
+        env_token = "env-cred-value"  # neutral: not a real credential shape
+        monkeypatch.setenv("GITHUB_TOKEN", env_token)
 
         captured: dict = {}
 
@@ -276,12 +307,12 @@ class TestMainTokenEnvPropagation:
             captured["token"] = token
             if url.endswith("/files"):
                 return []
-            return [{"labels": []}]
+            return _pr_payload([], changed_files=0)
 
         with patch("check_gate_integrity._api_get", side_effect=fake_api_get):
             code = cgi.main(["42", "--owner", "jaylfc", "--repo", "taOS"])
 
-        assert captured["token"] == "ghp_envtoken123"
+        assert captured["token"] == env_token
         assert code == cgi.EXIT_OK
 
 

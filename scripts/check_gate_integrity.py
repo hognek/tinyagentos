@@ -173,20 +173,27 @@ def collect_pr_files(
     return [f.get("filename", "") for f in data if isinstance(f, dict)]
 
 
-def collect_pr_labels(
+def collect_pr_meta(
     owner: str, repo: str, pr_number: int, token: str | None = None,
-) -> set[str] | None:
-    """Return the PR's label names (via the API). None on infrastructure
-    failure."""
+) -> tuple[set[str], int] | None:
+    """Return (label names, changed_files count) for the PR (via the API).
+
+    None on infrastructure failure, and also when the payload carries no
+    usable `changed_files` count: without it a truncated /files listing is
+    undetectable, and cannot-see must never read as a clean pass."""
     data = _api_get(f"{API}/repos/{owner}/{repo}/pulls/{pr_number}", token)
     if data is None:
         return None
     pr = data[0] if isinstance(data, list) and data else {}
     if not isinstance(pr, dict):
-        return set()
-    return {
+        return None
+    changed = pr.get("changed_files")
+    if not isinstance(changed, int) or isinstance(changed, bool):
+        return None
+    labels = {
         lbl.get("name", "") for lbl in pr.get("labels", []) if isinstance(lbl, dict)
     }
+    return labels, changed
 
 
 def classify(
@@ -247,11 +254,21 @@ def check_gate_integrity(
             f"gate-integrity: error -- could not fetch changed files for "
             f"PR #{pr_number} (infrastructure failure, exit {EXIT_ERROR})"
         )
-    labels = collect_pr_labels(owner, repo, pr_number, token)
-    if labels is None:
+    meta = collect_pr_meta(owner, repo, pr_number, token)
+    if meta is None:
         return EXIT_ERROR, (
-            f"gate-integrity: error -- could not fetch labels for PR #{pr_number} "
-            f"(infrastructure failure, exit {EXIT_ERROR})"
+            f"gate-integrity: error -- could not fetch labels/changed-file "
+            f"count for PR #{pr_number} (infrastructure failure, exit {EXIT_ERROR})"
+        )
+    labels, changed_total = meta
+    if len(files) != changed_total:
+        # GitHub's /files endpoint silently stops at 3,000 files; a diff the
+        # gate cannot fully see cannot be cleared. Fail closed, not open.
+        return EXIT_ERROR, (
+            f"gate-integrity: error -- /files returned {len(files)} name(s) but "
+            f"the PR reports changed_files={changed_total}; the listing is "
+            f"truncated or inconsistent, so unseen paths cannot be cleared "
+            f"(exit {EXIT_ERROR})"
         )
     result = classify(files, labels, allow_label)
     return result.exit_code, result.message
