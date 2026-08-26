@@ -35,6 +35,9 @@ Protected paths (the minimal gate surface a lane could corrupt):
   - `.github/workflows/`        the required-check workflow YAML itself
   - `.github/scripts/`          gate checkers collocated under `.github`
   - `scripts/check_*.py`        every repo gate checker lives here by convention
+  - `docs/doc-gate.toml`        the doc-gate's rule DATA (a gate input, not code)
+  - `pyproject.toml`            tool/test configuration the gates execute under
+  - `tests/conftest.py`         fixture root every gate-adjacent test imports
 
 Usage:
     python scripts/check_gate_integrity.py <pr-number> [--owner O] [--repo R] [--label LABEL]
@@ -199,7 +202,8 @@ def classify(
     if not violations:
         return CheckResult(
             EXIT_OK,
-            "gate-integrity: PASS -- PR touches no gate workflows or checker scripts",
+            "gate-integrity: PASS -- PR touches no protected gate paths "
+            f"({', '.join(PROTECTED_PREFIXES)} or {GATE_SCRIPT_PREFIX}*{GATE_SCRIPT_SUFFIX})",
         )
     if allow_label in label_set:
         return CheckResult(

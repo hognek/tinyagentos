@@ -15,9 +15,12 @@ name: Gate integrity
 #     to `ref: ${{ github.base_ref }}` (the base branch) -- the PR merge ref is
 #     deliberately never fetched. The base-ref checker then inspects the PR diff
 #     via the GitHub REST API only.
-#   * It fails any PR whose diff touches a protected gate file --
-#     .github/workflows/, .github/scripts/, or scripts/check_*.py -- unless the
-#     PR carries the human-set `gate-integrity-allow` label.
+#   * It fails any PR whose diff touches a protected gate file -- the
+#     PROTECTED_PREFIXES set in scripts/check_gate_integrity.py (workflows,
+#     gate checkers, gate data and test config) -- unless the PR carries the
+#     human-set `gate-integrity-allow` label. The checker is the single
+#     source of truth for the protected set; this comment deliberately does
+#     not enumerate it.
 #
 # Token permissions are minimal (contents: read, pull-requests: read); the
 # GITHUB_TOKEN never acquires write scope here, and PR-controlled code is never
