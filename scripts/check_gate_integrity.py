@@ -117,10 +117,10 @@ def _api_get(url: str, token: str | None = None) -> list | None:
                 data = json.loads(raw)
                 link = r.headers.get("Link", "")
         except urllib.error.HTTPError as e:
-            print(f"error: GET {url} failed: HTTP {e.code} {e.reason}", file=sys.stderr)
+            print(f"error: GET {page_url} failed: HTTP {e.code} {e.reason}", file=sys.stderr)
             return None
         except Exception as e:  # any infra failure fails closed
-            print(f"error: GET {url} failed: {e}", file=sys.stderr)
+            print(f"error: GET {page_url} failed: {e}", file=sys.stderr)
             return None
         if isinstance(data, dict) and data.get("message"):
             print(f"error: API response message: {data['message']}", file=sys.stderr)
@@ -230,13 +230,13 @@ def check_gate_integrity(
     allow_label: str = DEFAULT_ALLOW_LABEL,
     token: str | None = None,
 ) -> tuple[int, str]:
-    token = token or _get_token()
     """Fetch a PR's files + labels via the API and classify the integrity.
 
     Returns (exit_code, message). EXIT_ERROR (2) is returned when the GitHub
     API cannot be reached or returns an error, so a cannot-see state never
     reads as a clean pass.
     """
+    token = token or _get_token()
     files = collect_pr_files(owner, repo, pr_number, token)
     if files is None:
         return EXIT_ERROR, (

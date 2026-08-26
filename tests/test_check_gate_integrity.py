@@ -75,6 +75,9 @@ class TestIsProtected:
             ".github/workflows/deleted-symbols-gate.yml",
             ".github/workflows/gate-integrity.yml",
             ".github/scripts/check_all_skip.py",
+            "docs/doc-gate.toml",
+            "pyproject.toml",
+            "tests/conftest.py",
         ],
     )
     def test_gate_files_are_protected(self, path: str) -> None:
@@ -260,6 +263,25 @@ class TestCheckGateIntegrity:
         assert code == cgi.EXIT_OK
         assert any(u.endswith("/files") for u in captured)
         assert any(u.endswith("/pulls/42") for u in captured)
+
+
+class TestMainTokenEnvPropagation:
+    def test_main_uses_env_token_when_no_cli_token(self, monkeypatch) -> None:
+        monkeypatch.setenv("GITHUB_TOKEN", "ghp_envtoken123")
+
+        captured: dict = {}
+
+        def fake_api_get(url, token=None, **_):
+            captured["token"] = token
+            if url.endswith("/files"):
+                return []
+            return [{"labels": []}]
+
+        with patch("check_gate_integrity._api_get", side_effect=fake_api_get):
+            code = cgi.main(["42", "--owner", "jaylfc", "--repo", "taOS"])
+
+        assert captured["token"] == "ghp_envtoken123"
+        assert code == cgi.EXIT_OK
 
 
 # ---------------------------------------------------------------------------
