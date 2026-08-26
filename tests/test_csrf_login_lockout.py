@@ -199,11 +199,22 @@ class TestExemptionsStayWithinTheUnauthenticatedSurface:
 class TestPinPanelCanAlwaysRenderTheReason:
     """Every failure `/auth/pin-login` can return must carry an `error` key.
 
-    `_PIN_PANEL_SCRIPT` renders `(res.body && res.body.error) || "Incorrect PIN."`.
-    A body without an `error` key therefore surfaces as "Incorrect PIN." — so a
-    CORRECT PIN refused for an unrelated reason accused the user of typing it
-    wrong, on a device with no other way in. Assert the contract at the source
-    of the body, not at the string the panel happens to print.
+    `_PIN_PANEL_SCRIPT` used to render
+    `(res.body && res.body.error) || "Incorrect PIN."`, so a body without an
+    `error` key surfaced as "Incorrect PIN." — a CORRECT PIN refused for an
+    unrelated reason accused the user of typing it wrong, on a device with no
+    other way in. That expression now also reads `detail`, with a fallback that
+    does not blame the PIN:
+
+        var reason = res.body && (res.body.error || res.body.detail);
+        fail(reason || "Sign-in failed. Try again, or use your password.");
+
+    The client change is the backstop, not the contract. These tests assert the
+    contract at the SOURCE of the body — every failure the route can return
+    names itself in `error` — because a panel that can only ever say "something
+    went wrong" is still a dead end on a kiosk. Asserting the string the panel
+    prints would be one level too coarse: it passes as long as *some* text
+    appears, including text that identifies nothing.
     """
 
     @pytest.mark.asyncio
