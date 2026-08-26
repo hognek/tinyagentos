@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from tinyagentos.auth import AuthStoreCorruptError, _PinAttemptLimiter, is_console_origin, validate_pin
 from tinyagentos.middleware.csrf import verify_csrf
+from tinyagentos.routes.onscreen_keyboard import OSK_SCRIPT, osk_assets
 
 logger = logging.getLogger(__name__)
 
@@ -208,7 +209,169 @@ button[type="submit"]:disabled { opacity: 0.4; cursor: not-allowed; }
 """
 
 
-def _login_page(error: str = "", multi_user: bool = False, next_url: str = "") -> str:
+_PIN_PANEL_STYLE = """
+.pin-panel { margin-bottom: 14px; }
+.pin-panel[hidden], .pw-panel[hidden] { display: none; }
+.pin-dots { display: flex; gap: 10px; justify-content: center; margin: 8px 0 14px; }
+.pin-dot {
+  width: 14px; height: 14px; border-radius: 50%;
+  border: 1px solid rgba(255,255,255,0.45); background: transparent;
+}
+.pin-dot[data-filled="1"] { background: #4c9aff; border-color: #4c9aff; }
+.method-switch {
+  display: block; width: 100%; margin-top: 12px; padding: 12px;
+  min-height: 44px; background: none; border: none; cursor: pointer;
+  color: #9ecbff; font: inherit; text-decoration: underline;
+}
+.method-switch:focus-visible { outline: 3px solid #4c9aff; outline-offset: 2px; }
+"""
+
+# Plain (non-f) string: interpolated into the page as a value, so braces here
+# must not be doubled.
+_PIN_PANEL_SCRIPT = r"""
+(function () {
+  "use strict";
+  // Deferred to DOMContentLoaded on purpose. This script is inline and runs
+  // during parsing, but the on-screen keyboard appends its panel on
+  // DOMContentLoaded -- so calling taosOSK.enable() here at parse time would
+  // "show" a panel that is not in the document yet and the keypad would never
+  // appear. The OSK block is emitted BEFORE this one, so its listener is
+  // registered first and has already run by the time we get here.
+  function init() {
+  var pinPanel = document.getElementById("pin-panel");
+  var pwPanel  = document.getElementById("pw-panel");
+  if (!pinPanel || !pwPanel) return;
+
+  var input   = document.getElementById("pin-input");
+  var dots    = document.getElementById("pin-dots");
+  var err     = document.getElementById("pin-error");
+  var submit  = document.getElementById("pin-submit");
+  var toPw    = document.getElementById("use-password");
+  var toPin   = document.getElementById("use-pin");
+  var nextUrl = pinPanel.getAttribute("data-next") || "/desktop";
+  var user    = pinPanel.getAttribute("data-username") || "";
+  var busy    = false;
+
+  function paint() {
+    var n = input.value.length;
+    var kids = dots.children;
+    for (var i = 0; i < kids.length; i++) {
+      kids[i].setAttribute("data-filled", i < n ? "1" : "0");
+    }
+  }
+
+  input.addEventListener("input", function () {
+    // Digits only: the keypad cannot produce anything else, but a physical
+    // keyboard can, and a stray letter would fail server-side validation with
+    // a confusing "incorrect PIN".
+    input.value = input.value.replace(/\D/g, "");
+    paint();
+    err.textContent = "";
+  });
+
+  function fail(msg) {
+    err.textContent = msg;
+    input.value = "";
+    paint();
+  }
+
+  submit.addEventListener("click", function () {
+    if (busy) return;
+    var pin = input.value;
+    if (pin.length < 4) { fail("Enter your PIN."); return; }
+    busy = true;
+    fetch("/auth/pin-login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: user || undefined, pin: pin })
+    }).then(function (r) {
+      return r.json().then(function (body) { return { status: r.status, body: body }; });
+    }).then(function (res) {
+      busy = false;
+      if (res.status === 200 && res.body && res.body.ok) {
+        window.location.assign(nextUrl);
+        return;
+      }
+      // 404 means PIN sign-in is not available from here at all; say so plainly
+      // rather than leaving the user tapping at a keypad that cannot work.
+      if (res.status === 404) {
+        fail("PIN sign-in is not available on this device. Use your password.");
+        return;
+      }
+      fail((res.body && res.body.error) || "Incorrect PIN.");
+    }).catch(function () {
+      busy = false;
+      fail("Could not reach taOS. Check the connection and try again.");
+    });
+  });
+
+  function swap(showPin) {
+    pinPanel.hidden = !showPin;
+    pwPanel.hidden = showPin;
+    err.textContent = "";
+    if (showPin) {
+      input.value = "";
+      paint();
+      if (window.taosOSK) { window.taosOSK.enable(); window.taosOSK.focusField(input); }
+      else input.focus();
+    } else {
+      var pw = pwPanel.querySelector("input[type=password]");
+      if (pw && window.taosOSK) window.taosOSK.focusField(pw);
+      else if (pw) pw.focus();
+    }
+  }
+
+  if (toPw)  toPw.addEventListener("click", function () { swap(false); });
+  if (toPin) toPin.addEventListener("click", function () { swap(true); });
+
+  paint();
+  // The keypad is the whole point on a keyboard-less panel, so open it as soon
+  // as the PIN field exists rather than making the user find the toggle first.
+  if (window.taosOSK) { window.taosOSK.enable(); window.taosOSK.focusField(input); }
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+"""
+
+
+def _pin_panel_html(multi_user: bool, next_url: str) -> str:
+    """The PIN entry panel, shown only when the request is console-local."""
+    safe_next = html.escape(next_url or "/desktop")
+    # In multi-user mode we cannot guess which account the PIN belongs to, so
+    # the username the user typed for the password path is reused; the server
+    # refuses to guess too (AuthManager._pin_user).
+    return f"""
+    <div class="pin-panel" id="pin-panel" data-next="{safe_next}" data-username="">
+      <label class="field">
+        <span>PIN</span>
+        <input type="password" id="pin-input" inputmode="numeric" autocomplete="off"
+               data-osk-submit="pin-submit" aria-describedby="pin-error"
+               maxlength="12" required>
+      </label>
+      <div class="pin-dots" id="pin-dots" aria-hidden="true">
+        <span class="pin-dot"></span><span class="pin-dot"></span>
+        <span class="pin-dot"></span><span class="pin-dot"></span>
+      </div>
+      <p class="error" id="pin-error" role="alert"></p>
+      <button type="button" id="pin-submit">Sign in with PIN</button>
+      <button type="button" class="method-switch" id="use-password">
+        Use my password instead
+      </button>
+    </div>
+    """
+
+
+def _login_page(
+    error: str = "",
+    multi_user: bool = False,
+    next_url: str = "",
+    pin_available: bool = False,
+) -> str:
     err = f'<p class="error" role="alert">{html.escape(error)}</p>' if error else ""
     pwd_placeholder = "Password or invite code" if multi_user else "Password"
     autologin_default = "" if multi_user else "checked"
@@ -219,6 +382,17 @@ def _login_page(error: str = "", multi_user: bool = False, next_url: str = "") -
         </label>
         ''' if multi_user else ""
     next_field = f'<input type="hidden" name="next" value="{html.escape(next_url)}">' if next_url else ""
+    # The PIN panel and the "use a PIN instead" switch exist only when this
+    # request is console-local AND a PIN is set. Off-console the page is exactly
+    # what it has always been, so a LAN browser is never shown a method it would
+    # be refused (and never learns that a PIN exists on this box).
+    pin_panel = _pin_panel_html(multi_user, next_url) if pin_available else ""
+    pin_switch = (
+        '<button type="button" class="method-switch" id="use-pin">Use my PIN instead</button>'
+        if pin_available else ""
+    )
+    pin_script = '<script src="/auth/pin-panel.js" defer></script>' if pin_available else ""
+    pw_hidden = " hidden" if pin_available else ""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -226,27 +400,34 @@ def _login_page(error: str = "", multi_user: bool = False, next_url: str = "") -
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Sign in — taOS</title>
 <style>{_AUTH_BASE_STYLE}</style>
+<style>{_PIN_PANEL_STYLE}</style>
 </head>
 <body>
-  <form class="card" method="POST" action="/auth/login">
+  <div class="card">
     <div class="brand">
       <div class="icon">⌗</div>
       <h1>taOS</h1>
       <p>Sign in to continue</p>
     </div>
     {err}
-    {username_field}
-    {next_field}
-    <label class="field">
-      <span>Password</span>
-      <input type="password" name="password" autocomplete="current-password" placeholder="{pwd_placeholder}" {'' if multi_user else 'autofocus'} required>
-    </label>
-    <label class="checkbox">
-      <input type="checkbox" name="auto_login" value="1" {autologin_default}>
-      Stay signed in on this device
-    </label>
-    <button type="submit">Sign in</button>
-  </form>
+    {pin_panel}
+    <form class="pw-panel" id="pw-panel" method="POST" action="/auth/login"{pw_hidden}>
+      {username_field}
+      {next_field}
+      <label class="field">
+        <span>Password</span>
+        <input type="password" name="password" autocomplete="current-password" placeholder="{pwd_placeholder}" {'' if multi_user else 'autofocus'} required>
+      </label>
+      <label class="checkbox">
+        <input type="checkbox" name="auto_login" value="1" {autologin_default}>
+        Stay signed in on this device
+      </label>
+      <button type="submit">Sign in</button>
+      {pin_switch}
+    </form>
+  </div>
+{osk_assets()}
+{pin_script}
 </body>
 </html>
 """
@@ -294,6 +475,7 @@ def _setup_page(error: str = "") -> str:
     </label>
     <button type="submit">Get started</button>
   </form>
+{osk_assets()}
 </body>
 </html>
 """
@@ -340,7 +522,18 @@ async def login_page(request: Request, error: str = "", next: str = ""):
         err_text = ""
     # Only allow relative paths starting with / to prevent open redirect
     safe_next = next if (next.startswith("/") and not next.startswith("//")) else ""
-    return HTMLResponse(_login_page(err_text, multi_user=auth_mgr.is_multi_user(), next_url=safe_next))
+    # Same rule as /auth/status and /auth/pin-login: offer the keypad only where
+    # it would actually be accepted.
+    try:
+        pin_available = _request_is_console(request) and auth_mgr.has_pin()
+    except AuthStoreCorruptError:
+        pin_available = False
+    return HTMLResponse(_login_page(
+        err_text,
+        multi_user=auth_mgr.is_multi_user(),
+        next_url=safe_next,
+        pin_available=pin_available,
+    ))
 
 
 @router.get("/setup", response_class=HTMLResponse)
@@ -502,6 +695,32 @@ def _request_is_console(request: Request) -> bool:
 #: password path -- and since every console request arrives from the same
 #: loopback address, an IP-keyed counter would be one shared bucket for all.
 _pin_limiter = _PinAttemptLimiter()
+
+
+@router.get("/osk.js")
+async def osk_script(request: Request):
+    """Serve the on-screen keyboard as a same-origin script.
+
+    taOS sends `script-src 'self'`, which refuses inline <script> blocks. The
+    keyboard therefore CANNOT be inlined into the auth pages -- doing so renders
+    correct-looking HTML whose script the browser silently drops, so the page
+    looks right and the keyboard simply never appears.
+    """
+    return Response(
+        content=OSK_SCRIPT,
+        media_type="application/javascript",
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
+@router.get("/pin-panel.js")
+async def pin_panel_script(request: Request):
+    """Serve the PIN panel behaviour. Same CSP reasoning as /auth/osk.js."""
+    return Response(
+        content=_PIN_PANEL_SCRIPT,
+        media_type="application/javascript",
+        headers={"Cache-Control": "public, max-age=300"},
+    )
 
 
 @router.post("/pin-login")
