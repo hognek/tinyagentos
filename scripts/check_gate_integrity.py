@@ -164,13 +164,25 @@ def is_protected(path: str) -> bool:
 
 def collect_pr_files(
     owner: str, repo: str, pr_number: int, token: str | None = None,
-) -> list[str] | None:
-    """Return the list of filenames changed by a PR (via the API, never a
-    local checkout). None on infrastructure failure."""
+) -> tuple[list[str], int] | None:
+    """Return (changed paths, API record count) for a PR (via the API, never
+    a local checkout). A rename edits BOTH paths -- renaming a workflow out
+    of .github/workflows/ disables it -- so `previous_filename` is included
+    alongside `filename`. The record count is returned separately: the
+    truncation check must compare records against `changed_files`, or every
+    rename would read as a truncated listing. None on infrastructure
+    failure."""
     data = _api_get(f"{API}/repos/{owner}/{repo}/pulls/{pr_number}/files", token)
     if data is None:
         return None
-    return [f.get("filename", "") for f in data if isinstance(f, dict)]
+    records = [f for f in data if isinstance(f, dict)]
+    paths: list[str] = []
+    for f in records:
+        paths.append(f.get("filename", ""))
+        prev = f.get("previous_filename")
+        if isinstance(prev, str) and prev:
+            paths.append(prev)
+    return paths, len(records)
 
 
 def collect_pr_meta(
@@ -248,8 +260,8 @@ def check_gate_integrity(
     reads as a clean pass.
     """
     token = token or _get_token()
-    files = collect_pr_files(owner, repo, pr_number, token)
-    if files is None:
+    collected = collect_pr_files(owner, repo, pr_number, token)
+    if collected is None:
         return EXIT_ERROR, (
             f"gate-integrity: error -- could not fetch changed files for "
             f"PR #{pr_number} (infrastructure failure, exit {EXIT_ERROR})"
@@ -260,12 +272,15 @@ def check_gate_integrity(
             f"gate-integrity: error -- could not fetch labels/changed-file "
             f"count for PR #{pr_number} (infrastructure failure, exit {EXIT_ERROR})"
         )
+    files, record_count = collected
     labels, changed_total = meta
-    if len(files) != changed_total:
+    if record_count != changed_total:
         # GitHub's /files endpoint silently stops at 3,000 files; a diff the
         # gate cannot fully see cannot be cleared. Fail closed, not open.
+        # Compared per-record, not per-path: renames contribute two paths
+        # from one record.
         return EXIT_ERROR, (
-            f"gate-integrity: error -- /files returned {len(files)} name(s) but "
+            f"gate-integrity: error -- /files returned {record_count} record(s) but "
             f"the PR reports changed_files={changed_total}; the listing is "
             f"truncated or inconsistent, so unseen paths cannot be cleared "
             f"(exit {EXIT_ERROR})"

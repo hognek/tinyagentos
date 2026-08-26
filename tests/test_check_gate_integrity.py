@@ -260,6 +260,43 @@ class TestCheckGateIntegrity:
         assert code == cgi.EXIT_ERROR
         assert "truncated" in message
 
+    def test_rename_out_of_protected_path_fails_without_label(self) -> None:
+        # A rename edits BOTH paths: renaming a workflow out of
+        # .github/workflows/ disables it, yet /files reports only the new
+        # filename at top level and carries the old one in
+        # previous_filename. The protected old side must still be classified.
+        def _fake(url: str, token: str | None = None, **_: object) -> list:
+            if url.endswith("/files"):
+                return [{
+                    "filename": "docs/archived-gate.yml",
+                    "previous_filename": ".github/workflows/doc-gate.yml",
+                    "status": "renamed",
+                }]
+            return _pr_payload([], changed_files=1)
+
+        with patch("check_gate_integrity._api_get", side_effect=_fake):
+            code, message = cgi.check_gate_integrity("jaylfc", "taOS", 42)
+        assert code == cgi.EXIT_BLOCKED
+        assert ".github/workflows/doc-gate.yml" in message
+
+    def test_renamed_record_does_not_trip_truncation_check(self) -> None:
+        # Classifying both sides of a rename must not double-count records:
+        # the truncation comparison is records-vs-changed_files, so a single
+        # renamed record with changed_files=1 is a complete listing, not a
+        # truncated one.
+        def _fake(url: str, token: str | None = None, **_: object) -> list:
+            if url.endswith("/files"):
+                return [{
+                    "filename": "docs/b.md",
+                    "previous_filename": "docs/a.md",
+                    "status": "renamed",
+                }]
+            return _pr_payload([], changed_files=1)
+
+        with patch("check_gate_integrity._api_get", side_effect=_fake):
+            code, _ = cgi.check_gate_integrity("jaylfc", "taOS", 42)
+        assert code == cgi.EXIT_OK
+
     def test_missing_changed_files_count_fails_closed(self) -> None:
         # Without the changed_files field truncation is undetectable; treat
         # the payload as cannot-see rather than assuming the listing is whole.
