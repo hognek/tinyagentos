@@ -166,7 +166,7 @@ export function getLaunchableApps(installedOptional: Set<string>): AppManifest[]
     (a) =>
       (!a.optional || installedOptional.has(a.id)) &&
       a.handler !== true &&
-      (a.tier === undefined || a.tier <= 2),
+      (a.tier === undefined || a.tier <= 2 || (a.tier === 5 && installedOptional.has(a.id))),
   );
 }
 

@@ -208,6 +208,22 @@ describe("getLaunchableApps tier filtering (S1 contract)", () => {
   });
 });
 
+describe("getLaunchableApps tier-5 optional app filtering", () => {
+  it("includes installed tier-5 optional apps", () => {
+    const installed = new Set(["coding-studio", "design-studio"]);
+    const ids = getLaunchableApps(installed).map((a) => a.id);
+    expect(ids).toContain("coding-studio");
+    expect(ids).toContain("design-studio");
+  });
+
+  it("excludes non-installed tier-5 optional apps", () => {
+    const installed = new Set();
+    const ids = getLaunchableApps(installed).map((a) => a.id);
+    expect(ids).not.toContain("coding-studio");
+    expect(ids).not.toContain("design-studio");
+  });
+});
+
 describe("APP_REDIRECTS", () => {
   it("is exported as a Record", () => {
     expect(APP_REDIRECTS).toBeDefined();
