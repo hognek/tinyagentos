@@ -139,6 +139,18 @@ believes access was removed when it was not. Do not rely on it.
 400 without `?channel=<thread>`; there is no all-threads mode yet, so watching
 several threads means one connection each.
 
+**A malformed JSON body to an auth route is a 400, not a 500.** `request.json()`
+happily parses `null`, `[]`, `1` and `"x"` - all valid JSON, none of them an
+object - and the `body.get()` that follows then raises `AttributeError`. Six
+routes in `tinyagentos/routes/auth.py` shared that shape, and three of them
+(`/auth/login`, `/auth/setup`, `/auth/complete`) are in `EXEMPT_PATHS`, so any
+unauthenticated caller could reach the 500. They now answer 400 for a body that
+is not a JSON object. If you are driving these endpoints, treat a 400 as "your
+body was the wrong shape" and stop reading a 500 there as a server fault worth
+escalating. When adding a route that reads a JSON body, use the `_json_object()`
+helper rather than parsing inline - it follows the module's existing
+`(value, error_response)` convention.
+
 ## Gate on fresh CI, not stale rollups
 
 - Open the PR against `dev` and let the required checks run: the Python test

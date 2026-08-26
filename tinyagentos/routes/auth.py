@@ -815,16 +815,9 @@ async def pin_login(request: Request):
     if not _request_is_console(request):
         return JSONResponse({"error": "PIN sign-in is not available"}, status_code=404)
 
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    # request.json() happily returns null/[]/1/"x" -- all valid JSON, none of
-    # them a mapping. Without this the first body.get() raises AttributeError
-    # and the client gets a 500 for what is plainly a bad request. This route
-    # is reachable without a session, so any console client can send `null`.
-    if not isinstance(body, dict):
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    body, body_err = await _json_object(request)
+    if body_err is not None:
+        return body_err
     username = (body.get("username") or "").strip() or None
     pin = body.get("pin") or ""
 
@@ -883,16 +876,9 @@ async def set_pin(request: Request):
     if not user_id:
         return JSONResponse({"error": "not authenticated"}, status_code=401)
 
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    # request.json() happily returns null/[]/1/"x" -- all valid JSON, none of
-    # them a mapping. Without this the first body.get() raises AttributeError
-    # and the client gets a 500 for what is plainly a bad request. This route
-    # is reachable without a session, so any console client can send `null`.
-    if not isinstance(body, dict):
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    body, body_err = await _json_object(request)
+    if body_err is not None:
+        return body_err
 
     user = auth_mgr.get_user_by_id(user_id)
     if not user:
