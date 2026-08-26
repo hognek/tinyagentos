@@ -421,6 +421,37 @@ identity that reads as a person or as an internal taOS agent. The public
 register route returns 422. The admin-only internal mint/seed path is exempt -
 internal driver agents (`taos-dev`, ...) legitimately live under `taos-`.
 
+## Console-only PIN sign-in (third passthrough, narrowest)
+
+A touchscreen device with no keyboard could not sign in at all, so a PIN is an
+alternative proof for the **local console only**. Three paths join
+`EXEMPT_PATHS` in `tinyagentos/auth_middleware.py`:
+
+- `POST /auth/pin-login` — exempt for the same reason `/auth/login` is: it is
+  how a session is obtained, so gating it on a session would be circular.
+- `GET /auth/osk.js`, `GET /auth/pin-panel.js` — the on-screen keyboard and PIN
+  panel scripts, served to the signed-out login and setup pages.
+
+Exempt does NOT mean unguarded. `/auth/pin-login` refuses any request that is
+not from the device's own console (`auth.is_console_origin`: loopback peer AND
+no forwarding header) and throttles per user with an escalating delay
+(30s / 5m / 15m, never permanent). Off-console it returns **404** — the same
+answer as "no PIN is set" — so a remote guesser cannot learn whether a PIN
+exists. LAN and remote/relay callers get password auth only.
+
+`POST /auth/pin` and `DELETE /auth/pin` (set and clear a PIN) are deliberately
+**absent** from the allowlist: they require a live session and stay gated by the
+middleware. Setting a PIN additionally requires the account password; clearing
+one does not, so a user who has forgotten the PIN can always disable it.
+
+An agent token reaches none of this — the PIN surface is console-local by
+construction and is not part of the scoped registry-JWT surface above.
+
+Scripts are served as files, not inlined: taOS sends `script-src 'self'`, so an
+inline `<script>` on an auth page is silently refused by the browser and the
+page renders perfectly while doing nothing. `test_script_is_never_inlined`
+guards this. Never "fix" a broken auth-page script by adding `unsafe-inline`.
+
 ## Device bearer self-service (second, narrower passthrough)
 
 Beyond the `EXEMPT_PATHS` entry for `GET /api/share/destinations`, a paired
