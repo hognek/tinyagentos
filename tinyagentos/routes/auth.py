@@ -334,7 +334,12 @@ _PIN_PANEL_SCRIPT = r"""
         fail("PIN sign-in is not available on this device. Use your password.");
         return;
       }
-      fail((res.body && res.body.error) || "Incorrect PIN.");
+      // Read `detail` as well as `error`: a FastAPI HTTPException raised by a
+      // dependency (rather than returned by the handler) serialises as
+      // {"detail": ...}, and blaming the PIN for a failure that had nothing to
+      // do with it strands a kiosk user with no way to tell what is wrong.
+      var reason = res.body && (res.body.error || res.body.detail);
+      fail(reason || "Sign-in failed. Try again, or use your password.");
     }).catch(function () {
       busy = false;
       fail("Could not reach taOS. Check the connection and try again.");

@@ -464,6 +464,34 @@ inline `<script>` on an auth page is silently refused by the browser and the
 page renders perfectly while doing nothing. `test_script_is_never_inlined`
 guards this. Never "fix" a broken auth-page script by adding `unsafe-inline`.
 
+### CSRF and the sign-in routes
+
+`verify_csrf` is attached **router-wide** in `tinyagentos/routes/__init__.py`
+(`app.include_router(auth_router, dependencies=_csrf)`), not per route. Reading
+`routes/auth.py` alone tells you the opposite, because only `/auth/logout`,
+`/auth/lock` and the two `/auth/pin` routes carry a visible decorator — every
+other mutating auth route is protected invisibly. Introspect the **built** app,
+not the source, when you need to know whether a route is guarded.
+
+The routes that *establish* a credential are exempt by path
+(`_CREDENTIAL_PATHS` in `tinyagentos/middleware/csrf.py`): `/auth/login`,
+`/auth/pin-login`, `/auth/setup`, `/auth/complete`, `/setup/complete`. They must
+work for a browser still holding an **expired** session cookie — that cookie is
+sent, so a "no session cookie" exemption stops applying at precisely the moment
+sign-in is needed, and the server-rendered form has no JavaScript to attach an
+`X-CSRF-Token` header. The result was a 403 that retrying could not clear.
+
+Every exempt path is also in `EXEMPT_PATHS`; a test asserts that containment, so
+the exemption list cannot grow past the surface that is reachable without a
+credential. Adding a route here is a security decision — anything that acts on
+an already-valid session must stay protected.
+
+Note for anyone writing tests against these routes: `tests/conftest.py` has an
+autouse fixture that replaces `verify_csrf` with a no-op for **every** test file
+whose path does not contain `test_csrf`. A test of CSRF behaviour written
+anywhere else measures the fixture and passes green against broken code. Put it
+in a `test_csrf*.py` file and assert the real dependency is installed.
+
 ## Device bearer self-service (second, narrower passthrough)
 
 Beyond the `EXEMPT_PATHS` entry for `GET /api/share/destinations`, a paired
