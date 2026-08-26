@@ -222,6 +222,17 @@ OSK_SCRIPT = r"""
   function insert(text) {
     if (!target) return;
     var start = target.selectionStart, end = target.selectionEnd;
+    // Writing .value directly bypasses the maxlength the browser enforces for
+    // real typing, so honour it here or the keypad can overrun the field --
+    // the setup PIN is maxlength=12 and the numeric pad could enter a 13th
+    // digit. Clip to whatever room is left after the replaced selection.
+    var max = parseInt(target.getAttribute("maxlength"), 10);
+    if (max > 0) {
+      var selLen = (start === null || start === undefined) ? 0 : (end - start);
+      var room = max - (target.value.length - selLen);
+      if (room <= 0) return;
+      if (text.length > room) text = text.slice(0, room);
+    }
     // Some input types (email, number) throw or report null for selection.
     if (start === null || start === undefined) {
       target.value += text;

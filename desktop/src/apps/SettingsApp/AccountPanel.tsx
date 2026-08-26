@@ -221,6 +221,16 @@ function SignInMethodCard() {
       {status && !open && (
         <p className="text-xs text-emerald-400 mb-3">{status}</p>
       )}
+      {/* "Turn off" only exists in the COLLAPSED state, and disable() is the
+          one action that can fail from here. The form below renders `error`
+          too, but that branch is unreachable while the button is on screen --
+          without this the tap fails, the spinner returns to the label, and
+          nothing tells the user the PIN is still on. */}
+      {error && !open && (
+        <p className="text-xs text-amber-400 flex items-center gap-1.5 mb-3" role="alert">
+          <AlertCircle size={12} /> {error}
+        </p>
+      )}
 
       {!open ? (
         <div className="flex gap-2">

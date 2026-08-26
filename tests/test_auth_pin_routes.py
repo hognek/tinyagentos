@@ -287,3 +287,80 @@ class TestSetupOffersAPinAtInstall:
         assert r.status_code == 303
         assert fresh_app.state.auth.is_configured() is True
         assert fresh_app.state.auth.has_pin("tester") is False
+
+
+class TestConsoleIsNeverBrickedByAMissingScript:
+    """The login page must be usable with NO JavaScript at all.
+
+    CodeRabbit raised this on #2540 and it is the whole point of the card: the
+    page used to render the password form with a static `hidden` attribute
+    whenever a PIN existed, and ONLY /auth/pin-panel.js could reveal it. A CSP
+    refusal, a cache miss or JS-off therefore left a keypad that cannot submit
+    and no password form -- the exact hard lockout PIN sign-in was built to
+    remove. The server now renders the password form VISIBLE and the PIN panel
+    HIDDEN; the script swaps them once it is wired.
+    """
+
+    @pytest.mark.asyncio
+    async def test_password_form_is_visible_without_scripts(self, console):
+        r = await console.get("/auth/login")
+        assert r.status_code == 200
+        body = r.text
+        # The pw-panel form tag must carry no `hidden` attribute.
+        start = body.index('<form class="pw-panel"')
+        tag = body[start : body.index(">", start)]
+        assert "hidden" not in tag, f"password form is hidden without JS: {tag}"
+
+    @pytest.mark.asyncio
+    async def test_pin_panel_starts_hidden(self, console):
+        r = await console.get("/auth/login")
+        start = r.text.index('<div class="pin-panel"')
+        tag = r.text[start : r.text.index(">", start)]
+        assert "hidden" in tag, f"pin panel must start hidden: {tag}"
+
+    @pytest.mark.asyncio
+    async def test_script_reveals_the_pin_panel_at_init(self, console):
+        """The reveal must happen at INIT, not only on a click.
+
+        Asserting merely that "swap(true)" appears somewhere is one level
+        coarser than the defect and passes on the broken code, because the
+        `use-pin` click handler has always contained that call. What matters
+        is that init() ENDS by swapping, so the panel appears with no user
+        gesture. Anchor on init's closing statement.
+        """
+        r = await console.get("/auth/pin-panel.js")
+        assert r.status_code == 200
+        assert "swap(true);\n  }" in r.text, (
+            "init() does not end by revealing the PIN panel; the panel would "
+            "stay hidden until the user finds the toggle"
+        )
+
+
+class TestNonObjectJsonBodyIsABadRequest:
+    """`request.json()` accepts null/[]/1/"x" -- none of them a mapping.
+
+    Without an explicit check the first body.get() raises AttributeError and
+    the caller gets a 500 for a plainly malformed request. /auth/pin-login is
+    session-exempt, so any console client can reach it with the body `null`.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body", ["null", "[]", "1", '"x"'])
+    async def test_pin_login_rejects_non_object_body(self, console, body):
+        r = await console.post(
+            "/auth/pin-login",
+            content=body,
+            headers={"content-type": "application/json"},
+        )
+        assert r.status_code == 400, f"{body!r} gave {r.status_code}, want 400"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("body", ["null", "[]", "1", '"x"'])
+    async def test_set_pin_rejects_non_object_body(self, console, body):
+        """Unauthenticated here, so it 401s first -- but it must never 500."""
+        r = await console.post(
+            "/auth/pin",
+            content=body,
+            headers={"content-type": "application/json"},
+        )
+        assert r.status_code in (400, 401), f"{body!r} gave {r.status_code}"

@@ -8,6 +8,7 @@ import os
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -309,8 +310,15 @@ class _PinAttemptLimiter:
     #: ``(failures_at_or_above, delay_seconds)``, highest tier last.
     _TIERS = ((15, 900), (10, 300), (5, 30))
 
+    #: Upper bound on tracked keys. ``routes.auth`` falls back to the key
+    #: ``f"unknown:{username}"`` when no user resolves, so a caller cycling
+    #: usernames would otherwise grow this map for the life of the process.
+    #: A kiosk runs for weeks, so "small and bounded" beats "usually small".
+    _MAX_KEYS = 1024
+
     def __init__(self) -> None:
-        self._state: dict[str, tuple[int, float]] = {}
+        # Ordered so the bound can evict the least-recently-failed key.
+        self._state: OrderedDict[str, tuple[int, float]] = OrderedDict()
         self._lock = threading.Lock()
 
     @classmethod
@@ -333,6 +341,27 @@ class _PinAttemptLimiter:
         with self._lock:
             failures, _ = self._state.get(key, (0, 0.0))
             self._state[key] = (failures + 1, now)
+            self._state.move_to_end(key)
+            # Bound memory, but evict the LEAST-PENALISED key -- fewest
+            # failures, oldest first to break ties -- never simply the oldest.
+            # Plain LRU looked right and was wrong: an attacker who floods
+            # _MAX_KEYS distinct usernames pushes the genuinely-throttled key
+            # out and RESETS it, which is exactly the escalation this class
+            # exists to enforce. Keeping the most-penalised entries means a
+            # flood evicts the attacker's own one-failure keys instead. A test
+            # in tests/test_auth_pin.py holds this direction.
+            #
+            # We also do NOT drop entries whose delay has merely elapsed: the
+            # failure COUNT is what escalates, so expiring it would hand out a
+            # free reset (wait out the top tier, get five fast guesses again).
+            # The delay expiring is the intended self-healing; the count is
+            # deliberately sticky.
+            while len(self._state) > self._MAX_KEYS:
+                victim = min(
+                    self._state,
+                    key=lambda k: (self._state[k][0], self._state[k][1]),
+                )
+                del self._state[victim]
 
     def reset(self, key: str) -> None:
         with self._lock:

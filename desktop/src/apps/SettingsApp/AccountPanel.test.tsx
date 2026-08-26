@@ -291,6 +291,20 @@ describe("PIN sign-in card", () => {
     expect(screen.queryByText("Turn off")).not.toBeInTheDocument();
   });
 
+  /** A failed "Turn off" must SAY so. The error paragraph used to live only
+   *  inside the expanded form, but "Turn off" only exists while the card is
+   *  COLLAPSED -- so the request failed, the spinner returned to the label,
+   *  and the screen said nothing at all. */
+  it("shows why a failed 'Turn off' did not work", async () => {
+    withPin(true, () => new Response(
+      JSON.stringify({ error: "incorrect password" }),
+      { status: 403, headers: { "Content-Type": "application/json" } },
+    ));
+    render(<AccountSection />);
+    fireEvent.click(await screen.findByText("Turn off"));
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+  });
+
   it("offers to change or turn off a PIN that is configured", async () => {
     withPin(true);
     render(<AccountSection />);

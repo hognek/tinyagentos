@@ -359,10 +359,16 @@ _PIN_PANEL_SCRIPT = r"""
   if (toPw)  toPw.addEventListener("click", function () { swap(false); });
   if (toPin) toPin.addEventListener("click", function () { swap(true); });
 
-  paint();
-  // The keypad is the whole point on a keyboard-less panel, so open it as soon
-  // as the PIN field exists rather than making the user find the toggle first.
-  if (window.taosOSK) { window.taosOSK.enable(); window.taosOSK.focusField(input); }
+  // PROGRESSIVE ENHANCEMENT, and it is load-bearing. The server renders the
+  // PASSWORD form visible and the PIN panel hidden; only here, once every
+  // element resolved and the handlers are attached, do we swap to the PIN
+  // view. Hiding the password form server-side instead would brick the console
+  // whenever this file does not run -- a CSP refusal, a cache miss, JS off --
+  // leaving a keypad that cannot submit and no other way in. That is the exact
+  // lockout PIN sign-in was built to remove, so it must not be reintroduced by
+  // the fix. swap(true) also opens the keypad, which is the whole point on a
+  // keyboard-less panel: the user should not have to find a toggle first.
+  swap(true);
   }
 
   if (document.readyState === "loading") {
@@ -374,14 +380,18 @@ _PIN_PANEL_SCRIPT = r"""
 """
 
 
-def _pin_panel_html(multi_user: bool, next_url: str) -> str:
-    """The PIN entry panel, shown only when the request is console-local."""
+def _pin_panel_html(next_url: str) -> str:
+    """The PIN entry panel, shown only when the request is console-local.
+
+    Rendered HIDDEN. /auth/pin-panel.js reveals it (and hides the password
+    form) once it has wired itself up; see the note on the swap in that script.
+    """
     safe_next = html.escape(next_url or "/desktop")
-    # In multi-user mode we cannot guess which account the PIN belongs to, so
-    # the username the user typed for the password path is reused; the server
-    # refuses to guess too (AuthManager._pin_user).
+    # No username is sent with a PIN: this panel is only ever rendered for a
+    # single-user store, because AuthManager.has_pin(None) refuses to guess
+    # which account a PIN belongs to on a multi-user one.
     return f"""
-    <div class="pin-panel" id="pin-panel" data-next="{safe_next}" data-username="">
+    <div class="pin-panel" id="pin-panel" data-next="{safe_next}" data-username="" hidden>
       <label class="field">
         <span>PIN</span>
         <input type="password" id="pin-input" inputmode="numeric" autocomplete="off"
@@ -421,13 +431,12 @@ def _login_page(
     # request is console-local AND a PIN is set. Off-console the page is exactly
     # what it has always been, so a LAN browser is never shown a method it would
     # be refused (and never learns that a PIN exists on this box).
-    pin_panel = _pin_panel_html(multi_user, next_url) if pin_available else ""
+    pin_panel = _pin_panel_html(next_url) if pin_available else ""
     pin_switch = (
         '<button type="button" class="method-switch" id="use-pin">Use my PIN instead</button>'
         if pin_available else ""
     )
     pin_script = '<script src="/auth/pin-panel.js" defer></script>' if pin_available else ""
-    pw_hidden = " hidden" if pin_available else ""
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -446,7 +455,7 @@ def _login_page(
     </div>
     {err}
     {pin_panel}
-    <form class="pw-panel" id="pw-panel" method="POST" action="/auth/login"{pw_hidden}>
+    <form class="pw-panel" id="pw-panel" method="POST" action="/auth/login">
       {username_field}
       {next_field}
       <label class="field">
@@ -793,6 +802,12 @@ async def pin_login(request: Request):
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    # request.json() happily returns null/[]/1/"x" -- all valid JSON, none of
+    # them a mapping. Without this the first body.get() raises AttributeError
+    # and the client gets a 500 for what is plainly a bad request. This route
+    # is reachable without a session, so any console client can send `null`.
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
     username = (body.get("username") or "").strip() or None
     pin = body.get("pin") or ""
 
@@ -854,6 +869,12 @@ async def set_pin(request: Request):
     try:
         body = await request.json()
     except Exception:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    # request.json() happily returns null/[]/1/"x" -- all valid JSON, none of
+    # them a mapping. Without this the first body.get() raises AttributeError
+    # and the client gets a 500 for what is plainly a bad request. This route
+    # is reachable without a session, so any console client can send `null`.
+    if not isinstance(body, dict):
         return JSONResponse({"error": "invalid JSON body"}, status_code=400)
 
     user = auth_mgr.get_user_by_id(user_id)

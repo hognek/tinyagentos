@@ -258,3 +258,18 @@ class TestFocusedFieldIsClearOfTheKeys:
         assert "scrollIntoView(" not in OSK_SCRIPT  # the call, not the comment
         assert "panel.getBoundingClientRect().top" in OSK_SCRIPT
         assert "window.scrollBy" in OSK_SCRIPT
+
+
+def test_insert_honours_maxlength():
+    """Writing .value directly bypasses the browser's own maxlength.
+
+    The setup PIN field is maxlength=12, so without a clamp the numeric pad
+    could enter a 13th digit. This asserts the clamp is PRESENT in the served
+    script; that it BEHAVES is proven on the device (a script that is served
+    but refused by CSP passes any assertion about its text -- see
+    test_script_is_never_inlined for why that distinction is load-bearing).
+    """
+    from tinyagentos.routes.onscreen_keyboard import OSK_SCRIPT
+
+    assert 'getAttribute("maxlength")' in OSK_SCRIPT
+    assert "if (room <= 0) return;" in OSK_SCRIPT

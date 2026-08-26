@@ -241,3 +241,39 @@ class TestPinValidation:
         with pytest.raises(ValueError):
             mgr.set_pin("tester", "12a4")
         assert mgr.has_pin("tester") is False
+
+
+class TestPinLimiterIsBounded:
+    """The limiter map must not grow without limit.
+
+    routes.auth falls back to the key f"unknown:{username}" when no user
+    resolves, so a caller cycling usernames would otherwise add a permanent
+    entry per attempt for the life of the process -- and a kiosk process runs
+    for weeks.
+    """
+
+    def test_state_is_capped(self):
+        from tinyagentos.auth import _PinAttemptLimiter
+
+        lim = _PinAttemptLimiter()
+        for i in range(lim._MAX_KEYS + 500):
+            lim.record_failure(f"unknown:user{i}")
+        assert len(lim._state) <= lim._MAX_KEYS
+
+    def test_escalation_is_not_reset_by_the_bound(self):
+        """The ACTIVE key must survive eviction and keep its failure count.
+
+        Evicting least-recently-failed is what makes this safe; dropping
+        entries whose delay has merely elapsed would hand an attacker a free
+        reset (wait out the top tier, get five fast guesses again).
+        """
+        from tinyagentos.auth import _PinAttemptLimiter
+
+        lim = _PinAttemptLimiter()
+        for _ in range(5):
+            lim.record_failure("victim")
+        for i in range(lim._MAX_KEYS + 10):
+            lim.record_failure(f"noise{i}")
+        lim.record_failure("victim")
+        # 6 consecutive failures still sits at or above the first tier.
+        assert lim.retry_after("victim") > 0
