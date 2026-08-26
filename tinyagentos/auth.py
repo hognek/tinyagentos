@@ -1,13 +1,15 @@
 from __future__ import annotations
 import functools
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import secrets
 import threading
 import time
-from collections.abc import Iterator
+from collections import OrderedDict
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -190,6 +192,182 @@ def verify_and_maybe_rehash(password: str, stored: str) -> tuple[bool, str | Non
     return True, _ph.hash(password)
 
 
+#: Minimum / maximum PIN length. A PIN is a low-entropy credential by design —
+#: it is safe only because it is refused anywhere but the device's own screen
+#: (see :func:`is_console_origin`). Four digits matches what users expect from
+#: a phone or a Windows device; the upper bound just keeps the on-screen keypad
+#: usable and the stored value sane.
+PIN_MIN_LEN = 4
+PIN_MAX_LEN = 12
+
+#: Headers that mean "this request was relayed by something else". Their mere
+#: PRESENCE disqualifies a request from counting as console-local, regardless of
+#: value — see :func:`is_console_origin` for why we do not try to interpret them.
+_FORWARDING_HEADERS = (
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-real-ip",
+    "forwarded",
+    "via",
+)
+
+
+def validate_pin(pin: str) -> str:
+    """Return *pin* if it is well-formed, else raise ``ValueError``.
+
+    Digits only: the whole point of a PIN here is that it can be entered on a
+    taOS-rendered numeric keypad by a device with no keyboard attached, so a
+    PIN containing anything else would be unenterable on the hardware it exists
+    to serve.
+    """
+    if not isinstance(pin, str) or not pin.isdigit():
+        raise ValueError("PIN must contain digits only")
+    if not (PIN_MIN_LEN <= len(pin) <= PIN_MAX_LEN):
+        raise ValueError(f"PIN must be {PIN_MIN_LEN}-{PIN_MAX_LEN} digits")
+    return pin
+
+
+def _is_loopback(host: str) -> bool:
+    """True when *host* is a loopback literal (127.0.0.0/8, ::1, mapped v4)."""
+    if not host:
+        return False
+    candidate = host.strip()
+    # Strip an IPv6 zone id ("fe80::1%eth0") and brackets ("[::1]").
+    if candidate.startswith("[") and candidate.endswith("]"):
+        candidate = candidate[1:-1]
+    candidate = candidate.split("%", 1)[0]
+    if candidate == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    # ::ffff:127.0.0.1 is a v4-mapped loopback and is_loopback is False for it,
+    # so unwrap the mapping before asking.
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    return addr.is_loopback
+
+
+def is_console_origin(client_host: str | None, headers: Mapping[str, str] | None = None) -> bool:
+    """True only when this request came from the device's OWN screen.
+
+    This is the single control that makes PIN sign-in safe, so it is written to
+    fail closed and is deliberately dumber than it could be.
+
+    A PIN is 4-12 digits. That is fine against someone standing at the pi-top
+    and hopeless against anything that can send requests over a network, which
+    is why a PIN is accepted from the local console and nowhere else. The kiosk
+    is a browser running ON the device talking to ``localhost:6969``, so
+    "console" and "loopback" coincide today.
+
+    **They stop coinciding the moment taOS sits behind a reverse proxy.** Every
+    LAN request then arrives at the app from 127.0.0.1 with the real client
+    buried in ``X-Forwarded-For``, and a loopback-only test would silently start
+    accepting PINs from the entire network — turning a device-bound credential
+    into a 4-digit password for every machine in the house, with no code change
+    and nothing in the UI to show it happened.
+
+    So the PRESENCE of any forwarding header disqualifies the request outright.
+    We do not parse them and we do not consult a trusted-proxy list: a header we
+    cannot authenticate is not evidence, and treating an unverified header as
+    proof of locality is the whole failure mode. A proxied deployment simply
+    does not offer PIN sign-in, which is the correct answer for it.
+
+    Note this refuses in the safe direction only. Being wrong here costs a user
+    the keypad and sends them to the password; the opposite error would hand a
+    remote attacker a 10,000-guess credential.
+    """
+    if not _is_loopback(client_host or ""):
+        return False
+    if headers:
+        for name in _FORWARDING_HEADERS:
+            if headers.get(name):
+                return False
+    return True
+
+
+class _PinAttemptLimiter:
+    """Escalating, self-healing throttle for PIN attempts.
+
+    The delay grows with consecutive failures and then simply expires. There is
+    deliberately NO terminal "PIN disabled, go use your password" state: the
+    device this protects is a keyboard-less touchscreen, so a lockout that can
+    only be cleared from another machine would re-create the exact hard lockout
+    PIN sign-in was added to fix. Brute force is defeated on the clock instead —
+    at the top tier an attacker gets four guesses an hour against a space of at
+    least ten thousand — while the legitimate user always gets back in from the
+    screen in front of them by waiting.
+
+    Keyed by user id rather than by client address on purpose: every console
+    request shares the single loopback address, so an address key would be the
+    same bucket for everyone and would also let PIN failures interfere with the
+    password limiter.
+    """
+
+    #: ``(failures_at_or_above, delay_seconds)``, highest tier last.
+    _TIERS = ((15, 900), (10, 300), (5, 30))
+
+    #: Upper bound on tracked keys. ``routes.auth`` falls back to the key
+    #: ``f"unknown:{username}"`` when no user resolves, so a caller cycling
+    #: usernames would otherwise grow this map for the life of the process.
+    #: A kiosk runs for weeks, so "small and bounded" beats "usually small".
+    _MAX_KEYS = 1024
+
+    def __init__(self) -> None:
+        # Ordered so the bound can evict the least-recently-failed key.
+        self._state: OrderedDict[str, tuple[int, float]] = OrderedDict()
+        self._lock = threading.Lock()
+
+    @classmethod
+    def _delay_for(cls, failures: int) -> int:
+        for threshold, delay in cls._TIERS:
+            if failures >= threshold:
+                return delay
+        return 0
+
+    def retry_after(self, key: str, now: float | None = None) -> int:
+        """Seconds the caller must wait before another attempt is accepted."""
+        now = time.time() if now is None else now
+        with self._lock:
+            failures, last_failure = self._state.get(key, (0, 0.0))
+        remaining = self._delay_for(failures) - (now - last_failure)
+        return int(remaining) + 1 if remaining > 0 else 0
+
+    def record_failure(self, key: str, now: float | None = None) -> None:
+        now = time.time() if now is None else now
+        with self._lock:
+            failures, _ = self._state.get(key, (0, 0.0))
+            self._state[key] = (failures + 1, now)
+            self._state.move_to_end(key)
+            # Bound memory, but evict the LEAST-PENALISED key -- fewest
+            # failures, oldest first to break ties -- never simply the oldest.
+            # Plain LRU looked right and was wrong: an attacker who floods
+            # _MAX_KEYS distinct usernames pushes the genuinely-throttled key
+            # out and RESETS it, which is exactly the escalation this class
+            # exists to enforce. Keeping the most-penalised entries means a
+            # flood evicts the attacker's own one-failure keys instead. A test
+            # in tests/test_auth_pin.py holds this direction.
+            #
+            # We also do NOT drop entries whose delay has merely elapsed: the
+            # failure COUNT is what escalates, so expiring it would hand out a
+            # free reset (wait out the top tier, get five fast guesses again).
+            # The delay expiring is the intended self-healing; the count is
+            # deliberately sticky.
+            while len(self._state) > self._MAX_KEYS:
+                victim = min(
+                    self._state,
+                    key=lambda k: (self._state[k][0], self._state[k][1]),
+                )
+                del self._state[victim]
+
+    def reset(self, key: str) -> None:
+        with self._lock:
+            self._state.pop(key, None)
+
+
 class AuthManager:
     """Multi-user auth manager.
 
@@ -368,6 +546,10 @@ class AuthManager:
             "last_login_at": record.get("last_login_at"),
             "created_at": record.get("created_at"),
             "capabilities": caps,
+            # Whether a PIN exists, never the PIN or its hash. Settings needs
+            # this to show which sign-in methods are active; this dict is a
+            # whitelist, so `pin_hash` cannot escape through it by accident.
+            "has_pin": bool(record.get("pin_hash")),
         }
 
     # ------------------------------------------------------------------ #
@@ -609,6 +791,79 @@ class AuthManager:
         # No user records: legacy single-password store.
         self.set_password(new_password)
         return "(legacy)"
+
+    # ------------------------------------------------------------------ #
+    #  PIN ops (console-only credential — see is_console_origin)           #
+    # ------------------------------------------------------------------ #
+
+    def has_pin(self, username: str | None = None) -> bool:
+        """True when the named user (or the sole user) has a PIN configured."""
+        return self._pin_user(username) is not None
+
+    def _pin_user(self, username: str | None) -> dict | None:
+        """The user record a PIN attempt should be checked against, or None.
+
+        Mirrors ``check_password``'s resolution so the two factors always agree
+        on which account is being addressed, but only ever returns a record that
+        actually carries a ``pin_hash``.
+        """
+        users = self._read_users().get("users", [])
+        if username:
+            users = [u for u in users if u.get("username") == username]
+        elif len(users) != 1:
+            # Multi-user install with no username supplied: refuse to guess.
+            # Picking "the first user" here would let a PIN set on one account
+            # unlock whichever record happened to be stored first.
+            return None
+        for u in users:
+            if u.get("pin_hash"):
+                return u
+        return None
+
+    @_serialized
+    def set_pin(self, username: str, pin: str) -> None:
+        """Set (or replace) *username*'s PIN.
+
+        The caller is responsible for having already proven the user's identity
+        with their existing credential — this method does not re-check it, in
+        the same way ``recover_password`` does not.
+        """
+        validate_pin(pin)
+        data = self._read_users()
+        for i, u in enumerate(data.get("users", [])):
+            if u.get("username") == username:
+                data["users"][i]["pin_hash"] = hash_password(pin)
+                self._write_users(data)
+                return
+        raise ValueError(f"user '{username}' not found")
+
+    @_serialized
+    def clear_pin(self, username: str) -> bool:
+        """Remove *username*'s PIN. Returns True if one was actually removed."""
+        data = self._read_users()
+        for i, u in enumerate(data.get("users", [])):
+            if u.get("username") == username:
+                removed = data["users"][i].pop("pin_hash", None) is not None
+                if removed:
+                    self._write_users(data)
+                return removed
+        raise ValueError(f"user '{username}' not found")
+
+    def check_pin(self, pin: str, username: str | None = None) -> tuple[bool, dict | None]:
+        """Verify a PIN against the stored hash. Returns ``(ok, user_record)``.
+
+        This performs NO origin check of its own. Callers MUST gate it behind
+        :func:`is_console_origin` — the route layer owns that decision because
+        only it can see the request. Keeping the two apart makes the origin rule
+        testable on its own and keeps this method honest about what it proves,
+        which is solely "this PIN matches this account".
+        """
+        record = self._pin_user(username)
+        if record is None:
+            return (False, None)
+        if not verify_password(pin, record.get("pin_hash", "")):
+            return (False, None)
+        return (True, record)
 
     def check_password(self, password: str, username: str | None = None) -> tuple[bool, dict | None]:
         """Verify credentials.

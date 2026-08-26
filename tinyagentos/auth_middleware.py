@@ -15,7 +15,13 @@ from tinyagentos.device_store import DEVICE_TOKEN_PREFIX
 
 logger = logging.getLogger(__name__)
 
-EXEMPT_PATHS = {"/auth/login", "/auth/setup", "/auth/status", "/auth/me", "/auth/complete", "/auth/lock", "/api/health", "/api/version", "/setup", "/setup/complete", "/redeem", "/api/desktop/browser/push/vapid-public-key", "/api/desktop/browser/proxy-config", "/sw.js", "/desktop", "/desktop/index.html", "/chat-pwa", "/app.html", "/manifest", "/api/agents/registry/pubkey", "/api/share/destinations"}
+# /auth/pin-login is session-exempt for the same reason as /auth/login: it is
+# how a session is obtained, so requiring one would be circular. It is NOT
+# unguarded -- the route refuses any request that is not from the device's own
+# console (see auth.is_console_origin) and throttles per user on top of that.
+# Note /auth/pin (set/clear a PIN) is deliberately absent from this set: those
+# require a live session and must stay gated here.
+EXEMPT_PATHS = {"/auth/login", "/auth/pin-login", "/auth/osk.js", "/auth/pin-panel.js", "/auth/setup", "/auth/status", "/auth/me", "/auth/complete", "/auth/lock", "/api/health", "/api/version", "/setup", "/setup/complete", "/redeem", "/api/desktop/browser/push/vapid-public-key", "/api/desktop/browser/proxy-config", "/sw.js", "/desktop", "/desktop/index.html", "/chat-pwa", "/app.html", "/manifest", "/api/agents/registry/pubkey", "/api/share/destinations"}
 
 # Registry feed endpoints accept EITHER an admin session OR a registry JWT.
 # When a Bearer token is present for these paths the request bypasses the
