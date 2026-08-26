@@ -298,7 +298,10 @@ class TestDetectRepo:
             "ssh://git@github.com/acme/widgets.git",
         ],
     )
-    def test_detects_owner_repo_across_remote_styles(self, url) -> None:
+    def test_detects_owner_repo_across_remote_styles(self, url, monkeypatch) -> None:
+        # GITHUB_REPOSITORY short-circuits the remote parse entirely (CI always
+        # sets it); clear it so the test exercises the git-remote path.
+        monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
         fake = subprocess.CompletedProcess(
             args=["git"], returncode=0, stdout=url + "\n", stderr="",
         )
