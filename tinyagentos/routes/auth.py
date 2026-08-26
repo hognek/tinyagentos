@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import json
 import logging
 import threading
 import time
@@ -566,6 +567,31 @@ def _require_self(request: Request, username: str) -> tuple[bool, JSONResponse |
     return True, None
 
 
+async def _json_object(request: Request) -> tuple[dict | None, JSONResponse | None]:
+    """Read a JSON request body that must be an object. Returns (body, error_response).
+
+    Parsing alone is not enough: request.json() happily returns null, [], 1 or
+    "x" -- all valid JSON, none of them a mapping. A bare body.get() on any of
+    those raises AttributeError, so the caller gets a 500 for what is plainly a
+    malformed request. /auth/login, /auth/setup and /auth/complete are all
+    session-exempt, so that 500 is reachable by anyone who can reach the port.
+    """
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # Deliberately narrow. request.json() READS the body before it parses
+        # it, so a blanket `except Exception` also swallows body-read failures
+        # (a client disconnecting mid-upload raises ClientDisconnect here) and
+        # reports them to the caller as "your JSON was malformed". That is a
+        # false accusation, and it hides a transport fault behind a 400 that
+        # nobody investigates. A read failure is not the client's syntax error,
+        # so let it propagate.
+        return None, JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict):
+        return None, JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    return body, None
+
+
 @router.get("/login", response_class=HTMLResponse)
 async def login_page(request: Request, error: str = "", next: str = ""):
     """Server-rendered login page. Works without JavaScript — the SPA
@@ -643,10 +669,9 @@ async def login(request: Request):
             return JSONResponse({"error": _LOCKOUT_MSG}, status_code=429)
         return RedirectResponse("/auth/login?error=rate_limit", status_code=303)
     if "application/json" in content_type:
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        body, body_err = await _json_object(request)
+        if body_err:
+            return body_err
         username = (body.get("username") or "").strip() or None
         password = body.get("password") or ""
 
@@ -798,16 +823,9 @@ async def pin_login(request: Request):
     if not _request_is_console(request):
         return JSONResponse({"error": "PIN sign-in is not available"}, status_code=404)
 
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    # request.json() happily returns null/[]/1/"x" -- all valid JSON, none of
-    # them a mapping. Without this the first body.get() raises AttributeError
-    # and the client gets a 500 for what is plainly a bad request. This route
-    # is reachable without a session, so any console client can send `null`.
-    if not isinstance(body, dict):
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    body, body_err = await _json_object(request)
+    if body_err is not None:
+        return body_err
     username = (body.get("username") or "").strip() or None
     pin = body.get("pin") or ""
 
@@ -866,16 +884,9 @@ async def set_pin(request: Request):
     if not user_id:
         return JSONResponse({"error": "not authenticated"}, status_code=401)
 
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
-    # request.json() happily returns null/[]/1/"x" -- all valid JSON, none of
-    # them a mapping. Without this the first body.get() raises AttributeError
-    # and the client gets a 500 for what is plainly a bad request. This route
-    # is reachable without a session, so any console client can send `null`.
-    if not isinstance(body, dict):
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    body, body_err = await _json_object(request)
+    if body_err is not None:
+        return body_err
 
     user = auth_mgr.get_user_by_id(user_id)
     if not user:
@@ -984,10 +995,9 @@ async def auth_setup(request: Request):
     content_type = request.headers.get("content-type", "")
     user_agent = request.headers.get("user-agent", "")
     if "application/json" in content_type:
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        body, body_err = await _json_object(request)
+        if body_err:
+            return body_err
         if auth_mgr.is_configured():
             return JSONResponse({"error": "already configured"}, status_code=409)
         username = (body.get("username") or "").strip()
@@ -1099,10 +1109,9 @@ async def complete_invite(request: Request):
             status_code=429,
         )
 
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    body, body_err = await _json_object(request)
+    if body_err:
+        return body_err
 
     username = (body.get("username") or "").strip()
     invite_code = (body.get("invite_code") or "").strip()
@@ -1240,10 +1249,9 @@ async def add_user(request: Request):
     ok, err = _require_admin(request)
     if not ok:
         return err
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    body, body_err = await _json_object(request)
+    if body_err:
+        return body_err
     username = (body.get("username") or "").strip()
     if not username:
         return JSONResponse({"error": "username is required"}, status_code=400)
@@ -1298,10 +1306,9 @@ async def update_profile(username: str, request: Request):
     ok, err = _require_self(request, username)
     if not ok:
         return err
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    body, body_err = await _json_object(request)
+    if body_err:
+        return body_err
     full_name = body.get("full_name")
     email = body.get("email")
     auth_mgr = request.app.state.auth
@@ -1318,10 +1325,9 @@ async def change_password(username: str, request: Request):
     ok, err = _require_self(request, username)
     if not ok:
         return err
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    body, body_err = await _json_object(request)
+    if body_err:
+        return body_err
     current = body.get("current") or ""
     new_pw = body.get("new") or ""
     if not new_pw or len(new_pw) < 8:

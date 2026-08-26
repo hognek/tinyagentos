@@ -1311,3 +1311,85 @@ class TestAuthStatusUserAgentSymmetry:
             "/auth/me", headers={"user-agent": "TaosPWA/2.0 (updated browser)"}
         )
         assert rotated.status_code == 401
+
+
+# --- Non-object JSON bodies must be a 400, never a 500 -------------------------
+#
+# request.json() accepts null / [] / 1 / "x" -- all valid JSON, none of them a
+# mapping. Every one of these routes then calls body.get(), which raises
+# AttributeError and surfaces as a 500 for what is plainly a malformed request.
+# /auth/login, /auth/setup and /auth/complete are all session-exempt, so the
+# 500 is reachable by anyone who can talk to the port.
+
+# Sent as raw content, not via json=, because httpx omits the body entirely
+# for json=None -- which would test "no body" rather than the literal null.
+_NON_OBJECT_BODIES = ["null", "[]", "1", '"x"']
+_JSON_CT = {"content-type": "application/json"}
+
+
+class TestNonObjectJsonBody:
+    @pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+    @pytest.mark.asyncio
+    async def test_login_rejects_non_object_body(self, auth_client, body):
+        resp = await auth_client.post("/auth/login", content=body, headers=_JSON_CT)
+        assert resp.status_code == 400, f"{body!r} produced {resp.status_code}"
+
+    @pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+    @pytest.mark.asyncio
+    async def test_setup_rejects_non_object_body(self, auth_client, body):
+        # Unconfigured store, so the is_configured() 409 short-circuit above the
+        # body.get() calls does not mask the defect.
+        resp = await auth_client.post("/auth/setup", content=body, headers=_JSON_CT)
+        assert resp.status_code == 400, f"{body!r} produced {resp.status_code}"
+
+    @pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+    @pytest.mark.asyncio
+    async def test_complete_rejects_non_object_body(self, auth_client, body):
+        resp = await auth_client.post("/auth/complete", content=body, headers=_JSON_CT)
+        assert resp.status_code == 400, f"{body!r} produced {resp.status_code}"
+
+    @pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+    @pytest.mark.asyncio
+    async def test_add_user_rejects_non_object_body(self, auth_client, body):
+        await auth_client.post(
+            "/auth/setup",
+            json={"username": "admin", "full_name": "Admin", "email": "", "password": "adminpass", "auto_login": False},
+        )
+        login = await auth_client.post(
+            "/auth/login",
+            json={"username": "admin", "password": "adminpass", "auto_login": False},
+        )
+        resp = await auth_client.post("/auth/users", content=body, headers=_JSON_CT, cookies=login.cookies)
+        assert resp.status_code == 400, f"{body!r} produced {resp.status_code}"
+
+    @pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+    @pytest.mark.asyncio
+    async def test_update_profile_rejects_non_object_body(self, auth_client, body):
+        await auth_client.post(
+            "/auth/setup",
+            json={"username": "admin", "full_name": "Admin", "email": "", "password": "adminpass", "auto_login": False},
+        )
+        login = await auth_client.post(
+            "/auth/login",
+            json={"username": "admin", "password": "adminpass", "auto_login": False},
+        )
+        resp = await auth_client.post(
+            "/auth/users/admin/profile", content=body, headers=_JSON_CT, cookies=login.cookies
+        )
+        assert resp.status_code == 400, f"{body!r} produced {resp.status_code}"
+
+    @pytest.mark.parametrize("body", _NON_OBJECT_BODIES)
+    @pytest.mark.asyncio
+    async def test_change_password_rejects_non_object_body(self, auth_client, body):
+        await auth_client.post(
+            "/auth/setup",
+            json={"username": "admin", "full_name": "Admin", "email": "", "password": "adminpass", "auto_login": False},
+        )
+        login = await auth_client.post(
+            "/auth/login",
+            json={"username": "admin", "password": "adminpass", "auto_login": False},
+        )
+        resp = await auth_client.post(
+            "/auth/users/admin/password", content=body, headers=_JSON_CT, cookies=login.cookies
+        )
+        assert resp.status_code == 400, f"{body!r} produced {resp.status_code}"
