@@ -43,6 +43,15 @@ function readGuard(): boolean {
   }
 }
 
+// Both the automatic handoff and the manual fallback link must carry the same
+// destination. The shell has no client-side routing today, so this is
+// `/desktop/` in practice -- the point is that the two paths cannot drift if
+// that ever changes. No fragment: nothing in the SPA reads location.hash.
+function loginHref(): string {
+  const next = window.location.pathname + window.location.search;
+  return `${LOGIN_PATH}?next=${encodeURIComponent(next)}`;
+}
+
 function writeGuard(value: boolean): void {
   try {
     if (value) sessionStorage.setItem(REDIRECT_GUARD_KEY, "1");
@@ -134,14 +143,17 @@ export function LoginGate({ children }: Props) {
       return;
     }
     writeGuard(true);
-    const next = window.location.pathname + window.location.search;
-    window.location.assign(`${LOGIN_PATH}?next=${encodeURIComponent(next)}`);
+    window.location.assign(loginHref());
   }, [status.phase]);
 
   // Clear the loop guard once a session actually exists, so a later expiry in
   // the same tab can redirect again rather than landing on the manual link.
+  // "invite" counts: refreshStatus only reaches it on `authenticated: true`, so
+  // the bounce that set the guard has already succeeded. Leaving it set there
+  // would strand an invited user on the manual link if their session expired
+  // part-way through completing their profile.
   useEffect(() => {
-    if (status.phase === "ready") writeGuard(false);
+    if (status.phase === "ready" || status.phase === "invite") writeGuard(false);
   }, [status.phase]);
 
   if (status.phase === "loading") {
@@ -195,7 +207,7 @@ export function LoginGate({ children }: Props) {
                 Could not reach the sign-in page automatically.
               </p>
               <a
-                href={LOGIN_PATH}
+                href={loginHref()}
                 className="mt-1 px-4 py-2.5 rounded-lg bg-accent text-white text-sm font-medium hover:brightness-110 transition-all"
               >
                 Go to sign in

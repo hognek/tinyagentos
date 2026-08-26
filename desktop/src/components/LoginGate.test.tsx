@@ -64,7 +64,37 @@ describe("LoginGate hands sign-in to the server page", () => {
     expect(assign).not.toHaveBeenCalled();
     // A manual way out, and it is a link -- never a second password form.
     const link = screen.getByRole("link", { name: /go to sign in/i });
-    expect(link).toHaveAttribute("href", "/auth/login");
+    // Same destination the automatic handoff would have used -- the two paths
+    // must not drift.
+    expect(link).toHaveAttribute(
+      "href",
+      `/auth/login?next=${encodeURIComponent("/desktop/")}`,
+    );
+  });
+
+  it("clears the loop guard for an invited user mid-onboarding", async () => {
+    // refreshStatus only reaches "invite" on authenticated: true, so the bounce
+    // that set the guard already succeeded. If the guard survives here, a
+    // session expiring part-way through profile completion drops the user on
+    // the manual link instead of redirecting -- on a kiosk, a dead end.
+    sessionStorage.setItem("taos.login-redirected", "1");
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          configured: true,
+          authenticated: true,
+          needs_onboarding: true,
+          multi_user: true,
+          user: { username: "invitee" },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    render(<LoginGate><div>the desktop shell</div></LoginGate>);
+
+    await waitFor(() =>
+      expect(sessionStorage.getItem("taos.login-redirected")).toBeNull(),
+    );
   });
 
   it("clears the loop guard once a session exists", async () => {
