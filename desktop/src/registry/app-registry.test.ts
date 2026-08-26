@@ -1,5 +1,6 @@
-import { describe, it, expect, vi } from "vitest";
-import { getApp, getOrRegisterServiceApp, getAllApps, getLaunchableApps, prefetchApp, resolveApp } from "./app-registry";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import type { AppManifest } from "./app-registry";
+import { getApp, getOrRegisterServiceApp, getAllApps, getLaunchableApps, prefetchApp, resolveApp, apps, APP_REDIRECTS, resolvePinnedId } from "./app-registry";
 
 describe("resolveApp (deep-navigation token resolver)", () => {
   it("resolves an exact app id", () => {
@@ -103,5 +104,151 @@ describe("file handler tiering", () => {
       expect(app?.tier).toBe(4);
       expect(app?.handler).toBe(true);
     }
+  });
+});
+
+describe("getLaunchableApps tier filtering (S1 contract)", () => {
+  const TIER3_ID = "test-tier3-app";
+  const HANDLER_ID = "test-handler-app";
+  const TIER2_ID = "test-tier2-app";
+  const TIER1_ID = "test-tier1-app";
+
+  function addFixture(app: AppManifest) {
+    apps.push(app);
+  }
+
+  function removeFixture(id: string) {
+    const idx = apps.findIndex((a) => a.id === id);
+    if (idx !== -1) apps.splice(idx, 1);
+  }
+
+  beforeEach(() => {
+    addFixture({
+      id: TIER3_ID,
+      name: "Tier 3",
+      icon: "box",
+      category: "platform",
+      component: () => Promise.resolve({ default: () => null }),
+      defaultSize: { w: 100, h: 100 },
+      minSize: { w: 50, h: 50 },
+      singleton: true,
+      pinned: false,
+      launchpadOrder: 999,
+      tier: 3,
+    });
+    addFixture({
+      id: HANDLER_ID,
+      name: "Handler",
+      icon: "box",
+      category: "os",
+      component: () => Promise.resolve({ default: () => null }),
+      defaultSize: { w: 100, h: 100 },
+      minSize: { w: 50, h: 50 },
+      singleton: true,
+      pinned: false,
+      launchpadOrder: 999,
+      handler: true,
+    });
+    addFixture({
+      id: TIER2_ID,
+      name: "Tier 2",
+      icon: "box",
+      category: "platform",
+      component: () => Promise.resolve({ default: () => null }),
+      defaultSize: { w: 100, h: 100 },
+      minSize: { w: 50, h: 50 },
+      singleton: true,
+      pinned: false,
+      launchpadOrder: 999,
+      tier: 2,
+      group: "TestGroup",
+    });
+    addFixture({
+      id: TIER1_ID,
+      name: "Tier 1",
+      icon: "box",
+      category: "platform",
+      component: () => Promise.resolve({ default: () => null }),
+      defaultSize: { w: 100, h: 100 },
+      minSize: { w: 50, h: 50 },
+      singleton: true,
+      pinned: false,
+      launchpadOrder: 999,
+    });
+  });
+
+  afterEach(() => {
+    removeFixture(TIER3_ID);
+    removeFixture(HANDLER_ID);
+    removeFixture(TIER2_ID);
+    removeFixture(TIER1_ID);
+  });
+
+  it("excludes tier 3 apps", () => {
+    const ids = getLaunchableApps(new Set()).map((a) => a.id);
+    expect(ids).not.toContain(TIER3_ID);
+  });
+
+  it("excludes handler apps", () => {
+    const ids = getLaunchableApps(new Set()).map((a) => a.id);
+    expect(ids).not.toContain(HANDLER_ID);
+  });
+
+  it("includes tier 1 apps (apps without explicit tier)", () => {
+    const ids = getLaunchableApps(new Set()).map((a) => a.id);
+    expect(ids).toContain(TIER1_ID);
+  });
+
+  it("includes tier 2 apps and preserves their group", () => {
+    const appsList = getLaunchableApps(new Set());
+    const tier2 = appsList.find((a) => a.id === TIER2_ID);
+    expect(tier2).toBeDefined();
+    expect(tier2?.tier).toBe(2);
+    expect(tier2?.group).toBe("TestGroup");
+  });
+});
+
+describe("getLaunchableApps tier-5 optional app filtering", () => {
+  it("includes installed tier-5 optional apps", () => {
+    const installed = new Set(["coding-studio", "design-studio"]);
+    const ids = getLaunchableApps(installed).map((a) => a.id);
+    expect(ids).toContain("coding-studio");
+    expect(ids).toContain("design-studio");
+  });
+
+  it("excludes non-installed tier-5 optional apps", () => {
+    const installed = new Set();
+    const ids = getLaunchableApps(installed).map((a) => a.id);
+    expect(ids).not.toContain("coding-studio");
+    expect(ids).not.toContain("design-studio");
+  });
+});
+
+describe("APP_REDIRECTS", () => {
+  it("is exported as a Record", () => {
+    expect(APP_REDIRECTS).toBeDefined();
+    expect(typeof APP_REDIRECTS).toBe("object");
+  });
+});
+
+describe("resolvePinnedId", () => {
+  it("returns the id for a valid app", () => {
+    expect(resolvePinnedId("messages")).toBe("messages");
+  });
+
+  it("returns undefined for an unknown id", () => {
+    expect(resolvePinnedId("does-not-exist")).toBeUndefined();
+  });
+
+  it("resolves a redirect to the target app id", () => {
+    APP_REDIRECTS["legacy-id"] = { appId: "agents" };
+    expect(resolvePinnedId("legacy-id")).toBe("agents");
+    delete APP_REDIRECTS["legacy-id"];
+  });
+
+  it("returns undefined for a redirect to a non-existent app", () => {
+    APP_REDIRECTS["legacy-id"] = { appId: "does-not-exist" };
+    expect(resolvePinnedId("legacy-id")).toBeUndefined();
+    delete APP_REDIRECTS["legacy-id"];
   });
 });

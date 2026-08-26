@@ -41,7 +41,7 @@ export interface AppManifest {
   handler?: boolean;
 }
 
-const apps: AppManifest[] = [
+export const apps: AppManifest[] = [
   // Platform apps
   { id: "messages", name: "Messages", icon: "message-circle", category: "platform", component: () => import("@/apps/MessagesApp").then((m) => ({ default: m.MessagesApp })), defaultSize: { w: 900, h: 600 }, minSize: { w: 400, h: 300 }, singleton: true, pinned: true, launchpadOrder: 1, pwa: true },
   { id: "mail", name: "Mail", icon: "mail", category: "platform", component: () => import("@/apps/MailApp").then((m) => ({ default: m.MailApp })), defaultSize: { w: 1200, h: 800 }, minSize: { w: 720, h: 480 }, singleton: true, pinned: true, launchpadOrder: 1.25 },
@@ -159,10 +159,21 @@ export function getOptionalApps(): AppManifest[] {
  * optional apps the user has installed. `installedOptional` is the set of
  * installed optional app ids (from /api/apps/optional/installed).
  */
+export const APP_REDIRECTS: Record<string, { appId: string; section?: string }> = {};
+
 export function getLaunchableApps(installedOptional: Set<string>): AppManifest[] {
   return getAllApps().filter(
-    (a) => (!a.optional || installedOptional.has(a.id)) && a.tier !== 4 && a.handler !== true,
+    (a) =>
+      (!a.optional || installedOptional.has(a.id)) &&
+      a.handler !== true &&
+      (a.tier === undefined || a.tier <= 2 || (a.tier === 5 && installedOptional.has(a.id))),
   );
+}
+
+export function resolvePinnedId(id: string): string | undefined {
+  const redirect = APP_REDIRECTS[id];
+  const targetId = redirect?.appId ?? id;
+  return getApp(targetId) ? targetId : undefined;
 }
 
 const prefetched = new Set<string>();

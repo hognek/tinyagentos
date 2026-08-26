@@ -4,11 +4,29 @@ import { useSessionPersistence } from "../use-session-persistence";
 import { useDockStore } from "@/stores/dock-store";
 import { useThemeStore } from "@/stores/theme-store";
 import { useAuthReadyStore } from "@/stores/auth-ready-store";
+import { APP_REDIRECTS } from "@/registry/app-registry";
 
-vi.mock("@/registry/app-registry", () => ({
-  getApp: () => undefined,
-  prefetchApp: () => {},
-}));
+vi.mock("@/registry/app-registry", () => {
+  const apps = new Map<string, { id: string }>([
+    ["messages", { id: "messages" }],
+    ["files", { id: "files" }],
+    ["agents", { id: "agents" }],
+    ["store", { id: "store" }],
+    ["settings", { id: "settings" }],
+  ]);
+  const redirects: Record<string, { appId: string; section?: string }> = {};
+
+  return {
+    getApp: (id: string) => apps.get(id),
+    prefetchApp: () => {},
+    resolvePinnedId: (id: string) => {
+      const redirect = redirects[id];
+      const targetId = redirect?.appId ?? id;
+      return apps.has(targetId) ? targetId : undefined;
+    },
+    APP_REDIRECTS: redirects,
+  };
+});
 
 vi.mock("@/lib/browser-windows-api", () => ({
   loadWindows: async () => [],
@@ -99,6 +117,30 @@ describe("useSessionPersistence — dock settings restore (#1603)", () => {
     await waitFor(() => expect(globalThis.fetch).toHaveBeenCalled());
     expect(useDockStore.getState().iconSize).toBe("medium");
     expect(useDockStore.getState().position).toBe("bottom");
+  });
+
+  it("resolves pinned ids through APP_REDIRECTS and drops unresolvable ids", async () => {
+    APP_REDIRECTS["legacy-pin"] = { appId: "agents" };
+
+    mockFetchWith({
+      "/api/desktop/dock": {
+        pinned: ["legacy-pin", "nonexistent-app", "messages"],
+        iconSize: "medium",
+        position: "bottom",
+      },
+    });
+
+    renderHook(() => useSessionPersistence());
+
+    await waitFor(() => {
+      const pinned = useDockStore.getState().pinned;
+      expect(pinned).toContain("agents");
+      expect(pinned).toContain("messages");
+      expect(pinned).not.toContain("nonexistent-app");
+      expect(pinned).not.toContain("legacy-pin");
+    });
+
+    delete APP_REDIRECTS["legacy-pin"];
   });
 });
 
