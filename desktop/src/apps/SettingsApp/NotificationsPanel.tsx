@@ -83,7 +83,7 @@ export function NotificationsPanel() {
         </p>
 
         {error && (
-          <p className="mb-3 text-xs text-amber-400 flex items-center gap-1.5">
+          <p role="alert" className="mb-3 text-xs text-amber-400 flex items-center gap-1.5">
             {error}
           </p>
         )}
@@ -100,7 +100,7 @@ export function NotificationsPanel() {
       </p>
 
       {error && (
-        <p className="mb-3 text-xs text-amber-400 flex items-center gap-1.5">
+        <p role="alert" className="mb-3 text-xs text-amber-400 flex items-center gap-1.5">
           {error}
         </p>
       )}

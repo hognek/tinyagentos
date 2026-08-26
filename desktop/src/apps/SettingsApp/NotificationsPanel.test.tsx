@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { NotificationsPanel } from "./NotificationsPanel";
 
 function jsonResponse(obj: unknown) {
@@ -12,21 +12,25 @@ function jsonResponse(obj: unknown) {
 describe("NotificationsPanel", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("shows an error when the prefs request fails (non-ok)", async () => {
+  it("announces the prefs-load error via role=alert", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(null, { status: 500 }),
     );
     render(<NotificationsPanel />);
-    expect(await screen.findByText("Could not load notification preferences.")).toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load notification preferences.",
+    );
   });
 
-  it("shows an error when the prefs request rejects", async () => {
+  it("announces the prefs-load rejection via role=alert", async () => {
     vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network"));
     render(<NotificationsPanel />);
-    expect(await screen.findByText("Could not reach backend.")).toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not reach backend.",
+    );
   });
 
-  it("renders the toggle list on successful fetch", async () => {
+  it("renders the toggle list on successful fetch with no alert present", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       jsonResponse([
         { event_type: "worker.join", muted: false },
@@ -37,8 +41,24 @@ describe("NotificationsPanel", () => {
     expect(await screen.findByText("Notifications")).toBeInTheDocument();
     expect(screen.getByText("Worker joined")).toBeInTheDocument();
     expect(screen.getByText("Backend up")).toBeInTheDocument();
-    expect(screen.queryByText("Could not reach backend.")).not.toBeInTheDocument();
-    expect(screen.queryByText("Could not load notification preferences.")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("announces a toggle-save failure via role=alert", async () => {
+    let callCount = 0;
+    vi.spyOn(globalThis, "fetch").mockImplementation(() => {
+      callCount += 1;
+      if (callCount === 1) {
+        return Promise.resolve(jsonResponse([{ event_type: "worker.join", muted: false }]));
+      }
+      return Promise.resolve(new Response(null, { status: 500 }));
+    });
+    render(<NotificationsPanel />);
+    expect(await screen.findByText("Worker joined")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText("Worker joined notifications"));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Failed to save (500)",
+    );
   });
 
   it("shows loading state while genuinely pending", async () => {
