@@ -117,8 +117,36 @@ class TestFocusIsNotStolenFromTheField:
         assert 'panel.addEventListener("pointerdown"' in OSK_SCRIPT
         assert "ev.preventDefault()" in OSK_SCRIPT
 
-    def test_focus_leaving_to_a_key_does_not_close_the_panel(self):
-        assert "panel.contains(ev.relatedTarget)" in OSK_SCRIPT
+    def test_nothing_closes_the_panel_on_blur(self):
+        """The keyboard must not close because focus moved.
+
+        Measured in Chromium at 1024x600: tapping a button focuses it on
+        pointerdown, which blurred the field; the old focusout handler then hid
+        the panel, un-reserving ~276px, which reflowed the card out from under
+        the finger — so mouseup landed elsewhere and no `click` was ever fired.
+        "Sign in with PIN" produced pointerdown and no click: PIN sign-in was
+        dead to touch. Visibility now follows the toggle only.
+        """
+        assert 'addEventListener("focusout"' not in OSK_SCRIPT
+        # hide() may only be reached from the explicit on/off path.
+        assert OSK_SCRIPT.count("hide();") == 1
+        assert "function setEnabled" in OSK_SCRIPT
+
+    def test_reserved_space_is_measured_not_guessed(self):
+        """A fixed vh guess is wrong for at least one of {numeric, letters} x
+        {600px panel, desktop window}, and being wrong low puts the card's
+        buttons under the keys."""
+        assert "panel.offsetHeight" in OSK_SCRIPT
+        assert 'document.body.style.paddingBottom = h ? h + "px" : ""' in OSK_SCRIPT
+
+    def test_a_card_too_tall_for_the_space_left_stays_reachable(self):
+        """The auth pages centre their card in a flex body; centring a card
+        taller than the remaining space puts its actions behind the keys with
+        nothing to scroll."""
+        rule = re.search(r"body\.osk-open\s*\{([^}]*)\}", OSK_STYLE)
+        assert rule, "no body.osk-open rule"
+        assert "flex-start" in rule.group(1)
+        assert "overflow-y: auto" in rule.group(1)
 
 
 class TestAccessibility:
@@ -195,3 +223,28 @@ class TestPinPanelIsConsoleOnly:
     def test_password_remains_reachable_from_the_pin_panel(self, login_console):
         """A PIN that fails must never strand the user with no way back."""
         assert 'id="use-password"' in login_console
+
+
+class TestPinPanelChrome:
+    """Rendered-state defects seen on a 1024x600 panel, not markup presence."""
+
+    def test_empty_error_bar_is_not_rendered(self, login_console):
+        """`.error` carries a red background and border, and the live region
+        has to exist before it has anything to say — so without this the page
+        shows a bare red slab having failed at nothing."""
+        assert re.search(r"#pin-error:empty\s*\{[^}]*display:\s*none", login_console)
+
+    def test_primary_pin_action_is_a_real_touch_target(self, login_console):
+        """#pin-submit is type=button (a submit would post the password form),
+        so it misses `button[type="submit"]` styling entirely and renders as a
+        ~21px native button — half the 44px floor, on a touchscreen."""
+        rule = re.search(r"#pin-submit\s*\{([^}]*)\}", login_console)
+        assert rule, "#pin-submit carries no styling of its own"
+        found = re.search(r"min-height:\s*(\d+)px", rule.group(1))
+        assert found and int(found.group(1)) >= 44
+
+    def test_card_sheds_height_while_the_keyboard_is_open(self, login_console):
+        """The keypad takes 291px of a 600px panel. Without this the card's
+        buttons are only reachable by scrolling a page that gives no sign it
+        scrolls."""
+        assert "body.osk-open .card" in login_console

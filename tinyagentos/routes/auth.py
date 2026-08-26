@@ -142,6 +142,15 @@ body {
   background: linear-gradient(135deg, #8b92a3, #5b6170);
   font-size: 26px;
 }
+/* The on-screen keyboard takes roughly half of a 600px panel, so while it is
+   open the card sheds decorative height to keep its actions above the keys.
+   The body is scrollable in that state either way, but a sign-in the user has
+   to scroll to reach is a sign-in a kiosk user will not find. */
+body.osk-open .card { padding: 16px 20px 12px; }
+body.osk-open label.field { margin-bottom: 6px; }
+body.osk-open .brand { margin-bottom: 8px; gap: 6px; }
+body.osk-open .brand .icon { width: 40px; height: 40px; border-radius: 12px; font-size: 20px; }
+body.osk-open .brand p { display: none; }
 .brand h1 { margin: 0; font-size: 18px; font-weight: 600; }
 .brand p { margin: 0; font-size: 12px; color: rgba(255,255,255,0.5); text-align: center; }
 label.field {
@@ -212,7 +221,26 @@ button[type="submit"]:disabled { opacity: 0.4; cursor: not-allowed; }
 _PIN_PANEL_STYLE = """
 .pin-panel { margin-bottom: 14px; }
 .pin-panel[hidden], .pw-panel[hidden] { display: none; }
+/* The error paragraph is a live region, so it has to exist before it has
+   anything to say — but `.error` carries a red background and border, and an
+   empty one renders as a bare red slab above the keypad on a page that has not
+   failed at anything yet. */
+#pin-error:empty { display: none; }
+/* The primary action is type=button (a submit would post the password form),
+   so it misses `button[type="submit"]` styling entirely and lands as a ~21px
+   native button — on a touchscreen, under the 44px this keyboard's own floor
+   requires. */
+#pin-submit {
+  width: 100%; margin-top: 6px; padding: 12px 14px; min-height: 44px;
+  border: 0; border-radius: 10px;
+  background: #8b92a3; color: #fff;
+  font: inherit; font-weight: 600; cursor: pointer;
+  transition: filter 120ms;
+}
+#pin-submit:hover { filter: brightness(1.1); }
+#pin-submit:focus-visible { outline: 3px solid #4c9aff; outline-offset: 2px; }
 .pin-dots { display: flex; gap: 10px; justify-content: center; margin: 8px 0 14px; }
+body.osk-open .pin-dots { margin: 2px 0 8px; }
 .pin-dot {
   width: 14px; height: 14px; border-radius: 50%;
   border: 1px solid rgba(255,255,255,0.45); background: transparent;

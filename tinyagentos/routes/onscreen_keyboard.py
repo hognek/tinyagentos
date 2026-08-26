@@ -75,8 +75,15 @@ OSK_STYLE = """
 .osk[data-layout="numeric"] .osk-row { max-width: 320px; margin-left: auto; margin-right: auto; }
 .osk[data-layout="numeric"] .osk-key { min-height: 62px; font-size: 24px; }
 
-/* Keep the focused field visible above the keyboard. */
-body.osk-open { padding-bottom: 46vh; }
+/* Keep the whole card reachable above the keyboard.
+   The 46vh is only a fallback for the first frame: the script replaces it with
+   the panel's MEASURED height, because a guess is either wasted space or — on a
+   600px pi-top panel, where the numeric pad is 291px — a card whose buttons sit
+   underneath the keys.
+   `flex-start` matters: the auth pages centre their card in a flex body, and a
+   card taller than the space left over is centred THROUGH the keyboard, so its
+   actions end up behind the keys with no way to scroll to them. */
+body.osk-open { padding-bottom: 46vh; align-items: flex-start; overflow-y: auto; }
 
 @media (prefers-reduced-motion: no-preference) {
   .osk-key { transition: background-color 90ms ease; }
@@ -207,6 +214,9 @@ OSK_SCRIPT = r"""
       }
       panel.appendChild(row);
     }
+    // Switching between the letters, symbol and numeric layers changes the
+    // panel's height, so the space reserved for it has to change with it.
+    if (!panel.hidden) fit();
   }
 
   function insert(text) {
@@ -294,6 +304,15 @@ OSK_SCRIPT = r"""
     press(btn.getAttribute("data-key"));
   });
 
+  // Reserve exactly the space the keyboard occupies. Measured, not guessed:
+  // the numeric pad and the full keyboard are different heights, and so is the
+  // same layout on a 600px panel versus a desktop window.
+  function fit() {
+    if (panel.hidden) { document.body.style.paddingBottom = ""; return; }
+    var h = panel.offsetHeight;
+    document.body.style.paddingBottom = h ? h + "px" : "";
+  }
+
   function show() {
     if (!enabled || !target) return;
     var wanted = layoutFor(target);
@@ -301,11 +320,19 @@ OSK_SCRIPT = r"""
     render();
     panel.hidden = false;
     document.body.classList.add("osk-open");
+    fit();
+    // With the body top-aligned and scrollable, a card taller than the space
+    // left over is still fully reachable — but the field being typed into has
+    // to be the part that is on screen.
+    if (target.scrollIntoView) {
+      try { target.scrollIntoView({ block: "nearest" }); } catch (e) { target.scrollIntoView(); }
+    }
   }
 
   function hide() {
     panel.hidden = true;
     document.body.classList.remove("osk-open");
+    document.body.style.paddingBottom = "";
   }
 
   document.addEventListener("focusin", function (ev) {
@@ -314,12 +341,18 @@ OSK_SCRIPT = r"""
     if (enabled) show();
   });
 
-  document.addEventListener("focusout", function (ev) {
-    // Losing focus to a key is not losing focus; the pointer handler already
-    // prevented it, but guard anyway so a stray blur cannot close the panel.
-    if (panel.contains(ev.relatedTarget)) return;
-    if (!isTypable(ev.relatedTarget)) hide();
-  });
+  // THERE IS DELIBERATELY NO HIDE-ON-BLUR. Closing the keyboard when focus
+  // moves to something untypable looks obviously right and silently breaks
+  // every button on the page: tapping one focuses it on POINTERDOWN, which
+  // blurs the field, which used to hide the panel, which un-reserved ~276px and
+  // reflowed the card out from under the finger — so mouseup landed elsewhere
+  // and Chromium never fired `click`. Measured on the pi-top viewport: a tap on
+  // "Sign in with PIN" produced pointerdown and NO click, i.e. PIN sign-in was
+  // dead to touch, which is the entire feature. The panel now tracks the user's
+  // toggle only, the way the Windows on-screen keyboard does, so nothing moves
+  // under a finger mid-tap. `target` is kept for the same reason: keys go on
+  // typing into the last field the user was in, as they do on Windows.
+  window.addEventListener("resize", function () { if (enabled) fit(); });
 
   function setEnabled(on, announce) {
     enabled = on;
