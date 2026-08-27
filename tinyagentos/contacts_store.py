@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 from tinyagentos.base_store import BaseStore
+from tinyagentos.hub.identity import fingerprint as _compute_fingerprint
 
 
 CONTACTS_SCHEMA = """
@@ -15,8 +16,8 @@ CREATE TABLE IF NOT EXISTS contacts (
     contact_id        TEXT PRIMARY KEY,       -- "hub:{fingerprint}" — canonical key, never the username
     hub_username      TEXT NOT NULL,          -- display column; not unique (distinct peers may share a name)
     display_name      TEXT NOT NULL,
-    ed25519_pub       TEXT NOT NULL,          -- pinned at friend-accept
-    x25519_pub        TEXT NOT NULL,
+    ed25519_pub       TEXT NOT NULL,          -- pinned at friend-accept; verified via signature challenge
+    x25519_pub        TEXT NOT NULL,          -- accepted unverified — no verification protocol exists at this head; re-pinned every accept/re-accept
     peer_fingerprint  TEXT NOT NULL DEFAULT '', -- signing-key fingerprint; stable lookup key
     status            TEXT NOT NULL DEFAULT 'pending',  -- pending|active|blocked|revoked
     local_crm_id      TEXT,                   -- optional link to existing CRM row
@@ -138,6 +139,25 @@ class ContactsStore(BaseStore):
             except BaseException:
                 await self._db.rollback()
                 raise
+
+        # Backfill peer_fingerprint for pre-existing contacts that predate the
+        # column.  The ALTER TABLE above seeds them with DEFAULT '', and the
+        # rebuild copies those empty values verbatim.  Without backfill, these
+        # contacts are invisible to block_peer (which resolves by fingerprint),
+        # so the block path fails open — the peer link is never revoked.
+        async with self._db.execute(
+            "SELECT contact_id, ed25519_pub FROM contacts "
+            "WHERE peer_fingerprint = '' AND ed25519_pub != ''"
+        ) as cursor:
+            stale = await cursor.fetchall()
+        for contact_id, ed25519_pub in stale:
+            fp = _compute_fingerprint(ed25519_pub)
+            await self._db.execute(
+                "UPDATE contacts SET peer_fingerprint = ? WHERE contact_id = ?",
+                (fp, contact_id),
+            )
+        if stale:
+            await self._db.commit()
 
     async def _hub_username_unique_index_exists(self) -> bool:
         """True when the legacy UNIQUE auto-index on hub_username still exists."""

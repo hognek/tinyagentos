@@ -30,6 +30,7 @@ from tinyagentos.projects.task_store import ProjectTaskStore
 from tinyagentos.chat.channel_store import ChatChannelStore
 from tinyagentos.notes.shared_docs_store import SharedDocsStore
 from tinyagentos.contacts_store import ContactsStore
+from tinyagentos.hub.identity import fingerprint as _compute_fingerprint
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +551,46 @@ class TestContactsStoreUpgrade:
             contact = await store.get_contact("hub:test")
             assert contact is not None
             assert contact["peer_fingerprint"] == "deadbeef"
+        finally:
+            await store.close()
+
+    async def test_upgrade_backfills_fingerprint_for_existing_rows(
+        self, tmp_path
+    ):
+        """Regression: rows predating peer_fingerprint must get backfilled.
+
+        Without backfill, block_peer (routes/hub.py) resolves peers by
+        fingerprint only and silently fails to revoke the peer link for
+        every pre-existing contact — the block path fails open.
+        """
+        db_path = tmp_path / "contacts.db"
+        _seed_db(db_path, CONTACTS_V0_SCHEMA)
+        # Seed a pre-existing contact with key material but no fingerprint
+        # column (the v0 schema has no peer_fingerprint).
+        now = time.time()
+        db = sqlite3.connect(str(db_path))
+        db.execute(
+            "INSERT INTO contacts "
+            "(contact_id, hub_username, display_name, ed25519_pub, x25519_pub,"
+            " status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("hub:testpeer", "testpeer", "Test Peer",
+             "ab" * 32, "cd" * 32, "active", now),
+        )
+        db.commit()
+        db.close()
+
+        store = ContactsStore(db_path)
+        await store.init()
+        try:
+            contact = await store.get_contact("hub:testpeer")
+            assert contact is not None
+            assert contact["peer_fingerprint"] != "", (
+                "peer_fingerprint not backfilled for pre-existing row"
+            )
+            expected = _compute_fingerprint("ab" * 32)
+            assert contact["peer_fingerprint"] == expected, (
+                f"fingerprint mismatch: {contact['peer_fingerprint']} != {expected}"
+            )
         finally:
             await store.close()
 

@@ -169,6 +169,12 @@ def mint_peer_token(sub: str) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 # Handshake delivery
 # ---------------------------------------------------------------------------
+# WARNING: send_handshake / deliver_handshake currently have zero callers
+# repo-wide.  deliver_handshake POSTs to peer-supplied URLs with no SSRF
+# guard — wire a validating transport (e.g. an ssrf-safe httpx wrapper that
+# blocks internal/loopback/cloud-metadata targets) before either function
+# gets a caller.  Without it, a malicious peer endpoint could probe or
+# traverse the local network.
 
 
 def send_handshake(
