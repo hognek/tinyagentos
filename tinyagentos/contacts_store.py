@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
 import sqlite3
 import time
@@ -9,6 +10,8 @@ from typing import Optional
 
 from tinyagentos.base_store import BaseStore
 from tinyagentos.hub.identity import fingerprint as _compute_fingerprint
+
+logger = logging.getLogger(__name__)
 
 
 CONTACTS_SCHEMA = """
@@ -151,7 +154,14 @@ class ContactsStore(BaseStore):
         ) as cursor:
             stale = await cursor.fetchall()
         for contact_id, ed25519_pub in stale:
-            fp = _compute_fingerprint(ed25519_pub)
+            try:
+                fp = _compute_fingerprint(ed25519_pub)
+            except (ValueError, TypeError) as exc:
+                logger.warning(
+                    "contacts: cannot backfill fingerprint for %s: %s",
+                    contact_id, exc,
+                )
+                continue
             await self._db.execute(
                 "UPDATE contacts SET peer_fingerprint = ? WHERE contact_id = ?",
                 (fp, contact_id),

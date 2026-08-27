@@ -594,6 +594,55 @@ class TestContactsStoreUpgrade:
         finally:
             await store.close()
 
+    async def test_upgrade_skips_malformed_ed25519_during_backfill(
+        self, tmp_path
+    ):
+        """Backfill must not brick boot when a v0 row has non-hex key material.
+
+        _compute_fingerprint calls bytes.fromhex, which raises ValueError on
+        odd-length strings, non-hex chars, or embedded NULs.  A single bad row
+        must never crash init() or abort the rest of the backfill.
+        """
+        db_path = tmp_path / "contacts.db"
+        _seed_db(db_path, CONTACTS_V0_SCHEMA)
+        now = time.time()
+        db = sqlite3.connect(str(db_path))
+        # Row with valid hex — must be backfilled.
+        db.execute(
+            "INSERT INTO contacts "
+            "(contact_id, hub_username, display_name, ed25519_pub, x25519_pub,"
+            " status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("hub:valid", "valid", "Valid", "ab" * 32, "cd" * 32,
+             "active", now),
+        )
+        # Row with malformed hex — must NOT crash init().
+        db.execute(
+            "INSERT INTO contacts "
+            "(contact_id, hub_username, display_name, ed25519_pub, x25519_pub,"
+            " status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("hub:badhex", "badhex", "Bad Hex", "not-hex-data!!!", "cd" * 32,
+             "active", now),
+        )
+        db.commit()
+        db.close()
+
+        store = ContactsStore(db_path)
+        await store.init()  # must not raise
+        try:
+            # Valid row is backfilled.
+            valid = await store.get_contact("hub:valid")
+            assert valid is not None
+            assert valid["peer_fingerprint"] == _compute_fingerprint("ab" * 32)
+
+            # Bad row is reachable (not bricked), fingerprint stays empty.
+            bad = await store.get_contact("hub:badhex")
+            assert bad is not None
+            assert bad["peer_fingerprint"] == "", (
+                "malformed-hex row must keep empty fingerprint, not crash"
+            )
+        finally:
+            await store.close()
+
 
 # ---------------------------------------------------------------------------
 # Regression: no SCHEMA CREATE INDEX references a _post_init-added column
