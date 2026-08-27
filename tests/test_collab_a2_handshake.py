@@ -15,6 +15,8 @@ import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 
+from taos_test_csrf import csrf_event_hooks
+
 from tinyagentos.contacts_store import generate_peer_token, _hash_token
 
 # ---------------------------------------------------------------------------
@@ -161,6 +163,7 @@ async def client_with_contacts(app_with_contacts):
         transport=transport,
         base_url="http://test",
         cookies={"taos_session": _token},
+        event_hooks=csrf_event_hooks(),
     ) as c:
         yield c
 
