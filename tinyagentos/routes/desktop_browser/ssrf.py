@@ -55,12 +55,18 @@ _BLOCKED_NETWORKS = (
 )
 
 
-def validate_url_or_raise(url: str) -> None:
+def validate_url_or_raise(url: str, *, allow_private: bool = False) -> None:
     """Validate that `url` is safe to fetch.
 
     Parses the URL, checks scheme + hostname suffix, resolves DNS, and
     verifies every resolved address against the blocklist. Raises
     `SsrfBlockedError` on any failure.
+
+    Pass ``allow_private=True`` to permit RFC1918 addresses and their IPv6
+    unique-local equivalent (e.g. self-hosted LAN services) while still
+    refusing loopback, link-local, multicast, reserved, and unspecified
+    ranges. CGNAT is NOT permitted by ``allow_private`` — see
+    `validate_resolved_addr` for the ranges that stay blocked either way.
     """
     parsed = urlparse(url)
 
@@ -114,15 +120,22 @@ def validate_url_or_raise(url: str) -> None:
         raise SsrfBlockedError("hostname resolved to no addresses")
 
     for addr in addrs:
-        validate_resolved_addr(addr)
+        validate_resolved_addr(addr, allow_private=allow_private)
 
 
-def validate_resolved_addr(addr: str) -> None:
+def validate_resolved_addr(addr: str, *, allow_private: bool = False) -> None:
     """Validate that a resolved IP address is safe to connect to.
 
     Rejects loopback, RFC1918, link-local, multicast, broadcast,
     unspecified (0.0.0.0), and the IPv6 equivalents (incl. IPv4-mapped
-    IPv6 forms like ::ffff:127.0.0.1).
+    IPv6 forms like ::ffff:10.0.0.1).
+
+    Pass ``allow_private=True`` to skip the ``is_private`` check, which
+    permits RFC1918 and IPv6 unique-local (``fc00::/7``) addresses for
+    self-hosted LAN services. Everything in `_BLOCKED_NETWORKS` — CGNAT
+    (RFC 6598 ``100.64.0.0/10``) and deprecated IPv6 site-local
+    (``fec0::/10``) — stays blocked regardless of allow_private, because
+    our own A2A bus lives in the CGNAT range.
     """
     try:
         ip = ipaddress.ip_address(addr)
@@ -135,18 +148,17 @@ def validate_resolved_addr(addr: str) -> None:
     if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
 
-    if (
-        ip.is_loopback
-        or ip.is_private
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-    ):
+    if ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
         raise SsrfBlockedError(f"resolved address {addr!r} is in the blocklist")
 
-    # Backstop for ranges Python's `ipaddress` doesn't classify as
-    # private (e.g. RFC 6598 CGNAT).
+    # allow_private=True skips this check, which is what permits RFC1918
+    # and IPv6 unique-local for self-hosted LAN services. The
+    # _BLOCKED_NETWORKS pass below still applies either way.
+    if not allow_private and ip.is_private:
+        raise SsrfBlockedError(f"resolved address {addr!r} is in the blocklist")
+
+    # Always blocked, even when allow_private=True: CGNAT (our own A2A bus
+    # lives in that range) and deprecated IPv6 site-local.
     for net in _BLOCKED_NETWORKS:
         if ip in net:
             raise SsrfBlockedError(
