@@ -9,8 +9,10 @@ Name it `<pr-number>-<short-slug>.md` or, when the change is tracked by a
 task card, `tsk-<cardid>-<short-slug>.md`. Write the bullet exactly as it should
 appear in the changelog. The trailing `(#PR)` is NOT required: the fragment is
 authored inside the commit that does the work, before the pull request number
-exists. The reference is attached when the changelog is assembled, not when
-the fragment is written.
+exists. Nothing attaches the reference later either — the collator does not
+inject one (see "At release time" below). Add it by hand if you want it and
+you know the number; a `tsk-<cardid>` filename carries the card id instead,
+which is the traceable link for fragments written by a lane.
 
     - Projects gain a Notes area: title + markdown notes per project.
 
