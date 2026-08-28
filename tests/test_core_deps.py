@@ -44,10 +44,14 @@ class TestCoreDepGuard:
     alone."""
 
     def _install_stale_namespace(self, tmp_path, name):
-        """Create an empty PEP 420 namespace dir for *name* under *tmp_path*
-        and prepend tmp_path to sys.path[0].  Returns the dir path."""
+        """Create a real regular package dir for *name* under *tmp_path*
+        and prepend tmp_path to sys.path[0].  A regular package (with
+        __init__.py) earlier on sys.path shadows any installed regular
+        package, giving the guard something genuine to detect.  Returns
+        the package dir path."""
         pkg_dir = tmp_path / name
         pkg_dir.mkdir()
+        (pkg_dir / "__init__.py").write_text("")
         sys.path.insert(0, str(tmp_path))
         saved = {k: v for k, v in sys.modules.items()
                  if k == name or k.startswith(name + ".")}
@@ -84,10 +88,10 @@ class TestCoreDepGuard:
         _verify_core_deps()
 
     def test_guard_detects_stale_sniffio_namespace(self, tmp_path):
-        """Direct reproduction of the tsk-2nvear defect: an empty sniffio/
-        directory on sys.path makes the module importable but
-        attribute-less."""
-        self._install_stale_namespace(tmp_path, "sniffio")
+        """Direct reproduction of the tsk-2nvear defect: a stale sniffio/
+        regular-package directory on sys.path makes the module importable
+        but attribute-less."""
+        pkg_dir = self._install_stale_namespace(tmp_path, "sniffio")
         try:
             problems = _check_core_deps({
                 "sniffio": ("current_async_library", "AsyncLibraryNotFoundError"),
@@ -96,15 +100,15 @@ class TestCoreDepGuard:
             name, missing, mod = problems[0]
             assert name == "sniffio"
             assert "current_async_library" in missing
-            assert getattr(mod, "__file__", None) is None
-            assert getattr(mod, "__path__", None) is not None
+            assert mod.__file__ == str(pkg_dir / "__init__.py")
+            assert mod.__path__ == [str(pkg_dir)]
         finally:
             self._remove_stale_namespace(tmp_path, "sniffio")
 
     def test_guard_detects_generic_half_present_module(self, tmp_path):
         """Any importable-but-attribute-less core dep is caught, not just
         sniffio."""
-        self._install_stale_namespace(tmp_path, "fake_half_present_pkg")
+        pkg_dir = self._install_stale_namespace(tmp_path, "fake_half_present_pkg")
         try:
             problems = _check_core_deps({
                 "fake_half_present_pkg": ("some_attribute",),
@@ -113,8 +117,8 @@ class TestCoreDepGuard:
             name, missing, mod = problems[0]
             assert name == "fake_half_present_pkg"
             assert missing == ("some_attribute",)
-            assert getattr(mod, "__file__", None) is None
-            assert getattr(mod, "__path__", None) is not None
+            assert mod.__file__ == str(pkg_dir / "__init__.py")
+            assert mod.__path__ == [str(pkg_dir)]
         finally:
             self._remove_stale_namespace(tmp_path, "fake_half_present_pkg")
 
