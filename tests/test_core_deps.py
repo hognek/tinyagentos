@@ -43,21 +43,28 @@ class TestCoreDepGuard:
     not just sniffio -- the fix must not be keyed on the string 'sniffio'
     alone."""
 
-    @staticmethod
-    def _install_stale_namespace(tmp_path, name):
+    def _install_stale_namespace(self, tmp_path, name):
         """Create an empty PEP 420 namespace dir for *name* under *tmp_path*
         and prepend tmp_path to sys.path[0].  Returns the dir path."""
         pkg_dir = tmp_path / name
         pkg_dir.mkdir()
         sys.path.insert(0, str(tmp_path))
-        sys.modules.pop(name, None)
+        saved = {k: v for k, v in sys.modules.items()
+                 if k == name or k.startswith(name + ".")}
+        for key in list(saved):
+            sys.modules.pop(key, None)
+        importlib.invalidate_caches()
+        self._saved_stale_modules = saved
         return pkg_dir
 
-    @staticmethod
-    def _remove_stale_namespace(tmp_path, name):
+    def _remove_stale_namespace(self, tmp_path, name):
         """Undo _install_stale_namespace."""
         sys.path.remove(str(tmp_path))
-        sys.modules.pop(name, None)
+        for key in list(sys.modules):
+            if key == name or key.startswith(name + "."):
+                sys.modules.pop(key, None)
+        sys.modules.update(getattr(self, "_saved_stale_modules", {}))
+        self._saved_stale_modules = {}
 
     def test_contracts_include_sniffio_with_current_async_library(self):
         assert "sniffio" in _CORE_DEP_CONTRACTS
