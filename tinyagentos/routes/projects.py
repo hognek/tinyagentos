@@ -7,6 +7,7 @@ import uuid
 
 import asyncio as _asyncio
 import json as _json
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -14,6 +15,9 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from tinyagentos.agent_token_auth import (
     PROJECT_SCOPE_MISMATCH_DETAIL,
+    _get_grants_store,
+    _grant_unexpired,
+    check_agent_identity,
     check_agent_scope_for_project,
 )
 from tinyagentos.auth_context import CurrentUser, current_user, require_owner_or_admin
@@ -748,6 +752,98 @@ async def list_tasks(
         return auth
     store = request.app.state.project_task_store
     return {"items": await store.list_tasks(project_id=project_id, status=status, element_id=element_id)}
+
+
+async def _caller_project_candidates(request: Request, pstore) -> list[dict]:
+    """Candidate projects for the cross-project kanban aggregate.
+
+    This is scoped ENUMERATION, not authorization: it returns only projects the
+    caller could already name for itself, and the per-project
+    ``_authorize_task_actor`` gate applied by the aggregate route remains the
+    authoritative check (defence in depth).  It must never surface a project the
+    caller is not entitled to:
+
+      * session owner/admin -> own projects (``list_for_user``) or all (admin);
+      * registry-JWT agent   -> only projects it holds an active
+        ``project_tasks`` grant for (grant-gated, taOS #1862).
+
+    A caller with neither a session nor a Bearer never reaches this helper (the
+    auth middleware 401s first), so the empty fallbacks below are belt-and-braces
+    rather than the primary gate.
+    """
+    uid = getattr(request.state, "user_id", None)
+    if uid:
+        user = CurrentUser(
+            user_id=uid, is_admin=bool(getattr(request.state, "is_admin", False))
+        )
+        if user.is_admin:
+            return await pstore.list_projects(status="active")
+        return await pstore.list_for_user(uid, status="active")
+
+    # No session: a registry-JWT agent (the middleware only passes a Bearer
+    # through on the allowlist and leaves user_id=None).  Resolve WHO the agent
+    # is, then enumerate the projects it holds an active project_tasks grant for.
+    canonical_id = await check_agent_identity(request)
+    if not canonical_id:
+        return []
+    grants_store = _get_grants_store(request)
+    grants = await grants_store.list_grants(canonical_id)
+    now = datetime.now(timezone.utc)
+    project_ids: list[str] = []
+    for g in grants:
+        if g.get("scope") != "project_tasks":
+            continue
+        pid = g.get("project_id")
+        if not pid:
+            continue
+        if not _grant_unexpired(g.get("expires_at"), now):
+            continue
+        if pid not in project_ids:
+            project_ids.append(pid)
+    projects: list[dict] = []
+    for pid in project_ids:
+        p = await pstore.get_project(pid)
+        if p is not None:
+            projects.append(p)
+    return projects
+
+
+@router.get("/api/projects/tasks/aggregate")
+async def list_tasks_aggregate(
+    request: Request,
+    status: str | None = None,
+):
+    """Cross-project aggregate of the caller's kanban boards (READ ONLY).
+
+    Returns every project the caller is authorized to see -- its own boards for
+    a session owner, or the boards it holds a ``project_tasks`` grant for as an
+    agent -- each with that project's tasks.  The per-project
+    ``_authorize_task_actor`` gate is applied to EVERY candidate, so a caller
+    entitled to project A can never receive project B in the aggregate (the
+    whole point of this endpoint).  ``status`` filters tasks to
+    ``open`` / ``claimed`` / ``closed``.
+    """
+    pstore = request.app.state.project_store
+    store = request.app.state.project_task_store
+    items: list[dict] = []
+    for project in await _caller_project_candidates(request, pstore):
+        auth = await _authorize_task_actor(
+            request, pstore, project["id"], scope="project_tasks"
+        )
+        if isinstance(auth, JSONResponse):
+            # Not authorized for THIS project -> excluded from the aggregate, so
+            # it cannot leak another project's board to the caller.
+            continue
+        tasks = await store.list_tasks(project_id=project["id"], status=status)
+        items.append(
+            {
+                "project_id": project["id"],
+                "name": project.get("name"),
+                "slug": project.get("slug"),
+                "tasks": tasks,
+            }
+        )
+    return {"items": items}
 
 
 @router.get("/api/projects/{project_id}/tasks/ready")
