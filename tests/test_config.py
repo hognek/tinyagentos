@@ -531,3 +531,84 @@ class TestMemoryUrl:
 
         reloaded = load_config(p)
         assert reloaded.memory_url == "http://localhost:7900"
+
+
+class TestWakeBudgetConfig:
+    def test_defaults_when_missing(self, tmp_path):
+        p = tmp_path / "config.yaml"
+        cfg = AppConfig(config_path=p)
+        assert cfg.wake_budget["global_default"] == 2
+        assert cfg.wake_budget["per_agent"] == {}
+        assert cfg.wake_budget["per_project"] == {}
+
+    def test_loads_from_yaml(self, tmp_path):
+        p = tmp_path / "config.yaml"
+        cfg = AppConfig(
+            config_path=p,
+            wake_budget={"global_default": 5, "per_agent": {"a1": 10}, "per_project": {"p1": 1}},
+        )
+        from tinyagentos.config import save_config, load_config
+        save_config(cfg, p)
+        reloaded = load_config(p)
+        assert reloaded.wake_budget["global_default"] == 5
+        assert reloaded.wake_budget["per_agent"]["a1"] == 10
+        assert reloaded.wake_budget["per_project"]["p1"] == 1
+
+    def test_validate_valid(self, tmp_path):
+        p = tmp_path / "config.yaml"
+        cfg = AppConfig(
+            config_path=p,
+            wake_budget={"global_default": 2, "per_agent": {"a1": 3}, "per_project": {}},
+        )
+        errors = validate_config(cfg)
+        assert not any("wake_budget" in e for e in errors)
+
+    def test_validate_rejects_negative_global(self, tmp_path):
+        p = tmp_path / "config.yaml"
+        cfg = AppConfig(config_path=p, wake_budget={"global_default": -1})
+        errors = validate_config(cfg)
+        assert any("wake_budget.global_default" in e for e in errors)
+
+    def test_validate_rejects_non_integer_per_agent(self, tmp_path):
+        p = tmp_path / "config.yaml"
+        cfg = AppConfig(config_path=p, wake_budget={"per_agent": {"a1": "bad"}})
+        errors = validate_config(cfg)
+        assert any("per_agent" in e for e in errors)
+
+    def test_wake_budget_nested_defaults_are_per_instance(self, tmp_path):
+        """Per-agent/per-project mappings must be deep-copied per instance so
+        mutating one AppConfig (or load_config result) cannot leak into another
+        instance, the module DEFAULT_CONFIG, or an already-created instance."""
+        from tinyagentos.config import AppConfig, DEFAULT_CONFIG, load_config
+        from tinyagentos.wake_budget import resolve_budget
+
+        earlier = AppConfig(config_path=tmp_path / "config.yaml")
+
+        a = AppConfig(config_path=tmp_path / "config.yaml")
+        assert a.wake_budget["per_agent"] is not DEFAULT_CONFIG["wake_budget"]["per_agent"]
+        assert a.wake_budget["per_project"] is not DEFAULT_CONFIG["wake_budget"]["per_project"]
+        a.wake_budget["per_agent"]["victim-agent"] = 0
+        a.wake_budget["per_project"]["victim-proj"] = 0
+
+        # A fresh instance must not inherit the mutation.
+        fresh = AppConfig(config_path=tmp_path / "config.yaml")
+        assert "victim-agent" not in fresh.wake_budget["per_agent"]
+        assert "victim-proj" not in fresh.wake_budget["per_project"]
+        assert resolve_budget("victim-agent", None, fresh) == 2
+
+        # An earlier instance must not see the mutation.
+        assert "victim-agent" not in earlier.wake_budget["per_agent"]
+        assert "victim-proj" not in earlier.wake_budget["per_project"]
+
+        # The module-level DEFAULT_CONFIG must not be mutated.
+        assert "victim-agent" not in DEFAULT_CONFIG["wake_budget"]["per_agent"]
+        assert "victim-proj" not in DEFAULT_CONFIG["wake_budget"]["per_project"]
+
+        # load_config fallback (no wake_budget in YAML) must also be isolated.
+        p = tmp_path / "config.yaml"
+        p.write_text("server:\n  host: 0.0.0.0\n  port: 6969\n")
+        cfg = load_config(p)
+        cfg.wake_budget["per_agent"]["loaded-agent"] = 0
+        fresh2 = AppConfig(config_path=tmp_path / "config.yaml")
+        assert "loaded-agent" not in fresh2.wake_budget["per_agent"]
+        assert "loaded-agent" not in DEFAULT_CONFIG["wake_budget"]["per_agent"]

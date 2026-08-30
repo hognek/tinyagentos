@@ -1817,3 +1817,109 @@ class TestAgentBudgetRoutes:
     async def test_reset_not_found_agent(self, client):
         resp = await client.post("/api/agents/no-such-agent/budget/reset")
         assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+class TestAgentWakeBudget:
+    async def test_get_wake_budget_defaults(self, client):
+        resp = await client.get("/api/agents/test-agent/wake-budget")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["agent"] == "test-agent"
+        assert data["budget"] == 2
+        assert data["consumed"] == 0
+        assert data["remaining"] == 2
+        assert data["date"] == _today_str()
+        assert data["next_wake_epoch"] is not None
+
+    async def test_wake_budget_reports_enforced_project_counter(
+        self, client, app, tmp_data_dir, monkeypatch
+    ):
+        from tinyagentos.agent_heartbeat import _heartbeat_tick
+
+        agent = next(a for a in app.state.config.agents if a["name"] == "test-agent")
+        agent["id"] = "test-agent"
+        agent["status"] = "running"
+        app.state.config.server["agent_heartbeat_enabled"] = True
+
+        project = await app.state.project_store.create_project(
+            name="proj-1", slug="proj-1", created_by="test",
+        )
+        await app.state.project_task_store.create_task(
+            project_id=project["id"],
+            title="ready task",
+            created_by="test",
+            assignee_id="test-agent",
+        )
+
+        async def fake_wake(*args, **kwargs):
+            return True
+
+        monkeypatch.setattr(
+            "tinyagentos.agent_heartbeat._wake_agent_with_task", fake_wake
+        )
+
+        await _heartbeat_tick(app.state)
+
+        resp = await client.get("/api/agents/test-agent/wake-budget")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["consumed"] == 1
+
+    async def test_wake_budget_reports_per_project_override(
+        self, client, app, tmp_data_dir, monkeypatch
+    ):
+        from tinyagentos.agent_heartbeat import _heartbeat_tick
+
+        agent = next(a for a in app.state.config.agents if a["name"] == "test-agent")
+        agent["id"] = "test-agent"
+        agent["status"] = "running"
+        app.state.config.server["agent_heartbeat_enabled"] = True
+
+        project = await app.state.project_store.create_project(
+            name="proj-pp", slug="proj-pp", created_by="test",
+        )
+        app.state.config.wake_budget = {
+            "global_default": 2,
+            "per_agent": {},
+            "per_project": {project["id"]: 1},
+        }
+        await app.state.project_task_store.create_task(
+            project_id=project["id"],
+            title="ready task",
+            created_by="test",
+            assignee_id="test-agent",
+        )
+
+        async def fake_wake(*args, **kwargs):
+            return True
+
+        monkeypatch.setattr(
+            "tinyagentos.agent_heartbeat._wake_agent_with_task", fake_wake
+        )
+
+        await _heartbeat_tick(app.state)
+
+        resp = await client.get("/api/agents/test-agent/wake-budget")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["budget"] == 1
+        assert data["consumed"] == 1
+        assert data["remaining"] == 0
+
+        resp2 = await client.get("/api/observatory/wake-budget")
+        assert resp2.status_code == 200
+        data2 = resp2.json()
+        agent_row = next(a for a in data2["agents"] if a["agent_id"] == "test-agent")
+        assert agent_row["budget"] == 1
+        assert agent_row["consumed"] == 1
+        assert agent_row["remaining"] == 0
+
+    async def test_get_wake_budget_not_found(self, client):
+        resp = await client.get("/api/agents/no-such-agent/wake-budget")
+        assert resp.status_code == 404
+
+
+def _today_str() -> str:
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
