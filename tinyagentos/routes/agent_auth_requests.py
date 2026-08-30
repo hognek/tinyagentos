@@ -493,7 +493,7 @@ async def approve_request_record(
         # for a genuine same-origin (external-selfjoin) re-approval is
         # unaffected -- it never reaches this branch because its handle matches
         # exactly and collision_via_normalised stays False.
-        if collision_via_normalised and existing_active.get("origin") != "external-selfjoin":
+        if existing_active.get("origin") not in (None, "external-selfjoin"):
             raise HTTPException(
                 status_code=409,
                 detail=(

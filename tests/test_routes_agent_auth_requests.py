@@ -1865,6 +1865,86 @@ class TestConsentApproveHandleCollisionGuard:
         await self._shutdown(stores)
 
     @pytest.mark.asyncio
+    async def test_foreign_origin_slug_shaped_handle_is_refused(
+        self, client, monkeypatch, tmp_path
+    ):
+        """A foreign-origin row whose handle is ALREADY its own slug is found by
+        the EXACT lookup, so collision_via_normalised stays False. The guard
+        must key on the matched row's ORIGIN, not on which lookup hit: a
+        taos-deployed agent seeded as 'worker-01' must refuse an external claim
+        for 'worker-01' (409) instead of letting the reuse arm mint a registry
+        JWT for the foreign canonical_id (impersonation). Asserted on the
+        canonical_id/registry/grants, not just the status -- a 409 for the
+        wrong reason (e.g. the non-project arm) would still pass a status-only
+        check."""
+        stores = await self._seed_stores(client, monkeypatch, tmp_path, with_project=True)
+        registry = stores["registry"]
+        auth_store = stores["auth_store"]
+        grants = stores["grants"]
+        pid = stores["pid"]
+
+        # Seed a taos-deployed identity whose handle is ALREADY slug-shaped:
+        # 'worker-01' slugs to itself, so get_by_handle() finds it exactly and
+        # collision_via_normalised never becomes True.
+        foreign = await registry.register(
+            framework="taos-deployed",
+            display_name="worker-01",
+            user_id="admin",
+            origin="taos-deployed",
+            handle="worker-01",
+            capabilities=["a2a_send", "a2a_receive"],
+        )
+        foreign_cid = foreign["canonical_id"]
+
+        record = await auth_store.create(
+            identity_claim="worker-01",
+            framework="openclaw",
+            requested_scopes=["project_tasks"],
+            requested_skills=None,
+            reason="",
+            duration_secs=None,
+            project_id=pid,
+        )
+
+        resp = await client.post(
+            f"/api/agents/auth-requests/{record['id']}/approve",
+            json={"granted_scopes": ["project_tasks"], "project_id": pid},
+        )
+
+        # The guard must fail CLOSED before the reuse arm can mint a token for
+        # the foreign canonical_id. Assert the identity-level invariant first:
+        # the request must carry no canonical_id / token.
+        approved = await auth_store.get(record["id"])
+        assert approved["canonical_id"] is None
+        assert approved["token"] is None
+        assert approved["status"] != "accepted"
+
+        assert resp.status_code == 409, resp.text
+        assert "different origin" in resp.text, resp.text
+
+        # The foreign identity is untouched: still the single active row whose
+        # slugified handle == worker-01, with its original origin.
+        from tinyagentos.agent_registry_store import _slugify
+
+        active = await registry.list_all(status="active")
+        worker_rows = [
+            a for a in active if _slugify(a.get("handle") or "") == "worker-01"
+        ]
+        assert len(worker_rows) == 1
+        assert worker_rows[0]["canonical_id"] == foreign_cid
+        assert worker_rows[0]["origin"] == "taos-deployed"
+
+        # No grant may have been minted on the foreign canonical_id for this
+        # project/scope -- the reuse arm never ran.
+        agent_grants = await grants.list_grants(foreign_cid)
+        assert not any(
+            g["scope"] == "project_tasks" and g["project_id"] == pid
+            for g in agent_grants
+        ), "foreign identity must not receive the approved grant"
+
+        await self._shutdown(stores)
+
+    @pytest.mark.asyncio
     async def test_same_origin_reapproval_reuses_existing_identity(
         self, client, monkeypatch, tmp_path
     ):
