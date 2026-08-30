@@ -115,6 +115,31 @@ describe("light-scheme arbitrary-value overlay inversion", () => {
     }
   });
 
+  it("maps each arbitrary-value hover token to its inverted colour on :hover", () => {
+    // jsdom cannot apply :hover for getComputedStyle, so assert the exact
+    // declaration value inside the :hover rule — selector AND mapped colour —
+    // rather than only that the token's selector appears somewhere in the css.
+    // A regression that maps hover:bg-white/[0.06] to rgba(0, 0, 0, 0.05)
+    // would pass the selector-presence loop above but fail here.
+    const normalized = TOKENS_CSS.replace(/\s+/g, " ");
+    const hoverRules: Array<[string, string, string]> = [
+      ["hover:bg-white/[0.03]", "background-color", "rgba(0, 0, 0, 0.03)"],
+      ["hover:bg-white/[0.04]", "background-color", "rgba(0, 0, 0, 0.04)"],
+      ["hover:bg-white/[0.05]", "background-color", "rgba(0, 0, 0, 0.05)"],
+      ["hover:bg-white/[0.06]", "background-color", "rgba(0, 0, 0, 0.06)"],
+      ["hover:bg-white/[0.08]", "background-color", "rgba(0, 0, 0, 0.08)"],
+      ["hover:bg-white/[0.1]", "background-color", "rgba(0, 0, 0, 0.1)"],
+      ["hover:border-white/[0.06]", "border-color", "rgba(0, 0, 0, 0.06)"],
+    ];
+    for (const [token, property, value] of hoverRules) {
+      const rule = `[class~="${token}"]:hover { ${property}: ${value}; }`;
+      expect(
+        normalized,
+        `hover rule missing or mis-mapped for ${token}`,
+      ).toContain(rule);
+    }
+  });
+
   it("inverts the computed background across schemes (bg-white/[0.04])", () => {
     setScheme("dark");
     const dark = bgColor("bg-white/[0.04]");
