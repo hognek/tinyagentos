@@ -274,3 +274,91 @@ async def test_agent_aggregate_empty_without_project_tasks_grant(agent_ctx):
 
     assert resp.status_code == 200
     assert resp.json()["items"] == []
+
+
+# ---------------------------------------------------------------------------
+# Regression: status enum validation (Kilo #1)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_aggregate_rejects_invalid_status(client):
+    """A status outside open|claimed|closed is rejected 400 up front, not
+    silently filtered to an empty board (which would hide a caller's typo)."""
+    pid = await _new_project(client, "bad-status")
+    await _new_task(client, pid, "t")
+
+    resp = await client.get("/api/projects/tasks/aggregate?status=garbage")
+    assert resp.status_code == 400
+
+    # The documented enum still passes (validation is exact, not over-broad).
+    for ok in ("open", "claimed", "closed"):
+        r = await client.get(f"/api/projects/tasks/aggregate?status={ok}")
+        assert r.status_code == 200, r.text
+
+
+# ---------------------------------------------------------------------------
+# Regression: archived-project exclusion inside the loop (Kilo #3)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_aggregate_excludes_project_archived_after_listing(members, monkeypatch):
+    """A project archived between the candidate listing and the per-project
+    check must NOT leak into the response (the 'active only' contract)."""
+    alice, _bob = members
+    pstore = alice._transport.app.state.project_store
+    pid_keep = await _new_project(alice, "keep-active")
+    await _new_task(alice, pid_keep, "kept")
+    pid_arch = await _new_project(alice, "archive-me")
+    await _new_task(alice, pid_arch, "archived")
+    await pstore.set_status(pid_arch, "archived")
+    keep = await pstore.get_project(pid_keep)
+    arch = await pstore.get_project(pid_arch)
+    assert arch["status"] == "archived"
+
+    import tinyagentos.routes.projects as prj
+
+    async def _fake_candidates(request, _pstore):
+        # Simulate a listing that ran BEFORE the archive and still returns the
+        # now-archived project alongside the active one.
+        return [keep, arch], None, None
+
+    monkeypatch.setattr(prj, "_caller_project_candidates", _fake_candidates)
+
+    resp = await alice.get("/api/projects/tasks/aggregate")
+    assert resp.status_code == 200
+    ids = _project_ids(resp)
+    assert pid_keep in ids
+    assert pid_arch not in ids
+
+
+# ---------------------------------------------------------------------------
+# Regression: per-project authorization failure is skipped, not raised (Kilo #4)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_aggregate_skips_project_on_auth_failure(client, monkeypatch):
+    """A per-project authorization failure (e.g. agent suspended, token
+    superseded, grant revoked mid-iteration) skips that project instead of
+    aborting the whole aggregate with an unhandled 403/500."""
+    pid_ok = await _new_project(client, "auth-ok")
+    await _new_task(client, pid_ok, "kept")
+    pid_bad = await _new_project(client, "auth-bad")
+    await _new_task(client, pid_bad, "dropped")
+
+    import tinyagentos.routes.projects as prj
+    from fastapi import HTTPException
+
+    real = prj._authorize_task_actor
+
+    async def _flaky(request, pstore, project_id, **kwargs):
+        if project_id == pid_bad:
+            raise HTTPException(status_code=403, detail="agent is not active in the registry")
+        return await real(request, pstore, project_id, **kwargs)
+
+    monkeypatch.setattr(prj, "_authorize_task_actor", _flaky)
+
+    resp = await client.get("/api/projects/tasks/aggregate")
+    assert resp.status_code == 200
+    ids = _project_ids(resp)
+    assert pid_ok in ids
+    assert pid_bad not in ids
