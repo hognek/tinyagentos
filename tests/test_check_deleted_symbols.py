@@ -397,6 +397,27 @@ class TestResolveSymbolSymlinkTypechange:
         finally:
             self._purge_package("tinyagentos")
 
+    def test_symlinked_package_init_keeps_relative_reexport(self, tmp_path: Path):
+        """A symlinked pkg/__init__.py that re-exports via a relative import
+        must keep package semantics. Resolving the symlink target (_impl.py)
+        before spec_from_file_location() strips the __init__.py name and turns
+        `from .child import func_a` into an ImportError, so _resolve_symbol
+        would report a false deletion. Preserving the logical __init__.py path
+        keeps package semantics and the symbol stays importable."""
+        merge = self._write_tree(
+            tmp_path,
+            {
+                "tinyagentos/_impl.py": "from .child import func_a\n",
+                "tinyagentos/child.py": "def func_a():\n    pass\n",
+            },
+        )
+        os.symlink("_impl.py", merge / "tinyagentos/__init__.py")
+        self._purge_package("tinyagentos")
+        try:
+            assert cds._resolve_symbol(merge, "tinyagentos/__init__.py", "func_a") is True
+        finally:
+            self._purge_package("tinyagentos")
+
 
 # ---------------------------------------------------------------------------
 # Integration tests with synthetic git repos (merge-result model)
@@ -791,7 +812,7 @@ class TestTypechangeSymlink:
         repo = tmp_path / "repo"
         base_tip = self._build(repo, "bar.py", bar_has_func=False)
 
-        violations, waived, _ = cds.check_deleted_symbols(base_tip, repo)
+        violations, _, _ = cds.check_deleted_symbols(base_tip, repo)
 
         assert len(violations) == 1
         assert "func_a" in violations[0].symbol
@@ -805,7 +826,7 @@ class TestTypechangeSymlink:
         repo = tmp_path / "repo"
         base_tip = self._build(repo, "does_not_exist.py", bar_has_func=True)
 
-        violations, waived, _ = cds.check_deleted_symbols(base_tip, repo)
+        violations, _, _ = cds.check_deleted_symbols(base_tip, repo)
 
         assert len(violations) == 1
         assert "func_a" in violations[0].symbol

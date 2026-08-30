@@ -195,7 +195,16 @@ def _resolve_symbol(merge_result_dir: Path, file_path: str, name: str) -> bool:
         return False
     if not real_file.is_file():
         return False
-    abs_file = real_file
+    # Preserve the logical path for a package initializer. Passing the
+    # resolved symlink target (e.g. _impl.py) to spec_from_file_location()
+    # loses the __init__.py name and disables package semantics, so a
+    # relative re-export inside the target raises ImportError and
+    # _resolve_symbol reports a false deletion. The logical path is already
+    # validated above (real_file is contained in the merge tree and is a
+    # regular file), so keeping it here is safe. Other files keep the
+    # resolved target so the loader reads the real content.
+    if abs_file.name != "__init__.py":
+        abs_file = real_file
 
     name_parts = name.split(".")
     attr_name = name_parts[-1]
