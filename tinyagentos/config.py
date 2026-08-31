@@ -521,7 +521,7 @@ def validate_config(config: AppConfig) -> list[str]:
         if fb is not None and not isinstance(fb, list):
             errors.append(f"agents[{i}]: fallback_models must be a list")
     wb = config.wake_budget
-    if not isinstance(wb, dict):
+    if wb is None or not isinstance(wb, dict):
         errors.append("wake_budget must be a mapping")
         return errors
     raw_gd = wb.get("global_default", 2)
@@ -540,11 +540,9 @@ def validate_config(config: AppConfig) -> list[str]:
             if isinstance(val, bool):
                 errors.append(f"wake_budget.{section}[{key!r}] must be an integer")
                 continue
-            try:
-                n = int(val)
-            except (TypeError, ValueError):
+            if not isinstance(val, int):
                 errors.append(f"wake_budget.{section}[{key!r}] must be an integer")
                 continue
-            if n < 0:
+            if val < 0:
                 errors.append(f"wake_budget.{section}[{key!r}] must be >= 0")
     return errors

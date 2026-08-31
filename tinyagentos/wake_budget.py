@@ -200,7 +200,6 @@ async def get_fleet_wake_info(data_dir: Path, config: Any, project_task_store: A
         budget = resolve_budget(agent_id, project_id, config)
         try:
             consumption = get_consumption(data_dir, agent_id, project_id)
-            next_wake_epoch = get_next_scheduled_wake(data_dir, agent_id, project_id, config)
         except WakeBudgetStateError as exc:
             logger.warning(
                 "wake budget: skipping fleet row for %s due to damaged state: %s",
@@ -211,7 +210,23 @@ async def get_fleet_wake_info(data_dir: Path, config: Any, project_task_store: A
                 "agent_name": agent.get("name", agent_id),
                 "budget": budget,
                 "consumed": 0,
-                "remaining": budget,
+                "remaining": 0,
+                "next_wake_epoch": None,
+            })
+            continue
+        try:
+            next_wake_epoch = get_next_scheduled_wake(data_dir, agent_id, project_id, config)
+        except WakeBudgetStateError as exc:
+            logger.warning(
+                "wake budget: skipping fleet row for %s due to damaged state: %s",
+                agent_id, exc,
+            )
+            rows.append({
+                "agent_id": agent_id,
+                "agent_name": agent.get("name", agent_id),
+                "budget": budget,
+                "consumed": consumption["scheduled"],
+                "remaining": max(0, budget - consumption["scheduled"]),
                 "next_wake_epoch": None,
             })
             continue

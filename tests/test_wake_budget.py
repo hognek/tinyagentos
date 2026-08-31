@@ -165,7 +165,8 @@ class TestFleetWakeInfo:
         assert len(rows) == 2
         for row in rows:
             assert row["next_wake_epoch"] is None
-            assert row["remaining"] == row["budget"]
+            assert row["remaining"] == 0
+            assert row["consumed"] == 0
 
 
 class TestDamagedState:
