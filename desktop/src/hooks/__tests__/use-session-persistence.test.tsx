@@ -190,7 +190,7 @@ describe("useSessionPersistence — dock settings restore (#1603)", () => {
       () => {
         const putCalls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.filter(
           ([input, init]) =>
-            (typeof input === "string" ? input.toString() : input).includes("/api/desktop/dock") &&
+            (typeof input === "string" ? input : input.toString()).includes("/api/desktop/dock") &&
             (init as RequestInit | undefined)?.method === "PUT",
         );
         expect(setTimeoutSpy).toHaveBeenCalled();
@@ -287,7 +287,7 @@ describe("useSessionPersistence — persistence survives a logout/login cycle (#
     await new Promise((r) => setTimeout(r, 700));
     const putCalls = (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.filter(
       ([input, init]) =>
-        (typeof input === "string" ? input.toString() : input).includes("/api/desktop/settings") &&
+        (typeof input === "string" ? input : input.toString()).includes("/api/desktop/settings") &&
         (init as RequestInit | undefined)?.method === "PUT",
     );
     expect(putCalls).toHaveLength(0);
@@ -303,7 +303,7 @@ describe("useSessionPersistence — Dock and wallpaper auto-save write to separa
   function putCallsTo(path: string) {
     return (globalThis.fetch as ReturnType<typeof vi.fn>).mock.calls.filter(
       ([input, init]) =>
-        (typeof input === "string" ? input.toString() : input).includes(path) &&
+        (typeof input === "string" ? input : input.toString()).includes(path) &&
         (init as RequestInit | undefined)?.method === "PUT",
     );
   }
