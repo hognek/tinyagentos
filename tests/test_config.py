@@ -575,6 +575,30 @@ class TestWakeBudgetConfig:
         errors = validate_config(cfg)
         assert any("per_agent" in e for e in errors)
 
+    def test_validate_rejects_non_mapping_wake_budget(self, tmp_path):
+        p = tmp_path / "config.yaml"
+        cfg = AppConfig(config_path=p, wake_budget=[1])
+        errors = validate_config(cfg)
+        assert any("wake_budget" in e for e in errors)
+
+    def test_validate_rejects_falsy_non_mapping_wake_budget(self, tmp_path):
+        p = tmp_path / "config.yaml"
+        cfg = AppConfig(config_path=p, wake_budget=[])
+        errors = validate_config(cfg)
+        assert any("wake_budget" in e for e in errors)
+
+    def test_validate_rejects_float_global_default(self, tmp_path):
+        p = tmp_path / "config.yaml"
+        cfg = AppConfig(config_path=p, wake_budget={"global_default": 0.9})
+        errors = validate_config(cfg)
+        assert any("wake_budget.global_default" in e for e in errors)
+
+    def test_validate_rejects_bool_global_default(self, tmp_path):
+        p = tmp_path / "config.yaml"
+        cfg = AppConfig(config_path=p, wake_budget={"global_default": True})
+        errors = validate_config(cfg)
+        assert any("wake_budget.global_default" in e for e in errors)
+
     def test_wake_budget_nested_defaults_are_per_instance(self, tmp_path):
         """Per-agent/per-project mappings must be deep-copied per instance so
         mutating one AppConfig (or load_config result) cannot leak into another

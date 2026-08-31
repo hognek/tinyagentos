@@ -520,14 +520,15 @@ def validate_config(config: AppConfig) -> list[str]:
         fb = a.get("fallback_models")
         if fb is not None and not isinstance(fb, list):
             errors.append(f"agents[{i}]: fallback_models must be a list")
-    wb = config.wake_budget or {}
-    try:
-        gd = int(wb.get("global_default", 2))
-    except (TypeError, ValueError):
+    wb = config.wake_budget
+    if not isinstance(wb, dict):
+        errors.append("wake_budget must be a mapping")
+        return errors
+    raw_gd = wb.get("global_default", 2)
+    if isinstance(raw_gd, bool) or not isinstance(raw_gd, int):
         errors.append("wake_budget.global_default must be an integer")
-    else:
-        if gd < 0:
-            errors.append("wake_budget.global_default must be >= 0")
+    elif raw_gd < 0:
+        errors.append("wake_budget.global_default must be >= 0")
     for section in ("per_agent", "per_project"):
         bucket = wb.get(section)
         if bucket is None:
@@ -536,6 +537,9 @@ def validate_config(config: AppConfig) -> list[str]:
             errors.append(f"wake_budget.{section} must be a mapping")
             continue
         for key, val in bucket.items():
+            if isinstance(val, bool):
+                errors.append(f"wake_budget.{section}[{key!r}] must be an integer")
+                continue
             try:
                 n = int(val)
             except (TypeError, ValueError):

@@ -149,6 +149,24 @@ class TestFleetWakeInfo:
         assert rows[0]["consumed"] == 0
         assert rows[0]["remaining"] == 2
 
+    async def test_damaged_state_degrades_row_not_fleet(self, tmp_path):
+        """A damaged wake_budget.json must degrade affected rows, not raise
+        WakeBudgetStateError and take out the whole fleet report."""
+        state_path = tmp_path / "wake_budget.json"
+        state_path.write_bytes(b"\x00\x01\x02\x00")
+        cfg = _FakeConfig(
+            wake_budget={"global_default": 2, "per_agent": {}, "per_project": {}},
+            agents=[
+                {"id": "a1", "name": "agent-1", "status": "running"},
+                {"id": "a2", "name": "agent-2", "status": "running"},
+            ],
+        )
+        rows = await get_fleet_wake_info(tmp_path, cfg)
+        assert len(rows) == 2
+        for row in rows:
+            assert row["next_wake_epoch"] is None
+            assert row["remaining"] == row["budget"]
+
 
 class TestDamagedState:
     def test_absent_file_is_fresh_state(self, tmp_path):
