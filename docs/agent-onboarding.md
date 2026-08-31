@@ -45,14 +45,14 @@ If the limit hits before you can do this, the incoming agent recovers from: last
 
 ## Freshness cron held under fleet HOLD (2026-08-31)
 
-The hourly sweep is under fleet HOLD (Jay, 2026-08-24, reaffirmed 2026-08-30). Crons stay stopped; no re‑arm. The durable layer is swept manually when needed. The Pi's :00/:30 cron remains the durable backstop only as a reference point.
+The hourly sweep is under fleet HOLD (Jay, 2026-08-24, reaffirmed 2026-08-30). Crons stay stopped; no re‑arm. The durable layer is swept manually when needed.
 
 ---
 
 ## Task hygiene: so nothing is lost
 
 - **Every feature idea, bug, or TODO becomes a card on the project board `prj-5y722y` first.** GitHub issues are auxiliary and referenced from the board. Ideas in chat or memory evaporate across a handoff; the board persists. Label board cards (`feature`, `bug`, `security`, `docs`, `infra`).
-- **One issue = one pickup-able unit** with enough context that a cold agent can start it.
+- **One card = one pickup-able unit** with enough context that a cold agent can start it.
 - The board links to issues; it does not duplicate them.
 
 ---
@@ -71,7 +71,7 @@ The taosmd-hosted bus ingests messages into the project memory store, so posting
 
 | Store | Scope | Visible to | Use for |
 |-------|-------|-----------|---------|
-| GitHub project board `prj-5y722y` | canonical task list | every platform | backlog, features, bugs, audit findings |
+| taOS project board `prj-5y722y` | canonical task list | every platform | backlog, features, bugs, audit findings |
 | `docs/agent-onboarding.md` | the rules + protocol | every platform (in repo) | onboarding, identity, hop protocol |
 | A2A `taos-progress` | running progress log | bus agents + project memory | status, lessons, decisions (feeds memory) |
 | A2A bus | live coordination | the bus agents | real-time @mentions, decisions |
@@ -102,7 +102,7 @@ The taosmd-hosted bus ingests messages into the project memory store, so posting
 
 ## Test requirements
 
-Every PR must include tests for new behaviour. Run them with `uv run --extra dev pytest <paths> -q`.
+Every PR must include tests for new behaviour. Run them with `uv run pytest <paths> -q` (the `dev` dependency group is installed by default; there is no `dev` extra).
 
 - Mock at the narrowest scope: patch the specific function under test.
 - Never patch the whole imported library.
@@ -113,7 +113,7 @@ Every PR must include tests for new behaviour. Run them with `uv run --extra dev
 
 ## Changelog fragments
 
-A non-test change under `tinyagentos/` or `desktop/src/` requires a `changelog.d/<pr>-<slug>.md` or `changelog.d/tsk-<cardid>-<slug>.md` fragment containing a `### Added` or `### Fixed` heading and one bullet describing the change. Do not edit `CHANGELOG.md` directly.
+A non-test change under `tinyagentos/` or `desktop/src/` requires a `changelog.d/<pr>-<slug>.md` or `changelog.d/tsk-<cardid>-<slug>.md` fragment containing one of the `### Added` / `### Changed` / `### Fixed` / `### Removed` / `### Security` headings and one bullet describing the change. Do not edit `CHANGELOG.md` directly.
 
 ---
 
