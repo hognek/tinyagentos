@@ -98,9 +98,10 @@ _AGENT_TASK_ROUTES = (
     ("GET", re.compile(rf"^/api/projects/tasks/{_SEG}/context$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/comments$")),
     ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/comments$")),
-    # Task checklist items (list + create), gated by project_tasks_create in the
-    # handler (_authorize_task_actor). Reaching the handler is not
-    # authorisation: it then verifies the JWT, the project binding, and that
+    # Task checklist items (list + create), gated in the handler
+    # (_authorize_task_actor): POST (create) requires project_tasks_create,
+    # GET (list) takes the default project_tasks grant. Reaching the handler is
+    # not authorisation: it then verifies the JWT, the project binding, and the
     # scope. There is no archive route, so nothing beyond list + create is
     # listed here.
     ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/checklist-items$")),

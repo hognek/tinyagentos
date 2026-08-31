@@ -1079,6 +1079,9 @@ Route module `tinyagentos/routes/projects.py`.
   with the actor, task id, item id and text.
 - Archiving is store-level only and refuses unless the item is both **verified**
   and **reported**; there is no archive route.
+- `DELETE` and per-item subpaths (`.../checklist-items/{item_id}`) stay
+  session-only: no agent-reachable handler exists, and the allowlist must not
+  widen past list + create.
 
 The handlers call `_authorize_task_actor(...)` and accept EITHER a session
 owner/admin OR a project-bound agent's registry JWT. The Bearer allowlist in
