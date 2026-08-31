@@ -115,7 +115,8 @@ far exceed 512 MB once the OS and a framebuffer driver are resident.
   question 6").
 - **Do not design a hard dependency on the relay.** The Whisplay client must
   mirror the existing external-agent transport contract: probe `endpoints` in
-  order, fall back to the timed check when no SSE stream can be held, and treat
+  order — but use the TIMED-CHECK posture only, never SSE (see §4: this client
+  polls; it reuses the endpoint-priority and cursor semantics, not the stream) — and treat
   the relay as one more candidate endpoint (priority 4, only present when
   account-linked + mesh joined). The Pi being battery-powered actually *prefers*
   direct LAN/mesh over a relay hop — the relay is for genuinely off-net
@@ -173,11 +174,16 @@ use. Two concrete options, both contingent on his bring-up:
    (`routes/taos_agent.py:456-478` already turns attachment URLs into base64
    image blocks in the last user turn). This is the minimal "show the agent what
    the camera sees" path and reuses the existing multimodal attachment seam
-   end-to-end. PENDING Jay bring-up: whether the camera is a still sensor or a
+   end-to-end. **Auth gap: both routes are session-only today** (§1 gap 2) — a
+   `taosdev_` bearer cannot call them; unavailable until a device-authenticated
+   route (or controller-side bridge) exists, which is NOT in the first
+   increment. PENDING Jay bring-up: whether the camera is a still sensor or a
    stream, and its resolution/MJPEG pipeline on the Zero 2W.
 2. **Image capture as a Decision trigger** — a motion or button event raises a
-   `free_text` (or `approve_deny`) Decision to the owner (via the same
-   `POST /api/decisions` the device already answers), attaching the captured
+   `free_text` (or `approve_deny`) Decision to the owner. **Auth gap: decision
+   CREATION (`POST /api/decisions`) is session-only** — the device-bearer
+   allowlist covers list/get/history/ANSWER only, so this too needs a
+   device-authenticated route or bridge before it works; attach the captured
    frame as notification `data`. This turns the Pi into an event push device
    rather than a vision-input device.
 
@@ -231,7 +237,10 @@ confirms the battery/poll reality.
 ## Acceptance
 
 - Findings doc committed under `docs/design/` (this file).
-- Each claim cites a source path in the repo (no README-only assertions).
+- Each claim about the taOS codebase cites a source path in the repo (no
+  README-only assertions). Hardware figures (Pi Zero 2W CPU/RAM, battery, radio
+  cost) are vendor-spec-derived, not repo-cited, and battery behaviour is
+  PENDING Jay bring-up.
 - Hardware-dependent claims (Whisplay ai-chatbot model + RAM headroom, camera
   sensor type) are marked PENDING Jay bring-up.
 - No taOS code changes in this card (findings + first-increment recommendation
