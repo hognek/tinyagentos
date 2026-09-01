@@ -365,6 +365,14 @@ The registry-JWT surface, by scope:
   `POST .../tasks/{id}/unquarantine` is also reachable, but LEAD-only: the
   route (`_authorize_project_lead`) refuses a plain project_tasks worker.
   It returns a quarantined card to the open pool and clears its strikes.
+  The cross-project aggregate `GET /api/projects/tasks/aggregate` (Kanban
+  Viewer S1) is also `project_tasks`: it returns EVERY project the caller may
+  see -- its own boards for a session owner/admin, or only the projects it
+  holds an active `project_tasks` grant for as an agent -- each with that
+  project's tasks. The grant (not the token's advisory `project_id` claim) is
+  the sole per-project gate, so an agent granted board A can never receive
+  board B in the aggregate. Optional `?status=open|claimed|closed` filters
+  tasks and is validated up front (400 on anything else).
 - **project_tasks_create**: `POST /api/projects/{pid}/tasks` (author new cards).
   This is a SEPARATE scope from project_tasks and is off by default; grant it
   explicitly when an agent needs to create cards.

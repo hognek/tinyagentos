@@ -88,6 +88,11 @@ _AGENT_TOKEN_PATHS = (
 _SEG = r"[^/]+"
 _AGENT_TASK_ROUTES = (
     ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks$")),
+    # Cross-project kanban aggregate (READ ONLY): a static path (no project
+    # segment) that returns every board the token holds a project_tasks grant
+    # for. Reaching the handler is not authorization -- it verifies the JWT +
+    # per-project grant via _authorize_task_actor for every candidate project.
+    ("GET", re.compile(r"^/api/projects/tasks/aggregate$")),
     # Task CREATION, gated by the SEPARATE project_tasks_create scope (not
     # project_tasks, which stays read + lifecycle + comments per Invariant 2+5).
     # Reaching the handler is not authorisation: it then verifies the JWT, the
