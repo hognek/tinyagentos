@@ -125,10 +125,27 @@
 :root[data-scheme="light"] [class~="bg-white/[0.08]"] { background-color: rgba(0, 0, 0, 0.08); }
 :root[data-scheme="light"] [class~="bg-white/[0.1]"]  { background-color: rgba(0, 0, 0, 0.1); }
 
+/* Variant-prefixed arbitrary overlay: TabsTrigger's active state uses
+   `data-[state=active]:bg-white/[0.08]`, a distinct class token that the bare
+   `[class~="bg-white/[0.08]"]` rule above does NOT match (the prefix is part
+   of the token). Without this the active tab keeps its white tint and vanishes
+   on the light background. Guard with [data-state] so only the *active* trigger
+   inverts — every trigger carries the class token, but only the active one sets
+   data-state="active". */
+:root[data-scheme="light"] [data-state="active"][class~="data-[state=active]:bg-white/[0.08]"] { background-color: rgba(0, 0, 0, 0.08); }
+
 :root[data-scheme="light"] [class~="border-white/[0.04]"] { border-color: rgba(0, 0, 0, 0.04); }
 :root[data-scheme="light"] [class~="border-white/[0.06]"] { border-color: rgba(0, 0, 0, 0.06); }
 :root[data-scheme="light"] [class~="border-white/[0.08]"] { border-color: rgba(0, 0, 0, 0.08); }
 :root[data-scheme="light"] [class~="border-white/[0.18]"] { border-color: rgba(0, 0, 0, 0.18); }
+
+/* Divide overlay: `divide-white/[0.04]` colours the row separators, which
+   Tailwind targets with `> :not([hidden]) ~ :not([hidden])` on the *children*
+   of the element carrying the class — not the element itself. The inversion
+   must re-target those same children, or the file/archive row dividers render
+   white-on-light and vanish. No plain-fraction `divide-white/N` rule exists, so
+   there is no arbitrary counterpart yet either; add it here. */
+:root[data-scheme="light"] [class~="divide-white/[0.04]"] > :not([hidden]) ~ :not([hidden]) { border-color: rgba(0, 0, 0, 0.04); }
 
 /* Slate accent fills — light-scheme values (mirror the approved Messages
    mockup): a touch cooler/darker so tinted surfaces and the unread badge

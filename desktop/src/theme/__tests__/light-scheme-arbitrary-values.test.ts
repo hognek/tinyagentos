@@ -12,8 +12,15 @@
 //   2. It reads tokens.css via node:fs and asserts the load actually happened —
 //      `import tokensCss from "../tokens.css"` returns an empty string under
 //      this repo's vitest config.
+//
+// A third trap is avoided by the coverage test: it DERIVES the covered overlay
+// set out of tokens.css and diffs it against what desktop/src actually uses,
+// rather than asserting against a hardcoded allowlist. An allowlist cannot fail
+// on a form it does not already enumerate, so the next new arbitrary-value
+// utility would slip past it blind; deriving the set from the source of truth
+// and scanning the real source keeps the guard honest.
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 
 const TOKENS_CSS = readFileSync(
@@ -25,13 +32,37 @@ const TOKENS_CSS = readFileSync(
 // value `bg-white/[0.04]` compiles to a white-overlay rule; here we reproduce
 // that base rule (specificity (0,1,0)) so the tokens.css inversion
 // (:root[data-scheme="light"] …, specificity (0,3,0)) demonstrably overrides it
-// in light scheme and leaves it alone in dark scheme.
+// in light scheme and leaves it alone in dark scheme. The variant-prefixed and
+// divide forms get the same treatment so their inversion is asserted on
+// computed colour, not just on selector presence.
 const TAILWIND_BASE = `
 [class~="bg-white/[0.04]"] { background-color: rgba(255, 255, 255, 0.04); }
 [class~="bg-white/[0.02]"] { background-color: rgba(255, 255, 255, 0.02); }
 [class~="border-white/[0.06]"] { border-color: rgba(255, 255, 255, 0.06); }
 [class~="border-white/[0.18]"] { border-color: rgba(255, 255, 255, 0.18); }
+[class~="data-[state=active]:bg-white/[0.08]"][data-state="active"] { background-color: rgba(255, 255, 255, 0.08); }
+[class~="divide-white/[0.04]"] > :not([hidden]) ~ :not([hidden]) { border-color: rgba(255, 255, 255, 0.04); }
 `;
+
+// Walk desktop/src collecting every source module that can carry a class token,
+// skipping test files (their assertions are not rendered overlays) and the
+// node_modules/__tests__ subtrees.
+function collectSourceFiles(dir: string): string[] {
+  const out: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const p = resolve(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (entry.name === "node_modules" || entry.name === "__tests__") continue;
+      out.push(...collectSourceFiles(p));
+    } else if (
+      /\.(tsx|ts|jsx|js)$/.test(entry.name) &&
+      !/\.test\.(tsx|ts|jsx|js)$/.test(entry.name)
+    ) {
+      out.push(p);
+    }
+  }
+  return out;
+}
 
 function injectCss(css: string): void {
   const style = document.createElement("style");
@@ -44,9 +75,10 @@ function setScheme(scheme: "light" | "dark" | null): void {
   else document.documentElement.setAttribute("data-scheme", scheme);
 }
 
-function bgColor(className: string): string {
+function bgColor(className: string, attrs: Record<string, string> = {}): string {
   const el = document.createElement("div");
   el.className = className;
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
   document.body.appendChild(el);
   const color = window.getComputedStyle(el).backgroundColor;
   el.remove();
@@ -61,6 +93,22 @@ function borderColor(className: string): string {
   document.body.appendChild(el);
   const color = window.getComputedStyle(el).borderTopColor;
   el.remove();
+  return color;
+}
+
+// A divide utility colours the CHILD row separators, so measure the second
+// child's border-top colour, which is what `> :not([hidden]) ~ :not([hidden])`
+// targets in the emitted CSS.
+function divideColor(className: string): string {
+  const container = document.createElement("div");
+  container.className = className;
+  const first = document.createElement("div");
+  const second = document.createElement("div");
+  container.appendChild(first);
+  container.appendChild(second);
+  document.body.appendChild(container);
+  const color = window.getComputedStyle(second).borderTopColor;
+  container.remove();
   return color;
 }
 
@@ -84,35 +132,48 @@ describe("light-scheme arbitrary-value overlay inversion", () => {
     expect(TOKENS_CSS.length).toBeGreaterThan(1000);
   });
 
-  it("declares inversion rules for the arbitrary-value form", () => {
-    // Every distinct arbitrary-value overlay in the codebase must have a rule.
-    const required = [
-      "bg-white/[0.01]",
-      "bg-white/[0.02]",
-      "bg-white/[0.03]",
-      "bg-white/[0.04]",
-      "bg-white/[0.05]",
-      "bg-white/[0.06]",
-      "bg-white/[0.07]",
-      "bg-white/[0.08]",
-      "bg-white/[0.1]",
-      "border-white/[0.04]",
-      "border-white/[0.06]",
-      "border-white/[0.08]",
-      "border-white/[0.18]",
-      "hover:bg-white/[0.03]",
-      "hover:bg-white/[0.04]",
-      "hover:bg-white/[0.05]",
-      "hover:bg-white/[0.06]",
-      "hover:bg-white/[0.08]",
-      "hover:bg-white/[0.1]",
-      "hover:border-white/[0.06]",
-    ];
-    for (const token of required) {
-      expect(TOKENS_CSS, `missing inversion rule for ${token}`).toContain(
-        `[class~="${token}"]`,
-      );
+  // Trap #3: derive the covered overlay set straight out of tokens.css instead
+  // of restating it. `[class~="x"]` is the exact selector form the inversion
+  // layer uses, so every covered token — plain-fraction AND arbitrary-value —
+  // shows up here without a hand-maintained copy that can drift.
+  const COVERED_OVERLAYS = new Set(
+    Array.from(TOKENS_CSS.matchAll(/\[class~="([^"]+)"\]/g), (m) => m[1]),
+  );
+
+  it("reads a non-empty covered set out of tokens.css", () => {
+    // Guard the guard: an empty covered set would flag every overlay (noisy)
+    // and, worse, silently change what this test means.
+    expect(COVERED_OVERLAYS.size).toBeGreaterThan(10);
+    expect(COVERED_OVERLAYS.has("bg-white/[0.04]")).toBe(true);
+  });
+
+  it("declares inversion rules for every arbitrary-value white overlay used in desktop/src", () => {
+    // Scope to white overlays only: black overlays (e.g. bg-black/[0.18])
+    // already read on the light background and are deliberately not inverted.
+    const ARB_WHITE_RE =
+      /(?:^|:)(bg|text|border|ring|outline|shadow|divide|from|via|to)-white\/\[[^\]]*\]/;
+
+    const srcFiles = collectSourceFiles(resolve(process.cwd(), "src"));
+    expect(srcFiles.length).toBeGreaterThan(100);
+
+    const offenders = new Set<string>();
+    for (const file of srcFiles) {
+      const src = readFileSync(file, "utf8");
+      // Strip comments first: prose about `bg-white/[0.04]` is not a rendered
+      // overlay, and the file documents the very classes it avoids.
+      const code = src
+        .replace(/\/\*[\s\S]*?\*\//g, " ")
+        .replace(/(^|[^:])\/\/[^\n]*/g, "$1 ");
+      // Every whitespace/quote-delimited class token in the file, so an overlay
+      // added anywhere in the markup — including under a variant prefix like
+      // `data-[state=active]:` — is seen.
+      for (const tok of code.split(/[\s"'`{}()]+/)) {
+        if (ARB_WHITE_RE.test(tok) && !COVERED_OVERLAYS.has(tok)) {
+          offenders.add(tok);
+        }
+      }
     }
+    expect(Array.from(offenders)).toEqual([]);
   });
 
   it("maps each arbitrary-value hover token to its inverted colour on :hover", () => {
@@ -190,5 +251,35 @@ describe("light-scheme arbitrary-value overlay inversion", () => {
     for (const [className, expected] of cases) {
       expect(borderColor(className), className).toBe(expected);
     }
+  });
+
+  it("inverts the active-tab trigger only when data-state=active, and only in light scheme", () => {
+    // The class token `data-[state=active]:bg-white/[0.08]` is carried by every
+    // trigger; only the active one sets data-state="active". Dark must keep the
+    // white tint, light must flip it, and an inactive trigger must stay clear.
+    setScheme("dark");
+    const darkActive = bgColor("data-[state=active]:bg-white/[0.08]", {
+      "data-state": "active",
+    });
+    setScheme("light");
+    const lightActive = bgColor("data-[state=active]:bg-white/[0.08]", {
+      "data-state": "active",
+    });
+    const lightInactive = bgColor("data-[state=active]:bg-white/[0.08]", {
+      "data-state": "inactive",
+    });
+    expect(darkActive).toBe("rgba(255, 255, 255, 0.08)");
+    expect(lightActive).toBe("rgba(0, 0, 0, 0.08)");
+    expect(lightInactive).toBe("rgba(0, 0, 0, 0)");
+  });
+
+  it("inverts the divide row separators across schemes (divide-white/[0.04])", () => {
+    setScheme("dark");
+    const dark = divideColor("divide-white/[0.04]");
+    setScheme("light");
+    const light = divideColor("divide-white/[0.04]");
+    expect(dark).toBe("rgba(255, 255, 255, 0.04)");
+    expect(light).toBe("rgba(0, 0, 0, 0.04)");
+    expect(light).not.toBe(dark);
   });
 });
