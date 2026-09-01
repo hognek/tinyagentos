@@ -303,24 +303,34 @@ async def test_aggregate_rejects_invalid_status(client):
 @pytest.mark.asyncio
 async def test_aggregate_excludes_project_archived_after_listing(members, monkeypatch):
     """A project archived between the candidate listing and the per-project
-    check must NOT leak into the response (the 'active only' contract)."""
+    check must NOT leak into the response (the 'active only' contract).
+
+    This exercises the TOCTOU race itself: the candidate snapshot is captured
+    BEFORE the archive (so it still reports ``active``), the project is then
+    archived, and ``_caller_project_candidates`` hands back the stale snapshot.
+    The handler must re-read the FRESH project (via ``_authorize_task_actor``)
+    and exclude it, rather than trusting the stale ``active`` snapshot.
+    """
     alice, _bob = members
     pstore = alice._transport.app.state.project_store
     pid_keep = await _new_project(alice, "keep-active")
     await _new_task(alice, pid_keep, "kept")
     pid_arch = await _new_project(alice, "archive-me")
     await _new_task(alice, pid_arch, "archived")
+
+    # Capture the snapshot BEFORE archiving so it still reports "active".
+    arch_snapshot = await pstore.get_project(pid_arch)
+    assert arch_snapshot["status"] == "active"
+    # ...THEN the race: the project is archived after the listing ran.
     await pstore.set_status(pid_arch, "archived")
     keep = await pstore.get_project(pid_keep)
-    arch = await pstore.get_project(pid_arch)
-    assert arch["status"] == "archived"
 
     import tinyagentos.routes.projects as prj
 
     async def _fake_candidates(request, _pstore):
         # Simulate a listing that ran BEFORE the archive and still returns the
-        # now-archived project alongside the active one.
-        return [keep, arch], None, None
+        # now-stale "active" snapshot alongside the active project.
+        return [keep, arch_snapshot], None, None
 
     monkeypatch.setattr(prj, "_caller_project_candidates", _fake_candidates)
 

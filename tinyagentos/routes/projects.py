@@ -612,7 +612,8 @@ async def _authorize_task_actor(
         # entry means "no active grant bound to this project" -> same
         # existence-hiding 404 as the slow path, so it never confirms a
         # project the agent is not entitled to.
-        assert agent_canonical_id is not None, "canonical_id required with agent_grants"
+        if agent_canonical_id is None:
+            raise ValueError("canonical_id required with agent_grants")
         if project_id not in agent_grants:
             return JSONResponse({"error": "not found"}, status_code=404)
         project = await pstore.get_project(project_id)
@@ -893,7 +894,11 @@ async def list_tasks_aggregate(
         # Re-check status inside the loop (TOCTOU defence): a project archived
         # between the candidate listing and this per-project check must NOT leak
         # into the response -- the aggregate contract is "active projects only".
-        if project.get("status") != "active":
+        # Read the FRESH object returned by _authorize_task_actor (auth[2]) rather
+        # than the stale `project` loop variable from the candidates snapshot,
+        # which may still report "active" after the project was archived.
+        fresh_project = auth[2]
+        if (fresh_project or {}).get("status") != "active":
             continue
         tasks = await store.list_tasks(project_id=project["id"], status=status)
         items.append(
