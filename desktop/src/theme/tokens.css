@@ -108,6 +108,45 @@
 :root[data-scheme="light"] [class~="text-white/20"] { color: rgba(0, 0, 0, 0.40); }
 :root[data-scheme="light"] [class~="text-white/15"] { color: rgba(0, 0, 0, 0.38); }
 
+/* Arbitrary-value overlays (bg-white/[0.04], border-white/[0.06], …).
+   The plain-fraction rules above cover `bg-white/5` & friends, but Tailwind's
+   arbitrary-value form produces a distinct class token that matches none of
+   those selectors — and the shared primitives (card, button, tabs) plus ~126
+   app surfaces use exactly this form. Invert 1:1: an additive white overlay at
+   alpha a becomes a subtractive black overlay at the same alpha, so it reads on
+   the light graphite background instead of vanishing. */
+:root[data-scheme="light"] [class~="bg-white/[0.01]"] { background-color: rgba(0, 0, 0, 0.01); }
+:root[data-scheme="light"] [class~="bg-white/[0.02]"] { background-color: rgba(0, 0, 0, 0.02); }
+:root[data-scheme="light"] [class~="bg-white/[0.03]"] { background-color: rgba(0, 0, 0, 0.03); }
+:root[data-scheme="light"] [class~="bg-white/[0.04]"] { background-color: rgba(0, 0, 0, 0.04); }
+:root[data-scheme="light"] [class~="bg-white/[0.05]"] { background-color: rgba(0, 0, 0, 0.05); }
+:root[data-scheme="light"] [class~="bg-white/[0.06]"] { background-color: rgba(0, 0, 0, 0.06); }
+:root[data-scheme="light"] [class~="bg-white/[0.07]"] { background-color: rgba(0, 0, 0, 0.07); }
+:root[data-scheme="light"] [class~="bg-white/[0.08]"] { background-color: rgba(0, 0, 0, 0.08); }
+:root[data-scheme="light"] [class~="bg-white/[0.1]"]  { background-color: rgba(0, 0, 0, 0.1); }
+
+/* Variant-prefixed arbitrary overlay: TabsTrigger's active state uses
+   `data-[state=active]:bg-white/[0.08]`, a distinct class token that the bare
+   `[class~="bg-white/[0.08]"]` rule above does NOT match (the prefix is part
+   of the token). Without this the active tab keeps its white tint and vanishes
+   on the light background. Guard with [data-state] so only the *active* trigger
+   inverts — every trigger carries the class token, but only the active one sets
+   data-state="active". */
+:root[data-scheme="light"] [data-state="active"][class~="data-[state=active]:bg-white/[0.08]"] { background-color: rgba(0, 0, 0, 0.08); }
+
+:root[data-scheme="light"] [class~="border-white/[0.04]"] { border-color: rgba(0, 0, 0, 0.04); }
+:root[data-scheme="light"] [class~="border-white/[0.06]"] { border-color: rgba(0, 0, 0, 0.06); }
+:root[data-scheme="light"] [class~="border-white/[0.08]"] { border-color: rgba(0, 0, 0, 0.08); }
+:root[data-scheme="light"] [class~="border-white/[0.18]"] { border-color: rgba(0, 0, 0, 0.18); }
+
+/* Divide overlay: `divide-white/[0.04]` colours the row separators, which
+   Tailwind targets with `> :not([hidden]) ~ :not([hidden])` on the *children*
+   of the element carrying the class — not the element itself. The inversion
+   must re-target those same children, or the file/archive row dividers render
+   white-on-light and vanish. No plain-fraction `divide-white/N` rule exists, so
+   there is no arbitrary counterpart yet either; add it here. */
+:root[data-scheme="light"] [class~="divide-white/[0.04]"] > :not([hidden]) ~ :not([hidden]) { border-color: rgba(0, 0, 0, 0.04); }
+
 /* Slate accent fills — light-scheme values (mirror the approved Messages
    mockup): a touch cooler/darker so tinted surfaces and the unread badge
    read correctly on the light graphite background. */
@@ -124,7 +163,15 @@
    does not flatten under the base-state override. */
 :root[data-scheme="light"] [class~="hover:bg-white/5"]:hover  { background-color: rgba(0, 0, 0, 0.05); }
 :root[data-scheme="light"] [class~="hover:bg-white/10"]:hover { background-color: rgba(0, 0, 0, 0.07); }
-:root[data-scheme="light"] [class~="hover:bg-white/[0.06]"]:hover { background-color: rgba(0, 0, 0, 0.05); }
+/* Arbitrary-value hover overlays — same 1:1 inversion as the base rules above,
+   so the hover affordance survives the light-scheme flip. */
+:root[data-scheme="light"] [class~="hover:bg-white/[0.03]"]:hover { background-color: rgba(0, 0, 0, 0.03); }
+:root[data-scheme="light"] [class~="hover:bg-white/[0.04]"]:hover { background-color: rgba(0, 0, 0, 0.04); }
+:root[data-scheme="light"] [class~="hover:bg-white/[0.05]"]:hover { background-color: rgba(0, 0, 0, 0.05); }
+:root[data-scheme="light"] [class~="hover:bg-white/[0.06]"]:hover { background-color: rgba(0, 0, 0, 0.06); }
+:root[data-scheme="light"] [class~="hover:bg-white/[0.08]"]:hover { background-color: rgba(0, 0, 0, 0.08); }
+:root[data-scheme="light"] [class~="hover:bg-white/[0.1]"]:hover  { background-color: rgba(0, 0, 0, 0.1); }
+:root[data-scheme="light"] [class~="hover:border-white/[0.06]"]:hover { border-color: rgba(0, 0, 0, 0.06); }
 
 /* Safari backdrop-filter repaint guard
    ====================================
