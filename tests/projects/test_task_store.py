@@ -499,22 +499,39 @@ async def test_checklist_item_created_by_upgrade_from_pre_schema(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_checklist_item_created_by_migration_failure(tmp_path):
-    """Acceptance 3: Migration-failure path: a non-duplicate ALTER failure surfaces (raises), it is NOT read as already-migrated."""
+async def test_checklist_item_created_by_migration_failure(tmp_path, monkeypatch):
+    """Acceptance 3: a non-duplicate ALTER failure surfaces (raises); it is NOT
+    read as already-migrated. Fault-injects the ALTER statement itself so the
+    failure hits exactly the migration hunk -- a coarser fault (locking the
+    whole db) fails init before the migration runs and stays green even
+    against a blind except-pass."""
     import sqlite3
 
-    db_path = tmp_path / "locked.db"
+    import aiosqlite
+
+    db_path = tmp_path / "old_schema.db"
     await _create_old_schema_db(db_path)
 
-    conn = sqlite3.connect(str(db_path))
-    conn.execute("BEGIN EXCLUSIVE")
+    orig_execute = aiosqlite.Connection.execute
+
+    def _failing_execute(conn_self, sql, *args, **kwargs):
+        if isinstance(sql, str) and sql.lstrip().startswith(
+            "ALTER TABLE task_checklist_items ADD COLUMN created_by"
+        ):
+            raise sqlite3.OperationalError("disk I/O error")
+        return orig_execute(conn_self, sql, *args, **kwargs)
+
+    monkeypatch.setattr(aiosqlite.Connection, "execute", _failing_execute)
+    s = ProjectTaskStore(db_path)
     try:
-        s = ProjectTaskStore(db_path)
-        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
             await s.init()
     finally:
-        conn.rollback()
-        conn.close()
+        monkeypatch.undo()
+        try:
+            await s.close()
+        except Exception:
+            pass
 
 
 async def _create_old_schema_db(db_path):
