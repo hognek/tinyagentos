@@ -324,10 +324,32 @@ class TestResolveSymbolSymlinkTypechange:
         return root
 
     @staticmethod
-    def _purge_package(name: str) -> None:
+    def _purge_package(name: str) -> dict[str, tuple[bool, types.ModuleType | None]]:
+        """Remove every `name.*` module for the duration of a test, returning a
+        snapshot so the caller can restore them in a finally.
+
+        Snapshot each touched key's (was_present, old_obj) BEFORE deleting,
+        mirroring the `touched`/`preexisting_keys` discipline in _resolve_symbol.
+        Without the restore, the real tinyagentos.* modules stay evicted for the
+        rest of the pytest process: a later mock.patch("tinyagentos....") target
+        re-imports a DIFFERENT module object than the collection-time one and
+        silently no-ops -- the exact isolation defect that turned 56 unrelated
+        tests red.
+        """
+        touched: dict[str, tuple[bool, types.ModuleType | None]] = {}
         for key in list(sys.modules):
             if key == name or key.startswith(name + "."):
+                touched[key] = (key in sys.modules, sys.modules.get(key))
                 del sys.modules[key]
+        return touched
+
+    @staticmethod
+    def _restore_package(touched: dict[str, tuple[bool, types.ModuleType | None]]) -> None:
+        for key, (was_present, old_obj) in touched.items():
+            if was_present:
+                sys.modules[key] = old_obj
+            else:
+                sys.modules.pop(key, None)
 
     def test_in_tree_symlink_resolves_to_target(self, tmp_path: Path):
         """foo.py is a symlink to bar.py inside the merge tree: the symbol is
@@ -340,11 +362,11 @@ class TestResolveSymbolSymlinkTypechange:
             },
         )
         os.symlink("bar.py", merge / "tinyagentos/foo.py")
-        self._purge_package("tinyagentos")
+        touched = self._purge_package("tinyagentos")
         try:
             assert cds._resolve_symbol(merge, "tinyagentos/foo.py", "func_a") is True
         finally:
-            self._purge_package("tinyagentos")
+            self._restore_package(touched)
 
     def test_symlink_losing_symbol_is_deletion(self, tmp_path: Path):
         """foo.py symlinks to bar.py which no longer defines func_a: the symbol
@@ -357,11 +379,11 @@ class TestResolveSymbolSymlinkTypechange:
             },
         )
         os.symlink("bar.py", merge / "tinyagentos/foo.py")
-        self._purge_package("tinyagentos")
+        touched = self._purge_package("tinyagentos")
         try:
             assert cds._resolve_symbol(merge, "tinyagentos/foo.py", "func_a") is False
         finally:
-            self._purge_package("tinyagentos")
+            self._restore_package(touched)
 
     def test_symlink_escaping_tree_is_not_followed(self, tmp_path: Path):
         """A symlink whose target leaves the merge tree (absolute or ..) must
@@ -370,32 +392,32 @@ class TestResolveSymbolSymlinkTypechange:
         outside = tmp_path / "outside.py"
         outside.write_text("def func_a():\n    pass\n", encoding="utf-8")
         os.symlink(str(outside), merge / "tinyagentos/foo.py")  # absolute escape
-        self._purge_package("tinyagentos")
+        touched = self._purge_package("tinyagentos")
         try:
             assert cds._resolve_symbol(merge, "tinyagentos/foo.py", "func_a") is False
         finally:
-            self._purge_package("tinyagentos")
+            self._restore_package(touched)
 
     def test_dangling_symlink_is_not_importable(self, tmp_path: Path):
         """A dangling symlink resolves to no file: the symbol is gone."""
         merge = self._write_tree(tmp_path, {"tinyagentos/__init__.py": ""})
         os.symlink("does_not_exist.py", merge / "tinyagentos/foo.py")
-        self._purge_package("tinyagentos")
+        touched = self._purge_package("tinyagentos")
         try:
             assert cds._resolve_symbol(merge, "tinyagentos/foo.py", "func_a") is False
         finally:
-            self._purge_package("tinyagentos")
+            self._restore_package(touched)
 
     def test_self_loop_symlink_is_not_importable(self, tmp_path: Path):
         """A self-referential symlink must not hang or crash; it is simply not
         importable."""
         merge = self._write_tree(tmp_path, {"tinyagentos/__init__.py": ""})
         os.symlink("foo.py", merge / "tinyagentos/foo.py")
-        self._purge_package("tinyagentos")
+        touched = self._purge_package("tinyagentos")
         try:
             assert cds._resolve_symbol(merge, "tinyagentos/foo.py", "func_a") is False
         finally:
-            self._purge_package("tinyagentos")
+            self._restore_package(touched)
 
     def test_symlinked_package_init_keeps_relative_reexport(self, tmp_path: Path):
         """A symlinked pkg/__init__.py that re-exports via a relative import
@@ -412,11 +434,11 @@ class TestResolveSymbolSymlinkTypechange:
             },
         )
         os.symlink("_impl.py", merge / "tinyagentos/__init__.py")
-        self._purge_package("tinyagentos")
+        touched = self._purge_package("tinyagentos")
         try:
             assert cds._resolve_symbol(merge, "tinyagentos/__init__.py", "func_a") is True
         finally:
-            self._purge_package("tinyagentos")
+            self._restore_package(touched)
 
 
 # ---------------------------------------------------------------------------
