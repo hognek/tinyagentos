@@ -1112,3 +1112,27 @@ Container provisioning request (P1, agent-container-provisioning spec):
   escalated to a Decisions-app item for Jay. This is an identity-only check
   (no scope grant required), matching the scope-request create flow's use of
   `check_agent_identity`.
+
+## Skill-exec agent identity (credential-bound, not body-supplied)
+
+`POST /api/skill-exec/{skill_id}/call` and `GET /api/skill-exec/tools` now
+derive the agent identity from the PRESENTED CREDENTIAL, not from the request
+body. Each agent is issued a distinct per-agent token at deploy time
+(`AuthManager.mint_agent_local_token` in `tinyagentos/auth.py`; called from
+`tinyagentos/deployer.py`), and that minted token -- not the shared host token
+-- is what lands in the agent's `TAOS_LOCAL_TOKEN`. The auth middleware sets
+`request.state.agent_name` from that binding, and the route rejects any
+bound-token caller whose body claims a different `agent_name` with 403.
+The shared host local token stays unbound: admin/system callers presenting it
+(and admin sessions) may still supply `agent_name` in the body, and agents
+deployed before this change keep the host token until their next redeploy,
+which rotates them onto a bound per-agent token.
+
+Blast radius: `_resolve_agent_workspace`, `_capture_tool_receipt`,
+`_check_execution_policy`, `execute_notes_list_shared_docs`, and the todo tools
+all key off the same `agent_name` string, so binding it at the credential layer
+closes the hole for every downstream consumer in one place. Per-agent tokens
+replace the earlier shared-token binding: each deploy mints a fresh token,
+eliminating the last-deploy-wins collision where two agents bound to the same
+host token would overwrite each other's identity. The shared host token remains
+valid for admin/system callers but is no longer bound to any agent name.
