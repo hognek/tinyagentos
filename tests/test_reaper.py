@@ -24,21 +24,23 @@ class _MockProc:
       - proc.kill()            → kill the process
       - proc.wait()            → wait for the process
     """
-    __slots__ = ("info",)
+    __slots__ = ("info", "kill_called", "wait_called")
 
     def __init__(self, info: dict):
         self.info = info
+        self.kill_called = False
+        self.wait_called = False
 
     def ppid(self) -> int:
         return self.info["ppid"]
 
     def kill(self) -> None:
-        """Mock kill — just mark as no longer running."""
-        pass
+        """Mock kill — record call."""
+        self.kill_called = True
 
     def wait(self, timeout: int | None = None) -> None:
-        """Mock wait — just return."""
-        pass
+        """Mock wait — record call."""
+        self.wait_called = True
 
 
 class _MockPI:
@@ -87,6 +89,8 @@ async def test_reap_hung_executor_sh_ages_past_cap(monkeypatch):
         assert reaped[0]["pid"] == proc.info["pid"]
         assert reaped[0]["age"] > 300
         assert "executor.sh" in reaped[0]["cmdline"]
+        assert proc.kill_called
+        assert proc.wait_called
     finally:
         monkeypatch.setattr(psutil, "process_iter", original_iter)
 
@@ -106,6 +110,8 @@ async def test_reap_hung_executor_sh_younger_than_cap_survives(monkeypatch):
     try:
         reaped = reap_hung_executor_sh(cap_seconds=300)
         assert len(reaped) == 0
+        assert not proc.kill_called
+        assert not proc.wait_called
     finally:
         monkeypatch.setattr(psutil, "process_iter", original_iter)
 
@@ -129,6 +135,8 @@ async def test_reap_hung_executor_sh_cross_agent_guard(monkeypatch):
         reaped = reap_hung_executor_sh(cap_seconds=300)
         # Orphaned process (PPID 1) should NOT be reaped
         assert len(reaped) == 0
+        assert not proc.kill_called
+        assert not proc.wait_called
     finally:
         monkeypatch.setattr(psutil, "process_iter", original_iter)
 
@@ -164,5 +172,7 @@ async def test_reap_hung_executor_sh_live_parent_gets_reaped(monkeypatch):
         assert reaped[0]["pid"] == proc.info["pid"]
         assert reaped[0]["age"] > 300
         assert "executor.sh" in reaped[0]["cmdline"]
+        assert proc.kill_called
+        assert proc.wait_called
     finally:
         monkeypatch.setattr(psutil, "process_iter", original_iter)
