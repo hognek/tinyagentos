@@ -2011,8 +2011,17 @@ class TestAgentWakeBudget:
         async def fake_wake(*args, **kwargs):
             return True
 
+        from tinyagentos.wake_budget import can_wake as real_can_wake
+        can_wake_calls = []
+        def fake_can_wake(*args, **kwargs):
+            can_wake_calls.append((args, kwargs))
+            return real_can_wake(*args, **kwargs)
+
         monkeypatch.setattr(
             "tinyagentos.agent_heartbeat._wake_agent_with_task", fake_wake
+        )
+        monkeypatch.setattr(
+            "tinyagentos.agent_heartbeat.can_wake", fake_can_wake
         )
 
         await _heartbeat_tick(app.state)
@@ -2022,6 +2031,16 @@ class TestAgentWakeBudget:
 
         await _heartbeat_tick(app.state)
 
+        # Close task_b and create a new ready task so the third tick reaches
+        # can_wake (same task would re-debounce and skip budget enforcement).
+        await app.state.project_task_store.update_task(task_b["id"], status="closed")
+        task_c = await app.state.project_task_store.create_task(
+            project_id=project_b["id"],
+            title="task c",
+            created_by="test",
+            assignee_id="test-agent",
+        )
+
         # Third tick: budget exhausted, no more wakes regardless of ready tasks
         await _heartbeat_tick(app.state)
 
@@ -2030,6 +2049,7 @@ class TestAgentWakeBudget:
         data = resp.json()
         assert data["consumed"] == 2
         assert data["remaining"] == 0
+        assert len(can_wake_calls) == 3
 
     async def test_get_wake_budget_not_found(self, client):
         resp = await client.get("/api/agents/no-such-agent/wake-budget")
