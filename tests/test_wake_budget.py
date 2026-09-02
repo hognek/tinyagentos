@@ -167,6 +167,49 @@ class TestFleetWakeInfo:
             assert row["next_wake_epoch"] is None
             assert row["remaining"] == 0
             assert row["consumed"] == 0
+            assert row["state"] == "damaged"
+
+    async def test_partial_read_preserves_consumption_marks_damaged(self, tmp_path, monkeypatch):
+        """Defect 3 (tsk-oenmo2 mutating test): the grandparent #2669 code put
+        ``get_consumption`` and ``get_next_scheduled_wake`` inside a single
+        try block, so any error in the second read discarded the first read's
+        consumption and reported the row as ``consumed:0, remaining:budget``
+        (a full row masquerading as a damaged one). The split try/except
+        preserves the first successful read and must additionally carry an
+        explicit ``state: 'damaged'`` marker (LEAD RULING) so the fleet UI
+        can distinguish a working-half/working-half row from a genuinely
+        exhausted agent (working-half-masks-broken-half).
+
+        Setup: a healthy state with one wake consumed today. Patch
+        ``get_next_scheduled_wake`` to raise WakeBudgetStateError so only the
+        second read fails.
+
+        On grandparent code: both calls share one try/except, the row would
+        be ``consumed:0, remaining:budget`` -- this test REDS.
+        On current code: the first read succeeds, the second's exception is
+        caught separately, the row carries the real consumption plus the
+        damaged marker -- this test GREENS.
+        """
+        data_dir = tmp_path
+        state_path = data_dir / "wake_budget.json"
+        _write_state(state_path, {
+            "daily": {"a1:global": {_today(): 1}},
+        })
+        monkeypatch.setattr(
+            "tinyagentos.wake_budget.get_next_scheduled_wake",
+            lambda *a, **kw: (_ for _ in ()).throw(WakeBudgetStateError("simulated second-read failure")),
+        )
+        cfg = _FakeConfig(
+            wake_budget={"global_default": 2, "per_agent": {}, "per_project": {}},
+            agents=[{"id": "a1", "name": "agent-1", "status": "running"}],
+        )
+        rows = await get_fleet_wake_info(data_dir, cfg)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["consumed"] == 1
+        assert row["remaining"] == 1
+        assert row["next_wake_epoch"] is None
+        assert row["state"] == "damaged"
 
 
 class TestDamagedState:

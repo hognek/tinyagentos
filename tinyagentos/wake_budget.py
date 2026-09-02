@@ -212,6 +212,7 @@ async def get_fleet_wake_info(data_dir: Path, config: Any, project_task_store: A
                 "consumed": 0,
                 "remaining": 0,
                 "next_wake_epoch": None,
+                "state": "damaged",
             })
             continue
         try:
@@ -228,6 +229,7 @@ async def get_fleet_wake_info(data_dir: Path, config: Any, project_task_store: A
                 "consumed": consumption["scheduled"],
                 "remaining": max(0, budget - consumption["scheduled"]),
                 "next_wake_epoch": None,
+                "state": "damaged",
             })
             continue
         remaining = max(0, budget - consumption["scheduled"])

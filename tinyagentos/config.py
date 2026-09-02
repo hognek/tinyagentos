@@ -215,7 +215,11 @@ def load_config(path: Path) -> AppConfig:
         qmd=data.get("qmd", DEFAULT_CONFIG["qmd"].copy()),
         agents=agents,
         metrics=data.get("metrics", DEFAULT_CONFIG["metrics"].copy()),
-        wake_budget=copy.deepcopy(data.get("wake_budget", DEFAULT_CONFIG["wake_budget"])),
+        wake_budget=copy.deepcopy(
+            data["wake_budget"]
+            if isinstance(data.get("wake_budget"), dict)
+            else DEFAULT_CONFIG["wake_budget"]
+        ),
         webhooks=data.get("webhooks", []),
         archived_agents=data.get("archived_agents", []),
         archive=archive_cfg,
@@ -521,7 +525,9 @@ def validate_config(config: AppConfig) -> list[str]:
         if fb is not None and not isinstance(fb, list):
             errors.append(f"agents[{i}]: fallback_models must be a list")
     wb = config.wake_budget
-    if wb is None or not isinstance(wb, dict):
+    if wb is None:
+        return errors
+    if not isinstance(wb, dict):
         errors.append("wake_budget must be a mapping")
         return errors
     raw_gd = wb.get("global_default", 2)
