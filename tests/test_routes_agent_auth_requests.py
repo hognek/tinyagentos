@@ -1646,6 +1646,72 @@ class TestDeferBindingApproval:
             framework="openclaw",
             display_name="defer-bot",
             user_id="user-existing",
+            origin="external-selfjoin",
+            handle="defer-bot",
+        )
+        # external-selfjoin rows seed as "pending" (approval is what activates
+        # them); the defer arm below only triggers for an ACTIVE handle, so flip
+        # this seeded row to active to model the "already approved once" case.
+        await registry.set_status(existing["canonical_id"], "active")
+
+        record = await auth_store.create(
+            identity_claim="@defer-bot",
+            framework="defer-cli",
+            requested_scopes=["memory_read"],
+            requested_skills=None,
+            reason="",
+            duration_secs=None,
+            project_id=None,
+        )
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "agent_grants", grants)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            f"/api/agents/auth-requests/{record['id']}/approve",
+            json={"granted_scopes": ["memory_read"], "defer_binding": True},
+        )
+        assert resp.status_code == 409, resp.text
+        assert "assign-agent" in resp.text
+        assert "pick a different identity_claim" not in resp.text
+
+        await registry.close()
+        await auth_store.close()
+        await grants.close()
+
+    @pytest.mark.asyncio
+    async def test_defer_with_foreign_active_handle_returns_409_pick_other(
+        self, client, monkeypatch, tmp_path
+    ):
+        """Control: defer_binding=true when the handle already maps to an active
+        FOREIGN-origin identity (taos-deployed) must 409 with 'pick a different
+        identity_claim' and NOT steer the operator at assign-agent — binding a
+        foreign identity via assign-agent is exactly the class this PR closes.
+        Red on pre-e891b7473 code: the old collision_via_normalised guard skips
+        the exact-match row and the defer arm answers with assign-agent."""
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.agent_grants_store import AgentGrantsStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-defer-foreign.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-defer-foreign.db")
+        await auth_store.init()
+        grants = AgentGrantsStore(tmp_path / "grants-defer-foreign.db")
+        await grants.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-defer-foreign")
+
+        existing = await registry.register(
+            framework="openclaw",
+            display_name="defer-bot",
+            user_id="user-existing",
             origin="taos-deployed",
             handle="defer-bot",
         )
@@ -1672,8 +1738,8 @@ class TestDeferBindingApproval:
             json={"granted_scopes": ["memory_read"], "defer_binding": True},
         )
         assert resp.status_code == 409, resp.text
-        assert "assign-agent" in resp.text
-        assert "pick a different identity_claim" not in resp.text
+        assert "pick a different identity_claim" in resp.text
+        assert "assign-agent" not in resp.text
 
         await registry.close()
         await auth_store.close()
