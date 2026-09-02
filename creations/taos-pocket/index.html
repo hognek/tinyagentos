@@ -260,7 +260,10 @@
     }
 
     .tab {
+      font: inherit;
       font-size: 11px;
+      background: none;
+      border: 0;
       color: var(--text-tertiary);
       padding: 4px 8px;
       border-radius: 8px;
@@ -316,10 +319,10 @@
     <div class="bottombar" id="bottombar">
       <div class="hint">&#8593;&#8595; scroll</div>
       <div class="hint">&#9166; select</div>
-      <div class="tabs" id="tabs">
-        <div class="tab active" data-tab="0">Sessions</div>
-        <div class="tab" data-tab="1">Notifs</div>
-        <div class="tab" data-tab="2">Decision</div>
+      <div class="tabs" id="tabs" role="tablist" aria-label="Cards">
+        <button type="button" class="tab active" role="tab" aria-selected="true" data-tab="0">Sessions</button>
+        <button type="button" class="tab" role="tab" aria-selected="false" data-tab="1">Notifs</button>
+        <button type="button" class="tab" role="tab" aria-selected="false" data-tab="2">Decision</button>
       </div>
     </div>
   </div>
@@ -469,7 +472,11 @@
       else if (index === 1) topbarTitle.textContent = "Notifications";
       else topbarTitle.textContent = "Decision";
       const tabEls = tabs.querySelectorAll(".tab");
-      tabEls.forEach((t) => t.classList.toggle("active", parseInt(t.dataset.tab, 10) === index));
+      tabEls.forEach((t) => {
+        const on = parseInt(t.dataset.tab, 10) === index;
+        t.classList.toggle("active", on);
+        t.setAttribute("aria-selected", on ? "true" : "false");
+      });
       renderCurrent();
     }
 
