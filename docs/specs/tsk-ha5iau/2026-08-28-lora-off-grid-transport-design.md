@@ -12,7 +12,7 @@ This design note addresses the requirement to add Meshtastic as a first-class pl
 - **Payload Integrity**: AES-256-GCM encryption with per-frame nonces for message integrity.
 
 ### Security Architecture
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │  Source (LoRa)                                              │
 │  • Signed payload (device key)                              │
@@ -70,3 +70,201 @@ The new connector sits alongside the existing seven. It emits `IncomingMessage(p
 
 ### Routing Keys on the Channel, Not the Payload
 Map one Meshtastic channel (or node) to one agent and addressing costs ZERO bytes of the ~237 byte packet. The naive alternative is bad: real agent identities on this fleet are 25-30 chars (kilo-taos-20260711-000740, laguna-s-ora-20260721-191750, stepflash-taos-20260713-103907). Carrying sender + recipient in-payload would burn ~60 of 237 bytes, a quarter of the packet, before a single character of content. Meshtastic supports 8 channels, so channel-per-agent caps there and node-per-agent needs a board per agent; past that use a SHORT-CODE REGISTRY (2-4 bytes) mapped to canonical identity. Never put canonical ids on the radio.
+
+## 3. Degradation Policy
+
+### The Problem
+`OutgoingMessage` carries buttons, images and cards, and `message.py:parse_inline_hints` parses `[button:Label:action]` and `[image:path]` out of agent replies. NONE of that survives a text-only ~237 byte link. The connector needs an explicit policy for rich elements, long replies, and a hard per-message size budget enforced BEFORE transmit. An agent that answers in 2KB of prose must not silently become a 12-packet flood.
+
+### Rich Element Policy
+
+| Element | Policy |
+|---------|--------|
+| Buttons | Drop. Emit one notice per response: `"[button dropped: Meshtastic is text-only]"` |
+| Images | Drop. Emit one notice per response: `"[image dropped: Meshtastic is text-only]"` |
+| Cards | Drop. Emit one notice per response: `"[card dropped: Meshtastic is text-only]"` |
+
+Notices are per RESPONSE, not per conversation: `_degrade` builds a fresh notice list for
+each `OutgoingMessage` and the connector transmits each notice as its own frame. There is
+no conversation-scoped suppression; if repeats prove noisy in the field, suppression is a
+follow-up, not part of this contract.
+
+### Long Reply Policy
+
+| Length | Policy |
+|--------|--------|
+| Fits one frame | Transmit as a single `[part 1/1] `-prefixed frame (prefix bytes count against the budget, so the content cutover sits at 237 minus the prefix length, not at 237) |
+| Larger | Chunk into `[part N/M] `-prefixed frames, each <= 237 payload bytes |
+
+Every emitted CONTENT frame carries the `[part N/M] ` prefix, including single-part
+replies; notice frames (dropped buttons/images/cards) are transmitted before the content
+parts and carry no prefix.
+Receive-side reassembly is NOT implemented: `handle_incoming` routes each packet as its
+own message. Parts arrive as separate messages; reassembly is a hardware-phase follow-up
+(see section 5), not a promise of this connector.
+
+### Hard Size Budget
+Before transmit, every frame's text payload is verified to be <= 237 bytes — 237 is the Meshtastic application `Data.payload` limit, not the full on-wire frame (the 16-byte packet header rides outside it; the total LoRa frame caps at 255 bytes). The connector validates the UTF-8 text bytes only; the injected transport owns the serialized-frame limit at its own boundary. Long replies are chunked with a `[part N/M]` prefix whose denominator always equals the emitted part count; the connector guard raises (rather than shipping an over-budget frame) if any part still exceeds the limit after degradation.
+
+### Example Degradation
+```python
+# In channel_hub/message.py
+MAX_PAYLOAD = 237
+
+def _degrade(response: OutgoingMessage) -> tuple[list[str], list[str]]:
+    """Degrade rich elements and chunk long replies for the text-only link.
+
+    - Reads response.buttons, response.images, response.cards; drops them
+      and emits a notice per element kind (a fresh notice list per response).
+    - Chunks on encoded bytes, never splitting a multibyte character: the
+      chunk boundary is walked back to the last codepoint boundary before
+      decoding, and the '[part N/M] ' prefix bytes always count against
+      the 237-byte budget.
+    - Derives total from the same chunking the parts use, so the label
+      denominator always equals the number of emitted parts.
+    """
+    notices: list[str] = []
+
+    # Drop buttons -- emit a notice per response
+    if response.buttons:
+        notices.append("[button dropped: Meshtastic is text-only]")
+        response.buttons = []
+
+    # Drop images -- emit a notice per response
+    if response.images:
+        notices.append("[image dropped: Meshtastic is text-only]")
+        response.images = []
+
+    # Drop cards -- emit a notice per response
+    if response.cards:
+        notices.append("[card dropped: Meshtastic is text-only]")
+        response.cards = []
+
+    # The text is already clean (parse_inline_hints stripped markup),
+    # but we work with whatever content remains.
+    encoded = response.content.encode("utf-8")
+    if not encoded:
+        return [], notices
+
+    # Provisional total ignores the prefix length; refine until the label
+    # denominator equals the actual number of emitted parts.
+    total = max(1, (len(encoded) + MAX_PAYLOAD - 1) // MAX_PAYLOAD)
+    while True:
+        parts: list[str] = []
+        idx = 1
+        start = 0
+        while start < len(encoded):
+            prefix = f"[part {idx}/{total}] ".encode("utf-8")
+            content_bytes = MAX_PAYLOAD - len(prefix)
+            end = min(start + content_bytes, len(encoded))
+            # Walk back to a codepoint boundary so we never slice a
+            # multibyte character (which would corrupt it and inflate the
+            # re-encoded size past the budget).
+            while end < len(encoded) and (encoded[end] & 0xC0) == 0x80:
+                end -= 1
+            chunk_text = encoded[start:end].decode("utf-8")
+            parts.append(f"[part {idx}/{total}] {chunk_text}")
+            start = end
+            idx += 1
+        if len(parts) == total:
+            return parts, notices
+        total = len(parts)
+```
+
+## 4. Sovereignty
+
+### Real, With One Caveat
+Every other connector except webchat/webhook puts a company in the path. The sharper claim is not merely self-hosted but INFRASTRUCTURE INDEPENDENT: it keeps working with no ISP, no internet and no LAN. Caveat to design around rather than a blocker: encryption protects CONTENT, not PRESENCE. Broadcast RF means anyone in range observes that a transmission happened, roughly from where, how often and how large, and RF is direction-findable. Sovereignty over custody and content, not invisibility. Do not let the pitch drift into the latter.
+
+## 5. Concrete First Milestone (Hardware Phase)
+
+### Version 0.1.0 - "Point-to-Point Prototype"
+**Target**: Q3 2026 (after hardware arrival)
+
+#### Primary Objectives
+1. **Hardware Setup**: Deploy two Heltec V4 modules in point-to-point configuration
+2. **Connector Development**: Implement `meshtastic_connector.py` emitting `platform="meshtastic"`
+3. **Authentication**: Complete per-device key registration and validation system
+4. **Degradation Testing**: Verify rich elements are dropped, long replies are chunked, and the 237-byte budget is enforced
+
+#### Technical Deliverables
+- [ ] `meshtastic_connector.py` alongside the seven existing connectors
+- [ ] Device key management system with secure storage
+- [ ] `MessageRouter.assign_channel("meshtastic", <node_id>, <agent_name>)` wiring
+- [ ] Configuration management for radio parameters (freq, SF, channel)
+- [ ] Logging and monitoring for security events and degradation decisions
+- [ ] Test suite for connector functionality, security properties, and degradation policy
+
+Both modules run ONE shared operating configuration — same region/frequency slot, same
+modem preset (spreading factor/bandwidth), same channel name and PSK — pinned in the radio
+parameter configuration above. Two radios on different frequency slots cannot hear each
+other; the prototype defines exactly one config and both modules load it.
+
+#### Deployment Architecture
+```text
+┌─────────────────────────────────────────────────────────┐
+│  TAOS Controller                                        │
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │  channel_hub                                    │   │
+│  │  • MessageRouter.get_agent_for_channel("meshtastic", node_id) │
+│  │  • Archive and routing pipeline                  │   │
+│  └─────────────────────────────────────────────────┘   │
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │  meshtastic_connector.py                         │   │
+│  │  • Ingest Meshtastic packets                     │   │
+│  │  • Verify signature & decrypt                    │   │
+│  │  • Degrade rich elements, chunk long replies     │   │
+│  │  • Emit IncomingMessage(platform="meshtastic")   │   │
+│  └─────────────────────────────────────────────────┘   │
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │  Radio Links (2 Heltec V4 modules)                 │   │
+│  │                                                 │   │
+│  │  +----------------------+                    │   │
+│  │  │  Module 1 (Radio 1) │                    │   │
+│  │  │  - shared config    │                    │   │
+│  │  │  - 28 dBm TX        │                    │   │
+│  │  +----------------------+                    │   │
+│  │  │  Module 2 (Radio 2) │                    │   │
+│  │  │  - shared config    │                    │   │
+│  │  │  - 28 dBm TX        │                    │   │
+│  │  +----------------------+                    │   │
+│  └─────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### MVP Testing Requirements
+- [ ] Message round-trip testing: Radio -> connector -> router -> agent -> connector -> Radio
+- [ ] Security validation: Verify unsigned frames are rejected
+- [ ] Degradation validation: Verify buttons and images are dropped with logged notices
+- [ ] Size budget validation: Verify long replies are chunked into <=237-byte parts. Truncation is NEVER a success path — the guard raises rather than shipping or silently trimming an over-budget frame
+- [ ] Performance testing: 1 kbps sustained application throughput; latency scoped per payload — a full 237-byte part is ~1.9 s of serialization alone at 1 kbps, so the target is <1 s connector overhead (ingest -> route -> transmit handoff) on top of airtime, not <1 s end-to-end for maximum-size messages
+
+#### Success Criteria
+1. **Functional**: Both radio modules connect and exchange messages
+2. **Security**: All unsigned/replayed messages are rejected
+3. **Degradation**: Rich elements are dropped and long replies are chunked
+4. **Performance**: Status beacons sent every 30 seconds
+5. **Reliability**: Connector survives controller reboot without reconnection
+
+### Notes
+- This design focuses on the security model first as required
+- Firmware implementation will follow after this design is approved
+- The connector is a CONTROL channel, not a data tunnel
+- All security decisions must be made before hardware deployment
+
+## References
+- [Heltec WiFi LoRa 32 (V4)](https://heltec.org/project/wifi-lora-32-v4/)
+- [Meshtastic Documentation](https://meshtastic.org/)
+- [taOS channel_hub Architecture](/tinyagentos/channel_hub/)
+- [channel_hub/message.py](/tinyagentos/channel_hub/message.py)
+- [channel_hub/router.py](/tinyagentos/channel_hub/router.py)
+- [Jay's Note 2026-08-28](note-260828-f0fa88.md) — reference implementation
+
+---
+*Document created: 2026-08-28*
+*Status: Draft design note*
+*Author: taOS Lead*
+*Tags: lora, meshtastic, channel_hub, security, radio*

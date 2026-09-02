@@ -96,6 +96,11 @@ _AGENT_TOKEN_PATHS = (
 _SEG = r"[^/]+"
 _AGENT_TASK_ROUTES = (
     ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks$")),
+    # Cross-project kanban aggregate (READ ONLY): a static path (no project
+    # segment) that returns every board the token holds a project_tasks grant
+    # for. Reaching the handler is not authorization -- it verifies the JWT +
+    # per-project grant via _authorize_task_actor for every candidate project.
+    ("GET", re.compile(r"^/api/projects/tasks/aggregate$")),
     # Task CREATION, gated by the SEPARATE project_tasks_create scope (not
     # project_tasks, which stays read + lifecycle + comments per Invariant 2+5).
     # Reaching the handler is not authorisation: it then verifies the JWT, the
@@ -106,9 +111,10 @@ _AGENT_TASK_ROUTES = (
     ("GET", re.compile(rf"^/api/projects/tasks/{_SEG}/context$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/comments$")),
     ("POST", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/comments$")),
-    # Task checklist items (list + create), gated by project_tasks_create in the
-    # handler (_authorize_task_actor). Reaching the handler is not
-    # authorisation: it then verifies the JWT, the project binding, and that
+    # Task checklist items (list + create), gated in the handler
+    # (_authorize_task_actor): POST (create) requires project_tasks_create,
+    # GET (list) takes the default project_tasks grant. Reaching the handler is
+    # not authorisation: it then verifies the JWT, the project binding, and the
     # scope. There is no archive route, so nothing beyond list + create is
     # listed here.
     ("GET", re.compile(rf"^/api/projects/{_SEG}/tasks/{_SEG}/checklist-items$")),
@@ -588,6 +594,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     request.state.user_id = None
                     request.state.is_admin = False
                     request.state.via = "local_token"
+                bound_agent = auth_mgr.get_local_token_agent(presented)
+                if bound_agent:
+                    request.state.agent_name = bound_agent
                 return await call_next(request)
 
         # Agent-token endpoints (registry feeds + A2A bus proxy + project kanban)
