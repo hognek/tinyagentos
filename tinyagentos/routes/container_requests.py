@@ -18,6 +18,7 @@ count+create is serialized so a quota=1 race cannot double-approve.
 """
 
 import logging
+import re
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
@@ -65,15 +66,6 @@ def _get_policy(request: Request) -> ProvisioningPolicy:
     return policy
 
 
-def _get_backend():
-    """Return the active container backend, falling back to LXCBackend."""
-    try:
-        from tinyagentos.containers.backend import get_backend
-        return get_backend()
-    except RuntimeError:
-        return LXCBackend()
-
-
 def _default_image(request: Request) -> str:
     cfg = getattr(request.app.state, "config", None)
     if cfg is not None:
@@ -110,13 +102,6 @@ async def create_container_request(
         reason=body.reason,
         config=body.config or {},
     )
-    if record is None:
-        record = await store.create(
-            canonical_id,
-            image=image,
-            reason=body.reason,
-            config=body.config or {},
-        )
 
     decision_id = None
     if verdict == APPROVE:
@@ -206,29 +191,39 @@ async def provision_container_request(
     if record["status"] != "approved":
         raise HTTPException(status_code=400, detail=f"request is {record['status']}, not approved")
 
-    backend = _get_backend()
-    container_name = f"taos-agent-{canonical_id}-{id[:8]}"
+    backend = LXCBackend()
+    safe_cid = re.sub(r"[^a-zA-Z0-9_-]", "-", canonical_id)
+    container_name = f"taos-agent-{safe_cid}-{id[:8]}"
 
-    result = await backend.create_container(
-        name=container_name,
-        image=record.get("image") or _default_image(request) or "images:debian/bookworm",
-    )
+    try:
+        result = await backend.create_container(
+            name=container_name,
+            image=record.get("image") or _default_image(request) or "images:debian/bookworm",
+        )
+    except Exception as exc:
+        await store.set_status(id, "failed", error=str(exc))
+        raise HTTPException(status_code=500, detail=f"provisioning failed: {exc}")
+
     if not result.get("success"):
         error_msg = result.get("error", "provisioning failed")
         await store.set_status(id, "failed", error=error_msg)
         raise HTTPException(status_code=500, detail=error_msg)
 
-    updated = await store.set_status(id, "provisioned", container_name=container_name)
+    config_json = record.get("config_json") or {}
+    project_id = config_json.get("project_id")
+    env_result = await backend.set_env(container_name, "TAOS_AGENT_CANONICAL_ID", canonical_id)
+    if not env_result.get("success"):
+        error_msg = env_result.get("output", "set_env failed")
+        await store.set_status(id, "failed", error=error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
+    if project_id:
+        project_env_result = await backend.set_env(container_name, "TAOS_PROJECT_ID", str(project_id))
+        if not project_env_result.get("success"):
+            error_msg = project_env_result.get("output", "set_env failed")
+            await store.set_status(id, "failed", error=error_msg)
+            raise HTTPException(status_code=500, detail=error_msg)
 
-    # Bind the container to the agent + project via environment variables.
-    try:
-        await backend.set_env(container_name, "TAOS_AGENT_CANONICAL_ID", canonical_id)
-        config_json = record.get("config_json") or {}
-        project_id = config_json.get("project_id")
-        if project_id:
-            await backend.set_env(container_name, "TAOS_PROJECT_ID", str(project_id))
-    except Exception as exc:
-        logger.warning("provision: env bind failed for %s: %s", container_name, exc)
+    updated = await store.set_status(id, "provisioned", container_name=container_name)
 
     return {
         "request_id": updated["id"],
@@ -263,11 +258,10 @@ async def destroy_container_request(
 
     container_name = record.get("container_name")
     if container_name:
-        backend = _get_backend()
-        try:
-            await backend.destroy_container(container_name)
-        except Exception as exc:
-            logger.warning("destroy: container delete failed for %s: %s", container_name, exc)
+        backend = LXCBackend()
+        result = await backend.destroy_container(container_name)
+        if not result.get("success"):
+            raise HTTPException(status_code=500, detail=result.get("output", "destroy failed"))
 
     released = await store.destroy(id)
     if not released:

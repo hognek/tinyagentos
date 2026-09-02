@@ -196,23 +196,19 @@ class ContainerRequestStore(BaseStore):
         image: str = "",
         reason: str = "",
         config: dict | None = None,
-    ) -> tuple[dict | None, str, int]:
+    ) -> tuple[dict, str, int]:
         """Atomically count active requests and create a new one.
 
         The count and insert are serialized by an asyncio lock so that
         concurrent callers cannot both observe the same quota headroom
-        and both get approved when the quota is 1.
-
-        Returns ``(record, verdict, active_count)`` where ``record`` is None
-        when the verdict is not ``APPROVE`` (caller should not transition to
-        ``provisioned``).
+        and both get approved when the quota is 1. The record is always
+        created inside the lock so non-approve verdicts are also persisted
+        atomically.
         """
         from tinyagentos.containers.provisioning_policy import APPROVE
         async with self._create_lock:
             active_count = await self.count_active_for_agent(canonical_id)
             verdict = policy.evaluate(canonical_id, active_count)
-            if verdict != APPROVE:
-                return None, verdict, active_count
             record = await self.create(
                 canonical_id,
                 image=image,

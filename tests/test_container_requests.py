@@ -954,18 +954,9 @@ async def test_quota_one_concurrency_only_one_approved(client, monkeypatch, tmp_
         await env.close()
 
 
-# ---------------------------------------------------------------------------
-# P2: quota accounting mutation -- break the decrement and prove red
-# ---------------------------------------------------------------------------
-
 @pytest.mark.asyncio
-async def test_quota_one_enforces_concurrency(client, monkeypatch, tmp_path):
-    """With quota=1, only one of two concurrent requests may be approved.
-
-    This is the accounting-mutation guard: if count_active_for_agent is
-    broken (always returns 0), both requests would appear approved and this
-    assertion catches it. A test that only checks 'create returned 200' cannot
-    fail on quota being unenforced."""
+async def test_concurrent_over_quota_requests_both_created(client, monkeypatch, tmp_path):
+    """Two concurrent over-quota requests both get records inside the lock."""
     env = await _wire(
         client,
         monkeypatch,
@@ -976,6 +967,18 @@ async def test_quota_one_enforces_concurrency(client, monkeypatch, tmp_path):
         cid = await _register_active(env)
         token = env.agent_token(cid)
         app = _app(client)
+
+        # Pre-create one approved request so active_count=1.
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as bare:
+            r = await bare.post(
+                "/api/containers/requests",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"image": "images:debian/bookworm", "reason": "first"},
+            )
+        assert r.status_code == 200
+        assert r.json()["status"] == "approved"
 
         async def _post_request(reason):
             async with AsyncClient(
@@ -992,11 +995,17 @@ async def test_quota_one_enforces_concurrency(client, monkeypatch, tmp_path):
             _post_request("concurrent-a"),
             _post_request("concurrent-b"),
         )
-        approved = [s for _, s in results if s == "approved"]
-        assert len(approved) == 1, f"expected exactly 1 approved with quota=1, got {results}"
+        statuses = [s for _, s in results]
+        assert all(s == "pending-approval" for s in statuses)
+        all_reqs = await env.request_store.list(canonical_id=cid)
+        assert len(all_reqs) == 3
     finally:
         await env.close()
 
+
+# ---------------------------------------------------------------------------
+# P2: quota accounting mutation -- break the decrement and prove red
+# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # P2: escalate-failure -- decision_store.create raising must not strand the row
