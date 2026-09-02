@@ -254,6 +254,7 @@ other; the prototype defines exactly one config and both modules load it.
 - Firmware implementation will follow after this design is approved
 - The connector is a CONTROL channel, not a data tunnel
 - All security decisions must be made before hardware deployment
+- Milestone 2 candidate — not scheduled: `docs/specs/tsk-ha5iau/2026-09-02-lora-m2-image-uplink-spike.md`
 
 ## References
 - [Heltec WiFi LoRa 32 (V4)](https://heltec.org/project/wifi-lora-32-v4/)
