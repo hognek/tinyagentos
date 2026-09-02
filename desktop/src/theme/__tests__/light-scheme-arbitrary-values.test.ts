@@ -196,7 +196,7 @@ describe("light-scheme arbitrary-value overlay inversion", () => {
       ["hover:bg-white/[0.1]", "background-color", "rgba(0, 0, 0, 0.1)"],
       ["hover:border-white/[0.06]", "border-color", "rgba(0, 0, 0, 0.06)"],
       ["hover:bg-white/3", "background-color", "rgba(0, 0, 0, 0.03)"],
-      ["hover:bg-white/8", "background-color", "rgba(0, 0, 0, 0.05)"],
+      ["hover:bg-white/8", "background-color", "rgba(0, 0, 0, 0.06)"],
       ["hover:bg-white/15", "background-color", "rgba(0, 0, 0, 0.08)"],
       ["hover:bg-white/20", "background-color", "rgba(0, 0, 0, 0.10)"],
       ["hover:border-white/15", "border-color", "rgba(0, 0, 0, 0.14)"],
@@ -267,28 +267,45 @@ describe("light-scheme arbitrary-value overlay inversion", () => {
     }
   });
 
-  it("keeps the light-scheme bg-white/N plain-fraction alpha scale strictly increasing", () => {
+  describe("light-scheme bg-white/N plain-fraction alpha scales stay strictly increasing", () => {
     // N = 5, 8, 10, 15, 20 are the plain-fraction white-overlay steps emitted by
     // Tailwind. Their light-scheme inverted alphas must climb without ties or
-    // backsteps: /8 sits between /5 (0.04) and /10 (0.06), so it must not collide
-    // with /15 (0.08) or exceed /10 — both violations happened with the old 0.08.
+    // backsteps on BOTH the base scale and the hover mirror: /8 sits between /5
+    // and /10, so it must not collide with a neighbour or exceed /10. The base
+    // scale had /8 = 0.08 (tied /15, exceeded /10); the hover mirror then had
+    // /8 = 0.05 (tied /5). The two scales use different alpha ramps, so each is
+    // asserted against its own expected values.
     const steps = [5, 8, 10, 15, 20] as const;
-    const alphaOf: Record<number, number> = {};
-    const re =
-      /\[class~="bg-white\/(\d+)"\]\s*\{[^}]*background-color:\s*rgba\(\s*0,\s*0,\s*0,\s*([\d.]+)\s*\)/g;
-    for (const m of TOKENS_CSS.matchAll(re)) {
-      alphaOf[Number(m[1])] = parseFloat(m[2]);
-    }
-    for (const n of steps) {
-      expect(alphaOf[n], `bg-white/${n} has no light-scheme rule`).toBeDefined();
-    }
-    const vals = steps.map((n) => alphaOf[n]);
-    expect(vals).toEqual([0.04, 0.05, 0.06, 0.08, 0.1]);
-    for (let i = 0; i < vals.length - 1; i++) {
-      expect(
-        vals[i],
-        `bg-white/${steps[i]} alpha ${vals[i]} must be less than bg-white/${steps[i + 1]} alpha ${vals[i + 1]}`,
-      ).toBeLessThan(vals[i + 1]);
+    const cases: Array<[string, RegExp, number[]]> = [
+      [
+        "base",
+        /\[class~="bg-white\/(\d+)"\]\s*\{[^}]*background-color:\s*rgba\(\s*0,\s*0,\s*0,\s*([\d.]+)\s*\)/g,
+        [0.04, 0.05, 0.06, 0.08, 0.1],
+      ],
+      [
+        "hover",
+        /\[class~="hover:bg-white\/(\d+)"\]:hover\s*\{[^}]*background-color:\s*rgba\(\s*0,\s*0,\s*0,\s*([\d.]+)\s*\)/g,
+        [0.05, 0.06, 0.07, 0.08, 0.1],
+      ],
+    ];
+    for (const [label, re, expected] of cases) {
+      it(`${label} scale`, () => {
+        const alphaOf: Record<number, number> = {};
+        for (const m of TOKENS_CSS.matchAll(re)) {
+          alphaOf[Number(m[1])] = parseFloat(m[2]);
+        }
+        for (const n of steps) {
+          expect(alphaOf[n], `${label} bg-white/${n} has no light-scheme rule`).toBeDefined();
+        }
+        const vals = steps.map((n) => alphaOf[n]);
+        expect(vals).toEqual(expected);
+        for (let i = 0; i < vals.length - 1; i++) {
+          expect(
+            vals[i],
+            `${label} bg-white/${steps[i]} alpha ${vals[i]} must be less than bg-white/${steps[i + 1]} alpha ${vals[i + 1]}`,
+          ).toBeLessThan(vals[i + 1]);
+        }
+      });
     }
   });
 
