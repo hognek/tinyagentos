@@ -195,10 +195,32 @@ Every other connector except webchat/webhook puts a company in the path. The sha
 - [ ] Logging and monitoring for security events and degradation decisions
 - [ ] Test suite for connector functionality, security properties, and degradation policy
 
-Both modules run ONE shared operating configuration — same region/frequency slot, same
-modem preset (spreading factor/bandwidth), same channel name and PSK — pinned in the radio
+Both modules run ONE shared operating configuration -- same region/frequency slot, same
+modem preset (spreading factor/bandwidth), same channel name and PSK -- pinned in the radio
 parameter configuration above. Two radios on different frequency slots cannot hear each
-other; the prototype defines exactly one config and both modules load it.
+other; the prototype defines exactly one config and both modules load it. The pinned
+configuration for milestone 1 is:
+
+- Region: `EU_868` -- 869.4-869.65 MHz, sub-band P, centre 869.525 MHz, 10% duty cycle
+  (360 s/hour on-air), +27 dBm ERP. This is the only EU/UK slot that allows 10% duty; the
+  868.0-868.6 MHz 1% band (36 s/hour) cannot carry the 30-second beacon cadence (see
+  Duty-Cycle Budget below).
+- Modem preset: `LongFast` -- SF11, BW 250 kHz, coding rate 4/5 (~1.07 kbps link rate).
+  Frequency slot 1 (centre 869.525 MHz) is the Meshtastic default after a factory reset, so
+  both radios land on the same slot with no manual override.
+- Channel name: `LongFast` (the Meshtastic default primary channel).
+- PSK: provisioned out of band -- loaded onto each module via the non-radio configuration
+  path as a custom 256-bit AES key (never the well-known `AQ==` default), and never
+  transmitted over the link, so a mis-set region on one radio cannot re-tune it to a
+  frequency the other radio cannot hear.
+
+Modem-preset trade-off (Meshtastic preset table, see References): `LongFast` (SF11,
+~1.07 kbps) buys range, `ShortFast` (SF7, ~10.94 kbps) buys throughput -- roughly a 10x
+peak-rate swap, with each SF step adding ~2.5 dB of link budget at the long end. Milestone 1
+uses LongFast because the off-grid point-to-point pair is range-bound (two fixed sites with
+no infrastructure) and LongFast is the Meshtastic EU_868 default, so the two modules agree on
+a frequency slot automatically and avoid the exact failure mode (radios on different slots)
+called out above.
 
 #### Deployment Architecture
 ```text
@@ -240,13 +262,40 @@ other; the prototype defines exactly one config and both modules load it.
 - [ ] Security validation: Verify unsigned frames are rejected
 - [ ] Degradation validation: Verify buttons and images are dropped with logged notices
 - [ ] Size budget validation: Verify long replies are chunked into <=237-byte parts. Truncation is NEVER a success path — the guard raises rather than shipping or silently trimming an over-budget frame
-- [ ] Performance testing: 1 kbps sustained application throughput; latency scoped per payload — a full 237-byte part is ~1.9 s of serialization alone at 1 kbps, so the target is <1 s connector overhead (ingest -> route -> transmit handoff) on top of airtime, not <1 s end-to-end for maximum-size messages
+- [ ] Performance testing: LongFast (1.07 kbps) link rate; latency scoped per payload, a full 237-byte part air-times to ~2.0 s at the pinned preset (~166 ms preamble plus ~1.87 s payload, SF11/250 kHz/CR 4/5), so the target is <1 s connector overhead (ingest -> route -> transmit handoff) on top of airtime, not <1 s end-to-end for maximum-size messages
+
+#### Duty-Cycle Budget (EU_868, LongFast)
+
+On-air time of one frame at the pinned preset (SF11, 250 kHz, coding rate 4/5, Meshtastic
+16-symbol preamble). Symbol time `T_sym = 2^SF / BW` = 8.192 ms; total on-air time
+`ToA = (n_preamble + 4.25) * T_sym + n_payload * T_sym` (Semtech AN1200.13 form, see
+References).
+
+- One full 237-byte part: ~2.03 s (20.25 preamble symbols = 165.9 ms + 228 payload
+  symbols = 1.87 s). At the ~1.07 kbps link rate the pure payload serialization is ~1.77 s;
+  the duty-cycle cap makes the full ~2.03 s of air time what counts.
+- One status beacon: ~0.44 s, assuming a 24-byte payload (node id, uptime, battery,
+  link-health). The spec does not define a beacon size, so 24 bytes is a pinned prototype
+  assumption.
+
+Hourly on-air budget under the EU_868 cap:
+
+- 10% duty = 360 s/hour. 120 beacons/hour (~53 s) leaves ~307 s for application traffic,
+  i.e. ~150 full 237-byte parts (~305 s). Beacons (~53 s) plus target rate (~305 s) total
+  ~358 s, fitting the 360 s cap; beacons plus this target rate fit 10%.
+- 1% duty = 36 s/hour. The 120 beacons alone (~53 s) already exceed 36 s, so beacons plus
+  any target rate do NOT fit 1%. No application traffic is available on a 1% band, which is
+  why the prototype is pinned to the sub-band P 10% slot.
+
+The ~1.07 kbps figure is the per-transmission link rate from the LongFast preset; the 10%
+duty cycle caps sustained hourly-average throughput at ~0.08 kbps (~150 parts/hour), so
+"sustained" in the 1% sense is incoherent here -- the link is beacon-bound, not throughput-bound.
 
 #### Success Criteria
 1. **Functional**: Both radio modules connect and exchange messages
 2. **Security**: All unsigned/replayed messages are rejected
 3. **Degradation**: Rich elements are dropped and long replies are chunked
-4. **Performance**: Status beacons sent every 30 seconds
+4. **Performance**: Status beacons sent every 30 seconds (120/hour) and 120 beacons plus the target message rate fit inside the 10% duty-cycle budget but not 1% (see Duty-Cycle Budget)
 5. **Reliability**: Connector survives controller reboot without reconnection
 
 ### Notes
@@ -254,10 +303,14 @@ other; the prototype defines exactly one config and both modules load it.
 - Firmware implementation will follow after this design is approved
 - The connector is a CONTROL channel, not a data tunnel
 - All security decisions must be made before hardware deployment
+- The EU/UK sub-band P / 10% duty-cycle figures above are EU-specific; other regions pin their own region code (e.g. US, CN, JP) and the duty-cycle budget must be re-run for that band plan
 
 ## References
 - [Heltec WiFi LoRa 32 (V4)](https://heltec.org/project/wifi-lora-32-v4/)
 - [Meshtastic Documentation](https://meshtastic.org/)
+- [Meshtastic LoRa config (region and preset tables)](https://meshtastic.org/docs/configuration/radio/lora/)
+- [Meshtastic radio settings (EU_868, 869.525 MHz centre, 10% duty)](https://meshtastic.org/docs/overview/radio-settings/)
+- [LoRa time-on-air formula (Semtech AN1200.13)](https://d-central.tech/lora-airtime-calculator/)
 - [taOS channel_hub Architecture](/tinyagentos/channel_hub/)
 - [channel_hub/message.py](/tinyagentos/channel_hub/message.py)
 - [channel_hub/router.py](/tinyagentos/channel_hub/router.py)
