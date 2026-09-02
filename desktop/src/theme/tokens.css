@@ -384,6 +384,7 @@
   --board-status-ready: #64d2ff;
   --board-status-claimed: #ffb340;
   --board-status-closed: #30d158;
+  --board-status-quarantined: #ff453a;
 }
 
 /* ==================================================================
