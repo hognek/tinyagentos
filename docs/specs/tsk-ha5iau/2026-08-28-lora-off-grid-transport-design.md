@@ -201,10 +201,14 @@ parameter configuration above. Two radios on different frequency slots cannot he
 other; the prototype defines exactly one config and both modules load it. The pinned
 configuration for milestone 1 is:
 
-- Region: `EU_868` -- 869.4-869.65 MHz, sub-band P, centre 869.525 MHz, 10% duty cycle
-  (360 s/hour on-air), +27 dBm ERP. This is the only EU/UK slot that allows 10% duty; the
-  868.0-868.6 MHz 1% band (36 s/hour) cannot carry the 30-second beacon cadence (see
-  Duty-Cycle Budget below).
+- Region: `EU_868` -- the 869.4-869.65 MHz sub-band (ETSI EN 300 220-2 Annex B: 500 mW =
+  +27 dBm ERP, <=10% duty cycle, i.e. 360 s/hour on-air), centre 869.525 MHz. This is the
+  only EU/UK slot that allows 10% duty; the 868.0-868.6 MHz 1% band (36 s/hour) cannot
+  carry the 30-second beacon cadence (see Duty-Cycle Budget below). The +27 dBm figure is a
+  radiated (ERP) ceiling, not a TX-power setting: the module's `tx_power` is conducted power
+  at the antenna port, and ERP = conducted power + antenna gain relative to a dipole (dBd),
+  so the pinned `tx_power` must not exceed 27 dBm minus the fitted antenna's dBd gain.
+  Meshtastic's `EU_868` region profile applies this cap automatically.
 - Modem preset: `LongFast` -- SF11, BW 250 kHz, coding rate 4/5 (~1.07 kbps link rate).
   Frequency slot 1 (centre 869.525 MHz) is the Meshtastic default after a factory reset, so
   both radios land on the same slot with no manual override.
@@ -261,7 +265,7 @@ called out above.
 - [ ] Security validation: Verify unsigned frames are rejected
 - [ ] Degradation validation: Verify buttons and images are dropped with logged notices
 - [ ] Size budget validation: Verify long replies are chunked into <=237-byte parts. Truncation is NEVER a success path — the guard raises rather than shipping or silently trimming an over-budget frame
-- [ ] Performance testing: LongFast (1.07 kbps) link rate; latency scoped per payload, a full 237-byte part air-times to ~2.16 s at the pinned preset (~166 ms preamble plus ~1.99 s for the 256-byte PHY payload, SF11/250 kHz/CR 4/5; see Duty-Cycle Budget), so the target is <1 s connector overhead (ingest -> route -> transmit handoff) on top of airtime, not <1 s end-to-end for maximum-size messages
+- [ ] Performance testing: LongFast (1.07 kbps) link rate; latency scoped per payload, a full 237-byte part air-times to ~2.16 s at the pinned preset (~166 ms preamble plus ~1.99 s for the 255-byte PHY payload, SF11/250 kHz/CR 4/5; see Duty-Cycle Budget), so the target is <1 s connector overhead (ingest -> route -> transmit handoff) on top of airtime, not <1 s end-to-end for maximum-size messages
 
 #### Duty-Cycle Budget (EU_868, LongFast)
 
@@ -274,8 +278,10 @@ datasheet section 4.1.1.7 / AN1200.13, see References).
 For the payload-symbol count, with header IH = 0 (explicit header), CRC on (CRC = 1),
 coding rate CR = 1 (4/5), DE = 0, SF = 11 (so the divisor `4*(SF - 2*DE)` is 44):
 
-    n_payload = 8 + max(ceil((8*PL - 4*SF + 28 + 16*CRC - 20*IH) /
-                  (4*(SF - 2*DE))) * (CR + 4), 0)
+```text
+n_payload = 8 + max(ceil((8*PL - 4*SF + 28 + 16*CRC - 20*IH) /
+              (4*(SF - 2*DE))) * (CR + 4), 0)
+```
 
 **Payload definition:** PL in the formula is the on-air LoRa PHY payload. The 237-byte and
 24-byte figures used elsewhere in this spec are the Meshtastic application `Data.payload`
@@ -284,17 +290,23 @@ section). Meshtastic sends a raw 16-byte packet header (destination, sender, pac
 flags, channel hash, next-hop, relay -- offsets 0x00-0x0F on the mesh-algorithm page in
 References) ahead of the encrypted protobuf-framed `Data` message, so the PHY payload is
 `Data.payload` + 16 B header + a few bytes of protobuf framing. The budget below is
-evaluated on the PHY sizes: PL = 256 B for a full 237-byte part (the maximum Meshtastic
-frame) and PL = 44 B for a 24-byte beacon.
+evaluated on the PHY sizes: PL = 255 B for a full 237-byte part (`MAX_LORA_PAYLOAD_LEN`,
+the largest frame the Meshtastic firmware will transmit -- `RadioInterface.h` /
+`Router::perhapsEncode` reject anything larger) and PL = 44 B for a 24-byte beacon.
 
-Worked evaluations (all four are reproducible from the formula above):
+Worked evaluations (all four are reproducible from the formula above; PL is always the
+PHY payload -- the first two are raw PHY payloads equal in size to the application
+budgets, kept only to show what the figures would be *without* the Meshtastic header, and
+are not frames the prototype sends):
 
-    PL = 237 B (Data.payload only):  n = 8 + ceil(1896 / 44) * 5 = 8 + 44 * 5 = 228 symbols -> 1.87 s
-    PL =  24 B (Data.payload only):  n = 8 + ceil( 192 / 44) * 5 = 8 +  5 * 5 =  33 symbols -> 0.27 s
-    PL = 256 B (full part on air):   n = 8 + ceil(2048 / 44) * 5 = 8 + 47 * 5 = 243 symbols -> 1.99 s
-    PL =  44 B (beacon on air):      n = 8 + ceil( 352 / 44) * 5 = 8 +  8 * 5 =  48 symbols -> 0.39 s
+```text
+PL = 237 B (raw PHY payload, no header):  n = 8 + ceil(1896 / 44) * 5 = 8 + 44 * 5 = 228 symbols -> 1.87 s
+PL =  24 B (raw PHY payload, no header):  n = 8 + ceil( 192 / 44) * 5 = 8 +  5 * 5 =  33 symbols -> 0.27 s
+PL = 255 B (full part on air):            n = 8 + ceil(2040 / 44) * 5 = 8 + 47 * 5 = 243 symbols -> 1.99 s
+PL =  44 B (beacon on air):               n = 8 + ceil( 352 / 44) * 5 = 8 +  8 * 5 =  48 symbols -> 0.39 s
+```
 
-Preamble: (16 + 4.25) symbols = 20.25 x 8.192 ms = 165.9 ms on every frame.
+Preamble: (16 + 4.25) symbols = 20.25 × 8.192 ms = 165.9 ms on every frame.
 
 - One full 237-byte part: ~2.16 s on air (165.9 ms preamble + 243 payload symbols =
   1.99 s). At the ~1.07 kbps link rate the pure `Data.payload` serialization is ~1.77 s;
@@ -305,16 +317,16 @@ Preamble: (16 + 4.25) symbols = 20.25 x 8.192 ms = 165.9 ms on every frame.
 
 Hourly on-air budget under the EU_868 cap:
 
-- 10% duty = 360 s/hour. 120 beacons/hour (120 x 0.56 s = ~67 s) leaves ~293 s for
-  application traffic, i.e. ~135 full 237-byte parts (135 x 2.16 s = ~292 s). Beacons
+- 10% duty = 360 s/hour. 120 beacons/hour (120 × 0.56 s = ~67 s) leaves ~293 s for
+  application traffic, i.e. ~135 full 237-byte parts (135 × 2.16 s = ~292 s). Beacons
   (~67 s) plus target rate (~292 s) total ~359 s, fitting the 360 s cap with ~1 s of margin.
 - 1% duty = 36 s/hour. The 120 beacons alone (~67 s) already exceed 36 s, so beacons plus
   any target rate do NOT fit 1%. No application traffic is available on a 1% band, which is
-  why the prototype is pinned to the sub-band P 10% slot.
+  why the prototype is pinned to the 869.4-869.65 MHz 10% slot.
 
 The ~1.07 kbps figure is the per-transmission link rate from the LongFast preset; the 10%
-duty cycle caps sustained hourly-average application throughput at ~0.07 kbps (135 parts x
-237 B x 8 bit / 3600 s = ~71 bit/s), so "sustained" in the 1% sense is incoherent here --
+duty cycle caps sustained hourly-average application throughput at ~0.07 kbps (135 parts ×
+237 B × 8 bit / 3600 s = ~71 bit/s), so "sustained" in the 1% sense is incoherent here --
 the link is beacon-bound, not throughput-bound.
 
 #### Success Criteria
@@ -329,7 +341,8 @@ the link is beacon-bound, not throughput-bound.
 - Firmware implementation will follow after this design is approved
 - The connector is a CONTROL channel, not a data tunnel
 - All security decisions must be made before hardware deployment
-- The EU/UK sub-band P / 10% duty-cycle figures above are EU-specific; other regions pin their own region code (e.g. US, CN, JP) and the duty-cycle budget must be re-run for that band plan
+- The EU/UK 869.4-869.65 MHz / 10% duty-cycle figures above are EU-specific; other regions pin their own region code (e.g. US, CN, JP) and the duty-cycle budget must be re-run for that band plan
+- Milestone 2 candidate — not scheduled: `docs/specs/tsk-ha5iau/2026-09-02-lora-m2-image-uplink-spike.md`
 
 ## References
 - [Heltec WiFi LoRa 32 (V4)](https://heltec.org/project/wifi-lora-32-v4/)
@@ -337,7 +350,8 @@ the link is beacon-bound, not throughput-bound.
 - [Meshtastic LoRa config (region and preset tables)](https://meshtastic.org/docs/configuration/radio/lora/)
 - [Meshtastic radio settings (EU_868, 869.525 MHz centre, 10% duty)](https://meshtastic.org/docs/overview/radio-settings/)
 - [Meshtastic mesh algorithm (16-byte packet header layout)](https://meshtastic.org/docs/overview/mesh-algo/)
-- [Semtech SX1276 documentation -- datasheet section 4.1.1.7 time-on-air formula; the AN1200.13 "LoRa Modem Designer's Guide" app note and the LoRa Calculator that implements it are distributed from the same page](https://www.semtech.com/products/wireless-rf/lora-connect/sx1276)
+- [Semtech SX1276 product page -- SX1276-7-8-9 datasheet (section 4.1.1.7 time-on-air formula) and the SX1272 LoRa Calculator download](https://www.semtech.com/products/wireless-rf/lora-connect/sx1276)
+- [Semtech SX1272 product page -- hosts "AN1200.13 and AN1200.17: LoRa Modem Design" (the LoRa Modem Designer's Guide, zipped) under Application Notes](https://www.semtech.com/products/wireless-rf/lora-connect/sx1272)
 - [d-central LoRa airtime calculator (used to cross-check the figures above)](https://d-central.tech/lora-airtime-calculator/)
 - [taOS channel_hub Architecture](/tinyagentos/channel_hub/)
 - [channel_hub/message.py](/tinyagentos/channel_hub/message.py)
