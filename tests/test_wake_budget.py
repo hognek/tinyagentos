@@ -171,6 +171,29 @@ class TestFleetWakeInfo:
             assert row["consumed"] == 0
             assert row["state"] == "damaged"
 
+    @pytest.mark.parametrize(
+        "text",
+        ['{"daily": []}', '{"daily": {"a1:global": [1, 2]}}', '{"daily": {"a1:global": 3}}'],
+    )
+    async def test_misshaped_daily_degrades_row_not_fleet(self, tmp_path, text):
+        """Valid JSON whose nested ``daily`` shape is wrong must be a damaged row,
+        not an AttributeError escaping get_fleet_wake_info. Before _read_state
+        validated the nested shape, ``{"daily": []}`` passed the root check and
+        ``.items()`` raised in get_agent_consumption -- the fleet handler only
+        catches WakeBudgetStateError, so the whole report failed."""
+        (tmp_path / "wake_budget.json").write_text(text)
+        cfg = _FakeConfig(
+            wake_budget={"global_default": 2, "per_agent": {}, "per_project": {}},
+            agents=[{"id": "a1", "name": "agent-1", "status": "running"}],
+        )
+        rows = await get_fleet_wake_info(tmp_path, cfg)
+        assert len(rows) == 1
+        assert rows[0]["state"] == "damaged"
+        assert rows[0]["consumed"] == 0
+        assert rows[0]["remaining"] == 0
+        with pytest.raises(WakeBudgetStateError):
+            _read_state(tmp_path / "wake_budget.json")
+
     async def test_partial_read_preserves_consumption_marks_damaged(self, tmp_path, monkeypatch):
         """Defect 3 (tsk-oenmo2 mutating test): the grandparent #2669 code put
         ``get_consumption`` and ``get_next_scheduled_wake`` inside a single

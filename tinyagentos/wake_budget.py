@@ -54,6 +54,22 @@ def _read_state(path: Path) -> dict:
         raise WakeBudgetStateError(
             f"wake_budget.json root is {type(data).__name__}, expected a JSON object"
         )
+    # A well-formed root with a mis-shaped ``daily`` (e.g. ``{"daily": []}``)
+    # would otherwise pass here and raise AttributeError in the readers, which
+    # only catch WakeBudgetStateError -- the fleet report would then fail
+    # instead of degrading the row. Validate the nested shape here so every
+    # reader fails closed the same way.
+    daily = data.get("daily", {})
+    if not isinstance(daily, dict):
+        raise WakeBudgetStateError(
+            f"wake_budget.json 'daily' is {type(daily).__name__}, expected a JSON object"
+        )
+    for key, dates in daily.items():
+        if not isinstance(dates, dict):
+            raise WakeBudgetStateError(
+                f"wake_budget.json 'daily[{key!r}]' is {type(dates).__name__}, "
+                "expected a JSON object"
+            )
     return data
 
 
