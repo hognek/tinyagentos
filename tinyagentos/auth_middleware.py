@@ -5,11 +5,12 @@ import logging
 import re
 import time
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import HTMLResponse, RedirectResponse
 
+from tinyagentos.agent_token_auth import check_agent_identity
 from tinyagentos.auth import AuthStoreCorruptError
 from tinyagentos.device_store import DEVICE_TOKEN_PREFIX
 
@@ -245,6 +246,32 @@ def _is_device_bearer_path(method: str, path: str) -> bool:
     """True only for the exact device-bearer self-service routes. Strict
     method + anchored-regex match; everything else stays session-only."""
     return any(m == method and rx.match(path) for m, rx in _DEVICE_BEARER_PATHS)
+
+
+def _any_route_matches(method: str, path: str, routes) -> bool:
+    """Return True if any registered route matches the given method + path.
+
+    FastAPI path parameters (``{pid}``) are treated as ``[^/]+`` for the
+    purpose of existence checking; ``:path`` parameters (``{name:path}``)
+    are treated as ``.+`` so slash-bearing values match.
+    """
+    for route in routes:
+        route_methods = getattr(route, "methods", None)
+        route_path = getattr(route, "path", None)
+        if route_path is None:
+            continue
+        if route_methods is not None and method.upper() not in {m.upper() for m in route_methods}:
+            continue
+        parts = route_path.split("/")
+        pattern = "^" + "/".join(
+            re.escape(p) if not (p.startswith("{") and p.endswith("}"))
+            else ".+" if p.endswith(":path}")
+            else "[^/]+"
+            for p in parts
+        ) + "$"
+        if re.match(pattern, path):
+            return True
+    return False
 
 # Project-files routes a files_read / files_write token may reach. Reads
 # (list/watch/get/trash-list/stats) require a files_read grant; writes
@@ -567,20 +594,26 @@ class AuthMiddleware(BaseHTTPMiddleware):
             request.state.via = "loopback"
             return await call_next(request)
 
+        auth_header = request.headers.get("authorization", "")
+
+        # --- Credential validation: if a valid credential is presented,
+        # authenticate the user and fall through to routing so unknown
+        # paths resolve to 404 rather than 401.  If the credential is
+        # absent or invalid, we return 401 uniformly (anti-enumeration). ---
+        # 1) Local Bearer token (same-host trust via .auth_local_token)
         # Local token (Authorization: Bearer <token>) is accepted as a
         # substitute for the session cookie. The token lives at
         # {data_dir}/.auth_local_token, readable only by the user
         # running taOS, so possession = same-user-on-the-host trust.
         # Used by scripts and the upcoming CLI; the browser SPA keeps
         # using cookies.
-        auth_header = request.headers.get("authorization", "")
         if auth_header.lower().startswith("bearer "):
             presented = auth_header[7:].strip()
             if presented and auth_mgr.validate_local_token(presented):
                 # A valid local token IS valid auth (same-host trust: the
                 # token file is 0600, possession = the host user). It maps to
                 # the primary/admin user when one exists. Before onboarding
-                # there is no primary user yet — the token still passes (it is
+                # there is no primary user yet -- the token still passes (it is
                 # how scripts/CLI operate pre-setup), but with no user_id, so
                 # current_user-gated routes still 401 while middleware-only
                 # routes proceed as before. (Not failing closed here: the
@@ -599,34 +632,49 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     request.state.agent_name = bound_agent
                 return await call_next(request)
 
-        # Agent-token endpoints (registry feeds + A2A bus proxy + project kanban)
-        # accept a registry JWT as an alternative to the admin session.  This
-        # branch sits AFTER the local-token check on purpose: a local token is
-        # admin-equivalent and must keep its admin semantics on these paths
-        # (taOSmd polls the feeds with it today).  Only a Bearer that is NOT the
-        # local token falls through to here; it is PASSED THROUGH and the route
-        # verifies the registry JWT + scope grant (+ project binding for task
-        # routes).  The allowlist -- the exact _AGENT_TOKEN_PATHS plus the
-        # anchored task-route matcher -- is closed so a registry JWT can never
-        # authenticate any other route (no skeleton key).
-        if (
-            path in _AGENT_TOKEN_PATHS
-            or _is_agent_task_path(request.method, path)
-            or _is_agent_doc_review_path(request.method, path)
-            or _is_agent_notes_path(request.method, path)
-            or _is_agent_lists_path(request.method, path)
-            or _is_agent_canvas_path(request.method, path)
-            or _is_agent_decisions_path(request.method, path)
-            or _is_agent_files_path(request.method, path)
-            or _is_agent_scope_request_path(request.method, path)
-            or _is_container_request_action_path(request.method, path)
-            or _is_agent_container_quota_path(request.method, path)
-        ) and auth_header.lower().startswith("bearer "):
-            request.state.user_id = None
-            request.state.is_admin = False
-            request.state.via = "registry_jwt_candidate"
-            return await call_next(request)
+        # 2) Registry JWT on allowlisted paths (passthrough; route verifies
+        #    JWT + scope grant (+ project binding for task routes).
+        #    The allowlist -- the exact _AGENT_TOKEN_PATHS plus the
+        #    anchored task-route matcher -- is closed so a registry JWT can never
+        #    authenticate any other route (no skeleton key).
+        if auth_header.lower().startswith("bearer "):
+            presented = auth_header[7:].strip()
+            if presented and not presented.startswith(DEVICE_TOKEN_PREFIX):
+                is_allowlisted = (
+                    path in _AGENT_TOKEN_PATHS
+                    or _is_agent_task_path(request.method, path)
+                    or _is_agent_doc_review_path(request.method, path)
+                    or _is_agent_notes_path(request.method, path)
+                    or _is_agent_lists_path(request.method, path)
+                    or _is_agent_canvas_path(request.method, path)
+                    or _is_agent_decisions_path(request.method, path)
+                    or _is_agent_files_path(request.method, path)
+                    or _is_agent_scope_request_path(request.method, path)
+                    or _is_container_request_action_path(request.method, path)
+                    or _is_agent_container_quota_path(request.method, path)
+                )
 
+                if is_allowlisted:
+                    request.state.user_id = None
+                    request.state.is_admin = False
+                    request.state.via = "registry_jwt_candidate"
+                    return await call_next(request)
+
+                # Defer the 401 until after the session-cookie check below: a
+                # stale non-device Bearer header on a known route must not
+                # shadow a valid taos_session (tsk-3hei4g CodeRabbit finding
+                # #3). The final 401 in section 4 still fires when neither
+                # credential authenticates the request. Unknown-route handling
+                # (the 404/401 split for valid registry JWT) is handled
+                # immediately below so it does not interact with session.
+                if not _any_route_matches(request.method, path, request.app.routes):
+                    try:
+                        await check_agent_identity(request)
+                        return JSONResponse({"error": "Not Found"}, status_code=404)
+                    except HTTPException:
+                        return JSONResponse({"error": "Authentication required"}, status_code=401)
+
+        # 3) Device-bearer self-service on carded routes
         # Device-bearer self-service: a scoped device token may pass the auth
         # gate on the carded lock-screen routes. The middleware does NOT
         # resolve the device -- it only lets the Bearer through with
@@ -649,17 +697,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             request.state.via = "device_bearer_candidate"
             return await call_next(request)
 
-        # First boot: no user yet. Browsers go to the setup page; APIs
-        # hard-fail so a stale cached client knows to refresh.
-        if not auth_mgr.is_configured():
-            accept = request.headers.get("accept", "")
-            if "text/html" in accept:
-                return RedirectResponse("/auth/setup", status_code=303)
-            return JSONResponse(
-                {"error": "onboarding_required", "needs_onboarding": True},
-                status_code=401,
-            )
-
+        # 4) Session cookie
         # Check session cookie
         token = request.cookies.get("taos_session")
         if token:
@@ -673,6 +711,17 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 )
                 request.state.via = "session"
                 return await call_next(request)
+
+        # First boot: no user yet. Browsers go to the setup page; APIs
+        # hard-fail so a stale cached client knows to refresh.
+        if not auth_mgr.is_configured():
+            accept = request.headers.get("accept", "")
+            if "text/html" in accept:
+                return RedirectResponse("/auth/setup", status_code=303)
+            return JSONResponse(
+                {"error": "onboarding_required", "needs_onboarding": True},
+                status_code=401,
+            )
 
         # Redirect to login for browsers, 401 for API calls
         accept = request.headers.get("accept", "")
