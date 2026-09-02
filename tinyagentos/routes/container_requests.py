@@ -69,7 +69,7 @@ def _get_policy(request: Request) -> ProvisioningPolicy:
 def _default_image(request: Request) -> str:
     cfg = getattr(request.app.state, "config", None)
     if cfg is not None:
-        return cfg.container_provisioning.get("default_image", "")
+        return getattr(cfg, "container_provisioning", {}).get("default_image", "")
     return ""
 
 
@@ -193,6 +193,7 @@ async def provision_container_request(
 
     backend = LXCBackend()
     safe_cid = re.sub(r"[^a-zA-Z0-9_-]", "-", canonical_id)
+    safe_cid = safe_cid[:43]  # ensure container_name stays <= 63 chars: "taos-agent-" (11) + "-" (1) + safe_cid (max 43) + "-" (1) + id[:8] (8) = 63
     container_name = f"taos-agent-{safe_cid}-{id[:8]}"
 
     try:
@@ -213,12 +214,14 @@ async def provision_container_request(
     project_id = config_json.get("project_id")
     env_result = await backend.set_env(container_name, "TAOS_AGENT_CANONICAL_ID", canonical_id)
     if not env_result.get("success"):
+        await backend.destroy_container(container_name)
         error_msg = env_result.get("output", "set_env failed")
         await store.set_status(id, "failed", error=error_msg)
         raise HTTPException(status_code=500, detail=error_msg)
     if project_id:
         project_env_result = await backend.set_env(container_name, "TAOS_PROJECT_ID", str(project_id))
         if not project_env_result.get("success"):
+            await backend.destroy_container(container_name)
             error_msg = project_env_result.get("output", "set_env failed")
             await store.set_status(id, "failed", error=error_msg)
             raise HTTPException(status_code=500, detail=error_msg)
