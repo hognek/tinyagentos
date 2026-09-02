@@ -84,6 +84,7 @@ WHERE t.status = 'open'
       SELECT 1 FROM json_each(t.labels) je
       JOIN project_tasks bt
         ON 'blocked-on:' || bt.id = je.value
+       AND bt.project_id = t.project_id
       WHERE bt.status NOT IN ('closed', 'cancelled')
   );
 
@@ -229,6 +230,7 @@ class ProjectTaskStore(BaseStore):
             "AND NOT EXISTS ("
             "SELECT 1 FROM json_each(t.labels) je "
             "JOIN project_tasks bt ON 'blocked-on:' || bt.id = je.value "
+            "AND bt.project_id = t.project_id "
             "WHERE bt.status NOT IN ('closed', 'cancelled')"
             ")"
         )

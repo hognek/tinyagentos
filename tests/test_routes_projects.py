@@ -988,3 +988,57 @@ async def test_ready_limit_param_honoured_and_clamped(client):
     assert huge.status_code == 200
     assert len(huge.json()["items"]) <= 500
 
+
+@pytest.mark.asyncio
+async def test_ready_limit_clamp_500_enforced_with_501_tasks(client):
+    """tsk-cifqsh finding 1: with 501+ ready tasks, ?limit=99999 must clamp to 500.
+
+    Previous test only created 10 tasks, so an unclamped limit also returned
+    10 and the assertion passed without enforcing the cap. Seed 501 ready
+    tasks and assert the upper cap returns exactly 500.
+    """
+    pid = (await client.post("/api/projects", json={"name": "A", "slug": "cap"})).json()["id"]
+    for i in range(501):
+        r = await client.post(
+            f"/api/projects/{pid}/tasks", json={"title": f"T{i}"}
+        )
+        assert r.status_code == 200, r.text
+
+    huge = await client.get(
+        f"/api/projects/{pid}/tasks/ready", params={"limit": 99999}
+    )
+    assert huge.status_code == 200
+    assert len(huge.json()["items"]) == 500, (
+        f"?limit=99999 must clamp to 500 even when more than 500 ready tasks exist, "
+        f"got {len(huge.json()['items'])}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ready_blocked_on_label_does_not_match_across_projects(client):
+    """tsk-cifqsh finding 2: a blocked-on:<id> label must only match same-project tasks.
+
+    A task in project A labelled blocked-on:<blocker-in-project-B> must remain
+    ready; the label is meaningless across project boundaries. The schema view
+    join (and its migration twin) must constrain on ``bt.project_id = t.project_id``.
+    """
+    pid_a = (await client.post("/api/projects", json={"name": "A", "slug": "xpa"})).json()["id"]
+    pid_b = (await client.post("/api/projects", json={"name": "B", "slug": "xpb"})).json()["id"]
+
+    blocker_b = (await client.post(
+        f"/api/projects/{pid_b}/tasks", json={"title": "BlockerInB"}
+    )).json()
+
+    foreign_labeled = (await client.post(
+        f"/api/projects/{pid_a}/tasks",
+        json={"title": "ForeignLabeled", "labels": [f"blocked-on:{blocker_b['id']}"]},
+    )).json()
+    assert f"blocked-on:{blocker_b['id']}" in foreign_labeled["labels"]
+
+    resp = await client.get(f"/api/projects/{pid_a}/tasks/ready")
+    ids = [t["id"] for t in resp.json()["items"]]
+    assert foreign_labeled["id"] in ids, (
+        f"cross-project blocked-on:{blocker_b['id']} label must not exclude "
+        f"{foreign_labeled['id']} in project {pid_a}"
+    )
+
