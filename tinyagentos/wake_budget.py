@@ -217,7 +217,40 @@ async def get_fleet_wake_info(data_dir: Path, config: Any, project_task_store: A
         if not agent_id:
             continue
         budget = resolve_budget(agent_id, None, config)
-        consumption = get_agent_consumption(data_dir, agent_id)
+        try:
+            consumption = get_agent_consumption(data_dir, agent_id)
+        except WakeBudgetStateError as exc:
+            logger.warning(
+                "wake budget: skipping fleet row for %s due to damaged state: %s",
+                agent_id, exc,
+            )
+            rows.append({
+                "agent_id": agent_id,
+                "agent_name": agent.get("name", agent_id),
+                "budget": budget,
+                "consumed": 0,
+                "remaining": 0,
+                "next_wake_epoch": None,
+                "state": "damaged",
+            })
+            continue
+        try:
+            next_wake_epoch = get_next_scheduled_wake(data_dir, agent_id, None, config)
+        except WakeBudgetStateError as exc:
+            logger.warning(
+                "wake budget: skipping fleet row for %s due to damaged state: %s",
+                agent_id, exc,
+            )
+            rows.append({
+                "agent_id": agent_id,
+                "agent_name": agent.get("name", agent_id),
+                "budget": budget,
+                "consumed": consumption["scheduled"],
+                "remaining": max(0, budget - consumption["scheduled"]),
+                "next_wake_epoch": None,
+                "state": "damaged",
+            })
+            continue
         remaining = max(0, budget - consumption["scheduled"])
         rows.append({
             "agent_id": agent_id,
@@ -225,6 +258,6 @@ async def get_fleet_wake_info(data_dir: Path, config: Any, project_task_store: A
             "budget": budget,
             "consumed": consumption["scheduled"],
             "remaining": remaining,
-            "next_wake_epoch": get_next_scheduled_wake(data_dir, agent_id, None, config),
+            "next_wake_epoch": next_wake_epoch,
         })
     return rows
