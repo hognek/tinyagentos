@@ -252,6 +252,29 @@
       gap: 10px;
     }
 
+    .tabs {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-left: auto;
+    }
+
+    .tab {
+      font-size: 11px;
+      color: var(--text-tertiary);
+      padding: 4px 8px;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: color 0.12s ease, background 0.12s ease;
+    }
+
+    .tab:hover { color: var(--text-secondary); }
+
+    .tab.active {
+      color: var(--text);
+      background: var(--surface-hover);
+    }
+
     .hint {
       font-size: 11px;
       color: var(--text-tertiary);
@@ -293,6 +316,11 @@
     <div class="bottombar" id="bottombar">
       <div class="hint">&#8593;&#8595; scroll</div>
       <div class="hint">&#9166; select</div>
+      <div class="tabs" id="tabs">
+        <div class="tab active" data-tab="0">Sessions</div>
+        <div class="tab" data-tab="1">Notifs</div>
+        <div class="tab" data-tab="2">Decision</div>
+      </div>
     </div>
   </div>
 
@@ -326,7 +354,7 @@
       ],
     };
 
-    async function api(path) {
+    async function api(path, options) {
       if (MOCK) {
         await new Promise((r) => setTimeout(r, 60));
         if (path === "/api/sessions") return { ok: true, json: () => Promise.resolve(mockSessions) };
@@ -337,7 +365,7 @@
         }
         return { ok: false, status: 404, json: () => Promise.resolve({ error: "not found" }) };
       }
-      const res = await fetch(BASE_URL + path, { credentials: "include" });
+      const res = await fetch(BASE_URL + path, { credentials: "include", ...(options || {}) });
       return res;
     }
 
@@ -354,6 +382,7 @@
     const viewport = document.getElementById("viewport");
     const topbarTitle = document.getElementById("topbar-title");
     const topbarIndicator = document.getElementById("topbar-indicator");
+    const tabs = document.getElementById("tabs");
 
     function createCard(id, renderFn) {
       const el = document.createElement("div");
@@ -439,6 +468,8 @@
       if (index === 0) topbarTitle.textContent = "Sessions";
       else if (index === 1) topbarTitle.textContent = "Notifications";
       else topbarTitle.textContent = "Decision";
+      const tabEls = tabs.querySelectorAll(".tab");
+      tabEls.forEach((t) => t.classList.toggle("active", parseInt(t.dataset.tab, 10) === index));
       renderCurrent();
     }
 
@@ -472,18 +503,23 @@
       }
     }
 
-    function selectOption() {
+    async function selectOption() {
       if (state.screenIndex !== 2 || !state.decision) return;
       const opt = state.decision.options[state.highlightIndex];
       if (!opt) return;
-      api(`/api/decisions/${state.decision.id}/accept`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ option_id: opt.id }),
-      }).catch(() => {});
-      state.decision = null;
-      state.highlightIndex = 0;
-      renderDecision();
+      try {
+        const res = await api(`/api/decisions/${state.decision.id}/accept`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ option_id: opt.id }),
+        });
+        if (!res || !res.ok) return;
+        state.decision = null;
+        state.highlightIndex = 0;
+        renderDecision();
+      } catch (e) {
+        // leave the decision visible so the user can retry
+      }
     }
 
     function clampHighlight() {
@@ -514,7 +550,19 @@
       } else if (e.key === "Enter") {
         e.preventDefault();
         if (state.screenIndex === 2) selectOption();
+      } else if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+        e.preventDefault();
+        const delta = e.key === "ArrowRight" ? 1 : -1;
+        activateCard((state.screenIndex + delta + 3) % 3);
       }
+    });
+
+    tabs.addEventListener("click", (e) => {
+      const tab = e.target.closest(".tab");
+      if (!tab) return;
+      const index = parseInt(tab.dataset.tab, 10);
+      if (Number.isNaN(index)) return;
+      activateCard(index);
     });
 
     viewport.addEventListener("wheel", (e) => {
