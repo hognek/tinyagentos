@@ -458,10 +458,25 @@ class ProjectTaskStore(BaseStore):
         if changed:
             existing = await self.get_task(task_id)
             if existing is not None:
+                strike_count = (
+                    await self._strikes.count_strikes(task_id)
+                    if self._strikes is not None
+                    else 0
+                )
+                latest_strike = (
+                    await self._strikes.latest(task_id)
+                    if self._strikes is not None
+                    else None
+                )
                 await self._publish(
                     existing["project_id"],
                     "task.quarantined",
-                    {"id": task_id, "actor": actor},
+                    {
+                        "id": task_id,
+                        "actor": actor,
+                        "strike_count": strike_count,
+                        "latest_strike": latest_strike,
+                    },
                 )
             # Derive the pre-quarantine status race-free from the committed row
             # rather than a separate pre-read (which would have a TOCTOU gap).

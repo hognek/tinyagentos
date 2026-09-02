@@ -53,7 +53,12 @@ export function useBoardData(projectId: string) {
         case "task.deleted":
           return prev.filter(t => t.id !== p.id);
         case "task.quarantined":
-          return prev.map(t => t.id === p.id ? { ...t, status: "quarantined" } : t);
+          return prev.map(t => t.id === p.id ? {
+            ...t,
+            status: "quarantined",
+            strike_count: typeof p.strike_count === "number" ? p.strike_count : (t.strike_count ?? 0),
+            latest_strike: p.latest_strike ?? t.latest_strike ?? null,
+          } : t);
         case "task.unquarantined":
           return prev.map(t => t.id === p.id ? { ...t, status: "open", claimed_by: null, strike_count: undefined, latest_strike: null } : t);
         default:

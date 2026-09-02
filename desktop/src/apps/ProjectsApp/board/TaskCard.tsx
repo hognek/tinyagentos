@@ -64,6 +64,13 @@ export function TaskCard({ task, onOpen, onMove, justClaimed, draggable, element
                   e.stopPropagation();
                   onUnquarantine(task.id);
                 }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.stopPropagation();
+                    e.preventDefault();
+                    onUnquarantine(task.id);
+                  }
+                }}
                 aria-label={`Unquarantine task ${task.id}`}
               >
                 Unquarantine

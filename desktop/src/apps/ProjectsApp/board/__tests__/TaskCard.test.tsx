@@ -66,4 +66,38 @@ describe("TaskCard", () => {
     render(<TaskCard task={quarantined} onOpen={() => {}} isLead={false} onUnquarantine={() => {}} />);
     expect(screen.queryByRole("button", { name: /Unquarantine/i })).not.toBeInTheDocument();
   });
+
+  it("activates Unquarantine on Enter without opening the card", () => {
+    const quarantined: Task = {
+      ...t,
+      status: "quarantined",
+      strike_count: 3,
+      latest_strike: { id: "s3", task_id: "t1", step: "verification failed", log_tail: "", actor: "system", created_at: 1 },
+    };
+    const unquarantine = vi.fn();
+    const open = vi.fn();
+    render(<TaskCard task={quarantined} onOpen={open} isLead onUnquarantine={unquarantine} />);
+    const btn = screen.getByRole("button", { name: /Unquarantine task t1/i });
+    btn.focus();
+    fireEvent.keyDown(btn, { key: "Enter", bubbles: true });
+    expect(open).not.toHaveBeenCalled();
+    expect(unquarantine).toHaveBeenCalledWith("t1");
+  });
+
+  it("activates Unquarantine on Space without opening the card", () => {
+    const quarantined: Task = {
+      ...t,
+      status: "quarantined",
+      strike_count: 3,
+      latest_strike: { id: "s3", task_id: "t1", step: "verification failed", log_tail: "", actor: "system", created_at: 1 },
+    };
+    const unquarantine = vi.fn();
+    const open = vi.fn();
+    render(<TaskCard task={quarantined} onOpen={open} isLead onUnquarantine={unquarantine} />);
+    const btn = screen.getByRole("button", { name: /Unquarantine task t1/i });
+    btn.focus();
+    fireEvent.keyDown(btn, { key: " ", bubbles: true });
+    expect(open).not.toHaveBeenCalled();
+    expect(unquarantine).toHaveBeenCalledWith("t1");
+  });
 });
