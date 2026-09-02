@@ -261,56 +261,61 @@ called out above.
 - [ ] Security validation: Verify unsigned frames are rejected
 - [ ] Degradation validation: Verify buttons and images are dropped with logged notices
 - [ ] Size budget validation: Verify long replies are chunked into <=237-byte parts. Truncation is NEVER a success path — the guard raises rather than shipping or silently trimming an over-budget frame
-- [ ] Performance testing: LongFast (1.07 kbps) link rate; latency scoped per payload, a full 237-byte part air-times to ~2.0 s at the pinned preset (~166 ms preamble plus ~1.87 s payload, SF11/250 kHz/CR 4/5), so the target is <1 s connector overhead (ingest -> route -> transmit handoff) on top of airtime, not <1 s end-to-end for maximum-size messages
+- [ ] Performance testing: LongFast (1.07 kbps) link rate; latency scoped per payload, a full 237-byte part air-times to ~2.16 s at the pinned preset (~166 ms preamble plus ~1.99 s for the 256-byte PHY payload, SF11/250 kHz/CR 4/5; see Duty-Cycle Budget), so the target is <1 s connector overhead (ingest -> route -> transmit handoff) on top of airtime, not <1 s end-to-end for maximum-size messages
 
 #### Duty-Cycle Budget (EU_868, LongFast)
 
 On-air time of one frame at the pinned preset (SF11, 250 kHz, coding rate 4/5, Meshtastic
 16-symbol preamble). Symbol time `T_sym = 2^SF / BW` = 8.192 ms; DE = 0 because T_sym
 = 8.192 ms < 16 ms so low-data-rate optimisation is not mandatory. Total on-air time:
-`ToA = (n_preamble + 4.25) * T_sym + n_payload * T_sym` (Semtech AN1200.13 form, see
-References).
+`ToA = (n_preamble + 4.25) * T_sym + n_payload * T_sym` (Semtech time-on-air form, SX1276
+datasheet section 4.1.1.7 / AN1200.13, see References).
 
 For the payload-symbol count, with header IH = 0 (explicit header), CRC on (CRC = 1),
-coding rate CR = 1 (4/5), DE = 0, SF = 11:
+coding rate CR = 1 (4/5), DE = 0, SF = 11 (so the divisor `4*(SF - 2*DE)` is 44):
 
     n_payload = 8 + max(ceil((8*PL - 4*SF + 28 + 16*CRC - 20*IH) /
                   (4*(SF - 2*DE))) * (CR + 4), 0)
 
-PL = 237 bytes: n_payload = 8 + ceil(1896 / 44) * 5 = 8 + 43 * 5 = 228 symbols.
-PL = 24 bytes:  n_payload = 8 + ceil(192  / 44) * 5 = 8 + 5  * 5 = 33  symbols.
+**Payload definition:** PL in the formula is the on-air LoRa PHY payload. The 237-byte and
+24-byte figures used elsewhere in this spec are the Meshtastic application `Data.payload`
+budget (see the size-budget bullet in MVP Testing Requirements and the Hard Size Budget
+section). Meshtastic sends a raw 16-byte packet header (destination, sender, packet id,
+flags, channel hash, next-hop, relay -- offsets 0x00-0x0F on the mesh-algorithm page in
+References) ahead of the encrypted protobuf-framed `Data` message, so the PHY payload is
+`Data.payload` + 16 B header + a few bytes of protobuf framing. The budget below is
+evaluated on the PHY sizes: PL = 256 B for a full 237-byte part (the maximum Meshtastic
+frame) and PL = 44 B for a 24-byte beacon.
 
-- One full 237-byte part: ~2.03 s (20.25 preamble symbols = 165.9 ms + 228 payload
-  symbols = 1.87 s). At the ~1.07 kbps link rate the pure payload serialization is ~1.77 s;
-  the duty-cycle cap makes the full ~2.03 s of air time what counts.
-- One status beacon: ~0.44 s, assuming a 24-byte payload (node id, uptime, battery,
-  link-health). The spec does not define a beacon size, so 24 bytes is a pinned prototype
-  assumption.
+Worked evaluations (all four are reproducible from the formula above):
 
-**Payload definition:** the 237-byte and 24-byte figures above are the Meshtastic application
-`Data.payload` budget (see the size-budget bullet in MVP Testing Requirements and the Hard
-Size Budget section). The actual on-air PHY frame adds the 16-byte Meshtastic packet header
-and protobuf framing overhead that rides outside `Data.payload`, so a firmware engineer
-building the LoRA frame must add those bytes to arrive at the full PHY payload size when
-evaluating `n_payload`. Both readings reach the same conclusion — the 10% slot is sufficient,
-the 1% slot is not — but the margin tightens slightly under PHY overhead: beacons consume
-roughly 67 s (120 × ~0.56 s for a ~44-byte PHY frame), leaving approximately 293 s for
-roughly 135 full application parts per hour, for a total of roughly 359 s against the 360 s
-cap.
+    PL = 237 B (Data.payload only):  n = 8 + ceil(1896 / 44) * 5 = 8 + 44 * 5 = 228 symbols -> 1.87 s
+    PL =  24 B (Data.payload only):  n = 8 + ceil( 192 / 44) * 5 = 8 +  5 * 5 =  33 symbols -> 0.27 s
+    PL = 256 B (full part on air):   n = 8 + ceil(2048 / 44) * 5 = 8 + 47 * 5 = 243 symbols -> 1.99 s
+    PL =  44 B (beacon on air):      n = 8 + ceil( 352 / 44) * 5 = 8 +  8 * 5 =  48 symbols -> 0.39 s
+
+Preamble: (16 + 4.25) symbols = 20.25 x 8.192 ms = 165.9 ms on every frame.
+
+- One full 237-byte part: ~2.16 s on air (165.9 ms preamble + 243 payload symbols =
+  1.99 s). At the ~1.07 kbps link rate the pure `Data.payload` serialization is ~1.77 s;
+  the duty-cycle cap makes the full ~2.16 s of air time what counts.
+- One status beacon: ~0.56 s on air (165.9 ms preamble + 48 payload symbols = 0.39 s),
+  assuming a 24-byte `Data.payload` (node id, uptime, battery, link-health). The spec does
+  not define a beacon size, so 24 bytes is a pinned prototype assumption.
 
 Hourly on-air budget under the EU_868 cap:
 
-- 10% duty = 360 s/hour. 120 beacons/hour (~53 s) leaves ~307 s for application traffic,
-   i.e. ~150 full 237-byte parts (~305 s). Beacons (~53 s) plus target rate (~305 s) total
-   ~358 s, fitting the 360 s cap.
-- 1% duty = 36 s/hour. The 120 beacons alone (~53 s) already exceed 36 s, so beacons plus
+- 10% duty = 360 s/hour. 120 beacons/hour (120 x 0.56 s = ~67 s) leaves ~293 s for
+  application traffic, i.e. ~135 full 237-byte parts (135 x 2.16 s = ~292 s). Beacons
+  (~67 s) plus target rate (~292 s) total ~359 s, fitting the 360 s cap with ~1 s of margin.
+- 1% duty = 36 s/hour. The 120 beacons alone (~67 s) already exceed 36 s, so beacons plus
   any target rate do NOT fit 1%. No application traffic is available on a 1% band, which is
   why the prototype is pinned to the sub-band P 10% slot.
 
 The ~1.07 kbps figure is the per-transmission link rate from the LongFast preset; the 10%
-duty cycle caps sustained hourly-average throughput at ~0.07 kbps (~135 parts/hour at
-~2.16 s on-air per application part under PHY overhead), so "sustained" in the 1% sense
-is incoherent here -- the link is beacon-bound, not throughput-bound.
+duty cycle caps sustained hourly-average application throughput at ~0.07 kbps (135 parts x
+237 B x 8 bit / 3600 s = ~71 bit/s), so "sustained" in the 1% sense is incoherent here --
+the link is beacon-bound, not throughput-bound.
 
 #### Success Criteria
 1. **Functional**: Both radio modules connect and exchange messages
@@ -331,7 +336,9 @@ is incoherent here -- the link is beacon-bound, not throughput-bound.
 - [Meshtastic Documentation](https://meshtastic.org/)
 - [Meshtastic LoRa config (region and preset tables)](https://meshtastic.org/docs/configuration/radio/lora/)
 - [Meshtastic radio settings (EU_868, 869.525 MHz centre, 10% duty)](https://meshtastic.org/docs/overview/radio-settings/)
-- [LoRa time-on-air formula (Semtech AN1200.13)](https://www.semtech.com/products/wireless-rf/lora-software/sx1301sip)
+- [Meshtastic mesh algorithm (16-byte packet header layout)](https://meshtastic.org/docs/overview/mesh-algo/)
+- [Semtech SX1276 documentation -- datasheet section 4.1.1.7 time-on-air formula; the AN1200.13 "LoRa Modem Designer's Guide" app note and the LoRa Calculator that implements it are distributed from the same page](https://www.semtech.com/products/wireless-rf/lora-connect/sx1276)
+- [d-central LoRa airtime calculator (used to cross-check the figures above)](https://d-central.tech/lora-airtime-calculator/)
 - [taOS channel_hub Architecture](/tinyagentos/channel_hub/)
 - [channel_hub/message.py](/tinyagentos/channel_hub/message.py)
 - [channel_hub/router.py](/tinyagentos/channel_hub/router.py)
