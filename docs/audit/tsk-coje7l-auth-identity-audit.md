@@ -211,12 +211,13 @@ plausible failure here).
 ---
 
 ### Finding 7 — Latent: grant `expires_at` feed filter relies on lexicographic string comparison
-**Severity:** Low (latent). **Locations:** `agent_grants_store.py:218-221`
+**Severity:** Low (latent). **Locations:** `agent_grants_store.py:197-212`
 (`list_active_grants`, polled by @taOSmd), `agent_token_auth.py:48-66`
 (`_grant_unexpired`).
 
 `list_active_grants` filters live grants with SQL
-`expires_at > ?` against `datetime.now(timezone.utc).isoformat()`. That is sound
+`expires_at IS NULL OR expires_at > ?` against
+`datetime.now(timezone.utc).isoformat()`. That is sound
 **only** if every stored `expires_at` is canonical UTC ISO-8601 with offset
 `+00:00`. `add_grant` (agent_grants_store.py:133) stores the caller-supplied
 `expires_at` **as-is**, with no normalization, while the Agent-as-a-model store
@@ -279,12 +280,13 @@ path.
   agent-supplied `effective_project` fallback (agent_auth_requests.py:441-447,
   535). `set(_ALLOWED_SCOPES) == set(VALID_SCOPES)` is asserted by
   `tests/test_agent_internal_mint.py:24`.
-- **`bump_token_min_iat` is monotonic** via `MAX(token_min_iat, ?)` (auth.py:993),
+- **`bump_token_min_iat` is monotonic** via `MAX(token_min_iat, ?)` (agent_registry_store.py:993),
   so rotation can only raise the floor — a downgrade attempt is a no-op.
 - **`is_console_origin` fails closed** by the *presence* of any forwarding
-  header, never by parsing them; paired with the PIN limiter keyed by user id
+  header, never by parsing them (auth.py:255-279, with the fail-closed branch at
+  line 274); paired with the PIN limiter keyed by user id
   (not the shared loopback address), a flooded-username attack cannot reset the
-  escalation tier (auth.py:360-365).
+  escalation tier.
 
 ## 5. Test-coverage assessment
 
