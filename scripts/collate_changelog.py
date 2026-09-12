@@ -39,10 +39,26 @@ SECTION_ORDER = ["### Added", "### Changed", "### Fixed", "### Removed", "### Se
 
 
 def parse_fragment(path: Path) -> dict[str, list[str]]:
-    """Return {section: [bullet lines]} for one fragment file."""
+    """Return {section: [bullet lines]} for one fragment file.
+
+    Refuses with ValueError if the fragment starts with a YAML frontmatter
+    delimiter (---). The fragment author must strip the frontmatter block and
+    keep only the markdown bullets.
+    """
     sections: dict[str, list[str]] = {}
     current = DEFAULT_SECTION
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    text = path.read_text(encoding="utf-8")
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if not line.strip():
+            continue
+        if line == "---":
+            raise ValueError(
+                f"{path.name}: fragment starts with YAML frontmatter (---); "
+                "remove the frontmatter block and keep only markdown bullets"
+            )
+        break
+    for raw in text.splitlines():
         line = raw.rstrip()
         if not line.strip():
             continue
@@ -90,7 +106,11 @@ def main(argv: list[str]) -> int:
     if not FRAGMENT_DIR.is_dir():
         print("collate-changelog: no changelog.d/ directory, nothing to do")
         return 0
-    merged, consumed = collect(FRAGMENT_DIR)
+    try:
+        merged, consumed = collect(FRAGMENT_DIR)
+    except ValueError as e:
+        print(f"collate-changelog: {e}", file=sys.stderr)
+        return 1
     if not consumed:
         print("collate-changelog: no fragments, nothing to do")
         return 0

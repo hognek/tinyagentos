@@ -536,6 +536,67 @@ class TestBroadChangelogRequired:
         assert len(failures) == 1
 
 
+class TestChangelogFragmentShape:
+    """A changelog fragment must be markdown bullets only.
+
+    beta.52 leaked 21 lines of YAML frontmatter into CHANGELOG.md because the
+    doc gate never inspected fragment content. These tests pin the shape rule:
+    frontmatter (--- delimiters or title: keys) and non-bullet prose must fail.
+    """
+
+    def test_fragment_with_yaml_frontmatter_fails_shape_check(self, tmp_path: Path):
+        """RED: a fragment with YAML frontmatter must fail the doc gate."""
+        frag_dir = tmp_path / "changelog.d"
+        frag_dir.mkdir()
+        (frag_dir / "3654ad85b.md").write_text(
+            "---\n"
+            'title: "Implement taosgo app-join endpoint with 2FA gate integration"\n'
+            "summary: |\n"
+            "  Adds the taosgo app-join endpoint with 2FA gate integration.\n"
+            "---\n"
+            "- Added taosgo app-join endpoint with 2FA gate integration.\n",
+            encoding="utf-8",
+        )
+        failures = dg.check_changelog_fragment_shape(tmp_path, {})
+        assert len(failures) == 1
+        assert "3654ad85b.md" in failures[0]
+
+    def test_clean_fragment_passes_shape_check(self, tmp_path: Path):
+        """GREEN: a well-formed bullet-only fragment passes."""
+        frag_dir = tmp_path / "changelog.d"
+        frag_dir.mkdir()
+        (frag_dir / "good-frag.md").write_text(
+            "- Added a new feature.\n",
+            encoding="utf-8",
+        )
+        failures = dg.check_changelog_fragment_shape(tmp_path, {})
+        assert failures == []
+
+    def test_fragment_with_title_key_fails_shape_check(self, tmp_path: Path):
+        """A fragment containing a title: key must fail even without ---."""
+        frag_dir = tmp_path / "changelog.d"
+        frag_dir.mkdir()
+        (frag_dir / "bad.md").write_text(
+            "title: leaked frontmatter\n"
+            "- A bullet.\n",
+            encoding="utf-8",
+        )
+        failures = dg.check_changelog_fragment_shape(tmp_path, {})
+        assert len(failures) == 1
+        assert "bad.md" in failures[0]
+
+    def test_fragment_with_section_heading_passes_shape_check(self, tmp_path: Path):
+        """Section headings are valid in fragments."""
+        frag_dir = tmp_path / "changelog.d"
+        frag_dir.mkdir()
+        (frag_dir / "sectioned.md").write_text(
+            "### Fixed\n\n- Fixed a bug.\n",
+            encoding="utf-8",
+        )
+        failures = dg.check_changelog_fragment_shape(tmp_path, {})
+        assert failures == []
+
+
 class TestRequiredSections:
     """RED 1 and RED 2: content assertion for Layer A.
 
