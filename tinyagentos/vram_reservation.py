@@ -78,11 +78,14 @@ class VramReservationManager:
         probe: "Callable[[], tuple[int, int] | None] | None" = None,
     ) -> None:
         self._lock = asyncio.Lock()
-        # Separate threading.Lock for synchronous sweep mutations — protects
-        # _pending / _reserved_vram_mb against concurrent available_vram()/stats()
-        # calls dispatched via asyncio.to_thread (M3).  The asyncio lock serializes
-        # the reserve check→probe→commit path; this thread-lock serializes the
-        # sweep itself so dict-changed-during-iteration cannot corrupt state.
+        # threading.Lock guarding ALL three _pending / _reserved_vram_mb
+        # mutators — the sweep, release(), and the commit write in reserve() —
+        # so a sweep iterating _pending (dispatched via asyncio.to_thread from
+        # available_vram()/stats()) cannot race a concurrent release/reserve
+        # from another thread (M3).  The asyncio lock serializes the
+        # reserve check→probe→commit path; this thread-lock serializes the
+        # sweep + release + commit against each other so dict-changed-during-
+        # iteration and lost updates cannot corrupt state.
         self._thread_lock = threading.Lock()
         self._reserved_vram_mb: int = 0
         self._pending: dict[str, VramReservation] = {}
@@ -124,7 +127,7 @@ class VramReservationManager:
         async with self._lock:
             # Drop hung installers before admission so stale holds cannot
             # permanently starve later pulls.
-            self._sweep_stale_unlocked()
+            self._sweep_stale_locked()
 
             # Probe in a thread: nvidia-smi is a blocking subprocess and this
             # runs on a request hot path while holding the lock.
@@ -160,8 +163,12 @@ class VramReservationManager:
                 caller=caller,
                 created_at=time.time(),
             )
-            self._reserved_vram_mb += vram_mb
-            self._pending[reservation_id] = reservation
+            # Guard the commit against the sweep (M3): a sweep running in a
+            # to_thread worker iterates _pending, so this write must take the
+            # same thread-lock release()/sweep use or it can race them.
+            with self._thread_lock:
+                self._reserved_vram_mb += vram_mb
+                self._pending[reservation_id] = reservation
 
             logger.info(
                 "vram-reservation: granted %d MiB to %r (id=%s, "
@@ -177,16 +184,17 @@ class VramReservationManager:
         Returns ``True`` if a reservation was actually released,
         ``False`` if *reservation_id* was unknown or already released.
         """
-        reservation = self._pending.pop(reservation_id, None)
-        if reservation is not None:
-            self._reserved_vram_mb -= reservation.vram_mb
-            logger.debug(
-                "vram-reservation: released %d MiB for %r (id=%s, "
-                "total reserved=%d MiB)",
-                reservation.vram_mb, reservation.caller,
-                reservation_id, self._reserved_vram_mb,
-            )
-            return True
+        with self._thread_lock:
+            reservation = self._pending.pop(reservation_id, None)
+            if reservation is not None:
+                self._reserved_vram_mb -= reservation.vram_mb
+                logger.debug(
+                    "vram-reservation: released %d MiB for %r (id=%s, "
+                    "total reserved=%d MiB)",
+                    reservation.vram_mb, reservation.caller,
+                    reservation_id, self._reserved_vram_mb,
+                )
+                return True
         return False
 
     def sweep_stale(self, now: float | None = None) -> int:
@@ -196,7 +204,7 @@ class VramReservationManager:
         from :meth:`reserve` and the sync accessors; exposed for tests and
         optional background sweeps.
         """
-        return self._sweep_stale_unlocked(now=now)
+        return self._sweep_stale_locked(now=now)
 
     # ── read-only accessors ─────────────────────────────────────────
 
@@ -223,7 +231,7 @@ class VramReservationManager:
         path should already have been admitted fail-open by :meth:`reserve`
         (a deny message never reports these zeros as real capacity).
         """
-        self._sweep_stale_unlocked()
+        self._sweep_stale_locked()
         probe = self._probe_vram()
         if probe is None:
             return 0, 0
@@ -233,7 +241,7 @@ class VramReservationManager:
 
     def stats(self) -> dict:
         """Return a snapshot for monitoring / debug endpoints."""
-        self._sweep_stale_unlocked()
+        self._sweep_stale_locked()
         probe = self._probe_vram()
         free_mb, total_mb = probe if probe is not None else (0, 0)
         return {
@@ -248,11 +256,14 @@ class VramReservationManager:
 
     # ── internal ────────────────────────────────────────────────────
 
-    def _sweep_stale_unlocked(self, now: float | None = None) -> int:
-        """Drop reservations whose age exceeds the TTL. Guarded by ``_thread_lock``
-        to prevent dict-changed-during-iteration / lost updates when called from
-        sync accessors (``available_vram``, ``stats``) dispatched via
-        ``asyncio.to_thread`` alongside other concurrent sweeps (M3)."""
+    def _sweep_stale_locked(self, now: float | None = None) -> int:
+        """Drop reservations whose age exceeds the TTL, under ``_thread_lock``.
+
+        The lock excludes all three _pending/_reserved_vram_mb mutators —
+        the sweep itself, ``release()``, and the commit write in ``reserve()``
+        — so a sweep iterating ``_pending`` cannot race a concurrent
+        ``release()``/``reserve()`` from another thread (M3, taOS #1992).
+        """
         if self._ttl_seconds <= 0:
             return 0
 

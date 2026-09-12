@@ -143,26 +143,93 @@ class TestM3ThreadUnsafeSweep:
         )
 
 
-# ── M2: probe failure → 999_999 — test the fail-closed normaliser directly ───
+# ── M2: probe failure must not reverse the fail-open/fail-closed split ──────
 
-class TestM2ProbeFailureFakeVRAM:
-    """When the nvidia-smi probe fails or returns zero, discovery must NOT
-    inflate capacity to 999_999. The fail-closed rule is `normalise_vram_probe`
-    (a module-level helper so the behaviour is unit-testable)."""
+class TestM2ProbeFailure:
+    """`normalise_vram_probe(free_mb, total_mb)` must distinguish "probe
+    unavailable" (total == 0 → fail OPEN) from "probe ran, 0 free" (total > 0,
+    free == 0 → fail CLOSED). Collapsing both to 0 permanently refuses every
+    estimated_memory task on non-NVIDIA hosts; collapsing both to 999_999
+    re-inflates capacity on a genuinely full GPU."""
 
-    def test_normalise_positive_probe_passthrough(self):
-        """A real positive probe value is passed through unchanged."""
+    def test_probe_unavailable_fails_open(self):
+        """total <= 0 is *unknown* (no nvidia-smi) — must NOT block scheduling."""
         from tinyagentos.scheduler.discovery import normalise_vram_probe
-        assert normalise_vram_probe(8000) == 8000
+        assert normalise_vram_probe(0, 0) == 999_999
+        assert normalise_vram_probe(-1, 0) == 999_999
 
-    def test_normalise_zero_probe_fails_closed(self):
-        """A zero probe must map to 0, not an optimistic huge value."""
+    def test_probe_ran_zero_free_fails_closed(self):
+        """total > 0 and free <= 0 is *known full* — must refuse admission."""
         from tinyagentos.scheduler.discovery import normalise_vram_probe
-        assert normalise_vram_probe(0) == 0
+        assert normalise_vram_probe(0, 8192) == 0
+        assert normalise_vram_probe(-1, 8192) == 0
 
-    def test_normalise_negative_probe_fails_closed(self):
-        """A negative (failed) probe must map to 0, not 999_999."""
+    def test_positive_probe_passthrough(self):
         from tinyagentos.scheduler.discovery import normalise_vram_probe
-        assert normalise_vram_probe(-1) == 0
-        # Explicitly assert the old buggy value is never produced.
-        assert normalise_vram_probe(-1) != 999_999
+        assert normalise_vram_probe(8000, 8192) == 8000
+
+
+class TestM2CanAcceptFailOpen:
+    """The behaviour that actually regressed: `_gpu_vram_probe` feeding
+    `Resource.can_accept()` on a host whose probe (probe fails → 0,0) cannot run.
+
+    With the buggy all-zero collapse, every `estimated_memory_mb > 0` task is
+    refused on any GPU resource whose nvidia-smi is absent. `can_accept` must
+    admit the task when the probe is UNAVAILABLE (fail open), and refuse only
+    when the probe RAN and measured insufficient free VRAM (fail closed)."""
+
+    def _resource(self, memory_probe):
+        from tinyagentos.scheduler.resource import Resource, Tier
+        from tinyagentos.scheduler.types import ResourceSignature
+
+        sig = ResourceSignature(
+            platform="linux", runtime="native", runtime_version="",
+        )
+        return Resource(
+            name="gpu-rocm",
+            signature=sig,
+            concurrency=1,
+            get_capabilities=lambda: {"llm-chat"},
+            backend_lookup=lambda _cap: None,
+            tier=Tier.GPU,
+            memory_probe=memory_probe,
+        )
+
+    @staticmethod
+    def _task(estimated_memory_mb: int):
+        from tinyagentos.scheduler.types import Task, Capability
+
+        async def payload(_res):
+            return None
+
+        return Task(
+            capability=Capability.LLM_CHAT,
+            payload=payload,
+            preferred_resources=[],
+            estimated_memory_mb=estimated_memory_mb,
+        )
+
+    def test_probe_unavailable_does_not_block(self):
+        """Probe returns (0,0) → normalise → 999_999 → can_admit admits."""
+        from tinyagentos.scheduler.discovery import normalise_vram_probe
+
+        def probe():
+            free, total = 0, 0
+            return normalise_vram_probe(free, total)
+
+        res = self._resource(probe)
+        ok, _why = res.can_admit(self._task(4096))
+        assert ok, "probe-unavailable host must fail OPEN, not refuse every task"
+
+    def test_probe_zero_free_blocks(self):
+        """Probe RAN and measured 0 free → normalise → 0 → can_admit refuses."""
+        from tinyagentos.scheduler.discovery import normalise_vram_probe
+
+        def probe():
+            free, total = 0, 16384
+            return normalise_vram_probe(free, total)
+
+        res = self._resource(probe)
+        ok, why = res.can_admit(self._task(4096))
+        assert not ok, "a genuinely full GPU must refuse a 4 GB task"
+        assert why and "insufficient memory" in why
