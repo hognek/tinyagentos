@@ -14,6 +14,7 @@
   - Updated mac/build/sparkle_sign.sh
   - Updated mac/launcher/Sources/taOSLauncher/Resources/Info.plist.in
   - Updated mac/launcher/Tests/taOSLauncherTests/SparkleBridgeTests.swift
+  - S2-23: Mac updater is a no-op - security fixes never reached users if feed domain not owned by project
 
 - Added fetch_sparkle.sh script to fetch and verify Sparkle 2.6.0 framework
 
@@ -23,6 +24,3 @@
 - Added mac/build/checksums/sparkle-2.6.0.sha256
 
 - Updated mac/build/build.sh to fetch Sparkle.framework prior to bundling
-
-S2-23: Mac updater is a no-op - security fixes never reached users
-if feed domain not owned by project

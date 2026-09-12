@@ -42,26 +42,24 @@ def parse_fragment(path: Path) -> dict[str, list[str]]:
     """Return {section: [bullet lines]} for one fragment file.
 
     Refuses with ValueError if the fragment starts with a YAML frontmatter
-    delimiter (---). The fragment author must strip the frontmatter block and
-    keep only the markdown bullets.
+    delimiter (---) or a ``title:`` key. The fragment author must strip the
+    frontmatter block and keep only the markdown bullets.
     """
     sections: dict[str, list[str]] = {}
     current = DEFAULT_SECTION
     text = path.read_text(encoding="utf-8")
+    first = True
     for raw in text.splitlines():
         line = raw.rstrip()
         if not line.strip():
             continue
-        if line == "---":
-            raise ValueError(
-                f"{path.name}: fragment starts with YAML frontmatter (---); "
-                "remove the frontmatter block and keep only markdown bullets"
-            )
-        break
-    for raw in text.splitlines():
-        line = raw.rstrip()
-        if not line.strip():
-            continue
+        if first:
+            first = False
+            if line == "---" or line.startswith("title:"):
+                raise ValueError(
+                    f"{path.name}: fragment starts with YAML frontmatter ({line}); "
+                    "remove the frontmatter block and keep only markdown bullets"
+                )
         if line.startswith("### "):
             current = line.strip()
             continue
