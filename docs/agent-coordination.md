@@ -154,21 +154,37 @@ to verify it before considering onboarding finished. When you move hosts, confir
 the token works on the new host BEFORE decommissioning the old one. Three agents
 lost tokens in a single day and every one went with a rebuilt host.
 
-Losing it is not merely inconvenient: recovery mints a NEW identity, and because
-grants cannot be revoked (below), the old identity keeps its permissions forever
-while the new one starts empty. One agent spent an evening convinced it lacked a
+Losing it is not merely inconvenient: recovery mints a NEW identity with no
+grants, while the old identity keeps its own unless you revoke them (below) or
+revoke the identity itself. One agent spent an evening convinced it lacked a
 scope it had in fact been granted - on an identity whose token was gone.
 
-**Scope grants are permanent.** `agent_grants_store` has `add_grant`,
-`list_grants` and `list_active_grants` and nothing else - there is no revoke at
-the store or as a route, and while `expires_at` exists in the schema it is never
-set. Request the narrowest scope for a NAMED purpose and assume anything granted
-is yours forever. Tracked as jaylfc/taOS#2148.
+**Scope grants are revocable, per scope and per project.** `agent_grants_store`
+gained `revoke_grant(canonical_id, scope, project_id=...)` and
+`revoke_all_for_project(canonical_id, project_id)` (taOS #2148), and
+`POST /api/projects/{project_id}/members/revoke-agent` is the owner-or-admin
+route over them. Body: `{canonical_id, scopes: [...]}`; an omitted or empty
+`scopes` means every grant the agent holds on that project. A revoke removes
+exactly that one key, so the agent's other scopes and its grants on other
+projects survive, and the identity itself is untouched
+(`agent_registry_store.revoke` is still the whole-identity kill). The response
+reports the store's answer, not the request: `revoked_scopes` plus the read-back
+`active_scopes`. The revoke is audit-logged as `member.grants_revoked` on the
+project activity feed, and when no project-scoped grant is left, the agent's
+member row goes with it. `expires_at` is still never populated - a grant is
+revoked, not time-boxed - though an expired value is already refused at check
+time.
 
-**`assign-agent` with an empty scope list is NOT a revocation.** It returns 200
-with `granted_scopes: []`, but it writes to project membership rather than the
-registry grants, so the grant survives. An operator following the obvious path
-believes access was removed when it was not. Do not rely on it.
+**`assign-agent`'s scope list is authoritative, not a delta.** It returns 200
+with `granted_scopes` echoing the request and, since taOS #2148, reconciles the
+registry grants bound to that project to exactly the list you pass: a grant on
+that project you did not name - including all of them, when you pass
+`scopes: []` - is revoked. `revoked_scopes` reports what was actually removed
+and `active_scopes` is read back from the store, so the response can no longer
+claim a revocation it did not perform; a reconciliation that does not land is a
+500 rather than a success. Grants on the agent's other projects are not touched.
+(Before #2148 this route was additive: `scopes: []` answered
+`{"granted_scopes": []}` while the grant stayed live.)
 
 **The SSE stream proxy requires a channel.** `GET /api/a2a/bus/stream` returns
 400 without `?channel=<thread>`; there is no all-threads mode yet, so watching
@@ -350,6 +366,112 @@ Read through the controller with your own registry token, not the raw bus port:
 
 If the bus is silent, check `channel_known` and your cursor before concluding nobody is
 talking. A read that returns `200` with nothing is the failure mode that looks like peace.
+
+## Shared-GPU leases (`/api/a2a/gpu/*`)
+
+Two agents on one host share a physical GPU and must not silently co-load past
+its VRAM (taOS #893). Coordinate over the bus with a one-line text protocol, and
+use the controller's endpoints so the protocol is admission-checked and backed by
+a real lease:
+
+```text
+[GPU CLAIM] node=<host> holder=@you vram=~9.4gb reason=... eta=... expires=<unix ts>
+[GPU RELEASE] node=<host> holder=@you
+[GPU REQUEST] node=<host> need=~6gb
+```
+
+| Method | Path | Scope | Purpose |
+|--------|------|-------|---------|
+| GET  | `/api/a2a/gpu/check`   | `a2a_receive` | Fold the channel's open claims + the node's live VRAM and answer "may I load?" |
+| POST | `/api/a2a/gpu/claim`   | `a2a_send`    | Admission-checked claim: cluster lease (TTL) + `[GPU CLAIM]` post |
+| POST | `/api/a2a/gpu/release` | `a2a_send`    | Release the lease + `[GPU RELEASE]` post |
+| POST | `/api/a2a/gpu/request` | `a2a_send`    | Post `[GPU REQUEST]` when blocked |
+| POST | `/api/a2a/gpu/renew`   | `a2a_send`    | Keep-alive: extend a lease TTL |
+
+Do not post a claim line directly to the bus and skip `/claim`: only the endpoint
+checks admission (another holder's claim, the node's free VRAM, and the cluster's
+own lease table) before the line is posted. A line posted by hand is recorded but
+enforces nothing.
+
+The **local** half of a claim — the cluster lease with its TTL, renewal and
+rollback — applies to nodes this controller knows as cluster workers. A node that
+resolves to no worker is coordinated over the bus alone: CLAIM still admission-
+checks the channel and posts the line, but there is no local reservation to
+expire, so the bus-side `[GPU RELEASE]` is the only thing that frees it. The
+endpoint reports a node it cannot measure as `vram_verified: false` rather than
+as free.
+
+Rules that matter when you use it:
+
+- **CHECK before load, always.** It folds the channel's `[GPU CLAIM]`/`[GPU
+  RELEASE]` history into the claims still open, folds in this controller's own
+  GPU leases (which the bus never shows), and subtracts both from the node's
+  live free VRAM. A node claimed by ANY other holder is blocked even if the card
+  looks free, because "claimed" means a load is in flight.
+- **Holder identity is the bus author, not the `holder=` text.** The body is
+  caller-controlled; `from` is what the bus authenticated (see *Posting to the
+  coordination bus*). The `holder=` field is a readable label for humans.
+- **An agent always acts as itself.** `from` is the agent's registry canonical
+  id, the body's `holder=` is its registry handle, and the caller's own registry
+  JWT is forwarded to the bus exactly as on `/api/a2a/bus/send`. A `holder`
+  field in the request body is ignored for agent callers.
+- **Fail closed.** If the channel cannot be read, `check` and `claim` return
+  `503` rather than reporting the node free: an unreadable channel looks exactly
+  like "nobody has claimed anything". An agent's registry JWT is presented on
+  that read too, so a bus that gates reads does not look like a dead channel.
+- **Claim is both halves or neither.** The cluster lease is rolled back if the
+  bus post fails, so a peer that only watches the bus never disagrees with the
+  local scheduler about who holds the node. Release is ordered the same way: the
+  line is posted BEFORE the local lease is freed, so a failed post leaves the
+  lease intact rather than freeing a node peers still see as claimed.
+- **An operator's release is attributed to the holder whose claim it closes.**
+  A lease taken through `/claim` can also be freed by an explicit `lease_id` —
+  by its holder, or by an operator (`_may_act_on`). The node-scoped form (no
+  `lease_id`) only ever selects the caller's OWN lease: a body `holder` is
+  display text and never an identity, so it cannot be used to select someone
+  else's lease. Since a bus claim is keyed
+  on its **author**, the operator's `[GPU RELEASE]` is posted as the freed
+  holder, not as the operator (an admin session may set an explicit `from`, see
+  *Posting to the coordination bus*); the response reports both, `holder` (who
+  acted) and `released_holder` (whose claim the line closes). A bus that
+  authenticates senders refuses the substitution, and because the line is still
+  posted before the local lease is freed, the override then fails loudly
+  (`502`) with the lease intact rather than leaving the two views disagreeing.
+- **Keep-alive is the TTL, not a promise.** A cluster-worker lease expires after
+  `ttl_seconds` (default 300, capped at 3600) unless renewed via `/renew`; a
+  crashed or idle holder therefore frees the node without anyone releasing it.
+  An unbounded TTL would let one agent take the shared GPU permanently, so the
+  cap is enforced by the request model.
+- **A claim carries its own expiry, and the fold honours it.** `/claim` publishes
+  `expires=<unix ts>` on the line — the backing lease's expiry when the node is a
+  cluster worker, else the TTL it was asked for — rounded up, so a published
+  expiry can never precede the reservation it describes. `/renew` reposts the
+  claim as it extends the lease, on the channel the claim was made on (the
+  channel is an input to the *claim*, never to its renewal); if that repost
+  fails, the local extension is rolled back, so peers and this controller still
+  agree and the holder can retry. A fold drops a claim whose published expiry has
+  passed, exactly as the cluster lease's TTL frees its reservation, so a holder
+  that crashed or stopped keeping alive no longer blocks the card until its
+  claim ages out of the fold window. Keep-alive therefore means re-POST `/claim`
+  or `/renew` while you hold the card; a claim posted by hand without an
+  `expires=` has no TIME-based expiry — it is closed by a RELEASE — but it is
+  still subject to the fold window below, so a long-lived hand-posted claim has
+  to be reposted periodically like any other. That is what the interim protocol
+  in #893 relies on.
+- **A claim is only visible inside the channel fold window** (the newest 500
+  messages). For a load that outlives the chatter around it, re-POST `/claim`
+  periodically: it is idempotent (it extends the lease and reposts the line,
+  which the fold treats as a replacement, never a second claim).
+- **`node` labels** resolve to a cluster worker by name, by its URL host, or to
+  the local controller for `local`/`localhost`/this hostname. A node this
+  controller does not know is bus-governed only (no local lease), and its CHECK
+  is reported as `vram_verified: false` rather than as free.
+- The channel defaults to `gpu`; point every agent at the same thread with
+  `TAOS_A2A_GPU_CHANNEL`.
+
+`check` returns `admitted`, `blockers`, `free_mb`, `capacity_mb`, `claimed_mb`,
+`vram_verified`, `reason`, and the `claims` it folded. `claim` returns the
+`lease_id` (when the node is a cluster worker) and the exact `line` posted.
 
 ## Bus restarts during a controller update
 
@@ -560,7 +682,10 @@ purely from a matching active grant. An already-registered agent is added to a
 further project via `POST /api/projects/{project_id}/members/assign-agent`
 (admin/owner gated) or by redeeming an invite whose handle collides with an
 active identity (the existing canonical_id and token are reused instead of
-409ing).
+409ing). The reverse is
+`POST /api/projects/{project_id}/members/revoke-agent` (taOS #2148), which drops
+the agent's grants on that ONE project and leaves its other projects, its other
+scopes and the identity itself standing.
 
 Deferred binding and an existing active handle are mutually exclusive. Approving
 an auth-request with `defer_binding` mints the token and grants UNBOUND, so the
@@ -1452,6 +1577,14 @@ runs: `POST` (create) requires the narrower `project_tasks_create` grant, while
 worker lane is therefore refused on `POST` (it lacks the create grant, `403`)
 and authorised on `GET`. `tests/test_routes_task_checklist.py` pins this scope
 split directly, not behind an xfail.
+
+Shared-GPU leases (taOS #893). `GET /api/a2a/gpu/check` (scope `a2a_receive`)
+and `POST /api/a2a/gpu/{claim,release,request,renew}` (scope `a2a_send`). The
+route resolves the acting identity from the token and forces the bus `from` to
+the identity the token proves, so an agent can only claim/release GPU capacity
+for itself. See *Shared-GPU leases (`/api/a2a/gpu/*`)* above for the protocol,
+the admission rules, and why CHECK/CLAIM fail closed when the channel is
+unreadable.
 
 Container provisioning request (P1 + P2, agent-container-provisioning spec):
 
