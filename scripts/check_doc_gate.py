@@ -258,6 +258,37 @@ def check_required_sections(repo_root: Path, config: dict) -> list[str]:
     return failures
 
 
+def check_changelog_fragment_shape(repo_root: Path, config: dict) -> list[str]:
+    """Layer A: every ``changelog.d/*.md`` fragment must contain only markdown
+    bullets (``- ``), section headings (``### ``), or indented continuation
+    lines. Fragments that carry YAML frontmatter (``---`` delimiters or
+    ``title:`` keys) are rejected so they cannot leak into ``CHANGELOG.md``
+    the way beta.52 did.
+    """
+    failures: list[str] = []
+    fragment_dir = repo_root / "changelog.d"
+    if not fragment_dir.is_dir():
+        return failures
+    for path in sorted(fragment_dir.glob("*.md")):
+        rel = str(path.relative_to(repo_root))
+        text = path.read_text(encoding="utf-8")
+        for raw_line in text.splitlines():
+            line = raw_line.rstrip()
+            if not line.strip():
+                continue
+            if line == "---" or line.startswith("title:"):
+                failures.append(
+                    f"{rel}: fragment contains YAML frontmatter ({line})"
+                )
+                break
+            if not (line.startswith("### ") or line.startswith("- ") or line.startswith(" ")):
+                failures.append(
+                    f"{rel}: non-blank line is not a bullet or section heading: {line[:60]}"
+                )
+                break
+    return failures
+
+
 def _glob_match(path: str, pattern: str) -> bool:
     """Path-segment-aware glob match, unlike fnmatch (where `*` crosses `/`).
 
@@ -590,6 +621,7 @@ def main(argv: list[str] | None = None) -> int:
         files_to_scan = config.get("invariants", {}).get("referenced_paths_scan", [])
         failures = check_referenced_paths(REPO_ROOT, files_to_scan, config)
         failures.extend(check_required_sections(REPO_ROOT, config))
+        failures.extend(check_changelog_fragment_shape(REPO_ROOT, config))
         return _report(failures)
 
     if args.command == "print-trailer":
