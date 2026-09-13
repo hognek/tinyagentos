@@ -231,7 +231,9 @@ time, so patching the module attribute AFTER `create_app` does nothing.
 - GitHub Actions: `.github/workflows/ci.yml` in upstream repo
 - Uses `uv sync --frozen` and `pytest -n auto`
 - Also required: `spa-build` (npm build + tsc + **vitest** - a desktop type error or failing
-  component test fails CI), a "Verify app starts" `create_app` import smoke, `lint`
+  component test fails CI), `desktop-e2e` (the Playwright suite under `desktop/tests`, run on
+  webkit - see "Desktop SPA build + test" below), a "Verify app starts" `create_app` import
+  smoke, `lint`
   (`compileall`), `docs-build`, and `cla`. `docs-build` is the only job with the mkdocs
   toolchain installed (mkdocs is NOT a project dependency, so `uv sync` does not provide
   it): it runs `tests/test_mkdocs_exclude.py` with `TAOS_DOCS_BUILD_TESTS=1`, which turns
@@ -707,8 +709,67 @@ cd desktop
 npm install                # Node.js 22+
 npm run build              # tsc -b && vite build → outputs to static/desktop/
 npm run test               # vitest (unit/component tests)
-npm run test:e2e           # Playwright browser tests (needs running server)
+npm run test:e2e           # Playwright browser tests (starts vite itself)
 ```
+
+`test:e2e` with no `E2E_BASE_URL` starts its own vite server
+(`npm run build && npm run preview` on :5173) and runs the specs against it.
+That is enough for the specs that `page.route()`-mock the API, and NOT enough
+for the rest: `canvas-e2e` and `projects-mobile` POST `/api/projects` for real,
+and `sw-and-reconnect` needs `/sw.js` at the ROOT, which only the backend
+serves (`tinyagentos/routes/desktop.py`) because vite's base is `/desktop/`.
+
+To run the whole suite, start a real backend and point the suite at it:
+
+```bash
+uvicorn --factory tinyagentos.app:create_app --host 127.0.0.1 --port 6969
+cd desktop && npm run build          # the desktop routes serve static/desktop from disk
+E2E_BASE_URL=http://127.0.0.1:6969 npx playwright test
+```
+
+With `E2E_BASE_URL` set, `playwright.config.ts` leaves `webServer` undefined --
+the server is already up and is not the suite's to manage.
+
+A backend with **no account** serves the zero-user setup wizard at `/desktop/`,
+so `App.tsx` never mounts and anything inside the desktop shell is untested.
+The `desktop-e2e` CI job onboards a throwaway first user via `/auth/setup` and
+hands Playwright the session cookie as a storage state (`E2E_STORAGE_STATE`).
+Do the same locally, or expect those specs to fail on a 401.
+
+Seed that session under the **browser's** user-agent, not curl's. `auth.py:1011`
+stores a SHA-256 of the creating user-agent on the session and `:1048` compares
+it on every validation, so a session minted by a plain `curl` is rejected the
+moment WebKit replays the cookie: `/desktop/` 302s to `/auth/login?next=/desktop/`
+and the API answers `401 {"error":"Authentication required"}`. The CI job reads
+the UA out of `require("@playwright/test").devices["iPhone 14"].userAgent` and
+passes it as `curl -A`, so it cannot drift from the config's device.
+
+A `curl` probe **cannot** catch this class of bug on its own. The probe that
+mints the session and the probe that replays it are the same client, so the
+user-agent pair it exercises is self-consistent and passes while the browser's
+pair is refused. A probe proves the pair *it* uses, not the pair the real client
+uses -- give it the real client's identity, or assert the real client directly.
+
+The session cookie alone is not enough for a mutating call: the projects router
+is included with `dependencies=_csrf`, so a cookie-authenticated `POST
+/api/projects` answers `403 {"detail": "CSRF token missing"}` unless the
+`csrf_token` cookie is echoed in an `X-CSRF-Token` header. The job seeds **both**
+cookies into the storage state and proves the pair with a `curl` probe before
+Playwright starts, so a broken seed is one error line instead of three red tests.
+
+The suite also needs the browser binary, and that browser is **webkit**, not
+chromium: the config declares one project, `iphone-14`, built from
+`devices["iPhone 14"]`, whose `defaultBrowserType` is `webkit`. Install it once
+with
+
+```bash
+cd desktop && npx playwright install --with-deps webkit
+```
+
+Installing chromium instead fails every test at launch with
+`browserType.launch: Executable doesn't exist at .../webkit-<rev>/pw_run.sh`.
+The suite runs in CI as the `desktop-e2e` job; it is not schedule-only, so a
+spec broken by a PR fails that PR.
 
 ## Adding an app to the catalog
 
