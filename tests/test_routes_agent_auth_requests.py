@@ -2441,3 +2441,350 @@ class TestRevokeAgentScopesRoute:
 
         await _close_scope_fixture(stores)
 
+
+class TestProjectCreateRequest:
+    """Agent project-creation request flow via the auth-request machinery.
+
+    A registered agent submits a project_create request. If the slug is taken
+    the route returns 409 with suggestions and creates no Decision. If the
+    slug is free a pending approve/deny Decision is created. Approving the
+    Decision creates the project and makes the requester the lead member;
+    denying creates nothing and marks the auth request refused.
+    """
+
+    @pytest.mark.asyncio
+    async def test_taken_slug_returns_409_with_suggestions_and_no_decision(
+        self, client, monkeypatch, tmp_path
+    ):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.projects.project_store import ProjectStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-pc.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-pc.db")
+        await auth_store.init()
+        pstore = ProjectStore(tmp_path / "projects-pc.db")
+        await pstore.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-pc")
+
+        await pstore.create_project(name="Existing", slug="existing-slug", created_by="u")
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "agent-alice",
+                "framework": "openclaw",
+                "kind": "project_create",
+                "requested_name": "New Project",
+                "requested_slug": "existing-slug",
+                "purpose": "need a board",
+            },
+        )
+        assert resp.status_code == 409, resp.text
+        body = resp.json()
+        assert body["field"] == "slug"
+        assert body["taken"] == "existing-slug"
+        assert len(body["suggestions"]) > 0
+
+        decision_store = client._transport.app.state.decision_store
+        decisions = await decision_store.list()
+        assert len(decisions) == 0
+
+        await registry.close()
+        await auth_store.close()
+        await pstore.close()
+
+    @pytest.mark.asyncio
+    async def test_taken_name_returns_409_with_suggestions_and_no_decision(
+        self, client, monkeypatch, tmp_path
+    ):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.projects.project_store import ProjectStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-pcname.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-pcname.db")
+        await auth_store.init()
+        pstore = ProjectStore(tmp_path / "projects-pcname.db")
+        await pstore.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-pcname")
+
+        await pstore.create_project(name="Existing Name", slug="existing-name", created_by="u")
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "agent-alice",
+                "framework": "openclaw",
+                "kind": "project_create",
+                "requested_name": "Existing Name",
+                "requested_slug": "new-slug",
+                "purpose": "need a board",
+            },
+        )
+        assert resp.status_code == 409, resp.text
+        body = resp.json()
+        assert body["field"] == "name"
+        assert body["taken"] == "Existing Name"
+        assert len(body["suggestions"]) > 0
+
+        decision_store = client._transport.app.state.decision_store
+        decisions = await decision_store.list()
+        assert len(decisions) == 0
+
+        await registry.close()
+        await auth_store.close()
+        await pstore.close()
+
+    @pytest.mark.asyncio
+    async def test_free_slug_creates_decision_with_agent_from_agent(
+        self, client, monkeypatch, tmp_path
+    ):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.projects.project_store import ProjectStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-pcfree.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-pcfree.db")
+        await auth_store.init()
+        pstore = ProjectStore(tmp_path / "projects-pcfree.db")
+        await pstore.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-pcfree")
+
+        reg = await registry.register(
+            framework="openclaw",
+            display_name="agent-alice",
+            user_id="u",
+            origin="external-selfjoin",
+            handle="agent-alice",
+        )
+        await registry.set_status(reg["canonical_id"], "active")
+        cid = reg["canonical_id"]
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "agent-alice",
+                "framework": "openclaw",
+                "kind": "project_create",
+                "requested_name": "Alice Board",
+                "requested_slug": "alice-board",
+                "purpose": "need a board",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "pending"
+        request_id = body["request_id"]
+        decision_id = body["decision_id"]
+
+        decision_store = client._transport.app.state.decision_store
+        decision = await decision_store.get(decision_id)
+        assert decision is not None
+        assert decision["status"] == "pending"
+        assert decision["from_agent"] == cid
+        assert decision["type"] == "approve_deny"
+        assert len(decision["options"]) == 2
+        assert decision["project_id"] is None
+
+        auth_record = await auth_store.get(request_id)
+        assert auth_record is not None
+        assert auth_record["status"] == "pending"
+        assert auth_record["kind"] == "project_create"
+
+        await registry.close()
+        await auth_store.close()
+        await pstore.close()
+
+    @pytest.mark.asyncio
+    async def test_approve_creates_project_and_lead(
+        self, client, monkeypatch, tmp_path
+    ):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.agent_grants_store import AgentGrantsStore
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.projects.project_store import ProjectStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-pcapprove.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-pcapprove.db")
+        await auth_store.init()
+        pstore = ProjectStore(tmp_path / "projects-pcapprove.db")
+        await pstore.init()
+        grants = AgentGrantsStore(tmp_path / "grants-pcapprove.db")
+        await grants.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-pcapprove")
+
+        reg = await registry.register(
+            framework="openclaw",
+            display_name="agent-alice",
+            user_id="u",
+            origin="external-selfjoin",
+            handle="agent-alice",
+        )
+        await registry.set_status(reg["canonical_id"], "active")
+        cid = reg["canonical_id"]
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+        monkeypatch.setattr(client._transport.app.state, "agent_grants", grants)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "agent-alice",
+                "framework": "openclaw",
+                "kind": "project_create",
+                "requested_name": "Alice Board",
+                "requested_slug": "alice-board",
+                "purpose": "need a board",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        request_id = resp.json()["request_id"]
+        decision_id = resp.json()["decision_id"]
+
+        # Answer the Decision as admin (approve).
+        resp = await client.post(
+            f"/api/decisions/{decision_id}/answer",
+            json={"value": "approve"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        project = await pstore.get_project_by_slug("alice-board")
+        assert project is not None
+        assert project["name"] == "Alice Board"
+        assert project["user_id"] == client._transport.app.state.auth.find_user("admin")["id"]
+
+        members = await pstore.list_members(project["id"])
+        assert len(members) == 1
+        assert members[0]["member_id"] == cid
+        assert members[0]["role"] == "lead"
+        assert project.get("lead_member_id") == cid
+
+        auth_record = await auth_store.get(request_id)
+        assert auth_record["status"] == "accepted"
+
+        # Agent can list tasks with its own token.
+        from tinyagentos.agent_registry_store import mint_registry_token
+
+        agent_token = mint_registry_token(cid, priv, user_id="u", framework="openclaw")
+        resp = await client.get(
+            f"/api/projects/{project['id']}/tasks",
+            headers={"Authorization": f"Bearer {agent_token}"},
+            cookies={},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await registry.close()
+        await auth_store.close()
+        await pstore.close()
+        await grants.close()
+
+    @pytest.mark.asyncio
+    async def test_deny_creates_nothing_and_marks_refused(
+        self, client, monkeypatch, tmp_path
+    ):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.projects.project_store import ProjectStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-pcdeny.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-pcdeny.db")
+        await auth_store.init()
+        pstore = ProjectStore(tmp_path / "projects-pcdeny.db")
+        await pstore.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-pcdeny")
+
+        reg = await registry.register(
+            framework="openclaw",
+            display_name="agent-alice",
+            user_id="u",
+            origin="external-selfjoin",
+            handle="agent-alice",
+        )
+        await registry.set_status(reg["canonical_id"], "active")
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "agent-alice",
+                "framework": "openclaw",
+                "kind": "project_create",
+                "requested_name": "Denied Board",
+                "requested_slug": "denied-board",
+                "purpose": "need a board",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        request_id = resp.json()["request_id"]
+        decision_id = resp.json()["decision_id"]
+
+        # Answer the Decision as admin (deny).
+        resp = await client.post(
+            f"/api/decisions/{decision_id}/answer",
+            json={"value": "deny"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        project = await pstore.get_project_by_slug("denied-board")
+        assert project is None
+
+        auth_record = await auth_store.get(request_id)
+        assert auth_record["status"] == "refused"
+
+        await registry.close()
+        await auth_store.close()
+        await pstore.close()
+

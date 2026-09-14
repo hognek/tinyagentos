@@ -26,21 +26,25 @@ from tinyagentos.base_store import BaseStore, PendingCapExceeded
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS auth_requests (
-    id              TEXT PRIMARY KEY,
-    identity_claim  TEXT NOT NULL DEFAULT '',
-    framework       TEXT NOT NULL DEFAULT '',
-    requested_scopes  TEXT NOT NULL DEFAULT '[]',
-    requested_skills  TEXT NOT NULL DEFAULT '[]',
-    reason          TEXT NOT NULL DEFAULT '',
-    duration_secs   INTEGER,
-    project_id      TEXT,
-    status          TEXT NOT NULL DEFAULT 'pending',
-    canonical_id    TEXT,
-    token           TEXT,
-    granted_scopes  TEXT,
-    created_ts      TEXT NOT NULL,
-    decided_ts      TEXT,
-    decided_by      TEXT
+    id                      TEXT PRIMARY KEY,
+    identity_claim          TEXT NOT NULL DEFAULT '',
+    framework               TEXT NOT NULL DEFAULT '',
+    requested_scopes        TEXT NOT NULL DEFAULT '[]',
+    requested_skills        TEXT NOT NULL DEFAULT '[]',
+    reason                  TEXT NOT NULL DEFAULT '',
+    duration_secs           INTEGER,
+    project_id              TEXT,
+    status                  TEXT NOT NULL DEFAULT 'pending',
+    canonical_id            TEXT,
+    token                   TEXT,
+    granted_scopes          TEXT,
+    created_ts              TEXT NOT NULL,
+    decided_ts              TEXT,
+    decided_by              TEXT,
+    kind                    TEXT NOT NULL DEFAULT 'scope_request',
+    requested_project_name  TEXT,
+    requested_project_slug  TEXT,
+    purpose                 TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_auth_requests_status ON auth_requests(status);
 CREATE INDEX IF NOT EXISTS idx_auth_requests_identity ON auth_requests(identity_claim, framework, status);
@@ -52,7 +56,8 @@ _VALID_DECISION_STATUSES = frozenset({"accepted", "refused"})
 # uncapped writes can never drift apart on which columns they set.
 _CREATE_COLUMNS = (
     "(id, identity_claim, framework, requested_scopes, requested_skills,"
-    " reason, duration_secs, project_id, status, created_ts)"
+    " reason, duration_secs, project_id, status, created_ts,"
+    " kind, requested_project_name, requested_project_slug, purpose)"
 )
 
 # Makes the pending cap atomic with the insert: SQLite evaluates the count and
@@ -103,6 +108,10 @@ class AuthRequestsStore(BaseStore):
         duration_secs: Optional[int] = None,
         project_id: Optional[str] = None,
         pending_cap: Optional[int] = None,
+        kind: str = "scope_request",
+        requested_project_name: Optional[str] = None,
+        requested_project_slug: Optional[str] = None,
+        purpose: str = "",
     ) -> dict:
         """Create a new pending auth request. Returns the full record.
 
@@ -110,7 +119,7 @@ class AuthRequestsStore(BaseStore):
         framework) pair may hold. The comparison happens inside the INSERT (see
         ``_CAP_GUARD``), so it is atomic with the write: the caller must NOT
         count first and decide, as every request in a concurrent burst would
-        read the same pre-insert count, pass, and insert — and this route takes
+        read the same pre-insert count, pass, and insert -- and this route takes
         no credentials, so that burst is free. Raises ``PendingCapExceeded``
         when the cap is already full.
 
@@ -133,18 +142,22 @@ class AuthRequestsStore(BaseStore):
             duration_secs,
             project_id,
             now,
+            kind,
+            requested_project_name,
+            requested_project_slug,
+            purpose,
         )
 
         if pending_cap is None:
             cur = await self._db.execute(
                 f"INSERT INTO auth_requests {_CREATE_COLUMNS} "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
                 values,
             )
         else:
             cur = await self._db.execute(
                 f"INSERT INTO auth_requests {_CREATE_COLUMNS} "
-                "SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ? WHERE " + _CAP_GUARD,
+                "SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ? WHERE " + _CAP_GUARD,
                 (*values, identity_claim, framework, pending_cap),
             )
         await self._db.commit()
