@@ -27,6 +27,10 @@ const handlers: Record<string, EventHandler> = {
     const decisionId = payload["decision_id"] as string | undefined;
     if (decisionId) useDecisionEventsStore.getState().recordAnswered(decisionId);
   },
+  "decision.note": (payload) => {
+    const decisionId = payload["decision_id"] as string | undefined;
+    if (decisionId) useDecisionEventsStore.getState().recordNote(decisionId);
+  },
 };
 
 /**
