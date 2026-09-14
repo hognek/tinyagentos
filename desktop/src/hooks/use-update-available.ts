@@ -14,6 +14,7 @@
  * so local hacking doesn't trigger false positives.
  */
 import { useBackendStatus } from "@/contexts/BackendStatusContext";
+import { isValidVersion } from "@/lib/backendStatus";
 
 declare const __TAOS_VERSION__: string | undefined;
 
@@ -44,5 +45,6 @@ export function useUpdateAvailable(buildVersionOverride?: string): boolean {
 
   if (DEV_VERSION_PATTERN.test(buildVersion)) return false;
   if (!currentVersion || DEV_VERSION_PATTERN.test(currentVersion)) return false;
+  if (!isValidVersion(currentVersion)) return false;
   return strippedVersion(currentVersion) !== strippedVersion(buildVersion);
 }
