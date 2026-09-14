@@ -42,6 +42,16 @@ CREATE TABLE IF NOT EXISTS decisions (
 CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project_id, status);
 CREATE INDEX IF NOT EXISTS idx_decisions_user ON decisions(user_id, status);
+CREATE TABLE IF NOT EXISTS decision_notes (
+    id            TEXT PRIMARY KEY,
+    decision_id   TEXT NOT NULL,
+    author        TEXT NOT NULL DEFAULT '',
+    source        TEXT NOT NULL DEFAULT 'in_app',
+    text          TEXT NOT NULL,
+    created_at    REAL NOT NULL,
+    FOREIGN KEY (decision_id) REFERENCES decisions(id)
+);
+CREATE INDEX IF NOT EXISTS idx_decision_notes_decision_id ON decision_notes(decision_id, created_at);
 """
 
 _JSON_FIELDS = ("options", "answer", "metadata")
@@ -90,6 +100,34 @@ class DecisionStore(BaseStore):
         if "metadata" not in cols:
             await self._db.execute(
                 "ALTER TABLE decisions ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'"
+            )
+            await self._db.commit()
+
+        # tsk-u72wpc: decision_notes table was added after initial ship. Guarded
+        # CREATE so existing databases gain it without a destructive migration.
+        notes_tables = {
+            row[0]
+            for row in await (
+                await self._db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='decision_notes'"
+                )
+            ).fetchall()
+        }
+        if not notes_tables:
+            await self._db.execute(
+                "CREATE TABLE IF NOT EXISTS decision_notes ("
+                "    id            TEXT PRIMARY KEY,"
+                "    decision_id   TEXT NOT NULL,"
+                "    author        TEXT NOT NULL DEFAULT '',"
+                "    source        TEXT NOT NULL DEFAULT 'in_app',"
+                "    text          TEXT NOT NULL,"
+                "    created_at    REAL NOT NULL,"
+                "    FOREIGN KEY (decision_id) REFERENCES decisions(id)"
+                ")"
+            )
+            await self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_decision_notes_decision_id "
+                "ON decision_notes(decision_id, created_at)"
             )
             await self._db.commit()
 
@@ -209,7 +247,9 @@ class DecisionStore(BaseStore):
             row = await cur.fetchone()
             if row is None:
                 return None
-            return _row_to_decision(row, cur.description)
+            d = _row_to_decision(row, cur.description)
+        d["notes"] = await self.list_notes(decision_id)
+        return d
 
     async def list(
         self,
@@ -246,7 +286,26 @@ class DecisionStore(BaseStore):
         ) as cur:
             rows = await cur.fetchall()
             desc = cur.description
-        return [_row_to_decision(r, desc) for r in rows]
+        decisions = [_row_to_decision(r, desc) for r in rows]
+        if decisions:
+            ids = [d["id"] for d in decisions]
+            placeholders = ",".join("?" for _ in ids)
+            async with self._db.execute(
+                f"SELECT * FROM decision_notes WHERE decision_id IN ({placeholders}) ORDER BY created_at ASC",
+                ids,
+            ) as cur:
+                note_rows = await cur.fetchall()
+                note_desc = cur.description
+            notes = [_row_to_decision(row, note_desc) for row in note_rows]
+            notes_by_id: dict[str, list[dict]] = {}
+            for note in notes:
+                notes_by_id.setdefault(note["decision_id"], []).append(note)
+            for d in decisions:
+                d["notes"] = notes_by_id.get(d["id"], [])
+        else:
+            for d in decisions:
+                d["notes"] = []
+        return decisions
 
     async def answer(self, decision_id: str, value, answered_by: str, source: str = "in_app", *, other_value: str | None = None, note: str | None = None) -> dict | None:
         """Record an answer. Returns the updated decision, or None if the
@@ -275,3 +334,27 @@ class DecisionStore(BaseStore):
         )
         await self._db.commit()
         return cur.rowcount == 1
+
+    async def add_note(self, decision_id: str, text: str, author: str, source: str = "in_app") -> dict | None:
+        """Append a note to a decision. Returns the updated decision with notes,
+        or None if the decision does not exist."""
+        note_id = new_id("note")
+        now = time.time()
+        await self._db.execute(
+            "INSERT INTO decision_notes (id, decision_id, author, source, text, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (note_id, decision_id, author, source, text, now),
+        )
+        await self._db.commit()
+        return await self.get(decision_id)
+
+    async def list_notes(self, decision_id: str) -> list[dict]:
+        """Return all notes for a decision, oldest first."""
+        async with self._db.execute(
+            "SELECT * FROM decision_notes WHERE decision_id = ? ORDER BY created_at ASC",
+            (decision_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+            if not rows:
+                return []
+            desc = cur.description
+        return [_row_to_decision(row, desc) for row in rows]

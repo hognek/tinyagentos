@@ -1213,3 +1213,148 @@ async def test_create_decision_notification_enriches_data(client, app):
     assert data["from_agent"] == "@taOS-dev"
     assert data["kind"] == "decision"
     assert len(data["options"]) <= 4
+
+
+# --------------------------------------------------------------------------- #
+# tsk-u72wpc: decision notes
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_note_only_body_to_answer_route_rejected(client):
+    """A note-only body to /answer 422s because value is required. This proves
+    the gap: the client cannot use /answer as an annotation path."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "free_text",
+    })
+    d = resp.json()
+    resp = await client.post(f"/api/decisions/{d['id']}/answer", json={"text": "just a note"})
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_post_note_route_exists(client):
+    """POST /api/decisions/{id}/note records a note and returns it. FAILS with
+    404 before the route is implemented."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "free_text",
+    })
+    d = resp.json()
+    resp = await client.post(f"/api/decisions/{d['id']}/note", json={"text": "a note"})
+    assert resp.status_code == 200
+    assert len(resp.json()["notes"]) == 1
+    assert resp.json()["notes"][0]["text"] == "a note"
+
+
+@pytest.mark.asyncio
+async def test_note_empty_text_rejected(client):
+    """An empty or whitespace-only note text is rejected with 400."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "free_text",
+    })
+    d = resp.json()
+    for bad in ("", "   "):
+        resp = await client.post(f"/api/decisions/{d['id']}/note", json={"text": bad})
+        assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_device_bearer_can_note_gate_decision(client, app):
+    """A device bearer may post a note on a gate-kind decision: a note carries
+    no grant, so the phone notification-surface restriction from answer_decision
+    does not apply. FAILS with 404 before the route is implemented."""
+    admin_uid = _admin_uid(app)
+    device = await _register_device(app, admin_uid)
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "agent-a",
+        "question": "Agent agent-a wants to run code_exec (code-exec)",
+        "type": "approve_deny",
+        "priority": "blocking",
+        "metadata": {"kind": "execution_gate", "agent_name": "agent-a",
+                     "action_class": "code-exec", "tool": "code_exec"},
+    })
+    assert resp.status_code == 200
+    d = resp.json()
+    resp = await client.post(
+        f"/api/decisions/{d['id']}/note",
+        json={"text": "checking this"},
+        headers=_bearer(device["scoped_token"]),
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()["notes"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_note_on_answered_decision_preserves_state(client):
+    """Posting a note on an answered decision must not change status, answer
+    or answered_at. FAILS with 404 before the route is implemented."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "free_text",
+    })
+    d = resp.json()
+    await client.post(f"/api/decisions/{d['id']}/answer", json={"value": "yes"})
+    answered = await client.get(f"/api/decisions/{d['id']}")
+    answered = answered.json()
+    before_status = answered["status"]
+    before_answer = json.dumps(answered["answer"], sort_keys=True)
+    before_answered_at = answered["answered_at"]
+
+    resp = await client.post(f"/api/decisions/{d['id']}/note", json={"text": "after answer"})
+    assert resp.status_code == 200
+
+    after = await client.get(f"/api/decisions/{d['id']}")
+    after = after.json()
+    assert after["status"] == before_status
+    assert json.dumps(after["answer"], sort_keys=True) == before_answer
+    assert after["answered_at"] == before_answered_at
+
+
+@pytest.mark.asyncio
+async def test_notes_appear_in_get_and_list(client):
+    """Notes are returned from GET /api/decisions/{id} and list."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "free_text",
+    })
+    d = resp.json()
+    await client.post(f"/api/decisions/{d['id']}/note", json={"text": "first"})
+    await client.post(f"/api/decisions/{d['id']}/note", json={"text": "second"})
+
+    got = await client.get(f"/api/decisions/{d['id']}")
+    assert got.status_code == 200
+    notes = got.json()["notes"]
+    assert len(notes) == 2
+    assert [n["text"] for n in notes] == ["first", "second"]
+
+    items = await client.get("/api/decisions?status=pending")
+    assert items.status_code == 200
+    d2 = next(x for x in items.json()["items"] if x["id"] == d["id"])
+    assert len(d2["notes"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_note_publishes_event(client, monkeypatch):
+    """Posting a note publishes a decision.note event on the owner's channel."""
+    from tinyagentos.events.bus import EventBus
+
+    import tinyagentos.routes.decisions as dmod
+
+    monkeypatch.setattr(dmod.httpx, "AsyncClient", _NoOpAsyncClient)
+
+    app = client._transport.app
+    bus = EventBus()
+    app.state.event_bus = bus
+
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@taOS-dev", "question": "q", "type": "approve_deny",
+    })
+    did = resp.json()["id"]
+    owner = (await app.state.decision_store.get(did))["user_id"]
+    assert owner
+    owner_q = await bus.subscribe(f"user:{owner}")
+
+    resp = await client.post(f"/api/decisions/{did}/note", json={"text": "note"})
+    assert resp.status_code == 200
+
+    ev = owner_q.get_nowait()
+    assert ev.kind == "decision.note"
+    assert ev.payload["decision_id"] == did

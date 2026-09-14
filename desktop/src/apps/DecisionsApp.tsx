@@ -40,6 +40,14 @@ interface DecisionAnswer {
   note?: string | null;
 }
 
+interface DecisionNote {
+  id: string;
+  text: string;
+  author: string;
+  source: string;
+  created_at: number | string;
+}
+
 interface Decision {
   id: string;
   from_agent: string;
@@ -57,6 +65,7 @@ interface Decision {
   // original. When set, the supersession lineage can be walked via the history
   // endpoint.
   parent_decision_id?: string | null;
+  notes?: DecisionNote[];
 }
 
 // A pending external-agent access request (consent loop). Surfaced here as an
@@ -171,9 +180,11 @@ function OptionRow({
 function DecisionCard({
   decision,
   onAnswer,
+  onAddNote,
 }: {
   decision: Decision;
   onAnswer: (id: string, value: string | string[], otherValue?: string, note?: string) => Promise<void>;
+  onAddNote?: (id: string, text: string) => Promise<void>;
 }) {
   const [multi, setMulti] = useState<string[]>([]);
   const [singleSelected, setSingleSelected] = useState<string | null>(null);
@@ -183,6 +194,8 @@ function DecisionCard({
   const [note, setNote] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [noteText, setNoteText] = useState("");
+  const [noteSubmitting, setNoteSubmitting] = useState(false);
 
   async function submit(value: string | string[]) {
     setError(null);
@@ -193,6 +206,20 @@ function DecisionCard({
       setError(e instanceof Error ? e.message : "Could not record answer.");
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  async function submitNote() {
+    if (!onAddNote || !noteText.trim() || noteSubmitting) return;
+    setError(null);
+    setNoteSubmitting(true);
+    try {
+      await onAddNote(decision.id, noteText.trim());
+      setNoteText("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Could not add note.");
+    } finally {
+      setNoteSubmitting(false);
     }
   }
 
@@ -224,15 +251,27 @@ function DecisionCard({
 
       <div className="flex flex-col gap-1">
         <p className="text-sm font-semibold text-shell-text">{decision.question}</p>
-        {decision.context && (
-          <p className="text-xs leading-relaxed text-shell-text-secondary">
-            {decision.context}
-          </p>
-        )}
-        <span className="mt-0.5 text-[11px] uppercase tracking-wide text-shell-text-tertiary">
-          {TYPE_LABEL[decision.type]}
-        </span>
-      </div>
+      {decision.context && (
+        <p className="text-xs leading-relaxed text-shell-text-secondary">
+          {decision.context}
+        </p>
+      )}
+      {(decision.notes || []).length > 0 && (
+        <div className="flex flex-col gap-1 border-l border-shell-border pl-3">
+          {(decision.notes || []).map((n) => (
+            <div key={n.id} className="flex flex-col gap-0.5 text-xs">
+              <span className="text-shell-text-secondary">{n.text}</span>
+              <span className="text-shell-text-tertiary">
+                {n.author} · {relativeTime(n.created_at)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+      <span className="mt-0.5 text-[11px] uppercase tracking-wide text-shell-text-tertiary">
+        {TYPE_LABEL[decision.type]}
+      </span>
+    </div>
 
       {decision.type === "single_select" && (
         <div className="flex flex-col gap-2">
@@ -393,6 +432,29 @@ function DecisionCard({
           {error}
         </div>
       )}
+      {onAddNote && (
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={noteText}
+            onChange={(e) => setNoteText(e.target.value)}
+            placeholder="Add a note..."
+            maxLength={500}
+            aria-label="Note text"
+            className="flex-1 bg-shell-surface border-shell-border text-shell-text placeholder:text-shell-text-tertiary rounded-md px-3 py-2 text-sm"
+            onKeyDown={(e) => {
+              if (e.key === "Enter") submitNote();
+            }}
+          />
+          <Button
+            type="button"
+            disabled={noteSubmitting || !noteText.trim()}
+            onClick={submitNote}
+          >
+            {noteSubmitting ? "Adding..." : "Add note"}
+          </Button>
+        </div>
+      )}
     </li>
   );
 }
@@ -511,6 +573,7 @@ function HistoryTrail({ decisionId }: { decisionId: string }) {
 }
 
 function AnsweredCard({ decision }: { decision: Decision }) {
+  const notes = decision.notes || [];
   return (
     <li className="flex flex-col gap-2 rounded-xl border border-shell-border bg-shell-surface p-4">
       <div className="flex flex-wrap items-center gap-2">
@@ -533,6 +596,18 @@ function AnsweredCard({ decision }: { decision: Decision }) {
           {decision.status === "superseded" ? "Superseded" : answerLabel(decision)}
         </span>
       </div>
+      {notes.length > 0 && (
+        <div className="flex flex-col gap-1.5 border-l border-shell-border pl-3">
+          {notes.map((n) => (
+            <div key={n.id} className="flex flex-col gap-0.5 text-xs">
+              <span className="text-shell-text-secondary">{n.text}</span>
+              <span className="text-shell-text-tertiary">
+                {n.author} · {relativeTime(n.created_at)}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
       {decision.parent_decision_id && <HistoryTrail decisionId={decision.id} />}
     </li>
   );
@@ -667,8 +742,25 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
           typeof detail === "string" ? detail : "Could not record answer.",
         );
       }
-      // Silent refresh: avoid flashing the full-screen Loading state and the
-      // list re-mount on every answer.
+      await load({ silent: true });
+    },
+    [load],
+  );
+
+  const addNote = useCallback(
+    async (id: string, text: string) => {
+      const res = await fetch(`/api/decisions/${id}/note`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        const detail = data?.detail;
+        throw new Error(
+          typeof detail === "string" ? detail : "Could not add note.",
+        );
+      }
       await load({ silent: true });
     },
     [load],
@@ -747,7 +839,7 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
           <ul className="flex flex-col gap-3">
             {list.map((d) =>
               tab === "pending" ? (
-                <DecisionCard key={d.id} decision={d} onAnswer={answer} />
+                <DecisionCard key={d.id} decision={d} onAnswer={answer} onAddNote={addNote} />
               ) : (
                 <AnsweredCard key={d.id} decision={d} />
               ),
