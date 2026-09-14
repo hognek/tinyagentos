@@ -361,6 +361,8 @@ class ClusterManager:
 
         info.registered_at = time.time()
         info.last_heartbeat = time.time()
+        if info.free_vram_mb is not None:
+            info.last_vram_report_at = time.time()
         info.status = "online"
         self._workers[info.name] = info
         logger.info(f"Worker registered: {info.name} ({info.platform}, {len(info.capabilities)} capabilities)")
@@ -601,6 +603,7 @@ class ClusterManager:
             worker.kv_cache_quant_boundary_layer_protect = bool(kv_cache_quant_boundary_layer_protect)
         if free_vram_mb is not None:
             worker.free_vram_mb = int(free_vram_mb)
+            worker.last_vram_report_at = time.time()
         if used_vram_mb is not None:
             worker.used_vram_mb = int(used_vram_mb)
         # Registration-drift refresh (taOS #1538): update cached host_lan_ip,
@@ -862,7 +865,7 @@ class ClusterManager:
                     if (parsed := self._parse_resource_id(lease.resource_id)) \
                             and parsed[0] == worker.name:
                         if lease.expires_at > now \
-                                and lease.granted_at > worker.last_heartbeat:
+                                and lease.granted_at > worker.last_vram_report_at:
                             already_held += lease.required_vram_mb
 
                 effective_free = worker.free_vram_mb - already_held

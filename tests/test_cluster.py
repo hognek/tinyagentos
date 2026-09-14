@@ -296,6 +296,66 @@ class TestClusterManager:
         )
         assert lease_c is not None
 
+    async def test_vramless_heartbeat_does_not_forget_live_lease(self):
+        """A heartbeat without a VRAM sample must not age a live lease out
+        of claim_lease accounting, otherwise the next claim is admitted
+        against VRAM the live lease still reserves."""
+        mgr = ClusterManager()
+        await mgr.register_worker(_make_worker("gpu-box", url="http://gpu-box:9000"))
+        worker = mgr.get_worker("gpu-box")
+        worker.resources = ["gpu-cuda-0", "gpu-cuda-1"]
+        assert mgr.heartbeat("gpu-box", free_vram_mb=8192) is True
+        time.sleep(0.01)
+        lease_a = await mgr.claim_lease(
+            resource_id="gpu-box:gpu-cuda-0",
+            caller="a",
+            ttl_seconds=300,
+            required_vram_mb=8192,
+        )
+        assert lease_a is not None
+        time.sleep(0.01)
+        assert mgr.heartbeat("gpu-box", load=0.1) is True
+        lease_b = await mgr.claim_lease(
+            resource_id="gpu-box:gpu-cuda-1",
+            caller="b",
+            ttl_seconds=300,
+            required_vram_mb=8192,
+        )
+        assert lease_b is None
+
+    async def test_two_claims_between_vram_samples_are_both_counted(self):
+        """Two claims that land between VRAM heartbeat samples must both be
+        included in already_held (H1 race window)."""
+        mgr = ClusterManager()
+        await mgr.register_worker(_make_worker("gpu-box", url="http://gpu-box:9000"))
+        worker = mgr.get_worker("gpu-box")
+        worker.resources = ["gpu-cuda-0", "gpu-cuda-1", "gpu-cuda-2"]
+        assert mgr.heartbeat("gpu-box", free_vram_mb=16384) is True
+
+        lease_a = await mgr.claim_lease(
+            resource_id="gpu-box:gpu-cuda-0",
+            caller="a",
+            ttl_seconds=300,
+            required_vram_mb=8192,
+        )
+        assert lease_a is not None
+
+        lease_b = await mgr.claim_lease(
+            resource_id="gpu-box:gpu-cuda-1",
+            caller="b",
+            ttl_seconds=300,
+            required_vram_mb=8192,
+        )
+        assert lease_b is not None
+
+        lease_c = await mgr.claim_lease(
+            resource_id="gpu-box:gpu-cuda-2",
+            caller="c",
+            ttl_seconds=300,
+            required_vram_mb=8192,
+        )
+        assert lease_c is None
+
 
 @pytest.mark.asyncio
 class TestTaskRouter:

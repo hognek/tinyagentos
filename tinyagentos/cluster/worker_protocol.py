@@ -72,6 +72,11 @@ class WorkerInfo:
     # free", so those workers are never permanently un-leasable.
     free_vram_mb: int | None = None
     used_vram_mb: int | None = None
+    # Wall-clock timestamp of the most recent heartbeat that carried a VRAM
+    # sample.  Used by claim_lease to age out only leases granted after the
+    # last actual VRAM report, so a vram-less heartbeat does not cause live
+    # leases to drop out of already_held.
+    last_vram_report_at: float = 0.0
 
 
 @dataclass
