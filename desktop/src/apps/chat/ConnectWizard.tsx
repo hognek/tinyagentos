@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Copy, Check, ChevronRight, ChevronLeft, Play, X } from "lucide-react";
 import { Button, Input, Label } from "@/components/ui";
+import { withCsrf } from "@/lib/csrf";
 
 const BASH_SNIPPET = `#!/usr/bin/env bash
 # taOStalk connect snippet — emits session events to the taOS A2A bus.
@@ -163,6 +164,7 @@ export function ConnectWizard({ open, onClose }: { open: boolean; onClose: () =>
           description: `taOStalk session for ${selectedAgent}`,
           settings: { taostalk_agent: selectedAgent },
         }),
+        ...withCsrf(),
       });
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
