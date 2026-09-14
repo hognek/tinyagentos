@@ -65,17 +65,6 @@ for (const pwa of PWA_PATHS) {
     });
 
     test(`update toast appears on version mismatch (${pwa.url})`, async ({ page }) => {
-      // Quarantined on /chat-pwa ONLY, and it is a product bug, not a test bug:
-      // AppShell mounts UpdateAvailableToast, which returns null and pushes into
-      // the notification store; the store's only renderer, NotificationToasts,
-      // is mounted in App.tsx (the desktop shell) and never in chat-main.tsx, so
-      // no notification can render on /chat-pwa. Card tsk-wdtve7. /desktop/ keeps
-      // running this assertion and is the control that proves the toast works.
-      test.fixme(
-        pwa.name === "chat-pwa",
-        "tsk-wdtve7: chat-main.tsx never mounts NotificationToasts, so the store has no renderer",
-      );
-      // Force the backend to claim a different version than the build.
       await page.route("**/api/health", async (route) => {
         const r = await route.fetch();
         const body = await r.text();
