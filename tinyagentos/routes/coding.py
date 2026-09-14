@@ -634,8 +634,9 @@ def _assemble_preview_html(root: Path, html: str) -> str:
             continue
         style_el.text = _rewrite_css_urls(style_el.text, root)
 
+    doctype = tree.getroottree().docinfo.doctype or None
     try:
-        result = lxml_html.tostring(tree, encoding="unicode")
+        result = lxml_html.tostring(tree, encoding="unicode", doctype=doctype)
     except Exception:
         return html
 

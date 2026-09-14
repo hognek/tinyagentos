@@ -184,3 +184,16 @@ async def test_unquoted_img_src_rewritten(ws):
     assert r.status_code == 200, r.text
     html = r.text
     assert "logo.png" not in html
+    expected_data_uri = f"data:image/png;base64,{base64.b64encode(png_bytes).decode('ascii')}"
+    assert expected_data_uri in html
+
+
+@pytest.mark.asyncio
+async def test_doctype_preserved(ws):
+    client, ws_id, ws_dir = ws
+    (ws_dir / "index.html").write_text(
+        "<!DOCTYPE html><html><head></head><body></body></html>"
+    )
+    r = await client.get(f"/api/coding/workspaces/{ws_id}/preview")
+    assert r.status_code == 200, r.text
+    assert r.text.lstrip().lower().startswith("<!doctype html>")
