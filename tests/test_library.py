@@ -410,6 +410,54 @@ class TestImageProcessor:
 # ---------------------------------------------------------------------------
 
 
+class TestYamlLogExtraction:
+    @pytest.mark.asyncio
+    async def test_yaml_file_extracts_text(self, lib_store, storage_dir):
+        file_path = storage_dir / "config.yaml"
+        file_path.write_text("key: value\nport: 8080\n")
+
+        kind = detect_kind(file_path=str(file_path))
+
+        item_id = await lib_store.create_item(
+            kind=kind, title="config.yaml", storage_path=str(file_path)
+        )
+        await run_pipeline(lib_store, item_id, storage_dir)
+
+        item = await lib_store.get_item(item_id)
+        assert item["status"] == "ready"
+
+        artifacts = await lib_store.get_artifacts(item_id)
+        artifact_kinds = {a["kind"] for a in artifacts}
+        assert "text" in artifact_kinds
+
+        text_artifacts = [a for a in artifacts if a["kind"] == "text"]
+        assert len(text_artifacts) == 1
+        assert "key: value" in Path(text_artifacts[0]["path"]).read_text()
+
+    @pytest.mark.asyncio
+    async def test_log_file_extracts_text(self, lib_store, storage_dir):
+        file_path = storage_dir / "app.log"
+        file_path.write_text("2026-01-01 INFO started\n")
+
+        kind = detect_kind(file_path=str(file_path))
+
+        item_id = await lib_store.create_item(
+            kind=kind, title="app.log", storage_path=str(file_path)
+        )
+        await run_pipeline(lib_store, item_id, storage_dir)
+
+        item = await lib_store.get_item(item_id)
+        assert item["status"] == "ready"
+
+        artifacts = await lib_store.get_artifacts(item_id)
+        artifact_kinds = {a["kind"] for a in artifacts}
+        assert "text" in artifact_kinds
+
+        text_artifacts = [a for a in artifacts if a["kind"] == "text"]
+        assert len(text_artifacts) == 1
+        assert "started" in Path(text_artifacts[0]["path"]).read_text()
+
+
 class TestRunPipeline:
     @pytest.mark.asyncio
     async def test_pipeline_text(self, lib_store, storage_dir):
