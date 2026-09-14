@@ -1,13 +1,35 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse, JSONResponse
-from pathlib import Path
 
 router = APIRouter()
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
-SPA_DIR = PROJECT_DIR / "static" / "desktop"
+
+class _SpDir(Path):
+    """Path subclass that resolves from TAOS_SPA_DIR env var if set,
+    otherwise falls back to PROJECT_DIR/static/desktop. The env var is
+    checked on each __truediv__ so that monkeypatch.setenv takes effect
+    even after module import."""
+    
+    def __truediv__(self, tag: str) -> Path:
+        taos_dir = os.environ.get("TAOS_SPA_DIR")
+        if taos_dir:
+            return Path(taos_dir) / tag
+        return super().__truediv__(tag)
+
+
+_PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
+
+#: SPA directory — resolved from TAOS_SPA_DIR env var if the installer sets it,
+#: otherwise the default for editable/source checkouts.
+#: Using a Path subclass ensures the env var is re-checked on every access
+#: (important for non-editable pip installs where the installer sets TAOS_SPA_DIR).
+SPA_DIR: _SpDir = _SpDir(
+    os.environ.get("TAOS_SPA_DIR", str(_PROJECT_DIR / "static" / "desktop"))
+)
 
 
 @router.get("/api/desktop/settings")

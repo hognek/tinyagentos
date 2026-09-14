@@ -118,3 +118,36 @@ def test_api_agents_still_requires_auth(client):
     expose real API endpoints. /api/agents must still return 401 without a cookie."""
     r = client.get("/api/agents")
     assert r.status_code == 401
+
+
+def test_spa_found_when_package_not_at_repo_root(client, monkeypatch, tmp_path):
+    """Test that SPA routes work when the package is not at the repo root,
+    as long as the bundle is properly staged (simulating non-editable pip install).
+
+    Before the fix, this test FAILS with AssertionError because SPA_DIR resolves
+    to site-packages/static/desktop which never exists. After the fix, TAOS_SPA_DIR
+    is checked and the staged bundle is found.
+    """
+    # Setup: create a staged bundle directory (as the installer would do)
+    staged_dir = tmp_path / "staged-spa"
+    staged_dir.mkdir()
+    (staged_dir / "index.html").write_text("<html>spa</html>")
+    (staged_dir / "sw.js").write_text("// sw.js")
+    (staged_dir / "chat.html").write_text("<html>chat</html>")
+    (staged_dir / "app.html").write_text("<html>app</html>")
+
+    # Set TAOS_SPA_DIR to the staged directory (simulating installer sets this)
+    monkeypatch.setenv("TAOS_SPA_DIR", str(staged_dir))
+
+    # Act: access SPA routes — should find the bundle via the env var
+    r = client.get("/desktop")
+    assert r.status_code == 200, f"Expected 200 for /desktop, got {r.status_code}"
+
+    r = client.get("/sw.js")
+    assert r.status_code == 200, f"Expected 200 for /sw.js, got {r.status_code}"
+
+    r = client.get("/app.html?app=messages")
+    assert r.status_code == 200, f"Expected 200 for /app.html, got {r.status_code}"
+
+    r = client.get("/chat-pwa")
+    assert r.status_code == 200, f"Expected 200 for /chat-pwa, got {r.status_code}"
