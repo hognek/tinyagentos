@@ -1,0 +1,27 @@
+fix-forward #3033: restore JSON/XML text classification in detect_kind
+
+The PR dropped application/json, application/xml, text/xml from _MIME_KIND_MAP
+and .json/.xml from _EXT_OVERRIDE_MAP, relying on mimetypes.guess_type + a
+text/* rule. But mimetypes returns application/json and application/xml for
+those extensions -- neither starts with text/ -- so JSON and XML uploads
+classified as file with no text extraction.
+
+Fix: put application/json, application/xml, text/xml back in _MIME_KIND_MAP
+-> text, and add .json/.xml to _EXT_OVERRIDE_MAP so the answer does not
+depend on the host mime.types database. Leave the text/* rule in place.
+
+RED-FIRST proof (BASE exec/tsk-lgubqa):
+```
+FAILED tests/test_library.py::TestDetectKindParity::test_extension_parity[.json-text]
+FAILED tests/test_library.py::TestDetectKindParity::test_extension_parity[.xml-text]
+FAILED tests/test_library.py::TestDetectKindParity::test_content_type_parity[application/json-text]
+FAILED tests/test_library.py::TestDetectKindParity::test_content_type_parity[application/xml-text]
+4 failed
+```
+
+GREEN on head:
+```
+tests/test_library.py::TestDetectKindParity 27 passed
+```
+
+All 118 library tests pass.
