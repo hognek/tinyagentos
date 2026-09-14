@@ -379,6 +379,10 @@ async def _handle_project_create_request(
             purpose=body.purpose or body.reason,
         )
     except PendingCapExceeded as exc:
+        try:
+            await decision_store.supersede(decision["id"])
+        except Exception:
+            pass
         raise HTTPException(
             status_code=429,
             detail=(
@@ -473,6 +477,18 @@ async def create_auth_request(request: Request, body: CreateAuthRequest):
 
     if body.kind == "project_create":
         return await _handle_project_create_request(request, body, store)
+
+    if body.kind != "scope_request":
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown kind: {body.kind!r}; valid: scope_request, project_create",
+        )
+
+    if not body.requested_scopes:
+        raise HTTPException(
+            status_code=400,
+            detail="requested_scopes must not be empty for scope_request",
+        )
 
     # Only known scopes may be requested -- reject unknown ones up front so
     # the admin is never shown (and can never approve) a scope the system

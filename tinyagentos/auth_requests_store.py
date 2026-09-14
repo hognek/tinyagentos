@@ -93,6 +93,27 @@ class AuthRequestsStore(BaseStore):
         if self._db is not None:
             self._db.row_factory = aiosqlite.Row
 
+    async def _post_init(self) -> None:
+        cols = {
+            row[1]
+            for row in await (
+                await self._db.execute("PRAGMA table_info(auth_requests)")
+            ).fetchall()
+        }
+        alters = [
+            ("kind", "ALTER TABLE auth_requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'scope_request'"),
+            ("requested_project_name", "ALTER TABLE auth_requests ADD COLUMN requested_project_name TEXT"),
+            ("requested_project_slug", "ALTER TABLE auth_requests ADD COLUMN requested_project_slug TEXT"),
+            ("purpose", "ALTER TABLE auth_requests ADD COLUMN purpose TEXT DEFAULT ''"),
+        ]
+        dirty = False
+        for col, sql in alters:
+            if col not in cols:
+                await self._db.execute(sql)
+                dirty = True
+        if dirty:
+            await self._db.commit()
+
     # ------------------------------------------------------------------
     # Write
     # ------------------------------------------------------------------

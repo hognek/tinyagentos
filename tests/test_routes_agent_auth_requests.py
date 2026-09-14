@@ -65,6 +65,37 @@ class TestRequestableScopes:
         )
         assert resp.status_code == 400
 
+    @pytest.mark.asyncio
+    async def test_create_rejects_unknown_kind(self, client, monkeypatch):
+        monkeypatch.setattr(
+            client._transport.app.state, "auth_requests", _FakeAuthRequestsStore()
+        )
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "grok",
+                "framework": "grok-cli",
+                "kind": "not_a_real_kind",
+                "requested_scopes": ["memory_read"],
+            },
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_create_rejects_empty_scope_list(self, client, monkeypatch):
+        monkeypatch.setattr(
+            client._transport.app.state, "auth_requests", _FakeAuthRequestsStore()
+        )
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "grok",
+                "framework": "grok-cli",
+                "requested_scopes": [],
+            },
+        )
+        assert resp.status_code == 400
+
 
 class TestAgentAuthRequestsList:
     @pytest.mark.asyncio
@@ -2442,6 +2473,63 @@ class TestRevokeAgentScopesRoute:
         await _close_scope_fixture(stores)
 
 
+class TestExistingDbGainsProjectCreateColumns:
+    """An existing database created before the project_create columns were added
+    must gain them on store init so INSERT with kind='project_create' succeeds."""
+
+    @pytest.mark.asyncio
+    async def test_existing_db_gains_project_create_columns(self, tmp_path):
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+
+        db_path = tmp_path / "auth_old.db"
+        old_schema = """CREATE TABLE IF NOT EXISTS auth_requests (
+            id                      TEXT PRIMARY KEY,
+            identity_claim          TEXT NOT NULL DEFAULT '',
+            framework               TEXT NOT NULL DEFAULT '',
+            requested_scopes        TEXT NOT NULL DEFAULT '[]',
+            requested_skills        TEXT NOT NULL DEFAULT '[]',
+            reason                  TEXT NOT NULL DEFAULT '',
+            duration_secs           INTEGER,
+            project_id              TEXT,
+            status                  TEXT NOT NULL DEFAULT 'pending',
+            canonical_id            TEXT,
+            token                   TEXT,
+            granted_scopes          TEXT,
+            created_ts              TEXT NOT NULL,
+            decided_ts              TEXT,
+            decided_by              TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_auth_requests_status ON auth_requests(status);
+        CREATE INDEX IF NOT EXISTS idx_auth_requests_identity ON auth_requests(identity_claim, framework, status);
+        """
+        import aiosqlite
+
+        async with aiosqlite.connect(str(db_path)) as conn:
+            await conn.executescript(old_schema)
+            await conn.commit()
+
+        store = AuthRequestsStore(db_path)
+        await store.init()
+
+        record = await store.create(
+            identity_claim="test-agent",
+            framework="test-fw",
+            requested_scopes=[],
+            requested_skills=[],
+            reason="",
+            kind="project_create",
+            requested_project_name="New Project",
+            requested_project_slug="new-project",
+            purpose="test",
+        )
+        assert record["kind"] == "project_create"
+        assert record["requested_project_name"] == "New Project"
+        assert record["requested_project_slug"] == "new-project"
+        assert record["purpose"] == "test"
+
+        await store.close()
+
+
 class TestProjectCreateRequest:
     """Agent project-creation request flow via the auth-request machinery.
 
@@ -2783,6 +2871,136 @@ class TestProjectCreateRequest:
 
         auth_record = await auth_store.get(request_id)
         assert auth_record["status"] == "refused"
+
+        await registry.close()
+        await auth_store.close()
+        await pstore.close()
+
+    @pytest.mark.asyncio
+    async def test_project_create_failure_marks_auth_request_refused(
+        self, client, monkeypatch, tmp_path
+    ):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.projects.project_store import ProjectStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-pcfail.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-pcfail.db")
+        await auth_store.init()
+        pstore = ProjectStore(tmp_path / "projects-pcfail.db")
+        await pstore.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-pcfail")
+
+        reg = await registry.register(
+            framework="openclaw",
+            display_name="agent-alice",
+            user_id="u",
+            origin="external-selfjoin",
+            handle="agent-alice",
+        )
+        await registry.set_status(reg["canonical_id"], "active")
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "agent-alice",
+                "framework": "openclaw",
+                "kind": "project_create",
+                "requested_name": "Fail Board",
+                "requested_slug": "fail-board",
+                "purpose": "test",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        request_id = resp.json()["request_id"]
+        decision_id = resp.json()["decision_id"]
+
+        async def failing_create_project(*args, **kwargs):
+            raise RuntimeError("simulated project creation failure")
+
+        monkeypatch.setattr(pstore, "create_project", failing_create_project)
+
+        resp = await client.post(
+            f"/api/decisions/{decision_id}/answer",
+            json={"value": "approve"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        auth_record = await auth_store.get(request_id)
+        assert auth_record["status"] == "refused", f"expected refused, got {auth_record['status']}"
+
+        await registry.close()
+        await auth_store.close()
+        await pstore.close()
+
+
+class TestProjectCreatePendingCapNoOrphan:
+    """When the pending cap is exceeded on a project_create request, the Decision
+    already written must be cleaned up so it does not orphan."""
+
+    @pytest.mark.asyncio
+    async def test_pending_cap_exceeded_does_not_orphan_decision(self, client, monkeypatch, tmp_path):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.routes.agent_auth_requests import _PENDING_CAP
+        from tinyagentos.projects.project_store import ProjectStore
+        import uuid
+
+        registry = AgentRegistryStore(tmp_path / "reg-cap.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-cap.db")
+        await auth_store.init()
+        pstore = ProjectStore(tmp_path / "projects-cap.db")
+        await pstore.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-cap")
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        for i in range(_PENDING_CAP):
+            await auth_store.create(
+                identity_claim="cap-test",
+                framework="cap-fw",
+                requested_scopes=["memory_read"],
+                requested_skills=None,
+                reason="",
+                pending_cap=_PENDING_CAP,
+            )
+
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "cap-test",
+                "framework": "cap-fw",
+                "kind": "project_create",
+                "requested_name": "Cap Test Project",
+                "requested_slug": f"cap-test-{uuid.uuid4().hex[:8]}",
+                "purpose": "test",
+            },
+        )
+        assert resp.status_code == 429, resp.text
+
+        decision_store = client._transport.app.state.decision_store
+        pending = await decision_store.list(status="pending")
+        assert len(pending) == 0, f"orphaned pending decisions: {pending}"
 
         await registry.close()
         await auth_store.close()
