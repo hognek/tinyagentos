@@ -11,8 +11,10 @@ import logging
 from dataclasses import asdict
 from pathlib import Path
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
+
+from tinyagentos.agent_token_auth import check_agent_scope
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +104,11 @@ def _build_device_info(request: Request) -> dict:
 @router.get("/api/memory/stats")
 async def memory_stats(request: Request):
     """Return aggregated stats from all memory stores."""
+    # Scope check: agents must have memory_read grant
+    caller = await check_agent_scope(request, "memory_read")
+    if caller is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
     try:
         b = _backend(request)
         stats = await b.get_stats()
@@ -114,6 +121,11 @@ async def memory_stats(request: Request):
 @router.get("/api/memory/settings")
 async def memory_settings_get(request: Request):
     """Return current memory settings."""
+    # Scope check: agents must have memory_read grant
+    caller = await check_agent_scope(request, "memory_read")
+    if caller is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
     try:
         b = _backend(request)
         settings = await b.get_settings()
@@ -142,6 +154,11 @@ async def memory_settings_put(request: Request):
 @router.get("/api/memory/backend/capabilities")
 async def memory_backend_capabilities(request: Request):
     """Return backend name, version, and capabilities list."""
+    # Scope check: agents must have memory_read grant
+    caller = await check_agent_scope(request, "memory_read")
+    if caller is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
     try:
         from taosmd import TaOSmdBackend
         return {
@@ -157,6 +174,11 @@ async def memory_backend_capabilities(request: Request):
 @router.get("/api/memory/backend/settings-schema")
 async def memory_backend_settings_schema(request: Request):
     """Return JSON Schema for the memory settings form."""
+    # Scope check: agents must have memory_read grant
+    caller = await check_agent_scope(request, "memory_read")
+    if caller is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
     try:
         b = _backend(request)
         schema = await b.get_settings_schema()
@@ -169,6 +191,11 @@ async def memory_backend_settings_schema(request: Request):
 @router.get("/api/agents/{name}/memory-config")
 async def agent_memory_config_get(request: Request, name: str):
     """Return the memory config for a specific agent."""
+    # Scope check: agents must have memory_read grant
+    caller = await check_agent_scope(request, "memory_read")
+    if caller is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
     try:
         b = _backend(request)
         config = await b.get_agent_config(name)
@@ -181,6 +208,11 @@ async def agent_memory_config_get(request: Request, name: str):
 @router.put("/api/agents/{name}/memory-config")
 async def agent_memory_config_put(request: Request, name: str):
     """Update a specific agent's memory config from JSON body."""
+    # Scope check: agents must have memory_write grant
+    caller = await check_agent_scope(request, "memory_write")
+    if caller is None:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    
     try:
         body = await request.json()
     except Exception:
