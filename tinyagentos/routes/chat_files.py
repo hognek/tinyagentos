@@ -196,16 +196,24 @@ async def upload_file(request: Request, file: UploadFile = File(...), channel_id
     return attachment
 
 
+def _safe_chat_file(data_dir: Path, filename: str) -> Path | None:
+    candidate = data_dir / "chat-files" / filename
+    if not candidate.exists() or not candidate.is_file():
+        return None
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to((data_dir / "chat-files").resolve()):
+        return None
+    return resolved
+
+
 @router.get("/api/chat/files/{filename}")
 async def serve_file(request: Request, filename: str):
     """Serve an uploaded chat file."""
     data_dir = request.app.state.data_dir
-    file_path = data_dir / "chat-files" / filename
-    if not file_path.exists() or not file_path.resolve().is_relative_to(
-        (data_dir / "chat-files").resolve()
-    ):
+    safe_path = _safe_chat_file(data_dir, filename)
+    if safe_path is None:
         return JSONResponse({"error": "File not found"}, status_code=404)
-    return FileResponse(file_path)
+    return FileResponse(safe_path)
 
 
 @router.get("/api/chat/attachments/resolve")
@@ -228,8 +236,8 @@ async def resolve_attachment(request: Request, filename: str, slug: str):
     auth = await _authorize_files_actor(request, slug, "read")
     if isinstance(auth, JSONResponse):
         return auth
-    chat_file = data_dir / "chat-files" / filename
-    if not chat_file.exists() or not chat_file.is_file():
+    chat_file = _safe_chat_file(data_dir, filename)
+    if chat_file is None:
         return JSONResponse({
             "filename": filename,
             "size": 0,

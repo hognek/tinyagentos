@@ -289,3 +289,36 @@ class TestAttachmentRecordRoundTrip:
         assert body["size"] == len("roundtrip")
         assert body["url"].startswith("/api/chat/files/")
         assert body["source"] == "workspace"
+
+
+class TestContainment:
+    @pytest.mark.asyncio
+    async def test_resolve_does_not_escape_chat_files(self, client):
+        app = client._transport.app
+        data_dir = app.state.data_dir
+
+        await client.post("/api/projects", json={
+            "name": "TraversalProj", "slug": "travproj", "description": "test",
+        })
+
+        secret = data_dir / "outside-secret.txt"
+        secret.write_text("secret content")
+        (data_dir / "chat-files").mkdir(parents=True, exist_ok=True)
+
+        r_traversal = await client.get(
+            "/api/chat/attachments/resolve?filename=../outside-secret.txt&slug=travproj"
+        )
+        assert r_traversal.status_code == 200, r_traversal.text
+        body_traversal = r_traversal.json()
+
+        r_missing = await client.get(
+            "/api/chat/attachments/resolve?filename=nonexistent.txt&slug=travproj"
+        )
+        assert r_missing.status_code == 200, r_missing.text
+        body_missing = r_missing.json()
+
+        assert body_traversal["in_files_state"] == "unknown"
+        assert body_traversal["size"] == 0
+        assert body_traversal.keys() == body_missing.keys()
+        assert body_traversal["in_files_state"] == body_missing["in_files_state"]
+        assert body_traversal["size"] == body_missing["size"]
