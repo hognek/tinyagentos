@@ -210,7 +210,7 @@ function DecisionCard({
   }
 
   async function submitNote() {
-    if (!onAddNote || !noteText.trim()) return;
+    if (!onAddNote || !noteText.trim() || noteSubmitting) return;
     setError(null);
     setNoteSubmitting(true);
     try {
