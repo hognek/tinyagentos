@@ -849,12 +849,20 @@ class ClusterManager:
                 # Account for VRAM already held by other active leases on
                 # this worker — two concurrent claims for different resources
                 # must not both pass when their sum exceeds free_vram_mb (H1).
+                #
+                # free_vram_mb is not a pre-allocation figure: it is the
+                # latest heartbeat-reported free VRAM, so once a leased
+                # workload has allocated its VRAM that allocation is already
+                # absent from free_vram_mb.  Only count leases whose grant
+                # post-dates the last heartbeat — those are the ones the
+                # heartbeat cannot have seen yet.
                 already_held = 0
                 now = time.time()
                 for lid, lease in self._leases.items():
                     if (parsed := self._parse_resource_id(lease.resource_id)) \
                             and parsed[0] == worker.name:
-                        if lease.expires_at > now:
+                        if lease.expires_at > now \
+                                and lease.granted_at > worker.last_heartbeat:
                             already_held += lease.required_vram_mb
 
                 effective_free = worker.free_vram_mb - already_held
@@ -890,6 +898,7 @@ class ClusterManager:
                 caller=caller,
                 expires_at=time.time() + ttl_seconds,
                 required_vram_mb=required_vram_mb,
+                granted_at=time.time(),
                 claim_channel=claim_channel,
             )
             self._leases[lease_id] = lease

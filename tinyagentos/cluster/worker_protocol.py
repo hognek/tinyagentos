@@ -96,6 +96,9 @@ class GpuLease:
         required_vram_mb: How many MiB of VRAM the caller declared it
             needs.  Used by the pre-claim check to refuse a claim when
             the worker's ``free_vram_mb`` is too low.
+        granted_at: wall-clock timestamp (``time.time()``) when the lease
+            was granted.  Used to age VRAM accounting against the worker's
+            last heartbeat so already-allocated VRAM is not double-counted.
         claim_channel: The coordination thread this lease's peer-visible
             claim was published on (empty for a lease with no bus claim,
             e.g. one taken by the dispatcher through the cluster API).
@@ -107,4 +110,5 @@ class GpuLease:
     caller: str = ""
     expires_at: float = 0.0
     required_vram_mb: int = 0
+    granted_at: float = 0.0
     claim_channel: str = ""

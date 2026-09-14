@@ -253,6 +253,49 @@ class TestClusterManager:
             "models": [],
         }
 
+    async def test_claim_lease_does_not_double_count_allocated_vram(self):
+        """free_vram_mb already reflects prior lease allocations.
+
+        When a worker's free_vram_mb has been decremented by earlier leases'
+        allocations, a new claim that genuinely fits must still be admitted.
+        """
+        from tinyagentos.cluster.worker_protocol import GpuLease
+
+        mgr = ClusterManager()
+        await mgr.register_worker(
+            _make_worker("gpu-box", url="http://gpu-box:9000")
+        )
+        worker = mgr.get_worker("gpu-box")
+        worker.resources = ["gpu-cuda-0", "gpu-cuda-1", "gpu-cuda-2"]
+        worker.free_vram_mb = 8192
+        worker.used_vram_mb = 16384
+
+        now = time.time()
+        lease_a = GpuLease(
+            lease_id="l_a",
+            resource_id="gpu-box:gpu-cuda-0",
+            caller="prior-a",
+            expires_at=now + 300,
+            required_vram_mb=8192,
+        )
+        lease_b = GpuLease(
+            lease_id="l_b",
+            resource_id="gpu-box:gpu-cuda-1",
+            caller="prior-b",
+            expires_at=now + 300,
+            required_vram_mb=8192,
+        )
+        mgr._leases["l_a"] = lease_a
+        mgr._leases["l_b"] = lease_b
+
+        lease_c = await mgr.claim_lease(
+            resource_id="gpu-box:gpu-cuda-2",
+            caller="c",
+            ttl_seconds=300,
+            required_vram_mb=8192,
+        )
+        assert lease_c is not None
+
 
 @pytest.mark.asyncio
 class TestTaskRouter:
@@ -713,3 +756,4 @@ class TestWorkerDrain:
 
             assert mgr._monitor_task is not None
             assert not mgr._monitor_task.done()
+
