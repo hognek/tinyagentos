@@ -84,6 +84,27 @@ async def _route_answer_to_agent(decision: dict, value, note: str | None = None)
         pass
 
 
+async def _route_note_to_agent(decision: dict, note_text: str, source: str) -> None:
+    """Best-effort: post the note back to the asking agent on the A2A bus.
+    Never raises; the note is already persisted and the agent can also poll
+    GET /api/decisions/{id}."""
+    agent = (decision.get("from_agent") or "").strip()
+    if not agent.startswith("@"):
+        return
+    body = (
+        f"{agent} decision {decision.get('id')} noted: "
+        f"{decision.get('question', '')} -> {note_text}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                f"{_bus_url()}/a2a/send",
+                json={"from": "@taOS-decisions", "thread": _ANSWER_THREAD, "body": body},
+            )
+    except Exception:
+        pass
+
+
 async def _publish_answer_event(request: Request, decision: dict) -> None:
     """Best-effort: push a ``decision.answered`` event to SSE clients so every open
     surface (the chat thread that rendered the block, plus the Decisions app)
@@ -116,6 +137,32 @@ async def _publish_answer_event(request: Request, decision: dict) -> None:
     except Exception:
         logger.warning(
             "decision.answered SSE broadcast failed for %s",
+            decision.get("id"),
+            exc_info=True,
+        )
+
+
+async def _publish_note_event(request: Request, decision: dict) -> None:
+    """Best-effort: push a ``decision.note`` event to SSE clients so open
+    Decisions windows refresh live when a note is added."""
+    bus = getattr(request.app.state, "event_bus", None)
+    if bus is None:
+        return
+    payload = dict(decision) if isinstance(decision, dict) else {"id": decision.get("id")}
+    payload["decision_id"] = payload.get("id")
+    owner = str(payload.get("user_id") or "").strip()
+    if not owner:
+        return
+    try:
+        await bus.publish_to(f"user:{owner}", SystemEvent(
+            kind="decision.note",
+            source="decisions",
+            targets=["user"],
+            payload=payload,
+        ))
+    except Exception:
+        logger.warning(
+            "decision.note SSE broadcast failed for %s",
             decision.get("id"),
             exc_info=True,
         )
@@ -178,6 +225,11 @@ class AnswerIn(BaseModel):
     other_value: str | None = None
     note: str | None = None
     answered_by: str = ""
+    source: str = "in_app"
+
+
+class NoteIn(BaseModel):
+    text: str
     source: str = "in_app"
 
 
@@ -616,6 +668,39 @@ async def answer_decision(
     routed_pair = await _apply_device_pairing_grant(request, updated, stored_value)
     if not (routed_app or routed_exec or routed_deleg or routed_pair):
         await _route_answer_to_agent(updated, stored_value, note=body.note)
+    return updated
+
+
+@router.post("/api/decisions/{decision_id}/note")
+async def add_note_to_decision(
+    decision_id: str,
+    body: NoteIn,
+    request: Request,
+    user: CurrentUser = Depends(current_user_or_device),
+):
+    """Append a note to a decision without changing its state.
+
+    A note is commentary only -- it carries no grant, so a device bearer may
+    post one on ANY decision including gate-kind ones.  The phone is a
+    notification surface, not an approval channel, but annotation is safe on
+    every decision kind.  Do NOT copy the answer_decision 409 here; the two
+    paths have different security properties.
+    """
+    store = request.app.state.decision_store
+    existing = await store.get(decision_id)
+    if existing is None or (not user.is_admin and existing["user_id"] != user.user_id):
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    text = body.text.strip()
+    if not text:
+        return JSONResponse({"error": "text must not be empty"}, status_code=400)
+
+    updated = await store.add_note(decision_id, text, user.user_id or "user", source=body.source)
+    if updated is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    await _publish_note_event(request, updated)
+    await _route_note_to_agent(updated, text, body.source)
     return updated
 
 
