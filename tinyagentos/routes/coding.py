@@ -9,6 +9,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
+from lxml import html as lxml_html
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -552,101 +553,96 @@ def _data_uri(root: Path, ref: str) -> str | None:
     return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
 
 
-_LINK_TAG_RE = re.compile(r"<link\b[^>]*>", re.IGNORECASE)
-# Matches only empty script tags (external `<script src=...></script>`), which
-# is all that needs inlining. Inline scripts (a non-empty body) are left
-# untouched so they render in the sandbox unchanged.
-_SCRIPT_TAG_RE = re.compile(r"<script\b[^>]*>\s*</script>", re.IGNORECASE)
-_IMG_TAG_RE = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
-_STYLE_BLOCK_RE = re.compile(r"(<style\b[^>]*>)(.*?)(</style>)", re.IGNORECASE | re.DOTALL)
-_ATTR_RE = re.compile(r'\b(\w+)=(["\'])([^"\']*)\2', re.IGNORECASE)
-_CSS_URL_RE = re.compile(r"url\(\s*(['\"]?)([^'\")]+)\1\s*\)", re.IGNORECASE)
+_CSS_URL_RE = re.compile(
+    r"""url\(\s*(['"]?)([^'")]*(?:\([^)]*\)[^'")]*)*)\1\s*\)""",
+    re.IGNORECASE,
+)
+
+
+def _rewrite_css_urls(text: str, root: Path) -> str:
+    def replace_url(m: re.Match) -> str:
+        ref = m.group(2)
+        if _is_external_ref(ref):
+            return m.group(0)
+        uri = _data_uri(root, ref)
+        if uri is None:
+            return m.group(0)
+        return f"url({m.group(1)}{uri}{m.group(1)})"
+
+    return _CSS_URL_RE.sub(replace_url, text)
 
 
 def _assemble_preview_html(root: Path, html: str) -> str:
-    remaining = [_MAX_PREVIEW_BYTES - len(html.encode("utf-8"))]
+    parser = lxml_html.HTMLParser(encoding="utf-8")
+    try:
+        tree = lxml_html.fromstring(html, parser=parser)
+    except Exception:
+        return html
 
-    def consume(n: int) -> bool:
-        if n > remaining[0]:
-            return False
-        remaining[0] -= n
-        return True
+    if tree is None:
+        return html
 
-    def replace_link(m: re.Match) -> str:
-        tag = m.group(0)
-        attrs = {a: v for a, _q, v in _ATTR_RE.findall(tag)}
-        if attrs.get("rel", "").strip().lower() != "stylesheet":
-            return tag
-        href = attrs.get("href")
+    for link in tree.iter("link"):
+        rel = (link.get("rel") or "").strip().lower()
+        if rel != "stylesheet":
+            continue
+        href = link.get("href")
         if href is None or _is_external_ref(href):
-            return tag
+            continue
         data = _read_local_asset(root, href)
         if data is None:
-            return tag
+            continue
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
-            return tag
-        replacement = f"<style>{text}</style>"
-        delta = len(replacement.encode("utf-8")) - len(tag.encode("utf-8"))
-        return replacement if consume(delta) else tag
+            continue
+        text = text.replace("</style>", r"<\/style>")
+        style = lxml_html.Element("style")
+        style.text = text
+        parent = link.getparent()
+        if parent is not None:
+            parent.replace(link, style)
 
-    def replace_script(m: re.Match) -> str:
-        tag = m.group(0)
-        attrs = {a: v for a, _q, v in _ATTR_RE.findall(tag)}
-        src = attrs.get("src")
+    for script in tree.iter("script"):
+        src = script.get("src")
         if src is None or _is_external_ref(src):
-            return tag
+            continue
         data = _read_local_asset(root, src)
         if data is None:
-            return tag
+            continue
         try:
             text = data.decode("utf-8")
         except UnicodeDecodeError:
-            return tag
-        open_tag_m = re.match(r"<script\b([^>]*)>", tag, re.IGNORECASE)
-        remaining_attrs = open_tag_m.group(1) if open_tag_m else ""
-        remaining_attrs = re.sub(r'\s*\bsrc=["\'][^"\']*["\']', "", remaining_attrs, flags=re.IGNORECASE)
-        replacement = f"<script{remaining_attrs}>{text}</script>"
-        delta = len(replacement.encode("utf-8")) - len(tag.encode("utf-8"))
-        return replacement if consume(delta) else tag
+            continue
+        if script.text and script.text.strip():
+            continue
+        text = text.replace("</script>", r"<\/script>")
+        script.attrib.pop("src", None)
+        script.text = text
 
-    def replace_img(m: re.Match) -> str:
-        tag = m.group(0)
-        src_m = re.search(r'\bsrc=(["\'])([^"\']*)\1', tag, re.IGNORECASE)
-        if src_m is None:
-            return tag
-        src = src_m.group(2)
-        if _is_external_ref(src):
-            return tag
+    for img in tree.iter("img"):
+        src = img.get("src")
+        if src is None or _is_external_ref(src):
+            continue
         uri = _data_uri(root, src)
         if uri is None:
-            return tag
-        replacement = tag[: src_m.start(2)] + uri + tag[src_m.end(2) :]
-        return replacement if consume(len(replacement.encode("utf-8")) - len(tag.encode("utf-8"))) else tag
+            continue
+        img.set("src", uri)
 
-    def replace_style_block(m: re.Match) -> str:
-        open_tag, body, close_tag = m.group(1), m.group(2), m.group(3)
+    for style_el in tree.iter("style"):
+        if style_el.text is None:
+            continue
+        style_el.text = _rewrite_css_urls(style_el.text, root)
 
-        def replace_url(um: re.Match) -> str:
-            ref = um.group(2)
-            if _is_external_ref(ref):
-                return um.group(0)
-            uri = _data_uri(root, ref)
-            if uri is None:
-                return um.group(0)
-            replacement = f"url({uri})"
-            delta = len(replacement.encode("utf-8")) - len(um.group(0).encode("utf-8"))
-            return replacement if consume(delta) else um.group(0)
+    try:
+        result = lxml_html.tostring(tree, encoding="unicode")
+    except Exception:
+        return html
 
-        new_body = _CSS_URL_RE.sub(replace_url, body)
-        return f"{open_tag}{new_body}{close_tag}"
+    if len(result.encode("utf-8")) > _MAX_PREVIEW_BYTES:
+        return html
 
-    html = _LINK_TAG_RE.sub(replace_link, html)
-    html = _SCRIPT_TAG_RE.sub(replace_script, html)
-    html = _IMG_TAG_RE.sub(replace_img, html)
-    html = _STYLE_BLOCK_RE.sub(replace_style_block, html)
-    return html
+    return result
 
 
 @router.get("/api/coding/workspaces/{workspace_id}/preview")

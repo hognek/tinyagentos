@@ -114,3 +114,73 @@ async def test_unknown_workspace_returns_404(ws):
     client, _ws_id, _ws_dir = ws
     r = await client.get("/api/coding/workspaces/cws-notreal/preview")
     assert r.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_script_breakout_inside_js_string(ws):
+    client, ws_id, ws_dir = ws
+    (ws_dir / "script.js").write_text('const s = "</script>";\n')
+    (ws_dir / "index.html").write_text(
+        "<html><head></head><body>"
+        '<script src="script.js"></script>'
+        "</body></html>"
+    )
+    r = await client.get(f"/api/coding/workspaces/{ws_id}/preview")
+    assert r.status_code == 200, r.text
+    html = r.text
+    from lxml import html as lxml_html
+
+    scripts = list(lxml_html.fromstring(html).iter("script"))
+    assert len(scripts) == 1, f"expected 1 <script> element, found {len(scripts)}"
+    assert scripts[0].text == 'const s = "<\\/script>";\n'
+
+
+@pytest.mark.asyncio
+async def test_style_breakout_inside_css_string(ws):
+    client, ws_id, ws_dir = ws
+    (ws_dir / "style.css").write_text('body::before { content: "</style>"; }\n')
+    (ws_dir / "index.html").write_text(
+        '<html><head>'
+        '<link rel="stylesheet" href="style.css">'
+        "</head><body></body></html>"
+    )
+    r = await client.get(f"/api/coding/workspaces/{ws_id}/preview")
+    assert r.status_code == 200, r.text
+    html = r.text
+    from lxml import html as lxml_html
+
+    styles = list(lxml_html.fromstring(html).iter("style"))
+    assert len(styles) == 1, f"expected 1 <style> element, found {len(styles)}"
+    assert styles[0].text == 'body::before { content: "<\\/style>"; }\n'
+
+
+@pytest.mark.asyncio
+async def test_script_tag_with_gt_in_quoted_attr_inlined(ws):
+    client, ws_id, ws_dir = ws
+    (ws_dir / "script.js").write_text("console.log('hello');\n")
+    (ws_dir / "index.html").write_text(
+        "<html><head></head><body>"
+        '<script src="script.js" data-info="a > b"></script>'
+        "</body></html>"
+    )
+    r = await client.get(f"/api/coding/workspaces/{ws_id}/preview")
+    assert r.status_code == 200, r.text
+    html = r.text
+    assert "script.js" not in html
+    assert "console.log('hello');" in html
+
+
+@pytest.mark.asyncio
+async def test_unquoted_img_src_rewritten(ws):
+    client, ws_id, ws_dir = ws
+    png_bytes = b"\x89PNG\r\n\x1a\nfake-png-bytes"
+    (ws_dir / "logo.png").write_bytes(png_bytes)
+    (ws_dir / "index.html").write_text(
+        "<html><head></head><body>"
+        "<img src=logo.png>"
+        "</body></html>"
+    )
+    r = await client.get(f"/api/coding/workspaces/{ws_id}/preview")
+    assert r.status_code == 200, r.text
+    html = r.text
+    assert "logo.png" not in html
