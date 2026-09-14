@@ -25,6 +25,9 @@ logger = logging.getLogger(__name__)
 
 _MIME_KIND_MAP: dict[str, str] = {
     "application/pdf": "pdf",
+    "application/json": "text",
+    "application/xml": "text",
+    "text/xml": "text",
     "image/png": "image",
     "image/jpeg": "image",
     "image/gif": "image",
@@ -36,6 +39,8 @@ _MIME_KIND_MAP: dict[str, str] = {
 }
 
 _EXT_OVERRIDE_MAP: dict[str, str] = {
+    ".json": "text",
+    ".xml": "text",
     ".log": "text",
     ".yaml": "text", ".yml": "text", ".toml": "text",
     ".pdf": "pdf",

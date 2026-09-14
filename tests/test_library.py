@@ -89,6 +89,48 @@ class TestKindDetection:
         assert detect_kind() == "file"
 
 
+class TestDetectKindParity:
+    """Parity tests ensuring every extension and content type that origin/dev
+    classified as text still classifies as text after the mimetypes refactor."""
+
+    @pytest.mark.parametrize("ext,expected_kind", [
+        (".txt", "text"),
+        (".md", "text"),
+        (".csv", "text"),
+        (".json", "text"),
+        (".xml", "text"),
+        (".html", "text"),
+        (".pdf", "pdf"),
+        (".png", "image"),
+        (".jpg", "image"),
+        (".jpeg", "image"),
+        (".gif", "image"),
+        (".webp", "image"),
+        (".svg", "image"),
+        (".zip", "archive"),
+        (".gz", "archive"),
+        (".tar", "archive"),
+        (".yaml", "text"),
+        (".yml", "text"),
+        (".toml", "text"),
+        (".log", "text"),
+    ])
+    def test_extension_parity(self, ext: str, expected_kind: str):
+        assert detect_kind(file_path=f"x{ext}") == expected_kind
+
+    @pytest.mark.parametrize("content_type,expected_kind", [
+        ("application/json", "text"),
+        ("application/xml", "text"),
+        ("text/xml", "text"),
+        ("text/markdown", "text"),
+        ("text/csv", "text"),
+        ("text/html", "text"),
+        ("text/plain", "text"),
+    ])
+    def test_content_type_parity(self, content_type: str, expected_kind: str):
+        assert detect_kind(content_type=content_type) == expected_kind
+
+
 # ---------------------------------------------------------------------------
 # LibraryStore
 # ---------------------------------------------------------------------------
