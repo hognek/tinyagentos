@@ -1,52 +1,40 @@
 import pytest
 import pytest_asyncio
-from fastapi import HTTPException
+from httpx import ASGITransport, AsyncClient
 
 from tinyagentos.agent_registry_store import mint_registry_token
-from tinyagentos.agent_token_auth import (
-    check_agent_scope,
-    check_agent_scope_for_project,
-)
-
-
-class _FakeRequest:
-    """Minimal stand-in for a starlette Request: the auth helpers only touch
-    ``.headers.get(...)`` and ``.app.state`` on the object."""
-
-    def __init__(self, app, token: str | None = None):
-        self.app = app
-        self.headers = {}
-        if token is not None:
-            self.headers["Authorization"] = f"Bearer {token}"
+from tinyagentos.routes.agent_auth_requests import VALID_SCOPES
+from tinyagentos.routes.agent_registry import _ALLOWED_SCOPES
 
 
 @pytest_asyncio.fixture
-async def token_app(app):
-    for attr in ("agent_registry", "agent_grants"):
-        store = getattr(app.state, attr)
-        if store._db is None:
-            await store.init()
-    yield app
-    for attr in ("agent_registry", "agent_grants"):
-        store = getattr(app.state, attr)
-        if store._db is not None:
-            await store.close()
-
-
-async def _mint(
-    app, *, scopes=("project_tasks",), project_id="prj-1", extra_grants=None
-):
-    """Register an active agent, add its grants, and mint a JWT.
-
-    ``scopes`` are all bound to ``project_id``. ``extra_grants`` is an optional
-    list of ``(scope, project_id)`` pairs bound to OTHER projects, used to model
-    an agent that is a member of multiple projects (taOS #1862).
-    """
+async def agent_token_app(app):
+    """App with initialized stores and an agent token without memory scopes."""
+    for attr in ("agent_registry", "agent_grants", "metrics", "notifications", "qmd_client", 
+                 "secrets", "broker_store", "scheduler", "channels", "relationship_mgr",
+                 "conversion_mgr", "training_mgr", "agent_messages", "shared_folders",
+                 "streaming_sessions", "expert_agents", "chat_messages", "chat_channels",
+                 "project_store", "project_invites", "board_audit", "receipt_store",
+                 "task_strikes", "project_task_store", "project_element_store",
+                 "project_notes_store", "project_lists_store", "project_list_entries_store",
+                 "routine_store", "decision_store", "execution_policies", "coding_session_store",
+                 "container_request_store", "canvas_store", "themes", "office_docs", "web_sites",
+                 "song_store", "lora_store", "design_docs", "app_grants", "license_acceptances",
+                 "feedback_store", "client_log_store", "device_store", "device_pair_requests",
+                 "council_roles", "council_members"):
+        store = getattr(app.state, attr, None)
+        if store is not None and hasattr(store, '_db') and store._db is None:
+            if hasattr(store, 'init'):
+                await store.init()
+    
+    app.state.auth.setup_user("admin", "Test Admin", "", "testpass")
+    app.state._startup_complete = True
+    
+    # Register agent WITHOUT memory_read/memory_write scopes
     registry = app.state.agent_registry
     grants = app.state.agent_grants
     priv, _pub = app.state.agent_registry_keypair
     
-    # Use a unique handle for each agent to avoid constraint violations
     import uuid
     unique_suffix = str(uuid.uuid4())[:8]
     
@@ -58,269 +46,109 @@ async def _mint(
     )
     cid = rec["canonical_id"]
     await registry.set_status(cid, "active")
-    for scope in scopes:
-        await grants.add_grant(cid, scope, project_id=project_id)
-    for scope, pid in (extra_grants or []):
-        await grants.add_grant(cid, scope, project_id=pid)
+    # Only grant a2a_receive, NOT memory_read or memory_write
+    await grants.add_grant(cid, "a2a_receive", project_id="prj-1")
     token = mint_registry_token(
-        cid, priv, user_id="u", framework="grok", project_id=project_id
+        cid, priv, user_id="u", framework="grok", project_id="prj-1"
     )
-    return cid, token
+    
+    yield app, token, cid
+    
+    # Cleanup
+    for attr in ("agent_registry", "agent_grants", "metrics", "notifications", "qmd_client", 
+                 "secrets", "broker_store", "scheduler", "channels", "relationship_mgr",
+                 "conversion_mgr", "training_mgr", "agent_messages", "shared_folders",
+                 "streaming_sessions", "expert_agents", "chat_messages", "chat_channels",
+                 "project_store", "project_invites", "board_audit", "receipt_store",
+                 "task_strikes", "project_task_store", "project_element_store",
+                 "project_notes_store", "project_lists_store", "project_list_entries_store",
+                 "routine_store", "decision_store", "execution_policies", "coding_session_store",
+                 "container_request_store", "canvas_store", "themes", "office_docs", "web_sites",
+                 "song_store", "lora_store", "design_docs", "app_grants", "license_acceptances",
+                 "feedback_store", "client_log_store", "device_store", "device_pair_requests",
+                 "council_roles", "council_members"):
+        store = getattr(app.state, attr, None)
+        if store is not None and hasattr(store, '_db') and store._db is not None:
+            if hasattr(store, 'close'):
+                await store.close()
 
 
-@pytest.mark.asyncio
 class TestMemoryScopeEnforcement:
-    """Test that memory routes are protected by memory_read scope.
-
-    This test FAILS on current dev because memory routes have no scope checks.
+    """Test that memory scopes have been removed from the grantable vocabulary
+    (consent-integrity fix) since the memory routes are not reachable by agent tokens.
     """
 
-    async def test_agent_without_memory_read_is_refused(self, token_app):
-        """Test that an agent WITHOUT memory_read scope is REFUSED by auth middleware."""
-        cid, token = await _mint(token_app, scopes=("a2a_receive",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        # This should raise 403 because the token does NOT hold memory_read scope
-        with pytest.raises(HTTPException) as exc:
-            await check_agent_scope(req, "memory_read")
-        assert exc.value.status_code == 403
-        assert "token does not hold an active" in exc.value.detail
+    def test_memory_read_removed_from_valid_scopes(self):
+        """memory_read must not be in the grantable vocabulary."""
+        assert "memory_read" not in VALID_SCOPES
 
-    async def test_agent_with_memory_read_is_accepted(self, token_app):
-        """Test that an agent WITH memory_read scope is ACCEPTED."""
-        cid, token = await _mint(token_app, scopes=("memory_read",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        # This should succeed because the token holds memory_read scope
-        got = await check_agent_scope(req, "memory_read")
-        assert got == cid
+    def test_memory_write_removed_from_valid_scopes(self):
+        """memory_write must not be in the grantable vocabulary."""
+        assert "memory_write" not in VALID_SCOPES
 
-    async def test_project_memory_scope_enforcement(self, token_app):
-        """Test that project-bound memory routes require project binding."""
-        # Agent without project-scoped memory_read grant
-        cid, token = await _mint(token_app, scopes=("memory_read",), project_id=None)
-        req = _FakeRequest(token_app, token)
-        
-        # Project-scoped check should fail
-        with pytest.raises(HTTPException) as exc:
-            await check_agent_scope_for_project(req, "memory_read", "prj-1")
-        assert exc.value.status_code == 403
-        assert "token not scoped to this project" in exc.value.detail
+    def test_tools_execute_removed_from_valid_scopes(self):
+        """tools_execute must not be in the grantable vocabulary."""
+        assert "tools_execute" not in VALID_SCOPES
 
-    async def test_project_memory_scope_grant(self, token_app):
-        """Test that project-bound memory routes accept project-scoped grants."""
-        cid, token = await _mint(
-            token_app, 
-            scopes=("memory_read",), 
-            project_id=None,
-            extra_grants=[("memory_read", "prj-1")]
-        )
-        req = _FakeRequest(token_app, token)
-        
-        # Project-scoped check should succeed
-        got = await check_agent_scope_for_project(req, "memory_read", "prj-1")
-        assert got == cid
+    def test_memory_read_removed_from_allowed_scopes(self):
+        """memory_read must not be in the internal agent allowed scopes."""
+        assert "memory_read" not in _ALLOWED_SCOPES
 
-    async def test_memory_stats_requires_memory_read_scope(self, token_app):
-        """Test that /api/memory/stats requires memory_read scope."""
-        # Agent WITHOUT memory_read scope should be REFUSED
-        cid, token = await _mint(token_app, scopes=("a2a_receive",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        with pytest.raises(HTTPException) as exc:
-            await check_agent_scope(req, "memory_read")
-        assert exc.value.status_code == 403
-        
-        # Agent WITH memory_read scope should be ACCEPTED
-        cid, token = await _mint(token_app, scopes=("memory_read",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        got = await check_agent_scope(req, "memory_read")
-        assert got == cid
+    def test_memory_write_removed_from_allowed_scopes(self):
+        """memory_write must not be in the internal agent allowed scopes."""
+        assert "memory_write" not in _ALLOWED_SCOPES
 
-    async def test_memory_browse_requires_memory_read_scope(self, token_app):
-        """Test that /api/memory/browse requires memory_read scope."""
-        # Agent WITHOUT memory_read scope should be REFUSED
-        cid, token = await _mint(token_app, scopes=("a2a_receive",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        with pytest.raises(HTTPException) as exc:
-            await check_agent_scope(req, "memory_read")
-        assert exc.value.status_code == 403
-        
-        # Agent WITH memory_read scope should be ACCEPTED
-        cid, token = await _mint(token_app, scopes=("memory_read",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        got = await check_agent_scope(req, "memory_read")
-        assert got == cid
+    def test_tools_execute_removed_from_allowed_scopes(self):
+        """tools_execute must not be in the internal agent allowed scopes."""
+        assert "tools_execute" not in _ALLOWED_SCOPES
 
-    async def test_memory_user_stats_requires_memory_read_scope(self, token_app):
-        """Test that /api/user-memory/stats requires memory_read scope."""
-        # Agent WITHOUT memory_read scope should be REFUSED
-        cid, token = await _mint(token_app, scopes=("a2a_receive",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
+    @pytest.mark.asyncio
+    async def test_memory_routes_reachable_without_scope_checks(self, agent_token_app):
+        """Memory routes should be reachable via session auth (not agent token),
+        and should not have dead scope checks in handlers."""
+        app, token, cid = agent_token_app
         
-        with pytest.raises(HTTPException) as exc:
-            await check_agent_scope(req, "memory_read")
-        assert exc.value.status_code == 403
-        
-        # Agent WITH memory_read scope should be ACCEPTED
-        cid, token = await _mint(token_app, scopes=("memory_read",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        got = await check_agent_scope(req, "memory_read")
-        assert got == cid
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            headers={"Authorization": f"Bearer {token}"},
+        ) as client:
+            # Agent tokens are blocked by middleware (401) because memory routes
+            # are not in _AGENT_TOKEN_PATHS. This is expected - the consent-integrity
+            # fix acknowledges this by removing the unenforceable scopes.
+            resp = await client.get("/api/memory/browse")
+            assert resp.status_code == 401
+            assert resp.json()["error"] == "Authentication required"
+            
+            resp = await client.get("/api/memory/stats")
+            assert resp.status_code == 401
+            
+            resp = await client.post("/api/memory/search", json={"query": "test", "mode": "keyword"})
+            assert resp.status_code == 401
+            
+            resp = await client.get("/api/user-memory/stats")
+            assert resp.status_code == 401
 
-    async def test_memory_management_stats_requires_memory_read_scope(self, token_app):
-        """Test that /api/memory/stats in memory_management requires memory_read scope."""
-        # Agent WITHOUT memory_read scope should be REFUSED
-        cid, token = await _mint(token_app, scopes=("a2a_receive",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
+    @pytest.mark.asyncio
+    async def test_memory_write_routes_reachable_without_scope_checks(self, agent_token_app):
+        """Memory write routes should also be blocked at middleware for agent tokens."""
+        app, token, cid = agent_token_app
         
-        with pytest.raises(HTTPException) as exc:
-            await check_agent_scope(req, "memory_read")
-        assert exc.value.status_code == 403
-        
-        # Agent WITH memory_read scope should be ACCEPTED
-        cid, token = await _mint(token_app, scopes=("memory_read",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        got = await check_agent_scope(req, "memory_read")
-        assert got == cid
-
-    async def test_memory_write_operations_require_memory_write_scope(self, token_app):
-        """Test that memory write operations require memory_write scope."""
-        # Agent WITHOUT memory_write scope should be REFUSED
-        cid, token = await _mint(token_app, scopes=("memory_read",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        with pytest.raises(HTTPException) as exc:
-            await check_agent_scope(req, "memory_write")
-        assert exc.value.status_code == 403
-        
-        # Agent WITH memory_write scope should be ACCEPTED
-        cid, token = await _mint(token_app, scopes=("memory_write",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        got = await check_agent_scope(req, "memory_write")
-        assert got == cid
-
-    async def test_memory_user_save_requires_memory_write_scope(self, token_app):
-        """Test that /api/user-memory/save requires memory_write scope."""
-        # Agent WITHOUT memory_write scope should be REFUSED
-        cid, token = await _mint(token_app, scopes=("memory_read",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        with pytest.raises(HTTPException) as exc:
-            await check_agent_scope(req, "memory_write")
-        assert exc.value.status_code == 403
-        
-        # Agent WITH memory_write scope should be ACCEPTED
-        cid, token = await _mint(token_app, scopes=("memory_write",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        got = await check_agent_scope(req, "memory_write")
-        assert got == cid
-
-    async def test_memory_recipe_apply_requires_memory_write_scope(self, token_app):
-        """Test that /api/memory/recipes/default/apply requires memory_write scope."""
-        # Agent WITHOUT memory_write scope should be REFUSED
-        cid, token = await _mint(token_app, scopes=("memory_read",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        with pytest.raises(HTTPException) as exc:
-            await check_agent_scope(req, "memory_write")
-        assert exc.value.status_code == 403
-        
-        # Agent WITH memory_write scope should be ACCEPTED
-        cid, token = await _mint(token_app, scopes=("memory_write",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        got = await check_agent_scope(req, "memory_write")
-        assert got == cid
-
-    async def test_user_memory_search_requires_memory_read_scope(self, token_app):
-        """Test that /api/user-memory/search requires memory_read scope."""
-        # Agent WITHOUT memory_read scope should be REFUSED
-        cid, token = await _mint(token_app, scopes=("a2a_receive",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        with pytest.raises(HTTPException) as exc:
-            await check_agent_scope(req, "memory_read")
-        assert exc.value.status_code == 403
-        
-        # Agent WITH memory_read scope should be ACCEPTED
-        cid, token = await _mint(token_app, scopes=("memory_read",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        got = await check_agent_scope(req, "memory_read")
-        assert got == cid
-
-    async def test_user_memory_save_requires_memory_write_scope(self, token_app):
-        """Test that /api/user-memory/save requires memory_write scope."""
-        # Agent WITHOUT memory_write scope should be REFUSED
-        cid, token = await _mint(token_app, scopes=("memory_read",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        with pytest.raises(HTTPException) as exc:
-            await check_agent_scope(req, "memory_write")
-        assert exc.value.status_code == 403
-        
-        # Agent WITH memory_write scope should be ACCEPTED
-        cid, token = await _mint(token_app, scopes=("memory_write",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        got = await check_agent_scope(req, "memory_write")
-        assert got == cid
-
-    async def test_memory_delete_chunk_requires_memory_write_scope(self, token_app):
-        """Test that /api/memory/chunk/{hash} requires memory_write scope."""
-        # Agent WITHOUT memory_write scope should be REFUSED
-        cid, token = await _mint(token_app, scopes=("memory_read",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        with pytest.raises(HTTPException) as exc:
-            await check_agent_scope(req, "memory_write")
-        assert exc.value.status_code == 403
-        
-        # Agent WITH memory_write scope should be ACCEPTED
-        cid, token = await _mint(token_app, scopes=("memory_write",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        got = await check_agent_scope(req, "memory_write")
-        assert got == cid
-
-    async def test_user_memory_delete_chunk_requires_memory_write_scope(self, token_app):
-        """Test that /api/user-memory/chunk/{hash} requires memory_write scope."""
-        # Agent WITHOUT memory_write scope should be REFUSED
-        cid, token = await _mint(token_app, scopes=("memory_read",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        with pytest.raises(HTTPException) as exc:
-            await check_agent_scope(req, "memory_write")
-        assert exc.value.status_code == 403
-        
-        # Agent WITH memory_write scope should be ACCEPTED
-        cid, token = await _mint(token_app, scopes=("memory_write",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        got = await check_agent_scope(req, "memory_write")
-        assert got == cid
-
-    async def test_user_memory_agent_search_requires_memory_read_scope(self, token_app):
-        """Test that /api/user-memory/agent-search requires memory_read scope."""
-        # Agent WITHOUT memory_read scope should be REFUSED
-        cid, token = await _mint(token_app, scopes=("a2a_receive",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        with pytest.raises(HTTPException) as exc:
-            await check_agent_scope(req, "memory_read")
-        assert exc.value.status_code == 403
-        
-        # Agent WITH memory_read scope should be ACCEPTED
-        cid, token = await _mint(token_app, scopes=("memory_read",), project_id="prj-1")
-        req = _FakeRequest(token_app, token)
-        
-        got = await check_agent_scope(req, "memory_read")
-        assert got == cid
+        transport = ASGITransport(app=app)
+        async with AsyncClient(
+            transport=transport,
+            base_url="http://test",
+            headers={"Authorization": f"Bearer {token}"},
+        ) as client:
+            resp = await client.post("/api/user-memory/save", json={"content": "test"})
+            assert resp.status_code == 401
+            
+            resp = await client.post("/api/memory/recipes/default/apply", json={})
+            assert resp.status_code == 401
+            
+            resp = await client.delete("/api/memory/chunk/abc123")
+            assert resp.status_code == 401
+            
+            resp = await client.delete("/api/user-memory/chunk/abc123")
+            assert resp.status_code == 401

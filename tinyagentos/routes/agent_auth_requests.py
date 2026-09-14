@@ -47,13 +47,10 @@ _PENDING_CAP = 5
 # Closed vocabulary of grantable scopes — surfaced to the user in the
 # desktop consent actions (desktop/src/components/ConsentActions.tsx).
 VALID_SCOPES = frozenset({
-    "memory_read",
-    "memory_write",
     "a2a_send",
     "a2a_receive",
     "files_read",
     "files_write",
-    "tools_execute",
     "registry_feeds_read",
     # Least-privilege kanban access: task read + lifecycle + comments for the
     # agent's OWN project only (bound by the token's project_id claim). Does NOT

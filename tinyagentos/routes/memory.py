@@ -7,7 +7,6 @@ from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from tinyagentos.agent_token_auth import check_agent_scope
 from tinyagentos.otel.trace_context import build_trace_context_headers
 
 logger = logging.getLogger(__name__)
@@ -81,11 +80,6 @@ async def memory_browse(
     conversation_id: str | None = None,
 ):
     """Browse memory chunks via qmd serve GET /browse."""
-    # Scope check: agents must have memory_read grant
-    caller = await check_agent_scope(request, "memory_read")
-    if caller is None:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    
     http_client = request.app.state.http_client
     params: dict = {"limit": limit, "offset": offset}
     if collection:
@@ -157,11 +151,6 @@ async def memory_search(request: Request, body: SearchRequest):
     Aggregating across agents is a separate concern that belongs in a
     future ``/api/memory/all`` endpoint, gated by user permission.
     """
-    # Scope check: agents must have memory_read grant
-    caller = await check_agent_scope(request, "memory_read")
-    if caller is None:
-        raise HTTPException(status_code=401, detail="Authentication required")
-    
     db_path = _agent_db_path(request, body.agent)
     search_fn = _qmd_vsearch if body.mode == "semantic" else _qmd_search
 
