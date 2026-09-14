@@ -2968,6 +2968,16 @@ class TestProjectCreatePendingCapNoOrphan:
         await pstore.init()
         priv, pub = load_or_create_signing_keypair(tmp_path / "keys-cap")
 
+        reg = await registry.register(
+            framework="openclaw",
+            display_name="cap-test",
+            user_id="u",
+            origin="external-selfjoin",
+            handle="cap-test",
+        )
+        await registry.set_status(reg["canonical_id"], "active")
+        cid = reg["canonical_id"]
+
         monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
         monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
         monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
@@ -2977,12 +2987,14 @@ class TestProjectCreatePendingCapNoOrphan:
 
         for i in range(_PENDING_CAP):
             await auth_store.create(
-                identity_claim="cap-test",
-                framework="cap-fw",
+                identity_claim=cid,
+                framework="project_create",
                 requested_scopes=["memory_read"],
                 requested_skills=None,
                 reason="",
                 pending_cap=_PENDING_CAP,
+                cap_identity=cid,
+                cap_framework="project_create",
             )
 
         resp = await client.post(
@@ -3005,4 +3017,256 @@ class TestProjectCreatePendingCapNoOrphan:
         await registry.close()
         await auth_store.close()
         await pstore.close()
+
+
+class TestProjectCreateSecurity:
+    """Security tests for the project_create auth-request path."""
+
+    @pytest.mark.asyncio
+    async def test_unresolved_identity_is_rejected(self, client, monkeypatch, tmp_path):
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.projects.project_store import ProjectStore
+
+        auth_store = AuthRequestsStore(tmp_path / "auth-unresolved.db")
+        await auth_store.init()
+        pstore = ProjectStore(tmp_path / "projects-unresolved.db")
+        await pstore.init()
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", None)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "no-such-agent",
+                "framework": "openclaw",
+                "kind": "project_create",
+                "requested_name": "Orphan Project",
+                "requested_slug": "orphan-project",
+                "purpose": "test",
+            },
+        )
+        assert resp.status_code == 401, resp.text
+
+        await auth_store.close()
+        await pstore.close()
+
+    @pytest.mark.asyncio
+    async def test_cap_is_enforced_before_decision_row_exists(
+        self, client, monkeypatch, tmp_path
+    ):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.routes.agent_auth_requests import _PENDING_CAP
+        from tinyagentos.projects.project_store import ProjectStore
+        import uuid
+
+        registry = AgentRegistryStore(tmp_path / "reg-caporder.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-caporder.db")
+        await auth_store.init()
+        pstore = ProjectStore(tmp_path / "projects-caporder.db")
+        await pstore.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-caporder")
+
+        reg = await registry.register(
+            framework="openclaw",
+            display_name="cap-order",
+            user_id="u",
+            origin="external-selfjoin",
+            handle="cap-order",
+        )
+        await registry.set_status(reg["canonical_id"], "active")
+        cid = reg["canonical_id"]
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        for i in range(_PENDING_CAP):
+            await auth_store.create(
+                identity_claim=cid,
+                framework="project_create",
+                requested_scopes=["memory_read"],
+                requested_skills=None,
+                reason="",
+                pending_cap=_PENDING_CAP,
+                cap_identity=cid,
+                cap_framework="project_create",
+            )
+
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "cap-order",
+                "framework": "cap-fw",
+                "kind": "project_create",
+                "requested_name": "Cap Order Project",
+                "requested_slug": f"cap-order-{uuid.uuid4().hex[:8]}",
+                "purpose": "test",
+            },
+        )
+        assert resp.status_code == 429, resp.text
+
+        decision_store = client._transport.app.state.decision_store
+        pending = await decision_store.list(status="pending")
+        assert len(pending) == 0, f"decision row exists before cap check: {pending}"
+
+        await registry.close()
+        await auth_store.close()
+        await pstore.close()
+
+    @pytest.mark.asyncio
+    async def test_cap_key_ignores_caller_chosen_framework(
+        self, client, monkeypatch, tmp_path
+    ):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.routes.agent_auth_requests import _PENDING_CAP
+        from tinyagentos.projects.project_store import ProjectStore
+        import uuid
+
+        registry = AgentRegistryStore(tmp_path / "reg-capkey.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-capkey.db")
+        await auth_store.init()
+        pstore = ProjectStore(tmp_path / "projects-capkey.db")
+        await pstore.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-capkey")
+
+        reg = await registry.register(
+            framework="openclaw",
+            display_name="cap-key",
+            user_id="u",
+            origin="external-selfjoin",
+            handle="cap-key",
+        )
+        await registry.set_status(reg["canonical_id"], "active")
+        cid = reg["canonical_id"]
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        for i in range(_PENDING_CAP):
+            await auth_store.create(
+                identity_claim=cid,
+                framework="project_create",
+                requested_scopes=["memory_read"],
+                requested_skills=None,
+                reason="",
+                pending_cap=_PENDING_CAP,
+                cap_identity=cid,
+                cap_framework="project_create",
+            )
+
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "cap-key",
+                "framework": "fw-b",
+                "kind": "project_create",
+                "requested_name": "Cap Key Project",
+                "requested_slug": f"cap-key-{uuid.uuid4().hex[:8]}",
+                "purpose": "test",
+            },
+        )
+        assert resp.status_code == 429, resp.text
+
+        await registry.close()
+        await auth_store.close()
+        await pstore.close()
+
+    @pytest.mark.asyncio
+    async def test_member_failure_after_project_create_does_not_leave_orphan(
+        self, client, monkeypatch, tmp_path
+    ):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.agent_grants_store import AgentGrantsStore
+        from tinyagentos.projects.project_store import ProjectStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-orphan.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-orphan.db")
+        await auth_store.init()
+        pstore = ProjectStore(tmp_path / "projects-orphan.db")
+        await pstore.init()
+        grants = AgentGrantsStore(tmp_path / "grants-orphan.db")
+        await grants.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-orphan")
+
+        reg = await registry.register(
+            framework="openclaw",
+            display_name="orphan-agent",
+            user_id="u",
+            origin="external-selfjoin",
+            handle="orphan-agent",
+        )
+        await registry.set_status(reg["canonical_id"], "active")
+        cid = reg["canonical_id"]
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+        monkeypatch.setattr(client._transport.app.state, "agent_grants", grants)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        original_add_member = pstore.add_member
+
+        async def failing_add_member(*args, **kwargs):
+            raise RuntimeError("simulated member add failure")
+
+        monkeypatch.setattr(pstore, "add_member", failing_add_member)
+
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "orphan-agent",
+                "framework": "openclaw",
+                "kind": "project_create",
+                "requested_name": "Orphan Board",
+                "requested_slug": "orphan-board",
+                "purpose": "test",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        request_id = resp.json()["request_id"]
+        decision_id = resp.json()["decision_id"]
+
+        resp = await client.post(
+            f"/api/decisions/{decision_id}/answer",
+            json={"value": "approve"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        project = await pstore.get_project_by_slug("orphan-board")
+        assert project is None, f"orphan project created: {project}"
+
+        auth_record = await auth_store.get(request_id)
+        assert auth_record is not None
+        assert auth_record["status"] == "refused"
+
+        await registry.close()
+        await auth_store.close()
+        await pstore.close()
+        await grants.close()
 

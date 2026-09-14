@@ -1117,19 +1117,13 @@ async def _apply_project_create_grant(request: Request, decision: dict, value) -
 
         project = None
         try:
-            project = await pstore.create_project(
+            project = await pstore.create_project_with_lead(
                 name=requested_name,
                 slug=requested_slug,
                 created_by=from_agent,
+                member_id=from_agent,
                 user_id=decision.get("user_id") or "",
             )
-            await pstore.add_member(
-                project_id=project["id"],
-                member_id=from_agent,
-                member_kind="native",
-                role="lead",
-            )
-            await pstore.set_lead(project["id"], from_agent)
         except Exception:
             logger.warning(
                 "project_create project creation failed for decision %s",
@@ -1148,17 +1142,40 @@ async def _apply_project_create_grant(request: Request, decision: dict, value) -
                 )
             return False
 
+        granted = False
         try:
             grants_store = getattr(request.app.state, "agent_grants", None)
             if grants_store is not None:
                 await grants_store.add_grant(
                     from_agent, "project_tasks", tier="once", project_id=project["id"]
                 )
+            granted = True
         except Exception:
             logger.warning(
                 "project_create grant write failed for decision %s",
                 decision.get("id"), exc_info=True,
             )
+
+        if not granted:
+            try:
+                await pstore.set_status(project["id"], "deleted")
+            except Exception:
+                logger.warning(
+                    "project_create project cleanup failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            try:
+                await auth_store.set_decision(
+                    auth_request_id,
+                    "refused",
+                    decided_by=decision.get("user_id") or "",
+                )
+            except Exception:
+                logger.warning(
+                    "project_create refusal after grant failure failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            return False
 
         try:
             await auth_store.set_decision(

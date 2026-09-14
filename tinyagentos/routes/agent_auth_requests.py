@@ -251,21 +251,22 @@ def _get_approve_lock(request: Request, request_id: str) -> asyncio.Lock:
     return locks[request_id]
 
 
-async def _resolve_agent_identity(request: Request, identity_claim: str) -> str:
+async def _resolve_agent_identity(request: Request, identity_claim: str, *, strict: bool = False) -> str:
     """Resolve the agent's canonical_id from a Bearer token if present, otherwise
     look it up in the registry by the slugified identity_claim, falling back to
     the raw claim only when no matching registry row exists.
 
-    The project-create request path is exempt from scope checks (any registry
-    identity may request), but the resulting Decision is attributed to the
-    agent's canonical_id, not a caller-supplied string, so the registry is
-    consulted when no Bearer token is present.
+    When ``strict`` is True (project_create path), an HTTPException from
+    ``check_agent_identity`` is propagated, and a missing or unresolved identity
+    raises 401 instead of returning the caller-supplied string.
     """
     from tinyagentos.agent_token_auth import check_agent_identity
 
     try:
         cid = await check_agent_identity(request)
     except HTTPException:
+        if strict:
+            raise
         cid = None
     if cid:
         return cid
@@ -279,6 +280,11 @@ async def _resolve_agent_identity(request: Request, identity_claim: str) -> str:
         if existing is not None:
             return existing["canonical_id"]
 
+    if strict:
+        raise HTTPException(
+            status_code=401,
+            detail="unauthenticated: provide a valid registry token or a registered identity_claim",
+        )
     return identity_claim
 
 
@@ -329,7 +335,7 @@ async def _handle_project_create_request(
             status_code=409,
         )
 
-    from_agent = await _resolve_agent_identity(request, body.identity_claim)
+    from_agent = await _resolve_agent_identity(request, body.identity_claim, strict=True)
 
     admins = [u for u in request.app.state.auth.list_users() if u.get("is_admin")]
     if not admins:
@@ -337,36 +343,12 @@ async def _handle_project_create_request(
     decider = admins[0]["id"]
 
     decision_store = request.app.state.decision_store
-    decision = await decision_store.create(
-        from_agent=from_agent,
-        question=(
-            f"Agent {from_agent} requests to create project "
-            f"'{body.requested_name}' ({body.requested_slug})"
-        ),
-        type="approve_deny",
-        options=[
-            {"label": "Approve", "value": "approve"},
-            {"label": "Deny", "value": "deny"},
-        ],
-        context=body.purpose or body.reason,
-        priority="normal",
-        project_id=None,
-        user_id=decider,
-        metadata={
-            "kind": "project_create",
-            "_server_raised": True,
-            "auth_request_id": None,  # filled in after auth request is created
-            "requested_name": body.requested_name,
-            "requested_slug": body.requested_slug,
-            "purpose": body.purpose or body.reason,
-            "from_agent": from_agent,
-        },
-    )
 
+    record = None
     try:
         record = await store.create(
-            identity_claim=body.identity_claim,
-            framework=body.framework,
+            identity_claim=from_agent,
+            framework="project_create",
             requested_scopes=[],
             requested_skills=[],
             reason=body.purpose or body.reason,
@@ -377,19 +359,51 @@ async def _handle_project_create_request(
             requested_project_name=body.requested_name,
             requested_project_slug=body.requested_slug,
             purpose=body.purpose or body.reason,
+            cap_identity=from_agent,
+            cap_framework="project_create",
         )
     except PendingCapExceeded as exc:
-        try:
-            await decision_store.supersede(decision["id"])
-        except Exception:
-            pass
         raise HTTPException(
             status_code=429,
             detail=(
-                f"too many pending requests from identity {body.identity_claim!r} "
+                f"too many pending requests from identity {from_agent!r} "
                 f"({exc.pending} pending; resolve existing requests first)"
             ),
         ) from None
+
+    try:
+        decision = await decision_store.create(
+            from_agent=from_agent,
+            question=(
+                f"Agent {from_agent} requests to create project "
+                f"'{body.requested_name}' ({body.requested_slug})"
+            ),
+            type="approve_deny",
+            options=[
+                {"label": "Approve", "value": "approve"},
+                {"label": "Deny", "value": "deny"},
+            ],
+            context=body.purpose or body.reason,
+            priority="normal",
+            project_id=None,
+            user_id=decider,
+            metadata={
+                "kind": "project_create",
+                "_server_raised": True,
+                "auth_request_id": record["id"],
+                "requested_name": body.requested_name,
+                "requested_slug": body.requested_slug,
+                "purpose": body.purpose or body.reason,
+                "from_agent": from_agent,
+            },
+        )
+    except Exception:
+        await store._db.execute(
+            "DELETE FROM auth_requests WHERE id = ?",
+            (record["id"],),
+        )
+        await store._db.commit()
+        raise
 
     meta = dict(decision.get("metadata") or {})
     meta["auth_request_id"] = record["id"]
@@ -405,14 +419,14 @@ async def _handle_project_create_request(
             await notifs.add(
                 title="Project creation request",
                 message=(
-                    f"{body.identity_claim} requests to create project "
+                    f"{from_agent} requests to create project "
                     f"'{body.requested_name}' ({body.requested_slug})"
                 ),
                 level="info",
                 source="auth_requests",
                 data={
                     "request_id": record["id"],
-                    "identity_claim": body.identity_claim,
+                    "identity_claim": from_agent,
                     "framework": body.framework,
                     "requested_name": body.requested_name,
                     "requested_slug": body.requested_slug,

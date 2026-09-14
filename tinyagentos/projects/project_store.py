@@ -177,6 +177,40 @@ class ProjectStore(ProjectsDBStore):
                     (project_id,),
                 )
 
+    async def create_project_with_lead(
+        self,
+        name: str,
+        slug: str,
+        created_by: str,
+        member_id: str,
+        description: str = "",
+        settings: dict | None = None,
+        user_id: str = "",
+    ) -> dict:
+        """Create a project and add the lead member atomically.
+
+        Wraps ``create_project``, ``add_member`` and ``set_lead`` in a single
+        transaction so a failure after project creation never leaves an orphan
+        project with no lead.
+        """
+        async with self._tx():
+            project = await self.create_project(
+                name=name,
+                slug=slug,
+                created_by=created_by,
+                description=description,
+                settings=settings,
+                user_id=user_id,
+            )
+            await self.add_member(
+                project_id=project["id"],
+                member_id=member_id,
+                member_kind="native",
+                role="lead",
+            )
+            await self.set_lead(project["id"], member_id)
+            return project
+
     async def create_project(
         self,
         name: str,

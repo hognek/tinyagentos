@@ -133,6 +133,8 @@ class AuthRequestsStore(BaseStore):
         requested_project_name: Optional[str] = None,
         requested_project_slug: Optional[str] = None,
         purpose: str = "",
+        cap_identity: Optional[str] = None,
+        cap_framework: Optional[str] = None,
     ) -> dict:
         """Create a new pending auth request. Returns the full record.
 
@@ -176,10 +178,12 @@ class AuthRequestsStore(BaseStore):
                 values,
             )
         else:
+            cap_identity_val = cap_identity or identity_claim
+            cap_framework_val = cap_framework or framework
             cur = await self._db.execute(
                 f"INSERT INTO auth_requests {_CREATE_COLUMNS} "
                 "SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ? WHERE " + _CAP_GUARD,
-                (*values, identity_claim, framework, pending_cap),
+                (*values, cap_identity_val, cap_framework_val, pending_cap),
             )
         await self._db.commit()
 
