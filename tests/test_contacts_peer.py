@@ -747,6 +747,49 @@ class TestPeerRoutes:
         )
         assert resp2.status_code == 409, f"replay should be 409, got {resp2.status_code}: {resp2.text}"
 
+    async def test_inbox_drain_failure_does_not_block_dispatch(
+        self, client_with_contacts, app_with_contacts, monkeypatch
+    ):
+        """If the outbox drain raises, peer_inbox must still return 2xx."""
+        local_id = resolve_local_identity_id()
+        from tinyagentos.hub.identity import public_identity as _hub_pub
+        signing_pub = _hub_pub()["signing_pubkey"]
+
+        store = app_with_contacts.state.contacts_store
+        await store.add_contact(
+            contact_id="hub:drain-fail", hub_username="drain-fail", display_name="D",
+            ed25519_pub=signing_pub, x25519_pub="ek",
+        )
+        inbound = generate_peer_token()
+        await store.establish_peer_link(
+            contact_id="hub:drain-fail",
+            inbound_token=inbound,
+            outbound_token=generate_peer_token(),
+        )
+
+        env = build_envelope(
+            from_username="drain-fail",
+            to_username=_TEST_HUB_USERNAME,
+            kind="handshake",
+        )
+        headers = {"Authorization": f"Bearer {inbound}"}
+
+        async def _boom(*args, **kwargs):
+            raise RuntimeError("drain boom")
+
+        monkeypatch.setattr(
+            app_with_contacts.state.peer_outbox,
+            "drain_for_contact",
+            _boom,
+        )
+
+        resp = await client_with_contacts.post(
+            "/api/peer/inbox",
+            json={"envelope": env},
+            headers=headers,
+        )
+        assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+
     async def test_peer_routes_csrf_exempt(self, client_with_contacts, app_with_contacts):
         """Peer routes should work without a CSRF token (bearer-only auth)."""
         store = app_with_contacts.state.contacts_store

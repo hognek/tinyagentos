@@ -9,6 +9,7 @@ import {
   Archive,
   RotateCcw,
   Trash2,
+  Globe,
 } from "lucide-react";
 import { Button } from "@/components/ui";
 import { MessageAvatar } from "./MessageAvatar";
@@ -232,27 +233,29 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                               <Bot size={18} aria-hidden />
                             </div>
                           ) : (
-                            <div
-                              style={{
-                                width: 38,
-                                height: 38,
-                                borderRadius: 11,
-                                display: "flex",
-                                alignItems: "center",
-                                justifyContent: "center",
-                                background:
-                                  "var(--color-shell-surface-active)",
-                                color: "var(--color-shell-text-secondary)",
-                                flexShrink: 0,
-                              }}
-                            >
-                              {ch.type === "group" ? (
-                                <Users size={18} aria-hidden />
-                              ) : (
-                                <Hash size={18} aria-hidden />
-                              )}
-                            </div>
-                          )}
+                             <div
+                               style={{
+                                 width: 38,
+                                 height: 38,
+                                 borderRadius: 11,
+                                 display: "flex",
+                                 alignItems: "center",
+                                 justifyContent: "center",
+                                 background:
+                                   "var(--color-shell-surface-active)",
+                                 color: "var(--color-shell-text-secondary)",
+                                 flexShrink: 0,
+                               }}
+                             >
+                               {ch.type === "group" ? (
+                                 <Users size={18} aria-hidden />
+                                ) : ch.type === "dm-remote" ? (
+                                  <Globe size={18} data-lucide="globe" aria-hidden />
+                               ) : (
+                                 <Hash size={18} aria-hidden />
+                               )}
+                             </div>
+                           )}
                           <div style={{ flex: 1, minWidth: 0 }}>
                             <div
                               style={{
@@ -482,6 +485,8 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                         <span className="shrink-0 grid place-items-center w-[30px] h-[30px] rounded-[9px] bg-shell-surface-active text-shell-text-secondary">
                           {ch.type === "group" ? (
                             <Users size={15} aria-hidden />
+                          ) : ch.type === "dm-remote" ? (
+                            <Globe size={15} data-lucide="globe" aria-hidden />
                           ) : (
                             <Hash size={15} aria-hidden />
                           )}

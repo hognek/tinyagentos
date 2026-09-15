@@ -10,6 +10,9 @@ import {
   MessagesSquare,
   Search,
   PanelRight,
+  Check,
+  CheckCheck,
+  Globe,
 } from "lucide-react";
 import Picker, { Theme } from "emoji-picker-react";
 import { Button } from "@/components/ui";
@@ -56,6 +59,7 @@ export interface MessageRow {
   reactions?: Record<string, string[]>;
   edited_at?: number | string;
   deleted_at?: number | null;
+  delivered_at?: number | null;
   attachments?: AttachmentRecord[];
   reply_count?: number;
   last_reply_at?: number | null;
@@ -220,6 +224,8 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
           <Hash size={16} className="text-white/40" />
         ) : channel?.type === "group" ? (
           <Users size={16} className="text-white/40" />
+        ) : channel?.type === "dm-remote" ? (
+          <Globe size={16} className="text-white/40" />
         ) : (
           <AtSign size={16} className="text-white/40" />
         )}
@@ -361,7 +367,7 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
             <MessageCircle size={40} className="mb-3 opacity-30" />
             <p className="text-sm">
               No messages yet. Say hello to{" "}
-              {channel?.type === "dm"
+              {channel?.type === "dm" || channel?.type === "dm-remote"
                 ? `@${(channel.members ?? []).find((m) => m !== "user") ?? "them"}`
                 : channel?.name
                   ? `#${channel.name}`
@@ -559,6 +565,17 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
                             (error)
                           </span>
                         )}
+                        {channel?.type === "dm-remote" &&
+                          msg.author_id === currentUserId &&
+                          !["pending", "streaming"].includes(msg.state ?? "") && (
+                            <span className="ml-1 text-shell-text-tertiary inline-flex items-center">
+                              {msg.delivered_at ? (
+                                <CheckCheck size={12} aria-hidden="true" />
+                              ) : (
+                                <Check size={12} aria-hidden="true" />
+                              )}
+                            </span>
+                          )}
                       </div>
                     </div>
                   )}
