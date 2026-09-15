@@ -26,21 +26,25 @@ from tinyagentos.base_store import BaseStore, PendingCapExceeded
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS auth_requests (
-    id              TEXT PRIMARY KEY,
-    identity_claim  TEXT NOT NULL DEFAULT '',
-    framework       TEXT NOT NULL DEFAULT '',
-    requested_scopes  TEXT NOT NULL DEFAULT '[]',
-    requested_skills  TEXT NOT NULL DEFAULT '[]',
-    reason          TEXT NOT NULL DEFAULT '',
-    duration_secs   INTEGER,
-    project_id      TEXT,
-    status          TEXT NOT NULL DEFAULT 'pending',
-    canonical_id    TEXT,
-    token           TEXT,
-    granted_scopes  TEXT,
-    created_ts      TEXT NOT NULL,
-    decided_ts      TEXT,
-    decided_by      TEXT
+    id                      TEXT PRIMARY KEY,
+    identity_claim          TEXT NOT NULL DEFAULT '',
+    framework               TEXT NOT NULL DEFAULT '',
+    requested_scopes        TEXT NOT NULL DEFAULT '[]',
+    requested_skills        TEXT NOT NULL DEFAULT '[]',
+    reason                  TEXT NOT NULL DEFAULT '',
+    duration_secs           INTEGER,
+    project_id              TEXT,
+    status                  TEXT NOT NULL DEFAULT 'pending',
+    canonical_id            TEXT,
+    token                   TEXT,
+    granted_scopes          TEXT,
+    created_ts              TEXT NOT NULL,
+    decided_ts              TEXT,
+    decided_by              TEXT,
+    kind                    TEXT NOT NULL DEFAULT 'scope_request',
+    requested_project_name  TEXT,
+    requested_project_slug  TEXT,
+    purpose                 TEXT DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_auth_requests_status ON auth_requests(status);
 CREATE INDEX IF NOT EXISTS idx_auth_requests_identity ON auth_requests(identity_claim, framework, status);
@@ -52,7 +56,8 @@ _VALID_DECISION_STATUSES = frozenset({"accepted", "refused"})
 # uncapped writes can never drift apart on which columns they set.
 _CREATE_COLUMNS = (
     "(id, identity_claim, framework, requested_scopes, requested_skills,"
-    " reason, duration_secs, project_id, status, created_ts)"
+    " reason, duration_secs, project_id, status, created_ts,"
+    " kind, requested_project_name, requested_project_slug, purpose)"
 )
 
 # Makes the pending cap atomic with the insert: SQLite evaluates the count and
@@ -88,6 +93,27 @@ class AuthRequestsStore(BaseStore):
         if self._db is not None:
             self._db.row_factory = aiosqlite.Row
 
+    async def _post_init(self) -> None:
+        cols = {
+            row[1]
+            for row in await (
+                await self._db.execute("PRAGMA table_info(auth_requests)")
+            ).fetchall()
+        }
+        alters = [
+            ("kind", "ALTER TABLE auth_requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'scope_request'"),
+            ("requested_project_name", "ALTER TABLE auth_requests ADD COLUMN requested_project_name TEXT"),
+            ("requested_project_slug", "ALTER TABLE auth_requests ADD COLUMN requested_project_slug TEXT"),
+            ("purpose", "ALTER TABLE auth_requests ADD COLUMN purpose TEXT DEFAULT ''"),
+        ]
+        dirty = False
+        for col, sql in alters:
+            if col not in cols:
+                await self._db.execute(sql)
+                dirty = True
+        if dirty:
+            await self._db.commit()
+
     # ------------------------------------------------------------------
     # Write
     # ------------------------------------------------------------------
@@ -103,6 +129,12 @@ class AuthRequestsStore(BaseStore):
         duration_secs: Optional[int] = None,
         project_id: Optional[str] = None,
         pending_cap: Optional[int] = None,
+        kind: str = "scope_request",
+        requested_project_name: Optional[str] = None,
+        requested_project_slug: Optional[str] = None,
+        purpose: str = "",
+        cap_identity: Optional[str] = None,
+        cap_framework: Optional[str] = None,
     ) -> dict:
         """Create a new pending auth request. Returns the full record.
 
@@ -110,7 +142,7 @@ class AuthRequestsStore(BaseStore):
         framework) pair may hold. The comparison happens inside the INSERT (see
         ``_CAP_GUARD``), so it is atomic with the write: the caller must NOT
         count first and decide, as every request in a concurrent burst would
-        read the same pre-insert count, pass, and insert — and this route takes
+        read the same pre-insert count, pass, and insert -- and this route takes
         no credentials, so that burst is free. Raises ``PendingCapExceeded``
         when the cap is already full.
 
@@ -133,19 +165,25 @@ class AuthRequestsStore(BaseStore):
             duration_secs,
             project_id,
             now,
+            kind,
+            requested_project_name,
+            requested_project_slug,
+            purpose,
         )
 
         if pending_cap is None:
             cur = await self._db.execute(
                 f"INSERT INTO auth_requests {_CREATE_COLUMNS} "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)",
                 values,
             )
         else:
+            cap_identity_val = cap_identity or identity_claim
+            cap_framework_val = cap_framework or framework
             cur = await self._db.execute(
                 f"INSERT INTO auth_requests {_CREATE_COLUMNS} "
-                "SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ? WHERE " + _CAP_GUARD,
-                (*values, identity_claim, framework, pending_cap),
+                "SELECT ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ? WHERE " + _CAP_GUARD,
+                (*values, cap_identity_val, cap_framework_val, pending_cap),
             )
         await self._db.commit()
 
