@@ -74,7 +74,10 @@ curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-
 
 <details>
   <summary>Alpine / postmarketOS</summary>
-  sudo apk add --no-cache bash python3 py3-pip git curl libtorrent-rasterbar sqlite nodejs npm sqlcipher-dev vulkan-tools && curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo bash
+
+```bash
+sudo apk add --no-cache bash python3 py3-pip git curl libtorrent-rasterbar sqlite nodejs npm sqlcipher-dev vulkan-tools && curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo bash
+```
 </details>
 
 <details>
