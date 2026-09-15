@@ -137,6 +137,20 @@ class PeerOutboxStore(BaseStore):
             row = await cursor.fetchone()
         return row[0] if row else 0
 
+    async def drain_for_contact(self, contact_id: str) -> int:
+        """Dequeue all due rows for *contact_id* and mark each as sent.
+
+        Returns the number of rows drained.  Called when a peer link becomes
+        active (``last_seen_at`` refresh) so queued envelopes are flushed
+        immediately instead of waiting for the next retry window.
+        """
+        due = await self.dequeue_due(contact_id, limit=100)
+        count = 0
+        for item in due:
+            if await self.mark_sent(item["id"]):
+                count += 1
+        return count
+
 
 # ---------------------------------------------------------------------------
 # helpers

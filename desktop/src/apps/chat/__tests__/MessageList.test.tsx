@@ -680,4 +680,51 @@ describe("MessageList", () => {
       expect(screen.getByTitle("Search")).toBeInTheDocument();
     });
   });
+
+  /* ---- dm-remote delivery ticks ---- */
+
+  describe("dm-remote delivery ticks", () => {
+    it("shows single check for dm-remote message without delivered_at", () => {
+      renderWithMsg({
+        channel: channel({ type: "dm-remote", members: ["user", "hub:peer"] }),
+        messages: [
+          msg({
+            channel_id: "dmr-1",
+            delivered_at: undefined,
+          }),
+        ],
+      });
+      const svgs = document.querySelectorAll("svg");
+      const checkSvg = Array.from(svgs).find((svg) =>
+        svg.querySelector('path[d="M20 6 9 17l-5-5"]'),
+      );
+      expect(checkSvg).toBeTruthy();
+    });
+
+    it("shows double check for dm-remote message with delivered_at", () => {
+      renderWithMsg({
+        channel: channel({ type: "dm-remote", members: ["user", "hub:peer"] }),
+        messages: [
+          msg({
+            channel_id: "dmr-1",
+            delivered_at: 1700000001,
+          }),
+        ],
+      });
+      const svgs = document.querySelectorAll("svg");
+      const doubleCheckSvg = Array.from(svgs).find((svg) =>
+        svg.querySelector('path[d="m22 10-7.5 7.5L13 16"]'),
+      );
+      expect(doubleCheckSvg).toBeTruthy();
+    });
+
+    it("does not show delivery tick for non-dm-remote channels", () => {
+      renderWithMsg({
+        channel: channel({ type: "topic" }),
+        messages: [msg({ channel_id: "ch1" })],
+      });
+      const content = screen.getByText("Hello world").textContent ?? "";
+      expect(content).not.toContain("delivered");
+    });
+  });
 });
