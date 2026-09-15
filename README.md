@@ -473,6 +473,7 @@ Run `curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/ins
 | `/home/<user>/tinyagentos/data/` | All persistent state. **One directory to back up.** Contains: agent state YAMLs, agent memory SQLite indexes, agent workspaces, secrets DB, scheduler history, channel credentials, downloaded models, torrent settings, telemetry opt-in flag. |
 | `/home/<user>/.cache/qmd/index.sqlite` | User memory index (taOSmd knowledge base for personal notes). Per-agent indexes live separately under `data/agent-memory/{name}/index.sqlite`. |
 | Ports listened on | **6969** (controller HTTP API + web UI), **6970** (browser-proxy second-origin, `TAOS_BROWSER_PROXY_PORT`), **7832** (qmd embedding service), **4000** (LiteLLM proxy, localhost only by default) |
+| Env vars set | `TAOS_SPA_DIR=$INSTALL_DIR/static/desktop` (points the controller at the staged desktop bundle for non-editable `pip install .` users) |
 | OS packages added | python3 + venv + pip, git, curl, ca-certificates, libtorrent-rasterbar (model torrent mesh), Node.js 22 (qmd + SPA build), sqlite3, libsqlcipher (encrypted secrets), vulkan-tools (hardware detection), postgresql (LiteLLM virtual keys) |
 | User accounts created | The distro `postgres` system user is created when PostgreSQL is installed. A `litellm` Postgres role and database are created for virtual-key management. Everything else runs as the user who ran the installer. |
 

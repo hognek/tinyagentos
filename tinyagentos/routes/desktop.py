@@ -8,28 +8,9 @@ from fastapi.responses import FileResponse, JSONResponse
 router = APIRouter()
 
 
-class _SpDir(Path):
-    """Path subclass that resolves from TAOS_SPA_DIR env var if set,
-    otherwise falls back to PROJECT_DIR/static/desktop. The env var is
-    checked on each __truediv__ so that monkeypatch.setenv takes effect
-    even after module import."""
-    
-    def __truediv__(self, tag: str) -> Path:
-        taos_dir = os.environ.get("TAOS_SPA_DIR")
-        if taos_dir:
-            return Path(taos_dir) / tag
-        return super().__truediv__(tag)
-
-
 _PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 
-#: SPA directory — resolved from TAOS_SPA_DIR env var if the installer sets it,
-#: otherwise the default for editable/source checkouts.
-#: Using a Path subclass ensures the env var is re-checked on every access
-#: (important for non-editable pip installs where the installer sets TAOS_SPA_DIR).
-SPA_DIR: _SpDir = _SpDir(
-    os.environ.get("TAOS_SPA_DIR", str(_PROJECT_DIR / "static" / "desktop"))
-)
+SPA_DIR = Path(os.environ.get("TAOS_SPA_DIR") or (_PROJECT_DIR / "static" / "desktop"))
 
 
 @router.get("/api/desktop/settings")
@@ -228,8 +209,8 @@ async def serve_spa_root():
     if index.exists():
         return FileResponse(index, media_type="text/html", headers=_HTML_NO_CACHE)
     if SPA_DIR.is_dir():
-        return JSONResponse({"error": "Desktop shell not built — run: cd desktop && npm run build"}, status_code=404)
-    return JSONResponse({"error": "Desktop shell not installed (static/desktop missing; not built or staged on this install)"}, status_code=404)
+        return JSONResponse({"error": "Desktop shell not built — run: cd desktop && npm run build, or set TAOS_SPA_DIR to the built static/desktop"}, status_code=404)
+    return JSONResponse({"error": "Desktop shell not installed (static/desktop missing; not built or staged on this install — set TAOS_SPA_DIR to point at the built static/desktop)"}, status_code=404)
 
 
 @router.get("/desktop/{rest:path}")
@@ -254,5 +235,5 @@ async def serve_spa(rest: str = ""):
     if index.exists():
         return FileResponse(index, media_type="text/html", headers=_HTML_NO_CACHE)
     if SPA_DIR.is_dir():
-        return JSONResponse({"error": "Desktop shell not built — run: cd desktop && npm run build"}, status_code=404)
-    return JSONResponse({"error": "Desktop shell not installed (static/desktop missing; not built or staged on this install)"}, status_code=404)
+        return JSONResponse({"error": "Desktop shell not built — run: cd desktop && npm run build, or set TAOS_SPA_DIR to the built static/desktop"}, status_code=404)
+    return JSONResponse({"error": "Desktop shell not installed (static/desktop missing; not built or staged on this install — set TAOS_SPA_DIR to point at the built static/desktop)"}, status_code=404)

@@ -1,8 +1,9 @@
 """Coverage for GET /sw.js (the service worker entry served at root scope)."""
+import importlib
 import pytest
 from fastapi.testclient import TestClient
 from tinyagentos.app import create_app
-from tinyagentos.routes.desktop import SPA_DIR
+import tinyagentos.routes.desktop as desktop
 
 
 @pytest.fixture
@@ -17,7 +18,7 @@ def test_sw_js_returns_javascript_with_root_scope_header(client):
     - declare Service-Worker-Allowed: / so the SW can claim root scope
       even though it lives under /static/desktop/sw.js
     - not be aggressively cached (Cache-Control no-cache)"""
-    sw_path = SPA_DIR / "sw.js"
+    sw_path = desktop.SPA_DIR / "sw.js"
     if not sw_path.exists():
         pytest.skip("SPA not built (no static/desktop/sw.js); skipping live route test")
     r = client.get("/sw.js")
@@ -120,34 +121,29 @@ def test_api_agents_still_requires_auth(client):
     assert r.status_code == 401
 
 
-def test_spa_found_when_package_not_at_repo_root(client, monkeypatch, tmp_path):
-    """Test that SPA routes work when the package is not at the repo root,
-    as long as the bundle is properly staged (simulating non-editable pip install).
-
-    Before the fix, this test FAILS with AssertionError because SPA_DIR resolves
-    to site-packages/static/desktop which never exists. After the fix, TAOS_SPA_DIR
-    is checked and the staged bundle is found.
-    """
-    # Setup: create a staged bundle directory (as the installer would do)
+def test_spa_dir_honours_taos_spa_dir_env(tmp_path, monkeypatch):
+    """TAOS_SPA_DIR must override the default SPA_DIR at module load so
+    non-editable pip installs (where the installer stages the bundle and sets
+    the env var) resolve to the staged directory, not site-packages/static/desktop."""
     staged_dir = tmp_path / "staged-spa"
     staged_dir.mkdir()
     (staged_dir / "index.html").write_text("<html>spa</html>")
-    (staged_dir / "sw.js").write_text("// sw.js")
-    (staged_dir / "chat.html").write_text("<html>chat</html>")
-    (staged_dir / "app.html").write_text("<html>app</html>")
 
-    # Set TAOS_SPA_DIR to the staged directory (simulating installer sets this)
     monkeypatch.setenv("TAOS_SPA_DIR", str(staged_dir))
+    importlib.reload(desktop)
+    try:
+        assert desktop.SPA_DIR == staged_dir
+    finally:
+        monkeypatch.delenv("TAOS_SPA_DIR", raising=False)
+        importlib.reload(desktop)
 
-    # Act: access SPA routes — should find the bundle via the env var
+
+def test_spa_serves_staged_body_with_taos_spa_dir(client, monkeypatch, tmp_path):
+    """When TAOS_SPA_DIR is honoured, /desktop must serve the staged index.html."""
+    staged_dir = tmp_path / "staged-spa"
+    staged_dir.mkdir()
+    (staged_dir / "index.html").write_text("<html>spa</html>")
+    monkeypatch.setattr("tinyagentos.routes.desktop.SPA_DIR", staged_dir)
     r = client.get("/desktop")
-    assert r.status_code == 200, f"Expected 200 for /desktop, got {r.status_code}"
-
-    r = client.get("/sw.js")
-    assert r.status_code == 200, f"Expected 200 for /sw.js, got {r.status_code}"
-
-    r = client.get("/app.html?app=messages")
-    assert r.status_code == 200, f"Expected 200 for /app.html, got {r.status_code}"
-
-    r = client.get("/chat-pwa")
-    assert r.status_code == 200, f"Expected 200 for /chat-pwa, got {r.status_code}"
+    assert r.status_code == 200
+    assert r.text == "<html>spa</html>"
