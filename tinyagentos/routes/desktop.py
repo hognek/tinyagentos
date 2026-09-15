@@ -10,7 +10,7 @@ router = APIRouter()
 
 _PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
 
-SPA_DIR = Path(os.environ.get("TAOS_SPA_DIR") or (_PROJECT_DIR / "static" / "desktop"))
+SPA_DIR = Path(os.environ.get("TAOS_SPA_DIR") or (_PROJECT_DIR / "static" / "desktop")).resolve()
 
 
 @router.get("/api/desktop/settings")
