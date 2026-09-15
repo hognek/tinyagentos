@@ -295,9 +295,11 @@ class TestDiskTypeDetection:
             lambda *a, **k: "mmcblk0 1 mmc\n" if "lsblk" in a[0] else "",
         )
         real_exists = Path.exists
+        seen_paths = []
         def fake_exists(self):
             s = str(self)
-            if s.endswith("/sys/block/mmcblkboot0") or s.endswith("/sys/block/mmcblkrpmb"):
+            seen_paths.append(s)
+            if s.endswith("/sys/block/mmcblk0boot0") or s.endswith("/sys/block/mmcblk0boot1") or s.endswith("/sys/block/mmcblk0rpmb"):
                 return True
             if s.endswith("/sys/block/mmcblk0"):
                 return True
@@ -314,6 +316,8 @@ class TestDiskTypeDetection:
 
         disk = hardware_mod._detect_disk()
         assert disk.type == "emmc"
+        for p in seen_paths:
+            assert not p.endswith("mmcblkboot0"), f"Wrong path queried: {p}"
 
     def test_mmcblk_without_boot_partitions_is_sd(self, monkeypatch, tmp_path):
         """mmcblk without boot partitions -> sd (microSD)."""
@@ -322,9 +326,11 @@ class TestDiskTypeDetection:
             lambda *a, **k: "mmcblk0 1 mmc\n" if "lsblk" in a[0] else "",
         )
         real_exists = Path.exists
+        seen_paths = []
         def fake_exists(self):
             s = str(self)
-            if s.endswith("/sys/block/mmcblkboot0") or s.endswith("/sys/block/mmcblkrpmb"):
+            seen_paths.append(s)
+            if s.endswith("/sys/block/mmcblk0boot0") or s.endswith("/sys/block/mmcblk0boot1") or s.endswith("/sys/block/mmcblk0rpmb"):
                 return False
             if s.endswith("/sys/block/mmcblk0"):
                 return True
@@ -350,6 +356,8 @@ class TestDiskTypeDetection:
 
         disk = hardware_mod._detect_disk()
         assert disk.type == "sd"
+        for p in seen_paths:
+            assert not p.endswith("mmcblkboot0"), f"Wrong path queried: {p}"
 
     def test_mmcblk_sysfs_type_mmc_is_emmc(self, monkeypatch):
         """mmcblk with sysfs type=MMC -> emmc (fallback when no boot partitions)."""
