@@ -272,7 +272,7 @@ describe("ChannelSidebar — channel type icons", () => {
     );
     expect(screen.getByText("remote-peer")).toBeInTheDocument();
     const channelRow = screen.getByLabelText(`Channel ${ch.name}`);
-    expect(channelRow.querySelector("svg")).toBeTruthy();
+    expect(channelRow.querySelector('[data-lucide="globe"]')).toBeTruthy();
   });
 });
 

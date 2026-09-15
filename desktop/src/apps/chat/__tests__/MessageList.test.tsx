@@ -723,8 +723,11 @@ describe("MessageList", () => {
         channel: channel({ type: "topic" }),
         messages: [msg({ channel_id: "ch1", author_id: "user" })],
       });
-      const content = screen.getByText("Hello world").textContent ?? "";
-      expect(content).not.toContain("delivered");
+      const svgs = document.querySelectorAll("svg");
+      const checkSvg = Array.from(svgs).find((svg) =>
+        svg.querySelector('path[d="M20 6 9 17l-5-5"]'),
+      );
+      expect(checkSvg).toBeFalsy();
     });
 
     it("does not show delivery tick for remote-authored dm-remote messages", () => {
