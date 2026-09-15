@@ -6,7 +6,7 @@
 
 - **Messages**: the main chat. Talk to one agent (DM), several (group), or topic channels.
 - **Agents**: deploy or import agents (e.g. Hermes), configure, start, stop. Pick framework, model, and base images.
-- **Projects**: boards/docs; registered agents request project creation via auth-request with their own registry Bearer token, and `identity_claim` must match the token subject.
+- **Projects**: boards/docs; request access via auth-request.
 - **Files**: browse agent workspaces, user workspace, shared folders. Upload and download.
 - **Store**: one-click install of community apps. Each app gets its own container and a safe port.
 - **Models**: see and pull local models; pin cloud models.

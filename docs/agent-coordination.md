@@ -1147,8 +1147,7 @@ Authorization: Bearer <registry token>
 ```
 
 Without a valid registry token the request returns **401**. The token subject is
-the only source of the canonical agent id. The body's `identity_claim` must match
-the registry handle for that token subject; a mismatch returns **403**. The body
+the only source of the canonical agent id. The body's `identity_claim` must equal the registry handle of the agent the token was minted for; a mismatch returns **403**. The body
 carries the desired project name, slug, and purpose:
 
 ```json
