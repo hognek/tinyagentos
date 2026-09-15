@@ -1,3 +1,26 @@
+"""Memory routes — per-agent and user memory over the shared qmd serve.
+
+Every memory operation is an HTTP call to the host ``qmd.service``
+process on :7832. That process exposes ``/search``, ``/vsearch``,
+``/browse``, ``/collections``, ``/ingest``, and ``/delete-chunk`` and
+each call accepts an optional ``dbPath`` that selects which SQLite
+file to operate on. TinyAgentOS resolves the ``dbPath`` based on the
+calling scope:
+
+- ``agent=foo``  → ``data/agent-memory/foo/index.sqlite``
+- no agent       → a dedicated taOS user index
+  (``<data>/user-qmd-index/index.sqlite``), never qmd's shared default
+
+This is the load-bearing piece of per-agent memory isolation — each
+agent reads and writes its own index, so Agent A cannot see Agent B's
+memory and Agent A's deletions cannot trample anyone else's data. See
+``docs/design/framework-agnostic-runtime.md``.
+
+§4.4 trace-context propagation: all outbound memory calls inject W3C
+``traceparent`` and ``X-TaOS-Conversation-Id`` headers so the memory
+backend (qmd / taosmd) can nest its spans under the caller's OTel trace.
+The headers are built by ``build_trace_context_headers()``.
+"""
 from __future__ import annotations
 
 import logging

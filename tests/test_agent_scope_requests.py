@@ -100,7 +100,7 @@ async def test_owner_creates_and_approves_grant_on_existing_identity(
 
         resp = await client.post(
             f"/api/agents/registry/{cid}/scope-requests",
-            json={"requested_scopes": ["memory_read", "memory_write"], "reason": "need memory"},
+            json={"requested_scopes": ["a2a_send", "a2a_receive"], "reason": "need memory"},
         )
         assert resp.status_code == 200, resp.text
         req_id = resp.json()["request_id"]
@@ -109,14 +109,14 @@ async def test_owner_creates_and_approves_grant_on_existing_identity(
         # Admin narrows to a subset on approve.
         resp = await client.post(
             f"/api/agents/registry/{cid}/scope-requests/{req_id}/approve",
-            json={"granted_scopes": ["memory_read"]},
+            json={"granted_scopes": ["a2a_send"]},
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["canonical_id"] == cid
 
         # Grant landed on the EXISTING canonical_id, and NO new identity exists.
         grants = await env.grants.list_grants(cid)
-        assert {g["scope"] for g in grants} == {"memory_read"}
+        assert {g["scope"] for g in grants} == {"a2a_send"}
         assert all(g["project_id"] is None for g in grants)
         assert len(await env.registry.list_all()) == before  # no new identity
     finally:
@@ -871,7 +871,7 @@ async def test_get_scope_request_by_id(client, monkeypatch, tmp_path):
 
         resp = await client.post(
             f"/api/agents/registry/{cid}/scope-requests",
-            json={"requested_scopes": ["memory_read"], "reason": "need memory"},
+            json={"requested_scopes": ["a2a_send"], "reason": "need memory"},
         )
         assert resp.status_code == 200, resp.text
         req_id = resp.json()["request_id"]
@@ -884,7 +884,7 @@ async def test_get_scope_request_by_id(client, monkeypatch, tmp_path):
         assert body["id"] == req_id
         assert body["canonical_id"] == cid
         assert body["status"] == "pending"
-        assert body["requested_scopes"] == ["memory_read"]
+        assert body["requested_scopes"] == ["a2a_send"]
         assert body["reason"] == "need memory"
         assert body["granted_scopes"] is None
     finally:
