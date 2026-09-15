@@ -1,8 +1,9 @@
 """Coverage for GET /sw.js (the service worker entry served at root scope)."""
+import importlib
 import pytest
 from fastapi.testclient import TestClient
 from tinyagentos.app import create_app
-from tinyagentos.routes.desktop import SPA_DIR
+import tinyagentos.routes.desktop as desktop
 
 
 @pytest.fixture
@@ -17,7 +18,7 @@ def test_sw_js_returns_javascript_with_root_scope_header(client):
     - declare Service-Worker-Allowed: / so the SW can claim root scope
       even though it lives under /static/desktop/sw.js
     - not be aggressively cached (Cache-Control no-cache)"""
-    sw_path = SPA_DIR / "sw.js"
+    sw_path = desktop.SPA_DIR / "sw.js"
     if not sw_path.exists():
         pytest.skip("SPA not built (no static/desktop/sw.js); skipping live route test")
     r = client.get("/sw.js")
@@ -118,3 +119,31 @@ def test_api_agents_still_requires_auth(client):
     expose real API endpoints. /api/agents must still return 401 without a cookie."""
     r = client.get("/api/agents")
     assert r.status_code == 401
+
+
+def test_spa_dir_honours_taos_spa_dir_env(tmp_path, monkeypatch):
+    """TAOS_SPA_DIR must override the default SPA_DIR at module load so
+    non-editable pip installs (where the installer stages the bundle and sets
+    the env var) resolve to the staged directory, not site-packages/static/desktop."""
+    staged_dir = tmp_path / "staged-spa"
+    staged_dir.mkdir()
+    (staged_dir / "index.html").write_text("<html>spa</html>")
+
+    monkeypatch.setenv("TAOS_SPA_DIR", str(staged_dir))
+    importlib.reload(desktop)
+    try:
+        assert desktop.SPA_DIR == staged_dir
+    finally:
+        monkeypatch.delenv("TAOS_SPA_DIR", raising=False)
+        importlib.reload(desktop)
+
+
+def test_spa_serves_staged_body_with_taos_spa_dir(client, monkeypatch, tmp_path):
+    """When TAOS_SPA_DIR is honoured, /desktop must serve the staged index.html."""
+    staged_dir = tmp_path / "staged-spa"
+    staged_dir.mkdir()
+    (staged_dir / "index.html").write_text("<html>spa</html>")
+    monkeypatch.setattr("tinyagentos.routes.desktop.SPA_DIR", staged_dir)
+    r = client.get("/desktop")
+    assert r.status_code == 200
+    assert r.text == "<html>spa</html>"
