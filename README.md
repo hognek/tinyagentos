@@ -72,6 +72,26 @@ Sovereignty by default, cloud by choice. Run taOS fully offline, or connect a cl
 curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo bash
 ```
 
+<details>
+  <summary>Alpine / postmarketOS</summary>
+  sudo apk add --no-cache bash python3 py3-pip git curl libtorrent-rasterbar sqlite nodejs npm sqlcipher-dev vulkan-tools && curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo bash
+</details>
+
+<details>
+  <summary>Debian / Ubuntu</summary>
+  sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 python3-venv python3-pip git curl ca-certificates libtorrent-rasterbar-dev libboost-python-dev sqlite3 libsqlcipher-dev vulkan-tools && curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo bash
+</details>
+
+<details>
+  <summary>Fedora</summary>
+  sudo dnf install -y -q python3 python3-pip git curl rb_libtorrent-devel rb_libtorrent-python3 boost-python3 sqlite nodejs npm sqlcipher-devel vulkan-tools && curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo bash
+</details>
+
+<details>
+  <summary>Arch</summary>
+  sudo pacman -Sy --noconfirm --needed python python-pip git curl libtorrent-rasterbar boost sqlite nodejs npm sqlcipher vulkan-tools && curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo bash
+</details>
+
 Run without `sudo` to install as a user-mode systemd unit instead. The script is idempotent, safe to re-run on an existing install. Supports env-var overrides for install path, branch, and port.
 
 ### Verified installs
