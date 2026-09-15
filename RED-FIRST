@@ -1,0 +1,40 @@
+RED-FIRST: tests/test_routes_project_invites.py::test_mint_accepts_known_scopes still mints memory_read (removed from the vocabulary) - AssertionError:
+
+```
+FAILED tests/test_routes_project_invites.py::test_mint_accepts_known_scopes - AssertionError: {"error":"unknown scopes: ['memory_read']; valid: ['a2a_receive', 'a2a_send', 'canvas_read', 'canvas_write', 'decisions_read', 'decisions_write', 'files_read', 'files_write', 'observatory_control', 'project_doc_..."
+assert 400 == 200
+1 failed, 3536 passed, 7 skipped
+```
+
+RED test: replace memory_read with another scope that is in the route's valid list AND is not project-scoped
+
+GIT GREP OUTPUT:
+
+- tests/test_agent_scope_requests.py:259:            json={"requested_scopes": ["memory_read"]},
+- tests/test_agent_scope_requests.py:274:            json={"requested_scopes": ["memory_read"]},
+- tests/test_agent_scope_requests.py:305:            canonical_id=cid, requested_scopes=["memory_read"]
+- tests/test_agent_scope_requests.py:309:            json={"granted_scopes": ["memory_read", "memory_write"]},
+- tests/test_agent_scope_requests.py:373:            canonical_id=cid, requested_scopes=["memory_read"]
+- tests/test_agent_scope_requests.py:383:                json={"granted_scopes": ["memory_read"]},
+- tests/test_agent_scope_requests.py:400:            canonical_id=cid, requested_scopes=["memory_read"]
+- tests/test_agent_scope_requests.py:410:                json={"granted_scopes": ["memory_read"]},
+- tests/test_agent_scope_requests.py:459:            canonical_id=cid, requested_scopes=["memory_read"]
+- tests/test_agent_scope_requests.py:486:            canonical_id=cid_a, requested_scopes=["memory_read"]
+- tests/test_agent_scope_requests.py:490:            json={"granted_scopes": ["memory_read"]},
+- tests/test_agent_scope_requests.py:566:            canonical_id=cid, requested_scopes=["memory_read"]
+- tests/test_agent_scope_requests.py:723:                json={"requested_scopes": ["memory_read"]},
+- tests/test_agent_scope_requests.py:729:            json={"requested_scopes": ["memory_read"]},
+- tests/test_agent_scope_requests.py:754:            canonical_id=cid, requested_scopes=["memory_read"]
+- tests/test_agent_scope_requests.py:765:                json={"granted_scopes": ["memory_read"]},
+- tests/test_agent_scope_requests.py:769:                json={"granted_scopes": ["memory_read"]},
+- tests/test_agent_scope_requests.py:795:            canonical_id=cid, requested_scopes=["memory_read"],
+- tests/test_agent_scope_requests.py:911:            canonical_id=cid, requested_scopes=["memory_read"],
+- tests/test_agent_scope_requests.py:954:            canonical_id=cid, requested_scopes=["memory_read"],
+- tests/test_agent_scope_requests.py:1033:            canonical_id=cid_b, requested_scopes=["memory_read"],
+- tests/test_agent_scope_requests.py:1074:            canonical_id=cid_a, requested_scopes=["memory_read"],
+- tests/test_agent_scope_requests.py:1125:            canonical_id=cid, requested_scopes=["memory_read"],
+- tests/test_agent_scope_requests.py:1213:            canonical_id=cid, requested_scopes=["memory_read"],
+- tests/test_agent_scope_requests.py:1256:            canonical_id=cid, requested_scopes=["memory_read"],
+- tests/test_agent_scope_requests.py:1302:                canonical_id="agent-1", requested_scopes=["memory_read"],
+- tests/test_agent_scope_requests.py:1332:                canonical_id="agent-1", requested_scopes=["memory_read"],
+- tests/test_agent_scope_requests.py:1378:                    requested_scopes=["memory_read"],
