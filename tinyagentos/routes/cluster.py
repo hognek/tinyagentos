@@ -275,6 +275,15 @@ class HeartbeatBody(BaseModel):
     # rank candidates by actual free memory, not total capacity.
     free_vram_mb: int | None = None
     used_vram_mb: int | None = None
+    # Worker-sampled age of the VRAM report in milliseconds. When present,
+    # the controller uses the sample time (not the receipt time) to avoid
+    # over-admitting during heartbeat transit. If absent, keep the current
+    # receipt-time behavior (old workers, backward compatibility).
+    vram_sampled_age_ms: int | None = None
+    # Worker-sampled timestamp when the VRAM snapshot was taken (worker-monotonic).
+    # This is the same information as vram_sampled_age_ms but stored directly
+    # for internal use. The age field is derived from this in the worker.
+    vram_sampled_at: float | None = None
     # Registration-drift refresh (taOS #1538): workers report their live
     # host_lan_ip, url, and hardware on every heartbeat so the cluster
     # manager stays in sync with container reality. Optional so legacy

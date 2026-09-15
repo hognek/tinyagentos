@@ -356,6 +356,57 @@ class TestClusterManager:
         )
         assert lease_c is None
 
+    async def test_lease_granted_during_heartbeat_transit_is_still_counted(self):
+        """Lease granted during heartbeat transit must still be counted.
+        
+        This reproduces the H1 race window where a lease granted at t1 (sample time)
+        is not counted in already_held because worker.last_vram_report_at is stamped
+        when the CONTROLLER receives the heartbeat at t2 > t1.
+        
+        Steps:
+        1. Worker samples free_vram_mb=8192 at t0 and sends heartbeat.
+        2. Controller grants lease A at t1 > t0, before heartbeat lands.
+        3. Heartbeat arrives at t2 > t1: free_vram_mb=8192 (pre-lease sample), last_vram_report_at=t2.
+        4. Next claim: lease A has granted_at=t1 < t2, so NOT counted; effective_free=8192; 
+           a second 8192 MB lease is admitted on VRAM lease A still reserves.
+        """
+        mgr = ClusterManager()
+        await mgr.register_worker(_make_worker("gpu-box", url="http://gpu-box:9000"))
+        worker = mgr.get_worker("gpu-box")
+        worker.resources = ["gpu-cuda-0", "gpu-cuda-1"]
+        assert mgr.heartbeat("gpu-box", free_vram_mb=8192) is True
+
+        lease_a = await mgr.claim_lease(
+            resource_id="gpu-box:gpu-cuda-0",
+            caller="a",
+            ttl_seconds=300,
+            required_vram_mb=8192,
+        )
+        assert lease_a is not None
+
+        # Simulate late-arriving pre-lease sample heartbeat
+        # With the fix, we can pass vram_sampled_age_ms to use sample time
+        # instead of receipt time, so lease A IS counted in already_held
+        # This test should now PASS with the fix
+        time.sleep(0.01)
+        # Pass vram_sampled_age_ms that corresponds to the sample time before lease_a was granted
+        # This simulates the worker sending the age in the heartbeat
+        # If the sample was taken at t0 and arrives at t2, age = (t2 - t0) * 1000
+        # We want last_vram_report_at to be t0 (the sample time), so:
+        # vram_sampled_age_ms = 100 (t2 - t0 = 0.1s)
+        assert mgr.heartbeat("gpu-box", free_vram_mb=8192, vram_sampled_age_ms=100) is True
+
+        lease_b = await mgr.claim_lease(
+            resource_id="gpu-box:gpu-cuda-1",
+            caller="b",
+            ttl_seconds=300,
+            required_vram_mb=8192,
+        )
+        # Should be None because lease A is still holding VRAM
+        # With vram_sampled_age_ms=0, last_vram_report_at will be older, 
+        # so lease A WILL be counted in already_held
+        assert lease_b is None
+
 
 @pytest.mark.asyncio
 class TestTaskRouter:
