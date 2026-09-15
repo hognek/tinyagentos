@@ -52,6 +52,14 @@ def _extract_verify_function() -> str:
 
 
 def _write_wrapper(tmp_path: Path, curl_body: str, function_body: str) -> Path:
+    # Create a mock INSTALL_DIR with a local token file so the production
+    # function's auth-header branch is exercised.
+    install_dir = tmp_path / "mock_install"
+    install_dir.mkdir()
+    data_dir = install_dir / "data"
+    data_dir.mkdir()
+    (data_dir / ".auth_local_token").write_text("mock-token-12345")
+
     wrapper = tmp_path / "wrapper.sh"
     wrapper.write_text(
         "#!/usr/bin/env bash\n"
@@ -60,6 +68,7 @@ def _write_wrapper(tmp_path: Path, curl_body: str, function_body: str) -> Path:
         "warn() { printf '[server-install] %s\\n' \"$*\" >&2; }\n"
         "die()  { printf '[server-install] %s\\n' \"$*\" >&2; exit 1; }\n"
         f"curl() {{\n{curl_body}\n}}\n"
+        f"INSTALL_DIR=\"{install_dir}\"\n"
         "TAOS_PORT=\"$TAOS_PORT\"\n"
         "os_name=\"$os_name\"\n"
         "HW_PROFILE_ID=\"${HW_PROFILE_ID:-unknown}\"\n"
@@ -144,4 +153,57 @@ def test_install_script_uses_post_for_hardware_refresh() -> None:
         "install-server.sh must POST /api/system/hardware/refresh with a "
         "bounded --max-time; a GET against a POST-only route silently returns "
         "405 and triggers the empty-profile skip from taOS #2."
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
+def test_verify_dies_loud_when_local_token_is_missing(tmp_path: Path) -> None:
+    """Fresh-install scenario: no .auth_local_token yet (pre-admin state).
+    The installer must die with a clear message instead of silently
+    skipping or dying with the generic empty-profile warning."""
+    function_body = _extract_verify_function()
+    # Override _write_wrapper to NOT create a local token, simulating fresh install
+    install_dir = tmp_path / "mock_install_notoken"
+    install_dir.mkdir()
+    data_dir = install_dir / "data"
+    data_dir.mkdir()
+    # No .auth_local_token file created
+
+    wrapper = tmp_path / "wrapper_notoken.sh"
+    wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -u\n"
+        "log()  { printf '[server-install] %s\\n' \"$*\"; }\n"
+        "warn() { printf '[server-install] %s\\n' \"$*\" >&2; }\n"
+        "die()  { printf '[server-install] %s\\n' \"$*\" >&2; exit 1; }\n"
+        "curl() { :; }\n"
+        f"INSTALL_DIR=\"{install_dir}\"\n"
+        "TAOS_PORT=\"$TAOS_PORT\"\n"
+        "os_name=\"$os_name\"\n"
+        "HW_PROFILE_ID=\"${HW_PROFILE_ID:-unknown}\"\n"
+        "HW_NPU_TYPE=\"${HW_NPU_TYPE:-none}\"\n"
+        "HW_NPU_DEVICE=\"${HW_NPU_DEVICE:-}\"\n"
+        + function_body
+        + "\nverify_hardware_capabilities\n"
+    )
+    wrapper.chmod(0o755)
+
+    result = subprocess.run(
+        ["/usr/bin/env", "bash", str(wrapper)],
+        env={**os.environ, "TAOS_PORT": "0", "os_name": "Linux"},
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+
+    assert result.returncode != 0, (
+        "verify_hardware_capabilities returned 0 when local auth token is missing; "
+        "on a fresh install the check must fail loud instead of silently passing.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    combined = (result.stdout + result.stderr).lower()
+    assert "local auth token" in combined, (
+        "missing-token failure output does not mention the local auth token; "
+        "the operator must learn that first-boot init is incomplete.\n"
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
