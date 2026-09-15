@@ -1358,3 +1358,172 @@ async def test_note_publishes_event(client, monkeypatch):
     ev = owner_q.get_nowait()
     assert ev.kind == "decision.note"
     assert ev.payload["decision_id"] == did
+
+
+@pytest.mark.asyncio
+async def test_project_create_approve_refuses_auth_request_when_accepted_returns_none(
+    client, monkeypatch, tmp_path
+):
+    """When set_decision('accepted') returns None, the auth request is refused
+    and the agent gets a specific failure reply, not the generic 'approve'."""
+    import tinyagentos.routes.decisions as dmod
+
+    routed_calls = []
+
+    async def recording_route(decision, value, note=None):
+        routed_calls.append((decision.get("id"), value))
+        return None
+
+    monkeypatch.setattr(dmod, "_route_answer_to_agent", recording_route)
+
+    app = client._transport.app
+
+    from tinyagentos.auth_requests_store import AuthRequestsStore
+    from tinyagentos.agent_grants_store import AgentGrantsStore
+    from tinyagentos.projects.project_store import ProjectStore
+
+    auth_store = AuthRequestsStore(tmp_path / "auth-refused-none.db")
+    await auth_store.init()
+    pstore = ProjectStore(tmp_path / "projects-refused-none.db")
+    await pstore.init()
+    grants = AgentGrantsStore(tmp_path / "grants-refused-none.db")
+    await grants.init()
+
+    monkeypatch.setattr(app.state, "auth_requests", auth_store)
+    monkeypatch.setattr(app.state, "project_store", pstore)
+    monkeypatch.setattr(app.state, "agent_grants", grants)
+
+    auth_request = await auth_store.create(
+        identity_claim="@agent-a",
+        framework="openclaw",
+        requested_scopes=[],
+        requested_skills=[],
+        reason="",
+        kind="project_create",
+        requested_project_name="Test Project",
+        requested_project_slug="test-refused-none",
+        purpose="test",
+    )
+    auth_request_id = auth_request["id"]
+
+    d = await app.state.decision_store.create(
+        from_agent="@agent-a",
+        question="Create test project?",
+        type="approve_deny",
+        user_id="u",
+        metadata={
+            dmod.SERVER_RAISED_KEY: True,
+            "kind": "project_create",
+            "auth_request_id": auth_request_id,
+            "requested_name": "Test Project",
+            "requested_slug": "test-refused-none",
+            "from_agent": "@agent-a",
+        },
+    )
+
+    original_set_decision = auth_store.set_decision
+
+    async def fake_set_decision(request_id, status, **kwargs):
+        if status == "accepted":
+            return None
+        return await original_set_decision(request_id, status, **kwargs)
+
+    monkeypatch.setattr(auth_store, "set_decision", fake_set_decision)
+
+    resp = await client.post(f"/api/decisions/{d['id']}/answer", json={"value": "approve"})
+    assert resp.status_code == 200, resp.text
+
+    auth_record = await auth_store.get(auth_request_id)
+    assert auth_record["status"] == "refused", f"expected refused, got {auth_record['status']}"
+
+    generic_routed = any(
+        v == "approve" for did, v in routed_calls if did == d["id"]
+    )
+    assert not generic_routed, f"generic approve was routed: {routed_calls}"
+
+
+@pytest.mark.asyncio
+async def test_project_create_grant_failure_routes_specific_reply_and_deletes_project(
+    client, monkeypatch, tmp_path
+):
+    """When add_grant raises, the agent gets a specific failure reply mentioning
+    failure, the project is deleted, and the generic 'approve' is not sent."""
+    import tinyagentos.routes.decisions as dmod
+
+    routed_calls = []
+
+    async def recording_route(decision, value, note=None):
+        routed_calls.append((decision.get("id"), value))
+        return None
+
+    monkeypatch.setattr(dmod, "_route_answer_to_agent", recording_route)
+
+    app = client._transport.app
+
+    from tinyagentos.auth_requests_store import AuthRequestsStore
+    from tinyagentos.agent_grants_store import AgentGrantsStore
+    from tinyagentos.projects.project_store import ProjectStore
+
+    auth_store = AuthRequestsStore(tmp_path / "auth-grant-fail.db")
+    await auth_store.init()
+    pstore = ProjectStore(tmp_path / "projects-grant-fail.db")
+    await pstore.init()
+    grants = AgentGrantsStore(tmp_path / "grants-grant-fail.db")
+    await grants.init()
+
+    monkeypatch.setattr(app.state, "auth_requests", auth_store)
+    monkeypatch.setattr(app.state, "project_store", pstore)
+    monkeypatch.setattr(app.state, "agent_grants", grants)
+
+    auth_request = await auth_store.create(
+        identity_claim="@agent-a",
+        framework="openclaw",
+        requested_scopes=[],
+        requested_skills=[],
+        reason="",
+        kind="project_create",
+        requested_project_name="Test Project",
+        requested_project_slug="test-grant-fail",
+        purpose="test",
+    )
+    auth_request_id = auth_request["id"]
+
+    d = await app.state.decision_store.create(
+        from_agent="@agent-a",
+        question="Create test project?",
+        type="approve_deny",
+        user_id="u",
+        metadata={
+            dmod.SERVER_RAISED_KEY: True,
+            "kind": "project_create",
+            "auth_request_id": auth_request_id,
+            "requested_name": "Test Project",
+            "requested_slug": "test-grant-fail",
+            "from_agent": "@agent-a",
+        },
+    )
+
+    async def failing_add_grant(*args, **kwargs):
+        raise RuntimeError("simulated grant failure")
+
+    monkeypatch.setattr(grants, "add_grant", failing_add_grant)
+
+    resp = await client.post(f"/api/decisions/{d['id']}/answer", json={"value": "approve"})
+    assert resp.status_code == 200, resp.text
+
+    auth_record = await auth_store.get(auth_request_id)
+    assert auth_record["status"] == "refused", f"expected refused, got {auth_record['status']}"
+
+    project = await pstore.get_project_by_slug("test-grant-fail")
+    assert project is not None
+    assert project.get("status") == "deleted", f"expected deleted, got {project.get('status')}"
+
+    generic_routed = any(
+        v == "approve" for did, v in routed_calls if did == d["id"]
+    )
+    assert not generic_routed, f"generic approve was routed: {routed_calls}"
+
+    failure_routed = any(
+        "fail" in str(v).lower() for did, v in routed_calls if did == d["id"]
+    )
+    assert failure_routed, f"no failure reply was routed: {routed_calls}"

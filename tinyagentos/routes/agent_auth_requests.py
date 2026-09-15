@@ -280,7 +280,7 @@ async def _resolve_agent_identity(request: Request, identity_claim: str, *, stri
                         record.get("handle", "").strip().removeprefix("@").strip() or record.get("handle", "")
                     )
                     if token_handle != expected_handle:
-                        raise HTTPException(status_code=403, detail="identity_claim does not match token subject")
+                        raise HTTPException(status_code=403, detail="identity_claim does not match registry handle")
         return cid
 
     if strict:

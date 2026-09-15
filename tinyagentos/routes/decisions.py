@@ -1140,7 +1140,11 @@ async def _apply_project_create_grant(request: Request, decision: dict, value) -
                     "project_create refusal after project failure failed for decision %s",
                     decision.get("id"), exc_info=True,
                 )
-            return False
+            await _route_answer_to_agent(
+                decision,
+                f"project creation failed - auth request {auth_request_id} refused",
+            )
+            return True
 
         granted = False
         try:
@@ -1175,7 +1179,11 @@ async def _apply_project_create_grant(request: Request, decision: dict, value) -
                     "project_create refusal after grant failure failed for decision %s",
                     decision.get("id"), exc_info=True,
                 )
-            return False
+            await _route_answer_to_agent(
+                decision,
+                f"project creation approved, but saving the grant failed - auth request {auth_request_id} refused",
+            )
+            return True
 
         try:
             accepted = await auth_store.set_decision(
@@ -1211,7 +1219,22 @@ async def _apply_project_create_grant(request: Request, decision: dict, value) -
                         "project_create grant revoke failed for decision %s",
                         decision.get("id"), exc_info=True,
                     )
-            return False
+            try:
+                await auth_store.set_decision(
+                    auth_request_id,
+                    "refused",
+                    decided_by=decision.get("user_id") or "",
+                )
+            except Exception:
+                logger.warning(
+                    "project_create refusal after acceptance failure failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            await _route_answer_to_agent(
+                decision,
+                f"project creation approved, but acceptance failed - auth request {auth_request_id} refused",
+            )
+            return True
     else:
         try:
             await auth_store.set_decision(
