@@ -297,16 +297,17 @@ async def test_requested_scope_outside_vocabulary_400(client, monkeypatch, tmp_p
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
 async def test_granted_must_be_subset_of_requested_400(client, monkeypatch, tmp_path):
     env = await _wire(client, monkeypatch, tmp_path)
     try:
         cid = await _register_active(env)
         rec = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
         resp = await client.post(
             f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/approve",
-            json={"granted_scopes": ["memory_read", "memory_write"]},
+            json={"granted_scopes": ["a2a_receive", "a2a_send"]},
         )
         assert resp.status_code == 400, resp.text
         # Nothing was granted on the rejected approval.

@@ -85,7 +85,7 @@ async def test_mint_accepts_known_scopes(client, app):
     pid = await _create_project(client)
     resp = await client.post(
         f"/api/projects/{pid}/invites",
-        json={"scopes": ["a2a_send", "memory_read"], "approval_mode": "auto"},
+        json={"scopes": ["a2a_send", "a2a_receive"], "approval_mode": "auto"},
     )
     assert resp.status_code == 200, resp.text
 
