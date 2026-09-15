@@ -40,10 +40,9 @@ def test_decisions_scopes_are_grantable():
 
 ```python
 _ALLOWED_SCOPES = frozenset({
-    "memory_read", "memory_write",
     "a2a_send", "a2a_receive",
     "files_read", "files_write",
-    "tools_execute", "registry_feeds_read",
+    "registry_feeds_read",
     "project_tasks",
     "canvas_read", "canvas_write",
     "decisions_read", "decisions_write",
