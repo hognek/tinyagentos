@@ -40,6 +40,9 @@ import sys
 import tomllib
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _gitutil import diff_name_status_z, parse_name_status as _parse_name_status, run_git  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = REPO_ROOT / "docs" / "doc-gate.toml"
 DEFAULT_TRAILER = "Docs-Reviewed:"
@@ -304,13 +307,15 @@ def _glob_match(path: str, pattern: str) -> bool:
         char = pattern[i]
         if char == "*":
             if i + 1 < length and pattern[i + 1] == "*":
-                # A trailing `/**` should also match the bare parent path, so
-                # fold the preceding literal `/` into an optional group.
-                if regex_parts and regex_parts[-1] == "/" and i + 2 == length:
+                if i + 2 < length and pattern[i + 2] == "/":
+                    regex_parts.append("(?:.*/)?")
+                    i += 3
+                elif regex_parts and regex_parts[-1] == "/" and i + 2 == length:
                     regex_parts[-1] = "(?:/.*)?"
+                    i += 2
                 else:
                     regex_parts.append(".*")
-                i += 2
+                    i += 2
             else:
                 regex_parts.append("[^/]*")
                 i += 1
@@ -481,10 +486,7 @@ class GitCommandError(Exception):
 
 def _run_git(args: list[str], ref: str | None = None) -> str:
     try:
-        result = subprocess.run(
-            ["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, check=True,
-        )
-        return result.stdout
+        return run_git(args, cwd=REPO_ROOT)
     except subprocess.CalledProcessError:
         msg = f"git {' '.join(args)} failed"
         if ref:
@@ -492,26 +494,20 @@ def _run_git(args: list[str], ref: str | None = None) -> str:
         raise GitCommandError(msg) from None
 
 
-def _parse_name_status(output: str) -> list[tuple[str, str]]:
-    changed: list[tuple[str, str]] = []
-    for line in output.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        status = parts[0]
-        # Renames/copies (R100, C100, ...) carry old + new path; the new path
-        # is what matters for both triggering and satisfying a rule.
-        path = parts[-1]
-        changed.append((status[0], path))
-    return changed
-
-
 def _git_changed_staged() -> list[tuple[str, str]]:
-    return _parse_name_status(_run_git(["diff", "--cached", "--name-status"]))
+    try:
+        return diff_name_status_z(REPO_ROOT, cached=True)
+    except subprocess.CalledProcessError:
+        raise GitCommandError("git diff --cached --name-status failed") from None
 
 
 def _git_changed_base(base_ref: str) -> list[tuple[str, str]]:
-    return _parse_name_status(_run_git(["diff", "--name-status", f"{base_ref}...HEAD"], ref=base_ref))
+    try:
+        return diff_name_status_z(REPO_ROOT, base_ref=base_ref)
+    except subprocess.CalledProcessError:
+        raise GitCommandError(
+            f"git diff --name-status {base_ref}...HEAD failed (ref: {base_ref})"
+        ) from None
 
 
 def _git_commit_messages(base_ref: str) -> list[str]:

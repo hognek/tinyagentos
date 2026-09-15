@@ -40,6 +40,9 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _gitutil import parse_name_status as _parse_name_status, run_git  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TRAILER = "Store-Unwired-Intentionally:"
 
@@ -52,26 +55,11 @@ class Violation:
 
 
 def _run_git(args: list[str], repo_root: Path) -> str:
-    result = subprocess.run(
-        ["git", *args], cwd=repo_root, capture_output=True, text=True, check=True,
-    )
-    return result.stdout
-
-
-def _parse_name_status(output: str) -> list[tuple[str, str]]:
-    changed: list[tuple[str, str]] = []
-    for line in output.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        status = parts[0]
-        path = parts[-1]
-        changed.append((status[0], path))
-    return changed
+    return run_git(args, cwd=repo_root)
 
 
 def _git_changed(base_ref: str, repo_root: Path) -> list[tuple[str, str]]:
-    out = _run_git(["diff", "--name-status", f"{base_ref}...HEAD"], repo_root)
+    out = run_git(["-c", "core.quotePath=false", "diff", "-z", "--name-status", f"{base_ref}...HEAD"], cwd=repo_root)
     return _parse_name_status(out)
 
 
@@ -90,19 +78,34 @@ def _class_def_in_added_lines(
     file_path: str, class_name: str, base_ref: str, repo_root: Path,
 ) -> bool:
     """Return True if the class definition is newly added in the PR."""
-    base_content = _get_file_at_ref(file_path, base_ref, repo_root)
-    if base_content is not None:
-        try:
-            base_tree = ast.parse(base_content)
-            for node in ast.walk(base_tree):
-                if isinstance(node, ast.ClassDef) and node.name == class_name:
-                    return False
-        except SyntaxError:
-            pass
+    head_content = _get_file_at_ref(file_path, "HEAD", repo_root)
+    if head_content is None:
+        return False
+    try:
+        head_tree = ast.parse(head_content)
+        has_in_head = any(
+            isinstance(node, ast.ClassDef) and node.name == class_name
+            for node in ast.walk(head_tree)
+        )
+    except SyntaxError:
+        return False
 
-    diff = _run_git(["diff", f"{base_ref}...HEAD", "--", file_path], repo_root)
-    pattern = re.compile(rf"^\+.*class\s+{re.escape(class_name)}\s*\(", re.MULTILINE)
-    return bool(pattern.search(diff))
+    if not has_in_head:
+        return False
+
+    base_content = _get_file_at_ref(file_path, base_ref, repo_root)
+    if base_content is None:
+        return True
+    try:
+        base_tree = ast.parse(base_content)
+        has_in_base = any(
+            isinstance(node, ast.ClassDef) and node.name == class_name
+            for node in ast.walk(base_tree)
+        )
+    except SyntaxError:
+        return True
+
+    return not has_in_base
 
 
 def _is_wired_ast(app_py_content: str, class_name: str) -> bool:
