@@ -41,3 +41,20 @@ def test_probe1_input_echoed():
 def test_probe2_input_echoed():
     mod = load_probe("probe2_input_bytes_typing.py")
     assert mod.input_echoed(["got:hello"], "got:hello") is True
+
+
+def test_probe1_first_match_over_window():
+    mod = load_probe("probe1_socket_enumerate_spawn.py")
+    assert mod.first_match([["hello"], ["got:hello"]], lambda lines: mod.input_echoed(lines, "got:hello")) == ["got:hello"]
+    assert mod.first_match([["hello"]], lambda lines: mod.input_echoed(lines, "got:hello")) is None
+
+
+def test_input_probes_send_newline():
+    for name in (
+        "probe1_socket_enumerate_spawn.py",
+        "probe2_input_bytes_typing.py",
+        "probe3_frame_grid_readback.py",
+    ):
+        path = PROBE_DIR / name
+        source = path.read_text()
+        assert 'b"hello\\n"' in source, f"{name} missing b\"hello\\n\""

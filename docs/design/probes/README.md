@@ -64,6 +64,10 @@ The probe prints exactly one `could not run:` line to stdout and exits 2 if:
 
 No simulated output is ever produced. A degraded run must fail, not narrate.
 
+## Frame Window Judging
+
+Each probe that checks frame content judges over a timeout window rather than the first frame only. A `first_match` helper scans the frames pushed by the apphost within the conduit timeout; a `TuiuiConduitError` from the timeout ends the window and the probe records `FAILED` only when no matching frame was found. This makes the verdict independent of frame timing.
+
 ## Probe Descriptions
 
 | Probe | File | Claim / Evidence |

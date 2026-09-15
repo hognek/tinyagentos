@@ -87,7 +87,7 @@ could not run: no tuiui apphost at /run/user/1000/tuiui-jay/apphost.sock (timed 
 
 - **BUT: scrollback is NOT arbitrarily fetchable**: Only the **visible viewport grid** is pushed via `Frame` events. The apphost holds the full scrollback internally (alacritty's `display_offset`), and the `Scroll` command changes the viewport, but there is **no command to fetch arbitrary scrollback lines as a text stream**. The caller sees the live viewport and can scroll it up/down, but cannot pull old lines off-screen as text.
 
-- **Probe verification**: Spawning `for i in $(seq 1 50); do echo scroll-$i; done; sleep 3` into a 5-row grid, then `Scroll(app, lines=-10)` changes the visible viewport, but no `Frame` event carries "the last 10 scrollback lines as text." The grid after scroll simply shows different rows of the same cell buffer. To get earlier lines, you must scroll viewport incrementally.
+- **Probe verification**: Spawning `for i in $(seq 1 50); do echo scroll-$i; done; sleep 3` into a 5-row grid, then `Scroll(app, lines=10)` changes the visible viewport, but no `Frame` event carries "the last 10 scrollback lines as text." The grid after scroll simply shows different rows of the same cell buffer. To get earlier lines, you must scroll viewport incrementally.
 
 - **Summary**: The daemon gives you a clean, per-cell raster grid (no ANSI problem), but only the current viewport. If your use case requires "give me line 37 of scrollback as raw text," tuiui does not provide that — you must scroll the viewport to make it visible and then read the grid.
 

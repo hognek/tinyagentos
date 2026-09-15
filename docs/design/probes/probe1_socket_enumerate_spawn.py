@@ -29,6 +29,13 @@ def input_echoed(lines: list[str], marker: str) -> bool:
     return any(marker in line for line in lines)
 
 
+def first_match(frames, pred):
+    for lines in frames:
+        if pred(lines):
+            return lines
+    return None
+
+
 def verify_apphost(socket_path: str) -> None:
     """Verify the apphost socket exists and answers ListApps.
 
@@ -97,15 +104,18 @@ def probe_socket_enumerate_spawn(socket_path: str) -> str:
     with TuiuiConduit(socket_path, timeout=2.0) as conduit:
         spawned2 = conduit.spawn("sh", ["-c", "read x; echo got:$x"], cols=80, rows=24)
         try:
-            conduit.send_input(spawned2.app, b"hello")
-            for frame in conduit.iter_frames():
-                lines = TuiuiConduit.frame_lines(frame)
-                if input_echoed(lines, "got:hello"):
-                    transcript_lines.append("Result: Input echoed in frame")
-                else:
-                    transcript_lines.append("FAILED: Input not echoed in frame")
-                    failed = True
-                break
+            conduit.send_input(spawned2.app, b"hello\n")
+            frame_gen = conduit.iter_frames(timeout=2.0)
+            lines_iter = (TuiuiConduit.frame_lines(f) for f in frame_gen)
+            matched = first_match(lines_iter, lambda lines: input_echoed(lines, "got:hello"))
+            if matched is None:
+                transcript_lines.append("FAILED: Input not echoed in any frame")
+                failed = True
+            else:
+                transcript_lines.append("Result: Input echoed in frame")
+        except TuiuiConduitError:
+            transcript_lines.append("FAILED: timed out waiting for frame")
+            failed = True
         except Exception as e:
             transcript_lines.append(f"Result: Failed - {e}")
             failed = True

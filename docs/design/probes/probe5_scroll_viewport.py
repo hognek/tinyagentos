@@ -28,6 +28,13 @@ def viewport_moved(before: list[str], after: list[str]) -> bool:
     return before != after
 
 
+def first_match(frames, pred):
+    for lines in frames:
+        if pred(lines):
+            return lines
+    return None
+
+
 def verify_apphost(socket_path: str) -> None:
     """Verify the apphost socket exists and answers ListApps.
 
@@ -73,31 +80,35 @@ def probe_scroll_viewport_behavior(socket_path: str) -> str:
     with TuiuiConduit(socket_path, timeout=2.0) as conduit:
         spawned = conduit.spawn("sh", ["-c", "for i in $(seq 1 50); do echo scroll-$i; done; sleep 3"], cols=80, rows=5)
 
-        for frame in conduit.iter_frames():
-            before_lines = TuiuiConduit.frame_lines(frame)
-            transcript_lines.append(f"Result: Viewport shows lines: {before_lines}")
-            transcript_lines.append(f"  Initial viewport captured: {len(before_lines)} lines")
-            break
+        try:
+            for frame in conduit.iter_frames(timeout=2.0):
+                before_lines = TuiuiConduit.frame_lines(frame)
+                transcript_lines.append(f"Result: Viewport shows lines: {before_lines}")
+                transcript_lines.append(f"  Initial viewport captured: {len(before_lines)} lines")
+                break
+        except TuiuiConduitError:
+            transcript_lines.append("FAILED: timed out waiting for initial frame")
+            failed = True
 
     transcript_lines.append("")
 
     transcript_lines.append("=== Test 2: Scroll Command ===")
-    transcript_lines.append("Command: Send Scroll(app, lines=-1) to view previous lines")
+    transcript_lines.append("Command: Send Scroll(app, lines=1) to view previous lines (positive = back into history)")
 
     with TuiuiConduit(socket_path, timeout=2.0) as conduit:
         try:
-            conduit._send({"Scroll": {"app": spawned.app, "lines": -1}})
+            conduit._send({"Scroll": {"app": spawned.app, "lines": 1}})
 
-            for frame in conduit.iter_frames():
-                after_lines = TuiuiConduit.frame_lines(frame)
-                transcript_lines.append(f"Result: Viewport after scroll: {after_lines}")
-                break
-
-            if viewport_moved(before_lines, after_lines):
-                transcript_lines.append("  Result: Viewport changed after Scroll")
-            else:
+            frame_gen = conduit.iter_frames(timeout=2.0)
+            lines_iter = (TuiuiConduit.frame_lines(f) for f in frame_gen)
+            matched = first_match(lines_iter, lambda lines: viewport_moved(before_lines, lines))
+            if matched is None:
                 transcript_lines.append("  FAILED: Viewport did not change after Scroll")
                 failed = True
+            else:
+                after_lines = matched
+                transcript_lines.append(f"Result: Viewport after scroll: {after_lines}")
+                transcript_lines.append("  Result: Viewport changed after Scroll")
 
         except Exception as e:
             transcript_lines.append(f"Result: Error - {e}")

@@ -28,6 +28,13 @@ def input_echoed(lines: list[str], marker: str) -> bool:
     return any(marker in line for line in lines)
 
 
+def first_match(frames, pred):
+    for lines in frames:
+        if pred(lines):
+            return lines
+    return None
+
+
 def verify_apphost(socket_path: str) -> None:
     """Verify the apphost socket exists and answers ListApps.
 
@@ -74,15 +81,15 @@ def probe_input_bytes_typing(socket_path: str) -> str:
     transcript_lines.append("Command: Send Input payload containing bytes [104, 101, 108, 108, 111] (hello)")
 
     with TuiuiConduit(socket_path, timeout=2.0) as conduit:
-        conduit.send_input(spawned.app, b"hello")
-        for frame in conduit.iter_frames():
-            lines = TuiuiConduit.frame_lines(frame)
-            if input_echoed(lines, "got:hello"):
-                transcript_lines.append("Result: Input echoed in frame")
-            else:
-                transcript_lines.append("FAILED: Input not echoed in frame")
-                failed = True
-            break
+        conduit.send_input(spawned.app, b"hello\n")
+        frame_gen = conduit.iter_frames(timeout=2.0)
+        lines_iter = (TuiuiConduit.frame_lines(f) for f in frame_gen)
+        matched = first_match(lines_iter, lambda lines: input_echoed(lines, "got:hello"))
+        if matched is None:
+            transcript_lines.append("FAILED: Input not echoed in any frame")
+            failed = True
+        else:
+            transcript_lines.append("Result: Input echoed in frame")
 
     transcript_lines.append("Verification: The wire protocol should have carried [104, 101, 108, 108, 111] as integer array, NOT as base64-encoded bytes")
     transcript_lines.append("from source: tinyagentos/tuiui_conduit.py:TuiuiConduit.send_input")
