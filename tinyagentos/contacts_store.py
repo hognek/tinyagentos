@@ -435,6 +435,8 @@ class ContactsStore(BaseStore):
 
         If *peer_outbox* is provided, also drain the outbox for this contact
         so queued envelopes are delivered when the peer becomes active.
+        Drain errors are logged and swallowed so they do not block inbox
+        processing.
         """
         await self._db.execute(
             "UPDATE peer_links SET last_seen_at = ? WHERE contact_id = ?",
@@ -442,7 +444,12 @@ class ContactsStore(BaseStore):
         )
         await self._db.commit()
         if peer_outbox is not None:
-            await peer_outbox.drain_for_contact(contact_id)
+            try:
+                await peer_outbox.drain_for_contact(contact_id)
+            except Exception:
+                logger.warning(
+                    "peer_outbox drain failed for contact=%s", contact_id, exc_info=True
+                )
 
     async def revoke_peer_link(self, contact_id: str) -> bool:
         """Revoke the peer link (cascades to block contact).

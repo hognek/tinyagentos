@@ -249,8 +249,8 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                              >
                                {ch.type === "group" ? (
                                  <Users size={18} aria-hidden />
-                               ) : ch.type === "dm-remote" ? (
-                                 <Globe size={18} aria-hidden />
+                                ) : ch.type === "dm-remote" ? (
+                                  <Globe size={18} data-lucide="globe" aria-hidden />
                                ) : (
                                  <Hash size={18} aria-hidden />
                                )}
@@ -486,7 +486,7 @@ export function ChannelSidebar(props: ChannelSidebarProps) {
                           {ch.type === "group" ? (
                             <Users size={15} aria-hidden />
                           ) : ch.type === "dm-remote" ? (
-                            <Globe size={15} aria-hidden />
+                            <Globe size={15} data-lucide="globe" aria-hidden />
                           ) : (
                             <Hash size={15} aria-hidden />
                           )}

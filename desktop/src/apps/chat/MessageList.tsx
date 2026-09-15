@@ -565,15 +565,17 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
                             (error)
                           </span>
                         )}
-                        {channel?.type === "dm-remote" && (
-                          <span className="ml-1 text-shell-text-tertiary inline-flex items-center">
-                            {msg.delivered_at ? (
-                              <CheckCheck size={12} aria-hidden="true" />
-                            ) : (
-                              <Check size={12} aria-hidden="true" />
-                            )}
-                          </span>
-                        )}
+                        {channel?.type === "dm-remote" &&
+                          msg.author_id === currentUserId &&
+                          !["pending", "streaming"].includes(msg.state ?? "") && (
+                            <span className="ml-1 text-shell-text-tertiary inline-flex items-center">
+                              {msg.delivered_at ? (
+                                <CheckCheck size={12} aria-hidden="true" />
+                              ) : (
+                                <Check size={12} aria-hidden="true" />
+                              )}
+                            </span>
+                          )}
                       </div>
                     </div>
                   )}

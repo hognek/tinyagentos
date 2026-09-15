@@ -681,8 +681,6 @@ describe("MessageList", () => {
     });
   });
 
-  /* ---- dm-remote delivery ticks ---- */
-
   describe("dm-remote delivery ticks", () => {
     it("shows single check for dm-remote message without delivered_at", () => {
       renderWithMsg({
@@ -690,6 +688,7 @@ describe("MessageList", () => {
         messages: [
           msg({
             channel_id: "dmr-1",
+            author_id: "user",
             delivered_at: undefined,
           }),
         ],
@@ -707,6 +706,7 @@ describe("MessageList", () => {
         messages: [
           msg({
             channel_id: "dmr-1",
+            author_id: "user",
             delivered_at: 1700000001,
           }),
         ],
@@ -721,10 +721,64 @@ describe("MessageList", () => {
     it("does not show delivery tick for non-dm-remote channels", () => {
       renderWithMsg({
         channel: channel({ type: "topic" }),
-        messages: [msg({ channel_id: "ch1" })],
+        messages: [msg({ channel_id: "ch1", author_id: "user" })],
       });
       const content = screen.getByText("Hello world").textContent ?? "";
       expect(content).not.toContain("delivered");
+    });
+
+    it("does not show delivery tick for remote-authored dm-remote messages", () => {
+      renderWithMsg({
+        channel: channel({ type: "dm-remote", members: ["user", "hub:peer"] }),
+        messages: [
+          msg({
+            channel_id: "dmr-1",
+            author_id: "hub:peer",
+            delivered_at: 1700000001,
+          }),
+        ],
+      });
+      const svgs = document.querySelectorAll("svg");
+      const doubleCheckSvg = Array.from(svgs).find((svg) =>
+        svg.querySelector('path[d="m22 10-7.5 7.5L13 16"]'),
+      );
+      expect(doubleCheckSvg).toBeFalsy();
+    });
+
+    it("does not show delivery tick for pending dm-remote messages", () => {
+      renderWithMsg({
+        channel: channel({ type: "dm-remote", members: ["user", "hub:peer"] }),
+        messages: [
+          msg({
+            channel_id: "dmr-1",
+            author_id: "user",
+            state: "pending",
+          }),
+        ],
+      });
+      const svgs = document.querySelectorAll("svg");
+      const checkSvg = Array.from(svgs).find((svg) =>
+        svg.querySelector('path[d="M20 6 9 17l-5-5"]'),
+      );
+      expect(checkSvg).toBeFalsy();
+    });
+
+    it("does not show delivery tick for streaming dm-remote messages", () => {
+      renderWithMsg({
+        channel: channel({ type: "dm-remote", members: ["user", "hub:peer"] }),
+        messages: [
+          msg({
+            channel_id: "dmr-1",
+            author_id: "user",
+            state: "streaming",
+          }),
+        ],
+      });
+      const svgs = document.querySelectorAll("svg");
+      const checkSvg = Array.from(svgs).find((svg) =>
+        svg.querySelector('path[d="M20 6 9 17l-5-5"]'),
+      );
+      expect(checkSvg).toBeFalsy();
     });
   });
 });
