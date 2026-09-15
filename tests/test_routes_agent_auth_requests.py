@@ -76,7 +76,7 @@ class TestRequestableScopes:
                 "identity_claim": "grok",
                 "framework": "grok-cli",
                 "kind": "not_a_real_kind",
-                "requested_scopes": ["memory_read"],
+                "requested_scopes": ["a2a_receive"],
             },
         )
         assert resp.status_code == 400
@@ -115,7 +115,7 @@ class TestAgentAuthRequestsList:
                 "id": "abc123",
                 "identity_claim": "test-agent",
                 "framework": "langchain",
-                "requested_scopes": ["memory_read"],
+                "requested_scopes": ["a2a_receive"],
                 "requested_skills": [],
                 "reason": "testing",
                 "duration_secs": None,
@@ -169,7 +169,7 @@ class TestApproveDisplayNameNormalization:
         record = await auth_store.create(
             identity_claim="@taOSmd-dev",
             framework="openclaw",
-            requested_scopes=["memory_read"],
+            requested_scopes=["a2a_receive"],
             requested_skills=None,
             reason="",
             duration_secs=None,
@@ -185,7 +185,7 @@ class TestApproveDisplayNameNormalization:
 
         resp = await client.post(
             f"/api/agents/auth-requests/{record['id']}/approve",
-            json={"granted_scopes": ["memory_read"]},
+            json={"granted_scopes": ["a2a_receive"]},
         )
         assert resp.status_code == 200, resp.text
 
@@ -274,7 +274,7 @@ class TestApproveDisplayNameNormalization:
         record = await auth_store.create(
             identity_claim="taOSmd-dev",
             framework="openclaw",
-            requested_scopes=["memory_read"],
+            requested_scopes=["a2a_receive"],
             requested_skills=None,
             reason="",
             duration_secs=None,
@@ -290,7 +290,7 @@ class TestApproveDisplayNameNormalization:
 
         resp = await client.post(
             f"/api/agents/auth-requests/{record['id']}/approve",
-            json={"granted_scopes": ["memory_read"]},
+            json={"granted_scopes": ["a2a_receive"]},
         )
         assert resp.status_code == 200, resp.text
 
@@ -325,7 +325,7 @@ class TestApproveDisplayNameNormalization:
         record = await auth_store.create(
             identity_claim="@",
             framework="openclaw",
-            requested_scopes=["memory_read"],
+            requested_scopes=["a2a_receive"],
             requested_skills=None,
             reason="",
             duration_secs=None,
@@ -341,7 +341,7 @@ class TestApproveDisplayNameNormalization:
 
         resp = await client.post(
             f"/api/agents/auth-requests/{record['id']}/approve",
-            json={"granted_scopes": ["memory_read"]},
+            json={"granted_scopes": ["a2a_receive"]},
         )
         assert resp.status_code == 200, resp.text
 
@@ -841,7 +841,7 @@ class TestAddAgentToAnotherProject:
 
         r = await auth_store.create(
             identity_claim="@taOSmd-dev", framework="openclaw",
-            requested_scopes=["memory_read"], requested_skills=None, reason="",
+            requested_scopes=["a2a_receive"], requested_skills=None, reason="",
             duration_secs=None, project_id=None,
         )
         monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
@@ -851,7 +851,7 @@ class TestAddAgentToAnotherProject:
 
         resp = await client.post(
             f"/api/agents/auth-requests/{r['id']}/approve",
-            json={"granted_scopes": ["memory_read"]},
+            json={"granted_scopes": ["a2a_receive"]},
         )
         assert resp.status_code == 409, resp.text
 
@@ -1095,7 +1095,7 @@ class TestHandleSetOnApprove:
         record = await auth_store.create(
             identity_claim="@taOSmd-dev",
             framework="openclaw",
-            requested_scopes=["memory_read"],
+            requested_scopes=["a2a_receive"],
             requested_skills=None,
             reason="",
             duration_secs=None,
@@ -1111,7 +1111,7 @@ class TestHandleSetOnApprove:
 
         resp = await client.post(
             f"/api/agents/auth-requests/{record['id']}/approve",
-            json={"granted_scopes": ["memory_read"]},
+            json={"granted_scopes": ["a2a_receive"]},
         )
         assert resp.status_code == 200, resp.text
 
@@ -1161,7 +1161,7 @@ class TestHandleCollisionActiveRejects:
         record = await auth_store.create(
             identity_claim="@taOSmd-dev",
             framework="openclaw",
-            requested_scopes=["memory_read"],
+            requested_scopes=["a2a_receive"],
             requested_skills=None,
             reason="",
             duration_secs=None,
@@ -1177,7 +1177,7 @@ class TestHandleCollisionActiveRejects:
 
         resp = await client.post(
             f"/api/agents/auth-requests/{record['id']}/approve",
-            json={"granted_scopes": ["memory_read"]},
+            json={"granted_scopes": ["a2a_receive"]},
         )
         assert resp.status_code == 409, resp.text
 
@@ -1230,7 +1230,7 @@ class TestHandleCollisionSuspendedAllowsReuse:
         record = await auth_store.create(
             identity_claim="@taOSmd-dev",
             framework="openclaw",
-            requested_scopes=["memory_read"],
+            requested_scopes=["a2a_receive"],
             requested_skills=None,
             reason="",
             duration_secs=None,
@@ -1246,7 +1246,7 @@ class TestHandleCollisionSuspendedAllowsReuse:
 
         resp = await client.post(
             f"/api/agents/auth-requests/{record['id']}/approve",
-            json={"granted_scopes": ["memory_read"]},
+            json={"granted_scopes": ["a2a_receive"]},
         )
         assert resp.status_code == 200, resp.text
 
@@ -1324,12 +1324,12 @@ class TestConcurrentApproveSameIdentity:
         # so this exercises the unique-index race directly.
         r1 = await auth_store.create(
             identity_claim="@taOSmd-dev", framework="openclaw",
-            requested_scopes=["memory_read"], requested_skills=None, reason="",
+            requested_scopes=["a2a_receive"], requested_skills=None, reason="",
             duration_secs=None, project_id=None,
         )
         r2 = await auth_store.create(
             identity_claim="@taOSmd-dev", framework="openclaw",
-            requested_scopes=["memory_read"], requested_skills=None, reason="",
+            requested_scopes=["a2a_receive"], requested_skills=None, reason="",
             duration_secs=None, project_id=None,
         )
 
@@ -1343,7 +1343,7 @@ class TestConcurrentApproveSameIdentity:
         async def _approve(rid):
             return await client.post(
                 f"/api/agents/auth-requests/{rid}/approve",
-                json={"granted_scopes": ["memory_read"]},
+                json={"granted_scopes": ["a2a_receive"]},
             )
 
         # Drive both approvals concurrently so neither pre-check sees an active
@@ -1387,7 +1387,7 @@ class TestConcurrentApproveSameIdentity:
 
         record = await auth_store.create(
             identity_claim="grok-bot", framework="grok",
-            requested_scopes=["memory_read"], requested_skills=None, reason="",
+            requested_scopes=["a2a_receive"], requested_skills=None, reason="",
             duration_secs=None, project_id=None,
         )
 
@@ -1400,7 +1400,7 @@ class TestConcurrentApproveSameIdentity:
 
         resp = await client.post(
             f"/api/agents/auth-requests/{record['id']}/approve",
-            json={"granted_scopes": ["memory_read"]},
+            json={"granted_scopes": ["a2a_receive"]},
         )
         assert resp.status_code == 200, resp.text
 
@@ -1690,7 +1690,7 @@ class TestDeferBindingApproval:
         record = await auth_store.create(
             identity_claim="@defer-bot",
             framework="defer-cli",
-            requested_scopes=["memory_read"],
+            requested_scopes=["a2a_receive"],
             requested_skills=None,
             reason="",
             duration_secs=None,
@@ -1706,7 +1706,7 @@ class TestDeferBindingApproval:
 
         resp = await client.post(
             f"/api/agents/auth-requests/{record['id']}/approve",
-            json={"granted_scopes": ["memory_read"], "defer_binding": True},
+            json={"granted_scopes": ["a2a_receive"], "defer_binding": True},
         )
         assert resp.status_code == 409, resp.text
         assert "assign-agent" in resp.text
@@ -1752,7 +1752,7 @@ class TestDeferBindingApproval:
         record = await auth_store.create(
             identity_claim="@defer-bot",
             framework="defer-cli",
-            requested_scopes=["memory_read"],
+            requested_scopes=["a2a_receive"],
             requested_skills=None,
             reason="",
             duration_secs=None,
@@ -1768,7 +1768,7 @@ class TestDeferBindingApproval:
 
         resp = await client.post(
             f"/api/agents/auth-requests/{record['id']}/approve",
-            json={"granted_scopes": ["memory_read"], "defer_binding": True},
+            json={"granted_scopes": ["a2a_receive"], "defer_binding": True},
         )
         assert resp.status_code == 409, resp.text
         assert "pick a different identity_claim" in resp.text
@@ -1937,7 +1937,7 @@ class TestConsentApproveHandleCollisionGuard:
         record = await auth_store.create(
             identity_claim="@Hermes",
             framework="openclaw",
-            requested_scopes=["memory_read"],
+            requested_scopes=["a2a_receive"],
             requested_skills=None,
             reason="",
             duration_secs=None,
@@ -1946,7 +1946,7 @@ class TestConsentApproveHandleCollisionGuard:
 
         resp = await client.post(
             f"/api/agents/auth-requests/{record['id']}/approve",
-            json={"granted_scopes": ["memory_read"]},
+            json={"granted_scopes": ["a2a_receive"]},
         )
 
         assert resp.status_code == 409, resp.text
@@ -2130,7 +2130,7 @@ class TestConsentApproveHandleCollisionGuard:
         record = await auth_store.create(
             identity_claim="@brand-new-agent",
             framework="openclaw",
-            requested_scopes=["memory_read"],
+            requested_scopes=["a2a_receive"],
             requested_skills=None,
             reason="",
             duration_secs=None,
@@ -2139,7 +2139,7 @@ class TestConsentApproveHandleCollisionGuard:
 
         resp = await client.post(
             f"/api/agents/auth-requests/{record['id']}/approve",
-            json={"granted_scopes": ["memory_read"]},
+            json={"granted_scopes": ["a2a_receive"]},
         )
         assert resp.status_code == 200, resp.text
         cid = resp.json()["canonical_id"]
@@ -3005,7 +3005,7 @@ class TestProjectCreatePendingCapNoOrphan:
             await auth_store.create(
                 identity_claim=cid,
                 framework="project_create",
-                requested_scopes=["memory_read"],
+                requested_scopes=["a2a_receive"],
                 requested_skills=None,
                 reason="",
                 pending_cap=_PENDING_CAP,
@@ -3113,7 +3113,7 @@ class TestProjectCreateSecurity:
             await auth_store.create(
                 identity_claim=cid,
                 framework="project_create",
-                requested_scopes=["memory_read"],
+                requested_scopes=["a2a_receive"],
                 requested_skills=None,
                 reason="",
                 pending_cap=_PENDING_CAP,
@@ -3187,7 +3187,7 @@ class TestProjectCreateSecurity:
             await auth_store.create(
                 identity_claim=cid,
                 framework="project_create",
-                requested_scopes=["memory_read"],
+                requested_scopes=["a2a_receive"],
                 requested_skills=None,
                 reason="",
                 pending_cap=_PENDING_CAP,
