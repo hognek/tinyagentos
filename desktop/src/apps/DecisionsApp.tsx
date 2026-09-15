@@ -14,7 +14,7 @@ import {
 import { Button, Textarea } from "@/components/ui";
 import { ConsentActions } from "@/components/ConsentActions";
 import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
-import { useDecisionEventsStore } from "@/stores/decision-events-store";
+import { useOsEvents } from "@/hooks/use-os-events";
 
 type DecisionType =
   | "single_select"
@@ -714,16 +714,9 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
   const refreshSilently = useCallback(() => load({ silent: true }), [load]);
   useRefreshOnFocus(refreshSilently);
 
-  // Live propagation: when a decision is answered from another surface (e.g.
-  // inline in chat), the SSE handler bumps answeredEpoch via the global event
-  // stream. Re-fetch the lists so the card moves from pending to archive
-  // without a refresh.
-  const answeredEpoch = useDecisionEventsStore((s) => s.answeredEpoch);
-  useEffect(() => {
-    if (answeredEpoch > 0) {
-      void refreshSilently();
-    }
-  }, [answeredEpoch, refreshSilently]);
+  const { stale } = useOsEvents(["decision.answered", "decision.note"], () => {
+    void refreshSilently();
+  });
 
   const answer = useCallback(
     async (id: string, value: string | string[], otherValue?: string, note?: string) => {
@@ -774,6 +767,9 @@ export function DecisionsApp({ windowId: _windowId }: { windowId: string }) {
       <div className="flex items-center gap-2 border-b border-shell-border px-5 py-4">
         <Inbox size={18} className="text-accent" />
         <h1 className="text-base font-semibold text-shell-text">Decisions</h1>
+        {stale && (
+          <span className="text-[11px] text-shell-text-tertiary" aria-label="live updates paused">paused</span>
+        )}
         {pending.length > 0 && (
           <span className="ml-1 inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-accent px-1.5 text-xs font-semibold text-shell-bg">
             {pending.length}
