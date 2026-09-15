@@ -590,3 +590,21 @@ class TestDefectGlobMidPattern:
         assert _MOD._glob_match("a/x/y/b", "a/**/b") is True
         assert _MOD._glob_match("a/x/y/b", "a/*/b") is False
         assert _MOD._glob_match("a", "a/**") is True
+
+
+class TestParseNameStatusPreservesWhitespace:
+    def test_parse_name_status_preserves_trailing_whitespace(self):
+        """NUL-mode output with a path that has trailing space must preserve it."""
+        output = "M\x00README.md \x00"
+        changed = _MOD._parse_name_status(output)
+        assert changed == [("M", "README.md ")]
+
+
+class TestDiffNameStatusZRequiresBaseRef:
+    def test_diff_name_status_z_requires_base_ref(self, tmp_path: Path):
+        """diff_name_status_z with base_ref=None must raise ValueError."""
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        _git_commit(repo, "README.md", "# hello\n", "init")
+        with pytest.raises(ValueError, match="base_ref is required when cached=False"):
+            _MOD.diff_name_status_z(repo, base_ref=None, cached=False)

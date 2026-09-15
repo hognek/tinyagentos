@@ -16,6 +16,8 @@ def diff_name_status_z(
     base_ref: str | None = None,
     cached: bool = False,
 ) -> list[tuple[str, str]]:
+    if not cached and base_ref is None:
+        raise ValueError("base_ref is required when cached=False")
     args = ["-c", "core.quotePath=false", "diff", "-z", "--name-status"]
     if cached:
         args.append("--cached")
@@ -31,7 +33,7 @@ def parse_name_status(output: str) -> list[tuple[str, str]]:
         parts = output.split("\x00")
         i = 0
         while i < len(parts):
-            part = parts[i].strip()
+            part = parts[i]
             if not part:
                 i += 1
                 continue
@@ -39,10 +41,10 @@ def parse_name_status(output: str) -> list[tuple[str, str]]:
             i += 1
             if i >= len(parts):
                 break
-            path = parts[i].strip()
+            path = parts[i]
             i += 1
             if status[0] in ("R", "C") and i < len(parts):
-                new_path = parts[i].strip()
+                new_path = parts[i]
                 i += 1
                 if new_path:
                     path = new_path
