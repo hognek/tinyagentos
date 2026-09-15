@@ -138,6 +138,29 @@ def test_spa_dir_honours_taos_spa_dir_env(tmp_path, monkeypatch):
         importlib.reload(desktop)
 
 
+def test_spa_assets_served_when_taos_spa_dir_is_symlink(client, monkeypatch, tmp_path):
+    realdir = tmp_path / "real-spa"
+    assets = realdir / "assets"
+    assets.mkdir(parents=True)
+    (assets / "app.js").write_text("console.log(1)")
+    (realdir / "index.html").write_text("<html>spa</html>")
+    link = tmp_path / "spa-link"
+    link.symlink_to(realdir)
+
+    monkeypatch.setenv("TAOS_SPA_DIR", str(link))
+    importlib.reload(desktop)
+    try:
+        r = client.get("/desktop/assets/app.js")
+        assert r.text == "console.log(1)"
+        assert r.headers.get("content-type", "").startswith(
+            ("text/javascript", "application/javascript")
+        )
+        assert desktop.SPA_DIR == realdir.resolve()
+    finally:
+        monkeypatch.delenv("TAOS_SPA_DIR", raising=False)
+        importlib.reload(desktop)
+
+
 def test_spa_serves_staged_body_with_taos_spa_dir(client, monkeypatch, tmp_path):
     """When TAOS_SPA_DIR is honoured, /desktop must serve the staged index.html."""
     staged_dir = tmp_path / "staged-spa"
