@@ -505,3 +505,88 @@ class TestConfigValidation:
         }
         with pytest.raises(ValueError, match="invariants.ignore_tokens\[0\] must be a string"):
             _validate_config(invalid_config)
+
+
+# ---------------------------------------------------------------------------
+# Red-first integration tests for Defect 1 (non-ASCII paths) and Defect 2
+# (mid-pattern ** in _glob_match).
+# ---------------------------------------------------------------------------
+
+
+def _init_repo(repo: Path) -> None:
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=repo, capture_output=True, text=True, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True, text=True, check=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True, text=True, check=True)
+    subprocess.run(["git", "config", "commit.gpgsign", "false"], cwd=repo, capture_output=True, text=True, check=True)
+    subprocess.run(["git", "branch", "-M", "main"], cwd=repo, capture_output=True, text=True, check=True)
+
+
+def _write(repo: Path, rel_path: str, content: str) -> None:
+    full = repo / rel_path
+    full.parent.mkdir(parents=True, exist_ok=True)
+    full.write_text(content, encoding="utf-8")
+
+
+def _git_commit(repo: Path, rel_path: str, content: str, message: str) -> None:
+    _write(repo, rel_path, content)
+    subprocess.run(["git", "add", rel_path], cwd=repo, capture_output=True, text=True, check=True)
+    subprocess.run(["git", "commit", "-m", message], cwd=repo, capture_output=True, text=True, check=True)
+
+
+def _get_head(repo: Path) -> str:
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo, capture_output=True, text=True, check=True,
+    )
+    return result.stdout.strip()
+
+
+class TestDefectNonAsciiPaths:
+    def test_non_ascii_path_triggers_rule(self, tmp_path: Path):
+        """A change to docs/café.md must trigger a docs/** rule.
+
+        Today the path comes back quoted from git, so the glob never fires.
+        """
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        _git_commit(repo, "README.md", "# hello\n", "init")
+        base_tip = _get_head(repo)
+
+        subprocess.run(["git", "branch", "pr"], cwd=repo, capture_output=True, text=True, check=True)
+        subprocess.run(["git", "checkout", "-q", "pr"], cwd=repo, capture_output=True, text=True, check=True)
+        _git_commit(repo, "docs/café.md", "# café\n", "add café doc")
+        subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, capture_output=True, text=True, check=True)
+        subprocess.run(["git", "merge", "pr", "--no-edit"], cwd=repo, capture_output=True, text=True, check=True)
+
+        original_repo_root = _MOD.REPO_ROOT
+        try:
+            _MOD.REPO_ROOT = repo
+            changed = _MOD._git_changed_base(base_tip)
+        finally:
+            _MOD.REPO_ROOT = original_repo_root
+
+        config = {
+            "gate": {"trailer": "Docs-Reviewed:"},
+            "rules": [
+                {
+                    "name": "docs",
+                    "when_changed": ["docs/**"],
+                    "require_doc": ["README.md"],
+                    "hint": "a doc was added",
+                }
+            ],
+        }
+        failures = _MOD.evaluate_rules(changed, [], config)
+        assert len(failures) == 1
+        assert "docs" in failures[0]
+
+
+class TestDefectGlobMidPattern:
+    def test_glob_double_star_mid_pattern(self):
+        assert _MOD._glob_match("docs/x.md", "docs/**/*.md") is True
+        assert _MOD._glob_match("docs/a/b/x.md", "docs/**/*.md") is True
+        assert _MOD._glob_match("a/b", "a/**/b") is True
+        assert _MOD._glob_match("a/x/y/b", "a/**/b") is True
+        assert _MOD._glob_match("a/x/y/b", "a/*/b") is False
+        assert _MOD._glob_match("a", "a/**") is True

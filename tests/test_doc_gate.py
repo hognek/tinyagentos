@@ -896,6 +896,9 @@ class TestGitHooksTrailerEnforcement:
         (scripts_dir / "check_doc_gate.py").write_text(
             (REPO_ROOT / "scripts" / "check_doc_gate.py").read_text()
         )
+        (scripts_dir / "_gitutil.py").write_text(
+            (REPO_ROOT / "scripts" / "_gitutil.py").read_text()
+        )
 
         docs_dir = repo / "docs"
         docs_dir.mkdir()
