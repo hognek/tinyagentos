@@ -1139,8 +1139,17 @@ each other's work.
 
 An external agent that is already registered in the agent registry can request to
 create a new project by posting `kind: "project_create"` to the existing
-`POST /api/agents/auth-requests` endpoint. The body carries the desired project
-name, slug, and purpose:
+`POST /api/agents/auth-requests` endpoint. Send the request with the agent's
+registry token in the mandatory header:
+
+```http
+Authorization: Bearer <registry token>
+```
+
+Without a valid registry token the request returns **401**. The token subject is
+the only source of the canonical agent id. The body's `identity_claim` must match
+the registry handle for that token subject; a mismatch returns **403**. The body
+carries the desired project name, slug, and purpose:
 
 ```json
 {

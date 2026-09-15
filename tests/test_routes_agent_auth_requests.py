@@ -3446,3 +3446,86 @@ class TestProjectCreateSecurity:
         await pstore.close()
         await grants.close()
 
+
+class TestProjectCreateDocsAndMetadata:
+    def test_project_create_doc_names_bearer_token(self):
+        from pathlib import Path
+
+        docs_path = Path(__file__).parents[1] / "docs" / "agent-coordination.md"
+        docs = docs_path.read_text()
+        start = docs.index("## Agent project-creation requests")
+        end = docs.index("\n## ", start + 1)
+        assert "Authorization: Bearer" in docs[start:end]
+
+    @pytest.mark.asyncio
+    async def test_project_create_route_has_no_direct_metadata_update(
+        self, client, monkeypatch, tmp_path
+    ):
+        from pathlib import Path
+
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+            mint_registry_token,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.projects.project_store import ProjectStore
+
+        route_path = (
+            Path(__file__).parents[1]
+            / "tinyagentos"
+            / "routes"
+            / "agent_auth_requests.py"
+        )
+        assert "UPDATE decisions SET metadata" not in route_path.read_text()
+
+        registry = AgentRegistryStore(tmp_path / "reg-docs-metadata.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-docs-metadata.db")
+        await auth_store.init()
+        pstore = ProjectStore(tmp_path / "projects-docs-metadata.db")
+        await pstore.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-docs-metadata")
+
+        reg = await registry.register(
+            framework="openclaw",
+            display_name="agent-alice",
+            user_id="u",
+            origin="external-selfjoin",
+            handle="agent-alice",
+        )
+        await registry.set_status(reg["canonical_id"], "active")
+        token = mint_registry_token(
+            reg["canonical_id"], priv, user_id="u", framework="openclaw"
+        )
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "agent-alice",
+                "framework": "openclaw",
+                "kind": "project_create",
+                "requested_name": "Docs Metadata Board",
+                "requested_slug": "docs-metadata-board",
+                "purpose": "test",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        request_id = resp.json()["request_id"]
+        decision_id = resp.json()["decision_id"]
+
+        decision_store = client._transport.app.state.decision_store
+        decision = await decision_store.get(decision_id)
+        assert decision["metadata"]["auth_request_id"] == request_id
+
+        await registry.close()
+        await auth_store.close()
+        await pstore.close()
