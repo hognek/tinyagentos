@@ -14,7 +14,9 @@ import {
   Loader2,
   Check,
   Clock,
+  Play,
   Sparkles,
+  Globe,
 } from "lucide-react";
 import {
   Button,
@@ -28,6 +30,7 @@ import {
 import { MobileSplitView } from "@/components/mobile/MobileSplitView";
 import { useIsMobile } from "@/hooks/use-is-mobile";
 import { useVisualViewport } from "@/hooks/use-visual-viewport";
+import { copyText } from "@/lib/clipboard";
 import { useDropTarget } from "@/shell/dnd/use-drop-target";
 import { ChannelSettingsPanel } from "../chat/ChannelSettingsPanel";
 import { AgentContextMenu } from "../chat/AgentContextMenu";
@@ -73,6 +76,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { SearchPanel } from "../chat/SearchPanel";
 import { ChannelSidebar } from "../chat/ChannelSidebar";
+import { ConnectWizard } from "../chat/ConnectWizard";
 import { A2aBusMessageView, useBusChannels } from "../chat/A2aBusPanel";
 import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
 import { useDecisionEventsStore } from "@/stores/decision-events-store";
@@ -97,7 +101,7 @@ interface OpenMessagesDetail {
 interface Channel {
   id: string;
   name: string;
-  type: "dm" | "topic" | "group";
+  type: "dm" | "dm-remote" | "topic" | "group";
   description?: string;
   topic?: string;
   members?: string[];
@@ -913,6 +917,7 @@ export function MessagesApp({
   const [newChannel, setNewChannel] = useState({ name: "", type: "topic" as "topic" | "group", description: "" });
   const [prefillBanner, setPrefillBanner] = useState<{ promptName: string; agentName?: string } | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showConnectWizard, setShowConnectWizard] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ slug: string; x: number; y: number } | null>(null);
   const [agentInfoPopover, setAgentInfoPopover] = useState<
     { slug: string; framework: string; model: string; status: string; x: number; y: number } | null
@@ -983,6 +988,8 @@ export function MessagesApp({
   const lastTypingSentRef = useRef(0);
   const autoScrollRef = useRef(true);
   const reconnectDelayRef = useRef(1000);
+  const reconnectAttemptsRef = useRef(0);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const prevChannelRef = useRef<string | null>(null);
 
   /* ---- fetch channels + unread ---- */
@@ -1254,10 +1261,17 @@ export function MessagesApp({
     ws.onclose = () => {
       setWsStatus("disconnected");
       wsRef.current = null;
-      // reconnect with backoff
-      const delay = reconnectDelayRef.current;
-      reconnectDelayRef.current = Math.min(delay * 2, 30000);
-      setTimeout(connectWs, delay);
+      if (reconnectAttemptsRef.current >= 20) return;
+      reconnectAttemptsRef.current += 1;
+      const base = reconnectDelayRef.current;
+      const jitter = Math.floor(Math.random() * base);
+      const delay = base + jitter;
+      reconnectDelayRef.current = Math.min(base * 2, 30000);
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = setTimeout(() => {
+        timerRef.current = null;
+        connectWs();
+      }, delay);
     };
 
     ws.onerror = () => {
@@ -1295,10 +1309,14 @@ export function MessagesApp({
     fetchAgentLists();
     connectWs();
     return () => {
+      if (timerRef.current) clearTimeout(timerRef.current);
+      timerRef.current = null;
       if (wsRef.current) {
         wsRef.current.onclose = null;
         wsRef.current.close();
       }
+      wsRef.current = null;
+      reconnectAttemptsRef.current = 0;
     };
   }, [fetchChannels, fetchArchivedChannels, fetchAgentLists, connectWs]);
 
@@ -1909,18 +1927,14 @@ export function MessagesApp({
     setOverflowMenu(null);
     if (!selectedChannel) return;
     const url = `${window.location.origin}/chat/${selectedChannel}?msg=${msgId}`;
-    try {
-      await navigator.clipboard.writeText(url);
-    } catch { /* ignore */ }
+    await copyText(url);
   };
 
   const handleCopyText = async (msgId: string) => {
     setOverflowMenu(null);
     const msg = messages.find((m) => m.id === msgId);
     if (!msg) return;
-    try {
-      await navigator.clipboard.writeText(msg.content);
-    } catch { /* ignore */ }
+    await copyText(msg.content);
   };
 
   const handlePin = async (msg: Message) => {
@@ -1968,6 +1982,7 @@ export function MessagesApp({
     scope?.projectId ? c.project_id === scope.projectId : !c.project_id;
   const grouped = {
     dm: channels.filter((c) => c.type === "dm" && inSidebarSection(c)),
+    "dm-remote": channels.filter((c) => c.type === "dm-remote" && inSidebarSection(c)),
     topic: channels.filter((c) => c.type === "topic" && inSidebarSection(c)),
     group: channels.filter((c) => c.type === "group" && inSidebarSection(c)),
   };
@@ -1991,7 +2006,7 @@ export function MessagesApp({
   // In a DM (2 members: user + 1 agent), a leading "/" opens the agent's
   // slash menu.  In a group channel (3+ members), the user must prefix
   // with "@agentname /" so we know which agent's commands to show.
-  const isDm = (currentChannel?.members?.length ?? 0) === 2;
+  const isDm = (currentChannel?.members?.length ?? 0) === 2 || currentChannel?.type === "dm-remote";
   const showSlash = isDm ? input.startsWith("/") : /^@\S+\s+\//.test(input);
   // The agent scoped by "@agentname /" (group only; undefined in DM).
   const slashAgent = !isDm && showSlash ? input.match(/^@(\S+)\s+\//)?.[1] || undefined : undefined;
@@ -2072,6 +2087,9 @@ export function MessagesApp({
     { label: "Channels", icon: <Hash size={13} />, items: [...grouped.topic, ...grouped.group] },
     { label: "Agents-DMs", icon: <Bot size={13} />, items: [...dmSections.live, ...dmSections.suspended, ...dmSections.archived] },
     { label: "Direct Messages", icon: <AtSign size={13} />, items: dmSections.nonAgent },
+    ...(grouped["dm-remote"].length > 0
+      ? [{ label: "Remote", icon: <Globe size={13} />, items: grouped["dm-remote"] }]
+      : []),
   ].filter((s) => s.items.length > 0 || s.label === "Channels");
 
   const allEmpty =
@@ -2160,9 +2178,15 @@ export function MessagesApp({
           <div className="text-center px-6">
             <MessageCircle size={48} className="mx-auto mb-3 opacity-30" />
             <p className="text-sm mb-3">Pick a channel or start a DM</p>
-            <Button variant="outline" size="sm" onClick={() => setShowCreate(true)}>
-              New channel
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" onClick={() => setShowCreate(true)}>
+                New channel
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setShowConnectWizard(true)}>
+                <Play size={14} className="mr-1" aria-hidden="true" />
+                Connect session
+              </Button>
+            </div>
           </div>
         </div>
       ) : (
@@ -2791,6 +2815,9 @@ className="shrink-0 p-0.5 rounded hover:bg-shell-surface-active transition-color
           </div>
         )
       )}
+
+      {/* ---- Connect Session Wizard ---- */}
+      <ConnectWizard open={showConnectWizard} onClose={() => setShowConnectWizard(false)} />
     </div>
   );
 }

@@ -275,6 +275,12 @@ class HeartbeatBody(BaseModel):
     # rank candidates by actual free memory, not total capacity.
     free_vram_mb: int | None = None
     used_vram_mb: int | None = None
+    # Worker-sampled age of the VRAM report in milliseconds. When present,
+    # the controller uses the sample time (not the receipt time) to avoid
+    # over-admitting during heartbeat transit. If absent, keep the current
+    # receipt-time behavior (old workers, backward compatibility). Must be
+    # non-negative; negative values are rejected with a 422.
+    vram_sampled_age_ms: int | None = Field(default=None, ge=0)
     # Registration-drift refresh (taOS #1538): workers report their live
     # host_lan_ip, url, and hardware on every heartbeat so the cluster
     # manager stays in sync with container reality. Optional so legacy
@@ -309,6 +315,7 @@ class MoveRequest(BaseModel):
 
 @router.get("/api/cluster/workers")
 async def list_workers(request: Request):
+    is_admin = getattr(request.state, "is_admin", False)
     cluster = request.app.state.cluster_manager
     pairing = getattr(request.app.state, "cluster_pairing", None)
     registry = getattr(request.app.state, "registry", None)
@@ -323,6 +330,13 @@ async def list_workers(request: Request):
         # non-utf8 signing key, and (2) even when serialization didn't
         # crash, the secret has no business being on the wire.
         d.pop("signing_key", None)
+        if not is_admin:
+            result.append({
+                "name": d["name"],
+                "status": d["status"],
+                "tier_id": d.get("tier_id", ""),
+            })
+            continue
         # Surface the persistent auth state from the pairing store so the
         # Cluster UI can show whether a node's signing key is live (not
         # revoked/blocked) and offer revoke/block/unblock actions. A worker
@@ -589,6 +603,7 @@ async def worker_heartbeat(request: Request, body: HeartbeatBody):
         kv_cache_quant_boundary_layer_protect=body.kv_cache_quant_boundary_layer_protect,
         free_vram_mb=body.free_vram_mb,
         used_vram_mb=body.used_vram_mb,
+        vram_sampled_age_ms=body.vram_sampled_age_ms,
         # LXC storage counters (forwarded from worker heartbeat)
         storage_cap_bytes=body.storage_cap_bytes,
         storage_used_bytes=body.storage_used_bytes,

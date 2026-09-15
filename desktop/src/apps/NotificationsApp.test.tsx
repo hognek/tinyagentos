@@ -86,9 +86,21 @@ function notif(over: Partial<Notification>): Notification {
 }
 
 describe("NotificationsApp", () => {
+  const MockEventSourceCtor = vi.fn().mockImplementation(function (this: any) {
+    this.url = "";
+    this.onopen = null;
+    this.onmessage = null;
+    this.onerror = null;
+    this.close = vi.fn();
+    this.readyState = 0;
+  });
+  Object.assign(MockEventSourceCtor, { CONNECTING: 0, OPEN: 1, CLOSED: 2 });
+
   beforeEach(() => {
     vi.clearAllMocks();
     useNotificationStore.setState({ notifications: [], centreOpen: false });
+    vi.stubGlobal("EventSource", MockEventSourceCtor);
+    MockEventSourceCtor.mockClear();
   });
 
   it("renders Notifications and Archive tabs", () => {

@@ -26,6 +26,8 @@ import { MobileSplitView } from "@/components/mobile/MobileSplitView";
 import { useProcessStore } from "@/stores/process-store";
 import { useNotificationStore } from "@/stores/notification-store";
 import { getApp } from "@/registry/app-registry";
+import { createSseConnection } from "@/lib/sse";
+import { copyText } from "@/lib/clipboard";
 
 /* ------------------------------------------------------------------ */
 /*  Types                                                              */
@@ -1126,23 +1128,24 @@ function LogsTab({ serverId }: { serverId: string }) {
   const [connected, setConnected] = useState(false);
   const [paused, setPaused] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [copyError, setCopyError] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const pausedRef = useRef(false);
-  const esRef = useRef<EventSource | null>(null);
 
   pausedRef.current = paused;
 
   useEffect(() => {
-    const es = new EventSource(`/api/mcp/servers/${encodeURIComponent(serverId)}/logs/stream`);
-    esRef.current = es;
-    es.onopen = () => setConnected(true);
-    es.onerror = () => setConnected(false);
-    es.onmessage = (e) => {
-      if (!pausedRef.current) {
-        setLines((prev) => [...prev.slice(-500), e.data]);
-      }
-    };
-    return () => { es.close(); esRef.current = null; };
+    const cleanup = createSseConnection({
+      url: `/api/mcp/servers/${encodeURIComponent(serverId)}/logs/stream`,
+      onOpen: () => setConnected(true),
+      onError: () => setConnected(false),
+      onMessage: (e) => {
+        if (!pausedRef.current) {
+          setLines((prev) => [...prev.slice(-500), e.data]);
+        }
+      },
+    });
+    return cleanup;
   }, [serverId]);
 
   useEffect(() => {
@@ -1160,9 +1163,14 @@ function LogsTab({ serverId }: { serverId: string }) {
   }
 
   async function handleCopy() {
-    await navigator.clipboard.writeText(lines.join("\n"));
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    const ok = await copyText(lines.join("\n"));
+    if (ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } else {
+      setCopyError(true);
+      setTimeout(() => setCopyError(false), 2000);
+    }
   }
 
   return (
@@ -1172,9 +1180,10 @@ function LogsTab({ serverId }: { serverId: string }) {
         <span className="text-xs text-shell-text-secondary">{connected ? "Live" : "Disconnected"}</span>
         {paused && <span className="text-xs text-amber-400">Paused — scroll to bottom to resume</span>}
         <div className="flex-1" />
-        <Button size="sm" variant="ghost" onClick={handleCopy} aria-label="Copy all logs">
+        <Button size="sm" variant="ghost" onClick={handleCopy} aria-label={copyError ? "Copy failed" : "Copy all logs"}>
           {copied ? <Check size={13} /> : <Copy size={13} />}
         </Button>
+        {copyError && <span className="text-[10px] text-red-400 shrink-0">Copy failed</span>}
       </div>
       <div
         ref={scrollRef}

@@ -355,9 +355,6 @@ def _build_device_push_payload(row: dict) -> tuple[dict, list[dict] | None]:
     category: str | None = None
     decision_type = data.get("decision_type")
     if decision_type == "approve_deny":
-        # The native shell maps a category id to a registered UNNotificationCategory;
-        # tsk-cf7wzc pins the button set to approve / reject / add-note on both
-        # iPhone and Apple Watch.
         category = "DECISION_APPROVE_DENY"
         actions = [
             {"id": "approve", "label": "Approve"},
@@ -367,11 +364,21 @@ def _build_device_push_payload(row: dict) -> tuple[dict, list[dict] | None]:
     elif decision_type in ("single_select", "multi_select"):
         category = "DECISION_OPTIONS"
         opts = data.get("options") or []
-        actions = [{"id": o.get("value", o.get("label", "")), "label": o.get("label", "")} for o in opts]
+        capped = [
+            {"label": o.get("label", "")[:40], "value": o.get("value", o.get("label", ""))}
+            for o in opts[:4]
+        ]
+        actions = [{"id": o.get("value", o.get("label", "")), "label": o.get("label", "")} for o in capped]
     elif decision_type == "free_text":
         category = "DECISION_FREE_TEXT"
         actions = [{"id": "quick_reply", "label": "Reply"}]
     payload_data = dict(data)
+    if decision_type in ("single_select", "multi_select"):
+        opts = data.get("options") or []
+        payload_data["options"] = [
+            {"label": o.get("label", "")[:40], "value": o.get("value", o.get("label", ""))}
+            for o in opts[:4]
+        ]
     image = data.get("image")
     if isinstance(image, str) and image:
         payload_data["image"] = image
@@ -380,6 +387,12 @@ def _build_device_push_payload(row: dict) -> tuple[dict, list[dict] | None]:
     payload: dict = {"title": title, "body": body, "data": payload_data}
     if category:
         payload["category"] = category
+    decision_id = data.get("decision_id")
+    if decision_id:
+        payload["thread_id"] = decision_id
+    priority = data.get("priority")
+    if priority == "blocking":
+        payload["interruption_level"] = "time-sensitive"
     if isinstance(image, str) and image:
         payload["image"] = image
     return payload, actions
@@ -401,42 +414,44 @@ async def _clear_dead_push_token(device_store, device_id: str, push_token: str) 
 
 async def _send_one_device(
     device: dict,
-    payload: dict,
+    base_payload: dict,
     actions: list[dict] | None,
     apns_sender,
     up_sender,
     device_store=None,
 ) -> str:
+    from tinyagentos.push import send_device_push
     from tinyagentos.push.apns import ApnsUnregistered
 
-    platform = device.get("platform", "")
     push_token = device.get("push_token", "")
     if not push_token:
         return "skipped"
+    platform = device.get("platform", "")
+    if platform in ("ios", "watchos"):
+        from tinyagentos.push.apns import build_apns_payload
+        payload = build_apns_payload(
+            title=base_payload["title"],
+            body=base_payload["body"],
+            data=base_payload.get("data"),
+            category=base_payload.get("category"),
+            actions=actions,
+            image=base_payload.get("image"),
+            thread_id=base_payload.get("thread_id"),
+            interruption_level=base_payload.get("interruption_level"),
+        )
+    elif platform == "android":
+        from tinyagentos.push.unifiedpush import build_unifiedpush_payload
+        payload = build_unifiedpush_payload(
+            title=base_payload["title"],
+            body=base_payload["body"],
+            data=base_payload.get("data"),
+            actions=actions,
+            image=base_payload.get("image"),
+        )
+    else:
+        return "skipped"
     try:
-        if platform in ("ios", "watchos"):
-            from tinyagentos.push.apns import build_apns_payload
-            apns_payload = build_apns_payload(
-                title=payload["title"],
-                body=payload["body"],
-                data=payload.get("data"),
-                category=payload.get("category"),
-                actions=actions,
-                image=payload.get("image"),
-            )
-            ok = await apns_sender.send(push_token, apns_payload)
-        elif platform == "android":
-            from tinyagentos.push.unifiedpush import build_unifiedpush_payload
-            up_payload = build_unifiedpush_payload(
-                title=payload["title"],
-                body=payload["body"],
-                data=payload.get("data"),
-                actions=actions,
-                image=payload.get("image"),
-            )
-            ok = await up_sender.send(push_token, up_payload)
-        else:
-            return "skipped"
+        ok = await send_device_push(device, payload, apns_sender=apns_sender, up_sender=up_sender)
     except ApnsUnregistered as exc:
         # 410 is permanent, not a retryable failure: keep counting it as such
         # and the dead token is pushed to forever. Prune it instead, exactly as

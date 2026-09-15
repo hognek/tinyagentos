@@ -131,7 +131,7 @@ def _resolve_browser_cookie_key(data_dir: "Path") -> str:
     """Resolve the SQLCipher key for the browser cookie store.
 
     Precedence:
-      1. TAOS_BROWSER_COOKIE_KEY_HEX env var (must be 64 hex chars) — for
+       1. TAOS_BROWSER_COOKIE_KEY_HEX env var (must be 64 hex chars) -- for
          recovery / pinned-key deployments.
       2. data_dir / "browser_cookie_key.hex" — read existing per-install
          random key, or create a new one with secrets.token_hex(32) if
@@ -705,7 +705,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         try:
             from tinyagentos.services.mdns_publisher import _detect_primary_ipv4
             from tinyagentos.browser_sessions import wire_browser_runtime
-            _host_ip = _detect_primary_ipv4() or "127.0.0.1"
+            _host_ips = _detect_primary_ipv4()
+            _host_ip = _host_ips[0] if _host_ips else "127.0.0.1"
             await wire_browser_runtime(
                 app.state, hardware_profile, agent_browsers, browser_sessions,
                 host_ip=_host_ip,
@@ -1430,6 +1431,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
             )
 
         # All startup init complete — allow requests through.
+        from tinyagentos.agent_budget_store import AgentBudgetStore, default_budget_path
+        app.state.agent_budget_store = AgentBudgetStore(default_budget_path(data_dir))
         app.state._startup_complete = True
         logger.info("startup complete — accepting requests")
 
@@ -1785,6 +1788,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     projects_root.mkdir(parents=True, exist_ok=True)
     app.state.projects_root = projects_root
     app.state.chat_hub = chat_hub
+    from tinyagentos.chat.unified_chat_bridge import ChatBusBridge
+    app.state.chat_bus_bridge = ChatBusBridge(app)
     # wants_reply and typing are initialised by the lifespan — do not create
     # duplicate instances here that would shadow the lifespan-created ones.
     app.state.wants_reply = None

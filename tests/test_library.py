@@ -89,6 +89,48 @@ class TestKindDetection:
         assert detect_kind() == "file"
 
 
+class TestDetectKindParity:
+    """Parity tests ensuring every extension and content type that origin/dev
+    classified as text still classifies as text after the mimetypes refactor."""
+
+    @pytest.mark.parametrize("ext,expected_kind", [
+        (".txt", "text"),
+        (".md", "text"),
+        (".csv", "text"),
+        (".json", "text"),
+        (".xml", "text"),
+        (".html", "text"),
+        (".pdf", "pdf"),
+        (".png", "image"),
+        (".jpg", "image"),
+        (".jpeg", "image"),
+        (".gif", "image"),
+        (".webp", "image"),
+        (".svg", "image"),
+        (".zip", "archive"),
+        (".gz", "archive"),
+        (".tar", "archive"),
+        (".yaml", "text"),
+        (".yml", "text"),
+        (".toml", "text"),
+        (".log", "text"),
+    ])
+    def test_extension_parity(self, ext: str, expected_kind: str):
+        assert detect_kind(file_path=f"x{ext}") == expected_kind
+
+    @pytest.mark.parametrize("content_type,expected_kind", [
+        ("application/json", "text"),
+        ("application/xml", "text"),
+        ("text/xml", "text"),
+        ("text/markdown", "text"),
+        ("text/csv", "text"),
+        ("text/html", "text"),
+        ("text/plain", "text"),
+    ])
+    def test_content_type_parity(self, content_type: str, expected_kind: str):
+        assert detect_kind(content_type=content_type) == expected_kind
+
+
 # ---------------------------------------------------------------------------
 # LibraryStore
 # ---------------------------------------------------------------------------
@@ -356,10 +398,106 @@ class TestImageProcessor:
         artifacts = await proc.process(item)
         assert len(artifacts) == 0
 
+    @pytest.mark.asyncio
+    async def test_process_pa_mode_image(self, lib_store, storage_dir):
+        """RED-FIRST: a PA-mode (palette + alpha) image must convert to JPEG
+        without raising, producing a thumbnail artifact."""
+        from PIL import Image
+
+        file_path = storage_dir / "test_pa.tiff"
+        img = Image.new("PA", (100, 50), color=(128, 255))
+        img.save(file_path, format="TIFF")
+
+        item_id = await lib_store.create_item(
+            kind="image", title="test_pa.tiff", storage_path=str(file_path)
+        )
+        item = await lib_store.get_item(item_id)
+
+        proc = ImageProcessor(lib_store, storage_dir)
+        artifacts = await proc.process(item)
+
+        kinds = {a["kind"] for a in artifacts}
+        assert "thumbnail" in kinds, (
+            f"PA-mode image should produce a thumbnail, got kinds: {kinds}"
+        )
+        thumb_art = [a for a in artifacts if a["kind"] == "thumbnail"][0]
+        assert Path(thumb_art["path"]).exists()
+
+    @pytest.mark.asyncio
+    async def test_process_la_mode_image(self, lib_store, storage_dir):
+        """RED-FIRST: an LA-mode (grayscale + alpha) PNG must convert to JPEG
+        without raising, producing a thumbnail artifact."""
+        from PIL import Image
+
+        file_path = storage_dir / "test_la.png"
+        img = Image.new("LA", (100, 50), color=(128, 255))
+        img.save(file_path, format="PNG")
+
+        item_id = await lib_store.create_item(
+            kind="image", title="test_la.png", storage_path=str(file_path)
+        )
+        item = await lib_store.get_item(item_id)
+
+        proc = ImageProcessor(lib_store, storage_dir)
+        artifacts = await proc.process(item)
+
+        kinds = {a["kind"] for a in artifacts}
+        assert "thumbnail" in kinds, (
+            f"LA-mode image should produce a thumbnail, got kinds: {kinds}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # run_pipeline
 # ---------------------------------------------------------------------------
+
+
+class TestYamlLogExtraction:
+    @pytest.mark.asyncio
+    async def test_yaml_file_extracts_text(self, lib_store, storage_dir):
+        file_path = storage_dir / "config.yaml"
+        file_path.write_text("key: value\nport: 8080\n")
+
+        kind = detect_kind(file_path=str(file_path))
+
+        item_id = await lib_store.create_item(
+            kind=kind, title="config.yaml", storage_path=str(file_path)
+        )
+        await run_pipeline(lib_store, item_id, storage_dir)
+
+        item = await lib_store.get_item(item_id)
+        assert item["status"] == "ready"
+
+        artifacts = await lib_store.get_artifacts(item_id)
+        artifact_kinds = {a["kind"] for a in artifacts}
+        assert "text" in artifact_kinds
+
+        text_artifacts = [a for a in artifacts if a["kind"] == "text"]
+        assert len(text_artifacts) == 1
+        assert "key: value" in Path(text_artifacts[0]["path"]).read_text()
+
+    @pytest.mark.asyncio
+    async def test_log_file_extracts_text(self, lib_store, storage_dir):
+        file_path = storage_dir / "app.log"
+        file_path.write_text("2026-01-01 INFO started\n")
+
+        kind = detect_kind(file_path=str(file_path))
+
+        item_id = await lib_store.create_item(
+            kind=kind, title="app.log", storage_path=str(file_path)
+        )
+        await run_pipeline(lib_store, item_id, storage_dir)
+
+        item = await lib_store.get_item(item_id)
+        assert item["status"] == "ready"
+
+        artifacts = await lib_store.get_artifacts(item_id)
+        artifact_kinds = {a["kind"] for a in artifacts}
+        assert "text" in artifact_kinds
+
+        text_artifacts = [a for a in artifacts if a["kind"] == "text"]
+        assert len(text_artifacts) == 1
+        assert "started" in Path(text_artifacts[0]["path"]).read_text()
 
 
 class TestRunPipeline:

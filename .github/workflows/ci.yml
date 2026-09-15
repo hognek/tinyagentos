@@ -118,18 +118,47 @@ jobs:
         if: matrix.shard == 1
         run: uv run --no-sync python -c "from tinyagentos.app import create_app; print('OK')"
 
+  # Import smoke for the declared minimum Python version (3.11). The shard
+  # matrix only runs 3.11 on the nightly schedule, so a 3.11-only regression
+  # could merge green and fail at import on every supported host. This job
+  # runs on every PR and push to catch that class of defect before merge.
+  py311-import-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Provision Python 3.11 via uv
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --frozen --python 3.11
+
+      - name: Verify app and routes import under 3.11
+        run: uv run --no-sync python -c "import pkgutil, importlib, tinyagentos.app, tinyagentos.routes as r; mods=[importlib.import_module(n) for _, n, _ in pkgutil.walk_packages(r.__path__, 'tinyagentos.routes.')]; print('3.11 import ok:', len(mods), 'route modules')"
+
+      - name: Compile all tinyagentos modules
+        run: uv run --no-sync python -m compileall -q tinyagentos
+
   # Aggregate gate. Reports the exact check names branch protection requires
-  # ("test (3.12)", "test (3.13)") so the required-context list does not have to
-  # change when the shard count does. An explicit `name:` is used verbatim by
-  # GitHub rather than having the matrix values appended, which is what makes
-  # reproducing the old names possible at all.
+  # ("test (3.11)", "test (3.12)", "test (3.13)") so the required-context list
+  # does not have to change when the shard count does. An explicit `name:` is
+  # used verbatim by GitHub rather than having the matrix values appended, which
+  # is what makes reproducing the old names possible at all.
   #
   # `if: always()` is load-bearing. Without it this job is SKIPPED when the
   # shards fail, and GitHub treats a skipped required check as satisfied -- so a
   # red suite would report a green gate. It must run and fail explicitly.
   test:
     name: test (${{ matrix.python-version }})
-    needs: shards
+    needs:
+      - shards
+      - py311-import-smoke
     if: always()
     runs-on: ubuntu-latest
     strategy:
@@ -142,15 +171,71 @@ jobs:
       # trusting.
       fail-fast: false
       matrix:
-        python-version: ["3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13"]
     steps:
+      - name: Gate on 3.11 import smoke
+        if: matrix.python-version == '3.11'
+        run: |
+          echo "py311-import-smoke concluded: ${{ needs.py311-import-smoke.result }}"
+          if [ "${{ needs.py311-import-smoke.result }}" != "success" ]; then
+            echo "::error::3.11 import smoke did not pass"
+            exit 1
+          fi
+
       - name: Gate on shard results
+        if: matrix.python-version != '3.11'
         run: |
           echo "shards concluded: ${{ needs.shards.result }}"
           if [ "${{ needs.shards.result }}" != "success" ]; then
             echo "::error::test shards did not all pass"
             exit 1
           fi
+
+  docs-build:
+    # mkdocs is not in the project dependencies, so the ordinary shards skip
+    # tests/test_mkdocs_exclude.py. This job is where that guard actually runs:
+    # it installs the docs toolchain and sets TAOS_DOCS_BUILD_TESTS=1, which
+    # turns the skip off - a missing mkdocs fails here instead of passing by
+    # default. A guard no job executes is a no-op.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen --python 3.12
+
+      - name: Install the docs toolchain
+        run: |
+          uv pip install "mkdocs==1.6.1" "mkdocs-material==9.7.7" \
+            "pymdown-extensions==11.0.2"
+
+      - name: Docs exclusion guard (must run, not skip)
+        env:
+          TAOS_DOCS_BUILD_TESTS: "1"
+        run: |
+          uv run --no-sync python -m pytest tests/test_mkdocs_exclude.py \
+            -q --no-header -rs
+
+  mac-sparkle-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install bats
+        run: sudo apt-get update && sudo apt-get install -y bats
+
+      - name: Run sparkle bats suite
+        run: bats tests/sparkle_tests.bats
 
   lint:
     runs-on: ubuntu-latest
@@ -242,3 +327,201 @@ jobs:
             gh release upload "${{ github.event.release.tag_name }}" \
               desktop-bundle.tar.gz desktop-tree.txt desktop-bundle.sha256 --clobber
           fi
+
+  # The Playwright suite under desktop/tests has existed since the mobile-shell
+  # work but nothing ever ran it: `npm run test:e2e` appears in
+  # desktop/package.json and in no workflow, so five spec files (24 tests across
+  # agent-shortcuts, canvas-e2e, projects-mobile, taostalk-connect and
+  # tests/e2e/sw-and-reconnect) were dead weight in the tree. This job executes
+  # them on every push and pull_request, the same triggers as the rest of ci.yml
+  # -- deliberately NOT schedule-only, because a suite that only runs nightly is
+  # how the previous silence went unnoticed.
+  #
+  # The browser is WEBKIT, not chromium. playwright.config.ts declares exactly
+  # one project, `iphone-14`, built from devices["iPhone 14"], and that device's
+  # defaultBrowserType is "webkit". Installing chromium here would leave every
+  # test failing with "Executable doesn't exist at .../webkit-<rev>/pw_run.sh",
+  # which is what happens if you copy the usual chromium recipe.
+  #
+  # No backend is needed: every spec page.route()-mocks its API calls, so the
+  # config's webServer (`npm run dev`, vite on :5173) is the whole dependency.
+  # CI=true is set by Actions, so playwright applies retries: 2, workers: 1,
+  # forbidOnly and reuseExistingServer: false from that config.
+  desktop-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install deps
+        run: |
+          cd desktop
+          npm ci --silent
+
+      - name: Install Playwright WebKit
+        run: |
+          cd desktop
+          npx playwright install --with-deps webkit
+
+      # The suite needs a REAL backend, not a frontend server. Measured on the
+      # first two runs of this job: with vite alone, 10 of 24 tests fail and
+      # eight of those are one missing route -- src/lib/sw-register.ts:45
+      # registers "/sw.js" at the ROOT (deliberately: a worker under /desktop/
+      # could never control /chat-pwa, which is in the SW's PRECACHE_URLS), but
+      # vite's base is "/desktop/" so the built worker is only reachable at
+      # /desktop/sw.js. A diagnostic run confirmed it directly:
+      #   DIAG {"caches":[],"scope":null,"scriptURL":null,
+      #         "rootSwJs":"404 text/plain","basedSwJs":"200 text/javascript"}
+      # No service worker registered at all. tinyagentos/routes/desktop.py:185
+      # serves /sw.js at the root, and /desktop/, /chat-pwa and /api/health are
+      # all in auth_middleware's exempt set, so an unauthenticated backend is
+      # enough for the fast-boot specs.
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Install backend
+        run: uv sync --frozen --python 3.12
+
+      # The SPA must be built BEFORE the backend starts: the desktop routes
+      # serve static/desktop from disk, so an unbuilt tree serves nothing.
+      - name: Build SPA
+        run: |
+          cd desktop
+          npm run build
+
+      # Health-gated, not a fixed sleep: a sleep that is too short reads as a
+      # suite-wide failure and a sleep that is long enough is wasted on every
+      # green run. 60 x 2s bounds a backend that never comes up.
+      - name: Start backend
+        run: |
+          uv run --no-sync uvicorn --factory tinyagentos.app:create_app \
+            --host 127.0.0.1 --port 6969 > backend.log 2>&1 &
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:6969/api/health >/dev/null 2>&1; then
+              echo "backend up after ${i} attempt(s)"; exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::backend never became healthy"; tail -50 backend.log; exit 1
+
+      # The canvas and projects-mobile specs POST /api/projects, which is not in
+      # auth_middleware.EXEMPT_PATHS, so an unauthenticated backend answers 401
+      # and three of the 24 tests cannot pass. It is not only those three: a
+      # diagnostic run on this branch dumped document.body.innerText on
+      # /desktop/ and got "Welcome to taOS -- Set up your account", i.e. the
+      # zero-user setup wizard. App.tsx never mounts, so nothing that lives
+      # inside the desktop shell is under test either.
+      #
+      # /auth/setup onboards the FIRST user, which a fresh CI backend always
+      # needs, and is exempt from the auth middleware and from CSRF
+      # (middleware/csrf.py _CREDENTIAL_PATHS).
+      #
+      # The session cookie alone is NOT enough afterwards: routes/__init__.py
+      # includes the projects router with `dependencies=_csrf`, so verify_csrf
+      # guards every mutating route on it even though no decorator on
+      # create_project mentions it. A cookie-authenticated POST therefore needs
+      # the double-submit pair -- the `csrf_token` cookie CSRFMiddleware set on
+      # the /auth/setup response, echoed back in an X-CSRF-Token header. Both
+      # cookies go into the storage state so the browser starts from the same
+      # pair this step proves; the SPA reads csrf_token itself (lib/csrf.ts).
+      #
+      # This step FAILS the job rather than degrading: a suite that silently
+      # ran unauthenticated would report the same red with a different cause
+      # and cost another round to find.
+      - name: Seed an authenticated session
+        run: |
+          set -euo pipefail
+          jar="$(mktemp)"
+          out="$(mktemp)"
+          # Generated per run rather than written into the workflow: the
+          # account is thrown away with the runner, and a literal password in
+          # a public repo reads as a credential whether or not it is one.
+          pw="$(openssl rand -hex 16)"
+          # The session is bound to a SHA-256 of the creating user-agent
+          # (auth.py:1011 stores user_agent_hash; :1048 compares it), so a
+          # session minted under curl's UA is REJECTED for the browser that
+          # replays the cookie -- /desktop/ 302s to /auth/login and the API
+          # answers 401. Mint it under the UA Playwright will actually send,
+          # read out of the same devices table playwright.config.ts uses so
+          # the two cannot drift apart.
+          ua=$(cd desktop && node -e 'process.stdout.write(require("@playwright/test").devices["iPhone 14"].userAgent)')
+          if [ -z "$ua" ]; then
+            echo "::error::could not read the iPhone 14 user-agent from @playwright/test"; exit 1
+          fi
+          echo "seeding the session as: $ua"
+          code=$(PW="$pw" python3 -c 'import json, os, sys; json.dump({"username": "e2e", "full_name": "E2E Runner", "email": "e2e@example.invalid", "password": os.environ["PW"], "auto_login": True}, sys.stdout)' \
+            | curl -sS -o "$out" -w '%{http_code}' -c "$jar" -A "$ua" \
+              -H 'Content-Type: application/json' --data-binary @- \
+              http://127.0.0.1:6969/auth/setup)
+          if [ "$code" != "200" ]; then
+            echo "::error::/auth/setup returned $code"; cat "$out"; exit 1
+          fi
+          token=$(awk '$6 == "taos_session" { print $7 }' "$jar")
+          if [ -z "$token" ]; then
+            echo "::error::/auth/setup set no taos_session cookie"; cat "$jar"; exit 1
+          fi
+          csrf=$(awk '$6 == "csrf_token" { print $7 }' "$jar")
+          if [ -z "$csrf" ]; then
+            echo "::error::/auth/setup set no csrf_token cookie"; cat "$jar"; exit 1
+          fi
+          TOKEN="$token" CSRF="$csrf" python3 -c 'import json, os, sys; cookie = lambda n, v, http: {"name": n, "value": v, "domain": "127.0.0.1", "path": "/", "expires": -1, "httpOnly": http, "secure": False, "sameSite": "Strict"}; json.dump({"cookies": [cookie("taos_session", os.environ["TOKEN"], True), cookie("csrf_token", os.environ["CSRF"], False)], "origins": []}, sys.stdout)' > "$RUNNER_TEMP/e2e-storage-state.json"
+          # Prove the seeded session authorises the exact call the three specs
+          # make, here, where a failure is one line instead of three red tests.
+          # CreateProjectIn requires `slug` as well as `name` (routes/
+          # projects.py:80) -- a probe missing it answers 422, which proves auth
+          # but not the write, so send the shape the model actually accepts.
+          probe=$(curl -sS -o "$out" -w '%{http_code}' -b "$jar" -A "$ua" \
+            -H 'Content-Type: application/json' \
+            -H "X-CSRF-Token: $csrf" \
+            -d '{"name":"e2e auth probe","slug":"e2e-auth-probe"}' \
+            http://127.0.0.1:6969/api/projects)
+          case "$probe" in
+            2*) echo "seeded session authorised POST /api/projects ($probe)" ;;
+            *) echo "::error::seeded session failed POST /api/projects ($probe)"; cat "$out"; exit 1 ;;
+          esac
+          # Specs that call the `request` fixture need the same header this
+          # probe just used: the fixture inherits the cookies but runs no page
+          # script, so nothing echoes csrf_token for it. Not a credential --
+          # the double-submit token is public to any holder of the cookie.
+          echo "E2E_CSRF_TOKEN=$csrf" >> "$GITHUB_ENV"
+
+      - name: Run Playwright e2e
+        timeout-minutes: 20
+        env:
+          E2E_BASE_URL: http://127.0.0.1:6969
+          E2E_STORAGE_STATE: ${{ runner.temp }}/e2e-storage-state.json
+        run: |
+          cd desktop
+          npx playwright test --reporter=list
+
+      - name: Backend log
+        if: failure()
+        run: tail -100 backend.log
+
+      # The config's reporter is "html", which writes a directory rather than
+      # job-log lines; --reporter=list above puts the per-test results in the
+      # log, and this keeps the html report plus traces/screenshots for the
+      # runs where the log is not enough.
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            desktop/playwright-report
+            desktop/test-results
+          retention-days: 7
+          if-no-files-found: ignore

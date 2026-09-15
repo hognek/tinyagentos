@@ -666,7 +666,19 @@ class WorkerAgent:
             if any(b["type"] in {"vllm", "ollama", "exo", "mlx"} for b in backends):
                 resources.append("gpu-cuda-0")
             snap = capacity_snapshot()
-            vram = gpu_vram_snapshot()
+            vram_sample = gpu_vram_snapshot()
+            vram_sampled_age_ms = None
+            if vram_sample:
+                vram = vram_sample
+                # vram_sampled_age_ms = age since the sample was taken (for transit bug fix)
+                # If sample was taken at t0 and arrives at t2, age = (t2 - t0) * 1000
+                vram_sampled_age_ms = int((time.time() - vram_sample.get('sampled_at', time.time())) * 1000)
+                # Clamp negative ages to 0
+                if vram_sampled_age_ms < 0:
+                    vram_sampled_age_ms = 0
+            else:
+                vram = None
+                vram_sampled_age_ms = None
             adv_ip = os.environ.get("TAOS_ADVERTISE_IP", "").strip()
             live_url = (
                 self.advertise_url
@@ -695,6 +707,7 @@ class WorkerAgent:
                 # controller can tell "unknown" apart from "no VRAM free".
                 "free_vram_mb": vram["free_vram_mb"] if vram else None,
                 "used_vram_mb": vram["used_vram_mb"] if vram else None,
+                "vram_sampled_age_ms": vram_sampled_age_ms,
                 # Registration-drift refresh (taOS #1538): send live
                 # host_lan_ip, url, and hardware on every heartbeat
                 # so IP/subnet moves are reflected immediately.

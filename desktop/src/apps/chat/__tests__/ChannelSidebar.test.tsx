@@ -263,6 +263,17 @@ describe("ChannelSidebar — channel type icons", () => {
     const a2aSpan = container.querySelector(".bg-accent-soft");
     expect(a2aSpan).toBeTruthy();
   });
+
+  it("renders Globe icon for dm-remote channels", () => {
+    const ch = makeChannel({ id: "dmr-1", name: "remote-peer", type: "dm-remote", members: ["user", "hub:peer"] });
+    const sections = [makeSection("Remote", [ch])];
+    render(
+      <ChannelSidebar {...buildProps({ sections })} />,
+    );
+    expect(screen.getByText("remote-peer")).toBeInTheDocument();
+    const channelRow = screen.getByLabelText(`Channel ${ch.name}`);
+    expect(channelRow.querySelector('[data-lucide="globe"]')).toBeTruthy();
+  });
 });
 
 /* ------------------------------------------------------------------ */

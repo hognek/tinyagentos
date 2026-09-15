@@ -108,6 +108,9 @@ TAOS_BUS_PORT="${TAOS_BUS_PORT:-7900}"
 SERVICE_MODE="${TAOS_SERVICE:-auto}"
 COW_POOL_MODE="${TAOS_COW_POOL:-auto}"
 
+DOCKER_COMPOSE_STATUS="unknown"
+DOCKER_COMPOSE_DETAIL=""
+
 os_name="$(uname -s)"
 arch="$(uname -m)"
 
@@ -1092,6 +1095,53 @@ _apt_install_compose() {
     fi
 }
 
+_install_compose_v2() {
+    if command -v apt-get >/dev/null 2>&1; then
+        _apt_install_compose
+        local _apt_compose_rc=$?
+        if (( _apt_compose_rc == 0 )); then
+            DOCKER_COMPOSE_STATUS="installed"
+            DOCKER_COMPOSE_DETAIL="distro apt package"
+            return 0
+        fi
+        if (( _apt_compose_rc == 2 )); then
+            log "compose plugin not in distro apt -- trying Docker's official apt repo"
+            if _apt_install_docker_official_repo; then
+                DOCKER_COMPOSE_STATUS="installed"
+                DOCKER_COMPOSE_DETAIL="Docker official apt repo"
+                return 0
+            fi
+        else
+            warn "apt install of the Docker Compose v2 plugin failed -- Store Docker apps will be unavailable"
+        fi
+    elif command -v dnf >/dev/null 2>&1; then
+        if sudo dnf install -y -q docker-compose; then
+            DOCKER_COMPOSE_STATUS="installed"
+            DOCKER_COMPOSE_DETAIL="dnf package"
+            return 0
+        fi
+    elif command -v pacman >/dev/null 2>&1; then
+        if sudo pacman -Sy --noconfirm --needed docker-compose; then
+            DOCKER_COMPOSE_STATUS="installed"
+            DOCKER_COMPOSE_DETAIL="pacman package"
+            return 0
+        fi
+    elif command -v apk >/dev/null 2>&1; then
+        if sudo apk add --no-cache docker-cli-compose; then
+            DOCKER_COMPOSE_STATUS="installed"
+            DOCKER_COMPOSE_DETAIL="apk package"
+            return 0
+        fi
+    else
+        warn "unrecognised package manager -- cannot install Docker Compose v2"
+    fi
+
+    DOCKER_COMPOSE_STATUS="unavailable"
+    DOCKER_COMPOSE_DETAIL="compose installation failed"
+    warn "Docker Compose v2 is unavailable -- Store Docker apps will fail"
+    return 1
+}
+
 # Undo one apt file touched by the Docker official-repo fallback below.
 #   $1 = path, $2 = backup path ("" when the file did NOT pre-exist),
 #   $3 = 1 when THIS invocation created the file.
@@ -1316,13 +1366,17 @@ _apt_install_docker_official_repo() {
 
 ensure_docker_for_apps() {
     if [[ "${TAOS_SKIP_DOCKER:-0}" == "1" ]]; then
-        log "TAOS_SKIP_DOCKER=1 — skipping Docker (Store Docker apps will be unavailable)"
+        DOCKER_COMPOSE_STATUS="skipped"
+        DOCKER_COMPOSE_DETAIL="TAOS_SKIP_DOCKER=1"
+        log "TAOS_SKIP_DOCKER=1 -- skipping Docker (Store Docker apps will be unavailable)"
         return 0
     fi
     # macOS: the Docker Engine can't run natively (it needs a Linux VM), so the
     # server doesn't install it here — agents use the Apple Containerization
     # framework, and Docker apps need a user-provided Docker (Desktop/colima).
     if [[ "$(uname -s)" == "Darwin" ]]; then
+        DOCKER_COMPOSE_STATUS="unavailable"
+        DOCKER_COMPOSE_DETAIL="Docker Desktop or colima required"
         command -v docker >/dev/null 2>&1 \
             && log "macOS: using existing Docker ($(docker --version 2>/dev/null | head -1))" \
             || log "macOS: provide Docker (Desktop or colima) for Store Docker apps; agents use Apple Containerization"
@@ -1346,65 +1400,42 @@ ensure_docker_for_apps() {
     if (( had_docker )); then
         log "docker present: $(docker --version 2>/dev/null | head -1)"
     else
-        # Install the engine AND the Compose v2 plugin — taOS deploys Store
-        # Docker apps via `docker compose`, and most distro 'docker' packages
-        # (e.g. Ubuntu's docker.io) don't bundle compose, which otherwise fails
-        # with "unknown command: docker compose".
-        log "installing Docker Engine + Compose plugin (for Store Docker apps)"
+        log "installing Docker Engine (for Store Docker apps)"
         if command -v apt-get >/dev/null 2>&1; then
-            # Install the engine and the compose plugin in SEPARATE apt
-            # transactions: bundling them meant a missing compose package name
-            # (see _apt_install_compose below) failed the whole transaction and
-            # left the box without Docker at all (#1541).
             sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io \
-                || warn "apt install docker.io failed — Store Docker apps will be unavailable"
-            # _apt_install_compose distinguishes missing-package (rc=2)
-            # from install-failure (rc=1). Only the missing-package case
-            # means the distro archive has no compose plugin to offer --
-            # Debian trixie / Armbian trixie (taOS#2). Anything else is a
-            # real apt error and must NOT silently swap to Docker's repo.
-            _apt_install_compose
-            _apt_compose_rc=$?
-            if (( _apt_compose_rc == 2 )); then
-                log "compose plugin not in distro apt — trying Docker's official apt repo"
-                if ! _apt_install_docker_official_repo; then
-                    warn "Docker Engine + Compose plugin are unavailable on this host (Store Docker apps will be unavailable)"
-                fi
-            elif (( _apt_compose_rc != 0 )); then
-                warn "compose plugin install failed -- Store Docker apps will be unavailable"
-            fi
+                || warn "apt install docker.io failed -- Store Docker apps will be unavailable"
         elif command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y -q moby-engine docker-compose \
-                || warn "dnf install moby-engine/docker-compose failed — Store Docker apps will be unavailable"
+            sudo dnf install -y -q moby-engine \
+                || warn "dnf install moby-engine failed -- Store Docker apps will be unavailable"
         elif command -v pacman >/dev/null 2>&1; then
-            sudo pacman -Sy --noconfirm --needed docker docker-compose \
-                || warn "pacman install docker/docker-compose failed — Store Docker apps will be unavailable"
+            sudo pacman -Sy --noconfirm --needed docker \
+                || warn "pacman install docker failed -- Store Docker apps will be unavailable"
         elif command -v apk >/dev/null 2>&1; then
-            sudo apk add --no-cache docker docker-cli-compose \
-                || warn "apk add docker/docker-cli-compose failed — Store Docker apps will be unavailable"
+            sudo apk add --no-cache docker \
+                || warn "apk add docker failed -- Store Docker apps will be unavailable"
         else
-            warn "unrecognised package manager — install Docker + the compose plugin manually for Store Docker apps"
+            warn "unrecognised package manager -- install Docker manually for Store Docker apps"
+            DOCKER_COMPOSE_STATUS="unavailable"
+            DOCKER_COMPOSE_DETAIL="Docker engine unavailable"
             return 0
         fi
     fi
 
     # Ensure the Compose v2 plugin (taOS deploys apps via `docker compose`).
-    # This also covers the case where Docker was ALREADY installed but without
-    # the plugin — the fresh-install branch above bundles it, but a pre-existing
-    # Docker (the `had_docker` path) may lack it, so install it here too.
-    if ! docker compose version >/dev/null 2>&1; then
+    if docker compose version >/dev/null 2>&1; then
+        DOCKER_COMPOSE_STATUS="installed"
+        DOCKER_COMPOSE_DETAIL="docker compose version succeeded"
+    else
         log "installing the Docker Compose v2 plugin"
-        if command -v apt-get >/dev/null 2>&1; then
-            _apt_install_compose || true
-        elif command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y -q docker-compose || true
-        elif command -v pacman >/dev/null 2>&1; then
-            sudo pacman -Sy --noconfirm --needed docker-compose || true
-        elif command -v apk >/dev/null 2>&1; then
-            sudo apk add --no-cache docker-cli-compose || true
+        _install_compose_v2 || true
+        if ! docker compose version >/dev/null 2>&1; then
+            DOCKER_COMPOSE_STATUS="unavailable"
+            DOCKER_COMPOSE_DETAIL="docker compose version failed"
+            warn "the 'docker compose' plugin isn't available -- Store Docker apps need it (install docker-compose-v2 / docker-compose-plugin manually)"
+        else
+            DOCKER_COMPOSE_STATUS="installed"
+            DOCKER_COMPOSE_DETAIL="docker compose version succeeded"
         fi
-        docker compose version >/dev/null 2>&1 \
-            || warn "the 'docker compose' plugin isn't available — Store Docker apps need it (install docker-compose-v2 / docker-compose-plugin manually)"
     fi
 
     command -v docker >/dev/null 2>&1 || { warn "docker not on PATH after install — skipping daemon/group setup"; return 0; }
@@ -2249,7 +2280,7 @@ install_linux_systemd_system() {
     # Inject bind host/port + proxy port into the unit's Environment block.
     # ExecStart now runs `python -m tinyagentos`, which reads these (rather
     # than uvicorn CLI args), so the dual-port browser-proxy origin starts.
-    $sudo_cmd sed -i "s|^Environment=PYTHONUNBUFFERED=1|Environment=PYTHONUNBUFFERED=1\nEnvironment=TAOS_HOST=0.0.0.0\nEnvironment=TAOS_PORT=$TAOS_PORT\nEnvironment=TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT|" "$unit"
+    $sudo_cmd sed -i "s|^Environment=PYTHONUNBUFFERED=1|Environment=PYTHONUNBUFFERED=1\nEnvironment=TAOS_HOST=0.0.0.0\nEnvironment=TAOS_PORT=$TAOS_PORT\nEnvironment=TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT\nEnvironment=TAOS_SPA_DIR=$INSTALL_DIR/static/desktop|" "$unit"
     log "installed $unit (system unit, runs as 'taos')"
 
     # Install desktop-rebuild service (runs async after controller starts; taOS #807)
@@ -2316,7 +2347,7 @@ install_linux_systemd_user() {
     # Inject bind host/port + proxy port into the unit's Environment block.
     # ExecStart now runs `python -m tinyagentos`, which reads these (rather
     # than uvicorn CLI args), so the dual-port browser-proxy origin starts.
-    sed -i "s|^Environment=PYTHONUNBUFFERED=1|Environment=PYTHONUNBUFFERED=1\nEnvironment=TAOS_HOST=0.0.0.0\nEnvironment=TAOS_PORT=$TAOS_PORT\nEnvironment=TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT|" "$unit"
+    sed -i "s|^Environment=PYTHONUNBUFFERED=1|Environment=PYTHONUNBUFFERED=1\nEnvironment=TAOS_HOST=0.0.0.0\nEnvironment=TAOS_PORT=$TAOS_PORT\nEnvironment=TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT\nEnvironment=TAOS_SPA_DIR=$INSTALL_DIR/static/desktop|" "$unit"
     log "installed $unit (user unit fallback — sudo unavailable)"
 
     # Install desktop-rebuild service (runs async after controller starts; taOS #807)
@@ -2404,14 +2435,14 @@ if [ "\$(id -u)" = "0" ] && [ "\$(id -un)" != "$runuser" ]; then
     elif command -v sudo >/dev/null 2>&1; then exec sudo -u "$runuser" /bin/bash "\$0"
     elif command -v su >/dev/null 2>&1; then exec su -s /bin/bash "$runuser" -c "exec /bin/bash '\$0'"; fi
 fi
-export PYTHONUNBUFFERED=1 TAOS_HOST=0.0.0.0 TAOS_PORT=$TAOS_PORT TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT
+export PYTHONUNBUFFERED=1 TAOS_HOST=0.0.0.0 TAOS_PORT=$TAOS_PORT TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT TAOS_SPA_DIR="$INSTALL_DIR/static/desktop"
 exec "$pyenv" -m tinyagentos
 EOF
     chmod +x "$runner"
     [[ "$runuser" != "$(id -un)" ]] && chown "$runuser": "$runner" 2>/dev/null || true
 
     log "systemd is not the init here (e.g. WSL without systemd) -- starting the controller directly"
-    local launch="cd '$INSTALL_DIR'; PYTHONUNBUFFERED=1 TAOS_HOST=0.0.0.0 TAOS_PORT=$TAOS_PORT TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT nohup '$pyenv' -m tinyagentos >> '$logf' 2>&1 &"
+    local launch="cd '$INSTALL_DIR'; PYTHONUNBUFFERED=1 TAOS_HOST=0.0.0.0 TAOS_PORT=$TAOS_PORT TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT TAOS_SPA_DIR='$INSTALL_DIR/static/desktop' nohup '$pyenv' -m tinyagentos >> '$logf' 2>&1 &"
     if [[ "$runuser" != "$(id -un)" ]]; then
         # Drop to the service user without assuming sudo: minimal containers (a
         # target of this fallback) frequently run as root with no sudo binary.
@@ -2487,6 +2518,7 @@ install_macos_launchd() {
     <dict>
         <key>PYTHONUNBUFFERED</key><string>1</string>
         <key>TAOS_BROWSER_PROXY_PORT</key><string>$TAOS_BROWSER_PROXY_PORT</string>
+        <key>TAOS_SPA_DIR</key><string>$INSTALL_DIR/static/desktop</string>
     </dict>
 </dict>
 </plist>
@@ -2501,7 +2533,7 @@ EOF
 
 if [[ "$SERVICE_MODE" == "skip" ]]; then
     log "TAOS_SERVICE=skip — not installing a service unit"
-    log "run manually: cd $INSTALL_DIR && TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT ./.venv/bin/python -m tinyagentos"
+    log "run manually: cd $INSTALL_DIR && TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT TAOS_SPA_DIR='$INSTALL_DIR/static/desktop' ./.venv/bin/python -m tinyagentos"
 else
     case "$os_name" in
         Linux)  install_linux_systemd ;;
@@ -2620,6 +2652,25 @@ verify_hardware_capabilities() {
     local claimed_vulkan=0 claimed_cuda=0 claimed_rocm=0 claimed_rknpu=0 claimed_mlx=0
     local verified_ok=0 verified_warn=0
 
+    # Read the local auth token for controller API access. The token file is
+    # created at first boot by the controller (see tinyagentos/auth.py:get_local_token)
+    # and is the same-host trust anchor for scripts/CLI. If it doesn't exist yet,
+    # the controller is in a pre-admin state and cannot authenticate us -- we must
+    # fail loud rather than silently skipping (taOS #2 class: cannot-see-reads-as-pass).
+    local local_token_path="$INSTALL_DIR/data/.auth_local_token"
+    local local_token=""
+    if [[ -r "$local_token_path" ]]; then
+        local_token=$(cat "$local_token_path" 2>/dev/null || true)
+    fi
+    if [[ -z "$local_token" ]]; then
+        warn "local auth token not found at $local_token_path"
+        warn "  the controller has not yet minted its local token (pre-admin state)"
+        warn "  hardware capability verification requires authenticated API access"
+        warn "  this is a fresh-install blocker -- the controller must complete first-boot"
+        warn "  init (litellm prisma migration, store creation) before verification runs"
+        die "hardware verification cannot proceed without local auth token"
+    fi
+
     # Fetch the hardware profile from the now-running controller. POST is the
     # only method the route accepts; a GET gets 405 and looks like "empty".
     # Retry for up to 30 s so the controller can finish first-boot init
@@ -2632,6 +2683,7 @@ verify_hardware_capabilities() {
         [[ $_remaining -le 0 ]] && break
         _curl_timeout=$(( _remaining > 1 ? _remaining : 1 ))
         hw_json=$(curl -sf --max-time "$_curl_timeout" -X POST \
+            -H "Authorization: Bearer $local_token" \
             "http://localhost:$TAOS_PORT/api/system/hardware/refresh" 2>/dev/null || true)
         [[ -n "$hw_json" ]] && break
         _remaining=$(( _hw_deadline - SECONDS ))
@@ -2849,6 +2901,16 @@ if [[ "$TAOS_BROWSER_PROXY_PORT" != "0" ]]; then
 fi
 log "  Install dir : $INSTALL_DIR"
 log "  Storage pool: ${COW_EFFECTIVE_MODE:-n/a} (detected fs: ${COW_FS_TYPE:-unknown})"
+if [[ "$DOCKER_COMPOSE_STATUS" == "installed" ]]; then
+    log "  Docker Compose v2: available"
+elif [[ "$DOCKER_COMPOSE_STATUS" == "skipped" ]]; then
+    log "  Docker Compose v2: skipped (TAOS_SKIP_DOCKER=1)"
+else
+    warn "=== DOCKER COMPOSE V2 SUMMARY ==="
+    warn "  Docker Compose v2: UNAVAILABLE -- Store Docker apps will fail"
+    warn "    Reason: ${DOCKER_COMPOSE_DETAIL:-compose status unknown}"
+    warn "    Install docker-compose-plugin or docker-compose-v2 manually, then rerun the installer."
+fi
 # Surface what the controller actually detected so a tester can confirm at
 # a glance (taOS #2 -- installer used to silently skip, so testers had no
 # way to tell whether the NPU was recognised). HW_PROFILE_ID/HW_NPU_TYPE

@@ -40,6 +40,9 @@ import sys
 import tomllib
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _gitutil import diff_name_status_z, parse_name_status as _parse_name_status, run_git  # noqa: E402
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = REPO_ROOT / "docs" / "doc-gate.toml"
 DEFAULT_TRAILER = "Docs-Reviewed:"
@@ -258,6 +261,37 @@ def check_required_sections(repo_root: Path, config: dict) -> list[str]:
     return failures
 
 
+def check_changelog_fragment_shape(repo_root: Path, config: dict) -> list[str]:
+    """Layer A: every ``changelog.d/*.md`` fragment must contain only markdown
+    bullets (``- ``), section headings (``### ``), or indented continuation
+    lines. Fragments that carry YAML frontmatter (``---`` delimiters or
+    ``title:`` keys) are rejected so they cannot leak into ``CHANGELOG.md``
+    the way beta.52 did.
+    """
+    failures: list[str] = []
+    fragment_dir = repo_root / "changelog.d"
+    if not fragment_dir.is_dir():
+        return failures
+    for path in sorted(fragment_dir.glob("*.md")):
+        rel = str(path.relative_to(repo_root))
+        text = path.read_text(encoding="utf-8")
+        for raw_line in text.splitlines():
+            line = raw_line.rstrip()
+            if not line.strip():
+                continue
+            if line == "---" or line.startswith("title:"):
+                failures.append(
+                    f"{rel}: fragment contains YAML frontmatter ({line})"
+                )
+                break
+            if not (line.startswith("### ") or line.startswith("- ") or line.startswith(" ")):
+                failures.append(
+                    f"{rel}: non-blank line is not a bullet or section heading: {line[:60]}"
+                )
+                break
+    return failures
+
+
 def _glob_match(path: str, pattern: str) -> bool:
     """Path-segment-aware glob match, unlike fnmatch (where `*` crosses `/`).
 
@@ -273,13 +307,15 @@ def _glob_match(path: str, pattern: str) -> bool:
         char = pattern[i]
         if char == "*":
             if i + 1 < length and pattern[i + 1] == "*":
-                # A trailing `/**` should also match the bare parent path, so
-                # fold the preceding literal `/` into an optional group.
-                if regex_parts and regex_parts[-1] == "/" and i + 2 == length:
+                if i + 2 < length and pattern[i + 2] == "/":
+                    regex_parts.append("(?:.*/)?")
+                    i += 3
+                elif regex_parts and regex_parts[-1] == "/" and i + 2 == length:
                     regex_parts[-1] = "(?:/.*)?"
+                    i += 2
                 else:
                     regex_parts.append(".*")
-                i += 2
+                    i += 2
             else:
                 regex_parts.append("[^/]*")
                 i += 1
@@ -450,10 +486,7 @@ class GitCommandError(Exception):
 
 def _run_git(args: list[str], ref: str | None = None) -> str:
     try:
-        result = subprocess.run(
-            ["git", *args], cwd=REPO_ROOT, capture_output=True, text=True, check=True,
-        )
-        return result.stdout
+        return run_git(args, cwd=REPO_ROOT)
     except subprocess.CalledProcessError:
         msg = f"git {' '.join(args)} failed"
         if ref:
@@ -461,26 +494,20 @@ def _run_git(args: list[str], ref: str | None = None) -> str:
         raise GitCommandError(msg) from None
 
 
-def _parse_name_status(output: str) -> list[tuple[str, str]]:
-    changed: list[tuple[str, str]] = []
-    for line in output.splitlines():
-        if not line.strip():
-            continue
-        parts = line.split("\t")
-        status = parts[0]
-        # Renames/copies (R100, C100, ...) carry old + new path; the new path
-        # is what matters for both triggering and satisfying a rule.
-        path = parts[-1]
-        changed.append((status[0], path))
-    return changed
-
-
 def _git_changed_staged() -> list[tuple[str, str]]:
-    return _parse_name_status(_run_git(["diff", "--cached", "--name-status"]))
+    try:
+        return diff_name_status_z(REPO_ROOT, cached=True)
+    except subprocess.CalledProcessError:
+        raise GitCommandError("git diff --cached --name-status failed") from None
 
 
 def _git_changed_base(base_ref: str) -> list[tuple[str, str]]:
-    return _parse_name_status(_run_git(["diff", "--name-status", f"{base_ref}...HEAD"], ref=base_ref))
+    try:
+        return diff_name_status_z(REPO_ROOT, base_ref=base_ref)
+    except subprocess.CalledProcessError:
+        raise GitCommandError(
+            f"git diff --name-status {base_ref}...HEAD failed (ref: {base_ref})"
+        ) from None
 
 
 def _git_commit_messages(base_ref: str) -> list[str]:
@@ -590,6 +617,7 @@ def main(argv: list[str] | None = None) -> int:
         files_to_scan = config.get("invariants", {}).get("referenced_paths_scan", [])
         failures = check_referenced_paths(REPO_ROOT, files_to_scan, config)
         failures.extend(check_required_sections(REPO_ROOT, config))
+        failures.extend(check_changelog_fragment_shape(REPO_ROOT, config))
         return _report(failures)
 
     if args.command == "print-trailer":

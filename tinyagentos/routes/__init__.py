@@ -120,6 +120,9 @@ def register_all_routers(app):
     from tinyagentos.routes.a2a_bus import router as a2a_bus_router
     app.include_router(a2a_bus_router, dependencies=_csrf)
 
+    from tinyagentos.routes.a2a_gpu_lease import router as a2a_gpu_lease_router
+    app.include_router(a2a_gpu_lease_router, dependencies=_csrf)
+
     from tinyagentos.routes.scheduler import router as scheduler_router
     app.include_router(scheduler_router, dependencies=_csrf)
 
@@ -228,6 +231,9 @@ def register_all_routers(app):
     app.include_router(chat_files_router, dependencies=_csrf)
     from tinyagentos.routes.chat_admin import router as chat_admin_router
     app.include_router(chat_admin_router, dependencies=_csrf)
+
+    from tinyagentos.routes.chat_unified_bus_view import router as chat_unified_bus_view_router
+    app.include_router(chat_unified_bus_view_router, dependencies=_csrf)
 
     from tinyagentos.routes.canvas import router as canvas_router
     app.include_router(canvas_router, dependencies=_csrf)

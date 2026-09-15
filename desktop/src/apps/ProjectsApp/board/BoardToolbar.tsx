@@ -13,12 +13,13 @@ export interface BoardToolbarProps {
   filters: Filters;
   elements: ProjectElement[];
   live: boolean;
+  stale?: boolean;
   onChangeView: (m: ViewMode) => void;
   onChangeGroup: (g: GroupBy) => void;
   onChangeFilters: (f: Filters) => void;
   onAddTask?: () => void;
   /** When scoped to a single element (element drill-in), the filter bar is
-   *  hidden because the element is already the active filter. */
+    *  is hidden (the element is the active filter). Used by element drill-in. */
   hideElementFilter?: boolean;
 }
 
@@ -171,7 +172,7 @@ export function BoardToolbar(p: BoardToolbarProps) {
           onChange={(v) => p.onChangeFilters({ ...p.filters, elementId: v })}
         />
       )}
-      <span className={`${styles.pill} ${p.live ? styles.live : styles.dead}`}>● Live</span>
+      <span className={`${styles.pill} ${p.live && !p.stale ? styles.live : styles.dead}`} aria-label={p.stale || !p.live ? "live updates paused" : undefined}>● Live</span>
       {p.onAddTask && (
         <button type="button" className={styles.add} onClick={p.onAddTask}>＋ Task</button>
       )}

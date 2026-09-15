@@ -8,6 +8,11 @@ export function useBoardData(projectId: string) {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [elements, setElements] = useState<ProjectElement[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshKey, setRefreshKey] = useState(0);
+
+  const refresh = useCallback(() => {
+    setRefreshKey((k) => k + 1);
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -34,7 +39,7 @@ export function useBoardData(projectId: string) {
       }
     })();
     return () => { cancelled = true; };
-  }, [projectId]);
+  }, [projectId, refreshKey]);
 
   const applyEvent = useCallback((e: BoardLiveEvent) => {
     setTasks(prev => {
@@ -72,5 +77,5 @@ export function useBoardData(projectId: string) {
     });
   }, []);
 
-  return { tasks, elements, loading, setTasks, applyEvent };
+  return { tasks, elements, loading, setTasks, applyEvent, refresh };
 }

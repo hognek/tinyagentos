@@ -41,9 +41,24 @@ _A2A_BUS_READ_PATHS = frozenset({
 })
 # Authenticated A2A bus WRITE path: an agent may POST here with its own registry
 # JWT (scope a2a_send, verified by the route, which forces the bus `from` to the
-# agent's own handle so it posts as itself instead of the owner's account).
+# agent's own registry canonical_id -- the identity its token proves -- and
+# forwards that token to the bus so the bus can verify the sender).
 _A2A_BUS_WRITE_PATHS = frozenset({
     "/api/a2a/bus/send",
+})
+# A2A GPU lease coordination (taOS #893). Read (CHECK) needs a2a_receive; the
+# mutating actions (CLAIM/RELEASE/REQUEST/RENEW) need a2a_send. The route
+# resolves the acting identity from the token itself and forces the bus `from`
+# to the identity the token proves, so an agent can only claim/release for
+# itself. Same passthrough contract as the bus paths above.
+_A2A_GPU_READ_PATHS = frozenset({
+    "/api/a2a/gpu/check",
+})
+_A2A_GPU_WRITE_PATHS = frozenset({
+    "/api/a2a/gpu/claim",
+    "/api/a2a/gpu/release",
+    "/api/a2a/gpu/request",
+    "/api/a2a/gpu/renew",
 })
 # Observatory routes an agent may reach with its own registry JWT (scope
 # observatory_control). The route verifies the JWT + grant itself; the
@@ -81,6 +96,8 @@ _AGENT_TOKEN_PATHS = (
     _REGISTRY_FEED_PATHS
     | _A2A_BUS_READ_PATHS
     | _A2A_BUS_WRITE_PATHS
+    | _A2A_GPU_READ_PATHS
+    | _A2A_GPU_WRITE_PATHS
     | _OBSERVATORY_PATHS
     | _CONTAINER_REQUEST_PATHS
     | frozenset({"/api/agents/me/models", "/api/agents/me/model"})
@@ -586,7 +603,24 @@ class AuthMiddleware(BaseHTTPMiddleware):
         # endpoints, cluster heartbeat). Without this, a cached old client
         # could bypass onboarding by hitting an /api endpoint that the
         # not-configured branch used to allow through unconditionally.
+        #
+        # Exempt paths do not require auth, but if a valid session cookie is
+        # present we preserve the caller's identity so route handlers can serve
+        # a reduced view to unauthenticated callers and the full view to
+        # authenticated admins (e.g. GET /api/cluster/workers).
         if _is_exempt(request.method, path):
+            token = request.cookies.get("taos_session")
+            if token:
+                user_agent = request.headers.get("user-agent", "")
+                user_id = auth_mgr.validate_session(token, user_agent=user_agent)
+                if user_id is not None:
+                    user_record = auth_mgr.get_user_by_id(user_id)
+                    request.state.user_id = user_id
+                    request.state.is_admin = bool(
+                        user_record.get("is_admin") if user_record else False
+                    )
+                    request.state.via = "session"
+                    return await call_next(request)
             request.state.user_id = None
             request.state.is_admin = False
             request.state.via = "exempt"

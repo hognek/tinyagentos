@@ -6,6 +6,7 @@ import logging
 import math
 import secrets
 import time
+import uuid
 from collections import OrderedDict
 
 from fastapi import APIRouter, Request
@@ -55,7 +56,7 @@ class IdempotencyCache:
     already handling this key — the caller should ``await event.wait()``
     and then call ``get(key)`` for the cached result.
 
-    ``set(key, result)`` stores the result and fires the event so all
+    ``set(key, status_code, result)`` stores the response and fires the event so all
     waiters can proceed.
 
     This closes the race in the naive get-then-set pattern where
@@ -67,8 +68,8 @@ class IdempotencyCache:
     _MAX_SIZE: int = 1000         # LRU cap; oldest completed entry evicted first
 
     def __init__(self) -> None:
-        # Values: (event, result_or_None, inserted_at)
-        self._entries: OrderedDict[str, tuple[asyncio.Event, dict | None, float]] = OrderedDict()
+        # Values: (event, (status_code, body) | None, inserted_at)
+        self._entries: OrderedDict[str, tuple[asyncio.Event, tuple[int, dict] | None, float]] = OrderedDict()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -123,22 +124,22 @@ class IdempotencyCache:
         self._entries[key] = (event, None, time.monotonic())
         return ("proceed", event)
 
-    def set(self, key: str, result: dict) -> None:
-        """Store *result* and wake all waiters on *key*."""
+    def set(self, key: str, status_code: int, result: dict) -> None:
+        """Store *result* with *status_code* and wake all waiters on *key*."""
         entry = self._entries.get(key)
         if entry is None:
             self._evict_if_needed()
             event = asyncio.Event()
             event.set()
-            self._entries[key] = (event, result, time.monotonic())
+            self._entries[key] = (event, (status_code, result), time.monotonic())
             return
         event, _, inserted_at = entry
-        self._entries[key] = (event, result, inserted_at)
+        self._entries[key] = (event, (status_code, result), inserted_at)
         self._entries.move_to_end(key)
         event.set()
 
-    def get(self, key: str) -> dict | None:
-        """Return the cached result for *key*, or ``None``.
+    def get(self, key: str) -> tuple[int, dict] | None:
+        """Return the cached ``(status_code, body)`` for *key*, or ``None``.
 
         Returns ``None`` for unknown or TTL-expired keys.
         """
@@ -157,14 +158,16 @@ class IdempotencyCache:
 
         Call this in a ``finally`` block so that an unexpected exception
         never leaves the event unset and waiters hanging indefinitely.
-        Waiters that resume will receive ``None`` from ``get()``.
-        No-op when the event is already set (i.e. ``set()`` already called).
+        When ``set()`` was never called, the key is removed so a retry
+        can execute the handler again instead of receiving 503 for the
+        TTL duration.  No-op when the event is already set.
         """
         entry = self._entries.get(key)
         if entry is not None:
             ev, _res, _ts = entry
             if not ev.is_set():
                 ev.set()
+                del self._entries[key]
 
 
 @router.get("/api/agents")
@@ -358,7 +361,8 @@ async def add_agent(request: Request, body: AgentCreate):
             cached = idempotency_cache.get(scoped_key)
             if cached is None:
                 return JSONResponse({"error": "concurrent request failed"}, status_code=503)
-            return cached
+            status, body = cached
+            return JSONResponse(body, status_code=status)
 
     # Wrap so any unexpected exception still unblocks idempotency waiters.
     try:
@@ -368,7 +372,7 @@ async def add_agent(request: Request, body: AgentCreate):
         if name_error:
             err = {"error": name_error}
             if scoped_key and idempotency_cache is not None:
-                idempotency_cache.set(scoped_key, err)
+                idempotency_cache.set(scoped_key, 400, err)
             return JSONResponse(err, status_code=400)
 
         try:
@@ -376,7 +380,7 @@ async def add_agent(request: Request, body: AgentCreate):
         except ValueError as e:
             err = {"error": str(e)}
             if scoped_key and idempotency_cache is not None:
-                idempotency_cache.set(scoped_key, err)
+                idempotency_cache.set(scoped_key, 400, err)
             return JSONResponse(err, status_code=400)
 
         agent = body.model_dump()
@@ -386,7 +390,7 @@ async def add_agent(request: Request, body: AgentCreate):
         await save_config_locked(config, config.config_path)
         result = {"status": "created", "name": unique_slug, "display_name": display_name}
         if scoped_key and idempotency_cache is not None:
-            idempotency_cache.set(scoped_key, result)
+            idempotency_cache.set(scoped_key, 200, result)
         return result
     finally:
         # No-op when set() already fired; unblocks waiters on unexpected exceptions.
@@ -497,6 +501,19 @@ def _memory_selection_error(memory_plugin: str | None, memory_mode: str | None) 
     return None
 
 
+def _read_taosmd_default(data_dir):
+    import json
+    if data_dir is None:
+        return None
+    p = data_dir / "taosmd_default.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
 class DeployAgentRequest(BaseModel):
     name: str
     framework: str = "none"
@@ -597,7 +614,8 @@ async def deploy_agent_endpoint(request: Request, body: DeployAgentRequest):
             cached = idempotency_cache.get(scoped_key)
             if cached is None:
                 return JSONResponse({"error": "concurrent request failed"}, status_code=503)
-            return cached
+            status, body = cached
+            return JSONResponse(body, status_code=status)
 
     # Wrap so any unexpected exception still unblocks idempotency waiters.
     try:
@@ -606,7 +624,7 @@ async def deploy_agent_endpoint(request: Request, body: DeployAgentRequest):
         name_error = validate_agent_name(display_name)
         if name_error:
             if scoped_key and idempotency_cache is not None:
-                idempotency_cache.set(scoped_key, {"error": name_error})
+                idempotency_cache.set(scoped_key, 400, {"error": name_error})
             return JSONResponse({"error": name_error}, status_code=400)
         # Derive a container-safe slug and ensure uniqueness
         try:
@@ -614,7 +632,7 @@ async def deploy_agent_endpoint(request: Request, body: DeployAgentRequest):
         except ValueError as e:
             err = {"error": str(e)}
             if scoped_key and idempotency_cache is not None:
-                idempotency_cache.set(scoped_key, err)
+                idempotency_cache.set(scoped_key, 400, err)
             return JSONResponse(err, status_code=400)
         # Rewrite body.name to the unique slug; the original user-entered name
         # is preserved as display_name for the UI.
@@ -623,7 +641,7 @@ async def deploy_agent_endpoint(request: Request, body: DeployAgentRequest):
         fw_err = agent_deploy.validate_framework_and_ram(request, body)
         if fw_err is not None:
             if scoped_key and idempotency_cache is not None:
-                idempotency_cache.set(scoped_key, json.loads(fw_err.body))
+                idempotency_cache.set(scoped_key, fw_err.status_code, json.loads(fw_err.body))
             return fw_err
 
         # ------------------------------------------------------------------
@@ -632,7 +650,7 @@ async def deploy_agent_endpoint(request: Request, body: DeployAgentRequest):
         routed = agent_deploy.resolve_deploy_routing(request, body)
         if routed is not None:
             if scoped_key and idempotency_cache is not None:
-                idempotency_cache.set(scoped_key, json.loads(routed.body))
+                idempotency_cache.set(scoped_key, routed.status_code, json.loads(routed.body))
             return routed
 
         # Explicit target_worker pin: create the agent container ON that
@@ -641,21 +659,93 @@ async def deploy_agent_endpoint(request: Request, body: DeployAgentRequest):
         deploy_remote, deploy_taos_host, remote_err = await agent_deploy.configure_remote_deploy(request, body)
         if remote_err is not None:
             if scoped_key and idempotency_cache is not None:
-                idempotency_cache.set(scoped_key, json.loads(remote_err.body))
+                idempotency_cache.set(scoped_key, remote_err.status_code, json.loads(remote_err.body))
             return remote_err
 
-        # Register the agent with taosmd BEFORE mutating config so a failure
-        # here aborts cleanly with no half-state.
-        try:
-            tm_agents.register_agent(unique_slug)
-        except tm_agents.AgentExistsError:
-            pass  # idempotent — agent already registered, proceed normally
-        except Exception as e:
-            logger.exception("register_agent(%s) failed", unique_slug)
-            err_body = {"error": f"Could not register agent with taosmd: {e}"}
-            if scoped_key and idempotency_cache is not None:
-                idempotency_cache.set(scoped_key, err_body)
-            return JSONResponse(err_body, status_code=500)
+        data_dir = request.app.state.data_dir
+
+        # Self-heal deferred taOSmd model downloads.
+        # If the user deferred model pulls during setup and now deploys an
+        # agent with taOSmd memory (memory_config None or matching the
+        # deferred default), start the pull before the agent is marked ready.
+        # If we cannot start the pull (no registry / offline) return 409
+        # so the caller knows the agent cannot have memory search until the
+        # downloads complete.
+        self_heal_setup_task_id = None
+        if body.memory_plugin == "taosmd" and body.memory_mode != "framework":
+            default_data = _read_taosmd_default(data_dir)
+            if default_data and default_data.get("models_skipped"):
+                agent_cfg = body.memory_config or {}
+                if not body.memory_config or (
+                    agent_cfg.get("device_id") == default_data.get("device_id")
+                    and agent_cfg.get("tier_id") == default_data.get("tier_id")
+                ):
+                    registry = getattr(request.app.state, "registry", None)
+                    if registry is None:
+                        err_body = {
+                            "error": (
+                                "Cannot deploy with taOSmd memory: deferred model downloads "
+                                "require the model registry. Complete memory setup first."
+                            )
+                        }
+                        if scoped_key and idempotency_cache is not None:
+                            idempotency_cache.set(scoped_key, 409, err_body)
+                        return JSONResponse(err_body, status_code=409)
+
+                    tier_id = default_data.get("tier_id", "standard")
+                    from tinyagentos.routes.taosmd import MEMORY_TIERS, _run_setup, _tasks
+                    tier_cfg = MEMORY_TIERS.get(tier_id)
+                    if tier_cfg is not None:
+                        tasks = _tasks(request)
+                        existing_task_id = getattr(request.app.state, "taosmd_selfheal_task_id", None)
+                        reuse = False
+                        if existing_task_id is not None:
+                            existing_task = tasks.get(existing_task_id)
+                            if existing_task is not None and existing_task.get("state") not in {"done", "failed"}:
+                                task_id = existing_task_id
+                                self_heal_setup_task_id = task_id
+                                reuse = True
+
+                        if not reuse:
+                            request.app.state.taosmd_selfheal_task_id = None
+                            task_id = str(uuid.uuid4())
+                            tasks[task_id] = {
+                                "state": "pending",
+                                "progress_pct": 0,
+                                "message": "Queued…",
+                                "error": None,
+                            }
+                            asyncio.create_task(
+                                _run_setup(
+                                    tasks,
+                                    task_id,
+                                    default_data.get("device_id", "local"),
+                                    tier_id,
+                                    tier_cfg,
+                                    registry=registry,
+                                    hardware_profile=getattr(request.app.state, "hardware_profile", None),
+                                    backends=list(getattr(config, "backends", []) or []) if config else [],
+                                    skip_models=False,
+                                    data_dir=data_dir,
+                                )
+                            )
+                            request.app.state.taosmd_selfheal_task_id = task_id
+                            self_heal_setup_task_id = task_id
+
+        # Register the agent with taOSmd BEFORE mutating config so a failure
+        # here aborts cleanly with no half-state. Skipped for memory_mode='framework'
+        # because that mode explicitly opts out of taOSmd.
+        if body.memory_mode != "framework":
+            try:
+                tm_agents.register_agent(unique_slug)
+            except tm_agents.AgentExistsError:
+                pass  # idempotent — agent already registered, proceed normally
+            except Exception as e:
+                logger.exception("register_agent(%s) failed", unique_slug)
+                err_body = {"error": f"Could not register agent with taosmd: {e}"}
+                if scoped_key and idempotency_cache is not None:
+                    idempotency_cache.set(scoped_key, 500, err_body)
+                return JSONResponse(err_body, status_code=500)
 
         # Register the agent in the agent registry, minting a canonical_id.
         # Every deploy creates a NEW agent entry (slugs are made unique above),
@@ -676,13 +766,13 @@ async def deploy_agent_endpoint(request: Request, body: DeployAgentRequest):
                 # Reserved-prefix names are a user error, not a server fault.
                 err_body = {"error": str(e)}
                 if scoped_key and idempotency_cache is not None:
-                    idempotency_cache.set(scoped_key, err_body)
+                    idempotency_cache.set(scoped_key, 400, err_body)
                 return JSONResponse(err_body, status_code=400)
             except Exception as e:
                 logger.exception("agent_registry.register(%s) failed", unique_slug)
                 err_body = {"error": f"Could not register agent in registry: {e}"}
                 if scoped_key and idempotency_cache is not None:
-                    idempotency_cache.set(scoped_key, err_body)
+                    idempotency_cache.set(scoped_key, 500, err_body)
                 return JSONResponse(err_body, status_code=500)
 
         # Add agent entry immediately with deploying status. qmd_url has
@@ -738,12 +828,76 @@ async def deploy_agent_endpoint(request: Request, body: DeployAgentRequest):
         deploy_tasks[body.name] = {"status": "deploying", "name": body.name}
 
         from tinyagentos.deployer import deploy_agent, DeployRequest
-        data_dir = request.app.state.data_dir
         llm_proxy = getattr(request.app.state, "llm_proxy", None)
         secrets_store = getattr(request.app.state, "secrets", None)
 
         async def _background_deploy():
             try:
+                # Wait for deferred model pull if one was started.
+                if self_heal_setup_task_id is not None:
+                    setup_tasks = getattr(request.app.state, "taosmd_setup_tasks", {})
+                    setup_task = setup_tasks.get(self_heal_setup_task_id)
+                    if setup_task is not None:
+                        terminal = {"done", "failed"}
+                        if setup_task.get("state") not in terminal:
+                            last_progress = setup_task.get("progress_pct")
+                            last_message = setup_task.get("message")
+                            stall_seconds = 0
+                            max_stall_seconds = 600
+                            while True:
+                                await asyncio.sleep(1)
+                                setup_task = setup_tasks.get(self_heal_setup_task_id)
+                                if setup_task is None or setup_task.get("state") in terminal:
+                                    break
+                                pct = setup_task.get("progress_pct")
+                                msg = setup_task.get("message")
+                                if pct == last_progress and msg == last_message:
+                                    stall_seconds += 1
+                                    if stall_seconds >= max_stall_seconds:
+                                        setup_task = {
+                                            "state": "failed",
+                                            "message": "model download stalled — no progress for 10 minutes",
+                                        }
+                                        break
+                                else:
+                                    stall_seconds = 0
+                                    last_progress = pct
+                                    last_message = msg
+
+                        real_entry = setup_tasks.get(self_heal_setup_task_id)
+                        if real_entry is not None and real_entry.get("state") in terminal:
+                            request.app.state.taosmd_selfheal_task_id = None
+
+                        if setup_task.get("state") != "done":
+                            agent = find_agent(config, body.name)
+                            if agent is not None:
+                                agent["status"] = "failed"
+                            err_msg = (setup_task or {}).get("error") or (setup_task or {}).get("message") or "Setup failed"
+                            deploy_tasks[body.name] = {
+                                "status": "failed",
+                                "name": body.name,
+                                "error": err_msg,
+                            }
+                            notif = getattr(request.app.state, "notifications", None)
+                            if notif:
+                                await notif.add(
+                                    title=f"Deploy failed: {body.name}",
+                                    message=f"Deploy failed for {body.name}: {err_msg}",
+                                    level="error",
+                                    source="agents.deploy",
+                                )
+                            await save_config_locked(config, config.config_path)
+                            return
+
+                        # Setup succeeded: clear models_skipped so future deploys
+                        # don't re-trigger the pull.
+                        current_default = _read_taosmd_default(data_dir)
+                        if current_default and current_default.get("models_skipped"):
+                            current_default["models_skipped"] = False
+                            import json
+                            p = data_dir / "taosmd_default.json"
+                            p.write_text(json.dumps(current_default))
+
                 # Prefetch the base onto the worker here (not in the request
                 # path) so a cold ~300-500MB import never blocks POST /deploy.
                 if deploy_remote:
@@ -877,7 +1031,7 @@ async def deploy_agent_endpoint(request: Request, body: DeployAgentRequest):
         result = {"status": "deploying", "name": body.name, "archive_smoke_ok": smoke_ok}
 
         if scoped_key and idempotency_cache is not None:
-            idempotency_cache.set(scoped_key, result)
+            idempotency_cache.set(scoped_key, 200, result)
 
         return result
     finally:
@@ -1491,11 +1645,18 @@ async def update_agent_model(request: Request, name: str, body: AgentModelUpdate
     proxy = getattr(request.app.state, "llm_proxy", None)
     llm_key = agent.get("llm_key")
     key_rescoped = False
-    if proxy is not None and llm_key:
-        try:
-            key_rescoped = await proxy.update_agent_key(llm_key, permitted)
-        except Exception:
-            logger.exception("update_agent_model: re-scoping key for %s failed", name)
+    if proxy is not None:
+        if not llm_key:
+            from tinyagentos.agent_keys import re_mint_agent_key
+
+            llm_key = await re_mint_agent_key(
+                name, agent, proxy, config, config.config_path, models=permitted
+            )
+        if llm_key:
+            try:
+                key_rescoped = await proxy.update_agent_key(llm_key, permitted)
+            except Exception:
+                logger.exception("update_agent_model: re-scoping key for %s failed", name)
         if not key_rescoped:
             # Key re-scope failed (e.g. provider type mismatch after model
             # change).  Discard the stale per-agent key so the deployer
@@ -1602,11 +1763,18 @@ async def set_permitted_models(request: Request, name: str, body: PermittedModel
     proxy = getattr(request.app.state, "llm_proxy", None)
     llm_key = agent.get("llm_key")
     key_rescoped = False
-    if proxy is not None and llm_key:
-        try:
-            key_rescoped = await proxy.update_agent_key(llm_key, permitted)
-        except Exception:
-            logger.exception("set_permitted_models: re-scoping key for %s failed", name)
+    if proxy is not None:
+        if not llm_key:
+            from tinyagentos.agent_keys import re_mint_agent_key
+
+            llm_key = await re_mint_agent_key(
+                name, agent, proxy, config, config.config_path, models=permitted
+            )
+        if llm_key:
+            try:
+                key_rescoped = await proxy.update_agent_key(llm_key, permitted)
+            except Exception:
+                logger.exception("set_permitted_models: re-scoping key for %s failed", name)
 
     framework = agent.get("framework")
     if framework in ("openclaw", "hermes"):
@@ -1624,11 +1792,15 @@ async def set_permitted_models(request: Request, name: str, body: PermittedModel
         "key_rescoped": key_rescoped,
     }
 
-
 def _budget_store_for_request(request: Request):
     from tinyagentos.agent_budget_store import AgentBudgetStore, default_budget_path
-    data_dir = request.app.state.data_dir
-    return AgentBudgetStore(default_budget_path(data_dir))
+
+    store = getattr(request.app.state, "agent_budget_store", None)
+    if store is None:
+        data_dir = request.app.state.data_dir
+        store = AgentBudgetStore(default_budget_path(data_dir))
+        request.app.state.agent_budget_store = store
+    return store
 
 
 def _budget_response(agent_name: str, rec: dict | None) -> dict:
@@ -1645,7 +1817,7 @@ async def get_agent_budget(request: Request, name: str):
     if not agent:
         return JSONResponse({"error": f"Agent '{name}' not found"}, status_code=404)
     store = _budget_store_for_request(request)
-    return _budget_response(name, store.get(name))
+    return _budget_response(name, await asyncio.to_thread(store.get, name))
 
 
 class AgentBudgetUpdate(BaseModel):
@@ -1667,8 +1839,8 @@ async def set_agent_budget(request: Request, name: str, body: AgentBudgetUpdate)
             status_code=400,
         )
     store = _budget_store_for_request(request)
-    store.set_budget(name, body.max_budget_usd)
-    return _budget_response(name, store.get(name))
+    await asyncio.to_thread(store.set_budget, name, body.max_budget_usd)
+    return _budget_response(name, await asyncio.to_thread(store.get, name))
 
 
 @router.post("/api/agents/{name}/budget/reset")
@@ -1679,8 +1851,8 @@ async def reset_agent_budget(request: Request, name: str):
     if not agent:
         return JSONResponse({"error": f"Agent '{name}' not found"}, status_code=404)
     store = _budget_store_for_request(request)
-    store.reset_spend(name)
-    return _budget_response(name, store.get(name))
+    await asyncio.to_thread(store.reset_spend, name)
+    return _budget_response(name, await asyncio.to_thread(store.get, name))
 
 
 @router.get("/api/agents/{name}/wake-budget")

@@ -9,6 +9,7 @@ import pytest
 from tinyagentos.llm_proxy import (
     EMBEDDING_ALIAS,
     _is_embedding_model,
+    _pids_listening_on,
     generate_litellm_config,
     LLMProxy,
 )
@@ -564,6 +565,72 @@ class TestLLMProxyOwnership:
         assert called is False
 
 
+class TestPidsListeningOn:
+    def test_listening_pid_only_returns_listener_not_client(self):
+        """RED test for R2-11: lsof -ti :{port} returns clients too.
+
+        A client socket to the port must not appear in the result.
+        Only the LISTEN socket owner (the server) should be returned.
+        """
+        import os
+        import socket
+        import subprocess
+        import sys
+        import threading
+        import time
+
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind(("127.0.0.1", 0))
+        server_socket.listen(1)
+        port = server_socket.getsockname()[1]
+        server_pid = os.getpid()
+
+        accepted = threading.Event()
+
+        def _accept_and_hold():
+            try:
+                conn, _ = server_socket.accept()
+                accepted.set()
+                time.sleep(3)
+                conn.close()
+            except OSError:
+                pass
+
+        t = threading.Thread(target=_accept_and_hold, daemon=True)
+        t.start()
+
+        client_script = (
+            f"import socket, time\n"
+            f"s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+            f"s.connect(('127.0.0.1', {port}))\n"
+            f"time.sleep(3)\n"
+            f"s.close()\n"
+        )
+        child = subprocess.Popen([sys.executable, "-c", client_script])
+
+        try:
+            for _ in range(50):
+                if accepted.is_set():
+                    break
+                time.sleep(0.1)
+
+            pids = _pids_listening_on(port)
+        finally:
+            child.terminate()
+            try:
+                child.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+            server_socket.close()
+            t.join(timeout=2)
+
+        assert pids == [server_pid], (
+            f"Expected only server PID {server_pid}, got {pids}"
+        )
+
+
 class TestInhouseKeys:
     """In-house key mode: per-agent keys minted in a local SQLite store via
     the custom_auth hook, so virtual keys work with no DATABASE_URL (the ARM /
@@ -826,7 +893,7 @@ class TestProxySelfHeal:
             "[project.optional-dependencies]\n"
             # trailing whitespace/newline in an entry must be stripped, not
             # reach pip verbatim
-            "proxy = [\"litellm[proxy]>=1.90.0\", \"prisma>=0.11.0\\n\"]\n"
+            "proxy = [\"litellm[proxy]>=1.90.0\"\n]\n"
         )
         (tmp_path / ".venv" / "bin").mkdir(parents=True)
         monkeypatch.setattr(sys, "executable", str(tmp_path / ".venv" / "bin" / "python"))
@@ -853,7 +920,6 @@ class TestProxySelfHeal:
             "--no-input",
             "--disable-pip-version-check",
             "litellm[proxy]>=1.90.0",
-            "prisma>=0.11.0",
         ]
         assert "-e" not in captured["cmd"]
 
