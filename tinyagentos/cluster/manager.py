@@ -505,6 +505,7 @@ class ClusterManager:
         drain_reason: str | None = None,
         generation: int | None = None,
         resources: list[str] | None = None,
+        vram_sampled_age_ms: int | None = None,
     ) -> bool:
         """Accept a worker heartbeat.
 
@@ -603,7 +604,18 @@ class ClusterManager:
             worker.kv_cache_quant_boundary_layer_protect = bool(kv_cache_quant_boundary_layer_protect)
         if free_vram_mb is not None:
             worker.free_vram_mb = int(free_vram_mb)
-            worker.last_vram_report_at = time.time()
+            # Use worker-sampled age when available to avoid over-admission during heartbeat transit.
+            # Clamp to 0 to guard against direct callers or misbehaving workers sending a
+            # negative age, which would otherwise set vram_sampled_at in the future and
+            # cause claim_lease to omit every active lease from already_held.
+            safe_age = max(0, vram_sampled_age_ms) if vram_sampled_age_ms is not None else None
+            if safe_age is not None:
+                worker.last_vram_report_at = time.time() - (safe_age / 1000.0)
+                # Store the sample time itself (when the VRAM snapshot was taken)
+                worker.vram_sampled_at = worker.last_vram_report_at
+            else:
+                worker.last_vram_report_at = time.time()
+                worker.vram_sampled_at = None
         if used_vram_mb is not None:
             worker.used_vram_mb = int(used_vram_mb)
         # Registration-drift refresh (taOS #1538): update cached host_lan_ip,
@@ -857,15 +869,19 @@ class ClusterManager:
                 # latest heartbeat-reported free VRAM, so once a leased
                 # workload has allocated its VRAM that allocation is already
                 # absent from free_vram_mb.  Only count leases whose grant
-                # post-dates the last heartbeat — those are the ones the
-                # heartbeat cannot have seen yet.
+                # post-dates the last actual VRAM report (not the receipt time).
+                # If we have the sample time, compare against that; otherwise
+                # fall back to the receipt time for backward compatibility.
                 already_held = 0
                 now = time.time()
+                sample_time = getattr(worker, "vram_sampled_at", None)
+                if sample_time is None:
+                    sample_time = worker.last_vram_report_at
                 for lid, lease in self._leases.items():
                     if (parsed := self._parse_resource_id(lease.resource_id)) \
                             and parsed[0] == worker.name:
                         if lease.expires_at > now \
-                                and lease.granted_at > worker.last_vram_report_at:
+                                and lease.granted_at > sample_time:
                             already_held += lease.required_vram_mb
 
                 effective_free = worker.free_vram_mb - already_held
