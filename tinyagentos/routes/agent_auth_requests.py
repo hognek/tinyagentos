@@ -22,7 +22,6 @@ Security notes
 """
 
 import asyncio
-import json
 import logging
 from typing import Optional
 
@@ -417,14 +416,6 @@ async def _handle_project_create_request(
         )
         await store._db.commit()
         raise
-
-    meta = dict(decision.get("metadata") or {})
-    meta["auth_request_id"] = record["id"]
-    await request.app.state.decision_store._db.execute(
-        "UPDATE decisions SET metadata = ? WHERE id = ?",
-        (json.dumps(meta), decision["id"]),
-    )
-    await request.app.state.decision_store._db.commit()
 
     notifs = getattr(request.app.state, "notifications", None)
     if notifs is not None:
