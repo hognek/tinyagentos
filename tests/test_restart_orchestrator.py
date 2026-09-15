@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -416,14 +415,16 @@ class TestPrepareAgent:
 class TestWriteControllerNote:
     @pytest.mark.asyncio
     async def test_writes_note_file(self, tmp_path):
+        frozen_ts = 1234567890
         agent = {"name": "agent1"}
         orch = ro.RestartOrchestrator(_app_state(tmp_path))
+        orch._clock = staticmethod(lambda: frozen_ts)
         result = await orch._write_controller_note(agent, "stop", tmp_path)
         p = Path(result)
         assert p.exists()
         data = json.loads(p.read_text())
         assert data["reason"] == "stop"
-        assert data["paused_at"] == int(time.time())
+        assert data["paused_at"] == frozen_ts
         assert data["next_step_hint"] == (
             "controller-side fallback — agent framework did not implement /prepare-for-shutdown"
         )
