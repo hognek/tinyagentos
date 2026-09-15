@@ -5,3 +5,4 @@
 - Worker sends `None` for `vram_sampled_age_ms` when no VRAM probe is available instead of `0`, allowing the controller to distinguish "unknown" from "no VRAM free".
 - Removed duplicate `worker.vram_sampled_at = None` assignment, orphan comment, and unused `vram_sampled_at` field from heartbeat body.
 - Consolidated changelog fragments to reference `tsk-6e4t2b` only.
+- `HeartbeatBody.vram_sampled_age_ms` now rejects negative values with a 422 and `ClusterManager.heartbeat()` clamps negative ages to 0 to prevent `vram_sampled_at` being set in the future, which would omit all active leases from `already_held`.

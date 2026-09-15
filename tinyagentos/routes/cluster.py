@@ -278,8 +278,9 @@ class HeartbeatBody(BaseModel):
     # Worker-sampled age of the VRAM report in milliseconds. When present,
     # the controller uses the sample time (not the receipt time) to avoid
     # over-admitting during heartbeat transit. If absent, keep the current
-    # receipt-time behavior (old workers, backward compatibility).
-    vram_sampled_age_ms: int | None = None
+    # receipt-time behavior (old workers, backward compatibility). Must be
+    # non-negative; negative values are rejected with a 422.
+    vram_sampled_age_ms: int | None = Field(default=None, ge=0)
     # Registration-drift refresh (taOS #1538): workers report their live
     # host_lan_ip, url, and hardware on every heartbeat so the cluster
     # manager stays in sync with container reality. Optional so legacy

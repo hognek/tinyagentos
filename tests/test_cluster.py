@@ -388,7 +388,7 @@ class TestClusterManager:
         # With the fix, we can pass vram_sampled_age_ms to use sample time
         # instead of receipt time, so lease A IS counted in already_held
         # This test should now PASS with the fix
-        time.sleep(0.01)
+        await asyncio.sleep(0.01)
         # Pass vram_sampled_age_ms that corresponds to the sample time before lease_a was granted
         # This simulates the worker sending the age in the heartbeat
         # If the sample was taken at t0 and arrives at t2, age = (t2 - t0) * 1000
@@ -953,4 +953,94 @@ async def test_heartbeat_route_forwards_vram_sampled_age_ms(client, app):
         f"vram_sampled_at {worker.vram_sampled_at} should be ~5s before receipt {receipt_mid}"
     )
     await app.state.cluster_pairing.close()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_route_rejects_negative_vram_sampled_age_ms(client, app):
+    """Negative vram_sampled_age_ms is rejected with 422 at the route."""
+    import hashlib
+    import hmac
+    import json as _json
+
+    def _code_hash(code: str) -> str:
+        return hashlib.sha256(code.encode()).hexdigest()
+
+    def sign_worker_request(key: bytes, name: str, method: str, path: str, body: bytes) -> dict:
+        ts = str(int(time.time()))
+        body_hash = hashlib.sha256(body).hexdigest()
+        message = f"{ts}.{method.upper()}.{path}.{body_hash}".encode()
+        sig = hmac.new(key, message, hashlib.sha256).hexdigest()
+        return {
+            "X-TAOS-Worker-Name": name,
+            "X-TAOS-Timestamp": ts,
+            "X-TAOS-Signature": sig,
+        }
+
+    await app.state.cluster_pairing.init()
+    ch = _code_hash("test-pairing-code-neg")
+    resp = await client.post(
+        "/api/cluster/pairing/announce",
+        json={"name": "neg-age-worker", "url": "http://10.0.0.1:9000", "platform": "linux", "code_hash": ch},
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        "/api/cluster/pairing/confirm",
+        json={"name": "neg-age-worker", "code": "test-pairing-code-neg"},
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        "/api/cluster/pairing/claim",
+        json={"name": "neg-age-worker", "code": "test-pairing-code-neg"},
+    )
+    assert resp.status_code == 200, resp.text
+    key = bytes.fromhex(resp.json()["signing_key"])
+
+    reg_body = _json.dumps({
+        "name": "neg-age-worker",
+        "url": "http://10.0.0.1:9000",
+        "capabilities": ["chat"],
+    }).encode()
+    await client.post(
+        "/api/cluster/workers",
+        content=reg_body,
+        headers={
+            **sign_worker_request(key, "neg-age-worker", "POST", "/api/cluster/workers", reg_body),
+            "content-type": "application/json",
+        },
+    )
+
+    hb_body = _json.dumps({
+        "name": "neg-age-worker",
+        "load": 0.1,
+        "free_vram_mb": 8192,
+        "vram_sampled_age_ms": -1,
+    }).encode()
+    resp = await client.post(
+        "/api/cluster/heartbeat",
+        content=hb_body,
+        headers={
+            **sign_worker_request(key, "neg-age-worker", "POST", "/api/cluster/heartbeat", hb_body),
+            "content-type": "application/json",
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    await app.state.cluster_pairing.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_heartbeat_negative_vram_age_does_not_move_vram_sampled_at_past_now():
+    """Direct heartbeat with negative vram_sampled_age_ms clamps to 0 and keeps vram_sampled_at <= now."""
+    mgr = ClusterManager()
+    await mgr.register_worker(_make_worker("neg-direct", url="http://neg-direct:9000"))
+    worker = mgr.get_worker("neg-direct")
+    assert worker is not None
+
+    now_before = time.time()
+    assert mgr.heartbeat("neg-direct", free_vram_mb=4096, vram_sampled_age_ms=-1000) is True
+    now_after = time.time()
+
+    assert worker.vram_sampled_at is not None
+    assert worker.vram_sampled_at <= now_after, (
+        f"vram_sampled_at {worker.vram_sampled_at} should not be in the future after negative age"
+    )
 

@@ -604,9 +604,13 @@ class ClusterManager:
             worker.kv_cache_quant_boundary_layer_protect = bool(kv_cache_quant_boundary_layer_protect)
         if free_vram_mb is not None:
             worker.free_vram_mb = int(free_vram_mb)
-            # Use worker-sampled age when available to avoid over-admission during heartbeat transit
-            if vram_sampled_age_ms is not None:
-                worker.last_vram_report_at = time.time() - (vram_sampled_age_ms / 1000.0)
+            # Use worker-sampled age when available to avoid over-admission during heartbeat transit.
+            # Clamp to 0 to guard against direct callers or misbehaving workers sending a
+            # negative age, which would otherwise set vram_sampled_at in the future and
+            # cause claim_lease to omit every active lease from already_held.
+            safe_age = max(0, vram_sampled_age_ms) if vram_sampled_age_ms is not None else None
+            if safe_age is not None:
+                worker.last_vram_report_at = time.time() - (safe_age / 1000.0)
                 # Store the sample time itself (when the VRAM snapshot was taken)
                 worker.vram_sampled_at = worker.last_vram_report_at
             else:
