@@ -297,7 +297,6 @@ async def test_requested_scope_outside_vocabulary_400(client, monkeypatch, tmp_p
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-@pytest.mark.asyncio
 async def test_granted_must_be_subset_of_requested_400(client, monkeypatch, tmp_path):
     env = await _wire(client, monkeypatch, tmp_path)
     try:
