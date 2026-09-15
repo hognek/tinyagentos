@@ -1,3 +1,3 @@
 ### Fixed
 
-- Added `TAOS_SPA_DIR` environment variable support in `tinyagentos/routes/desktop.py` so that a non-editable `pip install .` can find the staged desktop bundle. The variable is checked first; if set, `SPA_DIR` resolves to that path. Otherwise the default `PROJECT_DIR / "static" / "desktop"` is used as before.
+- `TAOS_SPA_DIR` is now set automatically by the installer (`scripts/install-server.sh`) on Linux systemd, user-unit, nohup fallback, and macOS launchd paths, pointing at `$INSTALL_DIR/static/desktop` so non-editable `pip install .` finds the staged desktop bundle. The three stray root bundle files (`chat.html`, `index.html`, `sw.js`) have been removed.
