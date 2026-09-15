@@ -2653,6 +2653,7 @@ class TestProjectCreateRequest:
         from tinyagentos.agent_registry_store import (
             AgentRegistryStore,
             load_or_create_signing_keypair,
+            mint_registry_token,
         )
         from tinyagentos.auth_requests_store import AuthRequestsStore
         from tinyagentos.projects.project_store import ProjectStore
@@ -2674,6 +2675,7 @@ class TestProjectCreateRequest:
         )
         await registry.set_status(reg["canonical_id"], "active")
         cid = reg["canonical_id"]
+        token = mint_registry_token(cid, priv, user_id="u", framework="openclaw")
 
         monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
         monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
@@ -2692,6 +2694,7 @@ class TestProjectCreateRequest:
                 "requested_slug": "alice-board",
                 "purpose": "need a board",
             },
+            headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 200, resp.text
         body = resp.json()
@@ -2724,6 +2727,7 @@ class TestProjectCreateRequest:
         from tinyagentos.agent_registry_store import (
             AgentRegistryStore,
             load_or_create_signing_keypair,
+            mint_registry_token,
         )
         from tinyagentos.agent_grants_store import AgentGrantsStore
         from tinyagentos.auth_requests_store import AuthRequestsStore
@@ -2748,6 +2752,7 @@ class TestProjectCreateRequest:
         )
         await registry.set_status(reg["canonical_id"], "active")
         cid = reg["canonical_id"]
+        token = mint_registry_token(cid, priv, user_id="u", framework="openclaw")
 
         monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
         monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
@@ -2767,6 +2772,7 @@ class TestProjectCreateRequest:
                 "requested_slug": "alice-board",
                 "purpose": "need a board",
             },
+            headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 200, resp.text
         request_id = resp.json()["request_id"]
@@ -2816,6 +2822,7 @@ class TestProjectCreateRequest:
         from tinyagentos.agent_registry_store import (
             AgentRegistryStore,
             load_or_create_signing_keypair,
+            mint_registry_token,
         )
         from tinyagentos.auth_requests_store import AuthRequestsStore
         from tinyagentos.projects.project_store import ProjectStore
@@ -2836,6 +2843,8 @@ class TestProjectCreateRequest:
             handle="agent-alice",
         )
         await registry.set_status(reg["canonical_id"], "active")
+        cid = reg["canonical_id"]
+        token = mint_registry_token(cid, priv, user_id="u", framework="openclaw")
 
         monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
         monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
@@ -2854,6 +2863,7 @@ class TestProjectCreateRequest:
                 "requested_slug": "denied-board",
                 "purpose": "need a board",
             },
+            headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 200, resp.text
         request_id = resp.json()["request_id"]
@@ -2883,6 +2893,7 @@ class TestProjectCreateRequest:
         from tinyagentos.agent_registry_store import (
             AgentRegistryStore,
             load_or_create_signing_keypair,
+            mint_registry_token,
         )
         from tinyagentos.auth_requests_store import AuthRequestsStore
         from tinyagentos.projects.project_store import ProjectStore
@@ -2903,6 +2914,8 @@ class TestProjectCreateRequest:
             handle="agent-alice",
         )
         await registry.set_status(reg["canonical_id"], "active")
+        cid = reg["canonical_id"]
+        token = mint_registry_token(cid, priv, user_id="u", framework="openclaw")
 
         monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
         monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
@@ -2921,6 +2934,7 @@ class TestProjectCreateRequest:
                 "requested_slug": "fail-board",
                 "purpose": "test",
             },
+            headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 200, resp.text
         request_id = resp.json()["request_id"]
@@ -2954,6 +2968,7 @@ class TestProjectCreatePendingCapNoOrphan:
         from tinyagentos.agent_registry_store import (
             AgentRegistryStore,
             load_or_create_signing_keypair,
+            mint_registry_token,
         )
         from tinyagentos.auth_requests_store import AuthRequestsStore
         from tinyagentos.routes.agent_auth_requests import _PENDING_CAP
@@ -2977,6 +2992,7 @@ class TestProjectCreatePendingCapNoOrphan:
         )
         await registry.set_status(reg["canonical_id"], "active")
         cid = reg["canonical_id"]
+        token = mint_registry_token(cid, priv, user_id="u", framework="openclaw")
 
         monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
         monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
@@ -3007,6 +3023,7 @@ class TestProjectCreatePendingCapNoOrphan:
                 "requested_slug": f"cap-test-{uuid.uuid4().hex[:8]}",
                 "purpose": "test",
             },
+            headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 429, resp.text
 
@@ -3059,6 +3076,7 @@ class TestProjectCreateSecurity:
         from tinyagentos.agent_registry_store import (
             AgentRegistryStore,
             load_or_create_signing_keypair,
+            mint_registry_token,
         )
         from tinyagentos.auth_requests_store import AuthRequestsStore
         from tinyagentos.routes.agent_auth_requests import _PENDING_CAP
@@ -3082,6 +3100,7 @@ class TestProjectCreateSecurity:
         )
         await registry.set_status(reg["canonical_id"], "active")
         cid = reg["canonical_id"]
+        token = mint_registry_token(cid, priv, user_id="u", framework="openclaw")
 
         monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
         monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
@@ -3112,6 +3131,7 @@ class TestProjectCreateSecurity:
                 "requested_slug": f"cap-order-{uuid.uuid4().hex[:8]}",
                 "purpose": "test",
             },
+            headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 429, resp.text
 
@@ -3130,6 +3150,7 @@ class TestProjectCreateSecurity:
         from tinyagentos.agent_registry_store import (
             AgentRegistryStore,
             load_or_create_signing_keypair,
+            mint_registry_token,
         )
         from tinyagentos.auth_requests_store import AuthRequestsStore
         from tinyagentos.routes.agent_auth_requests import _PENDING_CAP
@@ -3153,6 +3174,7 @@ class TestProjectCreateSecurity:
         )
         await registry.set_status(reg["canonical_id"], "active")
         cid = reg["canonical_id"]
+        token = mint_registry_token(cid, priv, user_id="u", framework="openclaw")
 
         monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
         monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
@@ -3183,6 +3205,7 @@ class TestProjectCreateSecurity:
                 "requested_slug": f"cap-key-{uuid.uuid4().hex[:8]}",
                 "purpose": "test",
             },
+            headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 429, resp.text
 
@@ -3197,6 +3220,7 @@ class TestProjectCreateSecurity:
         from tinyagentos.agent_registry_store import (
             AgentRegistryStore,
             load_or_create_signing_keypair,
+            mint_registry_token,
         )
         from tinyagentos.auth_requests_store import AuthRequestsStore
         from tinyagentos.agent_grants_store import AgentGrantsStore
@@ -3221,6 +3245,7 @@ class TestProjectCreateSecurity:
         )
         await registry.set_status(reg["canonical_id"], "active")
         cid = reg["canonical_id"]
+        token = mint_registry_token(cid, priv, user_id="u", framework="openclaw")
 
         monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
         monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
@@ -3247,6 +3272,7 @@ class TestProjectCreateSecurity:
                 "requested_slug": "orphan-board",
                 "purpose": "test",
             },
+            headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 200, resp.text
         request_id = resp.json()["request_id"]
@@ -3264,6 +3290,156 @@ class TestProjectCreateSecurity:
         auth_record = await auth_store.get(request_id)
         assert auth_record is not None
         assert auth_record["status"] == "refused"
+
+        await registry.close()
+        await auth_store.close()
+        await pstore.close()
+        await grants.close()
+
+    @pytest.mark.asyncio
+    async def test_registered_handle_no_token_is_401(
+        self, client, monkeypatch, tmp_path
+    ):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.projects.project_store import ProjectStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-handle-no-token.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-handle-no-token.db")
+        await auth_store.init()
+        pstore = ProjectStore(tmp_path / "projects-handle-no-token.db")
+        await pstore.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-handle-no-token")
+
+        reg = await registry.register(
+            framework="openclaw",
+            display_name="handle-no-token",
+            user_id="u",
+            origin="external-selfjoin",
+            handle="handle-no-token",
+        )
+        await registry.set_status(reg["canonical_id"], "active")
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "handle-no-token",
+                "framework": "openclaw",
+                "kind": "project_create",
+                "requested_name": "Handle No Token Project",
+                "requested_slug": "handle-no-token-project",
+                "purpose": "test",
+            },
+        )
+        assert resp.status_code == 401, resp.text
+
+        await registry.close()
+        await auth_store.close()
+        await pstore.close()
+
+    @pytest.mark.asyncio
+    async def test_acceptance_result_none_rolls_back_project_and_grant(
+        self, client, monkeypatch, tmp_path
+    ):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+            mint_registry_token,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.agent_grants_store import AgentGrantsStore
+        from tinyagentos.projects.project_store import ProjectStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-accept-none.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-accept-none.db")
+        await auth_store.init()
+        pstore = ProjectStore(tmp_path / "projects-accept-none.db")
+        await pstore.init()
+        grants = AgentGrantsStore(tmp_path / "grants-accept-none.db")
+        await grants.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-accept-none")
+
+        reg = await registry.register(
+            framework="openclaw",
+            display_name="accept-none",
+            user_id="u",
+            origin="external-selfjoin",
+            handle="accept-none",
+        )
+        await registry.set_status(reg["canonical_id"], "active")
+        cid = reg["canonical_id"]
+        token = mint_registry_token(cid, priv, user_id="u", framework="openclaw")
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+        monkeypatch.setattr(client._transport.app.state, "agent_grants", grants)
+        monkeypatch.setattr(
+            client._transport.app.state, "agent_registry_keypair", (priv, pub)
+        )
+
+        original_set_decision = auth_store.set_decision
+
+        async def returning_none_for_accepted(request_id, status, *, canonical_id=None, token=None, granted_scopes=None, decided_by=""):
+            if status == "accepted":
+                return None
+            return await original_set_decision(
+                request_id, status, canonical_id=canonical_id, token=token,
+                granted_scopes=granted_scopes, decided_by=decided_by,
+            )
+
+        monkeypatch.setattr(auth_store, "set_decision", returning_none_for_accepted)
+
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "accept-none",
+                "framework": "openclaw",
+                "kind": "project_create",
+                "requested_name": "Accept None Project",
+                "requested_slug": "accept-none-project",
+                "purpose": "test",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        request_id = resp.json()["request_id"]
+        decision_id = resp.json()["decision_id"]
+
+        resp = await client.post(
+            f"/api/decisions/{decision_id}/answer",
+            json={"value": "approve"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        project = await pstore.get_project_by_slug("accept-none-project")
+        assert project is None or project.get("status") == "deleted", (
+            f"project should be deleted after failed acceptance: {project}"
+        )
+
+        agent_grants = await grants.list_grants(cid)
+        has_project_tasks_grant = any(
+            g.get("scope") == "project_tasks" and (
+                (project and g.get("project_id") == project["id"]) or
+                (not project and g.get("project_id") is None)
+            )
+            for g in agent_grants
+        )
+        assert not has_project_tasks_grant, (
+            f"project_tasks grant must not exist after failed acceptance: {agent_grants}"
+        )
 
         await registry.close()
         await auth_store.close()

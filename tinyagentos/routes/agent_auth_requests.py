@@ -269,7 +269,26 @@ async def _resolve_agent_identity(request: Request, identity_claim: str, *, stri
             raise
         cid = None
     if cid:
+        if strict and identity_claim:
+            registry = getattr(request.app.state, "agent_registry", None)
+            if registry is not None:
+                record = await registry.get(cid)
+                if record:
+                    expected_handle = agent_slug_or_fallback(
+                        identity_claim.strip().removeprefix("@").strip() or identity_claim
+                    )
+                    token_handle = agent_slug_or_fallback(
+                        record.get("handle", "").strip().removeprefix("@").strip() or record.get("handle", "")
+                    )
+                    if token_handle != expected_handle:
+                        raise HTTPException(status_code=403, detail="identity_claim does not match token subject")
         return cid
+
+    if strict:
+        raise HTTPException(
+            status_code=401,
+            detail="unauthenticated: provide a valid registry token or a registered identity_claim",
+        )
 
     registry = getattr(request.app.state, "agent_registry", None)
     if registry is not None:
@@ -279,12 +298,6 @@ async def _resolve_agent_identity(request: Request, identity_claim: str, *, stri
         existing = await registry.get_by_handle(handle, status=None)
         if existing is not None:
             return existing["canonical_id"]
-
-    if strict:
-        raise HTTPException(
-            status_code=401,
-            detail="unauthenticated: provide a valid registry token or a registered identity_claim",
-        )
     return identity_claim
 
 

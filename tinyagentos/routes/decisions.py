@@ -1178,7 +1178,7 @@ async def _apply_project_create_grant(request: Request, decision: dict, value) -
             return False
 
         try:
-            await auth_store.set_decision(
+            accepted = await auth_store.set_decision(
                 auth_request_id,
                 "accepted",
                 canonical_id=from_agent,
@@ -1190,6 +1190,28 @@ async def _apply_project_create_grant(request: Request, decision: dict, value) -
                 "project_create acceptance failed for decision %s",
                 decision.get("id"), exc_info=True,
             )
+            accepted = None
+
+        if not accepted:
+            try:
+                await pstore.set_status(project["id"], "deleted")
+            except Exception:
+                logger.warning(
+                    "project_create project cleanup failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            grants_store = getattr(request.app.state, "agent_grants", None)
+            if grants_store is not None:
+                try:
+                    await grants_store.revoke_grant(
+                        from_agent, "project_tasks", project_id=project["id"]
+                    )
+                except Exception:
+                    logger.warning(
+                        "project_create grant revoke failed for decision %s",
+                        decision.get("id"), exc_info=True,
+                    )
+            return False
     else:
         try:
             await auth_store.set_decision(
