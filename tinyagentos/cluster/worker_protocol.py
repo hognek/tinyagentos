@@ -77,6 +77,10 @@ class WorkerInfo:
     # last actual VRAM report, so a vram-less heartbeat does not cause live
     # leases to drop out of already_held.
     last_vram_report_at: float = 0.0
+    # Wall-clock timestamp when the sampled VRAM was taken (worker-monotonic).
+    # Used by claim_lease to count leases granted during heartbeat transit.
+    # None = unknown (legacy workers, or receipts without age).
+    vram_sampled_at: float | None = None
 
 
 @dataclass

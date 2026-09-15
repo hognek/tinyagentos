@@ -356,6 +356,57 @@ class TestClusterManager:
         )
         assert lease_c is None
 
+    async def test_lease_granted_during_heartbeat_transit_is_still_counted(self):
+        """Lease granted during heartbeat transit must still be counted.
+        
+        This reproduces the H1 race window where a lease granted at t1 (sample time)
+        is not counted in already_held because worker.last_vram_report_at is stamped
+        when the CONTROLLER receives the heartbeat at t2 > t1.
+        
+        Steps:
+        1. Worker samples free_vram_mb=8192 at t0 and sends heartbeat.
+        2. Controller grants lease A at t1 > t0, before heartbeat lands.
+        3. Heartbeat arrives at t2 > t1: free_vram_mb=8192 (pre-lease sample), last_vram_report_at=t2.
+        4. Next claim: lease A has granted_at=t1 < t2, so NOT counted; effective_free=8192; 
+           a second 8192 MB lease is admitted on VRAM lease A still reserves.
+        """
+        mgr = ClusterManager()
+        await mgr.register_worker(_make_worker("gpu-box", url="http://gpu-box:9000"))
+        worker = mgr.get_worker("gpu-box")
+        worker.resources = ["gpu-cuda-0", "gpu-cuda-1"]
+        assert mgr.heartbeat("gpu-box", free_vram_mb=8192) is True
+
+        lease_a = await mgr.claim_lease(
+            resource_id="gpu-box:gpu-cuda-0",
+            caller="a",
+            ttl_seconds=300,
+            required_vram_mb=8192,
+        )
+        assert lease_a is not None
+
+        # Simulate late-arriving pre-lease sample heartbeat
+        # With the fix, we can pass vram_sampled_age_ms to use sample time
+        # instead of receipt time, so lease A IS counted in already_held
+        # This test should now PASS with the fix
+        await asyncio.sleep(0.01)
+        # Pass vram_sampled_age_ms that corresponds to the sample time before lease_a was granted
+        # This simulates the worker sending the age in the heartbeat
+        # If the sample was taken at t0 and arrives at t2, age = (t2 - t0) * 1000
+        # We want last_vram_report_at to be t0 (the sample time), so:
+        # vram_sampled_age_ms = 100 (t2 - t0 = 0.1s)
+        assert mgr.heartbeat("gpu-box", free_vram_mb=8192, vram_sampled_age_ms=100) is True
+
+        lease_b = await mgr.claim_lease(
+            resource_id="gpu-box:gpu-cuda-1",
+            caller="b",
+            ttl_seconds=300,
+            required_vram_mb=8192,
+        )
+        # Should be None because lease A is still holding VRAM
+        # With vram_sampled_age_ms=0, last_vram_report_at will be older, 
+        # so lease A WILL be counted in already_held
+        assert lease_b is None
+
 
 @pytest.mark.asyncio
 class TestTaskRouter:
@@ -816,4 +867,180 @@ class TestWorkerDrain:
 
             assert mgr._monitor_task is not None
             assert not mgr._monitor_task.done()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_route_forwards_vram_sampled_age_ms(client, app):
+    """Route forwards vram_sampled_age_ms so controller derives sample time."""
+    import hashlib
+    import hmac
+    import json as _json
+
+    def _code_hash(code: str) -> str:
+        return hashlib.sha256(code.encode()).hexdigest()
+
+    def sign_worker_request(key: bytes, name: str, method: str, path: str, body: bytes) -> dict:
+        ts = str(int(time.time()))
+        body_hash = hashlib.sha256(body).hexdigest()
+        message = f"{ts}.{method.upper()}.{path}.{body_hash}".encode()
+        sig = hmac.new(key, message, hashlib.sha256).hexdigest()
+        return {
+            "X-TAOS-Worker-Name": name,
+            "X-TAOS-Timestamp": ts,
+            "X-TAOS-Signature": sig,
+        }
+
+    await app.state.cluster_pairing.init()
+    ch = _code_hash("test-pairing-code")
+    resp = await client.post(
+        "/api/cluster/pairing/announce",
+        json={"name": "vram-age-worker", "url": "http://10.0.0.1:9000", "platform": "linux", "code_hash": ch},
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        "/api/cluster/pairing/confirm",
+        json={"name": "vram-age-worker", "code": "test-pairing-code"},
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        "/api/cluster/pairing/claim",
+        json={"name": "vram-age-worker", "code": "test-pairing-code"},
+    )
+    assert resp.status_code == 200, resp.text
+    key = bytes.fromhex(resp.json()["signing_key"])
+
+    reg_body = _json.dumps({
+        "name": "vram-age-worker",
+        "url": "http://10.0.0.1:9000",
+        "capabilities": ["chat"],
+    }).encode()
+    await client.post(
+        "/api/cluster/workers",
+        content=reg_body,
+        headers={
+            **sign_worker_request(key, "vram-age-worker", "POST", "/api/cluster/workers", reg_body),
+            "content-type": "application/json",
+        },
+    )
+
+    hb_body = _json.dumps({
+        "name": "vram-age-worker",
+        "load": 0.1,
+        "free_vram_mb": 8192,
+        "vram_sampled_age_ms": 5000,
+    }).encode()
+    before = time.time()
+    resp = await client.post(
+        "/api/cluster/heartbeat",
+        content=hb_body,
+        headers={
+            **sign_worker_request(key, "vram-age-worker", "POST", "/api/cluster/heartbeat", hb_body),
+            "content-type": "application/json",
+        },
+    )
+    after = time.time()
+    assert resp.status_code == 200
+
+    mgr = app.state.cluster_manager
+    worker = mgr.get_worker("vram-age-worker")
+    assert worker is not None
+    receipt_mid = (before + after) / 2
+    expected_sample = receipt_mid - 5.0
+    assert worker.vram_sampled_at is not None, (
+        "vram_sampled_at should be set when vram_sampled_age_ms is forwarded"
+    )
+    assert abs(worker.vram_sampled_at - expected_sample) < 1.0, (
+        f"vram_sampled_at {worker.vram_sampled_at} should be ~5s before receipt {receipt_mid}"
+    )
+    await app.state.cluster_pairing.close()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_route_rejects_negative_vram_sampled_age_ms(client, app):
+    """Negative vram_sampled_age_ms is rejected with 422 at the route."""
+    import hashlib
+    import hmac
+    import json as _json
+
+    def _code_hash(code: str) -> str:
+        return hashlib.sha256(code.encode()).hexdigest()
+
+    def sign_worker_request(key: bytes, name: str, method: str, path: str, body: bytes) -> dict:
+        ts = str(int(time.time()))
+        body_hash = hashlib.sha256(body).hexdigest()
+        message = f"{ts}.{method.upper()}.{path}.{body_hash}".encode()
+        sig = hmac.new(key, message, hashlib.sha256).hexdigest()
+        return {
+            "X-TAOS-Worker-Name": name,
+            "X-TAOS-Timestamp": ts,
+            "X-TAOS-Signature": sig,
+        }
+
+    await app.state.cluster_pairing.init()
+    ch = _code_hash("test-pairing-code-neg")
+    resp = await client.post(
+        "/api/cluster/pairing/announce",
+        json={"name": "neg-age-worker", "url": "http://10.0.0.1:9000", "platform": "linux", "code_hash": ch},
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        "/api/cluster/pairing/confirm",
+        json={"name": "neg-age-worker", "code": "test-pairing-code-neg"},
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        "/api/cluster/pairing/claim",
+        json={"name": "neg-age-worker", "code": "test-pairing-code-neg"},
+    )
+    assert resp.status_code == 200, resp.text
+    key = bytes.fromhex(resp.json()["signing_key"])
+
+    reg_body = _json.dumps({
+        "name": "neg-age-worker",
+        "url": "http://10.0.0.1:9000",
+        "capabilities": ["chat"],
+    }).encode()
+    await client.post(
+        "/api/cluster/workers",
+        content=reg_body,
+        headers={
+            **sign_worker_request(key, "neg-age-worker", "POST", "/api/cluster/workers", reg_body),
+            "content-type": "application/json",
+        },
+    )
+
+    hb_body = _json.dumps({
+        "name": "neg-age-worker",
+        "load": 0.1,
+        "free_vram_mb": 8192,
+        "vram_sampled_age_ms": -1,
+    }).encode()
+    resp = await client.post(
+        "/api/cluster/heartbeat",
+        content=hb_body,
+        headers={
+            **sign_worker_request(key, "neg-age-worker", "POST", "/api/cluster/heartbeat", hb_body),
+            "content-type": "application/json",
+        },
+    )
+    assert resp.status_code == 422, resp.text
+    await app.state.cluster_pairing.close()
+
+
+@pytest.mark.asyncio
+async def test_direct_heartbeat_negative_vram_age_does_not_move_vram_sampled_at_past_now():
+    """Direct heartbeat with negative vram_sampled_age_ms clamps to 0 and keeps vram_sampled_at <= now."""
+    mgr = ClusterManager()
+    await mgr.register_worker(_make_worker("neg-direct", url="http://neg-direct:9000"))
+    worker = mgr.get_worker("neg-direct")
+    assert worker is not None
+
+    now_before = time.time()
+    assert mgr.heartbeat("neg-direct", free_vram_mb=4096, vram_sampled_age_ms=-1000) is True
+    now_after = time.time()
+
+    assert worker.vram_sampled_at is not None
+    assert worker.vram_sampled_at <= now_after, (
+        f"vram_sampled_at {worker.vram_sampled_at} should not be in the future after negative age"
+    )
 

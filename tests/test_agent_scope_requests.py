@@ -100,7 +100,7 @@ async def test_owner_creates_and_approves_grant_on_existing_identity(
 
         resp = await client.post(
             f"/api/agents/registry/{cid}/scope-requests",
-            json={"requested_scopes": ["memory_read", "memory_write"], "reason": "need memory"},
+            json={"requested_scopes": ["a2a_send", "a2a_receive"], "reason": "need memory"},
         )
         assert resp.status_code == 200, resp.text
         req_id = resp.json()["request_id"]
@@ -109,14 +109,14 @@ async def test_owner_creates_and_approves_grant_on_existing_identity(
         # Admin narrows to a subset on approve.
         resp = await client.post(
             f"/api/agents/registry/{cid}/scope-requests/{req_id}/approve",
-            json={"granted_scopes": ["memory_read"]},
+            json={"granted_scopes": ["a2a_send"]},
         )
         assert resp.status_code == 200, resp.text
         assert resp.json()["canonical_id"] == cid
 
         # Grant landed on the EXISTING canonical_id, and NO new identity exists.
         grants = await env.grants.list_grants(cid)
-        assert {g["scope"] for g in grants} == {"memory_read"}
+        assert {g["scope"] for g in grants} == {"a2a_send"}
         assert all(g["project_id"] is None for g in grants)
         assert len(await env.registry.list_all()) == before  # no new identity
     finally:
@@ -256,7 +256,7 @@ async def test_unknown_canonical_id_404(client, monkeypatch, tmp_path):
     try:
         resp = await client.post(
             "/api/agents/registry/does-not-exist/scope-requests",
-            json={"requested_scopes": ["memory_read"]},
+            json={"requested_scopes": ["a2a_receive"]},
         )
         assert resp.status_code == 404, resp.text
     finally:
@@ -271,7 +271,7 @@ async def test_inactive_canonical_id_404(client, monkeypatch, tmp_path):
         await env.registry.revoke(cid)  # now inactive
         resp = await client.post(
             f"/api/agents/registry/{cid}/scope-requests",
-            json={"requested_scopes": ["memory_read"]},
+            json={"requested_scopes": ["a2a_receive"]},
         )
         assert resp.status_code == 404, resp.text
     finally:
@@ -297,16 +297,17 @@ async def test_requested_scope_outside_vocabulary_400(client, monkeypatch, tmp_p
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
 async def test_granted_must_be_subset_of_requested_400(client, monkeypatch, tmp_path):
     env = await _wire(client, monkeypatch, tmp_path)
     try:
         cid = await _register_active(env)
         rec = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
         resp = await client.post(
             f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/approve",
-            json={"granted_scopes": ["memory_read", "memory_write"]},
+            json={"granted_scopes": ["a2a_receive", "a2a_send"]},
         )
         assert resp.status_code == 400, resp.text
         # Nothing was granted on the rejected approval.
@@ -370,7 +371,7 @@ async def test_non_owner_cannot_approve(client, monkeypatch, tmp_path):
     try:
         cid = await _register_active(env)
         rec = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
         async with AsyncClient(
             transport=ASGITransport(app=app),
@@ -380,7 +381,7 @@ async def test_non_owner_cannot_approve(client, monkeypatch, tmp_path):
         ) as bob_client:
             resp = await bob_client.post(
                 f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/approve",
-                json={"granted_scopes": ["memory_read"]},
+                json={"granted_scopes": ["a2a_receive"]},
             )
         assert resp.status_code == 404, resp.text
         assert await env.grants.list_grants(cid) == []
@@ -397,7 +398,7 @@ async def test_agent_cannot_approve_its_own_request(client, monkeypatch, tmp_pat
     try:
         cid = await _register_active(env)
         rec = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
         token = env.agent_token(cid)
         app = client._transport.app
@@ -407,7 +408,7 @@ async def test_agent_cannot_approve_its_own_request(client, monkeypatch, tmp_pat
             resp = await bare.post(
                 f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/approve",
                 headers={"Authorization": f"Bearer {token}"},
-                json={"granted_scopes": ["memory_read"]},
+                json={"granted_scopes": ["a2a_receive"]},
             )
         # The middleware allowlist only exposes the create path to a registry JWT;
         # an agent token on /approve is NOT matched (the regex anchors at the
@@ -456,7 +457,7 @@ async def test_deny_marks_refused_and_second_deny_conflicts(client, monkeypatch,
     try:
         cid = await _register_active(env)
         rec = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
         resp = await client.post(
             f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/deny",
@@ -483,11 +484,11 @@ async def test_approve_wrong_agent_path_404(client, monkeypatch, tmp_path):
         cid_a = await _register_active(env, handle="@a", display="a")
         cid_b = await _register_active(env, handle="@b", display="b")
         rec = await env.scope_store.create(
-            canonical_id=cid_a, requested_scopes=["memory_read"]
+            canonical_id=cid_a, requested_scopes=["a2a_receive"]
         )
         resp = await client.post(
             f"/api/agents/registry/{cid_b}/scope-requests/{rec['id']}/approve",
-            json={"granted_scopes": ["memory_read"]},
+            json={"granted_scopes": ["a2a_receive"]},
         )
         assert resp.status_code == 404, resp.text
     finally:
@@ -563,7 +564,7 @@ async def test_agent_cannot_deny_its_own_request(client, monkeypatch, tmp_path):
     try:
         cid = await _register_active(env)
         rec = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
         token = env.agent_token(cid)
         app = client._transport.app
@@ -719,14 +720,14 @@ async def test_create_scope_request_non_owner_and_nonexistent_identical(
         ) as carol_client:
             resp_owner = await carol_client.post(
                 f"/api/agents/registry/{cid}/scope-requests",
-                json={"requested_scopes": ["memory_read"]},
+                json={"requested_scopes": ["a2a_receive"]},
             )
             # Same caller for the nonexistent probe: an admin would 404 on a
             # missing id too, but the contract under test is what ONE
             # unprivileged caller can distinguish.
             resp_nonexistent = await carol_client.post(
                 "/api/agents/registry/does-not-exist/scope-requests",
-                json={"requested_scopes": ["memory_read"]},
+                json={"requested_scopes": ["a2a_receive"]},
             )
 
         assert resp_owner.status_code == resp_nonexistent.status_code == 404
@@ -751,7 +752,7 @@ async def test_approve_scope_request_non_owner_and_nonexistent_identical(
     try:
         cid = await _register_active(env)  # owned by admin, not carol
         rec = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
 
         async with AsyncClient(
@@ -762,11 +763,11 @@ async def test_approve_scope_request_non_owner_and_nonexistent_identical(
         ) as carol_client:
             resp_owner = await carol_client.post(
                 f"/api/agents/registry/{cid}/scope-requests/{rec['id']}/approve",
-                json={"granted_scopes": ["memory_read"]},
+                json={"granted_scopes": ["a2a_receive"]},
             )
             resp_nonexistent = await carol_client.post(
                 "/api/agents/registry/does-not-exist/scope-requests/does-not-exist/approve",
-                json={"granted_scopes": ["memory_read"]},
+                json={"granted_scopes": ["a2a_receive"]},
             )
 
         assert resp_owner.status_code == resp_nonexistent.status_code == 404
@@ -791,7 +792,7 @@ async def test_deny_scope_request_non_owner_and_nonexistent_identical(
     try:
         cid = await _register_active(env)  # owned by admin, not carol
         rec = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
 
         async with AsyncClient(
@@ -871,7 +872,7 @@ async def test_get_scope_request_by_id(client, monkeypatch, tmp_path):
 
         resp = await client.post(
             f"/api/agents/registry/{cid}/scope-requests",
-            json={"requested_scopes": ["memory_read"], "reason": "need memory"},
+            json={"requested_scopes": ["a2a_send"], "reason": "need memory"},
         )
         assert resp.status_code == 200, resp.text
         req_id = resp.json()["request_id"]
@@ -884,7 +885,7 @@ async def test_get_scope_request_by_id(client, monkeypatch, tmp_path):
         assert body["id"] == req_id
         assert body["canonical_id"] == cid
         assert body["status"] == "pending"
-        assert body["requested_scopes"] == ["memory_read"]
+        assert body["requested_scopes"] == ["a2a_send"]
         assert body["reason"] == "need memory"
         assert body["granted_scopes"] is None
     finally:
@@ -908,7 +909,7 @@ async def test_cannot_read_another_owners_scope_request(
     try:
         cid = await _register_active(env)  # owned by admin, not carol
         rec = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
 
         async with AsyncClient(
@@ -951,7 +952,7 @@ async def test_list_scope_requests_filters_by_status(client, monkeypatch, tmp_pa
     try:
         cid = await _register_active(env)
         pending = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
         decided = await env.scope_store.create(
             canonical_id=cid, requested_scopes=["a2a_send"]
@@ -1030,7 +1031,7 @@ async def test_agent_cannot_read_another_agents_scope_requests(
         cid_a = await _register_active(env, handle="@a", display="a")
         cid_b = await _register_active(env, handle="@b", display="b")
         rec_b = await env.scope_store.create(
-            canonical_id=cid_b, requested_scopes=["memory_read"]
+            canonical_id=cid_b, requested_scopes=["a2a_receive"]
         )
         token_a = env.agent_token(cid_a)
 
@@ -1071,7 +1072,7 @@ async def test_get_scope_request_wrong_agent_path_404(client, monkeypatch, tmp_p
         cid_a = await _register_active(env, handle="@a", display="a")
         cid_b = await _register_active(env, handle="@b", display="b")
         rec = await env.scope_store.create(
-            canonical_id=cid_a, requested_scopes=["memory_read"]
+            canonical_id=cid_a, requested_scopes=["a2a_receive"]
         )
 
         resp = await client.get(
@@ -1122,7 +1123,7 @@ async def test_read_routes_do_not_leak_decided_by(client, monkeypatch, tmp_path)
     try:
         cid = await _register_active(env)
         rec = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
         decided = await env.scope_store.set_decision(
             rec["id"], "refused", decided_by=env.admin_uid
@@ -1210,7 +1211,7 @@ async def test_list_scope_requests_is_bounded_and_keeps_pending(
         cid = await _register_active(env)
         # Oldest row of all, and the only pending one.
         pending = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
         decided_ids = []
         for _ in range(5):
@@ -1253,7 +1254,7 @@ async def test_list_scope_requests_status_filter_is_case_insensitive(
     try:
         cid = await _register_active(env)
         pending = await env.scope_store.create(
-            canonical_id=cid, requested_scopes=["memory_read"]
+            canonical_id=cid, requested_scopes=["a2a_receive"]
         )
         decided = await env.scope_store.create(
             canonical_id=cid, requested_scopes=["a2a_send"]
@@ -1299,7 +1300,7 @@ async def test_list_keeps_the_oldest_pending_even_past_the_route_cap(tmp_path):
         pending_ids = []
         for _ in range(5):
             rec = await store.create(
-                canonical_id="agent-1", requested_scopes=["memory_read"]
+                canonical_id="agent-1", requested_scopes=["a2a_receive"]
             )
             pending_ids.append(rec["id"])
 
@@ -1328,7 +1329,7 @@ async def test_list_for_page_does_not_sort_the_whole_history(tmp_path, monkeypat
     try:
         for _ in range(3):
             rec = await store.create(
-                canonical_id="agent-1", requested_scopes=["memory_read"]
+                canonical_id="agent-1", requested_scopes=["a2a_receive"]
             )
             await store.set_decision(rec["id"], "refused", decided_by="u1")
         await store.create(canonical_id="agent-1", requested_scopes=["a2a_send"])
@@ -1374,7 +1375,7 @@ async def test_store_create_enforces_pending_cap_atomically(tmp_path):
             *[
                 store.create(
                     canonical_id="agent-1",
-                    requested_scopes=["memory_read"],
+                    requested_scopes=["a2a_receive"],
                     pending_cap=3,
                 )
                 for _ in range(9)

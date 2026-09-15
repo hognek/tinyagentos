@@ -124,6 +124,7 @@ jobs:
   # runs on every PR and push to catch that class of defect before merge.
   py311-import-smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
