@@ -586,11 +586,11 @@ def _detect_disk() -> DiskInfo:
                 # an rpmb partition; microSD does not. Also check the device
                 # type attribute in sysfs (MMC vs SD).
                 dtype = "sd"
-                if Path(f"/sys/block/{name}boot0").exists() or Path(f"/sys/block/{name}boot1").exists() or Path(f"/sys/block/{name}rpmb").exists():
+                if _path_exists_safe(Path(f"/sys/block/{name}boot0")) or _path_exists_safe(Path(f"/sys/block/{name}boot1")) or _path_exists_safe(Path(f"/sys/block/{name}rpmb")):
                     dtype = "emmc"
                 else:
                     type_path = Path(f"/sys/block/{name}/device/type")
-                    if type_path.exists():
+                    if _path_exists_safe(type_path):
                         try:
                             dev_type = type_path.read_text().strip().upper()
                             if dev_type == "MMC":

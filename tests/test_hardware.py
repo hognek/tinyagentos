@@ -393,3 +393,28 @@ class TestDiskTypeDetection:
 
         disk = hardware_mod._detect_disk()
         assert disk.type == "emmc"
+
+    def test_mmcblk_probe_permission_denied_falls_back_to_sd(self, monkeypatch):
+        """PermissionError on /sys/block/mmcblk0* probes falls back to sd."""
+        monkeypatch.setattr(
+            "tinyagentos.hardware._run",
+            lambda *a, **k: "mmcblk0 1 mmc\n" if "lsblk" in a[0] else "",
+        )
+        real_exists = Path.exists
+        def fake_exists(self):
+            s = str(self)
+            if s.startswith("/sys/block/mmcblk0"):
+                raise PermissionError(f"[Errno 13] Permission denied: '{s}'")
+            return real_exists(self)
+        monkeypatch.setattr(Path, "exists", fake_exists)
+
+        import shutil as sh
+        def fake_disk_usage(path):
+            class DU:
+                total = 32 * (1024**3)
+                free = 16 * (1024**3)
+            return DU()
+        monkeypatch.setattr(sh, "disk_usage", fake_disk_usage)
+
+        disk = hardware_mod._detect_disk()
+        assert disk.type == "sd"
