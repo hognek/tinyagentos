@@ -139,7 +139,7 @@ jobs:
         run: uv sync --frozen --python 3.11
 
       - name: Verify app and routes import under 3.11
-        run: uv run --no-sync python -c "import tinyagentos.app; import tinyagentos.routes; print('3.11 import ok')"
+        run: uv run --no-sync python -c "import pkgutil, importlib, tinyagentos.app, tinyagentos.routes as r; mods=[importlib.import_module(n) for _, n, _ in pkgutil.walk_packages(r.__path__, 'tinyagentos.routes.')]; print('3.11 import ok:', len(mods), 'route modules')"
 
       - name: Compile all tinyagentos modules
         run: uv run --no-sync python -m compileall -q tinyagentos
