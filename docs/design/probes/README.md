@@ -24,11 +24,14 @@ The daemon must be running before any probe executes.
 Each probe takes the apphost socket path from:
 1. `TUIUI_APPHOST_SOCK` environment variable, or
 2. First command-line argument, or
-3. Default path: `$XDG_RUNTIME_DIR/tuiui-$USER/apphost.sock` (fallback: `/tmp/tuiui-<uid>/apphost.sock`)
+3. `default_socket_path()` from `tinyagentos.tuiui_conduit` (falls back to `$XDG_RUNTIME_DIR/tuiui-$USER/apphost.sock` or `/tmp/tuiui-<uid>/apphost.sock`)
 
 ### Run all probes:
 
 ```bash
+# From the repo root
+cd docs/design/probes
+
 # Using environment variable (recommended)
 export TUIUI_APPHOST_SOCK=/run/user/$(id -u)/tuiui-$(whoami)/apphost.sock
 for p in probe{1..5}_*.py; do python3 "$p"; done
@@ -50,6 +53,7 @@ python3 probe5_scroll_viewport.py
 ## Exit Codes
 
 - `0` — Probe completed successfully (real apphost run)
+- `1` — A check FAILED
 - `2` — Could not run: no tuiui apphost at `<path>` (`<reason>`)
 
 The probe prints exactly one `could not run:` line to stdout and exits 2 if:
@@ -62,8 +66,8 @@ No simulated output is ever produced. A degraded run must fail, not narrate.
 
 ## Probe Descriptions
 
-| Probe | File | Capability Verified |
-|-------|------|---------------------|
+| Probe | File | Claim / Evidence |
+|-------|------|------------------|
 | 1 | `probe1_socket_enumerate_spawn.py` | `ListApps`, `Spawn`, `Input` over Unix socket |
 | 2 | `probe2_input_bytes_typing.py` | `Input` byte encoding (integer array, not base64) |
 | 3 | `probe3_frame_grid_readback.py` | Frame grid is ANSI-free `CellBuffer` |

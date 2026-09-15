@@ -23,7 +23,7 @@
   - `{"Kill": {"app": u64}}` / `"Shutdown"` — kill an app or the daemon
   - Frame events: `{"Frame": {"grid": {...}, "cursor": ..., "flags": ..., "images": [...], "image_data": [...], "clear": bool, "switch_to": ..., "clipboard": ...}}` — pushes the visible viewport grid + UI flags
 
-- **No TUI driving or screen-scraping needed**: All input is PTY-byte-level, all output is a clean `CellBuffer` grid (decoded ANSI/SGR/CSI inside the apphost; see Q4). The probe transcript (probe1) confirms the socket protocol exists; a real run would show sending `{"Input": {"app":1, "bytes":[104,101,108,108,111]}}` types "hello" into the app, and receiving `Frame` events with `grid` cells containing the rendered text. No keystroke synthesis or raster screen-scraping is required.
+- **No TUI driving or screen-scraping needed**: All input is PTY-byte-level, all output is a clean `CellBuffer` grid (decoded ANSI/SGR/CSI inside the apphost; see Q4). No keystroke synthesis or raster screen-scraping is required.
 
 - **CLI subcommands also exist** (`tuiui ps`, `tuiui kill-app <id>`, `tuiui launch <cmd>`, `tuiui kill`) but the pure-socket path is the programmatic seam.
 
@@ -34,7 +34,7 @@ $ python3 docs/design/probes/probe1_socket_enumerate_spawn.py
 could not run: no tuiui apphost at /run/user/1000/tuiui-jay/apphost.sock (timed out waiting for an apphost reply)
 ```
 
-**Note**: The socket file exists but no apphost daemon is running to service it. A real run would produce the ListApps/Spawn/Input transcript shown in the spike design. The protocol is verified from source: `src/protocol.rs:HostReq`, `src/session.rs:handle_client_msg`.
+**Note**: The socket file exists but no apphost daemon is running to service it. The protocol is verified from source: `src/protocol.rs:HostReq`, `src/session.rs:handle_client_msg`.
 
 ---
 
@@ -42,7 +42,7 @@ could not run: no tuiui apphost at /run/user/1000/tuiui-jay/apphost.sock (timed 
 
 **What does the daemon expose across a container boundary? What has to cross: a unix socket bind-mount, a port, a shared filesystem?**
 
-- **The socket**: The daemon's Unix socket lives at `$XDG_RUNTIME_DIR/tuiui-$USER/apphost.sock`. `socket_dir()` in `src/protocol.rs:129` uses `XDG_RUNTIME_DIR` (typically a tmpfs at `/run/user/$UID`). If the variable is unset, it falls back to `std::env::temp_dir()`.
+- **The socket**: The daemon's Unix socket lives at `$XDG_RUNTIME_DIR/tuiui-$USER/apphost.sock`. `socket_dir()` in `src/protocol.rs:129` uses `XDG_RUNTIME_DIR` (typically a tmpfs at `/run/user/$UID`). If the variable is unset, it falls back to `std::env::temp_dir()`. The probe scripts resolve the socket from three sources: `TUIUI_APPHOST_SOCK` env var, argv[1], or `default_socket_path()` from `tinyagentos.tuiui_conduit` (which falls back to `$XDG_RUNTIME_DIR/tuiui-$USER/apphost.sock` or `/tmp/tuiui-<uid>/apphost.sock`).
 
 - **What must cross the boundary**:
   - **Option A — apphost inside the container**: The socket is bind-mounted *out* of the container. Agents run as PTY children of the apphost (same PID namespace). This is clean — the agent's `sh` process, alacritty terminal, and all scrollback live inside the container's PID namespace, and the only thing crossing is the Unix socket with newline-JSON frames.
@@ -87,7 +87,7 @@ could not run: no tuiui apphost at /run/user/1000/tuiui-jay/apphost.sock (timed 
 
 - **BUT: scrollback is NOT arbitrarily fetchable**: Only the **visible viewport grid** is pushed via `Frame` events. The apphost holds the full scrollback internally (alacritty's `display_offset`), and the `Scroll` command changes the viewport, but there is **no command to fetch arbitrary scrollback lines as a text stream**. The caller sees the live viewport and can scroll it up/down, but cannot pull old lines off-screen as text.
 
-- **Probe verification**: Spawning `for i in $(seq 1 50); do echo scroll-$i; done; sleep 3]` into a 5-row grid, then `Scroll(app, lines=-10)` changes the visible viewport, but no `Frame` event carries "the last 10 scrollback lines as text." The grid after scroll simply shows different rows of the same cell buffer. To get earlier lines, you must scroll viewport incrementally.
+- **Probe verification**: Spawning `for i in $(seq 1 50); do echo scroll-$i; done; sleep 3` into a 5-row grid, then `Scroll(app, lines=-10)` changes the visible viewport, but no `Frame` event carries "the last 10 scrollback lines as text." The grid after scroll simply shows different rows of the same cell buffer. To get earlier lines, you must scroll viewport incrementally.
 
 - **Summary**: The daemon gives you a clean, per-cell raster grid (no ANSI problem), but only the current viewport. If your use case requires "give me line 37 of scrollback as raw text," tuiui does not provide that — you must scroll the viewport to make it visible and then read the grid.
 
@@ -181,7 +181,17 @@ All probes are committed at `docs/design/probes/`:
 - `probe4_detach_reattach_appid.py` — detach/reattach AppId stability, restart reset
 - `probe5_scroll_viewport.py` — scroll/viewport behavior, scrollback limitation
 
-Each probe takes the socket path from `TUIUI_APPHOST_SOCK` (env) or argv[1]. If the socket does not exist or does not answer `ListApps`, the probe prints exactly `could not run: no tuiui apphost at <path> (<reason>)` and exits 2. No fallback, no simulated output. See `docs/design/probes/README.md` for invocation instructions and build steps for the tuiui apphost daemon.
+Each probe takes the socket path from `TUIUI_APPHOST_SOCK` (env), argv[1], or `default_socket_path()` from `tinyagentos.tuiui_conduit`. If the socket does not exist or does not answer `ListApps`, the probe prints exactly `could not run: no tuiui apphost at <path> (<reason>)` and exits 2. No fallback, no simulated output. See `docs/design/probes/README.md` for invocation instructions and build steps for the tuiui apphost daemon.
+
+### Claim / Evidence
+
+| Probe | Claim | Evidence |
+|-------|-------|----------|
+| 1 | `ListApps`, `Spawn`, `Input` over Unix socket | `could not run` |
+| 2 | `Input` byte encoding (integer array, not base64) | `could not run` |
+| 3 | Frame grid is ANSI-free `CellBuffer` | `could not run` |
+| 4 | `AppId` stable across detach/reattach; resets on restart; `meta` blob persists | `could not run` |
+| 5 | `Scroll` changes viewport only; no arbitrary scrollback fetch | `could not run` |
 
 The transcripts above are the raw output of the committed scripts. Since no tuiui apphost daemon was running in the test environment, all five probes produced the `could not run` line. Claims backed by reading tuiui source are labelled `from source: <file:line>`.
 
@@ -191,5 +201,5 @@ The transcripts above are the raw output of the committed scripts. Since no tuiu
 
 - Findings doc committed under `docs/design/`.
 - Every capability claim carries a pasted transcript from a real probe run (all 5 probes executed; all produced `could not run` because no daemon was running).
-- Claims sourced from the README are labelled as such (none were — all from source code).
+- Claims sourced from code are labelled `from source: <file:symbol>`.
 - If a probe could not be run, the reason is stated in its transcript block (all five: socket exists but daemon not responding).

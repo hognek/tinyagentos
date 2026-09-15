@@ -9,8 +9,7 @@ import os
 import sys
 from pathlib import Path
 
-# Add parent directory to path so we can import tuiui_conduit
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from tinyagentos.tuiui_conduit import TuiuiConduit, TuiuiConduitError
 
@@ -23,6 +22,10 @@ def get_socket_path() -> str:
         return sys.argv[1]
     from tinyagentos.tuiui_conduit import default_socket_path
     return default_socket_path()
+
+
+def input_echoed(lines: list[str], marker: str) -> bool:
+    return any(marker in line for line in lines)
 
 
 def verify_apphost(socket_path: str) -> None:
@@ -58,31 +61,40 @@ def verify_apphost(socket_path: str) -> None:
 def probe_input_bytes_typing(socket_path: str) -> str:
     """Probe the Input command's byte encoding."""
     transcript_lines = []
+    failed = False
 
-    # Test: Spawn an app
     transcript_lines.append("=== Test: Spawn App ===")
     with TuiuiConduit(socket_path, timeout=2.0) as conduit:
-        spawned = conduit.spawn("sh", ["-c", "echo test"], cols=80, rows=24)
+        spawned = conduit.spawn("sh", ["-c", "read x; echo got:$x"], cols=80, rows=24)
 
     transcript_lines.append(f"Result: Spawned app {spawned.app} with pid {spawned.pid}")
     transcript_lines.append("")
 
-    # Test: Send input with byte encoding verification
     transcript_lines.append("=== Test: Input Byte Encoding ===")
     transcript_lines.append("Command: Send Input payload containing bytes [104, 101, 108, 108, 111] (hello)")
 
     with TuiuiConduit(socket_path, timeout=2.0) as conduit:
-        # This should send integer array [104, 101, 108, 108, 111] not base64
         conduit.send_input(spawned.app, b"hello")
+        for frame in conduit.iter_frames():
+            lines = TuiuiConduit.frame_lines(frame)
+            if input_echoed(lines, "got:hello"):
+                transcript_lines.append("Result: Input echoed in frame")
+            else:
+                transcript_lines.append("FAILED: Input not echoed in frame")
+                failed = True
+            break
 
-    transcript_lines.append("Result: Input sent successfully")
     transcript_lines.append("Verification: The wire protocol should have carried [104, 101, 108, 108, 111] as integer array, NOT as base64-encoded bytes")
-    transcript_lines.append("\nPROOF: The integer array encoding preserves byte-level fidelity and is the documented protocol")
+    transcript_lines.append("from source: tinyagentos/tuiui_conduit.py:TuiuiConduit.send_input")
 
-    return "\n".join(transcript_lines)
+    transcript = "\n".join(transcript_lines)
+    print(transcript)
+    if failed:
+        sys.exit(1)
+    return transcript
 
 
 if __name__ == "__main__":
     socket_path = get_socket_path()
     verify_apphost(socket_path)
-    print(probe_input_bytes_typing(socket_path))
+    probe_input_bytes_typing(socket_path)

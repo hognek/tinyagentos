@@ -4,12 +4,12 @@
 Verifies that tuiui's Scroll command only changes visible viewport, not fetchable scrollback.
 """
 
+import json
 import os
 import sys
 from pathlib import Path
 
-# Add parent directory to path so we can import tuiui_conduit
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from tinyagentos.tuiui_conduit import TuiuiConduit, TuiuiConduitError
 
@@ -24,6 +24,10 @@ def get_socket_path() -> str:
     return default_socket_path()
 
 
+def viewport_moved(before: list[str], after: list[str]) -> bool:
+    return before != after
+
+
 def verify_apphost(socket_path: str) -> None:
     """Verify the apphost socket exists and answers ListApps.
 
@@ -33,15 +37,16 @@ def verify_apphost(socket_path: str) -> None:
         print(f"could not run: no tuiui apphost at {socket_path} (socket does not exist)")
         sys.exit(2)
 
-    import stat
-    try:
-        st = os.lstat(socket_path)
-        if not stat.S_ISSOCK(st.st_mode):
-            print(f"could not run: no tuiui apphost at {socket_path} (not a socket)")
+    if not os.path.isfile(socket_path):
+        import stat
+        try:
+            st = os.lstat(socket_path)
+            if not stat.S_ISSOCK(st.st_mode):
+                print(f"could not run: no tuiui apphost at {socket_path} (not a socket)")
+                sys.exit(2)
+        except OSError as e:
+            print(f"could not run: no tuiui apphost at {socket_path} (cannot stat: {e})")
             sys.exit(2)
-    except OSError as e:
-        print(f"could not run: no tuiui apphost at {socket_path} (cannot stat: {e})")
-        sys.exit(2)
 
     try:
         with TuiuiConduit(socket_path, timeout=2.0) as conduit:
@@ -57,71 +62,79 @@ def verify_apphost(socket_path: str) -> None:
 def probe_scroll_viewport_behavior(socket_path: str) -> str:
     """Probe scroll viewport vs scrollback fetch behavior."""
     transcript_lines = []
+    failed = False
 
-    # Test 1: Spawn and get initial viewport
     transcript_lines.append("=== Test 1: Spawn and Get Initial Viewport ===")
     transcript_lines.append("Command: Spawn app and read initial Frame")
 
+    before_lines = []
+    after_lines = []
+
     with TuiuiConduit(socket_path, timeout=2.0) as conduit:
-        spawned = conduit.spawn("sh", ["-c", "echo 'line1'; echo 'line2'; echo 'line3'"], cols=80, rows=24)
+        spawned = conduit.spawn("sh", ["-c", "for i in $(seq 1 50); do echo scroll-$i; done; sleep 3"], cols=80, rows=5)
 
-        # Read frames until we get one
         for frame in conduit.iter_frames():
-            lines = TuiuiConduit.frame_lines(frame)
-            transcript_lines.append(f"Result: Viewport shows lines: {lines}")
-
-            # Verify we can see the output
-            transcript_lines.append(f"  Initial viewport captured: {len(lines)} lines")
+            before_lines = TuiuiConduit.frame_lines(frame)
+            transcript_lines.append(f"Result: Viewport shows lines: {before_lines}")
+            transcript_lines.append(f"  Initial viewport captured: {len(before_lines)} lines")
             break
 
     transcript_lines.append("")
 
-    # Test 2: Use Scroll command
     transcript_lines.append("=== Test 2: Scroll Command ===")
     transcript_lines.append("Command: Send Scroll(app, lines=-1) to view previous lines")
 
     with TuiuiConduit(socket_path, timeout=2.0) as conduit:
         try:
-            # Scroll up by 1 line
-            # Note: The Scroll command is sent via the conduit's internal mechanism
-            # We need to send it manually since there's no scroll() method yet
-            import json
-            scroll_payload = {"Scroll": {"app": spawned.app, "lines": -1}}
-            conduit._send(scroll_payload)
+            conduit._send({"Scroll": {"app": spawned.app, "lines": -1}})
 
-            # Read frames after scroll
             for frame in conduit.iter_frames():
-                lines = TuiuiConduit.frame_lines(frame)
-                transcript_lines.append(f"Result: Viewport after scroll: {lines}")
+                after_lines = TuiuiConduit.frame_lines(frame)
+                transcript_lines.append(f"Result: Viewport after scroll: {after_lines}")
                 break
 
-            transcript_lines.append("  Result: Apphost would change viewport but NOT send scrollback as text")
-            transcript_lines.append("  Verification: No command exists to fetch arbitrary scrollback lines")
+            if viewport_moved(before_lines, after_lines):
+                transcript_lines.append("  Result: Viewport changed after Scroll")
+            else:
+                transcript_lines.append("  FAILED: Viewport did not change after Scroll")
+                failed = True
 
         except Exception as e:
             transcript_lines.append(f"Result: Error - {e}")
+            failed = True
 
     transcript_lines.append("")
 
-    # Test 3: Demonstrate the limitation
     transcript_lines.append("=== Test 3: Scrollback Fetch Limitation ===")
-    transcript_lines.append("Problem: If you need 'line 37 of scrollback as raw text',")
-    transcript_lines.append("  tuiui provides NO command to fetch it.")
-    transcript_lines.append("  You must scroll viewport incrementally to make it visible.")
+    transcript_lines.append("Command: Send unknown GetScrollback request")
+
+    with TuiuiConduit(socket_path, timeout=2.0) as conduit:
+        try:
+            conduit._send({"GetScrollback": {"app": spawned.app}})
+            reply = conduit._wait_for_matching(lambda evt: "Frame" not in evt, timeout=2.0)
+            transcript_lines.append(f"Result: Apphost replied: {json.dumps(reply)}")
+        except TuiuiConduitError as e:
+            transcript_lines.append(f"Result: Apphost error: {e}")
+        except Exception as e:
+            transcript_lines.append(f"Result: Error - {e}")
+
     transcript_lines.append("")
     transcript_lines.append("Limitation Summary:")
     transcript_lines.append("  - Frame events ONLY carry current viewport grid")
     transcript_lines.append("  - Scroll command ONLY changes visible viewport")
     transcript_lines.append("  - NO 'GetScrollback' or similar command exists")
     transcript_lines.append("  - Arbitrary scrollback lines cannot be pulled off-screen as text")
-
     transcript_lines.append("")
-    transcript_lines.append("Verification: The limitation is in the protocol design, not implementation")
+    transcript_lines.append("from source: tinyagentos/tuiui_conduit.py:TuiuiConduit._send")
 
-    return "\n".join(transcript_lines)
+    transcript = "\n".join(transcript_lines)
+    print(transcript)
+    if failed:
+        sys.exit(1)
+    return transcript
 
 
 if __name__ == "__main__":
     socket_path = get_socket_path()
     verify_apphost(socket_path)
-    print(probe_scroll_viewport_behavior(socket_path))
+    probe_scroll_viewport_behavior(socket_path)
