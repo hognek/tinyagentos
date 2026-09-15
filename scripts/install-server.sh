@@ -2226,7 +2226,7 @@ install_linux_systemd_system() {
     # Inject bind host/port + proxy port into the unit's Environment block.
     # ExecStart now runs `python -m tinyagentos`, which reads these (rather
     # than uvicorn CLI args), so the dual-port browser-proxy origin starts.
-    $sudo_cmd sed -i "s|^Environment=PYTHONUNBUFFERED=1|Environment=PYTHONUNBUFFERED=1\nEnvironment=TAOS_HOST=0.0.0.0\nEnvironment=TAOS_PORT=$TAOS_PORT\nEnvironment=TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT|" "$unit"
+    $sudo_cmd sed -i "s|^Environment=PYTHONUNBUFFERED=1|Environment=PYTHONUNBUFFERED=1\nEnvironment=TAOS_HOST=0.0.0.0\nEnvironment=TAOS_PORT=$TAOS_PORT\nEnvironment=TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT\nEnvironment=TAOS_SPA_DIR=$INSTALL_DIR/static/desktop|" "$unit"
     log "installed $unit (system unit, runs as 'taos')"
 
     # Install desktop-rebuild service (runs async after controller starts; taOS #807)
@@ -2293,7 +2293,7 @@ install_linux_systemd_user() {
     # Inject bind host/port + proxy port into the unit's Environment block.
     # ExecStart now runs `python -m tinyagentos`, which reads these (rather
     # than uvicorn CLI args), so the dual-port browser-proxy origin starts.
-    sed -i "s|^Environment=PYTHONUNBUFFERED=1|Environment=PYTHONUNBUFFERED=1\nEnvironment=TAOS_HOST=0.0.0.0\nEnvironment=TAOS_PORT=$TAOS_PORT\nEnvironment=TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT|" "$unit"
+    sed -i "s|^Environment=PYTHONUNBUFFERED=1|Environment=PYTHONUNBUFFERED=1\nEnvironment=TAOS_HOST=0.0.0.0\nEnvironment=TAOS_PORT=$TAOS_PORT\nEnvironment=TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT\nEnvironment=TAOS_SPA_DIR=$INSTALL_DIR/static/desktop|" "$unit"
     log "installed $unit (user unit fallback — sudo unavailable)"
 
     # Install desktop-rebuild service (runs async after controller starts; taOS #807)
@@ -2381,14 +2381,14 @@ if [ "\$(id -u)" = "0" ] && [ "\$(id -un)" != "$runuser" ]; then
     elif command -v sudo >/dev/null 2>&1; then exec sudo -u "$runuser" /bin/bash "\$0"
     elif command -v su >/dev/null 2>&1; then exec su -s /bin/bash "$runuser" -c "exec /bin/bash '\$0'"; fi
 fi
-export PYTHONUNBUFFERED=1 TAOS_HOST=0.0.0.0 TAOS_PORT=$TAOS_PORT TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT
+export PYTHONUNBUFFERED=1 TAOS_HOST=0.0.0.0 TAOS_PORT=$TAOS_PORT TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT TAOS_SPA_DIR="$INSTALL_DIR/static/desktop"
 exec "$pyenv" -m tinyagentos
 EOF
     chmod +x "$runner"
     [[ "$runuser" != "$(id -un)" ]] && chown "$runuser": "$runner" 2>/dev/null || true
 
     log "systemd is not the init here (e.g. WSL without systemd) -- starting the controller directly"
-    local launch="cd '$INSTALL_DIR'; PYTHONUNBUFFERED=1 TAOS_HOST=0.0.0.0 TAOS_PORT=$TAOS_PORT TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT nohup '$pyenv' -m tinyagentos >> '$logf' 2>&1 &"
+    local launch="cd '$INSTALL_DIR'; PYTHONUNBUFFERED=1 TAOS_HOST=0.0.0.0 TAOS_PORT=$TAOS_PORT TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT TAOS_SPA_DIR='$INSTALL_DIR/static/desktop' nohup '$pyenv' -m tinyagentos >> '$logf' 2>&1 &"
     if [[ "$runuser" != "$(id -un)" ]]; then
         # Drop to the service user without assuming sudo: minimal containers (a
         # target of this fallback) frequently run as root with no sudo binary.
@@ -2464,6 +2464,7 @@ install_macos_launchd() {
     <dict>
         <key>PYTHONUNBUFFERED</key><string>1</string>
         <key>TAOS_BROWSER_PROXY_PORT</key><string>$TAOS_BROWSER_PROXY_PORT</string>
+        <key>TAOS_SPA_DIR</key><string>$INSTALL_DIR/static/desktop</string>
     </dict>
 </dict>
 </plist>
@@ -2478,7 +2479,7 @@ EOF
 
 if [[ "$SERVICE_MODE" == "skip" ]]; then
     log "TAOS_SERVICE=skip — not installing a service unit"
-    log "run manually: cd $INSTALL_DIR && TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT ./.venv/bin/python -m tinyagentos"
+    log "run manually: cd $INSTALL_DIR && TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT TAOS_SPA_DIR='$INSTALL_DIR/static/desktop' ./.venv/bin/python -m tinyagentos"
 else
     case "$os_name" in
         Linux)  install_linux_systemd ;;

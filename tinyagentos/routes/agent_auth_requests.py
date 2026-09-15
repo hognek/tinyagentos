@@ -33,6 +33,7 @@ from aiosqlite import IntegrityError
 from tinyagentos.agent_registry_store import agent_slug_or_fallback, mint_registry_token
 from tinyagentos.auth_context import CurrentUser, current_user, require_owner_or_admin
 from tinyagentos.base_store import PendingCapExceeded
+from tinyagentos.routes.projects import _free_suggestions
 
 logger = logging.getLogger(__name__)
 
@@ -105,11 +106,15 @@ VALID_SCOPES = frozenset({
 class CreateAuthRequest(BaseModel):
     identity_claim: str
     framework: str
-    requested_scopes: list[str]
+    requested_scopes: list[str] = []
     requested_skills: Optional[list[str]] = None
     reason: str = ""
     duration_secs: Optional[int] = None
     project_id: Optional[str] = None
+    kind: str = "scope_request"
+    requested_name: Optional[str] = None
+    requested_slug: Optional[str] = None
+    purpose: str = ""
 
 
 class ApproveBody(BaseModel):
@@ -242,6 +247,201 @@ def _get_approve_lock(request: Request, request_id: str) -> asyncio.Lock:
     return locks[request_id]
 
 
+async def _resolve_agent_identity(request: Request, identity_claim: str, *, strict: bool = False) -> str:
+    """Resolve the agent's canonical_id from a Bearer token if present, otherwise
+    look it up in the registry by the slugified identity_claim, falling back to
+    the raw claim only when no matching registry row exists.
+
+    When ``strict`` is True (project_create path), an HTTPException from
+    ``check_agent_identity`` is propagated, and a missing or unresolved identity
+    raises 401 instead of returning the caller-supplied string.
+    """
+    from tinyagentos.agent_token_auth import check_agent_identity
+
+    try:
+        cid = await check_agent_identity(request)
+    except HTTPException:
+        if strict:
+            raise
+        cid = None
+    if cid:
+        if strict and identity_claim:
+            registry = getattr(request.app.state, "agent_registry", None)
+            if registry is not None:
+                record = await registry.get(cid)
+                if record:
+                    expected_handle = agent_slug_or_fallback(
+                        identity_claim.strip().removeprefix("@").strip() or identity_claim
+                    )
+                    token_handle = agent_slug_or_fallback(
+                        record.get("handle", "").strip().removeprefix("@").strip() or record.get("handle", "")
+                    )
+                    if token_handle != expected_handle:
+                        raise HTTPException(status_code=403, detail="identity_claim does not match registry handle")
+        return cid
+
+    if strict:
+        raise HTTPException(
+            status_code=401,
+            detail="unauthenticated: provide a valid registry token or a registered identity_claim",
+        )
+
+    registry = getattr(request.app.state, "agent_registry", None)
+    if registry is not None:
+        handle = agent_slug_or_fallback(
+            identity_claim.strip().removeprefix("@").strip() or identity_claim
+        )
+        existing = await registry.get_by_handle(handle, status=None)
+        if existing is not None:
+            return existing["canonical_id"]
+    return identity_claim
+
+
+async def _handle_project_create_request(
+    request: Request, body: CreateAuthRequest, store
+) -> JSONResponse:
+    """Process a kind=project_create auth request.
+
+    Checks name/slug uniqueness synchronously. A collision returns 409 with
+    suggestions and creates no auth-request row or Decision. A free slug
+    creates an auth-request record and a pending approve/deny Decision.
+    """
+    if not body.requested_slug or not body.requested_name:
+        raise HTTPException(
+            status_code=400,
+            detail="requested_name and requested_slug are required for project_create",
+        )
+
+    pstore = getattr(request.app.state, "project_store", None)
+    if pstore is None:
+        raise HTTPException(status_code=500, detail="project store unavailable")
+
+    # Check slug collision first (the primary identifier).
+    existing_slug = await pstore.get_project_by_slug(body.requested_slug)
+    if existing_slug is not None:
+        suggestions = await _free_suggestions(pstore, "slug", body.requested_slug)
+        return JSONResponse(
+            {
+                "error": f"slug already used: {body.requested_slug}",
+                "field": "slug",
+                "taken": body.requested_slug,
+                "suggestions": suggestions,
+            },
+            status_code=409,
+        )
+
+    # Check name collision.
+    existing_name = await pstore.get_project_by_name(body.requested_name)
+    if existing_name is not None:
+        suggestions = await _free_suggestions(pstore, "name", body.requested_name)
+        return JSONResponse(
+            {
+                "error": f"name already used: {body.requested_name}",
+                "field": "name",
+                "taken": body.requested_name,
+                "suggestions": suggestions,
+            },
+            status_code=409,
+        )
+
+    from_agent = await _resolve_agent_identity(request, body.identity_claim, strict=True)
+
+    admins = [u for u in request.app.state.auth.list_users() if u.get("is_admin")]
+    if not admins:
+        raise HTTPException(status_code=409, detail="no admin to receive the decision")
+    decider = admins[0]["id"]
+
+    decision_store = request.app.state.decision_store
+
+    record = None
+    try:
+        record = await store.create(
+            identity_claim=from_agent,
+            framework="project_create",
+            requested_scopes=[],
+            requested_skills=[],
+            reason=body.purpose or body.reason,
+            duration_secs=None,
+            project_id=None,
+            pending_cap=_PENDING_CAP,
+            kind="project_create",
+            requested_project_name=body.requested_name,
+            requested_project_slug=body.requested_slug,
+            purpose=body.purpose or body.reason,
+            cap_identity=from_agent,
+            cap_framework="project_create",
+        )
+    except PendingCapExceeded as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"too many pending requests from identity {from_agent!r} "
+                f"({exc.pending} pending; resolve existing requests first)"
+            ),
+        ) from None
+
+    try:
+        decision = await decision_store.create(
+            from_agent=from_agent,
+            question=(
+                f"Agent {from_agent} requests to create project "
+                f"'{body.requested_name}' ({body.requested_slug})"
+            ),
+            type="approve_deny",
+            options=[
+                {"label": "Approve", "value": "approve"},
+                {"label": "Deny", "value": "deny"},
+            ],
+            context=body.purpose or body.reason,
+            priority="normal",
+            project_id=None,
+            user_id=decider,
+            metadata={
+                "kind": "project_create",
+                "_server_raised": True,
+                "auth_request_id": record["id"],
+                "requested_name": body.requested_name,
+                "requested_slug": body.requested_slug,
+                "purpose": body.purpose or body.reason,
+                "from_agent": from_agent,
+            },
+        )
+    except Exception:
+        await store._db.execute(
+            "DELETE FROM auth_requests WHERE id = ?",
+            (record["id"],),
+        )
+        await store._db.commit()
+        raise
+
+    notifs = getattr(request.app.state, "notifications", None)
+    if notifs is not None:
+        try:
+            await notifs.add(
+                title="Project creation request",
+                message=(
+                    f"{from_agent} requests to create project "
+                    f"'{body.requested_name}' ({body.requested_slug})"
+                ),
+                level="info",
+                source="auth_requests",
+                data={
+                    "request_id": record["id"],
+                    "identity_claim": from_agent,
+                    "framework": body.framework,
+                    "requested_name": body.requested_name,
+                    "requested_slug": body.requested_slug,
+                    "purpose": body.purpose or body.reason,
+                },
+            )
+        except Exception:
+            pass
+
+    return JSONResponse(
+        {"request_id": record["id"], "status": "pending", "decision_id": decision["id"]}
+    )
+
+
 # ---------------------------------------------------------------------------
 # Routes — scope vocabulary (authenticated)
 # ---------------------------------------------------------------------------
@@ -279,12 +479,33 @@ async def get_scope_vocabulary(_user: CurrentUser = Depends(current_user)):
 async def create_auth_request(request: Request, body: CreateAuthRequest):
     """Submit an access request from an external agent.
 
-    No authentication required — the agent has no credentials yet.
+    No authentication required -- the agent has no credentials yet.
     Returns {request_id, status: 'pending'}.
+
+    For kind='project_create', carries requested_name, requested_slug, and
+    purpose. Slug (and name) uniqueness is checked synchronously against the
+    project store; a collision returns 409 with suggestions and creates no
+    auth-request row or Decision. A free slug creates an auth-request record
+    and a pending approve/deny Decision attributed to the requester.
     """
     store = _get_auth_requests_store(request)
 
-    # Only known scopes may be requested — reject unknown ones up front so
+    if body.kind == "project_create":
+        return await _handle_project_create_request(request, body, store)
+
+    if body.kind != "scope_request":
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown kind: {body.kind!r}; valid: scope_request, project_create",
+        )
+
+    if not body.requested_scopes:
+        raise HTTPException(
+            status_code=400,
+            detail="requested_scopes must not be empty for scope_request",
+        )
+
+    # Only known scopes may be requested -- reject unknown ones up front so
     # the admin is never shown (and can never approve) a scope the system
     # does not actually enforce.
     unknown = sorted(set(body.requested_scopes) - VALID_SCOPES)

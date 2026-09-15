@@ -666,7 +666,8 @@ async def answer_decision(
     routed_exec = await _apply_execution_grant(request, updated, stored_value)
     routed_deleg = await _apply_delegation_grant(request, updated, stored_value)
     routed_pair = await _apply_device_pairing_grant(request, updated, stored_value)
-    if not (routed_app or routed_exec or routed_deleg or routed_pair):
+    routed_project_create = await _apply_project_create_grant(request, updated, stored_value)
+    if not (routed_app or routed_exec or routed_deleg or routed_pair or routed_project_create):
         await _route_answer_to_agent(updated, stored_value, note=body.note)
     return updated
 
@@ -1071,3 +1072,180 @@ async def _apply_app_grant(request: Request, decision: dict, value) -> bool:
             app_id, decision.get("id"), exc_info=True,
         )
     return False
+
+
+async def _apply_project_create_grant(request: Request, decision: dict, value) -> bool:
+    """Side effect for a project_create Decision: on approve, create the project
+    and make the requester the lead member. On deny, mark the linked auth
+    request as refused. Best-effort: the answer is already persisted, so a
+    project-store hiccup must not fail the answer. Returns True when the
+    decision was a project_create one so the caller skips the generic agent
+    reply routing."""
+    meta = decision.get("metadata") or {}
+    if meta.get(SERVER_RAISED_KEY) is not True:
+        logger.warning(
+            "project_create decision %s refused: missing server provenance",
+            decision.get("id"),
+        )
+        return False
+    if meta.get("kind") != "project_create":
+        return False
+
+    auth_request_id = meta.get("auth_request_id")
+    if not auth_request_id:
+        return False
+
+    auth_store = getattr(request.app.state, "auth_requests", None)
+    if auth_store is None:
+        return False
+
+    auth_record = await auth_store.get(auth_request_id)
+    if auth_record is None or auth_record.get("status") != "pending":
+        return False
+
+    approved = value == "approve"
+
+    if approved:
+        pstore = getattr(request.app.state, "project_store", None)
+        if pstore is None:
+            logger.warning("project_create: project_store missing for decision %s", decision.get("id"))
+            return False
+
+        requested_name = meta.get("requested_name", "")
+        requested_slug = meta.get("requested_slug", "")
+        from_agent = meta.get("from_agent", "")
+
+        project = None
+        try:
+            project = await pstore.create_project_with_lead(
+                name=requested_name,
+                slug=requested_slug,
+                created_by=from_agent,
+                member_id=from_agent,
+                user_id=decision.get("user_id") or "",
+            )
+        except Exception:
+            logger.warning(
+                "project_create project creation failed for decision %s",
+                decision.get("id"), exc_info=True,
+            )
+            try:
+                await auth_store.set_decision(
+                    auth_request_id,
+                    "refused",
+                    decided_by=decision.get("user_id") or "",
+                )
+            except Exception:
+                logger.warning(
+                    "project_create refusal after project failure failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            await _route_answer_to_agent(
+                decision,
+                f"project creation failed - auth request {auth_request_id} refused",
+            )
+            return True
+
+        granted = False
+        try:
+            grants_store = getattr(request.app.state, "agent_grants", None)
+            if grants_store is not None:
+                await grants_store.add_grant(
+                    from_agent, "project_tasks", tier="once", project_id=project["id"]
+                )
+            granted = True
+        except Exception:
+            logger.warning(
+                "project_create grant write failed for decision %s",
+                decision.get("id"), exc_info=True,
+            )
+
+        if not granted:
+            try:
+                await pstore.set_status(project["id"], "deleted")
+            except Exception:
+                logger.warning(
+                    "project_create project cleanup failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            try:
+                await auth_store.set_decision(
+                    auth_request_id,
+                    "refused",
+                    decided_by=decision.get("user_id") or "",
+                )
+            except Exception:
+                logger.warning(
+                    "project_create refusal after grant failure failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            await _route_answer_to_agent(
+                decision,
+                f"project creation approved, but saving the grant failed - auth request {auth_request_id} refused",
+            )
+            return True
+
+        try:
+            accepted = await auth_store.set_decision(
+                auth_request_id,
+                "accepted",
+                canonical_id=from_agent,
+                granted_scopes=["project_tasks"],
+                decided_by=decision.get("user_id") or "",
+            )
+        except Exception:
+            logger.warning(
+                "project_create acceptance failed for decision %s",
+                decision.get("id"), exc_info=True,
+            )
+            accepted = None
+
+        if not accepted:
+            try:
+                await pstore.set_status(project["id"], "deleted")
+            except Exception:
+                logger.warning(
+                    "project_create project cleanup failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            grants_store = getattr(request.app.state, "agent_grants", None)
+            if grants_store is not None:
+                try:
+                    await grants_store.revoke_grant(
+                        from_agent, "project_tasks", project_id=project["id"]
+                    )
+                except Exception:
+                    logger.warning(
+                        "project_create grant revoke failed for decision %s",
+                        decision.get("id"), exc_info=True,
+                    )
+            try:
+                await auth_store.set_decision(
+                    auth_request_id,
+                    "refused",
+                    decided_by=decision.get("user_id") or "",
+                )
+            except Exception:
+                logger.warning(
+                    "project_create refusal after acceptance failure failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            await _route_answer_to_agent(
+                decision,
+                f"project creation approved, but acceptance failed - auth request {auth_request_id} refused",
+            )
+            return True
+    else:
+        try:
+            await auth_store.set_decision(
+                auth_request_id,
+                "refused",
+                decided_by=decision.get("user_id") or "",
+            )
+        except Exception:
+            logger.warning(
+                "project_create refusal failed for decision %s",
+                decision.get("id"), exc_info=True,
+            )
+
+    return True

@@ -121,7 +121,7 @@ A non-test change under `tinyagentos/` or `desktop/src/` requires a `changelog.d
 
 Every PR targeting `dev` or `master` must clear the following before merge:
 
-- CI green: `test (3.12)`, `test (3.13)`, `spa-build`, `lint`, `doc-gate`, `shards (3.12, 1-4)`, `shards (3.13, 1-4)`, `bot-review-gate` all passing.
+- CI green: `test (3.11)`, `test (3.12)`, `test (3.13)`, `spa-build`, `lint`, `doc-gate`, `shards (3.12, 1-4)`, `shards (3.13, 1-4)`, `bot-review-gate` all passing.
 - Human review: at least one project lead has approved.
 - `bot-review-gate` is required, so it blocks on its own.
 

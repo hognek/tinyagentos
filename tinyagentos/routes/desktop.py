@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from fastapi import APIRouter, Request
 from fastapi.responses import FileResponse, JSONResponse
-from pathlib import Path
 
 router = APIRouter()
 
-PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
-SPA_DIR = PROJECT_DIR / "static" / "desktop"
+
+_PROJECT_DIR = Path(__file__).resolve().parent.parent.parent
+
+SPA_DIR = Path(os.environ.get("TAOS_SPA_DIR") or (_PROJECT_DIR / "static" / "desktop")).resolve()
 
 
 @router.get("/api/desktop/settings")
@@ -206,8 +209,8 @@ async def serve_spa_root():
     if index.exists():
         return FileResponse(index, media_type="text/html", headers=_HTML_NO_CACHE)
     if SPA_DIR.is_dir():
-        return JSONResponse({"error": "Desktop shell not built — run: cd desktop && npm run build"}, status_code=404)
-    return JSONResponse({"error": "Desktop shell not installed (static/desktop missing; not built or staged on this install)"}, status_code=404)
+        return JSONResponse({"error": "Desktop shell not built — run: cd desktop && npm run build, or set TAOS_SPA_DIR to the built static/desktop"}, status_code=404)
+    return JSONResponse({"error": "Desktop shell not installed (static/desktop missing; not built or staged on this install — set TAOS_SPA_DIR to point at the built static/desktop)"}, status_code=404)
 
 
 @router.get("/desktop/{rest:path}")
@@ -232,5 +235,5 @@ async def serve_spa(rest: str = ""):
     if index.exists():
         return FileResponse(index, media_type="text/html", headers=_HTML_NO_CACHE)
     if SPA_DIR.is_dir():
-        return JSONResponse({"error": "Desktop shell not built — run: cd desktop && npm run build"}, status_code=404)
-    return JSONResponse({"error": "Desktop shell not installed (static/desktop missing; not built or staged on this install)"}, status_code=404)
+        return JSONResponse({"error": "Desktop shell not built — run: cd desktop && npm run build, or set TAOS_SPA_DIR to the built static/desktop"}, status_code=404)
+    return JSONResponse({"error": "Desktop shell not installed (static/desktop missing; not built or staged on this install — set TAOS_SPA_DIR to point at the built static/desktop)"}, status_code=404)

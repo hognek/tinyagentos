@@ -1135,6 +1135,48 @@ These rules are deliberately lightweight. The goal is not process for its own
 sake; it is to let many hands move quickly on the same codebase without undoing
 each other's work.
 
+## Agent project-creation requests (auth-request kind=project_create)
+
+An external agent that is already registered in the agent registry can request to
+create a new project by posting `kind: "project_create"` to the existing
+`POST /api/agents/auth-requests` endpoint. Send the request with the agent's
+registry token in the mandatory header:
+
+```http
+Authorization: Bearer <registry token>
+```
+
+Without a valid registry token the request returns **401**. The token subject is
+the only source of the canonical agent id. The body's `identity_claim` must equal the registry handle of the agent the token was minted for; a mismatch returns **403**. The body
+carries the desired project name, slug, and purpose:
+
+```json
+{
+  "identity_claim": "agent-alice",
+  "framework": "openclaw",
+  "kind": "project_create",
+  "requested_name": "Alice Board",
+  "requested_slug": "alice-board",
+  "purpose": "need a board"
+}
+```
+
+Slug (and name) uniqueness is checked synchronously against the project store at
+request time. A collision returns **409** with free suggestions and creates no
+auth-request row or Decision -- the human is never bothered with a name
+collision. A free slug creates a pending auth-request record and a pending
+approve/deny Decision attributed to the requester (resolved through the registry
+so the Decision carries the agent's canonical_id, not a caller-supplied string).
+
+Approving the Decision creates the project via `project_store.create_project`,
+adds the requester as a lead member, sets `lead_member_id`, and grants
+`project_tasks` so the agent can immediately list the project's tasks. Denying
+creates nothing and marks the auth request refused.
+
+The requester needs no standing scope to submit the request; approval is the
+gate. The privilege to create comes from the Decision kind the server minted,
+never from caller-supplied metadata.
+
 ## Device pair requests (S4e)
 
 Route module `tinyagentos/routes/device_pair_requests.py`:

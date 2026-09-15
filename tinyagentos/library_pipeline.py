@@ -24,14 +24,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _MIME_KIND_MAP: dict[str, str] = {
-    "text/plain": "text",
-    "text/markdown": "text",
-    "text/csv": "text",
-    "text/html": "text",
+    "application/pdf": "pdf",
     "application/json": "text",
     "application/xml": "text",
     "text/xml": "text",
-    "application/pdf": "pdf",
     "image/png": "image",
     "image/jpeg": "image",
     "image/gif": "image",
@@ -42,11 +38,21 @@ _MIME_KIND_MAP: dict[str, str] = {
     "application/x-tar": "archive",
 }
 
+_EXT_OVERRIDE_MAP: dict[str, str] = {
+    ".json": "text",
+    ".xml": "text",
+    ".log": "text",
+    ".yaml": "text", ".yml": "text", ".toml": "text",
+    ".pdf": "pdf",
+    ".png": "image", ".jpg": "image", ".jpeg": "image",
+    ".gif": "image", ".webp": "image", ".svg": "image",
+    ".zip": "archive", ".gz": "archive", ".tar": "archive",
+}
+
 
 def detect_kind(source_url: str = "", content_type: str = "",
                 file_path: str = "") -> str:
     """Detect the library item kind from URL, MIME, or file path."""
-    # URL-based detection
     if source_url:
         lower = source_url.lower()
         if any(lower.startswith(p) for p in ("https://www.youtube.com/",
@@ -60,25 +66,24 @@ def detect_kind(source_url: str = "", content_type: str = "",
         if any(lower.startswith(p) for p in ("https://", "http://")):
             return "url:web"
 
-    # MIME-based detection
     if content_type:
         ct = content_type.split(";")[0].strip().lower()
         if ct in _MIME_KIND_MAP:
             return _MIME_KIND_MAP[ct]
+        if ct.startswith("text/"):
+            return "text"
 
-    # File extension fallback
     if file_path:
         ext = Path(file_path).suffix.lower()
-        ext_map = {
-            ".txt": "text", ".md": "text", ".csv": "text",
-            ".json": "text", ".xml": "text", ".html": "text",
-            ".pdf": "pdf",
-            ".png": "image", ".jpg": "image", ".jpeg": "image",
-            ".gif": "image", ".webp": "image", ".svg": "image",
-            ".zip": "archive", ".gz": "archive", ".tar": "archive",
-        }
-        if ext in ext_map:
-            return ext_map[ext]
+        if ext in _EXT_OVERRIDE_MAP:
+            return _EXT_OVERRIDE_MAP[ext]
+        mime_type, _ = mimetypes.guess_type(file_path)
+        if mime_type:
+            if mime_type.startswith("text/"):
+                return "text"
+            kind = _MIME_KIND_MAP.get(mime_type)
+            if kind:
+                return kind
 
     return "file"
 
