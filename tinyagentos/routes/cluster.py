@@ -280,10 +280,6 @@ class HeartbeatBody(BaseModel):
     # over-admitting during heartbeat transit. If absent, keep the current
     # receipt-time behavior (old workers, backward compatibility).
     vram_sampled_age_ms: int | None = None
-    # Worker-sampled timestamp when the VRAM snapshot was taken (worker-monotonic).
-    # This is the same information as vram_sampled_age_ms but stored directly
-    # for internal use. The age field is derived from this in the worker.
-    vram_sampled_at: float | None = None
     # Registration-drift refresh (taOS #1538): workers report their live
     # host_lan_ip, url, and hardware on every heartbeat so the cluster
     # manager stays in sync with container reality. Optional so legacy
@@ -606,6 +602,7 @@ async def worker_heartbeat(request: Request, body: HeartbeatBody):
         kv_cache_quant_boundary_layer_protect=body.kv_cache_quant_boundary_layer_protect,
         free_vram_mb=body.free_vram_mb,
         used_vram_mb=body.used_vram_mb,
+        vram_sampled_age_ms=body.vram_sampled_age_ms,
         # LXC storage counters (forwarded from worker heartbeat)
         storage_cap_bytes=body.storage_cap_bytes,
         storage_used_bytes=body.storage_used_bytes,

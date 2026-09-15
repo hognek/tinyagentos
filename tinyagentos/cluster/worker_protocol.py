@@ -81,7 +81,6 @@ class WorkerInfo:
     # Used by claim_lease to count leases granted during heartbeat transit.
     # None = unknown (legacy workers, or receipts without age).
     vram_sampled_at: float | None = None
-    # field in heartbeats.
 
 
 @dataclass

@@ -868,3 +868,89 @@ class TestWorkerDrain:
             assert mgr._monitor_task is not None
             assert not mgr._monitor_task.done()
 
+
+@pytest.mark.asyncio
+async def test_heartbeat_route_forwards_vram_sampled_age_ms(client, app):
+    """Route forwards vram_sampled_age_ms so controller derives sample time."""
+    import hashlib
+    import hmac
+    import json as _json
+
+    def _code_hash(code: str) -> str:
+        return hashlib.sha256(code.encode()).hexdigest()
+
+    def sign_worker_request(key: bytes, name: str, method: str, path: str, body: bytes) -> dict:
+        ts = str(int(time.time()))
+        body_hash = hashlib.sha256(body).hexdigest()
+        message = f"{ts}.{method.upper()}.{path}.{body_hash}".encode()
+        sig = hmac.new(key, message, hashlib.sha256).hexdigest()
+        return {
+            "X-TAOS-Worker-Name": name,
+            "X-TAOS-Timestamp": ts,
+            "X-TAOS-Signature": sig,
+        }
+
+    await app.state.cluster_pairing.init()
+    ch = _code_hash("test-pairing-code")
+    resp = await client.post(
+        "/api/cluster/pairing/announce",
+        json={"name": "vram-age-worker", "url": "http://10.0.0.1:9000", "platform": "linux", "code_hash": ch},
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        "/api/cluster/pairing/confirm",
+        json={"name": "vram-age-worker", "code": "test-pairing-code"},
+    )
+    assert resp.status_code == 200, resp.text
+    resp = await client.post(
+        "/api/cluster/pairing/claim",
+        json={"name": "vram-age-worker", "code": "test-pairing-code"},
+    )
+    assert resp.status_code == 200, resp.text
+    key = bytes.fromhex(resp.json()["signing_key"])
+
+    reg_body = _json.dumps({
+        "name": "vram-age-worker",
+        "url": "http://10.0.0.1:9000",
+        "capabilities": ["chat"],
+    }).encode()
+    await client.post(
+        "/api/cluster/workers",
+        content=reg_body,
+        headers={
+            **sign_worker_request(key, "vram-age-worker", "POST", "/api/cluster/workers", reg_body),
+            "content-type": "application/json",
+        },
+    )
+
+    hb_body = _json.dumps({
+        "name": "vram-age-worker",
+        "load": 0.1,
+        "free_vram_mb": 8192,
+        "vram_sampled_age_ms": 5000,
+    }).encode()
+    before = time.time()
+    resp = await client.post(
+        "/api/cluster/heartbeat",
+        content=hb_body,
+        headers={
+            **sign_worker_request(key, "vram-age-worker", "POST", "/api/cluster/heartbeat", hb_body),
+            "content-type": "application/json",
+        },
+    )
+    after = time.time()
+    assert resp.status_code == 200
+
+    mgr = app.state.cluster_manager
+    worker = mgr.get_worker("vram-age-worker")
+    assert worker is not None
+    receipt_mid = (before + after) / 2
+    expected_sample = receipt_mid - 5.0
+    assert worker.vram_sampled_at is not None, (
+        "vram_sampled_at should be set when vram_sampled_age_ms is forwarded"
+    )
+    assert abs(worker.vram_sampled_at - expected_sample) < 1.0, (
+        f"vram_sampled_at {worker.vram_sampled_at} should be ~5s before receipt {receipt_mid}"
+    )
+    await app.state.cluster_pairing.close()
+

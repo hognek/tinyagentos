@@ -612,7 +612,6 @@ class ClusterManager:
             else:
                 worker.last_vram_report_at = time.time()
                 worker.vram_sampled_at = None
-                worker.vram_sampled_at = None
         if used_vram_mb is not None:
             worker.used_vram_mb = int(used_vram_mb)
         # Registration-drift refresh (taOS #1538): update cached host_lan_ip,
@@ -854,28 +853,32 @@ class ClusterManager:
                 )
                 return None
 
-            # Account for VRAM already held by other active leases on
-            # this worker — two concurrent claims for different resources
-            # must not both pass when their sum exceeds free_vram_mb (H1).
-            #
-            # free_vram_mb is not a pre-allocation figure: it is the
-            # latest heartbeat-reported free VRAM, so once a leased
-            # workload has allocated its VRAM that allocation is already
-            # absent from free_vram_mb.  Only count leases whose grant
-            # post-dates the last actual VRAM report (not the receipt time).
-            # If we have the sample time, compare against that; otherwise
-            # fall back to the receipt time for backward compatibility.
-            already_held = 0
-            now = time.time()
-            sample_time = getattr(worker, "vram_sampled_at", None)
-            if sample_time is None:
-                sample_time = worker.last_vram_report_at
-            for lid, lease in self._leases.items():
-                if (parsed := self._parse_resource_id(lease.resource_id)) \
-                        and parsed[0] == worker.name:
-                    if lease.expires_at > now \
-                            and lease.granted_at > sample_time:
-                        already_held += lease.required_vram_mb
+            if (
+                required_vram_mb > 0
+                and worker.free_vram_mb is not None
+            ):
+                # Account for VRAM already held by other active leases on
+                # this worker — two concurrent claims for different resources
+                # must not both pass when their sum exceeds free_vram_mb (H1).
+                #
+                # free_vram_mb is not a pre-allocation figure: it is the
+                # latest heartbeat-reported free VRAM, so once a leased
+                # workload has allocated its VRAM that allocation is already
+                # absent from free_vram_mb.  Only count leases whose grant
+                # post-dates the last actual VRAM report (not the receipt time).
+                # If we have the sample time, compare against that; otherwise
+                # fall back to the receipt time for backward compatibility.
+                already_held = 0
+                now = time.time()
+                sample_time = getattr(worker, "vram_sampled_at", None)
+                if sample_time is None:
+                    sample_time = worker.last_vram_report_at
+                for lid, lease in self._leases.items():
+                    if (parsed := self._parse_resource_id(lease.resource_id)) \
+                            and parsed[0] == worker.name:
+                        if lease.expires_at > now \
+                                and lease.granted_at > sample_time:
+                            already_held += lease.required_vram_mb
 
                 effective_free = worker.free_vram_mb - already_held
                 if required_vram_mb > effective_free:

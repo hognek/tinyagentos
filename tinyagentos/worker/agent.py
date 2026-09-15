@@ -678,7 +678,7 @@ class WorkerAgent:
                     vram_sampled_age_ms = 0
             else:
                 vram = None
-                vram_sampled_age_ms = 0
+                vram_sampled_age_ms = None
             adv_ip = os.environ.get("TAOS_ADVERTISE_IP", "").strip()
             live_url = (
                 self.advertise_url
