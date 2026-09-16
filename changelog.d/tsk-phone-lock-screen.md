@@ -6,3 +6,17 @@
   battery chips, a native round PIN keypad, and Dynamic-Island style agent pills
   fed by a new console-only `GET /auth/lock-widgets`. LAN browsers still get the
   plain login card.
+- Lock screen: the keypad is no longer always on screen. The resting screen is
+  the clock, the widgets and the agents; a home-indicator bar at the bottom
+  raises the passcode, by swipe or by tapping it.
+- Agent islands are pressable. Press-and-hold opens the agent's conversation in
+  a bottom sheet with the background blurred; an island that is waiting on a
+  decision pulses and opens an Approve/Deny sheet instead. Answering a real
+  decision still requires unlocking -- the lock screen holds no session.
+- Pinned the OS's own agent to the top of the island list, with the product mark
+  and its OMP harness badge.
+- Fixed: waking the screen with the POWER KEY left the phone lit indefinitely.
+  Powering the output on over the compositor IPC produces no input event, so
+  swayidle never saw its resume, stayed latched idle and never reached its
+  timeout again. The key handler now re-arms the idle watcher through the
+  compositor.

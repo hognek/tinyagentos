@@ -11,7 +11,12 @@ import re
 
 import pytest
 
-from tinyagentos.routes.auth import _login_page, _pin_panel_html, _setup_page
+from tinyagentos.routes.auth import (
+    _LOCK_SCREEN_SCRIPT as LOCK_SCRIPT,
+    _login_page,
+    _pin_panel_html,
+    _setup_page,
+)
 from tinyagentos.routes.onscreen_keyboard import (
     OSK_SCRIPT,
     OSK_SCRIPT_PATH,
@@ -243,6 +248,55 @@ class TestNumericLayoutForPin:
         assert not re.search(
             r"\.lockscreen\s+#pin-submit\s*\{[^}]*display:\s*none", login_console
         )
+
+    def test_keypad_is_reachable_without_a_gesture(self, login_console):
+        """The keypad is no longer always on screen, so the way to it must be a
+        real, focusable BUTTON.
+
+        The swipe is a shortcut. If the only route to the passcode were a drag,
+        anyone who cannot make that drag -- or any device where the touch layer
+        is misbehaving -- would be locked out of their own phone with the
+        keypad rendered but hidden.
+        """
+        match = re.search(r'<button[^>]*id="ls-unlock-btn"[^>]*>', login_console)
+        assert match, "no unlock button"
+        assert 'type="button"' in match.group(0)
+        assert "ls-unlock-btn" in LOCK_SCRIPT
+        assert 'unlockBtn.addEventListener("click", openPasscode)' in LOCK_SCRIPT
+
+    def test_resting_screen_hides_the_passcode_but_not_by_hiding_submit(self, login_console):
+        """The passcode is hidden as a SHEET -- the whole shell slides away --
+        rather than by hiding its controls one by one.
+
+        This is the rule the submit-visibility test protects, stated for the new
+        resting state: whatever hides the passcode must be reversible by the
+        unlock control, and #pin-submit must never be the thing being hidden.
+        """
+        assert 'setAttribute("data-sheet", "none")' in LOCK_SCRIPT
+        assert re.search(
+            r'\.lockscreen:not\(\[data-sheet="passcode"\]\)\s+\.ls-foot\s*\{[^}]*transform',
+            login_console,
+        ), "the passcode shell is not hidden by the sheet transform"
+        assert not re.search(
+            r"\.lockscreen[^{]*#pin-submit\s*\{[^}]*display:\s*none", login_console
+        )
+
+    def test_islands_are_buttons_not_a_list(self, login_console):
+        """An island opens a sheet, so it must be operable by keyboard too."""
+        assert 'el.setAttribute("role", "button")' in LOCK_SCRIPT
+        assert 'el.setAttribute("tabindex", "0")' in LOCK_SCRIPT
+        # A role="list" whose children are buttons is an invalid a11y tree.
+        assert 'id="ls-activity" role="group"' in login_console
+
+    def test_lock_chrome_does_not_select_text_like_a_browser(self, login_console):
+        """Press-and-hold is bound to the islands. Without this, chromium starts
+        a text selection on that exact gesture and raises the copy callout."""
+        assert re.search(
+            r"body\.lockscreen-on\s*\{[^}]*user-select:\s*none", login_console
+        )
+        assert re.search(
+            r"\.ls-msg,\s*\.ls-compose-input\s*\{[^}]*user-select:\s*text", login_console
+        ), "selection should still work inside the conversation"
 
     def test_lock_screen_renders_its_own_keypad(self, login_console):
         assert 'id="ls-pad"' in login_console
