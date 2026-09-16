@@ -1318,6 +1318,10 @@ export function MessagesApp({
 
   /* ---- A2A bus stream: live receipt updates ---- */
   useEffect(() => {
+    if (typeof EventSource === "undefined") {
+      console.debug("[MessagesApp] EventSource unavailable, skipping A2A bus stream");
+      return;
+    }
     const es = new EventSource("/api/a2a/bus/stream");
     es.onmessage = (ev) => {
       try {
