@@ -968,3 +968,117 @@ class TestTheHarnessCanFail:
         for panel in ("phone", "mailbox", "apps", "projects"):
             assert _keys(one, panel) == ["empty"], (panel, one[panel])
         assert _keys(one, "decisions") == [], one["decisions"]
+
+
+class TestPerAgentUsageInTheStatsPanel:
+    """Jay: "in the stats it should show live demo data for agents cpu, ram and
+    storage usage".
+
+    LIVE is the load-bearing word. The stats view polls every 3 SECONDS, so a
+    fixed table would sit there dead and read as broken rather than as demo
+    content -- which is the opposite of what he asked for.
+    """
+
+    def test_the_names_come_from_the_same_env_var_as_the_islands(self, monkeypatch):
+        """A second list would drift the first time one drop-in was edited and
+        not the other, and then the stats panel and the agent islands would
+        disagree about who is running."""
+        monkeypatch.setenv(
+            "TAOS_LOCK_DEMO_AGENTS",
+            "Personal Assistant:hermes:Drafting,Accountant:deepseek:Reconciling",
+        )
+        assert auth._demo_agent_names() == ["Personal Assistant", "Accountant"]
+
+    def test_a_repeated_name_is_not_listed_twice(self, monkeypatch):
+        monkeypatch.setenv("TAOS_LOCK_DEMO_AGENTS", "Ann:x,Ann:y,Bob:z")
+        assert auth._demo_agent_names() == ["Ann", "Bob"]
+
+    def test_no_demo_agents_means_no_usage_rather_than_zeroes(self, monkeypatch):
+        """Absent, not zero -- the rule this whole panel is built on. A row of
+        0% would be a claim that the agents are idle."""
+        monkeypatch.setenv("TAOS_LOCK_DEMO_AGENTS", "")
+        assert auth._demo_agent_usage() == []
+
+    def test_every_agent_reports_all_three_readings(self, monkeypatch):
+        monkeypatch.setenv("TAOS_LOCK_DEMO_AGENTS", "Ann:x,Bob:y,Cal:z")
+        rows = auth._demo_agent_usage()
+        assert len(rows) == 3
+        for row in rows:
+            assert row["cpu_percent"] > 0
+            assert row["ram_mb"] >= 48
+            assert row["storage_mb"] > 0
+            assert row["demo"] is True
+
+    def test_the_readings_move_between_polls(self, monkeypatch):
+        """The actual ask. Asserted by moving the CLOCK rather than sleeping,
+        so this cannot be the test that makes the suite slow."""
+        monkeypatch.setenv("TAOS_LOCK_DEMO_AGENTS", "Ann:x")
+        clock = [1_700_000_000.0]
+        monkeypatch.setattr(auth.time, "time", lambda: clock[0])
+        first = auth._demo_agent_usage()[0]
+        clock[0] += 30
+        second = auth._demo_agent_usage()[0]
+        assert first["cpu_percent"] != second["cpu_percent"], (first, second)
+        assert first["ram_mb"] != second["ram_mb"], (first, second)
+
+    def test_storage_only_ever_grows(self, monkeypatch):
+        """Storage that wobbles downward is a tell that the number is invented,
+        and it is the one reading here a viewer might actually reason about."""
+        monkeypatch.setenv("TAOS_LOCK_DEMO_AGENTS", "Ann:x")
+        clock = [1_700_000_000.0]
+        monkeypatch.setattr(auth.time, "time", lambda: clock[0])
+        seen = []
+        for _ in range(8):
+            seen.append(auth._demo_agent_usage()[0]["storage_mb"])
+            clock[0] += 600
+        assert seen == sorted(seen), seen
+        assert seen[-1] > seen[0], seen
+
+    def test_a_baseline_is_stable_for_a_given_name(self, monkeypatch):
+        """Derived from a CRC of the NAME, not from a random seed: an agent
+        showing 6% now and 21% after a controller bounce reads as a different
+        agent. Same clock, so only the baseline is in play."""
+        clock = [1_700_000_000.0]
+        monkeypatch.setattr(auth.time, "time", lambda: clock[0])
+        monkeypatch.setenv("TAOS_LOCK_DEMO_AGENTS", "Accountant:x")
+        first = auth._demo_agent_usage()[0]
+        monkeypatch.setenv("TAOS_LOCK_DEMO_AGENTS", "Accountant:x")
+        again = auth._demo_agent_usage()[0]
+        assert first["ram_mb"] == again["ram_mb"]
+        assert first["storage_mb"] == again["storage_mb"]
+
+    def test_different_agents_get_different_baselines(self, monkeypatch):
+        """Otherwise six identical rows, which reads as a rendering bug."""
+        monkeypatch.setenv("TAOS_LOCK_DEMO_AGENTS", "Ann:x,Bob:y,Cal:z,Dee:w")
+        rams = [r["ram_mb"] for r in auth._demo_agent_usage()]
+        assert len(set(rams)) == len(rams), rams
+
+    def test_the_agents_cannot_add_up_to_an_impossible_machine(self, monkeypatch):
+        """Six agents at an unbounded baseline would happily report a phone
+        that is 300% busy, next to a REAL cpu_percent from /proc/stat."""
+        monkeypatch.setenv(
+            "TAOS_LOCK_DEMO_AGENTS",
+            ",".join("Agent%d:f:s" % i for i in range(12)),
+        )
+        total = sum(r["cpu_percent"] for r in auth._demo_agent_usage())
+        assert total <= 82.5, total
+
+    def test_the_payload_key_is_absent_when_demo_is_off(self, monkeypatch):
+        """"No agents running" and "nothing is measuring agents" are different
+        answers, and this endpoint draws that distinction for every hardware
+        reading already."""
+        monkeypatch.delenv("TAOS_LOCK_DEMO_AGENTS", raising=False)
+        assert auth._demo_enabled() is False
+        assert auth._demo_agent_usage() == []
+
+    def test_the_stats_painter_draws_a_bar_only_for_cpu(self):
+        """RAM and storage have no ceiling to draw against, and a bar against
+        an invented maximum is worse than no bar."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index('partOf(statsEl, "agents"')
+        block = js[start:start + 1600]
+        assert "ag.cpu_percent" in block
+        # The value line carries all three readings as text...
+        assert "ram_mb" in block and "storage_mb" in block
+        # ...but only cpu_percent is passed as the percentage argument.
+        assert "statRow(acard" in block

@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import math
+import random
 import socket
 from pathlib import Path
 import logging
 import os
 import threading
 import time
+import zlib
 from collections import OrderedDict
 from datetime import datetime, timedelta
 
@@ -2642,7 +2645,6 @@ _LOCK_SCREEN_SCRIPT = r"""
       // the CPU reading is a DELTA -- polling it while hidden would hand the
       // stats view a first sample taken minutes ago.
       if (key === "stats") startStats(); else stopStats();
-      if (key !== "agents" && key !== "alerts" && key !== "stats") renderPlaceholder(key);
     }
 
     // -----------------------------------------------------------------------
@@ -2800,6 +2802,41 @@ _LOCK_SCREEN_SCRIPT = r"""
       // With no DSPs the chips and their caption are simply absent from
       // `parts`, and placeInOrder takes them out.
 
+      // PER-AGENT CPU / RAM / STORAGE. Jay: "in the stats it should show live
+      // demo data for agents cpu, ram and storage usage".
+      //
+      // Its own card, below the hardware one, because these are a different
+      // KIND of reading: the card above is the device, this is what is running
+      // on it. Reconciled by agent name like everything else here, which
+      // matters more than usual at a 3s poll -- a rebuilt row every three
+      // seconds is the flicker bug with numbers in it.
+      if (d.agents && d.agents.length) {
+        var acard = partOf(statsEl, "agents", "ls-stat-card");
+        var arows = [statNote(acard, "agents-head", "Agents")];
+        for (var a = 0; a < d.agents.length; a++) {
+          var ag = d.agents[a];
+          var nm = ag.name || "agent";
+          // One row per agent, all three readings on it: three rows per agent
+          // would push a six-agent phone off the bottom of the panel.
+          arows.push(statRow(acard, "agent-" + nm,
+            nm,
+            ag.cpu_percent.toFixed(1) + "%  ·  "
+              + Math.round(ag.ram_mb) + " MB  ·  "
+              + (ag.storage_mb >= 1024
+                  ? (ag.storage_mb / 1024).toFixed(1) + " GB"
+                  : Math.round(ag.storage_mb) + " MB"),
+            // The bar is CPU, the only one of the three with a natural 0-100
+            // scale. RAM and storage have no ceiling to draw them against, and
+            // a bar against an invented maximum is worse than no bar.
+            ag.cpu_percent
+          ));
+        }
+        arows.push(statNote(acard, "agents-note",
+          "Demo readings. taOS does not meter per-agent usage on this device yet."));
+        placeInOrder(acard, arows);
+        parts.push(acard);
+      }
+
       // "Nobody asked" and "none loaded" are different answers.
       parts.push(statNote(statsEl, "models", d.models
         ? (d.models.length ? d.models.join(", ") : "No models loaded.")
@@ -2809,32 +2846,17 @@ _LOCK_SCREEN_SCRIPT = r"""
       syncFeedFade();
     }
 
-    // The four views that have no data source yet say so plainly, once.
-    var PLACEHOLDERS = {
-      phone: ["Phone", "Calls and dialler are not wired up on this device yet."],
-      mailbox: ["Mailbox", "No mail account is connected to this device yet."],
-      apps: ["Apps", "Installed apps will appear here."],
-      settings: ["Settings", "Unlock to change settings."]
-    };
-
-    function renderPlaceholder(key) {
-      var host = document.getElementById("ls-" + key);
-      var text = PLACEHOLDERS[key];
-      if (!host || !text || host.firstChild) return;
-      var wrap = document.createElement("div");
-      wrap.className = "ls-empty";
-      var b = document.createElement("b");
-      b.textContent = text[0];
-      var p = document.createElement("span");
-      p.textContent = text[1];
-      wrap.appendChild(b); wrap.appendChild(p);
-      host.appendChild(wrap);
-      // `hidden` on these panels means "nothing in it yet", which is true in
-      // the markup and false from here on. Leaving it set would hide the panel
-      // even while its own tab is selected.
-      host.hidden = false;
-    }
-
+    // THE PLACEHOLDER TABLE IS GONE, and so is renderPlaceholder.
+    //
+    // It listed phone / mailbox / apps / settings as "no data source yet" and
+    // said things like "Calls and dialler are not wired up on this device yet"
+    // -- over a panel that now has ten missed calls in it. It also named a
+    // `settings` panel that no longer exists, since Projects replaced it.
+    //
+    // Every view has a source now, and each panel renders its OWN empty state
+    // (paintEmpty), which is both honest and specific: "No missed calls" rather
+    // than "not wired up". A second, staler answer to the same question is
+    // worse than none.
     if (viewsEl) {
       viewsEl.addEventListener("click", function (ev) {
         var tab = ev.target.closest(".ls-view-tab");
@@ -6404,6 +6426,78 @@ def _demo_panels() -> dict:
     }
 
 
+def _demo_agent_names() -> list[str]:
+    """The demo agent labels, parsed exactly as /auth/lock-widgets parses them.
+
+    Keyed off the SAME env var rather than a second list, so the stats panel and
+    the islands can never disagree about who is running. A separate table here
+    would drift the first time Jay edited one drop-in and not the other.
+    """
+    demo = os.environ.get("TAOS_LOCK_DEMO_AGENTS", "").strip()
+    names: list[str] = []
+    for raw in demo.split(","):
+        parts = [seg.strip() for seg in raw.split(":")]
+        if parts and parts[0] and parts[0] not in names:
+            names.append(parts[0])
+    return names
+
+
+def _demo_agent_usage() -> list[dict]:
+    """Per-agent CPU / RAM / storage that MOVES between polls.
+
+    Jay asked for "live demo data for agents cpu, ram and storage usage". Live
+    is the load-bearing word: the stats view polls every 3 SECONDS, so a fixed
+    table would sit there dead and read as broken rather than as demo content.
+
+    Each agent gets a baseline derived from a CRC of its NAME, so it is stable
+    across restarts -- an agent that shows 6% now and 21% after a controller
+    bounce looks like a different agent. On top of that:
+
+      cpu     a sine drift plus small jitter. The volatile one, because it is.
+      ram     a much slower, shallower drift. Memory does not thrash.
+      storage GROWS ONLY, slowly. Storage that wobbles downward is a tell that
+              the number is invented, and it is the one reading here a viewer
+              might actually reason about.
+
+    Percentages are per-agent, not shares of the device, and the total is capped
+    so six agents cannot add up to a machine that is 300% busy.
+    """
+    names = _demo_agent_names()
+    now = time.time()
+    out: list[dict] = []
+    budget = 82.0                      # leave headroom for the system itself
+    for name in names:
+        seed = zlib.crc32(name.encode("utf-8", "replace"))
+        phase = (seed % 1000) / 1000.0 * (2 * math.pi)
+        base_cpu = 2.5 + (seed % 17)
+        base_ram = 160 + (seed % 880)
+        base_store = 35 + (seed % 420)
+
+        cpu = base_cpu * (1 + 0.5 * math.sin(now / 7.0 + phase))
+        cpu += random.uniform(-1.2, 1.2)
+        ram = base_ram * (1 + 0.05 * math.sin(now / 29.0 + phase))
+        # A day's worth of slow creep, so it moves visibly over a demo without
+        # implying the phone is filling up.
+        store = base_store + ((now % 86400) / 86400.0) * 14.0
+
+        out.append({
+            "name": name,
+            "cpu_percent": round(max(0.2, cpu), 1),
+            "ram_mb": int(max(48, ram)),
+            "storage_mb": round(store, 1),
+            # Marked at construction, like every other invented row on this
+            # screen, so nothing downstream has to deduce it.
+            "demo": True,
+        })
+
+    total = sum(a["cpu_percent"] for a in out)
+    if total > budget and total > 0:
+        scale = budget / total
+        for agent in out:
+            agent["cpu_percent"] = round(agent["cpu_percent"] * scale, 1)
+    return out
+
+
 #: Previous /proc/stat reading, so CPU can be a PERCENTAGE. A single sample of
 #: /proc/stat gives cumulative jiffies since boot; dividing those by uptime
 #: yields the average load since the phone was switched on, which on a device
@@ -6612,6 +6706,19 @@ async def lock_stats(request: Request):
     dsps = _read_dsp_states()
     if dsps:
         payload["dsps"] = dsps
+
+    # Per-agent CPU / RAM / storage. Jay: "in the stats it should show live demo
+    # data for agents cpu, ram and storage usage".
+    #
+    # DEMO ONLY, and gated on the master demo flag, because taOS does not
+    # measure per-agent resource use on this handset yet. The key is absent
+    # rather than an empty list when the flag is off -- "no agents running" and
+    # "nothing is measuring agents" are different answers, and this endpoint
+    # already draws that distinction for every hardware reading above.
+    if _demo_enabled():
+        usage = _demo_agent_usage()
+        if usage:
+            payload["agents"] = usage
 
     # Loaded models are NOT an OS reading. Measured on the handset: no ollama
     # binary and nothing listening on 11434, so there is no local runtime to
