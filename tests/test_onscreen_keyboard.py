@@ -7,6 +7,7 @@ not cost the no-JavaScript guarantee those pages are written for.
 """
 from __future__ import annotations
 
+import json
 import re
 
 import pytest
@@ -35,6 +36,70 @@ def login_console():
 def login_remote():
     """Login page as a LAN browser sees it (no PIN)."""
     return _login_page("", multi_user=False, next_url="", pin_available=False)
+
+
+#: One forecast response, trimmed to the fields the route reads.
+_FORECAST_PAYLOAD = {
+    "current": {
+        "temperature_2m": 13.4,
+        "apparent_temperature": 11.2,
+        "is_day": 1,
+        "weather_code": 3,
+        "wind_speed_10m": 9.3,
+    },
+    "daily": {"temperature_2m_max": [15.1], "temperature_2m_min": [8.7]},
+}
+
+
+def _stub_forecast(monkeypatch, payload):
+    """Replace the HTTP client the weather route uses and record what it asked.
+
+    Returns the record, so a test can assert on the OUTGOING request rather than
+    on our own constants -- the units are a property of the call, and a route
+    that quietly asked for fahrenheit would still match any string we own.
+    """
+    from tinyagentos.routes import auth as auth_mod
+
+    captured = {"calls": 0, "url": None, "params": None}
+
+    class _Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    class _Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def get(self, url, params=None):
+            captured["calls"] += 1
+            captured["url"] = url
+            captured["params"] = params
+            return _Response()
+
+    monkeypatch.setattr(auth_mod.httpx, "AsyncClient", _Client)
+    return captured
+
+
+@pytest.fixture()
+def weather_cache_reset():
+    """The weather cache is module state, so a test that leaves a reading behind
+    makes the next one pass without calling anything."""
+    from tinyagentos.routes import auth as auth_mod
+
+    auth_mod._weather_cached = None
+    auth_mod._weather_cached_at = 0.0
+    yield
+    auth_mod._weather_cached = None
+    auth_mod._weather_cached_at = 0.0
 
 
 class TestKeyboardIsPresentWhereItIsNeeded:
@@ -392,3 +457,241 @@ def test_insert_honours_maxlength():
 
     assert 'getAttribute("maxlength")' in OSK_SCRIPT
     assert "if (room <= 0) return;" in OSK_SCRIPT
+
+
+class TestLockScreenWeather:
+    """The weather row between the clock and the agent islands.
+
+    Two things make it safe rather than merely present: the page never talks to
+    the forecast host itself, and the reading is cached so a pocketed phone does
+    not call out once per wake.
+    """
+
+    def test_weather_sits_between_the_clock_and_the_islands(self, login_console):
+        """Jay asked for it there, and the order is the one the eye reads this
+        screen in: what time is it, what is it like out, what are my agents up
+        to. A row rendered after the feed would be below the fold on a phone."""
+        date_at = login_console.index('id="ls-date"')
+        weather_at = login_console.index('id="ls-weather"')
+        feed_at = login_console.index('id="ls-feed"')
+        assert date_at < weather_at < feed_at
+
+    def test_the_page_never_calls_the_forecast_host_itself(self, login_console):
+        """The lock screen paints before sign-in and on every wake. A fetch from
+        the page would announce the device to a third party each time, from a
+        surface nobody has authenticated to -- so the call belongs on the server
+        and the page may only know about its own route."""
+        assert "open-meteo" not in LOCK_SCRIPT
+        assert "open-meteo" not in login_console
+        assert 'fetch("/auth/lock-weather"' in LOCK_SCRIPT
+
+    def test_the_reading_is_fixed_to_liverpool_in_celsius_and_mph(self):
+        from tinyagentos.routes import auth as auth_mod
+
+        assert auth_mod._WEATHER_PLACE == "Liverpool"
+        # Liverpool city centre, to the precision the forecast grid can use.
+        assert round(auth_mod._WEATHER_LAT, 2) == 53.41
+        assert round(auth_mod._WEATHER_LON, 2) == -2.99
+
+    @pytest.mark.asyncio
+    async def test_the_request_asks_for_celsius_and_mph(self, monkeypatch, weather_cache_reset):
+        """Asserted on the OUTGOING request, not on a constant: the units are a
+        property of what we ask the API for, and a route that quietly asked for
+        fahrenheit would still satisfy any check of our own strings."""
+        from tinyagentos.routes import auth as auth_mod
+
+        captured = _stub_forecast(monkeypatch, _FORECAST_PAYLOAD)
+        await auth_mod._fetch_weather()
+
+        assert captured["params"]["temperature_unit"] == "celsius"
+        assert captured["params"]["wind_speed_unit"] == "mph"
+        assert captured["params"]["latitude"] == auth_mod._WEATHER_LAT
+
+    @pytest.mark.asyncio
+    async def test_a_wake_does_not_hammer_the_api(self, monkeypatch, weather_cache_reset):
+        """A phone repaints its lock screen every time it is woken. Without the
+        cache that is one forecast call per wake, for a number that moves a few
+        times a day."""
+        from tinyagentos.routes import auth as auth_mod
+
+        captured = _stub_forecast(monkeypatch, _FORECAST_PAYLOAD)
+        first = await auth_mod._weather_reading()
+        second = await auth_mod._weather_reading()
+
+        assert first == second
+        assert captured["calls"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failed_refresh_keeps_the_last_good_reading(
+        self, monkeypatch, weather_cache_reset
+    ):
+        """A handset loses its link constantly. A row that vanishes every time
+        the refresh fails reads as broken; a temperature fifteen minutes old is
+        still roughly true."""
+        from tinyagentos.routes import auth as auth_mod
+
+        _stub_forecast(monkeypatch, _FORECAST_PAYLOAD)
+        good = await auth_mod._weather_reading()
+        assert good is not None
+
+        # Expire the cache, then take the API away.
+        auth_mod._weather_cached_at = 0.0
+
+        async def _dead(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(auth_mod, "_fetch_weather", _dead)
+        assert await auth_mod._weather_reading() == good
+
+    def test_a_clear_night_is_not_drawn_as_a_sun(self):
+        from tinyagentos.routes.auth import _weather_condition
+
+        assert _weather_condition(0, True)[1] == "clear"
+        assert _weather_condition(0, False)[1] == "night"
+        # An unmapped code degrades to cloud rather than to a blank icon.
+        assert _weather_condition(4242, True)[1] == "cloud"
+
+    def test_every_icon_the_route_can_name_is_one_the_page_can_draw(self):
+        """The wording and the picture are chosen together in the route, and the
+        page owns the shapes. A code mapped to an icon the script has no path for
+        would silently render as cloud, so the two tables must agree."""
+        from tinyagentos.routes.auth import _WMO_CONDITIONS
+
+        drawn = set(re.findall(r"^\s*(\w+):\s*'<", LOCK_SCRIPT, re.MULTILINE))
+        named = {icon for _label, icon in _WMO_CONDITIONS.values()} | {"night"}
+        assert named <= drawn, f"route names icons the page cannot draw: {named - drawn}"
+
+    @pytest.mark.asyncio
+    async def test_weather_is_console_only(self, monkeypatch):
+        """Same rule as every other lock-screen route: a LAN browser gets 403."""
+        from tinyagentos.routes import auth as auth_mod
+
+        monkeypatch.setattr(auth_mod, "_request_is_console", lambda _request: False)
+        assert (await auth_mod.lock_weather(None)).status_code == 403
+
+
+class TestLockScreenNotifications:
+    """The collated notification stacks under the agent islands."""
+
+    def test_the_stack_renders_under_the_agent_islands(self, login_console):
+        """Jay asked for them underneath the islands, and that is also the only
+        order that keeps the islands -- the point of this screen -- above a pile
+        of mail."""
+        activity_at = login_console.index('id="ls-activity"')
+        notifs_at = login_console.index('id="ls-notifs"')
+        assert activity_at < notifs_at
+
+    @pytest.mark.asyncio
+    async def test_notifications_are_demo_content_or_nothing(self, monkeypatch):
+        """This screen renders BEFORE sign-in. Real mail or a real call log here
+        would hand the phone's contents to whoever picked it up, so the route
+        serves the scripted table or 404s -- there is no third branch."""
+        from tinyagentos.routes import auth as auth_mod
+
+        monkeypatch.setattr(auth_mod, "_request_is_console", lambda _request: True)
+        monkeypatch.delenv("TAOS_LOCK_DEMO_AGENTS", raising=False)
+        assert (await auth_mod.lock_notifications(None)).status_code == 404
+
+        monkeypatch.setenv("TAOS_LOCK_DEMO_AGENTS", "Demo")
+        resp = await auth_mod.lock_notifications(None)
+        assert resp.status_code == 200
+        assert json.loads(resp.body)["demo"] is True
+
+    @pytest.mark.asyncio
+    async def test_notifications_are_console_only(self, monkeypatch):
+        from tinyagentos.routes import auth as auth_mod
+
+        monkeypatch.setenv("TAOS_LOCK_DEMO_AGENTS", "Demo")
+        monkeypatch.setattr(auth_mod, "_request_is_console", lambda _request: False)
+        assert (await auth_mod.lock_notifications(None)).status_code == 403
+
+    def test_every_source_jay_asked_for_has_a_stack(self):
+        from tinyagentos.routes.auth import _demo_notifications
+
+        sources = {group["source"] for group in _demo_notifications()}
+        assert {"mail", "x", "reddit", "phone", "sms"} <= sources
+
+    def test_items_are_collated_by_source_not_listed_flat(self):
+        """The whole point of the stack: several mails are ONE pile, not three
+        banners pushing the islands off the screen."""
+        from tinyagentos.routes.auth import _demo_notifications
+
+        groups = {g["source"]: g for g in _demo_notifications()}
+        assert len(groups["mail"]["items"]) >= 3
+
+    def test_stacks_and_their_items_are_newest_first(self):
+        """A phone orders by arrival. A fixed table order would leave an
+        hours-old pile sitting above one that landed a minute ago."""
+        from tinyagentos.routes.auth import _demo_notifications
+
+        groups = _demo_notifications()
+        tops = [group["items"][0]["at"] for group in groups]
+        assert tops == sorted(tops, reverse=True)
+        for group in groups:
+            ats = [item["at"] for item in group["items"]]
+            assert ats == sorted(ats, reverse=True)
+
+    def test_a_stack_is_a_button_not_a_list(self, login_console):
+        """Pressing a stack fans it out, so it must be reachable by tab and
+        operable by Enter -- the same rule the islands already follow."""
+        assert 'el.setAttribute("role", "button")' in LOCK_SCRIPT
+        assert 'el.setAttribute("aria-expanded"' in LOCK_SCRIPT
+        assert 'id="ls-notifs" role="group"' in login_console
+
+    def test_notification_text_is_never_written_as_markup(self):
+        """Titles and bodies are content. The only innerHTML on this path is an
+        icon path from the script's own table, keyed by name."""
+        assert "title.textContent = item.title" in LOCK_SCRIPT
+        assert "text.textContent = item.text" in LOCK_SCRIPT
+        assert "innerHTML = item" not in LOCK_SCRIPT
+
+    def test_a_closed_stack_says_how_deep_it_is(self, login_console):
+        """Only two cards peek out from behind the top one however many there
+        are, so the count is the only thing that can say 'three'."""
+        assert ".ls-notif-count" in login_console
+        assert "count.textContent = group.items.length" in LOCK_SCRIPT
+
+    def test_a_repaint_does_not_fold_a_stack_the_user_opened(self):
+        """The poll rebuilds the stacks. Open state kept inside the rendered
+        node would be destroyed by that -- the pile would shut under the user's
+        finger every refresh."""
+        assert "var notifOpen = {}" in LOCK_SCRIPT
+        assert "notifOpen[group.source]" in LOCK_SCRIPT
+
+
+class TestLockScreenFeedScrollsAsOne:
+    def test_one_scroll_region_holds_both_stacks(self, login_console):
+        """The agent stack used to be the scrolling element. With a second stack
+        under it that is wrong twice: the two would scroll independently, and the
+        notifications -- outside the only scrollable box -- would push the
+        passcode off the bottom of a full screen instead of scrolling."""
+        feed = re.search(r"\.ls-feed\s*\{([^}]*)\}", login_console)
+        assert feed and "overflow-y: auto" in feed.group(1)
+        agents = re.search(r"\.ls-agents\s*\{([^}]*)\}", login_console)
+        assert agents and "overflow" not in agents.group(1), (
+            "the agent stack still scrolls on its own -- the two stacks will "
+            "slide past each other"
+        )
+
+    def test_the_scrolling_box_is_allowed_to_shrink(self, login_console):
+        """Without min-height:0 a flex item refuses to shrink below its content,
+        so a full feed grows the column and pushes the keypad off-screen instead
+        of scrolling."""
+        feed = re.search(r"\.ls-feed\s*\{([^}]*)\}", login_console)
+        assert feed and "min-height: 0" in feed.group(1)
+
+    def test_a_scrolling_feed_fades_rather_than_slicing_a_card_in_half(self, login_console):
+        """With the scrollbar hidden, a feed that simply ends mid-card reads as a
+        rendering fault instead of as more content."""
+        assert '.ls-feed[data-fade="bottom"]' in login_console
+        assert 'feedEl.setAttribute("data-fade", fade)' in LOCK_SCRIPT
+
+    def test_the_fade_is_measured_not_assumed(self, login_console):
+        """An unconditional mask eats the bottom of the last card on a device
+        with one agent and no notifications, where nothing scrolls."""
+        assert re.search(
+            r"var over = feedEl\.scrollHeight - feedEl\.clientHeight", LOCK_SCRIPT
+        )
+        # The plain .ls-feed rule must not carry a mask of its own.
+        feed = re.search(r"\.ls-feed\s*\{([^}]*)\}", login_console)
+        assert feed and "mask-image" not in feed.group(1)

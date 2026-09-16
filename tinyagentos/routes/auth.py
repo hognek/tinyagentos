@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import socket
@@ -11,6 +12,7 @@ import time
 from collections import OrderedDict
 from datetime import datetime, timedelta
 
+import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from tinyagentos.auth import (
@@ -329,6 +331,42 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
   color: #fff;
 }
 .ls-date { font-size: 16px; font-weight: 500; color: rgba(255,255,255,0.62); }
+/* Weather. It sits between the clock and the agent islands because that is the
+   order the eye already reads this screen in: what time is it, what is it like
+   outside, what are my agents doing. A fixed location (Liverpool) in Celsius
+   and mph -- this device does not ask for geolocation, and a lock screen that
+   prompted for it before sign-in would be asking the wrong question of the
+   wrong person.
+
+   Everything here is fetched SERVER-SIDE by /auth/lock-weather. A fetch from
+   the page would hand the device's address to a third party on every
+   lock-screen paint, from a surface that renders before anyone has signed in. */
+.ls-weather {
+  display: flex; align-items: center; gap: 12px;
+  margin-top: 10px; padding: 0 4px;
+  transition: filter 320ms cubic-bezier(0.32, 0.72, 0, 1), opacity 320ms ease;
+}
+.lockscreen:not([data-sheet="none"]) .ls-weather { filter: blur(7px); opacity: 0.55; }
+/* No pill, no card. Up here this is a continuation of the clock -- a bordered
+   box around it would read as the first of a row of widgets and pull the eye
+   down off the time. */
+.ls-weather-icon { flex: none; width: 34px; height: 34px; color: rgba(255,255,255,0.92); }
+.ls-weather-icon svg { width: 100%; height: 100%; display: block; }
+.ls-weather-icon svg [fill="none"], .ls-weather-icon svg path, .ls-weather-icon svg circle {
+  fill: none; stroke: currentColor; stroke-width: 1.7;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.ls-weather-read { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; }
+.ls-weather-now { display: flex; align-items: baseline; gap: 9px; }
+.ls-weather-temp {
+  font-size: 26px; font-weight: 300; line-height: 1;
+  letter-spacing: -0.01em; font-variant-numeric: tabular-nums; color: #fff;
+}
+.ls-weather-label { font-size: 15px; font-weight: 500; color: rgba(255,255,255,0.74); }
+.ls-weather-sub {
+  font-size: 13px; color: rgba(255,255,255,0.52);
+  font-variant-numeric: tabular-nums;
+}
 /* Status bar. The product name and the battery are STATUS, not content: they
    belong on the top edge where a phone puts them, not stacked under the date
    competing with the clock. The device's hostname is gone -- it told the
@@ -381,15 +419,134 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
 .ls-agents {
   display: flex; flex-direction: column; align-items: center; gap: 14px;
   width: 100%; align-self: stretch;
-  /* The agent stack is the only part allowed to overflow, and it scrolls
-     without a visible bar: a scrollbar on a lock screen reads as a web page. */
+  min-height: 0;
+}
+/* THE SCROLL SEAM. The agent stack used to be the scrolling element itself.
+   With a second stack (notifications) under it that is wrong twice over: the
+   two would scroll independently -- islands sliding under a pinned pile of
+   banners -- and the notifications, being outside the only scrollable box,
+   would push the passcode sheet off the bottom of a full screen instead of
+   scrolling.
+
+   So the scroll moves up one level, to the box that holds BOTH stacks. They
+   travel together as one feed, and this is still the only part of the lock
+   screen allowed to overflow: min-height:0 keeps it shrinking rather than
+   growing the column, so the unlock bar and the passcode keep their room. */
+.ls-feed {
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  width: 100%; align-self: stretch;
   min-height: 0;
   overflow-y: auto;
+  /* A visible scrollbar on a lock screen reads as a web page. */
   scrollbar-width: none;
   -ms-overflow-style: none;
   overscroll-behavior: contain;
 }
-.ls-agents::-webkit-scrollbar { width: 0; height: 0; display: none; }
+.ls-feed::-webkit-scrollbar { width: 0; height: 0; display: none; }
+/* The cut edge. With the bar hidden, a scrolling feed ends in a card sliced
+   clean in half against the unlock bar, which reads as a rendering fault rather
+   than as more content. A fade says "this continues".
+   Applied only while the feed ACTUALLY overflows -- an unconditional mask would
+   eat the bottom of the last card on a device with one agent and no
+   notifications, where there is nothing to scroll to. */
+.ls-feed[data-fade="bottom"] {
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 34px), transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 34px), transparent 100%);
+}
+.ls-feed[data-fade="top"] {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 26px);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 26px);
+}
+.ls-feed[data-fade="both"] {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 34px), transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 34px), transparent 100%);
+}
+/* NOTIFICATIONS. Collated the way a phone does it: one stack per source, the
+   newest banner on top and the rest of that source's banners tucked behind it
+   as peeking edges. A flat list of every notification would bury the agent
+   islands under mail, and the islands are what this screen is for.
+
+   Pressing a stack fans it out in place. That is ALL a press does: this screen
+   renders before sign-in, so there is nothing here to open into. */
+.ls-notifs {
+  display: flex; flex-direction: column; align-items: center; gap: 12px;
+  width: 100%; align-self: stretch;
+}
+.ls-notif-group {
+  position: relative;
+  width: 100%; max-width: 396px;
+  animation: ls-island-in 520ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+/* Collapsed: only the newest card is in flow, so the group is exactly one card
+   tall and the ones behind it cannot change its height however long they are.
+   The padding is the gap the peeking edges show through. */
+.ls-notif-group:not([data-open="1"]) { padding-bottom: 13px; }
+.ls-notif-group:not([data-open="1"]) .ls-notif { position: relative; z-index: 2; }
+.ls-notif-group:not([data-open="1"]) .ls-notif ~ .ls-notif {
+  position: absolute; left: 0; right: 0; top: 0; height: 100%;
+  overflow: hidden; pointer-events: none;
+}
+.ls-notif-group:not([data-open="1"]) .ls-notif:nth-child(2) {
+  transform: translateY(7px) scale(0.955); opacity: 0.85; z-index: 1;
+}
+.ls-notif-group:not([data-open="1"]) .ls-notif:nth-child(3) {
+  transform: translateY(13px) scale(0.912); opacity: 0.55; z-index: 0;
+}
+/* A fourth card would peek out from under a stack that already reads as deep.
+   The count on the newest card is what says how many there really are. */
+.ls-notif-group:not([data-open="1"]) .ls-notif:nth-child(n+4) { opacity: 0; z-index: 0; }
+.ls-notif-group[data-open="1"] { display: flex; flex-direction: column; gap: 8px; }
+.ls-notif {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 10px 13px;
+  border-radius: 20px;
+  text-align: left;
+  background: rgba(30, 30, 34, 0.92);
+  box-shadow: 0 6px 18px -6px rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(24px) saturate(1.3);
+  -webkit-backdrop-filter: blur(24px) saturate(1.3);
+  transition: transform 340ms cubic-bezier(0.32, 0.72, 0, 1),
+              opacity 260ms ease;
+}
+.ls-notif-group:focus-visible { outline: 3px solid #4c9aff; outline-offset: 4px; border-radius: 22px; }
+.ls-notif-group:focus { outline: none; }
+/* The app tile. A monogram on a tinted square is the shape a phone uses for an
+   app, and it keeps every source the same size whether it has a real glyph or
+   just a letter. */
+.ls-notif-tile {
+  flex: none; width: 30px; height: 30px; border-radius: 9px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700; color: #fff;
+  background: var(--ls-n, #4c9aff);
+}
+.ls-notif-tile svg { width: 17px; height: 17px; fill: none; stroke: #fff; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.ls-notif-body { min-width: 0; flex: 1; }
+.ls-notif-meta {
+  display: flex; align-items: baseline; gap: 6px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+  color: rgba(255,255,255,0.45);
+}
+.ls-notif-app { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ls-notif-when { margin-left: auto; flex: none; text-transform: none; letter-spacing: 0; font-weight: 500; }
+.ls-notif-title {
+  margin-top: 2px;
+  font-size: 14px; font-weight: 600; color: #fff;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ls-notif-text {
+  margin-top: 1px;
+  font-size: 13px; line-height: 1.35; color: rgba(255,255,255,0.68);
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+}
+.ls-notif-group[data-open="1"] .ls-notif-text { -webkit-line-clamp: 6; }
+/* The pile count. Only meaningful while the stack is closed -- once it is fanned
+   out the cards themselves are the count. */
+.ls-notif-count {
+  flex: none; padding: 1px 7px; border-radius: 999px;
+  background: rgba(255,255,255,0.13); color: rgba(255,255,255,0.72);
+  font-size: 11px; font-weight: 600; letter-spacing: 0;
+}
+.ls-notif-group[data-open="1"] .ls-notif-count { display: none; }
 .ls-island {
   display: flex; align-items: center; gap: 10px;
   width: 100%; max-width: 396px;
@@ -845,6 +1002,8 @@ body.lockscreen-on .osk-toggle { display: none !important; }
   .ls-sheet, .ls-foot, .ls-head, .ls-unlock, .ls-scrim, .ls-island { transition: none; }
   .ls-msg { animation: none; }
   .ls-unlock-btn .ls-grabber { animation: none; }
+  .ls-notif-group { animation: none; }
+  .ls-notif { transition: none; }
   .lockscreen:not([data-sheet="none"]) .ls-head { filter: none; }
 }
 /* Landscape: the keypad and the clock sit side by side or neither fits. */
@@ -1141,9 +1300,13 @@ def _lock_head_html() -> str:
     <div class="ls-head">
       <div class="ls-time" id="ls-time" role="timer" aria-live="off">&nbsp;</div>
       <div class="ls-date" id="ls-date"></div>
-      <div class="ls-islands" id="ls-activity" role="group" aria-label="Agent activity" hidden>
-        <div class="ls-agents" id="ls-agents"></div>
-        <div class="ls-tasks" id="ls-tasks"></div>
+      <div class="ls-weather" id="ls-weather" role="group" aria-label="Weather" hidden></div>
+      <div class="ls-feed" id="ls-feed">
+        <div class="ls-islands" id="ls-activity" role="group" aria-label="Agent activity" hidden>
+          <div class="ls-agents" id="ls-agents"></div>
+          <div class="ls-tasks" id="ls-tasks"></div>
+        </div>
+        <div class="ls-notifs" id="ls-notifs" role="group" aria-label="Notifications" hidden></div>
       </div>
       {_FRAMEWORK_SPRITE}
     </div>
@@ -1460,6 +1623,7 @@ _LOCK_SCREEN_SCRIPT = r"""
         tasksEl.appendChild(more);
       }
       card.hidden = false;
+      syncFeedFade();
     }
 
     function pollActivity() {
@@ -1471,6 +1635,272 @@ _LOCK_SCREEN_SCRIPT = r"""
     if (card) {
       pollActivity();
       setInterval(pollActivity, 15000);
+    }
+
+    // -----------------------------------------------------------------------
+    // WEATHER. The reading comes from /auth/lock-weather, which does the call
+    // out to the forecast API itself. This page never talks to a third party:
+    // it renders before sign-in, and a fetch from here would announce the
+    // device to an outside host every time the screen lit up.
+    //
+    // This file knows how to DRAW eight shapes and nothing else. Which shape a
+    // given sky gets is policy and lives in the route, so the code that decides
+    // "overcast" and the code that decides which icon that is stay together.
+    // -----------------------------------------------------------------------
+    var weatherEl = document.getElementById("ls-weather");
+    var WEATHER_ICONS = {
+      clear: '<circle cx="12" cy="12" r="4.1"/><path d="M12 2.6v2.3M12 19.1v2.3M4.3 4.3l1.6 1.6M18.1 18.1l1.6 1.6M2.6 12h2.3M19.1 12h2.3M4.3 19.7l1.6-1.6M18.1 5.9l1.6-1.6"/>',
+      night: '<path d="M20.2 14.4A8.3 8.3 0 0 1 9.6 3.8a8.5 8.5 0 1 0 10.6 10.6z"/>',
+      partly: '<path d="M8 6.2V4.4M4.3 7.9L3 6.6M12.4 7.9l1.3-1.3M3.2 12.2H1.4"/><path d="M11 10.4a4 4 0 1 0-6.4 3"/><path d="M17.5 20H8.4a3.9 3.9 0 0 1-.5-7.8 5.2 5.2 0 0 1 10 1 3.4 3.4 0 0 1-.4 6.8z"/>',
+      cloud: '<path d="M17.5 19.5H8.2a4.2 4.2 0 0 1-.5-8.4 5.6 5.6 0 0 1 10.7 1.1 3.7 3.7 0 0 1-.9 7.3z"/>',
+      fog: '<path d="M17.2 14.4H8.3a3.9 3.9 0 0 1-.5-7.7 5.2 5.2 0 0 1 10 1 3.4 3.4 0 0 1-.6 6.7z"/><path d="M4.5 18h15M7 21.3h10"/>',
+      drizzle: '<path d="M17.2 14.4H8.3a3.9 3.9 0 0 1-.5-7.7 5.2 5.2 0 0 1 10 1 3.4 3.4 0 0 1-.6 6.7z"/><path d="M9 17.6l-.8 2.2M13 17.6l-.8 2.2M17 17.6l-.8 2.2"/>',
+      rain: '<path d="M17.2 13.8H8.3a3.9 3.9 0 0 1-.5-7.7 5.2 5.2 0 0 1 10 1 3.4 3.4 0 0 1-.6 6.7z"/><path d="M8.6 16.6L7 21.4M12.8 16.6l-1.6 4.8M17 16.6l-1.6 4.8"/>',
+      snow: '<path d="M17.2 13.8H8.3a3.9 3.9 0 0 1-.5-7.7 5.2 5.2 0 0 1 10 1 3.4 3.4 0 0 1-.6 6.7z"/><path d="M8.4 17.6v3.6M6.8 18.5l3.2 1.8M10 18.5l-3.2 1.8M15.6 17.6v3.6M14 18.5l3.2 1.8M17.2 18.5L14 20.3"/>',
+      storm: '<path d="M17.2 13.4H8.3a3.9 3.9 0 0 1-.5-7.7 5.2 5.2 0 0 1 10 1 3.4 3.4 0 0 1-.6 6.7z"/><path d="M13.2 15.6l-3.4 4.1h3.2l-1.3 3.1"/>'
+    };
+
+    function paintWeather(d) {
+      if (!weatherEl || !d || typeof d.temp !== "number") return;
+      weatherEl.textContent = "";
+
+      var icon = document.createElement("div");
+      icon.className = "ls-weather-icon";
+      icon.setAttribute("aria-hidden", "true");
+      // innerHTML with a path from THIS FILE's own table, selected by a key --
+      // no server string is ever parsed as markup here. Everything the route
+      // sends is written with textContent below.
+      icon.innerHTML = '<svg viewBox="0 0 24 24">'
+        + (WEATHER_ICONS[d.icon] || WEATHER_ICONS.cloud) + "</svg>";
+
+      var read = document.createElement("div");
+      read.className = "ls-weather-read";
+      var now = document.createElement("div");
+      now.className = "ls-weather-now";
+      var temp = document.createElement("span");
+      temp.className = "ls-weather-temp";
+      temp.textContent = Math.round(d.temp) + "°";
+      var label = document.createElement("span");
+      label.className = "ls-weather-label";
+      label.textContent = d.label || "";
+      now.appendChild(temp); now.appendChild(label);
+
+      var sub = document.createElement("div");
+      sub.className = "ls-weather-sub";
+      var bits = [];
+      if (typeof d.high === "number" && typeof d.low === "number") {
+        bits.push("H:" + Math.round(d.high) + "°  L:" + Math.round(d.low) + "°");
+      }
+      if (typeof d.wind === "number") bits.push(Math.round(d.wind) + " mph");
+      if (d.place) bits.push(d.place);
+      sub.textContent = bits.join("  ·  ");
+
+      read.appendChild(now); read.appendChild(sub);
+      weatherEl.appendChild(icon); weatherEl.appendChild(read);
+      // The icon is decorative, so the group carries the reading in words.
+      weatherEl.setAttribute("aria-label",
+        "Weather in " + (d.place || "") + ": " + Math.round(d.temp)
+        + " degrees celsius, " + (d.label || "") + ". " + sub.textContent);
+      weatherEl.hidden = false;
+    }
+
+    function pollWeather() {
+      fetch("/auth/lock-weather", { credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { if (d) paintWeather(d); })
+        // No error text on a lock screen: an unreachable forecast shows as no
+        // weather line at all, which is what the screen looked like before.
+        .catch(function () { /* offline: leave the row hidden */ });
+    }
+    if (weatherEl) {
+      pollWeather();
+      // The route caches for 15 minutes, so a tighter poll would only re-read
+      // the same answer. This is the interval that actually moves the number.
+      setInterval(pollWeather, 15 * 60 * 1000);
+    }
+
+    // -----------------------------------------------------------------------
+    // NOTIFICATIONS. One stack per source, collated the way a phone does it.
+    //
+    // SCRIPTED DEMO CONTENT ONLY, and the route enforces that: this screen
+    // renders before sign-in, so real mail or real messages here would be
+    // readable by whoever picked the phone up. There is no code path from this
+    // stack to a real inbox, which is why there is no gate here to get wrong.
+    // -----------------------------------------------------------------------
+    var feedEl = document.getElementById("ls-feed");
+
+    // Which edges of the feed are cut. Measured rather than assumed: whether
+    // this device's screen can hold its agents and notifications at once
+    // depends on how many of each it has and how tall the panel is.
+    function syncFeedFade() {
+      if (!feedEl) return;
+      var over = feedEl.scrollHeight - feedEl.clientHeight > 4;
+      var atTop = feedEl.scrollTop <= 2;
+      var atEnd = feedEl.scrollTop + feedEl.clientHeight >= feedEl.scrollHeight - 2;
+      var fade = "none";
+      if (over) fade = atTop ? "bottom" : (atEnd ? "top" : "both");
+      feedEl.setAttribute("data-fade", fade);
+    }
+    if (feedEl) {
+      feedEl.addEventListener("scroll", syncFeedFade, { passive: true });
+      window.addEventListener("resize", syncFeedFade);
+      syncFeedFade();
+    }
+
+    var notifsEl = document.getElementById("ls-notifs");
+    var NOTIF_GLYPHS = {
+      mail: '<path d="M3 6.5h18v11H3z"/><path d="M3.4 7l8.6 6 8.6-6"/>',
+      phone: '<path d="M6.2 3.5l2.4 4-1.9 2a11 11 0 0 0 5.8 5.8l2-1.9 4 2.4v3.1a1.7 1.7 0 0 1-1.9 1.7A16.5 16.5 0 0 1 3.4 5.4 1.7 1.7 0 0 1 5.1 3.5z"/>',
+      sms: '<path d="M4 4.5h16v11H8.5L4 19z"/><path d="M8 8.6h8M8 11.6h5"/>'
+    };
+
+    // Which stacks the user has fanned out, kept OUTSIDE the paint so a repaint
+    // does not fold the pile the user just opened.
+    var notifOpen = {};
+    // Every rendered time label, so the minutes can tick without rebuilding the
+    // DOM -- a rebuild would restart every entrance animation on a screen the
+    // user may be looking at.
+    var notifClocks = [];
+
+    function whenText(ts) {
+      var secs = (Date.now() / 1000) - ts;
+      if (secs < 60) return "now";
+      var mins = Math.round(secs / 60);
+      if (mins < 60) return mins + "m ago";
+      var hrs = Math.round(mins / 60);
+      if (hrs < 24) return hrs + "h ago";
+      var days = Math.round(hrs / 24);
+      return days <= 1 ? "Yesterday" : days + "d ago";
+    }
+
+    function notifCard(group, item) {
+      var el = document.createElement("div");
+      el.className = "ls-notif";
+
+      var tile = document.createElement("div");
+      tile.className = "ls-notif-tile";
+      tile.setAttribute("aria-hidden", "true");
+      // Only a colour literal is ever taken from the payload, and only after it
+      // is checked -- an unchecked value here would be written into a style.
+      if (/^#[0-9a-fA-F]{3,8}$/.test(group.tint || "")) {
+        tile.style.setProperty("--ls-n", group.tint);
+      }
+      if (group.glyph && NOTIF_GLYPHS[group.glyph]) {
+        tile.innerHTML = '<svg viewBox="0 0 24 24">' + NOTIF_GLYPHS[group.glyph] + "</svg>";
+      } else {
+        tile.textContent = (group.mono || group.app || "?").slice(0, 2);
+      }
+
+      var body = document.createElement("div");
+      body.className = "ls-notif-body";
+
+      var meta = document.createElement("div");
+      meta.className = "ls-notif-meta";
+      var app = document.createElement("span");
+      app.className = "ls-notif-app";
+      app.textContent = group.app || "";
+      meta.appendChild(app);
+      // The pile count rides on the newest card, where the eye already is. CSS
+      // hides it once the stack is fanned out, when the cards are the count.
+      if (group.items.length > 1 && item === group.items[0]) {
+        var count = document.createElement("span");
+        count.className = "ls-notif-count";
+        count.textContent = group.items.length;
+        meta.appendChild(count);
+      }
+      var when = document.createElement("span");
+      when.className = "ls-notif-when";
+      when.textContent = whenText(item.at);
+      notifClocks.push({ el: when, at: item.at });
+      meta.appendChild(when);
+
+      var title = document.createElement("div");
+      title.className = "ls-notif-title";
+      title.textContent = item.title || "";          // textContent, never innerHTML
+      var text = document.createElement("div");
+      text.className = "ls-notif-text";
+      text.textContent = item.text || "";
+
+      body.appendChild(meta); body.appendChild(title);
+      if (item.text) body.appendChild(text);
+      el.appendChild(tile); el.appendChild(body);
+      return el;
+    }
+
+    function notifGroup(group) {
+      var el = document.createElement("div");
+      el.className = "ls-notif-group";
+      // A stack OPENS, so it is a button: reachable by tab, operable by Enter,
+      // same rule the islands follow.
+      el.setAttribute("role", "button");
+      el.setAttribute("tabindex", "0");
+      var open = notifOpen[group.source] ? "1" : "0";
+      el.setAttribute("data-open", open);
+      el.setAttribute("aria-expanded", open === "1" ? "true" : "false");
+      el.setAttribute("aria-label", group.items.length > 1
+        ? group.app + ", " + group.items.length + " notifications. "
+          + (open === "1" ? "Collapse." : "Show all.")
+        : group.app + ": " + (group.items[0].title || ""));
+
+      for (var i = 0; i < group.items.length; i++) {
+        el.appendChild(notifCard(group, group.items[i]));
+      }
+
+      function toggle() {
+        var nowOpen = el.getAttribute("data-open") !== "1";
+        // Single-item stacks have nothing to fan out.
+        if (group.items.length < 2) return;
+        notifOpen[group.source] = nowOpen;
+        el.setAttribute("data-open", nowOpen ? "1" : "0");
+        el.setAttribute("aria-expanded", nowOpen ? "true" : "false");
+        el.setAttribute("aria-label", group.app + ", " + group.items.length
+          + " notifications. " + (nowOpen ? "Collapse." : "Show all."));
+        syncFeedFade();
+      }
+      el.addEventListener("click", toggle);
+      el.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar") {
+          ev.preventDefault();
+          toggle();
+        }
+      });
+      return el;
+    }
+
+    function paintNotifications(data) {
+      if (!notifsEl) return;
+      // Same rule as the islands: never rebuild under an open sheet.
+      var sheetNow = screenEl ? screenEl.getAttribute("data-sheet") : "none";
+      if (sheetNow && sheetNow !== "none") return;
+      var groups = (data && data.groups) || [];
+      notifsEl.textContent = "";
+      notifClocks = [];
+      if (!groups.length) { notifsEl.hidden = true; return; }
+      for (var i = 0; i < groups.length; i++) {
+        if (!groups[i].items || !groups[i].items.length) continue;
+        notifsEl.appendChild(notifGroup(groups[i]));
+      }
+      notifsEl.hidden = !notifsEl.firstChild;
+      syncFeedFade();
+    }
+
+    function pollNotifications() {
+      fetch("/auth/lock-notifications", { credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { if (d) paintNotifications(d); })
+        // 404 is the ordinary answer with demo content off: no stack, no error.
+        .catch(function () { /* leave the stack as it is */ });
+    }
+    if (notifsEl) {
+      pollNotifications();
+      setInterval(pollNotifications, 15 * 60 * 1000);
+      // The minutes move far faster than the content does, so they are retouched
+      // in place rather than by re-rendering the stack.
+      setInterval(function () {
+        for (var i = 0; i < notifClocks.length; i++) {
+          notifClocks[i].el.textContent = whenText(notifClocks[i].at);
+        }
+      }, 60000);
     }
 
     // Switching to the password form STAYS on the lock screen.
@@ -3116,6 +3546,298 @@ async def lock_thread(slug: str, request: Request):
     if not safe:
         return JSONResponse({"error": "not found"}, status_code=404)
     return JSONResponse({"slug": safe, "messages": _demo_thread(safe), "demo": True})
+
+
+#: The lock screen's weather is FIXED to Liverpool, in Celsius and mph.
+#:
+#: Not a preference and not a lookup: this surface renders BEFORE sign-in, so
+#: there is no account to read a home town from, and the alternative -- asking
+#: the browser for geolocation -- would put a permission prompt on a locked
+#: phone, aimed at whoever is holding it. A constant is the honest answer.
+_WEATHER_PLACE = "Liverpool"
+_WEATHER_LAT = 53.4084
+_WEATHER_LON = -2.9916
+
+#: Open-Meteo needs no API key, which is the whole reason it is the source: a
+#: key would have to live on the device, and this endpoint answers anyone
+#: holding the phone.
+_WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+
+#: A lock screen repaints every time the phone is woken. Without a cache a
+#: pocketed handset would call the forecast API dozens of times an hour for a
+#: number that changes four times a day.
+_WEATHER_TTL_SECONDS = 900
+_WEATHER_TIMEOUT_SECONDS = 6.0
+
+_weather_cached: dict | None = None
+_weather_cached_at: float = 0.0
+#: Serialises the refresh, so a wake that paints several times does one call
+#: rather than one per paint.
+_weather_lock = asyncio.Lock()
+
+#: WMO weather code -> (what to call it, which icon the page should draw).
+#:
+#: The icon name is decided HERE rather than in the script so the wording and
+#: the picture cannot drift apart: the page owns eight shapes and is told which
+#: one to use. Codes absent from this table fall back to plain cloud, which is
+#: wrong-ish rather than blank.
+_WMO_CONDITIONS: dict[int, tuple[str, str]] = {
+    0: ("Clear", "clear"),
+    1: ("Mainly clear", "clear"),
+    2: ("Partly cloudy", "partly"),
+    3: ("Overcast", "cloud"),
+    45: ("Fog", "fog"),
+    48: ("Freezing fog", "fog"),
+    51: ("Light drizzle", "drizzle"),
+    53: ("Drizzle", "drizzle"),
+    55: ("Heavy drizzle", "drizzle"),
+    56: ("Freezing drizzle", "drizzle"),
+    57: ("Freezing drizzle", "drizzle"),
+    61: ("Light rain", "rain"),
+    63: ("Rain", "rain"),
+    65: ("Heavy rain", "rain"),
+    66: ("Freezing rain", "rain"),
+    67: ("Freezing rain", "rain"),
+    71: ("Light snow", "snow"),
+    73: ("Snow", "snow"),
+    75: ("Heavy snow", "snow"),
+    77: ("Snow grains", "snow"),
+    80: ("Light showers", "rain"),
+    81: ("Showers", "rain"),
+    82: ("Heavy showers", "rain"),
+    85: ("Snow showers", "snow"),
+    86: ("Snow showers", "snow"),
+    95: ("Thunderstorm", "storm"),
+    96: ("Thunderstorm", "storm"),
+    99: ("Thunderstorm", "storm"),
+}
+
+
+def _weather_condition(code: int, is_day: bool) -> tuple[str, str]:
+    """Name and icon for one WMO code, with the night variant of a clear sky."""
+    label, icon = _WMO_CONDITIONS.get(int(code), ("Cloudy", "cloud"))
+    if icon == "clear" and not is_day:
+        return (label, "night")
+    return (label, icon)
+
+
+async def _fetch_weather() -> dict | None:
+    """One call to the forecast API, shaped into what the lock screen draws.
+
+    Returns None on any failure. Every caller treats that as "show no weather":
+    a lock screen that renders an error string because a forecast host was slow
+    is worse than one that simply has no weather line.
+    """
+    params = {
+        "latitude": _WEATHER_LAT,
+        "longitude": _WEATHER_LON,
+        "current": "temperature_2m,apparent_temperature,is_day,weather_code,wind_speed_10m",
+        "daily": "temperature_2m_max,temperature_2m_min",
+        "timezone": "Europe/London",
+        "temperature_unit": "celsius",
+        "wind_speed_unit": "mph",
+        "forecast_days": 1,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_WEATHER_TIMEOUT_SECONDS) as client:
+            resp = await client.get(_WEATHER_URL, params=params)
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception as exc:  # noqa: BLE001 - offline, DNS, timeout, bad JSON
+        logger.debug("lock-screen weather fetch failed: %s", exc)
+        return None
+
+    current = payload.get("current") or {}
+    daily = payload.get("daily") or {}
+    temp = current.get("temperature_2m")
+    if temp is None:
+        return None
+
+    label, icon = _weather_condition(
+        current.get("weather_code") or 0,
+        bool(current.get("is_day", 1)),
+    )
+
+    def first(seq, default=None):
+        return seq[0] if isinstance(seq, list) and seq else default
+
+    return {
+        "place": _WEATHER_PLACE,
+        "temp": float(temp),
+        "feels": current.get("apparent_temperature"),
+        "label": label,
+        "icon": icon,
+        "wind": current.get("wind_speed_10m"),
+        "high": first(daily.get("temperature_2m_max")),
+        "low": first(daily.get("temperature_2m_min")),
+        # Stated rather than implied: the page renders "°" and "mph" and should
+        # not have to assume which system produced the numbers.
+        "units": {"temperature": "celsius", "wind": "mph"},
+    }
+
+
+async def _weather_reading() -> dict | None:
+    """The cached reading, refreshed at most every _WEATHER_TTL_SECONDS.
+
+    A failed refresh keeps serving the last good reading rather than blanking
+    the row: a stale temperature is still roughly true, and a line that
+    disappears every time the phone's link drops looks broken.
+    """
+    global _weather_cached, _weather_cached_at
+
+    now = time.time()
+    if _weather_cached is not None and now - _weather_cached_at < _WEATHER_TTL_SECONDS:
+        return _weather_cached
+
+    async with _weather_lock:
+        # Re-check under the lock: several paints can queue behind one refresh.
+        now = time.time()
+        if _weather_cached is not None and now - _weather_cached_at < _WEATHER_TTL_SECONDS:
+            return _weather_cached
+        fresh = await _fetch_weather()
+        if fresh is not None:
+            _weather_cached = fresh
+            _weather_cached_at = now
+    return _weather_cached
+
+
+@router.get("/lock-weather")
+async def lock_weather(request: Request):
+    """Weather for the lock screen. Console-only, fetched SERVER-SIDE.
+
+    The page deliberately does not call the forecast API itself. The lock screen
+    paints before sign-in and every time the screen wakes, so a browser-side
+    call would announce this device to a third-party host on every wake, from a
+    surface nobody has authenticated to. Going through the server also means the
+    result can be cached once for the device instead of per page load.
+
+    Nothing here is account-derived: a fixed city, a public forecast, no key.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    reading = await _weather_reading()
+    if reading is None:
+        # The page treats a non-200 as "no weather" and leaves the row hidden.
+        return JSONResponse({"error": "unavailable"}, status_code=503)
+    return JSONResponse(reading)
+
+
+#: Scripted lock-screen notifications, collated per source.
+#:
+#: DEMO CONTENT, and it can never be anything else. The lock screen renders
+#: BEFORE sign-in, so serving real mail, real messages or a real call log here
+#: would hand the contents of the phone to whoever picked it up. This table is
+#: the only thing /auth/lock-notifications can serve, which is why there is no
+#: gate to get wrong: there is no code path from this screen to an inbox.
+#:
+#: Each item is (minutes_ago, title, text). Offsets rather than timestamps so
+#: the stack always reads as "this morning", whenever the demo is run. The
+#: tints are the colours the app tiles are drawn in; `glyph` picks one of the
+#: page's three drawn marks and `mono` is the letterform used when there is no
+#: glyph for that source.
+_DEMO_NOTIFICATIONS: tuple[dict, ...] = (
+    {
+        "source": "mail",
+        "app": "Mail",
+        "glyph": "mail",
+        "tint": "#2f6fd0",
+        "items": (
+            (12, "Hargreaves & Co", "Re: Thursday's site visit — 09:15 works for us. I'll bring the revised drawings."),
+            (74, "Companies House", "Your confirmation statement is due on 3 October."),
+            (221, "Liverpool FC", "Your ticket ballot result for Newcastle (H) is ready to view."),
+        ),
+    },
+    {
+        "source": "x",
+        "app": "X",
+        "mono": "X",
+        "tint": "#3b3b42",
+        "items": (
+            (8, "@marcus_dev mentioned you", "what's the actual memory floor for running this on a 4GB board?"),
+            (96, "12 posts from people you follow", "including 3 about on-device inference"),
+        ),
+    },
+    {
+        "source": "reddit",
+        "app": "Reddit",
+        "mono": "r",
+        "tint": "#ff4500",
+        "items": (
+            (34, "r/selfhosted · 47 upvotes", "Someone replied to your comment on “Running an agent OS on a single board”."),
+            (150, "r/LocalLLaMA", "Today's discussion thread is up."),
+        ),
+    },
+    {
+        "source": "phone",
+        "app": "Phone",
+        "glyph": "phone",
+        "tint": "#34c759",
+        "items": (
+            (41, "Missed call", "2 missed calls"),
+        ),
+    },
+    {
+        "source": "sms",
+        "app": "Messages",
+        "glyph": "sms",
+        "tint": "#25c05d",
+        "items": (
+            (19, "Sam", "are you still alright for Sunday?"),
+            (310, "O2", "You've used 80% of your data allowance this month."),
+        ),
+    },
+)
+
+
+def _demo_notifications() -> list[dict]:
+    """The scripted stacks, timestamped relative to now and newest-first.
+
+    Sorted by each stack's newest item, the way a phone orders its notification
+    list -- a fixed table order would leave an hours-old stack sitting above one
+    that arrived a minute ago.
+    """
+    now = time.time()
+    groups: list[dict] = []
+    for spec in _DEMO_NOTIFICATIONS:
+        items = [
+            {
+                "title": title,
+                "text": text,
+                "at": now - (minutes_ago * 60),
+            }
+            for minutes_ago, title, text in spec["items"]
+        ]
+        items.sort(key=lambda item: item["at"], reverse=True)
+        groups.append({
+            "source": spec["source"],
+            "app": spec["app"],
+            "glyph": spec.get("glyph", ""),
+            "mono": spec.get("mono", ""),
+            "tint": spec.get("tint", ""),
+            "items": items,
+            # Marked at construction so nothing downstream has to work out that
+            # these are placeholders by elimination.
+            "demo": True,
+        })
+    groups.sort(key=lambda group: group["items"][0]["at"], reverse=True)
+    return groups
+
+
+@router.get("/lock-notifications")
+async def lock_notifications(request: Request):
+    """Collated notification stacks for the lock screen. Console-only.
+
+    DEMO CONTENT ONLY, on the same flag as the placeholder agents and their
+    scripted threads: one switch governs everything invented on this screen, so
+    a device cannot end up showing made-up mail while believing it is in its
+    real state. With demo mode off there is nothing to serve and the answer is
+    404 -- the page treats that as "no notifications" and renders no stack.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    if not _demo_enabled():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({"groups": _demo_notifications(), "demo": True})
 
 
 @router.post("/pin-login")
