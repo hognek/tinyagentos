@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 
@@ -386,7 +387,11 @@ class TestGestureLatching:
         elsewhere = elsewhere.replace(_function("feedScrollRoom"), "")
         assert "feedEl.scrollHeight" not in elsewhere
         assert "feedEl.clientHeight" not in elsewhere
-        # scrollTop survives outside them exactly once, for the top edge's fade,
-        # which is the one edge neither helper answers.
-        assert elsewhere.count("feedEl.scrollTop") == 1
+        # scrollTop is READ outside them exactly once, for the top edge's fade,
+        # which is the one edge neither helper answers. Writes are not
+        # measurements and stay allowed: the view switcher resets the offset
+        # when it swaps panels, and counting that as a rogue measurement would
+        # make this check fail for doing the right thing.
+        reads = re.findall(r"feedEl\.scrollTop(?!\s*=(?!=))", elsewhere)
+        assert len(reads) == 1, f"feedEl.scrollTop is read {len(reads)} times outside the helpers"
         assert "var atTop" in elsewhere
