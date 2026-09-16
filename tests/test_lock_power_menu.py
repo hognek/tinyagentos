@@ -400,7 +400,7 @@ class TestTheVolumeKeys:
 
     def test_a_hold_starts_the_walkie_talkie_and_a_release_stops_it(self):
         js = auth._LOCK_SCREEN_SCRIPT
-        assert "HOLD_MS" in js
+        assert "PTT_HOLD_MS" in js
         start = js.index("function volumeKey(")
         body = js[start:js.index("\n    }", start)]
         assert "startTalking" in body and "stopTalking" in body

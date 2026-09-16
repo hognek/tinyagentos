@@ -3417,7 +3417,17 @@ _LOCK_SCREEN_SCRIPT = r"""
     var talking = false;
     // 600ms: past a deliberate press, short enough that holding to talk feels
     // immediate rather than like waiting for the phone to agree.
-    var HOLD_MS = 600;
+    //
+    // Named for push-to-talk, and deliberately NOT the island press machinery's
+    // own hold constant further down. test_lock_screen_views.py locates that
+    // machinery by searching for its declaration, so a second declaration of
+    // the same name earlier in the script makes it slice from here instead --
+    // "SyntaxError: Unexpected end of input", five tests red, in code that was
+    // itself perfectly valid. A landmark another file navigates by is part of
+    // the interface whether it was meant to be or not, and that includes
+    // repeating it in a comment: the first version of this note spelled the
+    // other name out and broke the search all over again.
+    var PTT_HOLD_MS = 600;
 
     function volShow() {
       if (!volEl) return;
@@ -3505,7 +3515,15 @@ _LOCK_SCREEN_SCRIPT = r"""
         var agent = list[i];
         var face = partOf(carStrip, agent.name, "ls-face");
         if (agent.avatar) {
-          var url = "url(\"" + String(agent.avatar).replace(/["\\\\]/g, "") + "\")";
+          // Sanitised with split/join rather than a REGEX LITERAL. A regex
+          // containing a quote -- /["\\]/ -- breaks the JS extractor the tests
+          // use to lift functions out of this script: it is quote-aware but not
+          // regex-aware, so the quote inside the literal opens a string that
+          // never closes and the capture runs off the end of the file.
+          // "SyntaxError: Unexpected end of input", five tests red, in code
+          // that was itself perfectly valid.
+          var safe = String(agent.avatar).split("\"").join("").split("\\").join("");
+          var url = "url(\"" + safe + "\")";
           if (face.style.getPropertyValue("background-image") !== url) {
             face.style.setProperty("background-image", url);
           }
@@ -3565,7 +3583,7 @@ _LOCK_SCREEN_SCRIPT = r"""
       // A hold starts counting on every press, but only ever means anything
       // while the carousel is up.
       if (holdTimer) window.clearTimeout(holdTimer);
-      holdTimer = window.setTimeout(startTalking, HOLD_MS);
+      holdTimer = window.setTimeout(startTalking, PTT_HOLD_MS);
 
       if (!carOpen && !volOpen) {
         // From rest: which key was pressed decides which surface appears.
