@@ -419,6 +419,13 @@ var panelEls = {
   phone: makeNode("div"), mailbox: makeNode("div"), apps: makeNode("div"),
   projects: makeNode("div"), decisions: makeNode("div")
 };
+// Server-rendered HIDDEN, exactly as _lock_head_html() emits them. The harness
+// used to create them visible, which is why 64 tests passed while every panel
+// was display:none on the real glass.
+panelEls.phone.hidden = true;
+panelEls.mailbox.hidden = true;
+panelEls.apps.hidden = true;
+panelEls.projects.hidden = true;
 // The decisions container lives INSIDE the alerts panel on the real page, so
 // the harness gives it the same home -- otherwise the attach/detach the
 // painter performs would have nothing to attach to and would silently no-op.
@@ -514,6 +521,8 @@ function snapshot() {
   out.__clocks = panelClocks.length;
   // Where the decisions container actually IS. Painted into a detached node it
   // would be correct, complete and invisible.
+  out.__hidden = {};
+  for (var h in panelEls) out.__hidden[h] = !!panelEls[h].hidden;
   out.__decisions_parented = panelEls.decisions.parent === notifsEl;
   out.__decisions_first = notifsEl.children[0] === panelEls.decisions;
   return out;
@@ -822,6 +831,34 @@ class TestTheContentReachesTheGlass:
         after = {r["key"]: r for r in two["projects"]}["prj-taos-site"]
         assert before["pct"] == "88" and after["pct"] == "93"
         assert before["id"] == after["id"]
+
+    def test_painting_a_panel_un_hides_it(self):
+        """The bug that reached the glass: 354 rows in the DOM and nothing
+        visible.
+
+        The panels are server-rendered `hidden`, and the view switcher only
+        toggles `data-off` -- it never clears `hidden`. The two older panels
+        escape it because their own painters set `hidden` themselves. These
+        four had nobody doing it, so `.ls-feed > [data-view][hidden]` held them
+        at display:none whichever tab was selected. Every content and identity
+        assertion in this file passed throughout, because the harness had been
+        creating the panels VISIBLE -- it was not reproducing the markup.
+        """
+        one, = _run([_payload()])
+        for panel in ("phone", "mailbox", "apps", "projects"):
+            assert one["__hidden"][panel] is False, (
+                f"{panel} is still hidden after being painted -- "
+                "it will render nothing on the device"
+            )
+
+    def test_an_empty_panel_is_shown_rather_than_hidden(self):
+        """A panel with no rows must still render its "nothing here" card. The
+        lazy fix for the above -- hide when empty, show when not -- would make
+        an empty panel vanish, which is the state that is hardest to tell from
+        a failure to load."""
+        one, = _run([_payload(phone=[])])
+        assert one["__hidden"]["phone"] is False
+        assert _keys(one, "phone") == ["empty"]
 
     def test_decisions_sit_at_the_top_of_the_alerts_panel(self):
         """Not a tab of their own: Jay put them in alerts for quick answering.

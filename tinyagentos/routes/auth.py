@@ -3284,6 +3284,22 @@ _LOCK_SCREEN_SCRIPT = r"""
 
     function paintPanels(data) {
       lastPanels = data || {};
+      // Clear the markup's `hidden` on every panel we paint.
+      //
+      // The panels are SERVER-RENDERED HIDDEN, and the view switcher only ever
+      // toggles `data-off` -- it never touches `hidden`. The two panels that
+      // predate this row get away with it because their own painters set
+      // `hidden` themselves (notifsEl.hidden = !notifsEl.firstChild). These
+      // four had nobody doing that, so `.ls-feed > [data-view][hidden]` kept
+      // them at display:none no matter which tab was selected: fully painted,
+      // 354 rows in the DOM, and invisible on the glass.
+      //
+      // Cleared here rather than per-painter so a panel showing its "nothing
+      // here" card is still shown -- an empty panel the user selected must
+      // render its empty state, not vanish.
+      for (var p in panelEls) {
+        if (panelEls[p] && p !== "decisions") panelEls[p].hidden = false;
+      }
       paintPhone(data.phone || []);
       paintMailbox(data.mailbox || []);
       paintApps(data.apps || []);
