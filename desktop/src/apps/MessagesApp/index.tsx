@@ -14,7 +14,9 @@ import {
   Loader2,
   Check,
   Clock,
+  Play,
   Sparkles,
+  Globe,
 } from "lucide-react";
 import {
   Button,
@@ -28,6 +30,7 @@ import {
 import { MobileSplitView } from "@/components/mobile/MobileSplitView";
 import { useIsMobile } from "@/hooks/use-is-mobile";
 import { useVisualViewport } from "@/hooks/use-visual-viewport";
+import { copyText } from "@/lib/clipboard";
 import { useDropTarget } from "@/shell/dnd/use-drop-target";
 import { ChannelSettingsPanel } from "../chat/ChannelSettingsPanel";
 import { AgentContextMenu } from "../chat/AgentContextMenu";
@@ -52,6 +55,7 @@ import {
   editMessage as apiEditMessage, deleteMessage as apiDeleteMessage,
   markUnread as apiMarkUnread,
 } from "@/lib/chat-messages-api";
+import { getReceipts, markSeen, type Receipt } from "@/lib/a2a-receipts-api";
 import { projectsApi, type Project } from "@/lib/projects";
 import {
   findA2aChannelId,
@@ -73,6 +77,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { SearchPanel } from "../chat/SearchPanel";
 import { ChannelSidebar } from "../chat/ChannelSidebar";
+import { ConnectWizard } from "../chat/ConnectWizard";
 import { A2aBusMessageView, useBusChannels } from "../chat/A2aBusPanel";
 import { useRefreshOnFocus } from "@/hooks/use-refresh-on-focus";
 import { useDecisionEventsStore } from "@/stores/decision-events-store";
@@ -97,7 +102,7 @@ interface OpenMessagesDetail {
 interface Channel {
   id: string;
   name: string;
-  type: "dm" | "topic" | "group";
+  type: "dm" | "dm-remote" | "topic" | "group";
   description?: string;
   topic?: string;
   members?: string[];
@@ -901,6 +906,7 @@ export function MessagesApp({
   const [busSelected, setBusSelected] = useState<string | null>(null);
   const bus = useBusChannels();
   const [messages, setMessages] = useState<Message[]>([]);
+  const [receipts, setReceipts] = useState<Record<string, Receipt[]>>({});
   const [unread, setUnread] = useState<Record<string, number>>({});
   const unreadRef = useRef<Record<string, number>>({});
   const pendingNewCountRef = useRef(0);
@@ -913,6 +919,7 @@ export function MessagesApp({
   const [newChannel, setNewChannel] = useState({ name: "", type: "topic" as "topic" | "group", description: "" });
   const [prefillBanner, setPrefillBanner] = useState<{ promptName: string; agentName?: string } | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [showConnectWizard, setShowConnectWizard] = useState(false);
   const [contextMenu, setContextMenu] = useState<{ slug: string; x: number; y: number } | null>(null);
   const [agentInfoPopover, setAgentInfoPopover] = useState<
     { slug: string; framework: string; model: string; status: string; x: number; y: number } | null
@@ -1076,6 +1083,39 @@ export function MessagesApp({
       /* offline */
     }
   }, []);
+
+  /* ---- fetch receipts for own messages ---- */
+  const fetchReceipts = useCallback(async (messageIds: string[]) => {
+    const results = await Promise.allSettled(
+      messageIds.map((id) => getReceipts(id)),
+    );
+    const next: Record<string, Receipt[]> = {};
+    let idx = 0;
+    for (const result of results) {
+      if (result.status === "fulfilled") {
+        next[messageIds[idx] ?? ""] = result.value;
+      }
+      idx++;
+    }
+    if (Object.keys(next).length > 0) {
+      setReceipts((prev) => ({ ...prev, ...next }));
+    }
+  }, []);
+
+  /* ---- mark a single message as seen (idempotent) ---- */
+  const handleMarkSeen = useCallback(async (messageId: string) => {
+    if (!currentUserId) return;
+    try {
+      const existing = receipts[messageId] ?? [];
+      const mine = existing.find((r) => r.agent_id === currentUserId);
+      if (mine?.seen_at != null) return;
+      await markSeen(messageId);
+      const updated = await getReceipts(messageId);
+      setReceipts((prev) => ({ ...prev, [messageId]: updated }));
+    } catch {
+      /* ignore */
+    }
+  }, [currentUserId, receipts]);
 
   /* ---- mark channel read ---- */
   const markRead = useCallback(async (channelId: string) => {
@@ -1274,6 +1314,42 @@ export function MessagesApp({
     };
 
     wsRef.current = ws;
+  }, []);
+
+  /* ---- A2A bus stream: live receipt updates ---- */
+  useEffect(() => {
+    if (typeof EventSource === "undefined") {
+      console.debug("[MessagesApp] EventSource unavailable, skipping A2A bus stream");
+      return;
+    }
+    const es = new EventSource("/api/a2a/bus/stream");
+    es.onmessage = (ev) => {
+      try {
+        const data = JSON.parse(ev.data);
+        if (data.type === "receipt" && data.message_id) {
+          setReceipts((prev) => {
+            const existing = prev[data.message_id] ?? [];
+            const idx = existing.findIndex((r) => r.agent_id === data.agent_id);
+            const updated: Receipt = {
+              message_id: data.message_id,
+              agent_id: data.agent_id,
+              delivered_at: data.delivered_at ?? existing[idx]?.delivered_at ?? null,
+              seen_at: data.seen_at ?? existing[idx]?.seen_at ?? null,
+            };
+            const next = [...existing];
+            if (idx >= 0) next[idx] = updated;
+            else next.push(updated);
+            return { ...prev, [data.message_id]: next };
+          });
+        }
+      } catch {
+        /* ignore malformed stream event */
+      }
+    };
+    es.onerror = () => {
+      es.close();
+    };
+    return () => es.close();
   }, []);
 
   /* ---- emoji popover: escape and outside click ---- */
@@ -1476,6 +1552,17 @@ export function MessagesApp({
     setTypingHumans([]);
     setTypingAgents([]);
   }, [selectedChannel, fetchMessages, markRead]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* ---- fetch receipts for own messages when messages change ---- */
+  useEffect(() => {
+    if (!currentUserId || messages.length === 0) return;
+    const ownIds = messages
+      .filter((m) => m.author_id === currentUserId && m.state !== "pending" && m.state !== "streaming")
+      .map((m) => m.id);
+    if (ownIds.length > 0) {
+      void fetchReceipts(ownIds);
+    }
+  }, [messages, currentUserId, fetchReceipts]);
 
   /* ---- deep-link scroll on ?msg=<id> — latch so it fires once per URL ---- */
   const deepLinkSeenRef = useRef<string | null>(null);
@@ -1922,18 +2009,14 @@ export function MessagesApp({
     setOverflowMenu(null);
     if (!selectedChannel) return;
     const url = `${window.location.origin}/chat/${selectedChannel}?msg=${msgId}`;
-    try {
-      await navigator.clipboard.writeText(url);
-    } catch { /* ignore */ }
+    await copyText(url);
   };
 
   const handleCopyText = async (msgId: string) => {
     setOverflowMenu(null);
     const msg = messages.find((m) => m.id === msgId);
     if (!msg) return;
-    try {
-      await navigator.clipboard.writeText(msg.content);
-    } catch { /* ignore */ }
+    await copyText(msg.content);
   };
 
   const handlePin = async (msg: Message) => {
@@ -1981,6 +2064,7 @@ export function MessagesApp({
     scope?.projectId ? c.project_id === scope.projectId : !c.project_id;
   const grouped = {
     dm: channels.filter((c) => c.type === "dm" && inSidebarSection(c)),
+    "dm-remote": channels.filter((c) => c.type === "dm-remote" && inSidebarSection(c)),
     topic: channels.filter((c) => c.type === "topic" && inSidebarSection(c)),
     group: channels.filter((c) => c.type === "group" && inSidebarSection(c)),
   };
@@ -2004,7 +2088,7 @@ export function MessagesApp({
   // In a DM (2 members: user + 1 agent), a leading "/" opens the agent's
   // slash menu.  In a group channel (3+ members), the user must prefix
   // with "@agentname /" so we know which agent's commands to show.
-  const isDm = (currentChannel?.members?.length ?? 0) === 2;
+  const isDm = (currentChannel?.members?.length ?? 0) === 2 || currentChannel?.type === "dm-remote";
   const showSlash = isDm ? input.startsWith("/") : /^@\S+\s+\//.test(input);
   // The agent scoped by "@agentname /" (group only; undefined in DM).
   const slashAgent = !isDm && showSlash ? input.match(/^@(\S+)\s+\//)?.[1] || undefined : undefined;
@@ -2085,6 +2169,9 @@ export function MessagesApp({
     { label: "Channels", icon: <Hash size={13} />, items: [...grouped.topic, ...grouped.group] },
     { label: "Agents-DMs", icon: <Bot size={13} />, items: [...dmSections.live, ...dmSections.suspended, ...dmSections.archived] },
     { label: "Direct Messages", icon: <AtSign size={13} />, items: dmSections.nonAgent },
+    ...(grouped["dm-remote"].length > 0
+      ? [{ label: "Remote", icon: <Globe size={13} />, items: grouped["dm-remote"] }]
+      : []),
   ].filter((s) => s.items.length > 0 || s.label === "Channels");
 
   const allEmpty =
@@ -2173,9 +2260,15 @@ export function MessagesApp({
           <div className="text-center px-6">
             <MessageCircle size={48} className="mx-auto mb-3 opacity-30" />
             <p className="text-sm mb-3">Pick a channel or start a DM</p>
-            <Button variant="outline" size="sm" onClick={() => setShowCreate(true)}>
-              New channel
-            </Button>
+            <div className="flex items-center gap-2">
+              <Button variant="outline" size="sm" onClick={() => setShowCreate(true)}>
+                New channel
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setShowConnectWizard(true)}>
+                <Play size={14} className="mr-1" aria-hidden="true" />
+                Connect session
+              </Button>
+            </div>
           </div>
         </div>
       ) : (
@@ -2253,6 +2346,7 @@ export function MessagesApp({
             onOpenSettings={handleOpenSettings}
             typingHumans={typingHumans}
             typingAgents={typingAgents}
+            receipts={receipts}
           />
 
           {/* #1741: stall banner — surfaces only when a response is abnormally
@@ -2497,6 +2591,7 @@ className="shrink-0 p-0.5 rounded hover:bg-shell-surface-active transition-color
           isFullscreen={isMobile}
           liveReplies={threadLiveReplies}
           authorCtx={{ currentUserId, currentUserDisplayName }}
+          onMarkSeen={handleMarkSeen}
           onSend={async (content, attachments) => {
             const r = await fetch("/api/chat/messages", {
               method: "POST",
@@ -2804,6 +2899,9 @@ className="shrink-0 p-0.5 rounded hover:bg-shell-surface-active transition-color
           </div>
         )
       )}
+
+      {/* ---- Connect Session Wizard ---- */}
+      <ConnectWizard open={showConnectWizard} onClose={() => setShowConnectWizard(false)} />
     </div>
   );
 }

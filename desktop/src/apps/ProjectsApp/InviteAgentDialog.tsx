@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { createPortal } from "react-dom";
+import { copyText } from "@/lib/clipboard";
 
 const SCOPE_PRESETS: { value: string; label: string; defaultOn: boolean; disabled?: boolean; hint?: string }[] = [
   { value: "project_tasks", label: "project_tasks", defaultOn: true, disabled: true, hint: "required for project invites" },
@@ -81,7 +82,6 @@ export function InviteAgentDialog({
     for (const s of SCOPE_PRESETS) init[s.value] = s.defaultOn;
     return init;
   });
-  const [isLead, setIsLead] = useState(false);
   const [manualApproval, setManualApproval] = useState(false);
   const [intervalSecs, setIntervalSecs] = useState(1800);
   const [submitting, setSubmitting] = useState(false);
@@ -113,7 +113,6 @@ export function InviteAgentDialog({
       if (s.disabled) continue;
       if (scopes[s.value]) out.add(s.value);
     }
-    if (isLead) out.add("lead");
     return [...out];
   };
 
@@ -162,8 +161,8 @@ export function InviteAgentDialog({
     }
   };
 
-  const copy = (text: string) => {
-    navigator.clipboard?.writeText(text).catch(() => {});
+  const copy = async (text: string) => {
+    await copyText(text);
   };
 
   const instruction = useMemo(() => {
@@ -260,15 +259,10 @@ export function InviteAgentDialog({
                   )}
                 </label>
               ))}
-              <label className="flex items-center gap-2 text-sm py-0.5 mt-1">
-                <input
-                  type="checkbox"
-                  checked={isLead}
-                  onChange={(e) => setIsLead(e.target.checked)}
-                  aria-label="Make this agent the project lead"
-                />
-                <span>Make this agent the project lead</span>
-              </label>
+              <p className="text-[11px] text-zinc-500 mt-1">
+                Lead is assigned after the agent registers — set it from the
+                project&apos;s members view.
+              </p>
             </fieldset>
 
             <fieldset className="border border-zinc-800 p-2 rounded">

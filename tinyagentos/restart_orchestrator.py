@@ -71,6 +71,8 @@ def clear_pending_restart() -> None:
 
 
 class RestartOrchestrator:
+    _clock = staticmethod(time.time)
+
     def __init__(self, app_state) -> None:
         self._app_state = app_state
         self._status: dict = {"phase": "idle", "reason": "", "started_at": 0, "agents": {}}
@@ -95,7 +97,7 @@ class RestartOrchestrator:
         self._status = {
             "phase": "preparing",
             "reason": reason,
-            "started_at": int(time.time()),
+            "started_at": int(self._clock()),
             "agents": {a["name"]: {"status": "preparing", "duration_s": 0, "note_path": None} for a in agents},
         }
 
@@ -195,7 +197,7 @@ class RestartOrchestrator:
         note_path = note_dir / "resume_note.json"
         note = {
             "reason": reason,
-            "paused_at": int(time.time()),
+            "paused_at": int(self._clock()),
             "last_user_msg": None,
             "in_progress_task": None,
             "next_step_hint": "controller-side fallback — agent framework did not implement /prepare-for-shutdown",

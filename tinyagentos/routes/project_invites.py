@@ -93,6 +93,11 @@ def _derive_handle(project_slug: str, harness: str, label: str | None) -> str:
 
     Each component is slugified independently so an awkward label cannot bleed
     separators into a neighbour; the parts are then joined with single dashes.
+
+    Dedup: if the slugified label starts with (or equals) a prefix already in
+    the handle, strip that overlap from the label before appending — so
+    ``taosmobile`` + ``claude`` + ``taosmobile-dev`` yields
+    ``taosmobile-claude-dev``, not ``taosmobile-claude-taosmobile-dev``.
     """
     slug = _slugify(project_slug)
     hw = _slugify(harness)
@@ -100,7 +105,16 @@ def _derive_handle(project_slug: str, harness: str, label: str | None) -> str:
     if label:
         lbl = _slugify(label)
         if lbl:
-            parts.append(lbl)
+            # Dedup: strip any prefix of the label that duplicates a part.
+            for dedup in (slug, hw):
+                if not lbl:
+                    break
+                if lbl == dedup:
+                    lbl = ""
+                elif lbl.startswith(dedup + "-"):
+                    lbl = lbl[len(dedup) + 1:]
+            if lbl:
+                parts.append(lbl)
     return "-".join(p for p in parts if p)
 
 
@@ -559,7 +573,8 @@ def _build_guide_markdown(
         lines.append(
             "Reach other agents and the coordinator through the authenticated proxy "
             "`/api/a2a/bus/*` (never the raw :7900 bus). The proxy forces `from` to your "
-            "own handle, so you always post as yourself. Send with "
+            "own registry canonical identity and presents your registry token to the "
+            "bus, so you always post as yourself and the bus can verify it. Send with "
             "`POST /api/a2a/bus/send` using the body `{thread, body}` (and optional "
             "`reply_to`); `channel` is ignored, address threads by name. Read via "
             "`GET /api/a2a/bus/messages?channel={channel}&since={cursor}`."
@@ -626,7 +641,8 @@ def _build_os_guide_markdown(
         lines.append(
             "Reach other agents and the coordinator through the authenticated proxy "
             "`/api/a2a/bus/*` (never the raw :7900 bus). The proxy forces `from` to your "
-            "own handle, so you always post as yourself. Send with "
+            "own registry canonical identity and presents your registry token to the "
+            "bus, so you always post as yourself and the bus can verify it. Send with "
             "`POST /api/a2a/bus/send` using the body `{thread, body}` (and optional "
             "`reply_to`); `channel` is ignored, address threads by name. Read via "
             "`GET /api/a2a/bus/messages?channel={channel}&since={cursor}`."
@@ -737,6 +753,7 @@ async def list_invites(
             "status": i["status"],
             "expires_ts": i["expires_ts"],
             "redeemed_by": i.get("redeemed_by"),
+            "kind": i.get("kind", "agent"),
         }
         for i in items
     ]

@@ -69,8 +69,47 @@ Sovereignty by default, cloud by choice. Run taOS fully offline, or connect a cl
 
 ```bash
 # Debian / Ubuntu / Fedora / Arch / Alpine / macOS, one-line install
-curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo sh
 ```
+
+<details><summary>Alpine / postmarketOS — install dependencies first</summary>
+
+```bash
+sudo apk add --no-cache bash python3 py3-pip git curl libtorrent-rasterbar sqlite nodejs npm sqlcipher-dev vulkan-tools
+curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo sh
+```
+</details>
+
+<details><summary>Debian / Ubuntu — install dependencies first</summary>
+
+```bash
+sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  bash python3 python3-venv python3-pip git curl ca-certificates \
+  libtorrent-rasterbar-dev libboost-python-dev sqlite3 libsqlcipher-dev vulkan-tools
+curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo sh
+```
+</details>
+
+<details><summary>Fedora — install dependencies first</summary>
+
+```bash
+sudo dnf install -y bash python3 python3-pip git curl \
+  rb_libtorrent-devel rb_libtorrent-python3 boost-python3 \
+  sqlite nodejs npm sqlcipher-devel vulkan-tools
+curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo sh
+```
+</details>
+
+<details><summary>Arch — install dependencies first</summary>
+
+```bash
+sudo pacman -Sy --needed bash python python-pip git curl \
+  libtorrent-rasterbar boost sqlite nodejs npm sqlcipher vulkan-tools
+curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo sh
+```
+</details>
+
+Node 22 is installed by the script itself (NodeSource); it is not in these lists.
 
 Run without `sudo` to install as a user-mode systemd unit instead. The script is idempotent, safe to re-run on an existing install. Supports env-var overrides for install path, branch, and port.
 
@@ -461,7 +500,7 @@ Full transparency on every file, service, user, and port the installers touch. N
 
 ### Controller install (`scripts/install-server.sh`)
 
-Run `curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo bash` on a fresh Debian / Ubuntu / Fedora / Arch / Alpine box to get the controller fully installed, repo cloned to `~/tinyagentos/`, venv created, all deps installed, and both `tinyagentos.service` (port 6969) and `qmd.service` (port 7832) registered and started.
+Run `curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo sh` on a fresh Debian / Ubuntu / Fedora / Arch / Alpine box to get the controller fully installed, repo cloned to `~/tinyagentos/`, venv created, all deps installed, and both `tinyagentos.service` (port 6969) and `qmd.service` (port 7832) registered and started.
 
 | Where | What |
 |---|---|
@@ -473,6 +512,7 @@ Run `curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/ins
 | `/home/<user>/tinyagentos/data/` | All persistent state. **One directory to back up.** Contains: agent state YAMLs, agent memory SQLite indexes, agent workspaces, secrets DB, scheduler history, channel credentials, downloaded models, torrent settings, telemetry opt-in flag. |
 | `/home/<user>/.cache/qmd/index.sqlite` | User memory index (taOSmd knowledge base for personal notes). Per-agent indexes live separately under `data/agent-memory/{name}/index.sqlite`. |
 | Ports listened on | **6969** (controller HTTP API + web UI), **6970** (browser-proxy second-origin, `TAOS_BROWSER_PROXY_PORT`), **7832** (qmd embedding service), **4000** (LiteLLM proxy, localhost only by default) |
+| Env vars set | `TAOS_SPA_DIR=$INSTALL_DIR/static/desktop` (points the controller at the staged desktop bundle for non-editable `pip install .` users) |
 | OS packages added | python3 + venv + pip, git, curl, ca-certificates, libtorrent-rasterbar (model torrent mesh), Node.js 22 (qmd + SPA build), sqlite3, libsqlcipher (encrypted secrets), vulkan-tools (hardware detection), postgresql (LiteLLM virtual keys) |
 | User accounts created | The distro `postgres` system user is created when PostgreSQL is installed. A `litellm` Postgres role and database are created for virtual-key management. Everything else runs as the user who ran the installer. |
 

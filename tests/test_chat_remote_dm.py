@@ -390,8 +390,111 @@ class TestPeerOutboxStore:
 
 
 # ---------------------------------------------------------------------------
-# Outbox upgrade — no columns added, but verify init is idempotent
+# Outbox drain on peer last_seen refresh
 # ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestPeerOutboxDrainOnPeerSeen:
+    async def test_drain_for_contact_returns_due_without_deleting(self, outbox):
+        await outbox.enqueue(
+            contact_id="hub:hogne",
+            envelope={"kind": "chat", "body": {"content": "hello"}},
+        )
+        assert await outbox.count_for_contact("hub:hogne") == 1
+
+        due = await outbox.drain_for_contact("hub:hogne")
+        assert len(due) == 1
+        assert await outbox.count_for_contact("hub:hogne") == 1
+
+    async def test_drain_for_contact_returns_zero_when_empty(self, outbox):
+        drained = await outbox.drain_for_contact("hub:hogne")
+        assert drained == []
+
+    async def test_drain_for_contact_skips_future_retries(self, outbox):
+        await outbox.enqueue(
+            contact_id="hub:hogne",
+            envelope={"kind": "chat"},
+            next_retry_at=time.time() + 3600,
+        )
+        drained = await outbox.drain_for_contact("hub:hogne")
+        assert drained == []
+        assert await outbox.count_for_contact("hub:hogne") == 1
+
+    async def test_drain_for_contact_only_affects_target_contact(self, outbox):
+        await outbox.enqueue(contact_id="hub:a", envelope={"kind": "chat"})
+        await outbox.enqueue(contact_id="hub:b", envelope={"kind": "chat"})
+
+        drained = await outbox.drain_for_contact("hub:a")
+        assert len(drained) == 1
+        assert await outbox.count_for_contact("hub:a") == 1
+        assert await outbox.count_for_contact("hub:b") == 1
+
+    async def test_mark_peer_seen_does_not_delete_outbox_on_drain(self, tmp_path: Path):
+        from tinyagentos.contacts_store import ContactsStore
+
+        contacts_db = tmp_path / "contacts.db"
+        outbox_db = tmp_path / "outbox.db"
+
+        contacts = ContactsStore(contacts_db)
+        await contacts.init()
+
+        outbox = PeerOutboxStore(outbox_db)
+        await outbox.init()
+
+        await contacts.establish_peer_link(
+            contact_id="hub:hogne",
+            inbound_token="test-token",
+            outbound_token="test-outbound",
+        )
+
+        await outbox.enqueue("hub:hogne", {"kind": "chat", "body": {"content": "queued"}})
+        assert await outbox.count_for_contact("hub:hogne") == 1
+
+        await contacts.mark_peer_seen("hub:hogne", peer_outbox=outbox)
+
+        assert await outbox.count_for_contact("hub:hogne") == 1
+        await outbox.close()
+        await contacts.close()
+
+    async def test_mark_peer_seen_without_outbox_does_not_error(self, tmp_path: Path):
+        from tinyagentos.contacts_store import ContactsStore
+
+        contacts_db = tmp_path / "contacts.db"
+        contacts = ContactsStore(contacts_db)
+        await contacts.init()
+
+        await contacts.establish_peer_link(
+            contact_id="hub:hogne",
+            inbound_token="test-token",
+            outbound_token="test-outbound",
+        )
+
+        await contacts.mark_peer_seen("hub:hogne")
+        await contacts.close()
+
+
+@pytest.mark.asyncio
+class TestPeerOutboxDrainFailure:
+    """drain_for_contact must not delete rows when delivery is not attempted."""
+
+    @pytest_asyncio.fixture
+    async def outbox(self, tmp_path):
+        s = PeerOutboxStore(tmp_path / "outbox.db")
+        await s.init()
+        yield s
+        await s.close()
+
+    async def test_drain_without_sender_keeps_rows(self, outbox):
+        await outbox.enqueue(
+            contact_id="hub:x",
+            envelope={"kind": "chat", "body": {"content": "queued"}},
+        )
+        assert await outbox.count_for_contact("hub:x") == 1
+
+        due = await outbox.drain_for_contact("hub:x")
+        assert len(due) == 1
+        assert await outbox.count_for_contact("hub:x") == 1
+
 
 @pytest.mark.asyncio
 class TestPeerOutboxUpgrade:

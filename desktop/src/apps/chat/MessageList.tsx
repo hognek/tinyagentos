@@ -10,6 +10,9 @@ import {
   MessagesSquare,
   Search,
   PanelRight,
+  Check,
+  CheckCheck,
+  Globe,
 } from "lucide-react";
 import Picker, { Theme } from "emoji-picker-react";
 import { Button } from "@/components/ui";
@@ -28,11 +31,51 @@ import { resolveAgentEmoji } from "@/lib/agent-emoji";
 import { startDrag, endDrag } from "@/shell/dnd/dnd-bus";
 import { renderContent, dayLabel, relativeTime, toMs, resolveAuthorDisplayState } from "../MessagesApp";
 import type { ContentBlock } from "../MessagesApp";
+import { copyText } from "@/lib/clipboard";
 import type { AttachmentRecord } from "@/lib/chat-attachments-api";
+import type { Receipt } from "@/lib/a2a-receipts-api";
 import { displayAuthor } from "./format-author";
 import type { LiveAgent, ArchivedAgentEntry, Channel } from "./types";
 
 const EMOJI_PICKER = ["👍", "❤️", "😂", "🎉", "🤔", "👀", "🚀", "✅"];
+
+type ReceiptTickState = "sent" | "delivered" | "seen";
+
+function computeReceiptTick(
+  msgAuthorId: string,
+  currentUserId: string | null,
+  channelMembers: string[] | undefined,
+  receipts: Receipt[],
+): ReceiptTickState {
+  if (msgAuthorId !== currentUserId || !currentUserId) return "sent";
+  const addressees = (channelMembers ?? []).filter((m) => m !== currentUserId);
+  if (addressees.length === 0) return "sent";
+  const receiptMap = new Map(receipts.map((r) => [r.agent_id, r]));
+  const allHaveRow = addressees.every((a) => receiptMap.has(a));
+  if (!allHaveRow) return "sent";
+  const allSeen = addressees.every((a) => receiptMap.get(a)?.seen_at != null);
+  return allSeen ? "seen" : "delivered";
+}
+
+function ReceiptTick({ state, seenAt }: { state: ReceiptTickState; seenAt?: number }) {
+  const ariaLabel = state === "sent" ? "Sent" : state === "delivered" ? "Delivered" : "Seen";
+  const title =
+    state === "seen" && seenAt != null
+      ? `Seen ${new Date(seenAt * 1000).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`
+      : undefined;
+  if (state === "sent") {
+    return <Check size={12} aria-label={ariaLabel} className="inline-block" />;
+  }
+  return (
+    <CheckCheck
+      size={12}
+      aria-label={ariaLabel}
+      className={`inline-block ${state === "seen" ? "text-accent" : "text-shell-text-tertiary"}`}
+    >
+      {title ? <title>{title}</title> : null}
+    </CheckCheck>
+  );
+}
 
 export interface MessageRow {
   id: string;
@@ -55,9 +98,12 @@ export interface MessageRow {
   reactions?: Record<string, string[]>;
   edited_at?: number | string;
   deleted_at?: number | null;
+  delivered_at?: number | null;
   attachments?: AttachmentRecord[];
   reply_count?: number;
   last_reply_at?: number | null;
+  /** A2A per-recipient receipts loaded via GET /a2a/messages/{id}/receipts. */
+  receipts?: Receipt[];
 }
 
 export interface MessageListProps {
@@ -143,6 +189,8 @@ export interface MessageListProps {
   /* ---- typing ---- */
   typingHumans: string[];
   typingAgents: AgentTyping[];
+  /** A2A receipts keyed by message id. Used to render read-receipt ticks. */
+  receipts: Record<string, Receipt[]>;
 }
 
 export interface MessageListHandle {
@@ -190,6 +238,7 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
   onOpenSettings,
   typingHumans,
   typingAgents,
+  receipts,
 }: MessageListProps, ref: React.Ref<MessageListHandle>) {
   const messageListRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -219,6 +268,8 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
           <Hash size={16} className="text-white/40" />
         ) : channel?.type === "group" ? (
           <Users size={16} className="text-white/40" />
+        ) : channel?.type === "dm-remote" ? (
+          <Globe size={16} className="text-white/40" />
         ) : (
           <AtSign size={16} className="text-white/40" />
         )}
@@ -360,7 +411,7 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
             <MessageCircle size={40} className="mb-3 opacity-30" />
             <p className="text-sm">
               No messages yet. Say hello to{" "}
-              {channel?.type === "dm"
+              {channel?.type === "dm" || channel?.type === "dm-remote"
                 ? `@${(channel.members ?? []).find((m) => m !== "user") ?? "them"}`
                 : channel?.name
                   ? `#${channel.name}`
@@ -558,6 +609,38 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
                             (error)
                           </span>
                         )}
+                        {channel?.type === "dm-remote" &&
+                          msg.author_id === currentUserId &&
+                          !["pending", "streaming"].includes(msg.state ?? "") && (
+                            <span className="ml-1 text-shell-text-tertiary inline-flex items-center">
+                              {msg.delivered_at ? (
+                                <CheckCheck size={12} aria-hidden="true" />
+                              ) : (
+                                <Check size={12} aria-hidden="true" />
+                              )}
+                            </span>
+                          )}
+                        {msg.author_id === currentUserId &&
+                          msg.state !== "pending" &&
+                          msg.state !== "streaming" &&
+                          (() => {
+                            const tickState = computeReceiptTick(
+                              msg.author_id,
+                              currentUserId,
+                              channel?.members,
+                              msg.receipts ?? receipts[msg.id] ?? [],
+                            );
+                            const seenAt = tickState === "seen"
+                              ? (msg.receipts ?? receipts[msg.id] ?? []).find(
+                                  (r) => (channel?.members ?? []).includes(r.agent_id) && r.agent_id !== currentUserId,
+                                )?.seen_at ?? undefined
+                              : undefined;
+                            return (
+                              <span className="ml-1 inline-flex items-center">
+                                <ReceiptTick state={tickState} seenAt={seenAt} />
+                              </span>
+                            );
+                          })()}
                       </div>
                     </div>
                   )}
@@ -804,13 +887,13 @@ function CopyButton({
 
   const handleCopy = async () => {
     if (!content) return;
-    try {
-      await navigator.clipboard.writeText(content);
+    const ok = await copyText(content);
+    if (ok) {
       setCopied(true);
       setClipError(false);
       if (timerRef.current) clearTimeout(timerRef.current);
       timerRef.current = setTimeout(() => setCopied(false), 1500);
-    } catch {
+    } else {
       setClipError(true);
       if (errorTimerRef.current) clearTimeout(errorTimerRef.current);
       errorTimerRef.current = setTimeout(() => setClipError(false), 2500);
