@@ -393,7 +393,14 @@ def _is_agent_container_quota_path(method: str, path: str) -> bool:
 # wrapping a WS upgrade can cause connection-level issues in some Starlette
 # versions, so /ws/ remains exempt at the middleware layer; the per-endpoint
 # check is the authoritative guard for all WebSocket endpoints.
-EXEMPT_PREFIXES = ("/static/", "/desktop/", "/chat-pwa/", "/ws/", "/shortcut/", "/api/peer/", "/auth/lock-avatar/")
+# The lock screen renders BEFORE sign-in, so every URL it fetches has to be
+# reachable without a session or the screen half-loads with no visible error.
+# The two /auth/lock-* prefixes are its per-agent reads (portrait, conversation);
+# both are console-gated in the route itself, which is where that check belongs.
+EXEMPT_PREFIXES = (
+    "/static/", "/desktop/", "/chat-pwa/", "/ws/", "/shortcut/", "/api/peer/",
+    "/auth/lock-avatar/", "/auth/lock-thread/",
+)
 
 # Consent-loop status-poll paths are unauthenticated (the opaque request_id is
 # the capability), but the sub-action paths (/approve, /deny) require admin

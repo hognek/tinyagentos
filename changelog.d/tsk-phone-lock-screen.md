@@ -20,3 +20,6 @@
   swayidle never saw its resume, stayed latched idle and never reached its
   timeout again. The key handler now re-arms the idle watcher through the
   compositor.
+- Fixed: the conversation sheet opened empty. `/auth/lock-thread/` was never
+  added to the auth middleware's exempt prefixes, so the lock screen — which
+  renders before sign-in — got a 401 with nothing shown and nothing logged.

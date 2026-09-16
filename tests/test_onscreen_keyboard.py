@@ -298,6 +298,26 @@ class TestNumericLayoutForPin:
             r"\.ls-msg,\s*\.ls-compose-input\s*\{[^}]*user-select:\s*text", login_console
         ), "selection should still work inside the conversation"
 
+    def test_every_url_the_lock_screen_fetches_is_reachable_pre_auth(self):
+        """The lock screen renders BEFORE sign-in, so anything it fetches must be
+        exempt from the auth middleware or it 401s.
+
+        This is derived from the script rather than listed by hand: the defect it
+        guards was a new per-agent route (/auth/lock-thread/) added to the page
+        and to EXEMPT_PATHS' sibling list but NOT to EXEMPT_PREFIXES, so the
+        conversation sheet opened empty with nothing logged. A hand-maintained
+        list would have been updated in the same pass that forgot the prefix.
+        """
+        from tinyagentos.auth_middleware import EXEMPT_PATHS, EXEMPT_PREFIXES
+
+        urls = set(re.findall(r'fetch\(\s*"([^"]+)"', LOCK_SCRIPT))
+        assert urls, "no fetches found -- the regex stopped matching the script"
+        for url in sorted(urls):
+            exempt = url in EXEMPT_PATHS or any(
+                url.startswith(prefix) for prefix in EXEMPT_PREFIXES
+            )
+            assert exempt, f"{url} is fetched pre-auth but is not exempt"
+
     def test_lock_screen_renders_its_own_keypad(self, login_console):
         assert 'id="ls-pad"' in login_console
         for digit in "0123456789":

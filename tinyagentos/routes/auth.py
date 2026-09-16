@@ -418,13 +418,13 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
    wordmark into a 34px circle would cut the word in half. It gets a wider slot
    and is contained inside it, while the harness badge stays exactly where it is
    on every other island. */
-.ls-island[data-system="1"] .ls-marks { width: 64px; }
-.ls-island[data-system="1"] .ls-avatar {
-  width: 46px; border-radius: 0; background: none;
-}
-.ls-island[data-system="1"] .ls-avatar-img {
-  border-radius: 0; object-fit: contain;
-}
+/* Same circle, same size as every other avatar -- a row of pills whose first
+   mark is a different shape and size reads as a mis-render, not as emphasis.
+   The only differences are the ground (a flat dark disc rather than the
+   per-name gradient, which is there to make INITIALS legible) and `contain`,
+   because the wordmark is landscape and `cover` would crop it to "aO". */
+.ls-island[data-system="1"] .ls-avatar { background: #0f0f12; }
+.ls-island[data-system="1"] .ls-avatar-img { object-fit: contain; }
 .ls-sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
 /* One stroke weight and one cap style across the marks. */
 .ls-fw svg, .ls-sprite {
@@ -669,7 +669,7 @@ body.lockscreen-on .osk-toggle { display: none; }
   background: linear-gradient(145deg, var(--ls-a, #4c9aff), var(--ls-b, #2f6fd0));
 }
 .ls-sheet-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
-.ls-sheet-avatar[data-system="1"] { border-radius: 0; background: none; width: 52px; }
+.ls-sheet-avatar[data-system="1"] { background: #0f0f12; }
 .ls-sheet-avatar[data-system="1"] img { object-fit: contain; }
 .ls-sheet-name {
   font-size: 15px; font-weight: 600; color: rgba(255,255,255,0.94);
@@ -1626,7 +1626,19 @@ _LOCK_SCREEN_SCRIPT = r"""
       // Open at the newest message, the way every messaging app does. Set
       // directly rather than scrollIntoView so it does not also scroll the page
       // behind the sheet.
+      //
+      // Twice, on the next frame: setting scrollTop in the same frame the
+      // bubbles were appended measures a scrollHeight that layout has not
+      // finished computing, and the thread opens with its last message clipped
+      // behind the composer. The second frame catches the reflow that wrapping
+      // the final bubble causes. Measured on the device.
       msgsEl.scrollTop = msgsEl.scrollHeight;
+      requestAnimationFrame(function () {
+        msgsEl.scrollTop = msgsEl.scrollHeight;
+        requestAnimationFrame(function () {
+          msgsEl.scrollTop = msgsEl.scrollHeight;
+        });
+      });
     }
 
     function openChat(agent) {
