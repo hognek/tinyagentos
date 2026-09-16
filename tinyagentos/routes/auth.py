@@ -353,7 +353,7 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
 .ls-statusbar .ls-widget b { color: rgba(255,255,255,0.80); }
 .ls-brand { grid-column: 2; justify-self: center; }
 .ls-brand b { font-weight: 700; }
-#ls-battery { grid-column: 3; justify-self: end; }
+#ls-battery { grid-column: 3; justify-self: end; margin-right: 4px; }
 /* Widgets are CLIENT-SIDE only (clock, battery) plus the device's own name.
    Nothing here reads the account or its data: this surface is shown BEFORE
    authentication, so anything account-derived would be a pre-auth leak. */
