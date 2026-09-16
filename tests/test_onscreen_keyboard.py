@@ -695,3 +695,60 @@ class TestLockScreenFeedScrollsAsOne:
         # The plain .ls-feed rule must not carry a mask of its own.
         feed = re.search(r"\.ls-feed\s*\{([^}]*)\}", login_console)
         assert feed and "mask-image" not in feed.group(1)
+
+
+class TestTheIslandRepaintKeepsKeyboardFocus:
+    """The islands poll every 15 seconds and paintActivity rebuilds the list.
+
+    Measured on the handset over CDP before this was fixed: focus an island,
+    wait 17s, and document.activeElement had fallen back to the lock screen
+    body. Because the six islands and their six mic buttons come BEFORE the
+    notification stacks in tab order, a keyboard or switch-access user was
+    thrown back to the top every 15 seconds and could never tab far enough to
+    reach a stack at all -- while `island()` carries a comment promising it is
+    "reachable by tab". The notification stacks polled at 15 MINUTES and kept
+    their focus, which is why only half the surface looked broken.
+    """
+
+    def _paint_activity(self):
+        """The body of paintActivity, which is the function that wipes the list."""
+        start = LOCK_SCRIPT.index("function paintActivity(")
+        end = LOCK_SCRIPT.index("function pollActivity(", start)
+        return LOCK_SCRIPT[start:end]
+
+    def test_focus_is_captured_before_the_wipe_and_restored_after_the_rebuild(self):
+        """Ordering is the whole assertion.
+
+        Reading activeElement AFTER `agentsEl.textContent = ""` reads the body,
+        because the wipe is what moved focus there -- so a capture in the wrong
+        place records nothing and restores nothing while looking correct.
+        """
+        body = self._paint_activity()
+        capture = body.index("document.activeElement")
+        wipe = body.index('agentsEl.textContent = ""')
+        restore = body.index(".focus()")
+        assert capture < wipe, "focus must be read BEFORE the list is wiped"
+        assert wipe < restore, "focus must be restored AFTER the list is rebuilt"
+
+    def test_the_island_is_found_again_by_a_stable_key_not_by_position(self):
+        """Restoring by index moves focus to a DIFFERENT agent whenever the list
+        reorders between polls, which is worse than losing focus: the user's next
+        Enter opens an agent they never selected."""
+        assert 'el.setAttribute("data-agent", name)' in LOCK_SCRIPT
+        body = self._paint_activity()
+        assert '.ls-island[data-agent="' in body
+
+    def test_the_mic_button_keeps_focus_rather_than_the_island(self):
+        """An island and its mic button are separate tab stops that do different
+        things. Restoring the island when the user was on the mic silently
+        re-aims the next Enter from 'dictate' to 'open conversation'."""
+        body = self._paint_activity()
+        assert "focusWasMic" in body
+        assert '.ls-mic' in body
+
+    def test_focus_is_not_moved_when_the_agent_is_gone(self):
+        """If that agent disappeared, the body is the correct place for focus."""
+        body = self._paint_activity()
+        assert re.search(r"if \(again\)", body), (
+            "restore must be conditional on the element still existing"
+        )

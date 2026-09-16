@@ -1490,6 +1490,11 @@ _LOCK_SCREEN_SCRIPT = r"""
 
       var el = document.createElement("div");
       el.className = "ls-island";
+      // Stable identity across repaints. The 15s poll rebuilds this list, and
+      // without a key there is no way to put keyboard focus back on the island
+      // the user was actually on -- an index would silently move the focus to a
+      // different agent whenever the list reorders.
+      el.setAttribute("data-agent", name);
       el.setAttribute("data-state", busy ? "busy" : "idle");
       if (agent.attention) el.setAttribute("data-attention", "1");
       // An island OPENS something, so it is a button, not a list item: it has
@@ -1594,6 +1599,24 @@ _LOCK_SCREEN_SCRIPT = r"""
       // keeps running; the next tick after the sheet closes paints.
       var openSheetName = screenEl ? screenEl.getAttribute("data-sheet") : "none";
       if (openSheetName && openSheetName !== "none") return;
+
+      // Wiping agentsEl destroys whichever island holds keyboard focus, and the
+      // browser drops focus to the body. At a 15s poll that means a keyboard or
+      // switch-access user is thrown back to the top of the page every 15
+      // seconds -- and since the islands and their mic buttons come BEFORE the
+      // notification stacks in tab order, they could never tab far enough to
+      // reach a stack at all. Remember where focus was and put it back.
+      var focusKey = null;
+      var focusWasMic = false;
+      var active = document.activeElement;
+      if (active && agentsEl.contains(active)) {
+        var owner = active.closest ? active.closest(".ls-island") : null;
+        if (owner) {
+          focusKey = owner.getAttribute("data-agent");
+          focusWasMic = active !== owner;
+        }
+      }
+
       agentsEl.textContent = "";
       tasksEl.textContent = "";
       var agents = data.agents || [];
@@ -1623,6 +1646,21 @@ _LOCK_SCREEN_SCRIPT = r"""
         tasksEl.appendChild(more);
       }
       card.hidden = false;
+
+      // Put focus back on the same agent, and on the same control within it.
+      // Only when the element is still there: if that agent has gone away,
+      // leaving focus on the body is correct -- moving it to a neighbour would
+      // aim the user's next Enter at an agent they never selected.
+      if (focusKey !== null) {
+        var again = agentsEl.querySelector(
+          '.ls-island[data-agent="' + (window.CSS && CSS.escape
+            ? CSS.escape(focusKey) : focusKey.replace(/["\\]/g, "\\$&")) + '"]');
+        if (again) {
+          var target = focusWasMic ? (again.querySelector(".ls-mic") || again) : again;
+          target.focus();
+        }
+      }
+
       syncFeedFade();
     }
 
