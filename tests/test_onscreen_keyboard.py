@@ -711,8 +711,14 @@ class TestLockScreenFeedScrollsAsOne:
     def test_the_fade_is_measured_not_assumed(self, login_console):
         """An unconditional mask eats the bottom of the last card on a device
         with one agent and no notifications, where nothing scrolls."""
+        # The measurement moved into `feedOverflows()` when the unlock-swipe
+        # veto (tsk-6bjsvg) came to need the same answer; asserted through the
+        # helper so the fade is still proven to ASK rather than assume, and so
+        # gutting it to a constant still fails here.
+        assert re.search(r"var over = feedOverflows\(\);", LOCK_SCRIPT)
         assert re.search(
-            r"var over = feedEl\.scrollHeight - feedEl\.clientHeight", LOCK_SCRIPT
+            r"function feedOverflows\(\)[^}]*feedEl\.scrollHeight - feedEl\.clientHeight",
+            LOCK_SCRIPT,
         )
         # The plain .ls-feed rule must not carry a mask of its own.
         feed = re.search(r"\.ls-feed\s*\{([^}]*)\}", login_console)

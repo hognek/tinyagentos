@@ -1767,12 +1767,21 @@ _LOCK_SCREEN_SCRIPT = r"""
     // -----------------------------------------------------------------------
     var feedEl = document.getElementById("ls-feed");
 
+    // Does the feed actually have somewhere to scroll? Measured, never assumed:
+    // on a device with one agent and no notifications the feed still fills the
+    // middle of the screen but has nothing to move. TWO behaviours hang off
+    // this -- the cut-edge fade below and the unlock-swipe veto near the
+    // gestures -- and they must agree, so the 4px tolerance is defined once.
+    function feedOverflows() {
+      return !!feedEl && feedEl.scrollHeight - feedEl.clientHeight > 4;
+    }
+
     // Which edges of the feed are cut. Measured rather than assumed: whether
     // this device's screen can hold its agents and notifications at once
     // depends on how many of each it has and how tall the panel is.
     function syncFeedFade() {
       if (!feedEl) return;
-      var over = feedEl.scrollHeight - feedEl.clientHeight > 4;
+      var over = feedOverflows();
       var atTop = feedEl.scrollTop <= 2;
       var atEnd = feedEl.scrollTop + feedEl.clientHeight >= feedEl.scrollHeight - 2;
       var fade = "none";
@@ -2119,11 +2128,17 @@ _LOCK_SCREEN_SCRIPT = r"""
     // dismiss gesture now lives ONLY on the sheet's header -- the grabber is
     // the handle, which is what the grabber is for -- and the unlock swipe is
     // only armed while nothing is open.
-    function swipe(surface, onUp, onDown, guard) {
-      var y0 = null, x0 = null, moved = false;
+    // `veto` decides, FROM THE TOUCH THAT STARTED THE GESTURE, that this drag
+    // is not ours at all. It is deliberately latched at touchstart and never
+    // re-read: over a long drag the finger travels far from where it landed, so
+    // touchend's target is a different element than the one the user began on.
+    // Reading the end would misjudge exactly the gesture we mean to exclude.
+    function swipe(surface, onUp, onDown, guard, veto) {
+      var y0 = null, x0 = null, moved = false, vetoed = false;
       surface.addEventListener("touchstart", function (ev) {
         var t = ev.touches[0];
         y0 = t.clientY; x0 = t.clientX; moved = false;
+        vetoed = !!(veto && veto(ev));
       }, { passive: true });
       surface.addEventListener("touchmove", function (ev) {
         if (y0 === null) return;
@@ -2134,7 +2149,9 @@ _LOCK_SCREEN_SCRIPT = r"""
         if (y0 === null) return;
         var t = ev.changedTouches[0];
         var dy = t.clientY - y0, dx = t.clientX - x0;
-        y0 = null; x0 = null;
+        var dead = vetoed;
+        y0 = null; x0 = null; vetoed = false;
+        if (dead) return;
         // Vertical intent, and a long one. The threshold is deliberately well
         // past a scroll flick, and a drag more horizontal than vertical is
         // never a dismiss.
@@ -2146,8 +2163,26 @@ _LOCK_SCREEN_SCRIPT = r"""
     }
 
     // Unlock: only from the resting screen, so it can never fight a sheet.
+    //
+    // Swipe-up-to-unlock is armed over the WHOLE resting screen on purpose --
+    // this is a phone in a hand, and a user should not have to find a target.
+    // The feed is the single exception: reading to the end of a long
+    // notification list is one long upward drag, which is indistinguishable
+    // from an unlock by distance alone, so the reader was being thrown into the
+    // keypad. `overscroll-behavior: contain` cannot help; it stops scroll
+    // CHAINING, not an ancestor's JS listener.
+    //
+    // The exception is narrowed to the case that actually collides: a feed with
+    // somewhere to scroll. A feed that cannot move is not being read, and
+    // vetoing there would kill unlock across most of the glass on a device with
+    // one agent and no notifications -- the first screen a new user ever sees.
+    // Same reasoning, and the same measurement, as the cut-edge fade.
     swipe(document.body, openPasscode, null, function () {
       return !screenEl || screenEl.getAttribute("data-sheet") === "none";
+    }, function (ev) {
+      var t = ev.target;
+      if (!t || !t.closest || !t.closest(".ls-feed")) return false;
+      return feedOverflows();
     });
     // Dismiss: only by dragging the sheet's own header.
     var chatHead = chatSheet ? chatSheet.querySelector(".ls-sheet-head") : null;
