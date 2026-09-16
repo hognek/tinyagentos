@@ -3103,8 +3103,8 @@ _LOCK_SCREEN_SCRIPT = r"""
 
     // label, verb, glyph, note, and whether Jay asked for a confirm step.
     var POWER_ITEMS = [
-      ["Power off", "poweroff", "⏻", "", false],
-      ["Restart", "reboot", "↻", "", false],
+      ["Power off", "poweroff", "⏻", "", true],
+      ["Restart", "reboot", "↻", "", true],
       ["Stop all agents", "stop-agents", "■", "Halts every running agent", true],
       ["Screenshot", "screenshot", "⌘", "Saves to the device", false],
       ["Emergency call", "emergency", "✢", "", true]
@@ -3184,9 +3184,16 @@ _LOCK_SCREEN_SCRIPT = r"""
       q.textContent = item[0] + "?";
       var note = document.createElement("div");
       note.className = "ls-power-confirm-note";
-      note.textContent = item[1] === "stop-agents"
-        ? "Every running agent stops. Nobody is signed in, so this cannot be undone from here."
-        : "There is no dialer configured on this device.";
+      // Jay asked for the shutdown button to confirm too, after tapping it by
+      // accident while testing. Restart gets the same treatment: on a phone
+      // being demoed, an accidental restart costs the same minute.
+      var NOTES = {
+        "poweroff": "The phone switches off. It needs the power key to come back.",
+        "reboot": "The phone restarts. Agents stop and come back with it.",
+        "stop-agents": "Every running agent stops. Nobody is signed in, so this cannot be undone from here.",
+        "emergency": "There is no dialer configured on this device."
+      };
+      note.textContent = NOTES[item[1]] || "";
       var row = document.createElement("div");
       row.className = "ls-power-confirm-row";
       var no = document.createElement("button");

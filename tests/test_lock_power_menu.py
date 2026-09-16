@@ -262,7 +262,13 @@ class TestTheMenuOnTheGlass:
         table = js[start:js.index("];", start)]
         rows = [r for r in table.split("[") if '"' in r and "," in r]
         confirming = [r.split('"')[1] for r in rows if r.rstrip(" ],\n").endswith("true")]
-        assert set(confirming) == {"Stop all agents", "Emergency call"}, confirming
+        # Jay asked for Stop all agents and Emergency call first, then added the
+        # shutdown button after tapping it by accident while testing. Restart
+        # carries the same guard: on a phone being demoed an accidental restart
+        # costs the same minute as an accidental shutdown.
+        assert set(confirming) == {
+            "Power off", "Restart", "Stop all agents", "Emergency call",
+        }, confirming
 
     def test_the_page_subscribes_to_the_push_channel(self):
         assert 'EventSource("/auth/lock-events")' in auth._LOCK_SCREEN_SCRIPT
