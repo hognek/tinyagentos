@@ -804,9 +804,24 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
    Pressing a stack fans it out in place. That is ALL a press does: this screen
    renders before sign-in, so there is nothing here to open into. */
 .ls-notifs {
-  display: flex; flex-direction: column; align-items: center; gap: 12px;
+  /* 18px, not 12: Jay, from the glass -- "the alert cards/banners need a little
+     space between eachother vertically". A collapsed stack also carries 13px of
+     padding-bottom for the cards peeking out behind it, so at 12px a
+     single-item alert (which has nothing peeking) sat visually tighter against
+     its neighbour than a stack did. */
+  display: flex; flex-direction: column; align-items: center; gap: 18px;
   width: 100%; align-self: stretch;
 }
+/* The pending-decision list at the head of the alerts panel. It had NO rule at
+   all, so its .ls-row cards -- which rely on a flex gap like every other list
+   on this screen -- stacked flush against each other with nothing between
+   them. It is the first thing in the panel, so that was the tightest spot on
+   the screen. */
+.ls-decisions {
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  width: 100%;
+}
+.ls-decisions:empty { display: none; }
 .ls-notif-group {
   position: relative;
   width: 100%; max-width: var(--ls-card-w);
@@ -5477,53 +5492,41 @@ async def lock_weather(request: Request):
 #: glyph for that source.
 _DEMO_NOTIFICATIONS: tuple[dict, ...] = (
     {
-        "source": "mail",
-        "app": "Mail",
-        "glyph": "mail",
-        "tint": "#2f6fd0",
+        "source": "agent",
+        "app": "Agents",
+        "mono": "ta",
+        "tint": "#4c9aff",
         "items": (
-            (12, "Hargreaves & Co", "Re: Thursday's site visit — 09:15 works for us. I'll bring the revised drawings."),
-            (74, "Companies House", "Your confirmation statement is due on 3 October."),
-            (221, "Liverpool FC", "Your ticket ballot result for Newcastle (H) is ready to view."),
+            (6, "Accountant finished reconciling", "September invoices are matched. 2 need your eye."),
+            (52, "Social Media Manager posted", "3 scheduled posts went out this morning."),
         ),
     },
     {
-        "source": "x",
-        "app": "X",
-        "mono": "X",
-        "tint": "#3b3b42",
+        "source": "system",
+        "app": "System",
+        "mono": "sy",
+        "tint": "#8e8e93",
         "items": (
-            (8, "@marcus_dev mentioned you", "what's the actual memory floor for running this on a 4GB board?"),
-            (96, "12 posts from people you follow", "including 3 about on-device inference"),
+            (23, "Battery health check passed", "Capacity 94%. Next check in 30 days."),
+            (140, "taOS updated to build 412", "Lock screen panels and the new Projects view."),
         ),
     },
     {
-        "source": "reddit",
-        "app": "Reddit",
-        "mono": "r",
-        "tint": "#ff4500",
+        "source": "security",
+        "app": "Security",
+        "mono": "se",
+        "tint": "#ff9f0a",
         "items": (
-            (34, "r/selfhosted · 47 upvotes", "Someone replied to your comment on “Running an agent OS on a single board”."),
-            (150, "r/LocalLLaMA", "Today's discussion thread is up."),
+            (88, "New sign-in on the desktop app", "From your usual network. Tap if this was not you."),
         ),
     },
     {
-        "source": "phone",
-        "app": "Phone",
-        "glyph": "phone",
-        "tint": "#34c759",
+        "source": "backup",
+        "app": "Backup",
+        "mono": "bk",
+        "tint": "#30d158",
         "items": (
-            (41, "Missed call", "2 missed calls"),
-        ),
-    },
-    {
-        "source": "sms",
-        "app": "Messages",
-        "glyph": "sms",
-        "tint": "#25c05d",
-        "items": (
-            (19, "Sam", "are you still alright for Sunday?"),
-            (310, "O2", "You've used 80% of your data allowance this month."),
+            (300, "Nightly backup completed", "412 MB in 41s. Nothing skipped."),
         ),
     },
 )
@@ -5736,6 +5739,18 @@ _DEMO_MAILBOX: tuple[dict, ...] = (
         "unread": True,
     },
     {
+        "key": "mail-lfc",
+        "source": "mail",
+        "app": "Mail",
+        "who": "Liverpool FC",
+        "subject": "Ticket ballot result: Newcastle (H)",
+        "preview": "Your ballot result is ready to view.",
+        "minutes": 68,
+        "glyph": "mail",
+        "tint": "#2f6fd0",
+        "unread": True,
+    },
+    {
         "key": "mail-companies-house",
         "source": "mail",
         "app": "Mail",
@@ -5863,7 +5878,7 @@ _DEMO_APPS: tuple[dict, ...] = (
         "mono": "r",
         "tint": "#ff4500",
         "badge": 12,
-        "note": "r/selfhosted replies",
+        "note": "Reply on “Running an agent OS”",
     },
     {
         "key": "app-bank",
@@ -5898,7 +5913,7 @@ _DEMO_APPS: tuple[dict, ...] = (
         "mono": "X",
         "tint": "#3b3b42",
         "badge": 9,
-        "note": "Mentions and 2 DMs",
+        "note": "12 posts from people you follow",
     },
     {
         "key": "app-photos",
