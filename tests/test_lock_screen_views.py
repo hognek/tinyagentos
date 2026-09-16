@@ -17,6 +17,7 @@ made before.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -557,3 +558,58 @@ class TestTheViewListCannotDrift:
         monkeypatch.setattr(auth, "_LOCK_SCREEN_SCRIPT", "(function(){})();")
         with pytest.raises(RuntimeError, match="__LOCK_VIEWS__"):
             auth._lock_screen_js()
+
+
+class TestTheTopEdgeIsMeasured:
+    """The status row sits on the camera line, and the cards are capped once.
+
+    Both numbers came from a measurement rather than from nudging something
+    until it looked right, so both are re-derived here: if someone changes the
+    token, this says WHICH measurement they just contradicted.
+    """
+
+    #: Nothing's own `config_mainBuiltInDisplayCutout` for spacewar, verbatim,
+    #: out of the stock FrameworksResCommon_Sys_Spacewar.apk overlay (and
+    #: byte-identical in LineageOS's device tree -- two independent sources).
+    #: Android reads this in PHYSICAL pixels unless it ends `@dp`; `@left` only
+    #: moves the origin to the top-left of the panel.
+    CUTOUT_PATH = (
+        "M89.3,42.31 m0,26.19 a26.19,26.19 0 1,0 52.38,0 a26.19,26.19 0 1,0 -52.38,0 Z @left"
+    )
+    #: sway's scale for DSI-1, measured on the handset with `swaymsg -t
+    #: get_outputs`: the panel is 1080x2400 and the page sees 540x1200.
+    OUTPUT_SCALE = 2.0
+
+    def _token(self, name: str) -> float:
+        m = re.search(rf"{re.escape(name)}:\s*([0-9.]+)px", auth._LOCK_SCREEN_STYLE)
+        assert m, f"{name} is gone from the lock screen stylesheet"
+        return float(m.group(1))
+
+    def test_the_status_row_is_centred_on_the_camera(self):
+        """Derived from the cutout path, not copied from the stylesheet."""
+        start_y = float(re.match(r"M[\d.]+,([\d.]+)", self.CUTOUT_PATH).group(1))
+        # The `m` hop moves the pen down one radius, to the circle's left-hand
+        # point, so the centre's y is the pen's y after the hop.
+        hop_y = float(re.search(r" m[\d.-]+,([\d.-]+)", self.CUTOUT_PATH).group(1))
+        centre_y_physical = start_y + hop_y
+        assert centre_y_physical == 68.50
+
+        expected_css_px = centre_y_physical / self.OUTPUT_SCALE
+        assert self._token("--ls-cam-centre-y") == pytest.approx(expected_css_px)
+
+    def test_the_padding_puts_that_centre_where_the_camera_is(self):
+        """The row's CENTRE, not its top edge -- half its height is subtracted.
+
+        Asserted on the formula because the alternative is a number: a literal
+        padding that happens to be right today is exactly what stops being right
+        the moment the row's height changes.
+        """
+        style = auth._LOCK_SCREEN_STYLE
+        assert "var(--ls-cam-centre-y) - var(--ls-status-h) / 2" in style
+        assert "min-height: var(--ls-status-h)" in style
+
+    def test_the_card_cap_still_fits_the_panel(self):
+        """436px of card inside a 540px viewport, less .lockscreen's padding."""
+        viewport_css_px = 1080 / self.OUTPUT_SCALE
+        side_padding = 10
+        assert self._token("--ls-card-w") <= viewport_css_px - 2 * side_padding

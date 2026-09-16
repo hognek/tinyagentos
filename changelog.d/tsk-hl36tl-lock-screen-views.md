@@ -25,3 +25,8 @@
   sway drives the panel at 1080x2400 with scale 2.0, so the page gets a 540px
   CSS viewport and that cap is what was actually holding the cards in — widening
   the side padding instead would only have moved the gutters.
+- Phone lock screen: the taOS wordmark and the battery reading sit level with
+  the middle of the punch-hole camera instead of above it. The camera's centre
+  is a measurement, not a nudge: the panel's own vendor description puts it
+  68.50 physical pixels down, which is 34.25 CSS pixels at the scale this
+  display runs at.

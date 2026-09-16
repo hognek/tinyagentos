@@ -294,6 +294,28 @@ _LOCK_SCREEN_STYLE = """
    would only have moved the gutters -- the cap would still have held the
    cards at their old width. */
 :root { --ls-card-w: 436px; }
+/* THE CAMERA LINE. The status row -- the taOS wordmark and the battery -- sits
+   level with the middle of the punch-hole camera, so the top edge reads as one
+   line of hardware and text rather than as text floating above a hole.
+
+   MEASURED, not nudged. There is no cutout information anywhere on this device
+   (nothing under /sys/firmware/devicetree/base, nothing in the pmaports device
+   package), so the number comes from the panel's own vendor description: the
+   stock Nothing OS overlay FrameworksResCommon_Sys_Spacewar.apk carries
+
+     config_mainBuiltInDisplayCutout = M89.3,42.31 m0,26.19 a26.19,26.19 0 1,0
+                                       52.38,0 a26.19,26.19 0 1,0 -52.38,0 Z @left
+
+   which is a circle of r=26.19 centred at (115.49, 68.50) in PHYSICAL pixels
+   from the top-left of the panel -- Android's path is in px unless it ends
+   @dp, and @left only moves the origin. The identical string is in LineageOS's
+   spacewar device tree, so it is two independent sources, not one dump.
+
+   68.50 physical px / 2 = 34.25 CSS px, because sway drives DSI-1 at
+   "scale": 2.0 (measured on the handset, same reading as --ls-card-w rests on).
+   The row is given an explicit height so "centred" is arithmetic rather than a
+   guess about line-height: its centre is padding-top + half of it. */
+:root { --ls-cam-centre-y: 34.25px; --ls-status-h: 20px; }
 /* display:block, NOT a flex row. The base stylesheet makes <body> a centring
    flex container for the sign-in card, and the on-screen keyboard appends its
    panel, toggle and live region to <body> -- under a flex ROW those become
@@ -322,7 +344,11 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
   width: 100%;
   height: 100vh;
   height: 100dvh;
-  padding: calc(env(safe-area-inset-top, 0px) + 14px) 10px calc(env(safe-area-inset-bottom, 0px) + 18px);
+  /* Top padding puts the status row's CENTRE on the camera line; it is not a
+     margin chosen by eye. See --ls-cam-centre-y. */
+  padding: calc(env(safe-area-inset-top, 0px) + var(--ls-cam-centre-y) - var(--ls-status-h) / 2)
+           10px
+           calc(env(safe-area-inset-bottom, 0px) + 18px);
   gap: 16px;
 }
 /* The clock keeps its distance from the status bar rather than the screen top. */
@@ -389,6 +415,10 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
      every time the battery string changed width (9% -> 100%). */
   display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
   align-self: stretch; flex: none;
+  /* An explicit height, so the camera line above is arithmetic and not a bet on
+     what line-height resolves to. align-items:center already centres the text
+     inside it. */
+  min-height: var(--ls-status-h);
   width: 100%; padding: 0 6px; gap: 10px;
   transition: filter 320ms cubic-bezier(0.32, 0.72, 0, 1), opacity 320ms ease;
 }
