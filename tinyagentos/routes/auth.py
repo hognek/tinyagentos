@@ -1243,7 +1243,15 @@ body.lockscreen-on .osk-toggle { display: none !important; }
 }
 .ls-sheet[hidden] { display: none; }
 .lockscreen[data-sheet="chat"] ~ #ls-chat,
+.lockscreen[data-sheet="power"] ~ #ls-power,
 .lockscreen[data-sheet="decision"] ~ #ls-decision { transform: translateY(0); }
+/* ⚠ EVERY sheet needs a line here. `.ls-sheet` rests at translateY(101%) and
+   only the names listed are pulled up, while the backdrop blur is driven by the
+   generic `:not([data-sheet="none"])` rules. So a sheet that is opened but not
+   named here produces EXACTLY what Jay saw: "Power button blurs screen but no
+   buttons show" -- the chrome reacts, the sheet stays off-screen, and nothing
+   errors. Same shape as the panels that painted 354 rows while `hidden`: a new
+   element added to a system whose visibility is a hand-written list of names. */
 /* The passcode sheet is the sign-in shell itself, so it gets the same motion
    rather than a second implementation of "a sheet". */
 .lockscreen .ls-foot {
@@ -3206,6 +3214,11 @@ _LOCK_SCREEN_SCRIPT = r"""
       // the controller restarts on every deploy and the page does not.
       try {
         var lockStream = new EventSource("/auth/lock-events");
+        // The panel is going dark. Put the sheet away NOW rather than leaving
+        // it up behind a black screen for the next wake to land on.
+        lockStream.addEventListener("screen-off", function () {
+          if (screenEl && screenEl.getAttribute("data-sheet") === "power") closeSheet();
+        });
         lockStream.addEventListener("power-menu", function () {
           paintPowerMenu();
           if (powerSub) {
@@ -6695,6 +6708,24 @@ async def lock_events(request: Request):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
+
+
+@router.post("/lock-screen-off")
+async def lock_screen_off(request: Request):
+    """The panel is being powered down. Put any open sheet away. Console-only.
+
+    Jay: "if I turn the screen off on the power menu it should also dismiss the
+    menu". Without this the menu is still up behind a dark screen, so the next
+    wake lands on a stale power menu the user has to dismiss before they can do
+    anything -- and on a lock screen that reads as the phone being stuck.
+
+    Posted by taos-kiosk-power as it powers the output off, so it covers every
+    route to a dark screen that goes through that script rather than only the
+    power key.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    return JSONResponse({"ok": True, "delivered": _push_lock_event("screen-off")})
 
 
 @router.post("/lock-power-menu")

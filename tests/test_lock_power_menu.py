@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 import pytest
 
@@ -205,6 +206,45 @@ class TestThePushChannel:
             auth._LOCK_EVENT_WAITERS.clear()
 
 
+class TestTurningTheScreenOffPutsTheMenuAway:
+    """Jay: "if I turn the screen off on the power menu it should also dismiss
+    the menu". Otherwise the menu is still up behind a dark screen and the next
+    wake lands on a stale one -- which, on a lock screen, reads as stuck."""
+
+    def test_the_signal_reaches_an_open_page(self, monkeypatch):
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: True)
+        auth._LOCK_EVENT_WAITERS.clear()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=8)
+        auth._LOCK_EVENT_WAITERS.add(queue)
+        try:
+            got = _body(_call(auth.lock_screen_off(_Req())))
+            assert got["delivered"] == 1
+            assert queue.get_nowait() == "screen-off"
+        finally:
+            auth._LOCK_EVENT_WAITERS.clear()
+
+    def test_it_is_console_only_and_exempt(self, monkeypatch):
+        assert "/auth/lock-screen-off" in EXEMPT_PATHS
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: False)
+        assert _call(auth.lock_screen_off(_Req())).status_code == 403
+
+    def test_the_page_closes_the_sheet_on_that_signal(self):
+        js = auth._LOCK_SCREEN_SCRIPT
+        assert 'addEventListener("screen-off"' in js
+        start = js.index('addEventListener("screen-off"')
+        handler = js[start:start + 400]
+        assert "closeSheet()" in handler, handler[:200]
+
+    def test_it_closes_only_the_power_sheet(self):
+        """A screen-off must not yank the passcode sheet out from under someone
+        mid-PIN: the panel going dark on a timeout is not a reason to throw away
+        what they were typing."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index('addEventListener("screen-off"')
+        handler = js[start:start + 400]
+        assert '=== "power"' in handler, handler[:200]
+
+
 class TestTheMenuOnTheGlass:
     """The page half, read out of the served script rather than re-typed."""
 
@@ -227,6 +267,33 @@ class TestTheMenuOnTheGlass:
     def test_the_page_subscribes_to_the_push_channel(self):
         assert 'EventSource("/auth/lock-events")' in auth._LOCK_SCREEN_SCRIPT
         assert 'addEventListener("power-menu"' in auth._LOCK_SCREEN_SCRIPT
+
+    def test_every_sheet_openSheet_knows_has_a_css_rule_that_reveals_it(self):
+        """The bug Jay hit: "Power button blurs screen but no buttons show".
+
+        `.ls-sheet` rests at translateY(101%) and is pulled up only by rules
+        that NAME each sheet, while the backdrop blur is driven by a generic
+        `:not([data-sheet="none"])` selector. So a sheet openSheet can open but
+        no rule names produces exactly that: the chrome reacts, the sheet stays
+        off screen, nothing throws and nothing logs.
+
+        Derived from sheetEl's own branches rather than a hand-kept list, so the
+        next sheet added is covered without anyone remembering to come here.
+        """
+        js = auth._LOCK_SCREEN_SCRIPT
+        css = auth._LOCK_SCREEN_STYLE
+        body = js[js.index("function sheetEl("):]
+        body = body[: body.index("\n    }")]
+        names = re.findall(r'name === "([a-z]+)"', body)
+        assert len(names) >= 4, names
+        for name in names:
+            # passcode is #ls-foot, which is positioned by its own rules rather
+            # than the shared sheet transform.
+            if name == "passcode":
+                continue
+            assert 'data-sheet="%s"' % name in css, (
+                "no CSS rule reveals the %r sheet: it will open invisibly" % name
+            )
 
     def test_the_sheet_exists_in_the_markup_and_is_reachable_by_name(self):
         html = auth._lock_head_html() if hasattr(auth, "_lock_head_html") else ""
