@@ -281,6 +281,19 @@ _LOCK_SCREEN_STYLE = """
 /* A handset is tall, and a sign-in card floating in the middle of 2400px of
    glass reads as a web page, not as an OS. The lock screen splits the height
    the way iOS and Android do: status up top, passcode down by the thumb. */
+/* THE COLUMN WIDTH. Everything stacked down the middle of this screen -- the
+   agent islands, the notification groups, the view row, the stats card -- is
+   one column, and it was six copies of the same number. A token, so widening
+   the islands cannot leave the row above them at the old width.
+
+   It is a cap, not a width: the elements are `width: 100%` under it. On
+   spacewar it BINDS, which is why this is the knob that moves them. Measured
+   on the device rather than assumed: sway drives DSI-1 at 1080x2400 with
+   `"scale": 2.0`, so the page gets a 540px CSS viewport, and .lockscreen's
+   10px side padding leaves 520px of content. Widening the padding instead
+   would only have moved the gutters -- the cap would still have held the
+   cards at their old width. */
+:root { --ls-card-w: 436px; }
 /* display:block, NOT a flex row. The base stylesheet makes <body> a centring
    flex container for the sign-in card, and the on-screen keyboard appends its
    panel, toggle and live region to <body> -- under a flex ROW those become
@@ -474,7 +487,7 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
   gap: 2px; flex: 0 0 auto;
   margin-top: 18px;
   /* The row is fixed chrome; only the feed under it is allowed to overflow. */
-  width: 100%; max-width: 396px; align-self: center;
+  width: 100%; max-width: var(--ls-card-w); align-self: center;
 }
 .ls-view-tab {
   -webkit-appearance: none; appearance: none;
@@ -554,7 +567,7 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
    readings read as another thing this screen shows rather than as a settings
    page that wandered in. */
 .ls-stat-card {
-  width: 100%; max-width: 396px;
+  width: 100%; max-width: var(--ls-card-w);
   padding: 16px 18px;
   display: flex; flex-direction: column; gap: 14px;
   background: rgba(255,255,255,0.06);
@@ -587,12 +600,12 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
 .ls-stat-note {
   font-size: 11.5px; line-height: 1.45;
   color: rgba(255,255,255,0.38);
-  max-width: 396px; text-align: center;
+  max-width: var(--ls-card-w); text-align: center;
 }
 .ls-stat-card .ls-stat-note { text-align: left; }
 .ls-chips {
   display: flex; flex-wrap: wrap; gap: 7px; justify-content: center;
-  width: 100%; max-width: 396px;
+  width: 100%; max-width: var(--ls-card-w);
 }
 .ls-chip {
   font-size: 12px; padding: 5px 11px; border-radius: 999px;
@@ -626,7 +639,7 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
 }
 .ls-notif-group {
   position: relative;
-  width: 100%; max-width: 396px;
+  width: 100%; max-width: var(--ls-card-w);
   animation: ls-island-in 520ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
 }
 /* Collapsed: only the newest card is in flow, so the group is exactly one card
@@ -701,7 +714,7 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
 .ls-notif-group[data-open="1"] .ls-notif-count { display: none; }
 .ls-island {
   display: flex; align-items: center; gap: 10px;
-  width: 100%; max-width: 396px;
+  width: 100%; max-width: var(--ls-card-w);
   padding: 7px 16px 7px 7px;
   border-radius: 999px;
   background: rgba(30, 30, 34, 0.92);

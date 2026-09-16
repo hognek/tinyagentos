@@ -16,3 +16,12 @@
   utilisation counter on this SoC, so none is shown, the GPU is labelled as a
   clock rather than as usage, and anything unmeasured renders `--` rather than
   zero.
+
+### Changed
+
+- Phone lock screen: the agent islands, notification stacks, view row and stats
+  card are ~10% wider (a 396px cap becomes 436px, now a single token rather than
+  six copies of the same number). Measured on the handset rather than guessed:
+  sway drives the panel at 1080x2400 with scale 2.0, so the page gets a 540px
+  CSS viewport and that cap is what was actually holding the cards in — widening
+  the side padding instead would only have moved the gutters.
