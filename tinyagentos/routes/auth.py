@@ -832,10 +832,134 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
 }
 .ls-decisions:empty { display: none; }
 
-/* THE POWER MENU. Big targets: this is reached by feel, often in the dark,
+/* THE PULL-DOWN SHADE, from the TOP edge -- the one surface on this screen that
+   does not come from the bottom, because that is where the gesture starts. It
+   deliberately does NOT cover the whole screen: a shade that fills the display
+   for one slider reads as a mode you have to escape, and the clock staying
+   visible behind it is what makes it feel like a shade rather than a page. */
+.ls-shade {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 70;
+  padding: calc(env(safe-area-inset-top, 0px) + 8px) 12px 14px;
+  transform: translateY(-101%);
+  transition: transform 340ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+.ls-shade[hidden] { display: none; }
+.lockscreen[data-sheet="shade"] ~ #ls-shade { transform: translateY(0); }
+.ls-shade-inner {
+  position: relative;
+  margin: 0 auto; width: 100%; max-width: var(--ls-card-w);
+  padding: 16px 16px 20px;
+  border-radius: 0 0 26px 26px;
+  background: rgba(24, 24, 27, 0.9);
+  box-shadow: 0 20px 50px -14px rgba(0, 0, 0, 0.9);
+  backdrop-filter: blur(30px) saturate(1.3);
+  -webkit-backdrop-filter: blur(30px) saturate(1.3);
+}
+.ls-shade-row { display: flex; align-items: center; gap: 12px; }
+.ls-shade-icon {
+  flex: none; width: 22px; height: 22px;
+  fill: none; stroke: rgba(255,255,255,0.8);
+  stroke-width: 1.7; stroke-linecap: round;
+}
+.ls-shade-value {
+  flex: none; min-width: 42px; text-align: right;
+  font-size: 14px; font-weight: 600; color: rgba(255,255,255,0.75);
+  font-variant-numeric: tabular-nums;
+}
+/* A tall track and a big thumb: this is dragged with a thumb in the dark, and
+   it is the control someone reaches for precisely when they cannot see well. */
+.ls-shade-slider {
+  flex: 1; min-width: 0; height: 34px; margin: 0;
+  -webkit-appearance: none; appearance: none; background: none;
+}
+.ls-shade-slider::-webkit-slider-runnable-track {
+  height: 10px; border-radius: 999px; background: rgba(255,255,255,0.18);
+}
+.ls-shade-slider::-webkit-slider-thumb {
+  -webkit-appearance: none; appearance: none;
+  width: 26px; height: 26px; margin-top: -8px;
+  border-radius: 50%; background: #fff;
+  box-shadow: 0 2px 8px -1px rgba(0,0,0,0.6);
+}
+.ls-shade-slider:focus-visible { outline: 3px solid #4c9aff; outline-offset: 4px; border-radius: 999px; }
+.ls-shade-note {
+  margin-top: 10px; font-size: 12px; line-height: 1.35;
+  color: rgba(255,176,32,0.9);
+}
+/* The grip, echoing the unlock grabber at the other end of the screen so the
+   two read as the same vocabulary. */
+.ls-shade-grip {
+  position: absolute; left: 50%; bottom: 7px; transform: translateX(-50%);
+  width: 38px; height: 4px; border-radius: 999px;
+  background: rgba(255,255,255,0.28);
+}
+@media (prefers-reduced-motion: reduce) {
+  .ls-shade { transition: none; }
+}
+
+/* THE POWER MENU. Jay: "I rather the power button menu be buttons centred on
+   the screen against blurred background like iOS."
+ *
+ * So it is NOT a bottom sheet. It is a centred dialog that scales up out of the
+ * blur -- the same shape iOS uses for an alert, and the right one here: this is
+ * a modal question with four answers, not a drawer of content you might browse.
+ * Centring also puts the targets under the thumb from either hand, which a
+ * bottom sheet does not once it is five rows tall.
+ *
+ * The backdrop blur is already there: `.lockscreen:not([data-sheet="none"])`
+ * blurs the chrome and `.ls-scrim` darkens behind it, both driven by the same
+ * data-sheet attribute this rides on. */
+.ls-modal {
+  position: fixed; inset: 0; z-index: 60;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+  /* Not shown until the attribute says so. pointer-events:none while hidden so
+     the invisible full-screen box cannot swallow a touch meant for the page --
+     a modal that is closed but still eating input is indistinguishable from a
+     frozen screen. */
+  opacity: 0; pointer-events: none;
+  transform: scale(0.92);
+  transition: opacity 200ms ease, transform 260ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+.ls-modal[hidden] { display: none; }
+.lockscreen[data-sheet="power"] ~ #ls-power {
+  opacity: 1; pointer-events: auto; transform: scale(1);
+}
+.ls-modal-card {
+  width: 100%; max-width: var(--ls-card-w);
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 20px 16px 14px;
+  border-radius: 28px;
+  background: rgba(28, 28, 30, 0.78);
+  box-shadow: 0 24px 60px -12px rgba(0, 0, 0, 0.9);
+  backdrop-filter: blur(34px) saturate(1.35);
+  -webkit-backdrop-filter: blur(34px) saturate(1.35);
+}
+.ls-modal-title {
+  text-align: center; font-size: 19px; font-weight: 700; color: #fff;
+}
+.ls-modal-sub {
+  text-align: center; margin-top: -4px; padding-bottom: 4px;
+  font-size: 12px; color: rgba(255,255,255,0.5);
+}
+/* Cancel, set apart from the actions above it. iOS puts the safe choice last
+   and makes it the plainest thing on the card; the dangerous ones should never
+   be what the thumb finds by default. */
+.ls-modal-cancel {
+  margin-top: 4px; padding: 13px; border: 0; border-radius: 16px;
+  font: inherit; font-size: 16px; font-weight: 600;
+  background: rgba(255,255,255,0.14); color: #fff;
+}
+.ls-modal-cancel:focus-visible { outline: 3px solid #4c9aff; outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) {
+  .ls-modal { transition: none; transform: none; }
+  .lockscreen[data-sheet="power"] ~ #ls-power { transform: none; }
+}
+
+/* The action rows. Big targets: this is reached by feel, often in the dark,
    sometimes in a hurry, and it is the one surface here where picking the wrong
    row costs something. */
-.ls-power-body { display: flex; flex-direction: column; gap: 8px; padding: 4px 0 6px; }
+.ls-power-body { display: flex; flex-direction: column; gap: 8px; padding: 2px 0 4px; }
 .ls-power-item {
   display: flex; align-items: center; gap: 13px;
   width: 100%; padding: 14px 15px; border: 0; border-radius: 18px;
@@ -844,6 +968,12 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
 }
 .ls-power-item:focus-visible { outline: 3px solid #4c9aff; outline-offset: 2px; }
 .ls-power-item[data-danger="1"] { color: #ff6b6b; }
+/* Emergency is not "destructive", it is URGENT: the whole row carries the
+   colour rather than just the label, so it is findable without reading. */
+.ls-power-item[data-emergency="1"] {
+  background: rgba(255,59,48,0.22); color: #ff8a80;
+}
+.ls-power-item[data-emergency="1"] .ls-power-glyph { background: rgba(255,59,48,0.28); }
 .ls-power-glyph {
   flex: none; width: 30px; height: 30px; border-radius: 9px;
   display: flex; align-items: center; justify-content: center;
@@ -1246,7 +1376,6 @@ body.lockscreen-on .osk-toggle { display: none !important; }
 }
 .ls-sheet[hidden] { display: none; }
 .lockscreen[data-sheet="chat"] ~ #ls-chat,
-.lockscreen[data-sheet="power"] ~ #ls-power,
 .lockscreen[data-sheet="decision"] ~ #ls-decision { transform: translateY(0); }
 /* ⚠ EVERY sheet needs a line here. `.ls-sheet` rests at translateY(101%) and
    only the names listed are pulled up, while the backdrop blur is driven by the
@@ -1986,19 +2115,38 @@ def _lock_tail_html() -> str:
        key always was. Power off and Restart add nothing the hardware key did
        not already allow; "Stop all agents" and "Emergency call" DO ask for
        something more, which is why Jay asked for both to confirm first. -->
-  <section class="ls-sheet" id="ls-power" role="dialog" aria-modal="true"
-           aria-labelledby="ls-power-title" hidden>
-    <header class="ls-sheet-head">
-      <span class="ls-grabber"></span>
-      <div class="ls-sheet-title">
-        <div>
-          <div class="ls-sheet-name" id="ls-power-title">Power</div>
-          <div class="ls-sheet-sub" id="ls-power-sub">Hold the power key to reach this</div>
-        </div>
+  <!-- THE PULL-DOWN SHADE. Jay: "We need a pull down area from the top of the
+       screen for things like brightness". Swipe down from the top edge.
+       "things like" is the brief, so this is a container with one control in it
+       today rather than a brightness dialog -- the next toggle goes beside it
+       without moving anything. -->
+  <section class="ls-shade" id="ls-shade" role="dialog" aria-modal="true"
+           aria-label="Quick settings" hidden>
+    <div class="ls-shade-inner">
+      <div class="ls-shade-row">
+        <svg class="ls-shade-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <circle cx="12" cy="12" r="4.2" />
+          <path d="M12 2.6v2.6M12 18.8v2.6M21.4 12h-2.6M5.2 12H2.6" />
+          <path d="m18.6 5.4-1.8 1.8M7.2 16.8l-1.8 1.8M18.6 18.6l-1.8-1.8M7.2 7.2 5.4 5.4" />
+        </svg>
+        <input type="range" class="ls-shade-slider" id="ls-brightness"
+               min="4" max="100" step="1" value="60"
+               aria-label="Screen brightness" />
+        <span class="ls-shade-value" id="ls-brightness-value">--</span>
       </div>
-      <button type="button" class="ls-sheet-close" id="ls-power-close" aria-label="Close">&#10005;</button>
-    </header>
-    <div class="ls-power-body" id="ls-power-body"></div>
+      <div class="ls-shade-note" id="ls-shade-note" hidden></div>
+      <span class="ls-shade-grip" aria-hidden="true"></span>
+    </div>
+  </section>
+
+  <section class="ls-modal" id="ls-power" role="dialog" aria-modal="true"
+           aria-labelledby="ls-power-title" hidden>
+    <div class="ls-modal-card">
+      <div class="ls-modal-title" id="ls-power-title">Power</div>
+      <div class="ls-modal-sub" id="ls-power-sub">Hold the power key to reach this</div>
+      <div class="ls-power-body" id="ls-power-body"></div>
+      <button type="button" class="ls-modal-cancel" id="ls-power-close">Cancel</button>
+    </div>
   </section>
 
   <section class="ls-sheet" id="ls-decision" role="dialog" aria-modal="true"
@@ -3112,6 +3260,104 @@ _LOCK_SCREEN_SCRIPT = r"""
     }
 
     // ------------------------------------------------------------------
+    // THE PULL-DOWN SHADE. Swipe down from the TOP EDGE.
+    //
+    // Jay: "We need a pull down area from the top of the screen for things like
+    // brightness, implement brightness controls asap". Brightness is the one
+    // setting that plainly belongs on a PRE-AUTH screen: someone holding an
+    // unreadably dim phone has to be able to fix it before they can read the
+    // PIN prompt.
+    // ------------------------------------------------------------------
+    var shadeEl = document.getElementById("ls-shade");
+    var brightEl = document.getElementById("ls-brightness");
+    var brightValEl = document.getElementById("ls-brightness-value");
+    var shadeNote = document.getElementById("ls-shade-note");
+
+    function showBrightness(reading) {
+      if (!reading || typeof reading.percent !== "number") return;
+      var pct = Math.round(reading.percent);
+      // Only write the input's value when the user is NOT dragging it: a poll
+      // landing mid-drag would yank the thumb back under the finger.
+      if (document.activeElement !== brightEl) brightEl.value = String(pct);
+      setText(brightValEl, pct + "%");
+    }
+
+    function loadBrightness() {
+      fetch("/auth/lock-brightness", { credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (d) return showBrightness(d);
+          // 404 is the honest answer on a device with no backlight node.
+          if (shadeNote) {
+            setText(shadeNote, "This device reports no backlight.");
+            shadeNote.hidden = false;
+          }
+          if (brightEl) brightEl.disabled = true;
+        })
+        .catch(function () { /* leave the slider where it is */ });
+    }
+
+    // Throttled, not debounced. A drag fires `input` continuously and every one
+    // of those is a sysfs write; throttling keeps the panel following the finger
+    // (which debouncing would not), while capping the writes.
+    var brightPending = null;
+    var brightTimer = null;
+
+    function pushBrightness() {
+      brightTimer = null;
+      if (brightPending === null) return;
+      var want = brightPending;
+      brightPending = null;
+      fetch("/auth/lock-brightness", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ percent: want })
+      }).then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          // The server reports what the PANEL took, not what was asked for --
+          // the write's own result is not trustworthy on this hardware, and the
+          // level is clamped away from full dark. Showing the read-back is how
+          // the slider stops lying about a floor it cannot go below.
+          if (d) setText(brightValEl, Math.round(d.percent) + "%");
+        })
+        .catch(function () { /* the panel is the feedback */ });
+    }
+
+    if (brightEl) {
+      brightEl.addEventListener("input", function () {
+        var pct = Number(brightEl.value);
+        setText(brightValEl, pct + "%");
+        brightPending = pct;
+        if (!brightTimer) brightTimer = window.setTimeout(pushBrightness, 90);
+      });
+    }
+
+    function openShade() {
+      loadBrightness();
+      openSheet("shade");
+    }
+
+    if (shadeEl) {
+      // Down from the TOP EDGE only. The veto is what keeps this off the feed:
+      // a downward drag anywhere else is a scroll, and stealing it would make
+      // the panels unusable. 90px is a thumb's reach from the edge, measured
+      // against the 540px-wide CSS viewport this device renders at.
+      swipe(document.body, null, function () {
+        if (screenEl && screenEl.getAttribute("data-sheet") === "none") openShade();
+      }, null, function (ev) {
+        var t = ev.touches[0];
+        return !t || t.clientY > 90;      // vetoed unless it began up top
+      });
+
+      // Swipe back up, or tap the dimmed screen behind it, to put it away.
+      swipe(shadeEl, function () { closeSheet(); }, null);
+      shadeEl.addEventListener("click", function (ev) {
+        if (ev.target === shadeEl) closeSheet();
+      });
+    }
+
+    // ------------------------------------------------------------------
     // THE POWER MENU. Raised by HOLDING the power key, not by anything on
     // screen: sway owns that key and posts to /auth/lock-power-menu, which
     // arrives here over /auth/lock-events.
@@ -3170,9 +3416,14 @@ _LOCK_SCREEN_SCRIPT = r"""
           var btn = document.createElement("button");
           btn.type = "button";
           btn.className = "ls-power-item";
-          if (item[1] === "poweroff" || item[1] === "stop-agents") {
+          // Red: the three that cost something. Emergency call is red because
+          // that is what it is FOR -- on every phone it is the one control you
+          // should be able to find without reading, and colour is how.
+          if (item[1] === "poweroff" || item[1] === "stop-agents"
+              || item[1] === "emergency") {
             btn.setAttribute("data-danger", "1");
           }
+          if (item[1] === "emergency") btn.setAttribute("data-emergency", "1");
           var glyph = document.createElement("span");
           glyph.className = "ls-power-glyph";
           glyph.setAttribute("aria-hidden", "true");
@@ -3661,6 +3912,7 @@ _LOCK_SCREEN_SCRIPT = r"""
       if (name === "decision") return decSheet;
       if (name === "voice") return voiceSheet;
       if (name === "power") return document.getElementById("ls-power");
+      if (name === "shade") return document.getElementById("ls-shade");
       if (name === "passcode") return document.getElementById("ls-foot");
       return null;
     }
@@ -6822,6 +7074,120 @@ async def lock_events(request: Request):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
     )
+
+
+#: The panel's backlight. Discovered rather than hardcoded: the node is named
+#: after the DSI controller (ae94000.dsi.0 on this handset), so a different
+#: panel or a kernel rename would break a literal path.
+_BACKLIGHT_DIR = "/sys/class/backlight"
+
+
+def _backlight_path() -> str | None:
+    """The first backlight device's directory, or None if there is no panel."""
+    try:
+        names = sorted(os.listdir(_BACKLIGHT_DIR))
+    except OSError:
+        return None
+    return os.path.join(_BACKLIGHT_DIR, names[0]) if names else None
+
+
+def _read_brightness() -> dict | None:
+    """Current and maximum backlight level, or None if unreadable.
+
+    Returns raw levels rather than a percentage, and the client does the
+    arithmetic: the maximum here is 4095, and rounding through a 0-100 integer
+    on the way in and out would make the slider jump under the finger.
+    """
+    base = _backlight_path()
+    if not base:
+        return None
+    try:
+        with open(os.path.join(base, "brightness")) as handle:
+            current = int(handle.read().strip())
+        with open(os.path.join(base, "max_brightness")) as handle:
+            maximum = int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+    if maximum <= 0:
+        return None
+    return {"current": current, "max": maximum,
+            "percent": round(current * 100.0 / maximum, 1)}
+
+
+def _write_brightness(level: int) -> dict | None:
+    """Set the backlight, then READ IT BACK and report what the panel took.
+
+    ⚠ THE WRITE'S OWN RESULT CANNOT BE TRUSTED HERE, measured on the device:
+    writing through a shell reported "write error: Invalid argument" for three
+    different values in a row while the level plainly changed -- the final read
+    showed the last value written. The driver accepts the value and then errors
+    on close, so the exit status describes the REQUEST and not the STATE. The
+    only honest answer is the read-back, which is what this returns.
+
+    Refuses to go fully dark. A slider that can reach 0 on a phone with no
+    hardware brightness key leaves a screen that is on, unreadable, and looks
+    broken -- and the way back is a control the user can no longer see.
+    """
+    base = _backlight_path()
+    if not base:
+        return None
+    reading = _read_brightness()
+    if not reading:
+        return None
+    floor = max(1, int(reading["max"] * 0.04))
+    level = max(floor, min(reading["max"], int(level)))
+    try:
+        with open(os.path.join(base, "brightness"), "w") as handle:
+            handle.write(str(level))
+    except OSError:
+        # Deliberately NOT a failure return: the value may well have landed.
+        # The read-back below is the measurement.
+        pass
+    return _read_brightness()
+
+
+@router.get("/lock-brightness")
+async def lock_brightness(request: Request):
+    """Current backlight level. Console-only."""
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    reading = _read_brightness()
+    if reading is None:
+        return JSONResponse({"error": "no backlight"}, status_code=404)
+    return JSONResponse(reading)
+
+
+@router.post("/lock-brightness")
+async def set_lock_brightness(request: Request):
+    """Set the backlight. Console-only.
+
+    Reachable before sign-in, like the rest of this screen. Brightness is the
+    one setting where that is plainly right: someone holding an unreadably dim
+    phone has to be able to fix it without first reading the PIN prompt.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    raw = body.get("level", body.get("percent"))
+    if raw is None:
+        return JSONResponse({"error": "level or percent required"}, status_code=400)
+    reading = _read_brightness()
+    if reading is None:
+        return JSONResponse({"error": "no backlight"}, status_code=404)
+    try:
+        if "level" in body:
+            level = int(raw)
+        else:
+            level = int(float(raw) * reading["max"] / 100.0)
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "not a number"}, status_code=400)
+    after = _write_brightness(level)
+    if after is None:
+        return JSONResponse({"error": "backlight write failed"}, status_code=503)
+    return JSONResponse(after)
 
 
 @router.post("/lock-screen-off")
