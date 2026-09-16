@@ -14,7 +14,13 @@ from datetime import datetime, timedelta
 
 import httpx
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from tinyagentos.auth import (
     PIN_MAX_LEN,
     PIN_MIN_LEN,
@@ -822,6 +828,50 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
   width: 100%;
 }
 .ls-decisions:empty { display: none; }
+
+/* THE POWER MENU. Big targets: this is reached by feel, often in the dark,
+   sometimes in a hurry, and it is the one surface here where picking the wrong
+   row costs something. */
+.ls-power-body { display: flex; flex-direction: column; gap: 8px; padding: 4px 0 6px; }
+.ls-power-item {
+  display: flex; align-items: center; gap: 13px;
+  width: 100%; padding: 14px 15px; border: 0; border-radius: 18px;
+  font: inherit; font-size: 16px; font-weight: 600; text-align: left;
+  color: #fff; background: rgba(255,255,255,0.09);
+}
+.ls-power-item:focus-visible { outline: 3px solid #4c9aff; outline-offset: 2px; }
+.ls-power-item[data-danger="1"] { color: #ff6b6b; }
+.ls-power-glyph {
+  flex: none; width: 30px; height: 30px; border-radius: 9px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 15px; background: rgba(255,255,255,0.10);
+}
+.ls-power-note {
+  display: block; margin-top: 2px;
+  font-size: 12px; font-weight: 500; color: rgba(255,255,255,0.55);
+}
+/* The confirm step for the two Jay asked to guard. It REPLACES the row rather
+   than opening a second dialog: a nested modal on a lock screen is a place to
+   get lost, and the question should sit where the answer was given. */
+.ls-power-confirm {
+  display: flex; flex-direction: column; gap: 8px;
+  padding: 13px 15px; border-radius: 18px;
+  background: rgba(255,59,48,0.14);
+}
+.ls-power-confirm-q { font-size: 14px; font-weight: 600; color: #fff; }
+.ls-power-confirm-note { font-size: 12px; line-height: 1.35; color: rgba(255,255,255,0.68); }
+.ls-power-confirm-row { display: flex; gap: 8px; margin-top: 2px; }
+.ls-power-confirm-row button {
+  flex: 1; padding: 10px; border: 0; border-radius: 12px;
+  font: inherit; font-size: 14px; font-weight: 600;
+  background: rgba(255,255,255,0.12); color: #fff;
+}
+.ls-power-confirm-row button[data-go="1"] { background: rgba(255,59,48,0.34); color: #ffb3ad; }
+.ls-power-result {
+  padding: 11px 15px; border-radius: 14px;
+  background: rgba(255,255,255,0.08);
+  font-size: 13px; line-height: 1.4; color: rgba(255,255,255,0.78);
+}
 .ls-notif-group {
   position: relative;
   width: 100%; max-width: var(--ls-card-w);
@@ -1919,6 +1969,27 @@ def _lock_tail_html() -> str:
       </button>
     </div>
   </section>
+  <!-- The power menu. Raised by HOLDING the power key: sway posts to
+       /auth/lock-power-menu on loopback and the stream below brings it here.
+       ⚠ This sheet is reachable BEFORE SIGN-IN, exactly as holding the physical
+       key always was. Power off and Restart add nothing the hardware key did
+       not already allow; "Stop all agents" and "Emergency call" DO ask for
+       something more, which is why Jay asked for both to confirm first. -->
+  <section class="ls-sheet" id="ls-power" role="dialog" aria-modal="true"
+           aria-labelledby="ls-power-title" hidden>
+    <header class="ls-sheet-head">
+      <span class="ls-grabber"></span>
+      <div class="ls-sheet-title">
+        <div>
+          <div class="ls-sheet-name" id="ls-power-title">Power</div>
+          <div class="ls-sheet-sub" id="ls-power-sub">Hold the power key to reach this</div>
+        </div>
+      </div>
+      <button type="button" class="ls-sheet-close" id="ls-power-close" aria-label="Close">&#10005;</button>
+    </header>
+    <div class="ls-power-body" id="ls-power-body"></div>
+  </section>
+
   <section class="ls-sheet" id="ls-decision" role="dialog" aria-modal="true"
            aria-labelledby="ls-decision-q" hidden>
     <header class="ls-sheet-head">
@@ -3011,7 +3082,147 @@ _LOCK_SCREEN_SCRIPT = r"""
     }
 
     // ------------------------------------------------------------------
-    // THE SCRIPTED PANELS: phone, mailbox, apps, decisions, settings.
+    // THE POWER MENU. Raised by HOLDING the power key, not by anything on
+    // screen: sway owns that key and posts to /auth/lock-power-menu, which
+    // arrives here over /auth/lock-events.
+    //
+    // A push, not a poll. The key is a physical button, so the menu has to be
+    // up by the time the thumb lifts; this screen's fastest poll is 3s.
+    // ------------------------------------------------------------------
+    var powerSheet = document.getElementById("ls-power");
+    var powerBody = document.getElementById("ls-power-body");
+    var powerSub = document.getElementById("ls-power-sub");
+
+    // label, verb, glyph, note, and whether Jay asked for a confirm step.
+    var POWER_ITEMS = [
+      ["Power off", "poweroff", "⏻", "", false],
+      ["Restart", "reboot", "↻", "", false],
+      ["Stop all agents", "stop-agents", "■", "Halts every running agent", true],
+      ["Screenshot", "screenshot", "⌘", "Saves to the device", false],
+      ["Emergency call", "emergency", "✢", "", true]
+    ];
+
+    function powerResult(text) {
+      var el = document.createElement("div");
+      el.className = "ls-power-result";
+      el.textContent = text;                       // textContent, never innerHTML
+      powerBody.appendChild(el);
+    }
+
+    function runPowerAction(verb, label) {
+      fetch("/auth/lock-power-action", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: verb })
+      }).then(function (r) { return r.json().catch(function () { return {}; }); })
+        .then(function (d) {
+          // Power off and restart never come back -- the phone is going down,
+          // and a "done" message would be a lie either way.
+          if (verb === "poweroff" || verb === "reboot") return;
+          if (d && d.ok) {
+            powerResult(label + ": done." + (d.path ? " Saved to " + d.path : ""));
+          } else {
+            // The failure TEXT, not a generic apology: "no supported format
+            // found" is the difference between a bug report and a shrug, and
+            // screenshot genuinely does fail on this compositor today.
+            powerResult(label + " failed. " + ((d && d.detail) || "No detail."));
+          }
+        })
+        .catch(function () { powerResult(label + " failed: no answer from taOS."); });
+    }
+
+    function paintPowerMenu() {
+      if (!powerBody) return;
+      powerBody.textContent = "";
+      for (var i = 0; i < POWER_ITEMS.length; i++) {
+        (function (item) {
+          var btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "ls-power-item";
+          if (item[1] === "poweroff" || item[1] === "stop-agents") {
+            btn.setAttribute("data-danger", "1");
+          }
+          var glyph = document.createElement("span");
+          glyph.className = "ls-power-glyph";
+          glyph.setAttribute("aria-hidden", "true");
+          glyph.textContent = item[2];
+          var text = document.createElement("span");
+          text.textContent = item[0];
+          if (item[3]) {
+            var note = document.createElement("span");
+            note.className = "ls-power-note";
+            note.textContent = item[3];
+            text.appendChild(note);
+          }
+          btn.appendChild(glyph);
+          btn.appendChild(text);
+          btn.addEventListener("click", function () {
+            if (!item[4]) return runPowerAction(item[1], item[0]);
+            confirmPower(btn, item);
+          });
+          powerBody.appendChild(btn);
+        })(POWER_ITEMS[i]);
+      }
+    }
+
+    // Replace the row with its own question. Jay: "stop all agents and
+    // emergency call needs confirmation".
+    function confirmPower(btn, item) {
+      var box = document.createElement("div");
+      box.className = "ls-power-confirm";
+      var q = document.createElement("div");
+      q.className = "ls-power-confirm-q";
+      q.textContent = item[0] + "?";
+      var note = document.createElement("div");
+      note.className = "ls-power-confirm-note";
+      note.textContent = item[1] === "stop-agents"
+        ? "Every running agent stops. Nobody is signed in, so this cannot be undone from here."
+        : "There is no dialer configured on this device.";
+      var row = document.createElement("div");
+      row.className = "ls-power-confirm-row";
+      var no = document.createElement("button");
+      no.type = "button";
+      no.textContent = "Cancel";
+      var yes = document.createElement("button");
+      yes.type = "button";
+      yes.setAttribute("data-go", "1");
+      yes.textContent = item[0];
+      no.addEventListener("click", paintPowerMenu);
+      yes.addEventListener("click", function () {
+        box.remove();
+        runPowerAction(item[1], item[0]);
+      });
+      row.appendChild(no); row.appendChild(yes);
+      box.appendChild(q); box.appendChild(note); box.appendChild(row);
+      btn.replaceWith(box);
+    }
+
+    if (powerSheet) {
+      var powerClose = document.getElementById("ls-power-close");
+      if (powerClose) powerClose.addEventListener("click", function () { closeSheet(); });
+
+      // EventSource reconnects on its own after a drop, which matters here:
+      // the controller restarts on every deploy and the page does not.
+      try {
+        var lockStream = new EventSource("/auth/lock-events");
+        lockStream.addEventListener("power-menu", function () {
+          paintPowerMenu();
+          if (powerSub) {
+            powerSub.textContent = new Date().toLocaleTimeString([], {
+              hour: "2-digit", minute: "2-digit"
+            });
+          }
+          openSheet("power");
+        });
+      } catch (err) {
+        // No stream means no menu, and the power key still toggles the screen.
+        // That is the fallback direction this whole layer is built around.
+      }
+    }
+
+    // ------------------------------------------------------------------
+    // THE SCRIPTED PANELS: phone, mailbox, apps, projects, decisions.
     //
     // Five more pollers on a screen whose last bug was "every poller that wipes
     // its container and rebuilds makes the whole panel flicker". So not one of
@@ -3407,6 +3618,7 @@ _LOCK_SCREEN_SCRIPT = r"""
       if (name === "chat") return chatSheet;
       if (name === "decision") return decSheet;
       if (name === "voice") return voiceSheet;
+      if (name === "power") return document.getElementById("ls-power");
       if (name === "passcode") return document.getElementById("ls-foot");
       return null;
     }
@@ -6370,6 +6582,193 @@ async def lock_notifications(request: Request):
     if not _demo_notifications_enabled():
         return JSONResponse({"error": "not found"}, status_code=404)
     return JSONResponse({"groups": _demo_notifications(), "demo": True})
+
+
+#: Where the privileged helper looks for a power request. The controller runs as
+#: `taos` and CANNOT power the handset off itself -- logind answers "challenge"
+#: to that user, and a challenge on a device with no keyboard and no polkit
+#: agent is a refusal. It drops a verb here instead and taos-power.path (root)
+#: acts on it. The directory is 0700 taos:taos, so this is not a channel anyone
+#: else can shout down.
+_POWER_REQUEST = "/run/taos-power/request"
+
+#: Listeners on /auth/lock-events. The power key is a PHYSICAL button: the menu
+#: has to be on screen by the time the user's thumb lifts, so this is a push.
+#: The lock screen's fastest poll is 3s and its panels are 15 MINUTES -- a menu
+#: that arrives on a poll is a broken menu.
+_LOCK_EVENT_WAITERS: set = set()
+
+
+def _push_lock_event(kind: str) -> int:
+    """Fan an event out to every open lock-screen stream. Returns the count.
+
+    The count is returned rather than discarded so the caller -- and the test --
+    can tell "delivered to nobody" from "delivered", which are the same silence
+    otherwise.
+    """
+    delivered = 0
+    for queue in list(_LOCK_EVENT_WAITERS):
+        try:
+            queue.put_nowait(kind)
+            delivered += 1
+        except Exception:
+            # A full or closed queue is one dead listener, not a reason to drop
+            # the event for everyone else.
+            _LOCK_EVENT_WAITERS.discard(queue)
+    return delivered
+
+
+@router.get("/lock-events")
+async def lock_events(request: Request):
+    """Server-sent events for the lock screen. Console-only.
+
+    Carries only UI signals the device itself raises -- today, "the power key
+    was held". It deliberately carries no content: everything on this screen is
+    fetched by its own endpoint, and this stream renders before sign-in, so it
+    must never become a second way to read anything.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+
+    queue: asyncio.Queue = asyncio.Queue(maxsize=8)
+    _LOCK_EVENT_WAITERS.add(queue)
+
+    async def stream():
+        try:
+            # An immediate byte, so the browser's EventSource resolves its
+            # connection rather than sitting in CONNECTING until the first real
+            # event -- which could be hours.
+            yield ": connected\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    kind = await asyncio.wait_for(queue.get(), timeout=20)
+                except asyncio.TimeoutError:
+                    # A comment line. Without it a silent stream is
+                    # indistinguishable from a dead one, and the socket is free
+                    # to be reaped by anything in between.
+                    yield ": keepalive\n\n"
+                    continue
+                yield "event: %s\ndata: {}\n\n" % kind
+        finally:
+            _LOCK_EVENT_WAITERS.discard(queue)
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
+
+
+@router.post("/lock-power-menu")
+async def lock_power_menu(request: Request):
+    """The power key was held. Raise the menu on the lock screen. Console-only.
+
+    Posted by the compositor (taos-kiosk-power-hold) on loopback. sway owns the
+    key -- a logind config this image deliberately ships without once made a
+    short press shut the phone down outright -- so the long press has to reach
+    the page from outside it.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    delivered = _push_lock_event("power-menu")
+    return JSONResponse({"ok": True, "delivered": delivered})
+
+
+#: What the power menu is allowed to do. A closed set, named here rather than
+#: derived from the request: this menu is reachable BEFORE sign-in, so the list
+#: of things a stranger holding the phone can trigger has to be readable in one
+#: place.
+_POWER_ACTIONS = ("poweroff", "reboot", "stop-agents", "screenshot", "emergency")
+
+
+@router.post("/lock-power-action")
+async def lock_power_action(request: Request):
+    """Carry out a power-menu choice. Console-only.
+
+    Jay asked for confirmation on "stop all agents" and "emergency call"; that
+    confirm step lives in the page, because it is a question about intent and
+    the answer never needs to leave the device.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    action = str(body.get("action", "")).strip()
+    if action not in _POWER_ACTIONS:
+        return JSONResponse({"error": "unknown action"}, status_code=400)
+
+    if action in ("poweroff", "reboot"):
+        try:
+            # Written whole, then renamed: the watcher fires on the path
+            # EXISTING, so a partially written file could be read as a verb
+            # that was never finished.
+            tmp = _POWER_REQUEST + ".part"
+            with open(tmp, "w") as handle:
+                handle.write(action)
+            os.replace(tmp, _POWER_REQUEST)
+        except OSError as exc:
+            return JSONResponse(
+                {"error": "power request failed", "detail": str(exc)}, status_code=503
+            )
+        return JSONResponse({"ok": True, "action": action})
+
+    if action == "stop-agents":
+        orchestrator = getattr(request.app.state, "orchestrator", None)
+        if orchestrator is None:
+            return JSONResponse({"error": "orchestrator unavailable"}, status_code=503)
+        try:
+            # The same call /api/system/prepare-shutdown makes, deliberately:
+            # "stop all agents" from the lock screen and the systemd stop hook
+            # should drain agents the same way, or one of the two paths is
+            # quietly doing something else.
+            report = await orchestrator.prepare("all", "lock-screen-power-menu")
+        except Exception as exc:
+            return JSONResponse({"error": str(exc)}, status_code=500)
+        return JSONResponse({"ok": True, "action": action, "report": report})
+
+    if action == "screenshot":
+        return JSONResponse(_take_screenshot())
+
+    # Emergency call. There is no dialer on this handset and no telephony stack
+    # behind it, so this says so rather than pretending: a menu entry that
+    # silently does nothing in an emergency is worse than one that is honest.
+    return JSONResponse(
+        {"ok": False, "action": "emergency", "demo": True,
+         "detail": "No dialer is configured on this device."}
+    )
+
+
+def _take_screenshot() -> dict:
+    """Grab the screen with grim, into /var/lib/taos-kiosk/screenshots.
+
+    ⚠ grim currently FAILS on this compositor with "no supported format found"
+    -- measured on the device. That is why this reports the error text instead
+    of a bare False: the next person needs to know the capture was attempted
+    and what refused it, not just that no file appeared.
+    """
+    import subprocess
+
+    target_dir = "/var/lib/taos-kiosk/screenshots"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    path = "%s/%s.png" % (target_dir, stamp)
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+        proc = subprocess.run(
+            ["grim", path], capture_output=True, text=True, timeout=15
+        )
+    except Exception as exc:
+        return {"ok": False, "action": "screenshot", "detail": str(exc)}
+    if proc.returncode != 0 or not os.path.exists(path):
+        return {
+            "ok": False, "action": "screenshot",
+            "detail": (proc.stderr or proc.stdout or "grim failed").strip()[:200],
+        }
+    return {"ok": True, "action": "screenshot", "path": path,
+            "bytes": os.path.getsize(path)}
 
 
 @router.get("/lock-panels")
