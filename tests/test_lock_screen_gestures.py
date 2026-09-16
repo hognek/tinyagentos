@@ -153,7 +153,16 @@ def _drive(scenario: dict, *, with_fix: bool = True) -> int:
     """Run one gesture and return how many times unlock was triggered."""
     node = shutil.which("node")
     if node is None:  # pragma: no cover - depends on the runner image
-        pytest.skip("node is required to execute the lock screen gesture source")
+        # FAIL, do not skip. These tests execute the gesture source; without node
+        # they measure nothing, and a skip reads as satisfied to both the shard
+        # summary and GitHub's required-check logic. A suite that can quietly
+        # evaporate is indistinguishable from one that ran and found no defect.
+        # CI provisions node in the shards job -- if it is missing, that is the bug.
+        pytest.fail(
+            "node is required to execute the lock screen gesture source, and was "
+            "not found on PATH. These tests cannot be skipped: skipping them would "
+            "report green while proving nothing about the unlock gesture."
+        )
     script = _HARNESS.replace("__GESTURE_SOURCE__", _gesture_source(with_fix=with_fix))
     done = subprocess.run(
         [node, "-e", script],
