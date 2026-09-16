@@ -355,6 +355,21 @@ class TestGestureLatching:
         touchend = LOCK_SCRIPT.index('surface.addEventListener("touchend"', touchstart)
         assert touchstart < LOCK_SCRIPT.index(latch) < touchend
 
+    def test_overflow_is_measured_in_exactly_one_place(self):
+        """Unchanged in intent. `feedOverflows()` is still the only definition of
+        "this feed is taller than its viewport".
+
+        What changed is that it is no longer the veto's question. tsk-36i6ed
+        needed a SECOND one -- how far the feed can still travel -- and asking
+        both would have left an arm that cannot fail: a feed that does not
+        overflow has `scrollTop` clamped to 0 by the browser, so it always reads
+        as already at its end, and the overflow conjunct could never change the
+        answer. The fade still asks it, and it stays defined once.
+        """
+        assert LOCK_SCRIPT.count("function feedOverflows(") == 1
+        # Callers, not occurrences: the definition line contains the call text.
+        assert LOCK_SCRIPT.count("feedOverflows()") - 1 >= 1
+
     def test_the_feed_is_measured_only_inside_its_two_helpers(self):
         """The fade and the veto must not drift apart about the same feed.
 
