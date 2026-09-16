@@ -307,9 +307,11 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
   width: 100%;
   height: 100vh;
   height: 100dvh;
-  padding: calc(env(safe-area-inset-top, 0px) + 7vh) 10px calc(env(safe-area-inset-bottom, 0px) + 18px);
+  padding: calc(env(safe-area-inset-top, 0px) + 14px) 10px calc(env(safe-area-inset-bottom, 0px) + 18px);
   gap: 16px;
 }
+/* The clock keeps its distance from the status bar rather than the screen top. */
+.lockscreen .ls-head { margin-top: 4vh; }
 /* Top block: the glanceable half. */
 .ls-head {
   display: flex; flex-direction: column; align-items: center; gap: 4px;
@@ -327,9 +329,31 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
   color: #fff;
 }
 .ls-date { font-size: 16px; font-weight: 500; color: rgba(255,255,255,0.62); }
-.ls-widgets {
-  display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 18px;
+/* Status bar. The product name and the battery are STATUS, not content: they
+   belong on the top edge where a phone puts them, not stacked under the date
+   competing with the clock. The device's hostname is gone -- it told the
+   person holding their own phone something they already know. */
+.ls-statusbar {
+  /* Three columns, brand in the middle: a flex row would re-centre the brand
+     every time the battery string changed width (9% -> 100%). */
+  display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
+  align-self: stretch; flex: none;
+  width: 100%; padding: 0 6px; gap: 10px;
+  transition: filter 320ms cubic-bezier(0.32, 0.72, 0, 1), opacity 320ms ease;
 }
+.lockscreen:not([data-sheet="none"]) .ls-statusbar { filter: blur(7px); opacity: 0.55; }
+/* Text, not chips. Up here these are a status line the eye skips over; a
+   bordered translucent pill around each one turns the top edge into two
+   buttons that cannot be pressed. */
+.ls-statusbar .ls-widget {
+  padding: 0; border: 0; background: none;
+  backdrop-filter: none; -webkit-backdrop-filter: none;
+  font-size: 14px; color: rgba(255,255,255,0.58);
+}
+.ls-statusbar .ls-widget b { color: rgba(255,255,255,0.80); }
+.ls-brand { grid-column: 2; justify-self: center; }
+.ls-brand b { font-weight: 700; }
+#ls-battery { grid-column: 3; justify-self: end; }
 /* Widgets are CLIENT-SIDE only (clock, battery) plus the device's own name.
    Nothing here reads the account or its data: this surface is shown BEFORE
    authentication, so anything account-derived would be a pre-auth leak. */
@@ -530,7 +554,7 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
    reads as a stray browser control. The toggle comes back with the password
    form, which does need typing -- lock-screen.js drops .lockscreen-on when the
    user switches to it. */
-body.lockscreen-on .osk-toggle { display: none; }
+body.lockscreen-on .osk-toggle { display: none !important; }
 /* ---------------------------------------------------------------------------
    SHEETS. The lock screen has one resting state and three things that can rise
    over it: the passcode, an agent conversation and a decision. They are all the
@@ -554,7 +578,7 @@ body.lockscreen-on .osk-toggle { display: none; }
 .lockscreen .ls-foot {
   position: fixed; left: 0; right: 0; bottom: var(--ls-kb, 0px); z-index: 50;
   width: 100%; max-width: 520px; margin: 0 auto;
-  max-height: min(88dvh, 720px);
+  max-height: min(88dvh, 720px, calc(100dvh - var(--ls-kb, 0px) - 24px));
   padding: 14px 14px calc(env(safe-area-inset-bottom, 0px) + 18px);
   border-radius: 26px 26px 0 0;
   background: rgba(24, 24, 27, 0.86);
@@ -635,7 +659,12 @@ body.lockscreen-on .osk-toggle { display: none; }
 .ls-sheet {
   position: fixed; left: 0; right: 0; bottom: var(--ls-kb, 0px); z-index: 50;
   display: flex; flex-direction: column;
-  max-height: min(76dvh, 640px);
+  /* Subtract --ls-kb: the sheet's bottom edge is already raised by the
+     keyboard, so a cap measured from the full viewport lets the box run off
+     the TOP of the screen. When that happened the message list -- a
+     flex:1/min-height:0 child -- collapsed to zero and the thread rendered
+     with every bubble invisible. */
+  max-height: min(76dvh, 640px, calc(100dvh - var(--ls-kb, 0px) - 24px));
   margin: 0 auto; width: 100%; max-width: 520px;
   padding: 8px 14px calc(env(safe-area-inset-bottom, 0px) + 14px);
   border-radius: 26px 26px 0 0;
@@ -774,6 +803,35 @@ body.lockscreen-on .osk-toggle { display: none; }
   padding: 10px 4px 6px; text-align: center;
   font-size: 14px; color: rgba(255,255,255,0.72);
 }
+
+/* Dictation button. Quiet until touched -- it sits on every island, so a filled
+   control would turn the stack into a row of buttons. */
+.ls-mic {
+  flex: none; width: 30px; height: 30px; margin-left: 2px;
+  border-radius: 50%; border: 0; padding: 0;
+  background: rgba(255,255,255,0.07); color: rgba(255,255,255,0.62);
+  display: flex; align-items: center; justify-content: center; cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 140ms ease, color 140ms ease, transform 90ms ease;
+}
+.ls-mic svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.ls-mic:active { transform: scale(0.9); background: rgba(255,255,255,0.18); color: #fff; }
+.ls-mic:focus-visible { outline: 3px solid #4c9aff; outline-offset: 2px; }
+
+/* Voice sheet. The waveform is the whole interface: it is the only thing that
+   proves the microphone is actually hearing you, so it gets the room. */
+.ls-voice-body { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 10px 4px 18px; }
+.ls-wave { width: 100%; max-width: 420px; height: 120px; display: block; }
+.ls-voice-text {
+  margin: 0; min-height: 44px; text-align: center;
+  font-size: 17px; line-height: 1.35; color: rgba(255,255,255,0.92);
+}
+.ls-voice-text:empty::before {
+  content: "Say something\2026"; color: rgba(255,255,255,0.32);
+}
+.ls-voice-text[data-error="1"] { font-size: 14px; color: rgba(255,176,32,0.92); }
+.ls-voice-acts { display: flex; gap: 10px; padding-top: 2px; }
+.lockscreen[data-sheet="voice"] ~ #ls-voice { transform: translateY(0); }
 
 /* Force-touch feel: the island sinks under the finger, then pops as it opens.
    Without the sink there is no feedback that a HOLD is doing anything, and the
@@ -1076,13 +1134,13 @@ def _lock_head_html() -> str:
     """
     return f"""
   <div class="lockscreen" id="lockscreen">
+    <div class="ls-statusbar">
+      <span class="ls-widget ls-brand"><b>taOS</b></span>
+      <span class="ls-widget" id="ls-battery" hidden></span>
+    </div>
     <div class="ls-head">
       <div class="ls-time" id="ls-time" role="timer" aria-live="off">&nbsp;</div>
       <div class="ls-date" id="ls-date"></div>
-      <div class="ls-widgets" id="ls-widgets">
-        <span class="ls-widget"><b>taOS</b>&nbsp;{html.escape(_device_label())}</span>
-        <span class="ls-widget" id="ls-battery" hidden></span>
-      </div>
       <div class="ls-islands" id="ls-activity" role="group" aria-label="Agent activity" hidden>
         <div class="ls-agents" id="ls-agents"></div>
         <div class="ls-tasks" id="ls-tasks"></div>
@@ -1160,6 +1218,28 @@ def _lock_tail_html() -> str:
       <button type="button" class="ls-act" data-act="approve">Approve</button>
     </div>
     <p class="ls-decision-done" id="ls-decision-done" hidden></p>
+  </section>
+  <section class="ls-sheet ls-sheet-voice" id="ls-voice" role="dialog" aria-modal="true"
+           aria-labelledby="ls-voice-title" hidden>
+    <header class="ls-sheet-head">
+      <span class="ls-grabber"></span>
+      <div class="ls-sheet-title">
+        <div class="ls-sheet-avatar" id="ls-voice-avatar" aria-hidden="true"></div>
+        <div>
+          <div class="ls-sheet-name" id="ls-voice-title"></div>
+          <div class="ls-sheet-sub" id="ls-voice-state">Listening\u2026</div>
+        </div>
+      </div>
+      <button type="button" class="ls-sheet-close" id="ls-voice-close" aria-label="Cancel dictation">&#10005;</button>
+    </header>
+    <div class="ls-voice-body">
+      <canvas class="ls-wave" id="ls-wave" width="600" height="120" aria-hidden="true"></canvas>
+      <p class="ls-voice-text" id="ls-voice-text" aria-live="polite"></p>
+    </div>
+    <div class="ls-voice-acts">
+      <button type="button" class="ls-act" id="ls-voice-cancel">Cancel</button>
+      <button type="button" class="ls-act" data-act="approve" id="ls-voice-send" disabled>Send</button>
+    </div>
   </section>"""
 
 
@@ -1328,6 +1408,19 @@ _LOCK_SCREEN_SCRIPT = r"""
       var pip = document.createElement("span");
       pip.className = "ls-pip";
       el.appendChild(pip);
+
+      // Dictation, next to the live pip: the fastest way to say something to an
+      // agent from a locked phone is to say it. Its own button rather than a
+      // gesture on the island, because it does something DIFFERENT from opening
+      // the conversation and must not be reachable by accident.
+      var mic = document.createElement("button");
+      mic.type = "button";
+      mic.className = "ls-mic";
+      mic.setAttribute("aria-label", "Dictate a message to " + name);
+      mic.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true">'
+        + '<rect x="9" y="3" width="6" height="11" rx="3"/>'
+        + '<path d="M5.5 11.5a6.5 6.5 0 0 0 13 0"/><path d="M12 18v3"/></svg>';
+      el.appendChild(mic);
       return el;
     }
 
@@ -1380,14 +1473,35 @@ _LOCK_SCREEN_SCRIPT = r"""
       setInterval(pollActivity, 15000);
     }
 
-    // Switching to the password form leaves the lock screen: that form needs a
-    // real keyboard, and the keypad/clock chrome has nothing to do with it.
-    // Dropping the class restores the ordinary centred sign-in card, keyboard
-    // toggle included, without this script re-implementing either.
+    // Switching to the password form STAYS on the lock screen.
+    //
+    // This used to drop .lockscreen-on to get the ordinary card and the shared
+    // keyboard back. On a handset kiosk that is wrong in three visible ways at
+    // once: the page loses `overflow:hidden` and grows a chromium SCROLLBAR
+    // down the edge, the keyboard's floating toggle button reappears over the
+    // screen, and the whole lock screen visually falls apart mid-sign-in. The
+    // password form is just another thing that rises in the passcode sheet, so
+    // raise the keyboard for it and leave the chrome alone.
     var toPw = document.getElementById("use-password");
     if (toPw) {
       toPw.addEventListener("click", function () {
-        document.body.classList.remove("lockscreen-on");
+        openSheet("passcode");
+        var pw = document.querySelector("#pw-panel input[type=password]");
+        if (pw && window.taosOSK) {
+          window.taosOSK.enable();
+          window.taosOSK.focusField(pw);
+        }
+        window.setTimeout(syncKeyboard, 60);
+      });
+    }
+
+    // Coming BACK to the PIN closes the keyboard again: the keypad is this
+    // screen's input method and the two must never both be up.
+    var toPin = document.getElementById("use-pin");
+    if (toPin) {
+      toPin.addEventListener("click", function () {
+        if (window.taosOSK) window.taosOSK.disable();
+        setKeyboardOffset(0);
       });
     }
 
@@ -1405,9 +1519,12 @@ _LOCK_SCREEN_SCRIPT = r"""
 
     if (screenEl) screenEl.setAttribute("data-sheet", "none");
 
+    var voiceSheet = document.getElementById("ls-voice");
+
     function sheetEl(name) {
       if (name === "chat") return chatSheet;
       if (name === "decision") return decSheet;
+      if (name === "voice") return voiceSheet;
       if (name === "passcode") return document.getElementById("ls-foot");
       return null;
     }
@@ -1443,8 +1560,10 @@ _LOCK_SCREEN_SCRIPT = r"""
       if (!current || current === "none") return;
       screenEl.setAttribute("data-sheet", "none");
       if (unlockBtn) unlockBtn.setAttribute("aria-expanded", "false");
-      // The composer must not keep the keyboard up over a closed sheet.
+      // The composer must not keep the keyboard up over a closed sheet, and the
+      // microphone must never outlive the sheet that opened it.
       if (window.taosOSK) window.taosOSK.disable();
+      stopVoice();
       setKeyboardOffset(0);
       var el = sheetEl(current);
       // Wait out the slide before hiding, or the sheet vanishes mid-animation.
@@ -1458,7 +1577,16 @@ _LOCK_SCREEN_SCRIPT = r"""
       lastFocus = null;
     }
 
-    if (scrim) scrim.addEventListener("click", closeSheet);
+    // Tap-to-dismiss on the scrim, but only a real tap: a drag that began on the
+    // sheet and ended over the scrim is not a dismissal.
+    if (scrim) {
+      var sx = 0, sy = 0;
+      scrim.addEventListener("pointerdown", function (ev) { sx = ev.clientX; sy = ev.clientY; });
+      scrim.addEventListener("click", function (ev) {
+        if (Math.abs(ev.clientX - sx) > 12 || Math.abs(ev.clientY - sy) > 12) return;
+        closeSheet();
+      });
+    }
     document.addEventListener("keydown", function (ev) {
       if (ev.key === "Escape") closeSheet();
     });
@@ -1484,6 +1612,9 @@ _LOCK_SCREEN_SCRIPT = r"""
       if (!oskPanel) { oskPanel = document.querySelector(".osk"); }
       if (!oskPanel || oskPanel.hidden) { setKeyboardOffset(0); return; }
       setKeyboardOffset(oskPanel.offsetHeight);
+      // Switching keyboard layers (letters/symbols/numeric) changes its height
+      // and therefore the sheet's, so re-anchor the thread each time.
+      if (screenEl && screenEl.getAttribute("data-sheet") === "chat") bottomOut();
     }
     if (window.ResizeObserver) {
       var ro = new ResizeObserver(syncKeyboard);
@@ -1512,38 +1643,51 @@ _LOCK_SCREEN_SCRIPT = r"""
     }
     if (unlockBtn) unlockBtn.addEventListener("click", openPasscode);
 
-    // Swipe up from the resting screen, swipe down to dismiss a sheet. Tracked
-    // on the whole lock screen rather than a thin edge strip, because an edge
-    // strip on a phone competes with the system's own gesture area.
-    (function () {
+    // Two SEPARATE gestures, deliberately not one handler on the body.
+    //
+    // A single body-wide handler that read any downward drag as "dismiss" made
+    // the conversation impossible to scroll: dragging down through older
+    // messages IS a downward drag, so the sheet closed under the finger. The
+    // dismiss gesture now lives ONLY on the sheet's header -- the grabber is
+    // the handle, which is what the grabber is for -- and the unlock swipe is
+    // only armed while nothing is open.
+    function swipe(surface, onUp, onDown, guard) {
       var y0 = null, x0 = null, moved = false;
-      function start(ev) {
-        var t = ev.touches ? ev.touches[0] : ev;
+      surface.addEventListener("touchstart", function (ev) {
+        var t = ev.touches[0];
         y0 = t.clientY; x0 = t.clientX; moved = false;
-      }
-      function move(ev) {
+      }, { passive: true });
+      surface.addEventListener("touchmove", function (ev) {
         if (y0 === null) return;
-        var t = ev.touches ? ev.touches[0] : ev;
+        var t = ev.touches[0];
         if (Math.abs(t.clientY - y0) > 10 || Math.abs(t.clientX - x0) > 10) moved = true;
-      }
-      function end(ev) {
+      }, { passive: true });
+      surface.addEventListener("touchend", function (ev) {
         if (y0 === null) return;
-        var t = (ev.changedTouches ? ev.changedTouches[0] : ev);
-        var dy = t.clientY - y0;
-        var dx = t.clientX - x0;
+        var t = ev.changedTouches[0];
+        var dy = t.clientY - y0, dx = t.clientX - x0;
         y0 = null; x0 = null;
-        // Vertical intent only: a diagonal drag while scrolling the agent list
-        // must not be read as an unlock.
-        if (!moved || Math.abs(dy) < 56 || Math.abs(dx) > Math.abs(dy)) return;
-        var sheet = screenEl ? screenEl.getAttribute("data-sheet") : "none";
-        if (dy < 0 && sheet === "none") openPasscode();
-        else if (dy > 0 && sheet !== "none") closeSheet();
-      }
-      var surface = document.body;
-      surface.addEventListener("touchstart", start, { passive: true });
-      surface.addEventListener("touchmove", move, { passive: true });
-      surface.addEventListener("touchend", end, { passive: true });
-    })();
+        // Vertical intent, and a long one. The threshold is deliberately well
+        // past a scroll flick, and a drag more horizontal than vertical is
+        // never a dismiss.
+        if (!moved || Math.abs(dy) < 90 || Math.abs(dx) > Math.abs(dy) * 0.6) return;
+        if (guard && !guard()) return;
+        if (dy < 0 && onUp) onUp();
+        else if (dy > 0 && onDown) onDown();
+      }, { passive: true });
+    }
+
+    // Unlock: only from the resting screen, so it can never fight a sheet.
+    swipe(document.body, openPasscode, null, function () {
+      return !screenEl || screenEl.getAttribute("data-sheet") === "none";
+    });
+    // Dismiss: only by dragging the sheet's own header.
+    var chatHead = chatSheet ? chatSheet.querySelector(".ls-sheet-head") : null;
+    if (chatHead) swipe(chatHead, null, closeSheet);
+    var decHead = decSheet ? decSheet.querySelector(".ls-sheet-head") : null;
+    if (decHead) swipe(decHead, null, closeSheet);
+    var footEl = document.getElementById("ls-foot");
+    if (footEl) swipe(footEl, null, closeSheet);
 
     // -----------------------------------------------------------------------
     // CONVERSATION SHEET.
@@ -1632,6 +1776,14 @@ _LOCK_SCREEN_SCRIPT = r"""
       // finished computing, and the thread opens with its last message clipped
       // behind the composer. The second frame catches the reflow that wrapping
       // the final bubble causes. Measured on the device.
+      bottomOut();
+    }
+
+    // Anchor the thread to its newest message. Repeated across frames because
+    // the height it is measuring against keeps changing underneath it: bubbles
+    // wrap on layout, and the keyboard shortens the sheet a moment later.
+    function bottomOut() {
+      if (!msgsEl) return;
       msgsEl.scrollTop = msgsEl.scrollHeight;
       requestAnimationFrame(function () {
         msgsEl.scrollTop = msgsEl.scrollHeight;
@@ -1650,6 +1802,25 @@ _LOCK_SCREEN_SCRIPT = r"""
       composer.value = "";
       if (sendBtn) sendBtn.disabled = true;
       openSheet("chat");
+
+      // The keyboard comes up with the sheet: this is a conversation, and the
+      // reason to open one is to say something. Waiting for a tap on the field
+      // costs a tap and leaves the sheet looking like a read-only transcript.
+      window.setTimeout(function () {
+        if (!screenEl || screenEl.getAttribute("data-sheet") !== "chat") return;
+        if (window.taosOSK) {
+          window.taosOSK.enable();
+          window.taosOSK.focusField(composer);
+        }
+        window.setTimeout(function () {
+          syncKeyboard();
+          // Raising the keyboard SHORTENS the sheet, so the scroll position
+          // computed for the full-height sheet is no longer the bottom. Without
+          // this the thread opens parked mid-conversation with the newest
+          // message behind the composer.
+          bottomOut();
+        }, 60);
+      }, 420);
 
       fetch("/auth/lock-thread/" + encodeURIComponent(slugFor(agent.name || "")), {
         credentials: "same-origin"
@@ -1795,6 +1966,9 @@ _LOCK_SCREEN_SCRIPT = r"""
       }
 
       agentsEl.addEventListener("pointerdown", function (ev) {
+        // The mic is its own control sitting inside the island; without this the
+        // island's press handler would open the conversation underneath it.
+        if (ev.target.closest(".ls-mic")) return;
         var el = ev.target.closest(".ls-island");
         if (!el) return;
         held = false;
@@ -1819,6 +1993,7 @@ _LOCK_SCREEN_SCRIPT = r"""
       });
 
       agentsEl.addEventListener("pointerup", function (ev) {
+        if (ev.target.closest(".ls-mic")) return;
         var el = pressed;
         clear();
         if (held) { held = false; return; }   // the hold already opened it
@@ -1839,6 +2014,177 @@ _LOCK_SCREEN_SCRIPT = r"""
         open(el);
       });
     })();
+
+    // -----------------------------------------------------------------------
+    // DICTATION. The waveform is driven by the REAL microphone through an
+    // AnalyserNode, not by a canned animation: a fake waveform that moves while
+    // the mic is muted or denied is worse than no waveform, because it tells
+    // the user they are being heard when they are not.
+    //
+    // Transcription is a separate capability from capture. Where the browser
+    // has SpeechRecognition it is used; where it does not, the sheet says so
+    // plainly instead of listening forever into nothing.
+    // -----------------------------------------------------------------------
+    var waveCanvas = document.getElementById("ls-wave");
+    var voiceText  = document.getElementById("ls-voice-text");
+    var voiceState = document.getElementById("ls-voice-state");
+    var voiceTitle = document.getElementById("ls-voice-title");
+    var voiceAv    = document.getElementById("ls-voice-avatar");
+    var voiceSend  = document.getElementById("ls-voice-send");
+    var voiceAgent = null;
+    var mediaStream = null, audioCtx = null, analyser = null, waveRAF = null;
+    var recog = null, finalText = "";
+
+    function drawWave(level) {
+      if (!waveCanvas) return;
+      var ctx = waveCanvas.getContext("2d");
+      var w = waveCanvas.width, h = waveCanvas.height, mid = h / 2;
+      ctx.clearRect(0, 0, w, h);
+      var bars = 48, gap = 3, bw = (w - gap * (bars - 1)) / bars;
+      for (var i = 0; i < bars; i++) {
+        // A travelling envelope so the bars read as a moving waveform rather
+        // than a level meter; scaled by the ACTUAL measured level.
+        var phase = (Date.now() / 260) + i * 0.38;
+        var env = 0.32 + 0.68 * Math.abs(Math.sin(phase));
+        var mag = Math.max(2, level * env * mid * 1.9);
+        var x = i * (bw + gap);
+        ctx.fillStyle = "rgba(10,132,255," + (0.45 + 0.55 * env) + ")";
+        ctx.beginPath();
+        if (ctx.roundRect) ctx.roundRect(x, mid - mag, bw, mag * 2, bw / 2);
+        else ctx.rect(x, mid - mag, bw, mag * 2);
+        ctx.fill();
+      }
+    }
+
+    function pumpWave() {
+      if (!analyser) return;
+      var buf = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteTimeDomainData(buf);
+      // RMS around the 128 midpoint: a peak reading spikes on a single click
+      // and makes a quiet room look loud.
+      var sum = 0;
+      for (var i = 0; i < buf.length; i++) {
+        var v = (buf[i] - 128) / 128;
+        sum += v * v;
+      }
+      drawWave(Math.min(1, Math.sqrt(sum / buf.length) * 3.2));
+      waveRAF = requestAnimationFrame(pumpWave);
+    }
+
+    function stopVoice() {
+      if (waveRAF) { cancelAnimationFrame(waveRAF); waveRAF = null; }
+      if (recog) { try { recog.onend = null; recog.abort(); } catch (e) {} recog = null; }
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} });
+        mediaStream = null;
+      }
+      if (audioCtx) { try { audioCtx.close(); } catch (e) {} audioCtx = null; }
+      analyser = null;
+    }
+
+    function voiceFail(msg) {
+      stopVoice();
+      if (voiceState) voiceState.textContent = "Not available";
+      if (voiceText) { voiceText.setAttribute("data-error", "1"); voiceText.textContent = msg; }
+      drawWave(0);
+    }
+
+    function openVoice(agent) {
+      voiceAgent = agent;
+      finalText = "";
+      if (voiceTitle) voiceTitle.textContent = agent.name || "agent";
+      if (voiceAv) fillAvatar(voiceAv, agent);
+      if (voiceText) { voiceText.removeAttribute("data-error"); voiceText.textContent = ""; }
+      if (voiceState) voiceState.textContent = "Listening\u2026";
+      if (voiceSend) voiceSend.disabled = true;
+      openSheet("voice");
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        voiceFail("This device has no microphone available to the browser.");
+        return;
+      }
+      navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+        if (!screenEl || screenEl.getAttribute("data-sheet") !== "voice") {
+          stream.getTracks().forEach(function (t) { t.stop(); });
+          return;
+        }
+        mediaStream = stream;
+        var AC = window.AudioContext || window.webkitAudioContext;
+        audioCtx = new AC();
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 1024;
+        audioCtx.createMediaStreamSource(stream).connect(analyser);
+        pumpWave();
+
+        var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SR) {
+          // Capture works, transcription does not. Say exactly that rather than
+          // leaving a waveform moving under a caption that never appears.
+          if (voiceState) voiceState.textContent = "Dictation unavailable";
+          if (voiceText) {
+            voiceText.setAttribute("data-error", "1");
+            voiceText.textContent = "This build has no speech recognition, so it cannot turn speech into text. Type instead.";
+          }
+          return;
+        }
+        recog = new SR();
+        recog.continuous = true;
+        recog.interimResults = true;
+        recog.lang = navigator.language || "en-GB";
+        recog.onresult = function (ev) {
+          var interim = "";
+          for (var i = ev.resultIndex; i < ev.results.length; i++) {
+            var chunk = ev.results[i][0].transcript;
+            if (ev.results[i].isFinal) finalText += chunk;
+            else interim += chunk;
+          }
+          if (voiceText) voiceText.textContent = (finalText + interim).trim();
+          if (voiceSend) voiceSend.disabled = !(finalText + interim).trim();
+        };
+        recog.onerror = function (ev) {
+          voiceFail(ev && ev.error === "not-allowed"
+            ? "Microphone access was refused."
+            : "Dictation stopped. Type instead.");
+        };
+        try { recog.start(); } catch (e) { /* already running */ }
+      }).catch(function () {
+        voiceFail("Microphone access was refused, so nothing is being recorded.");
+      });
+    }
+
+    if (agentsEl) {
+      agentsEl.addEventListener("click", function (ev) {
+        var mic = ev.target.closest(".ls-mic");
+        if (!mic) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        var el = mic.closest(".ls-island");
+        if (el && el.__agent) openVoice(el.__agent);
+      });
+    }
+
+    var voiceClose = document.getElementById("ls-voice-close");
+    if (voiceClose) voiceClose.addEventListener("click", closeSheet);
+    var voiceCancel = document.getElementById("ls-voice-cancel");
+    if (voiceCancel) voiceCancel.addEventListener("click", closeSheet);
+    if (voiceSend) {
+      voiceSend.addEventListener("click", function () {
+        var text = (voiceText ? voiceText.textContent : "").trim();
+        var agent = voiceAgent;
+        stopVoice();
+        if (!text || !agent) { closeSheet(); return; }
+        // Hand the dictation to the conversation rather than sending it from
+        // here: the thread is where a message belongs, and it is then visible
+        // as having been said.
+        openChat(agent);
+        window.setTimeout(function () {
+          if (composer) {
+            composer.value = text;
+            composer.dispatchEvent(new Event("input", { bubbles: true }));
+          }
+        }, 60);
+      });
+    }
 
     // Keypad -> the existing PIN input.
     var pad = document.getElementById("ls-pad");

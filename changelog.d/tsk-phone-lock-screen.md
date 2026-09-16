@@ -23,3 +23,12 @@
 - Fixed: the conversation sheet opened empty. `/auth/lock-thread/` was never
   added to the auth middleware's exempt prefixes, so the lock screen — which
   renders before sign-in — got a 401 with nothing shown and nothing logged.
+- Lock screen chrome: product name and battery moved to a top status bar as
+  plain text; the device hostname is gone. Dictation button on every island
+  opens a voice sheet whose waveform is driven by the real microphone.
+- Fixed: "Use my password instead" dropped the lock-screen class, which threw
+  away `overflow:hidden` (a chromium scrollbar appeared) and un-hid the
+  keyboard's floating toggle. The password form now stays on the lock screen
+  and raises the keyboard itself.
+- Fixed: the conversation sheet was dismissed by any downward drag, so the
+  thread could not be scrolled. Dismissal is now the header/grabber only.
