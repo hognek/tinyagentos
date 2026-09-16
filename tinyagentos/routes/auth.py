@@ -832,6 +832,101 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
 }
 .ls-decisions:empty { display: none; }
 
+/* THE VOLUME BEZEL. Right edge, vertical, level with the rocker. */
+.ls-vol {
+  position: fixed; right: 10px; top: 50%; z-index: 80;
+  transform: translate(120%, -50%);
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  padding: 14px 10px; border-radius: 22px;
+  background: rgba(24,24,27,0.86);
+  backdrop-filter: blur(24px) saturate(1.3);
+  -webkit-backdrop-filter: blur(24px) saturate(1.3);
+  box-shadow: 0 12px 34px -10px rgba(0,0,0,0.85);
+  opacity: 0;
+  transition: transform 260ms cubic-bezier(0.32,0.72,0,1), opacity 200ms ease;
+  pointer-events: none;     /* a heads-up, never a target */
+}
+.ls-vol[data-on="1"] { transform: translate(0, -50%); opacity: 1; }
+.ls-vol-track {
+  width: 8px; height: 150px; border-radius: 999px;
+  background: rgba(255,255,255,0.18);
+  display: flex; align-items: flex-end; overflow: hidden;
+}
+.ls-vol-fill {
+  display: block; width: 100%; height: var(--ls-vol, 50%);
+  border-radius: 999px; background: #fff;
+  transition: height 140ms ease;
+}
+.ls-vol-num {
+  font-size: 12px; font-weight: 600; color: rgba(255,255,255,0.8);
+  font-variant-numeric: tabular-nums;
+}
+.ls-vol-note {
+  max-width: 76px; font-size: 10px; line-height: 1.25; text-align: center;
+  color: rgba(255,176,32,0.92);
+}
+
+/* THE AGENT CAROUSEL. Left edge, because that is where the keys are. */
+.ls-carousel {
+  position: fixed; left: 0; top: 0; bottom: 0; z-index: 80;
+  display: flex; align-items: center; gap: 12px;
+  padding: 0 14px 0 8px;
+  transform: translateX(-110%);
+  opacity: 0;
+  transition: transform 300ms cubic-bezier(0.32,0.72,0,1), opacity 200ms ease;
+  pointer-events: none;
+}
+.ls-carousel[data-on="1"] { transform: translateX(0); opacity: 1; }
+.ls-carousel-strip {
+  display: flex; flex-direction: column; gap: 10px;
+  padding: 12px 8px; border-radius: 26px;
+  background: rgba(24,24,27,0.86);
+  backdrop-filter: blur(26px) saturate(1.3);
+  -webkit-backdrop-filter: blur(26px) saturate(1.3);
+  box-shadow: 0 14px 40px -12px rgba(0,0,0,0.85);
+}
+/* Each face. The focused one grows and brightens; the rest stay small and dim,
+   so which is selected is readable at a glance from the corner of the eye --
+   this is driven by a key, not a tap, so the eye is not already on it. */
+.ls-face {
+  width: 40px; height: 40px; border-radius: 50%;
+  background: rgba(255,255,255,0.1) center/cover no-repeat;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; font-weight: 700; color: rgba(255,255,255,0.7);
+  opacity: 0.42; transform: scale(0.88);
+  transition: opacity 180ms ease, transform 220ms cubic-bezier(0.32,0.72,0,1),
+              box-shadow 180ms ease;
+}
+.ls-face[data-focus="1"] {
+  opacity: 1; transform: scale(1.12);
+  box-shadow: 0 0 0 2px rgba(255,255,255,0.85);
+  color: #fff;
+}
+.ls-carousel-banner { max-width: 190px; }
+.ls-carousel-name { font-size: 16px; font-weight: 700; color: #fff; }
+.ls-carousel-role {
+  margin-top: 1px; font-size: 12px; color: rgba(255,255,255,0.62);
+  text-transform: uppercase; letter-spacing: 0.05em;
+}
+.ls-carousel-ptt {
+  margin-top: 8px; font-size: 12px; color: rgba(255,255,255,0.45);
+}
+/* Talking: the whole banner picks it up, because at arm's length the words are
+   not what you read -- the colour is. */
+.ls-carousel[data-talking="1"] .ls-carousel-ptt { color: #6ee787; font-weight: 600; }
+.ls-carousel[data-talking="1"] .ls-face[data-focus="1"] {
+  box-shadow: 0 0 0 3px #30d158;
+  animation: ls-ptt 1.1s ease-in-out infinite;
+}
+@keyframes ls-ptt {
+  0%, 100% { box-shadow: 0 0 0 3px #30d158; }
+  50%      { box-shadow: 0 0 0 7px rgba(48,209,88,0.35); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ls-vol, .ls-carousel, .ls-face, .ls-vol-fill { transition: none; }
+  .ls-carousel[data-talking="1"] .ls-face[data-focus="1"] { animation: none; }
+}
+
 /* THE PULL-DOWN SHADE, from the TOP edge -- the one surface on this screen that
    does not come from the bottom, because that is where the gesture starts. It
    deliberately does NOT cover the whole screen: a shade that fills the display
@@ -2122,6 +2217,28 @@ def _lock_tail_html() -> str:
        key always was. Power off and Restart add nothing the hardware key did
        not already allow; "Stop all agents" and "Emergency call" DO ask for
        something more, which is why Jay asked for both to confirm first. -->
+  <!-- THE VOLUME BEZEL. Vertical, on the RIGHT, because that is the side the
+       rocker is on -- the readout should be next to the finger that caused it.
+       It does NOT take a sheet slot: volume is a transient heads-up, and taking
+       the sheet slot would mean nudging the volume dismissed an open menu. -->
+  <div class="ls-vol" id="ls-vol" aria-hidden="true">
+    <div class="ls-vol-track"><span class="ls-vol-fill" id="ls-vol-fill"></span></div>
+    <div class="ls-vol-num" id="ls-vol-num">--</div>
+    <div class="ls-vol-note" id="ls-vol-note" hidden></div>
+  </div>
+
+  <!-- THE AGENT CAROUSEL. Jay: "a carousel type animation slides out from the
+       left of the screen where the buttons are with the agents avatars/faces".
+       Left edge, vertical, because the keys that drive it are vertical. -->
+  <div class="ls-carousel" id="ls-carousel" aria-hidden="true">
+    <div class="ls-carousel-strip" id="ls-carousel-strip"></div>
+    <div class="ls-carousel-banner" id="ls-carousel-banner">
+      <div class="ls-carousel-name" id="ls-carousel-name"></div>
+      <div class="ls-carousel-role" id="ls-carousel-role"></div>
+      <div class="ls-carousel-ptt" id="ls-carousel-ptt">Hold a volume key to talk</div>
+    </div>
+  </div>
+
   <!-- THE PULL-DOWN SHADE. Jay: "We need a pull down area from the top of the
        screen for things like brightness". Swipe down from the top edge.
        "things like" is the brief, so this is a container with one control in it
@@ -3267,6 +3384,208 @@ _LOCK_SCREEN_SCRIPT = r"""
     }
 
     // ------------------------------------------------------------------
+    // THE VOLUME KEYS. Jay's spec, and all of the policy lives here because it
+    // is all STATE -- the compositor only reports press and release.
+    //
+    //   up   from rest -> reveal the bezel. THE FIRST PRESS DOES NOT CHANGE THE
+    //                     VOLUME. That is the point of it: on a phone with no
+    //                     on-screen volume, the first press today changes a
+    //                     level you cannot see. This makes the first press the
+    //                     one that shows you what you are about to change.
+    //   down from rest -> slide the agent carousel out of the LEFT edge.
+    //   then           -> up/down move whichever surface is open.
+    //   HOLD           -> walkie-talkie with the focused agent. MOCK: Jay,
+    //                     "just for demo/mock purposes for now so we can play
+    //                     around with designs and testing". No mic is opened,
+    //                     nothing is recorded, nothing is sent.
+    // ------------------------------------------------------------------
+    var volEl = document.getElementById("ls-vol");
+    var volFill = document.getElementById("ls-vol-fill");
+    var volNum = document.getElementById("ls-vol-num");
+    var volNote = document.getElementById("ls-vol-note");
+    var carEl = document.getElementById("ls-carousel");
+    var carStrip = document.getElementById("ls-carousel-strip");
+    var carName = document.getElementById("ls-carousel-name");
+    var carRole = document.getElementById("ls-carousel-role");
+    var carPtt = document.getElementById("ls-carousel-ptt");
+
+    var volPct = 50;          // last known level
+    var volArmed = false;     // has the reveal press been spent?
+    var volHideTimer = null;
+    var carIndex = 0;
+    var holdTimer = null;
+    var talking = false;
+    // 600ms: past a deliberate press, short enough that holding to talk feels
+    // immediate rather than like waiting for the phone to agree.
+    var HOLD_MS = 600;
+
+    function volShow() {
+      if (!volEl) return;
+      volEl.setAttribute("data-on", "1");
+      restartIdleHide();
+    }
+
+    function hideAll() {
+      if (volEl) volEl.removeAttribute("data-on");
+      if (carEl) { carEl.removeAttribute("data-on"); carEl.removeAttribute("data-talking"); }
+      volArmed = false;
+      talking = false;
+    }
+
+    function restartIdleHide() {
+      if (volHideTimer) window.clearTimeout(volHideTimer);
+      // Long enough to nudge the level twice without it vanishing between
+      // presses, short enough that it is gone before it becomes clutter.
+      volHideTimer = window.setTimeout(hideAll, 2600);
+    }
+
+    function paintVolume(d) {
+      if (!d || typeof d.percent !== "number") return;
+      volPct = Math.round(d.percent);
+      if (volFill) volFill.style.setProperty("--ls-vol", volPct + "%");
+      setText(volNum, volPct + "%");
+      // Said on the glass, because it is the difference between a broken
+      // slider and an honest one: PipeWire answers, and has no sink behind it.
+      if (volNote) {
+        if (d.no_sink) {
+          setText(volNote, "No audio output");
+          volNote.hidden = false;
+        } else {
+          volNote.hidden = true;
+        }
+      }
+    }
+
+    function loadVolume() {
+      fetch("/auth/lock-volume", { credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { if (d) paintVolume(d); })
+        .catch(function () { /* the bezel keeps its last reading */ });
+    }
+
+    function nudgeVolume(delta) {
+      volPct = Math.max(0, Math.min(100, volPct + delta));
+      if (volFill) volFill.style.setProperty("--ls-vol", volPct + "%");
+      setText(volNum, volPct + "%");
+      fetch("/auth/lock-volume", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ percent: volPct })
+      }).then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { if (d) paintVolume(d); })
+        .catch(function () { /* the bar has already moved; leave it */ });
+    }
+
+    function carAgents() {
+      // The islands are the source. The carousel must never show an agent the
+      // screen behind it does not, and re-fetching would let the two disagree.
+      var out = [];
+      if (!agentsEl) return out;
+      for (var i = 0; i < agentsEl.children.length; i++) {
+        var el = agentsEl.children[i];
+        var rec = el.__agent;
+        if (rec && rec.name) out.push(rec);
+      }
+      return out;
+    }
+
+    function paintCarousel() {
+      var list = carAgents();
+      if (!carStrip) return;
+      if (!list.length) {
+        setText(carName, "No agents");
+        setText(carRole, "");
+        return;
+      }
+      if (carIndex >= list.length) carIndex = 0;
+      if (carIndex < 0) carIndex = list.length - 1;
+      var want = [];
+      for (var i = 0; i < list.length; i++) {
+        var agent = list[i];
+        var face = partOf(carStrip, agent.name, "ls-face");
+        if (agent.avatar) {
+          var url = "url(\"" + String(agent.avatar).replace(/["\\\\]/g, "") + "\")";
+          if (face.style.getPropertyValue("background-image") !== url) {
+            face.style.setProperty("background-image", url);
+          }
+        } else {
+          setText(face, (agent.name || "?").slice(0, 2));
+        }
+        setAttrIfChanged(face, "data-focus", i === carIndex ? "1" : "0");
+        want.push(face);
+      }
+      placeInOrder(carStrip, want);
+      var focused = list[carIndex];
+      setText(carName, focused.name || "");
+      setText(carRole, focused.framework || focused.status || "agent");
+      if (!talking) setText(carPtt, "Hold a volume key to talk");
+    }
+
+    function carShow() {
+      if (!carEl) return;
+      paintCarousel();
+      carEl.setAttribute("data-on", "1");
+      restartIdleHide();
+    }
+
+    function startTalking() {
+      if (!carEl || carEl.getAttribute("data-on") !== "1") return;
+      talking = true;
+      carEl.setAttribute("data-talking", "1");
+      // MOCK. No getUserMedia, no recorder, no upload. The word "demo" stays on
+      // screen so this can never be mistaken for a live channel.
+      setText(carPtt, "Talking… (demo)");
+      if (volHideTimer) window.clearTimeout(volHideTimer);
+    }
+
+    function stopTalking() {
+      if (!talking) return;
+      talking = false;
+      if (carEl) carEl.removeAttribute("data-talking");
+      setText(carPtt, "Sent (demo)");
+      restartIdleHide();
+    }
+
+    function volumeKey(key, action) {
+      // Never over the passcode: a volume nudge must not cover the keypad
+      // someone is typing a PIN into.
+      var sheet = screenEl ? screenEl.getAttribute("data-sheet") : "none";
+      if (sheet && sheet !== "none") return;
+
+      var carOpen = carEl && carEl.getAttribute("data-on") === "1";
+      var volOpen = volEl && volEl.getAttribute("data-on") === "1";
+
+      if (action === "release") {
+        if (holdTimer) { window.clearTimeout(holdTimer); holdTimer = null; }
+        stopTalking();
+        return;
+      }
+
+      // A hold starts counting on every press, but only ever means anything
+      // while the carousel is up.
+      if (holdTimer) window.clearTimeout(holdTimer);
+      holdTimer = window.setTimeout(startTalking, HOLD_MS);
+
+      if (!carOpen && !volOpen) {
+        // From rest: which key was pressed decides which surface appears.
+        if (key === "up") { loadVolume(); volShow(); volArmed = true; }
+        else { carIndex = 0; carShow(); }
+        return;
+      }
+
+      restartIdleHide();
+      if (carOpen) {
+        carIndex += (key === "up" ? -1 : 1);   // up moves UP the strip
+        paintCarousel();
+        return;
+      }
+      // The bezel is showing, so now the keys move the level. The reveal press
+      // was spent getting here, which is the whole point of `volArmed`.
+      nudgeVolume(key === "up" ? 5 : -5);
+    }
+
+    // ------------------------------------------------------------------
     // THE PULL-DOWN SHADE. Swipe down from the TOP EDGE.
     //
     // Jay: "We need a pull down area from the top of the screen for things like
@@ -3520,6 +3839,10 @@ _LOCK_SCREEN_SCRIPT = r"""
           screenEl.setAttribute("data-instant", "1");
           closeSheet();
         });
+        lockStream.addEventListener("volume-up-press", function () { volumeKey("up", "press"); });
+        lockStream.addEventListener("volume-up-release", function () { volumeKey("up", "release"); });
+        lockStream.addEventListener("volume-down-press", function () { volumeKey("down", "press"); });
+        lockStream.addEventListener("volume-down-release", function () { volumeKey("down", "release"); });
         lockStream.addEventListener("power-menu", function () {
           paintPowerMenu();
           if (powerSub) {
@@ -7168,6 +7491,124 @@ def _write_brightness(level: int) -> dict | None:
         # The read-back below is the measurement.
         pass
     return _read_brightness()
+
+
+@router.post("/lock-volume-key")
+async def lock_volume_key(request: Request):
+    """A volume key went down or came up. Console-only.
+
+    Posted by the compositor. The BEHAVIOUR is not decided here: the page owns
+    which surface is open, which agent is focused and whether the first press
+    has been spent, and splitting that across a route and a page would give two
+    places a different idea of whether the slider is showing.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    key = str(body.get("key", "")).strip()
+    action = str(body.get("action", "")).strip()
+    if key not in ("up", "down") or action not in ("press", "release"):
+        return JSONResponse({"error": "bad key or action"}, status_code=400)
+    delivered = _push_lock_event("volume-%s-%s" % (key, action))
+    return JSONResponse({"ok": True, "delivered": delivered})
+
+
+def _read_volume() -> dict | None:
+    """Current output volume via PipeWire, or None if there is nothing to ask.
+
+    ⚠ MEASURED ON THIS HANDSET: PipeWire is running and answers
+    `wpctl get-volume @DEFAULT_AUDIO_SINK@` with 1.00, but `wpctl status` lists
+    NO SINKS AND NO SOURCES. So the number is real and there is nothing behind
+    it -- setting it would succeed and make nothing louder. `no_sink` is
+    reported rather than hidden, because a volume slider that silently drives
+    nothing is worse than one that says so.
+    """
+    import subprocess
+
+    env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/%d" % os.getuid())
+    try:
+        got = subprocess.run(
+            ["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"],
+            capture_output=True, text=True, timeout=4, env=env,
+        )
+    except Exception:
+        return None
+    if got.returncode != 0:
+        return None
+    # "Volume: 0.75" or "Volume: 0.75 [MUTED]"
+    parts = got.stdout.split()
+    level = None
+    for index, token in enumerate(parts):
+        if token.rstrip(":").lower() == "volume" and index + 1 < len(parts):
+            try:
+                level = float(parts[index + 1])
+            except ValueError:
+                level = None
+            break
+    if level is None:
+        return None
+    sinks = False
+    try:
+        status = subprocess.run(
+            ["wpctl", "status"], capture_output=True, text=True, timeout=4, env=env
+        ).stdout
+        after = status.split("Sinks:", 1)
+        # A populated list has an id line under the heading; an empty one goes
+        # straight to the next section.
+        sinks = bool(after[1:] and any(
+            ch.isdigit() for ch in after[1].split("Sources:", 1)[0]
+        ))
+    except Exception:
+        sinks = False
+    return {
+        "percent": round(level * 100, 1),
+        "muted": "MUTED" in got.stdout.upper(),
+        "no_sink": not sinks,
+    }
+
+
+@router.get("/lock-volume")
+async def lock_volume(request: Request):
+    """Current output volume. Console-only."""
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    reading = _read_volume()
+    if reading is None:
+        return JSONResponse({"error": "no audio"}, status_code=404)
+    return JSONResponse(reading)
+
+
+@router.post("/lock-volume")
+async def set_lock_volume(request: Request):
+    """Set the output volume. Console-only. Returns the READ-BACK."""
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        percent = max(0.0, min(100.0, float(body.get("percent"))))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "percent required"}, status_code=400)
+
+    import subprocess
+
+    env = dict(os.environ, XDG_RUNTIME_DIR="/run/user/%d" % os.getuid())
+    try:
+        subprocess.run(
+            ["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", "%.2f" % (percent / 100.0)],
+            capture_output=True, text=True, timeout=4, env=env,
+        )
+    except Exception:
+        pass
+    after = _read_volume()
+    if after is None:
+        return JSONResponse({"error": "no audio"}, status_code=404)
+    return JSONResponse(after)
 
 
 @router.get("/lock-brightness")

@@ -332,3 +332,122 @@ class TestTheMenuOnTheGlass:
         page = auth._LOCK_SCREEN_SCRIPT
         assert 'if (name === "power")' in page, "openSheet cannot find the power sheet"
         del html  # the sheet is emitted outside the head fragment
+
+
+class TestTheVolumeKeys:
+    """Jay's spec: "if the user presses up it activates the volume slider
+    (doesnt change volume yet) then they can use both volume buttons to change
+    the volume. if they press down then a carousel ... with the agents
+    avatars/faces ... holding a volume buttons activates voice comms with the
+    agent like a walkie talkie."
+
+    The compositor reports press and release and decides nothing; every bit of
+    that behaviour is state, and it lives in the page.
+    """
+
+    @pytest.mark.parametrize("key", ["up", "down"])
+    @pytest.mark.parametrize("action", ["press", "release"])
+    def test_a_key_event_reaches_an_open_page(self, monkeypatch, key, action):
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: True)
+        auth._LOCK_EVENT_WAITERS.clear()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=8)
+        auth._LOCK_EVENT_WAITERS.add(queue)
+        try:
+            got = _body(_call(auth.lock_volume_key(
+                _Req({"key": key, "action": action}))))
+            assert got["delivered"] == 1
+            assert queue.get_nowait() == "volume-%s-%s" % (key, action)
+        finally:
+            auth._LOCK_EVENT_WAITERS.clear()
+
+    def test_a_nonsense_key_is_refused(self, monkeypatch):
+        """This is a compositor-driven endpoint on a pre-auth screen; the set of
+        things it will relay is closed."""
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: True)
+        for body in ({"key": "sideways", "action": "press"},
+                     {"key": "up", "action": "wiggle"},
+                     {}):
+            assert _call(auth.lock_volume_key(_Req(body))).status_code == 400
+
+    def test_it_is_console_only_and_exempt(self, monkeypatch):
+        assert "/auth/lock-volume-key" in EXEMPT_PATHS
+        assert "/auth/lock-volume" in EXEMPT_PATHS
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: False)
+        assert _call(auth.lock_volume_key(
+            _Req({"key": "up", "action": "press"}))).status_code == 403
+
+    def test_the_first_up_press_reveals_without_changing_the_volume(self):
+        """The whole point of Jay's "doesnt change volume yet". On a phone with
+        no on-screen volume, the first press today changes a level you cannot
+        see; this makes the first press the one that shows you what you are
+        about to change."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function volumeKey(")
+        body = js[start:js.index("\n    }", start)]
+        rest = body[body.index("if (!carOpen && !volOpen)"):]
+        reveal = rest[:rest.index("return;")]
+        # The reveal branch shows the bezel and does NOT nudge.
+        assert "volShow()" in reveal, reveal
+        assert "nudgeVolume" not in reveal, reveal
+
+    def test_down_from_rest_opens_the_carousel_not_the_bezel(self):
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function volumeKey(")
+        body = js[start:js.index("\n    }", start)]
+        rest = body[body.index("if (!carOpen && !volOpen)"):]
+        reveal = rest[:rest.index("return;")]
+        assert "carShow()" in reveal, reveal
+
+    def test_a_hold_starts_the_walkie_talkie_and_a_release_stops_it(self):
+        js = auth._LOCK_SCREEN_SCRIPT
+        assert "HOLD_MS" in js
+        start = js.index("function volumeKey(")
+        body = js[start:js.index("\n    }", start)]
+        assert "startTalking" in body and "stopTalking" in body
+
+    def test_the_walkie_talkie_opens_no_microphone(self):
+        """Jay: "just for demo/mock purposes for now". A mock that quietly grew
+        a real mic would be the worst possible surprise on a PRE-AUTH screen,
+        so the absence is asserted rather than trusted to the comment.
+
+        Scoped to the volume/carousel code rather than the whole script,
+        because the script is NOT mic-free: the pre-existing `#ls-voice` sheet
+        calls navigator.mediaDevices.getUserMedia({audio: true}), and it is
+        reachable from the lock screen. That is worth knowing and is not this
+        feature's doing -- asserting it away here would have quietly taken
+        responsibility for someone else's microphone.
+        """
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("var volEl = document.getElementById")
+        block = js[start:js.index("function volumeKey(", start)]
+        # CALL syntax, not bare words: the comment in startTalking says "No
+        # getUserMedia, no recorder, no upload", and a substring check on the
+        # word made this file fail on its own prose.
+        for forbidden in (".getUserMedia(", "new MediaRecorder(",
+                          "new AudioContext(", "navigator.mediaDevices"):
+            assert forbidden not in block, forbidden
+
+    def test_the_talking_state_says_demo_on_screen(self):
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function startTalking(")
+        assert "(demo)" in js[start:start + 600]
+
+    def test_the_volume_surfaces_never_cover_the_passcode(self):
+        """A volume nudge must not drop a bezel over the keypad someone is
+        typing a PIN into."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function volumeKey(")
+        body = js[start:js.index("\n    }", start)]
+        head = body[:body.index("var carOpen")]
+        assert 'data-sheet' in head and "return" in head, head
+
+    def test_the_carousel_reads_the_agents_off_the_islands(self):
+        """It must never show an agent the screen behind it does not. A second
+        fetch would let the two disagree the moment one of them was stale."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function carAgents(")
+        body = js[start:js.index("function paintCarousel(", start)]
+        assert "agentsEl" in body
+        # "fetch(" and not "fetch": the comment above it explains why
+        # RE-FETCHING would be wrong, and matching the bare word caught that.
+        assert "fetch(" not in body, body
