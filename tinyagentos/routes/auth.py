@@ -922,6 +922,13 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
   transition: opacity 200ms ease, transform 260ms cubic-bezier(0.32, 0.72, 0, 1);
 }
 .ls-modal[hidden] { display: none; }
+/* Set for the duration of a close that happens while the panel is powering
+   down. Nothing is compositing then, so an animated close has nowhere to run
+   and would replay on wake -- the user sees the menu close half a second after
+   the screen comes back, which reads as the phone catching up with itself. */
+.lockscreen[data-instant="1"] ~ .ls-modal,
+.lockscreen[data-instant="1"] ~ .ls-shade,
+.lockscreen[data-instant="1"] ~ .ls-sheet { transition: none; }
 .lockscreen[data-sheet="power"] ~ #ls-power {
   opacity: 1; pointer-events: auto; transform: scale(1);
 }
@@ -3497,7 +3504,21 @@ _LOCK_SCREEN_SCRIPT = r"""
         // The panel is going dark. Put the sheet away NOW rather than leaving
         // it up behind a black screen for the next wake to land on.
         lockStream.addEventListener("screen-off", function () {
-          if (screenEl && screenEl.getAttribute("data-sheet") === "power") closeSheet();
+          if (!screenEl) return;
+          var open = screenEl.getAttribute("data-sheet");
+          // The passcode sheet is deliberately left alone: the panel blanking
+          // on a timeout must not throw away a half-typed PIN.
+          if (open !== "power" && open !== "shade") return;
+          // CLOSE IT WITHOUT ANIMATING. Jay: "when I turn the screen back on I
+          // see the menu close, it needs close when the screen turns off".
+          // The close already fires at screen-off -- but the panel is powering
+          // down, nothing is compositing, and the 340ms transition has nowhere
+          // to run. It then plays on wake, so the menu appears to close half a
+          // second after the screen returns. Suppressing the transition makes
+          // the close land while the screen is dark, which is the only place it
+          // can be invisible.
+          screenEl.setAttribute("data-instant", "1");
+          closeSheet();
         });
         lockStream.addEventListener("power-menu", function () {
           paintPowerMenu();
@@ -3919,6 +3940,9 @@ _LOCK_SCREEN_SCRIPT = r"""
 
     function openSheet(name) {
       if (!screenEl) return;
+      // Drop the no-animation flag set by a screen-off close. Cleared HERE
+      // rather than on a timer, which would race the transition it suppresses.
+      if (screenEl.hasAttribute("data-instant")) screenEl.removeAttribute("data-instant");
       var current = screenEl.getAttribute("data-sheet");
       if (current === name) return;
       // Remember where the user was so closing returns them there rather than

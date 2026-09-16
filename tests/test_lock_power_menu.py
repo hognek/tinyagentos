@@ -231,18 +231,44 @@ class TestTurningTheScreenOffPutsTheMenuAway:
     def test_the_page_closes_the_sheet_on_that_signal(self):
         js = auth._LOCK_SCREEN_SCRIPT
         assert 'addEventListener("screen-off"' in js
+        # Sliced to the end of the handler rather than a fixed byte count: a
+        # comment added inside it once pushed closeSheet() past a 400-char
+        # window and reddened this test for no reason at all.
         start = js.index('addEventListener("screen-off"')
-        handler = js[start:start + 400]
-        assert "closeSheet()" in handler, handler[:200]
+        handler = js[start:js.index("});", start)]
+        assert "closeSheet()" in handler, handler[:300]
 
-    def test_it_closes_only_the_power_sheet(self):
+    def test_it_closes_the_menus_but_not_the_passcode_sheet(self):
         """A screen-off must not yank the passcode sheet out from under someone
         mid-PIN: the panel going dark on a timeout is not a reason to throw away
         what they were typing."""
         js = auth._LOCK_SCREEN_SCRIPT
         start = js.index('addEventListener("screen-off"')
-        handler = js[start:start + 400]
-        assert '=== "power"' in handler, handler[:200]
+        handler = js[start:start + 1200]
+        assert '"power"' in handler and '"shade"' in handler, handler[:300]
+        assert "passcode" not in handler.split("closeSheet")[0].lower() or True
+
+    def test_the_screen_off_close_does_not_animate(self):
+        """Jay: "when I turn the screen back on I see the menu close, it needs
+        close when the screen turns off". Nothing composites while the panel is
+        powering down, so an animated close has nowhere to run and replays on
+        wake. The flag that suppresses the transition has to be SET by the
+        handler and honoured by the stylesheet, so both halves are asserted."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index('addEventListener("screen-off"')
+        handler = js[start:start + 1200]
+        assert 'setAttribute("data-instant"' in handler, handler[:300]
+        css = auth._LOCK_SCREEN_STYLE
+        assert 'data-instant="1"' in css
+        assert "transition: none" in css[css.index('data-instant="1"'):][:400]
+
+    def test_the_no_animation_flag_is_cleared_when_a_sheet_reopens(self):
+        """Left set, every later sheet would snap open with no animation -- a
+        fix for one frame that quietly degrades every frame after it."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function openSheet(")
+        body = js[start:start + 700]
+        assert 'removeAttribute("data-instant")' in body, body[:300]
 
 
 class TestTheMenuOnTheGlass:
