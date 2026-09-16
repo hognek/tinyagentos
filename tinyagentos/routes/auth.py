@@ -1880,6 +1880,49 @@ _LOCK_SCREEN_SCRIPT = r"""
     var FRAMEWORKS = { hermes: 1, openclaw: 1, deepseek: 1, omp: 1 };
     var RESTING = ["", "stopped", "idle", "exited", "error"];
 
+    // An island's IMMUTABLE half, as a string. Everything here comes from
+    // configuration rather than from runtime state, so a change is a
+    // reconfiguration and not a tick: rare enough to rebuild the element for,
+    // and not worth the code to mutate an avatar or a framework badge in place.
+    // The agent's NAME is not in here because the name is the key itself.
+    //
+    // JSON.stringify rather than a joined string: an avatar is a URL and a
+    // framework name is user-supplied, so any separator character I picked
+    // could appear inside a value and make two different agents compare equal.
+    function islandIdentity(agent) {
+      return JSON.stringify([
+        agent.avatar || "",
+        agent.framework_icon || "",
+        String(agent.framework || "").toLowerCase(),
+        agent.system ? "1" : "",
+      ]);
+    }
+
+    // An island's MUTABLE half: everything a 15s poll can legitimately change.
+    // Written in place, and only where the value actually differs, so that a
+    // tick which changes nothing touches nothing.
+    function applyAgent(el, agent) {
+      var name = agent.name || "agent";
+      var status = agent.status || "idle";
+      var busy = RESTING.indexOf(status.trim().toLowerCase()) === -1;
+      // The handlers read the whole record off the element rather than
+      // re-looking it up by name, so this has to be refreshed even when every
+      // visible field is unchanged.
+      el.__agent = agent;
+      setAttrIfChanged(el, "data-state", busy ? "busy" : "idle");
+      if (agent.attention) setAttrIfChanged(el, "data-attention", "1");
+      else if (el.hasAttribute("data-attention")) el.removeAttribute("data-attention");
+      setAttrIfChanged(el, "aria-label", (agent.attention && agent.decision)
+        ? name + " needs a decision: " + (agent.decision.question || "")
+        : name + ", " + status + ". Open conversation.");
+      var s = el.querySelector(".ls-status");
+      if (s && s.textContent !== status) s.textContent = status;
+    }
+
+    function setAttrIfChanged(el, attr, value) {
+      if (el.getAttribute(attr) !== value) el.setAttribute(attr, value);
+    }
+
     function island(agent) {
       var name = agent.name || "agent";
       var status = agent.status || "idle";
@@ -1887,6 +1930,7 @@ _LOCK_SCREEN_SCRIPT = r"""
 
       var el = document.createElement("div");
       el.className = "ls-island";
+      el.setAttribute("data-identity", islandIdentity(agent));
       // Stable identity across repaints. The 15s poll rebuilds this list, and
       // without a key there is no way to put keyboard focus back on the island
       // the user was actually on -- an index would silently move the focus to a
@@ -1989,6 +2033,97 @@ _LOCK_SCREEN_SCRIPT = r"""
       return el;
     }
 
+    // Bring the island list to match `agents` by CHANGING it, never by
+    // rebuilding it.
+    //
+    // The old code did `agentsEl.textContent = ""` and appended six fresh
+    // elements every 15 seconds. Every one of them was a new node, so every one
+    // of them replayed `ls-island-in` -- a 520ms entrance animation with
+    // staggered per-child delays. On the glass that is the whole list blinking
+    // every fifteen seconds, which is what Jay reported, and it happened
+    // whether or not a single byte of the payload had changed.
+    //
+    // Measured before the fix, over one poll with nothing touched: six of six
+    // islands fired `animationstart`, and the first island was no longer the
+    // same DOM node. Both of those are what the test asserts, because "the
+    // names are still right" would have passed on the broken code too.
+    //
+    // Keyed by agent name: that is already the identity this list uses for
+    // focus restoration, and an index would move an agent's island under the
+    // user's finger the moment the list reordered.
+    // Put exactly `els` inside `parent`, in this order, and remove whatever
+    // else is in there -- WITHOUT touching an element that is already in
+    // position. Re-inserting a node restarts its CSS animation, so a blind
+    // appendChild of every child in order flickers exactly as badly as the
+    // wipe it replaces. Every keyed list on this screen goes through here.
+    function placeInOrder(parent, els) {
+      var prev = null;
+      for (var i = 0; i < els.length; i++) {
+        var want = prev ? prev.nextSibling : parent.firstChild;
+        if (els[i] !== want) parent.insertBefore(els[i], want);
+        prev = els[i];
+      }
+      // Anything past the last wanted element is no longer in the payload.
+      while (prev ? prev.nextSibling : parent.firstChild) {
+        parent.removeChild(prev ? prev.nextSibling : parent.firstChild);
+      }
+    }
+
+    // The child of `parent` carrying this key, created once if it is not
+    // there yet. A new element comes back DETACHED -- placeInOrder puts it
+    // where the payload says it goes.
+    function partOf(parent, key, cls, tag) {
+      var kids = parent.children;
+      for (var i = 0; i < kids.length; i++) {
+        if (kids[i].getAttribute("data-part") === key) return kids[i];
+      }
+      var el = document.createElement(tag || "div");
+      el.className = cls;
+      el.setAttribute("data-part", key);
+      return el;
+    }
+
+    // Only write text that actually changed: assigning textContent replaces
+    // the text node even when the string is identical.
+    function setText(el, text) {
+      if (el.textContent !== text) el.textContent = text;
+      return el;
+    }
+
+    function reconcileIslands(agents) {
+      var existing = {};
+      var kids = agentsEl.children;
+      for (var i = 0; i < kids.length; i++) {
+        var key = kids[i].getAttribute("data-agent");
+        if (key !== null) existing[key] = kids[i];
+      }
+      var want = [];
+      for (var j = 0; j < agents.length; j++) {
+        var agent = agents[j];
+        var name = agent.name || "agent";
+        var el = Object.prototype.hasOwnProperty.call(existing, name)
+          ? existing[name] : null;
+        // A reconfigured agent -- new portrait, different framework -- is the
+        // one case where the element itself is wrong rather than merely stale.
+        if (el && el.getAttribute("data-identity") !== islandIdentity(agent)) {
+          el.remove();
+          el = null;
+        }
+        if (el) {
+          applyAgent(el, agent);
+        } else {
+          el = island(agent);
+        }
+        // Claimed: a second agent sharing this name gets its own island
+        // rather than the two of them fighting over one element.
+        delete existing[name];
+        want.push(el);
+      }
+      // Whatever the payload no longer lists has genuinely gone away, and
+      // placeInOrder drops it.
+      placeInOrder(agentsEl, want);
+    }
+
     function paintActivity(data) {
       // A repaint while a sheet is open would destroy the very island the sheet
       // was opened from -- dropping its record, restarting every entrance
@@ -2020,15 +2155,12 @@ _LOCK_SCREEN_SCRIPT = r"""
         }
       }
 
-      agentsEl.textContent = "";
       tasksEl.textContent = "";
       var agents = data.agents || [];
       var tasks = data.tasks || [];
       if (!agents.length && !tasks.length) { card.hidden = true; return; }
 
-      for (var i = 0; i < agents.length; i++) {
-        agentsEl.appendChild(island(agents[i]));
-      }
+      reconcileIslands(agents);
       for (var j = 0; j < tasks.length; j++) {
         var row = document.createElement("div");
         row.className = "ls-task";
@@ -2296,60 +2428,87 @@ _LOCK_SCREEN_SCRIPT = r"""
         .catch(function () { /* a lock screen does not show network errors */ });
     }
 
-    function statRow(label, value, pct) {
-      var row = document.createElement("div");
-      row.className = "ls-stat";
-      var top = document.createElement("div");
-      top.className = "ls-stat-top";
-      var l = document.createElement("span");
-      l.className = "ls-stat-label";
-      l.textContent = label;
-      var v = document.createElement("span");
-      v.className = "ls-stat-value";
-      v.textContent = value;
-      top.appendChild(l); top.appendChild(v);
-      row.appendChild(top);
+    // A stat row is built once and thereafter only its numbers change.
+    //
+    // The old code built a fresh one every poll, inside a freshly built
+    // `.ls-stat-card`, after `statsEl.textContent = ""`. That is the islands'
+    // disease one view over, except the stats poll runs every THREE seconds,
+    // not fifteen, and `.ls-stat-card` carries the same 520ms `ls-island-in`
+    // entrance. Measured in chromium at 540x1200 before the fix: two entrance
+    // replays in 7.5s, and the card was a different, detached node each time.
+    // That is the "the system stats widget flickers too" Jay reported in the
+    // same breath as the islands.
+    //
+    // Keeping the row also makes `.ls-stat-fill`'s `transition: width 420ms`
+    // mean something. A brand-new node has no previous width to travel from,
+    // so every meter SNAPPED to its reading; kept in place, they glide.
+    function statRow(parent, key, label, value, pct) {
+      var row = partOf(parent, key, "ls-stat");
+      var top = row.firstChild;
+      if (!top) {
+        top = document.createElement("div");
+        top.className = "ls-stat-top";
+        var l = document.createElement("span");
+        l.className = "ls-stat-label";
+        var v = document.createElement("span");
+        v.className = "ls-stat-value";
+        top.appendChild(l); top.appendChild(v);
+        row.appendChild(top);
+      }
+      setText(top.firstChild, label);
+      setText(top.lastChild, value);
       // A bar ONLY when there is a real percentage behind it. A meter drawn at
       // zero because nothing was measured looks exactly like a meter drawn at
-      // zero because the thing is idle.
+      // zero because the thing is idle -- and a meter LEFT at its last reading
+      // once the readings stop is worse still, because it goes on reporting a
+      // measurement nobody is making. So the track goes when the number does.
+      var track = row.lastChild === top ? null : row.lastChild;
       if (typeof pct === "number") {
-        var track = document.createElement("div");
-        track.className = "ls-stat-track";
-        var fill = document.createElement("div");
-        fill.className = "ls-stat-fill";
-        fill.style.width = Math.max(0, Math.min(100, pct)) + "%";
-        track.appendChild(fill);
-        row.appendChild(track);
+        if (!track) {
+          track = document.createElement("div");
+          track.className = "ls-stat-track";
+          var fill = document.createElement("div");
+          fill.className = "ls-stat-fill";
+          track.appendChild(fill);
+          row.appendChild(track);
+        }
+        track.firstChild.style.width = Math.max(0, Math.min(100, pct)) + "%";
+      } else if (track) {
+        row.removeChild(track);
       }
       return row;
+    }
+
+    function statNote(parent, key, text) {
+      return setText(partOf(parent, key, "ls-stat-note"), text);
     }
 
     function gib(kb) { return (kb / 1048576).toFixed(1) + " GB"; }
 
     function paintStats(d) {
       if (!statsEl) return;
-      statsEl.textContent = "";
       // Same as the placeholders: `hidden` meant "empty", and it no longer is.
       statsEl.hidden = false;
 
-      var card = document.createElement("div");
-      card.className = "ls-stat-card";
+      var parts = [];
+      var card = partOf(statsEl, "card", "ls-stat-card");
+      var rows = [];
 
       var cores = d.cpu_cores ? " · " + d.cpu_cores + " cores" : "";
-      card.appendChild(statRow(
+      rows.push(statRow(card, "cpu",
         "CPU" + cores,
         typeof d.cpu_percent === "number" ? d.cpu_percent.toFixed(0) + "%" : "--",
         typeof d.cpu_percent === "number" ? d.cpu_percent : null
       ));
 
       if (d.memory) {
-        card.appendChild(statRow(
+        rows.push(statRow(card, "memory",
           "Memory",
           gib(d.memory.used_kb) + " / " + gib(d.memory.total_kb),
           d.memory.percent
         ));
       } else {
-        card.appendChild(statRow("Memory", "--"));
+        rows.push(statRow(card, "memory", "Memory", "--"));
       }
 
       // GPU: LABELLED AS FREQUENCY, because that is what it is. The bar is the
@@ -2358,52 +2517,49 @@ _LOCK_SCREEN_SCRIPT = r"""
       if (d.gpu && d.gpu.freq_hz) {
         var mhz = Math.round(d.gpu.freq_hz / 1000000);
         var maxMhz = d.gpu.max_freq_hz ? Math.round(d.gpu.max_freq_hz / 1000000) : 0;
-        card.appendChild(statRow(
+        rows.push(statRow(card, "gpu",
           "GPU clock",
           maxMhz ? mhz + " / " + maxMhz + " MHz" : mhz + " MHz",
           maxMhz ? (mhz * 100 / maxMhz) : null
         ));
         if (typeof d.gpu.active_percent === "number") {
-          var note = document.createElement("div");
-          note.className = "ls-stat-note";
-          note.textContent = "Above idle clock " + d.gpu.active_percent.toFixed(0)
-            + "% of uptime. The GPU reports no utilisation counter.";
-          card.appendChild(note);
+          rows.push(statNote(card, "gpu-note",
+            "Above idle clock " + d.gpu.active_percent.toFixed(0)
+            + "% of uptime. The GPU reports no utilisation counter."));
         }
       } else {
-        card.appendChild(statRow("GPU clock", "--"));
+        rows.push(statRow(card, "gpu", "GPU clock", "--"));
       }
 
-      statsEl.appendChild(card);
+      placeInOrder(card, rows);
+      parts.push(card);
 
       // The remote processors, as state chips. This is where the NPU lives, and
       // running/offline is genuinely all it reports.
       if (d.dsps && d.dsps.length) {
-        var chips = document.createElement("div");
-        chips.className = "ls-chips";
+        var chips = partOf(statsEl, "chips", "ls-chips");
+        var want = [];
         for (var i = 0; i < d.dsps.length; i++) {
-          var c = document.createElement("span");
-          c.className = "ls-chip";
-          var up = String(d.dsps[i].state || "") === "running";
-          c.setAttribute("data-on", up ? "1" : "0");
-          c.textContent = (d.dsps[i].name || "dsp") + " · " + (d.dsps[i].state || "unknown");
-          chips.appendChild(c);
+          var name = d.dsps[i].name || "dsp";
+          var state = d.dsps[i].state || "unknown";
+          var c = partOf(chips, name, "ls-chip", "span");
+          c.setAttribute("data-on", String(d.dsps[i].state || "") === "running" ? "1" : "0");
+          want.push(setText(c, name + " · " + state));
         }
-        statsEl.appendChild(chips);
-        var why = document.createElement("div");
-        why.className = "ls-stat-note";
-        why.textContent = "Accelerators report running or offline only — no usage counter exists for them.";
-        statsEl.appendChild(why);
+        placeInOrder(chips, want);
+        parts.push(chips);
+        parts.push(statNote(statsEl, "accel-note",
+          "Accelerators report running or offline only — no usage counter exists for them."));
       }
+      // With no DSPs the chips and their caption are simply absent from
+      // `parts`, and placeInOrder takes them out.
 
       // "Nobody asked" and "none loaded" are different answers.
-      var models = document.createElement("div");
-      models.className = "ls-stat-note";
-      models.textContent = d.models
+      parts.push(statNote(statsEl, "models", d.models
         ? (d.models.length ? d.models.join(", ") : "No models loaded.")
-        : "Loaded models are not reported by this device.";
-      statsEl.appendChild(models);
+        : "Loaded models are not reported by this device."));
 
+      placeInOrder(statsEl, parts);
       syncFeedFade();
     }
 
@@ -2527,7 +2683,9 @@ _LOCK_SCREEN_SCRIPT = r"""
       var when = document.createElement("span");
       when.className = "ls-notif-when";
       when.textContent = whenText(item.at);
-      notifClocks.push({ el: when, at: item.at });
+      // The paint collects these from the DOM afterwards, so a stack it left
+      // untouched still gets its minutes retouched.
+      when.setAttribute("data-at", item.at);
       meta.appendChild(when);
 
       var title = document.createElement("div");
@@ -2583,19 +2741,75 @@ _LOCK_SCREEN_SCRIPT = r"""
       return el;
     }
 
+    // What a stack is CURRENTLY showing. Two payloads with the same signature
+    // are the same notifications, so the stack on screen is already right and
+    // must not be touched.
+    function notifIdentity(group) {
+      var parts = [group.app || "", group.glyph || "", group.mono || ""];
+      for (var i = 0; i < group.items.length; i++) {
+        var it = group.items[i];
+        parts.push(String(it.at) + "" + (it.title || "")
+          + "" + (it.text || ""));
+      }
+      return parts.join("");
+    }
+
     function paintNotifications(data) {
       if (!notifsEl) return;
       // Same rule as the islands: never rebuild under an open sheet.
       var sheetNow = screenEl ? screenEl.getAttribute("data-sheet") : "none";
       if (sheetNow && sheetNow !== "none") return;
       var groups = (data && data.groups) || [];
-      notifsEl.textContent = "";
-      notifClocks = [];
-      if (!groups.length) { notifsEl.hidden = true; return; }
-      for (var i = 0; i < groups.length; i++) {
-        if (!groups[i].items || !groups[i].items.length) continue;
-        notifsEl.appendChild(notifGroup(groups[i]));
+      if (!groups.length) {
+        notifsEl.textContent = "";
+        notifClocks = [];
+        notifsEl.hidden = true;
+        return;
       }
+
+      // Keyed by source, exactly like the islands, and for the same reason:
+      // the old code wiped the whole stack and rebuilt it, and
+      // `.ls-notif-group` carries the same 520ms `ls-island-in` entrance, so
+      // every stack replayed its entrance on every poll. It also threw away
+      // keyboard focus, and a stack IS a button.
+      var existing = {};
+      var kids = notifsEl.children;
+      for (var i = 0; i < kids.length; i++) {
+        var key = kids[i].getAttribute("data-source");
+        if (key !== null) existing[key] = kids[i];
+      }
+      var want = [];
+      for (var j = 0; j < groups.length; j++) {
+        var group = groups[j];
+        if (!group.items || !group.items.length) continue;
+        var source = String(group.source);
+        var el = Object.prototype.hasOwnProperty.call(existing, source)
+          ? existing[source] : null;
+        var identity = notifIdentity(group);
+        // A stack whose notifications genuinely CHANGED is new content, and
+        // new content is exactly what the entrance animation is for. A stack
+        // that did not change keeps its node, so it does not animate.
+        if (el && el.getAttribute("data-identity") !== identity) el = null;
+        if (!el) {
+          el = notifGroup(group);
+          el.setAttribute("data-source", source);
+          el.setAttribute("data-identity", identity);
+        }
+        delete existing[source];
+        want.push(el);
+      }
+      placeInOrder(notifsEl, want);
+
+      // The minute labels are retouched in place on their own timer, so the
+      // list of them is rebuilt from what is ACTUALLY on screen -- a stack
+      // that was left alone still has its own `when` nodes, and they are not
+      // the ones notifCard just pushed.
+      notifClocks = [];
+      var whens = notifsEl.querySelectorAll(".ls-notif-when[data-at]");
+      for (var k = 0; k < whens.length; k++) {
+        notifClocks.push({ el: whens[k], at: Number(whens[k].getAttribute("data-at")) });
+      }
+
       notifsEl.hidden = !notifsEl.firstChild;
       syncFeedFade();
     }
@@ -2855,15 +3069,41 @@ _LOCK_SCREEN_SCRIPT = r"""
     // because scrollTop, clientHeight and scrollHeight are all fractional under
     // a non-integer device pixel ratio and never sum exactly.
     //
-    // A feed that cannot scroll at all has no room either, so it still unlocks
-    // across the whole screen -- the device with one agent and no
-    // notifications, which is the first screen a new user ever sees.
+    // A feed that CANNOT SCROLL AT ALL is the third case, and it was wrong.
+    // Room alone cannot tell it apart from a feed scrolled to its end: both
+    // report zero. They are opposite situations, though. At the end of a long
+    // feed the drag that got you there is finished and an upward swipe means
+    // unlock. On a feed that never scrolled, an upward drag on a card is not
+    // the end of anything -- it is the user pushing at the cards -- and
+    // throwing them into the keypad is the same complaint as tsk-36i6ed from
+    // the other side.
+    //
+    // MEASURED at the device's real viewport (540x1200, sway scale 2.0) with a
+    // full lock screen of SIX agents: #ls-feed scrollHeight 394 == clientHeight
+    // 394, so it does not overflow and never did. The feed is content-sized;
+    // the islands fit. So this branch is not a corner case on a new user's
+    // phone -- it is the ordinary state of the demo device, and it meant every
+    // drag that started on an island opened the keypad.
+    //
+    // Overflow therefore comes back into the veto, but as a DISJUNCT rather
+    // than the conjunct that was removed with tsk-36i6ed. That conjunct could
+    // not change the answer -- the browser clamps scrollTop to 0 on a feed that
+    // cannot scroll, so it was an unfailable arm. Here each arm decides a case
+    // by itself and all three are reachable:
+    //
+    //   scrollable, at the top  -> room > 4      -> veto   (reading != unlock)
+    //   scrollable, at the end  -> neither       -> unlock (tsk-36i6ed)
+    //   cannot scroll at all    -> !overflows    -> veto   (cards are not a
+    //                                                       hidden unlock pad)
+    //
+    // The gesture is not lost: the feed is 394px of a 1200px screen, so the
+    // other two thirds of the glass still unlock on a single upward swipe.
     swipe(document.body, openPasscode, null, function () {
       return !screenEl || screenEl.getAttribute("data-sheet") === "none";
     }, function (ev) {
       var t = ev.target;
       if (!t || !t.closest || !t.closest(".ls-feed")) return false;
-      return feedScrollRoom() > 4;
+      return feedScrollRoom() > 4 || !feedOverflows();
     });
     // Dismiss: only by dragging the sheet's own header.
     var chatHead = chatSheet ? chatSheet.querySelector(".ls-sheet-head") : null;
