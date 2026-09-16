@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import html
 import json
+import socket
+from pathlib import Path
 import logging
+import os
 import threading
 import time
 from collections import OrderedDict
@@ -268,6 +271,254 @@ body.osk-open .pin-dots { margin: 2px 0 8px; }
 .method-switch:focus-visible { outline: 3px solid #4c9aff; outline-offset: 2px; }
 """
 
+
+# Phone lock-screen chrome. Only ever rendered for a console-local request that
+# already qualifies for PIN sign-in, so a LAN browser still gets the plain card.
+_LOCK_SCREEN_STYLE = """
+/* A handset is tall, and a sign-in card floating in the middle of 2400px of
+   glass reads as a web page, not as an OS. The lock screen splits the height
+   the way iOS and Android do: status up top, passcode down by the thumb. */
+/* display:block, NOT a flex row. The base stylesheet makes <body> a centring
+   flex container for the sign-in card, and the on-screen keyboard appends its
+   panel, toggle and live region to <body> -- under a flex ROW those become
+   SIBLING FLEX ITEMS of the lock screen, squeezing it to a fraction of the
+   width (its max-width never binds) and spilling a stray control above the
+   clock. As a block the lock screen owns the full width and those appended
+   elements sit out of flow where they belong. */
+body.lockscreen-on { display: block; padding: 0; overflow: hidden; }
+/* The on-screen keyboard's layout override (padding-bottom + flex-start) is for
+   the password form. The lock screen carries its own keypad and never opens it,
+   but be explicit so a stray .osk-open cannot re-anchor the screen to the top. */
+body.lockscreen-on.osk-open { display: block; padding-bottom: 0; overflow-y: hidden; }
+.lockscreen {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  padding: calc(env(safe-area-inset-top, 0px) + 7vh) 10px calc(env(safe-area-inset-bottom, 0px) + 18px);
+  gap: 16px;
+}
+/* Top block: the glanceable half. */
+.ls-head {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  align-self: stretch;
+  /* min-height:0 so this block is allowed to shrink instead of pushing the
+     keypad off-screen; a flex item's default min-height:auto refuses to. */
+  min-height: 0;
+}
+.ls-time {
+  font-size: clamp(56px, 17vw, 88px);
+  font-weight: 250;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  color: #fff;
+}
+.ls-date { font-size: 16px; font-weight: 500; color: rgba(255,255,255,0.62); }
+.ls-widgets {
+  display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 18px;
+}
+/* Widgets are CLIENT-SIDE only (clock, battery) plus the device's own name.
+   Nothing here reads the account or its data: this surface is shown BEFORE
+   authentication, so anything account-derived would be a pre-auth leak. */
+.ls-widget {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 12px; border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.05);
+  font-size: 13px; color: rgba(255,255,255,0.70);
+  backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+}
+.ls-widget b { font-weight: 600; color: rgba(255,255,255,0.88); }
+/* Agent islands. Each running agent is its own floating pill -- a row of
+   identical cards would make three agents look like a list of settings; a
+   detached island reads as a thing that is alive and can speak up on its own.
+   Elevation is declared ONCE, as a shadow: no hairline border under it. */
+.ls-islands {
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  width: 100%; align-self: stretch; margin-top: 16px;
+}
+/* #ls-agents is the box the islands are appended INTO. Without a width of its
+   own it is a shrink-to-fit block inside a centre-aligned flex column, so every
+   island's width:100% and max-width resolved against its CONTENT box -- the cap
+   could never bind and side padding changed nothing. It carries the stack. */
+.ls-agents {
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  width: 100%; align-self: stretch;
+  /* The agent stack is the only part allowed to overflow, and it scrolls
+     without a visible bar: a scrollbar on a lock screen reads as a web page. */
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  overscroll-behavior: contain;
+}
+.ls-agents::-webkit-scrollbar { width: 0; height: 0; display: none; }
+.ls-island {
+  display: flex; align-items: center; gap: 10px;
+  width: 100%; max-width: 396px;
+  padding: 7px 16px 7px 7px;
+  border-radius: 999px;
+  background: rgba(30, 30, 34, 0.92);
+  box-shadow: 0 6px 18px -6px rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(24px) saturate(1.3);
+  -webkit-backdrop-filter: blur(24px) saturate(1.3);
+  /* Entrance: already-visible default, one authored moment, exponential ease. */
+  animation: ls-island-in 520ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+.ls-island:nth-child(2) { animation-delay: 70ms; }
+.ls-island:nth-child(3) { animation-delay: 140ms; }
+@keyframes ls-island-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.96); filter: blur(3px); }
+  to   { opacity: 1; transform: none; filter: none; }
+}
+/* The avatar and the harness mark sit as a pair, the mark tucked over the
+   avatar's edge the way a platform badge does -- two separate circles side by
+   side read as two unrelated buttons. */
+.ls-marks { position: relative; flex: none; width: 52px; height: 34px; }
+.ls-avatar {
+  position: absolute; inset: 0 auto 0 0;
+  width: 34px; height: 34px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 600; letter-spacing: 0.01em; color: #fff;
+  background: linear-gradient(145deg, var(--ls-a, #4c9aff), var(--ls-b, #2f6fd0));
+}
+.ls-fw {
+  position: absolute; right: 0; bottom: -1px;
+  width: 22px; height: 22px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: #0f0f12;
+  /* The ring is the separation from the avatar behind it, not decoration. */
+  box-shadow: 0 0 0 2px rgba(30, 30, 34, 0.92);
+  color: rgba(255, 255, 255, 0.86);
+}
+.ls-fw svg { width: 15px; height: 15px; }
+/* A real store logo fills the badge; the drawn marks are inset because they are
+   line art and need the breathing room a solid mark does not. */
+.ls-fw-img { background: #fff; overflow: hidden; }
+.ls-fw-img img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* A photo fills the circle edge to edge; the monogram gradient stays behind it
+   as the loading ground rather than a grey box. */
+.ls-avatar-img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; display: block; }
+.ls-sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+/* One stroke weight and one cap style across the marks. */
+.ls-fw svg, .ls-sprite {
+  fill: none; stroke: currentColor; stroke-width: 1.7;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.ls-body { min-width: 0; flex: 1 1 auto; }
+.ls-name {
+  font-size: 13.5px; font-weight: 600; color: rgba(255,255,255,0.92);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  letter-spacing: -0.01em;
+}
+.ls-status {
+  font-size: 11.5px; color: rgba(255,255,255,0.52);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Live pip: present only while the agent is actually doing something. */
+.ls-pip {
+  flex: none; width: 7px; height: 7px; border-radius: 50%;
+  background: #3ddc84;
+}
+.ls-island[data-state="idle"] .ls-pip { background: rgba(255,255,255,0.28); }
+/* ATTENTION. The island itself breathes -- a ring that grows out of its own
+   silhouette, so it is legible from across a room without reading a word. */
+.ls-island[data-attention="1"] {
+  animation: ls-island-in 520ms cubic-bezier(0.16, 1, 0.3, 1) backwards,
+             ls-attention 2.6s ease-out 520ms infinite;
+}
+.ls-island[data-attention="1"] .ls-pip { background: #ffb020; }
+.ls-island[data-attention="1"] .ls-status { color: rgba(255, 176, 32, 0.92); }
+@keyframes ls-attention {
+  0%   { box-shadow: 0 6px 18px -6px rgba(0,0,0,0.75), 0 0 0 0 rgba(255,176,32,0.45); }
+  70%  { box-shadow: 0 6px 18px -6px rgba(0,0,0,0.75), 0 0 0 10px rgba(255,176,32,0); }
+  100% { box-shadow: 0 6px 18px -6px rgba(0,0,0,0.75), 0 0 0 0 rgba(255,176,32,0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ls-island, .ls-island[data-attention="1"] { animation: none; }
+  .ls-island[data-attention="1"] { outline: 2px solid rgba(255,176,32,0.7); outline-offset: 2px; }
+}
+/* Scheduled tasks stay quieter than the agents: they are context, not actors. */
+.ls-tasks { width: 100%; align-self: stretch; }
+.ls-tasks:not(:empty) {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  margin-top: 6px; width: 100%;
+}
+.ls-task {
+  display: flex; justify-content: space-between; gap: 10px;
+  padding: 0 18px; font-size: 11.5px; color: rgba(255,255,255,0.42);
+}
+.ls-task-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ls-empty { font-size: 13px; color: rgba(255,255,255,0.40); padding: 2px 0; }
+/* The spacer, not a margin: it collapses first when the viewport is short, so
+   the keypad stays reachable on a small phone instead of being pushed off. */
+.ls-spacer { flex: 1 1 auto; min-height: 8px; }
+.ls-foot { display: flex; flex-direction: column; align-items: center; gap: 10px; align-self: stretch; flex: none; }
+.ls-hint { margin: 0; font-size: 14px; color: rgba(255,255,255,0.55); }
+/* Keypad: 3 columns, targets well above the 44px minimum because this is the
+   one control on the device that must work with a thumb, in the dark. */
+.ls-pad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  width: 100%;
+  max-width: 300px;
+  margin-top: 4px;
+}
+.ls-key {
+  aspect-ratio: 1 / 1;
+  max-height: 74px;
+  border-radius: 50%;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.07);
+  color: #fff;
+  font: 300 30px/1 inherit;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 90ms ease, transform 90ms ease;
+}
+.ls-key:active { background: rgba(255,255,255,0.20); transform: scale(0.94); }
+.ls-key:focus-visible { outline: 3px solid #4c9aff; outline-offset: 2px; }
+/* Backspace and the password escape are actions, not digits: no filled pill, so
+   the ten digits stay the obvious targets. */
+.ls-key[data-action] { background: none; border-color: transparent; font-size: 22px; }
+.ls-key[data-action]:active { background: rgba(255,255,255,0.12); }
+.ls-key.ls-key-blank { visibility: hidden; pointer-events: none; }
+/* The lock screen supplies its own dots/keypad, so the card chrome that the
+   plain sign-in page needs is not wanted here. */
+.lockscreen .pin-panel:not([hidden]) { display: contents; }
+.lockscreen #pin-submit {
+  width: 100%; max-width: 300px; margin-top: 4px;
+  border-radius: 999px; background: rgba(255,255,255,0.14);
+  border: 1px solid rgba(255,255,255,0.12); color: #fff;
+}
+.lockscreen .pin-panel label.field { display: none; }
+.lockscreen .pin-dots { margin: 0; }
+.lockscreen .pin-dot { width: 12px; height: 12px; }
+.lockscreen .error { margin: 0; min-height: 18px; text-align: center; }
+.lockscreen .method-switch { margin-top: 2px; }
+.lockscreen .pw-panel { width: 100%; max-width: 320px; }
+/* No keyboard and no keyboard BUTTON on the passcode screen: the keypad is the
+   only input this screen takes, and a floating keyboard FAB over a lock screen
+   reads as a stray browser control. The toggle comes back with the password
+   form, which does need typing -- lock-screen.js drops .lockscreen-on when the
+   user switches to it. */
+body.lockscreen-on .osk-toggle { display: none; }
+/* Landscape: the keypad and the clock sit side by side or neither fits. */
+@media (orientation: landscape) and (max-height: 560px) {
+  .lockscreen { flex-direction: row; align-items: center; gap: 24px; padding-top: 12px; }
+  .ls-head { flex: 1 1 0; }
+  .ls-spacer { display: none; }
+  .ls-foot { flex: 1 1 0; }
+  .ls-time { font-size: clamp(40px, 9vw, 64px); }
+  .ls-widgets { margin-top: 10px; }
+  .ls-key { max-height: 52px; }
+}
+"""
+
 # Plain (non-f) string: interpolated into the page as a value, so braces here
 # must not be doubled.
 _PIN_PANEL_SCRIPT = r"""
@@ -359,8 +610,18 @@ _PIN_PANEL_SCRIPT = r"""
     if (showPin) {
       input.value = "";
       paint();
-      if (window.taosOSK) { window.taosOSK.enable(); window.taosOSK.focusField(input); }
-      else input.focus();
+      // The lock screen draws its own keypad (#ls-pad), so the shared keyboard
+      // must stay shut: enabling it here opened a full QWERTY over the passcode
+      // pad and covered the lower third of the phone. Only the page WITHOUT a
+      // keypad needs the shared keyboard to type a PIN at all.
+      if (document.getElementById("ls-pad")) {
+        if (window.taosOSK) window.taosOSK.disable();
+      } else if (window.taosOSK) {
+        window.taosOSK.enable();
+        window.taosOSK.focusField(input);
+      } else {
+        input.focus();
+      }
     } else {
       var pw = pwPanel.querySelector("input[type=password]");
       if (pw && window.taosOSK) window.taosOSK.focusField(pw);
@@ -392,13 +653,45 @@ _PIN_PANEL_SCRIPT = r"""
 """
 
 
-def _pin_panel_html(next_url: str) -> str:
+
+#: The lock-screen keypad. A plain grid of buttons rather than a re-use of the
+#: shared on-screen keyboard: that one is a full text keyboard docked to the
+#: bottom of the viewport, and a passcode pad wants ten large round targets
+#: under the thumb. Digits carry aria-labels because the visible glyph alone is
+#: ambiguous to a screen reader announcing a grid of buttons.
+_KEYPAD_HTML = """
+      <div class="ls-pad" id="ls-pad" role="group" aria-label="PIN keypad">
+        <button type="button" class="ls-key" data-digit="1">1</button>
+        <button type="button" class="ls-key" data-digit="2">2</button>
+        <button type="button" class="ls-key" data-digit="3">3</button>
+        <button type="button" class="ls-key" data-digit="4">4</button>
+        <button type="button" class="ls-key" data-digit="5">5</button>
+        <button type="button" class="ls-key" data-digit="6">6</button>
+        <button type="button" class="ls-key" data-digit="7">7</button>
+        <button type="button" class="ls-key" data-digit="8">8</button>
+        <button type="button" class="ls-key" data-digit="9">9</button>
+        <span class="ls-key ls-key-blank" aria-hidden="true"></span>
+        <button type="button" class="ls-key" data-digit="0">0</button>
+        <button type="button" class="ls-key" data-action="back" aria-label="Delete">&#9003;</button>
+      </div>
+"""
+
+
+def _pin_panel_html(next_url: str, keypad: bool = False) -> str:
     """The PIN entry panel, shown only when the request is console-local.
 
     Rendered HIDDEN. /auth/pin-panel.js reveals it (and hides the password
     form) once it has wired itself up; see the note on the swap in that script.
     """
     safe_next = html.escape(next_url or "/desktop")
+    # The lock screen draws its own keypad, so the shared on-screen keyboard must
+    # not also open: two keypads fight for the same input, and the OSK's layout
+    # override top-anchors the screen. inputmode="none" also stops the
+    # compositor's Wayland keyboard (squeekboard) from appearing over the pad.
+    osk_mode = "none" if keypad else "numeric"
+    osk_attr = "" if keypad else 'data-osk-submit="pin-submit"'
+    keypad_html = _KEYPAD_HTML if keypad else ""
+
     # No username is sent with a PIN: this panel is only ever rendered for a
     # single-user store, because AuthManager.has_pin(None) refuses to guess
     # which account a PIN belongs to on a multi-user one.
@@ -406,8 +699,8 @@ def _pin_panel_html(next_url: str) -> str:
     <div class="pin-panel" id="pin-panel" data-next="{safe_next}" data-username="" hidden>
       <label class="field">
         <span>PIN</span>
-        <input type="password" id="pin-input" inputmode="numeric" autocomplete="off"
-               data-osk-submit="pin-submit" aria-describedby="pin-error"
+        <input type="password" id="pin-input" inputmode="{osk_mode}" autocomplete="off"
+               {osk_attr} aria-describedby="pin-error"
                maxlength="12" required>
       </label>
       <div class="pin-dots" id="pin-dots" aria-hidden="true">
@@ -415,12 +708,339 @@ def _pin_panel_html(next_url: str) -> str:
         <span class="pin-dot"></span><span class="pin-dot"></span>
       </div>
       <p class="error" id="pin-error" role="alert"></p>
+      {keypad_html}
       <button type="button" id="pin-submit">Sign in with PIN</button>
       <button type="button" class="method-switch" id="use-password">
         Use my password instead
       </button>
     </div>
     """
+
+
+
+
+#: Framework marks, drawn as geometry rather than shipped as logo files: the
+#: lock screen must render with no network and no asset pipeline, and a glyph or
+#: emoji standing in for an icon set is not an icon set. One stroke weight and
+#: one cap style across all three so they read as a family at 18px. These are
+#: stylised marks for the harness a taOS agent runs on, not the vendors' logos.
+_FRAMEWORK_SPRITE = """
+      <svg class="ls-sprite" aria-hidden="true" focusable="false" width="0" height="0">
+        <defs>
+          <symbol id="fw-hermes" viewBox="0 0 24 24">
+            <!-- winged helm: a dome with two upswept wings -->
+            <path d="M7.5 15.5a4.5 4.5 0 0 1 9 0" />
+            <path d="M6 15.5h12" />
+            <path d="M16.5 11.5c1.6-1.1 3-1.4 4.5-1.1-1 1.3-2.3 2.2-4 2.6" />
+            <path d="M7.5 11.5C5.9 10.4 4.5 10.1 3 10.4c1 1.3 2.3 2.2 4 2.6" />
+          </symbol>
+          <symbol id="fw-openclaw" viewBox="0 0 24 24">
+            <!-- three tapered talons converging on a palm arc -->
+            <path d="M8 4.5v7" />
+            <path d="M12 3.5v8" />
+            <path d="M16 4.5v7" />
+            <path d="M6.5 11.5a5.5 5.5 0 0 0 11 0" />
+          </symbol>
+          <symbol id="fw-deepseek" viewBox="0 0 24 24">
+            <!-- breaching whale: body arc, tail fluke, spout -->
+            <path d="M3.5 14.5c3.2 2.6 7.2 3.4 11 2.1 2.6-.9 4.4-2.8 5.2-5.4" />
+            <path d="M19.7 11.2c.9.5 1.4 1.4 1.3 2.5-1-.3-1.8-.9-2.3-1.7" />
+            <path d="M8.2 16.8c-.6 1.2-1.7 2-3.1 2.2.2-1.3.9-2.3 2-2.9" />
+            <path d="M12.5 9.2c.6-1.2 1.6-2 3-2.3" />
+          </symbol>
+        </defs>
+      </svg>
+"""
+
+
+def _device_label() -> str:
+    """The handset's own name, for the lock-screen chip.
+
+    Falls back to the product name: a lock screen that renders an empty chip
+    because the host has no resolvable name looks broken, and the name is
+    cosmetic here.
+    """
+    try:
+        name = socket.gethostname().split(".")[0].strip()
+    except OSError:
+        name = ""
+    return name or "taOS"
+
+
+def _lock_head_html() -> str:
+    """Opening half of the lock screen: clock, date and the widget row.
+
+    Emitted as the page's first element and closed by the caller, so the
+    passcode shell below it is the SAME markup the plain card path renders --
+    the lock screen is chrome around the sign-in, not a second implementation
+    of it.
+
+    The clock renders empty and is filled by /auth/lock-screen.js: a
+    server-rendered time would be the SERVER's clock and, worse, frozen at page
+    load, so a phone left on the lock screen would show a stale time.
+    """
+    return f"""
+  <div class="lockscreen" id="lockscreen">
+    <div class="ls-head">
+      <div class="ls-time" id="ls-time" role="timer" aria-live="off">&nbsp;</div>
+      <div class="ls-date" id="ls-date"></div>
+      <div class="ls-widgets" id="ls-widgets">
+        <span class="ls-widget"><b>taOS</b>&nbsp;{html.escape(_device_label())}</span>
+        <span class="ls-widget" id="ls-battery" hidden></span>
+      </div>
+      <div class="ls-islands" id="ls-activity" role="list" aria-label="Agent activity" hidden>
+        <div class="ls-agents" id="ls-agents"></div>
+        <div class="ls-tasks" id="ls-tasks"></div>
+      </div>
+      {_FRAMEWORK_SPRITE}
+    </div>
+    <div class="ls-spacer"></div>"""
+
+
+# Plain (non-f) string: braces are JavaScript, not format fields.
+_LOCK_SCREEN_SCRIPT = r"""
+(function () {
+  "use strict";
+  // Lock-screen chrome only: the clock, the battery chip and the keypad. PIN
+  // submission, the dots and the error line stay in /auth/pin-panel.js -- this
+  // script types into the same #pin-input and lets that one do the rest, so
+  // there is exactly one implementation of "what happens when a PIN is entered".
+  function init() {
+    var timeEl = document.getElementById("ls-time");
+    var dateEl = document.getElementById("ls-date");
+
+    function tick() {
+      var now = new Date();
+      // Locale-driven: a 24h phone shows 24h. hour12 is left to the locale
+      // rather than forced, because forcing it is wrong in half the world.
+      if (timeEl) {
+        timeEl.textContent = now.toLocaleTimeString([], {
+          hour: "numeric", minute: "2-digit"
+        });
+      }
+      if (dateEl) {
+        dateEl.textContent = now.toLocaleDateString([], {
+          weekday: "long", day: "numeric", month: "long"
+        });
+      }
+      // Re-align to the top of the next minute instead of polling every second:
+      // the display only changes once a minute and this is a battery-powered
+      // device sitting on this screen whenever it is idle.
+      var ms = (60 - now.getSeconds()) * 1000 - now.getMilliseconds();
+      setTimeout(tick, ms > 0 ? ms : 60000);
+    }
+    tick();
+
+    // Battery: navigator.getBattery is not universal (and is absent on desktop
+    // Firefox), so the chip stays hidden unless the API actually answers.
+    var batEl = document.getElementById("ls-battery");
+    if (batEl && navigator.getBattery) {
+      navigator.getBattery().then(function (bat) {
+        function paint() {
+          var pct = Math.round(bat.level * 100);
+          batEl.textContent = (bat.charging ? "⚡ " : "") + pct + "%";
+          batEl.hidden = false;
+        }
+        paint();
+        bat.addEventListener("levelchange", paint);
+        bat.addEventListener("chargingchange", paint);
+      }).catch(function () { /* no battery info: leave the chip hidden */ });
+    }
+
+    // Agent activity. Re-fetched on a timer because a lock screen is a LIVE
+    // surface: it is what the phone shows while it sits there, so a card that
+    // only reflects page-load time is wrong within a minute.
+    var card = document.getElementById("ls-activity");
+    var agentsEl = document.getElementById("ls-agents");
+    var tasksEl = document.getElementById("ls-tasks");
+
+    // Deterministic hue per agent, so an agent keeps its colour between
+    // refreshes and between boots. A random palette would reshuffle the lock
+    // screen every 15 seconds.
+    function hueFor(name) {
+      var h = 0;
+      for (var i = 0; i < name.length; i++) { h = (h * 31 + name.charCodeAt(i)) % 360; }
+      return h;
+    }
+
+    function initials(name) {
+      var words = name.trim().split(/\s+/);
+      if (!words[0]) return "?";
+      if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+      return (words[0][0] + words[words.length - 1][0]).toUpperCase();
+    }
+
+    var FRAMEWORKS = { hermes: 1, openclaw: 1, deepseek: 1 };
+    var RESTING = ["", "stopped", "idle", "exited", "error"];
+
+    function island(agent) {
+      var name = agent.name || "agent";
+      var status = agent.status || "idle";
+      var busy = RESTING.indexOf(status.trim().toLowerCase()) === -1;
+
+      var el = document.createElement("div");
+      el.className = "ls-island";
+      el.setAttribute("role", "listitem");
+      el.setAttribute("data-state", busy ? "busy" : "idle");
+      if (agent.attention) el.setAttribute("data-attention", "1");
+
+      var marks = document.createElement("div");
+      marks.className = "ls-marks";
+
+      var av = document.createElement("div");
+      av.className = "ls-avatar";
+      var hue = hueFor(name);
+      av.style.setProperty("--ls-a", "hsl(" + hue + " 62% 58%)");
+      av.style.setProperty("--ls-b", "hsl(" + ((hue + 28) % 360) + " 58% 38%)");
+      // A photo when one is configured; the monogram is the fallback, so a
+      // missing file degrades to initials rather than a broken image frame.
+      if (agent.avatar) {
+        var img = document.createElement("img");
+        img.className = "ls-avatar-img";
+        img.alt = "";
+        img.src = agent.avatar;
+        img.addEventListener("error", function () {
+          img.remove();
+          av.textContent = initials(name);
+        });
+        av.appendChild(img);
+      } else {
+        av.textContent = initials(name);
+      }
+      marks.appendChild(av);
+
+      var fw = String(agent.framework || "").toLowerCase();
+      if (agent.framework_icon) {
+        // The App Store's own artwork, when this framework ships one.
+        var badge = document.createElement("div");
+        badge.className = "ls-fw ls-fw-img";
+        var logo = document.createElement("img");
+        logo.alt = "";
+        logo.src = agent.framework_icon;
+        badge.appendChild(logo);
+        marks.appendChild(badge);
+      } else if (FRAMEWORKS[fw]) {
+        var badge = document.createElement("div");
+        badge.className = "ls-fw";
+        var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        var use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+        // setAttribute, not the xlink-prefixed form: plain href on <use>
+        // resolves in every browser this ships to and xlink is deprecated.
+        use.setAttribute("href", "#fw-" + fw);
+        svg.appendChild(use);
+        badge.appendChild(svg);
+        marks.appendChild(badge);
+      }
+      el.appendChild(marks);
+
+      var body = document.createElement("div");
+      body.className = "ls-body";
+      var n = document.createElement("div");
+      n.className = "ls-name";
+      n.textContent = name;                 // textContent, never innerHTML
+      var s = document.createElement("div");
+      s.className = "ls-status";
+      s.textContent = status;
+      body.appendChild(n); body.appendChild(s);
+      el.appendChild(body);
+
+      var pip = document.createElement("span");
+      pip.className = "ls-pip";
+      el.appendChild(pip);
+      return el;
+    }
+
+    function paintActivity(data) {
+      agentsEl.textContent = "";
+      tasksEl.textContent = "";
+      var agents = data.agents || [];
+      var tasks = data.tasks || [];
+      if (!agents.length && !tasks.length) { card.hidden = true; return; }
+
+      for (var i = 0; i < agents.length; i++) {
+        agentsEl.appendChild(island(agents[i]));
+      }
+      for (var j = 0; j < tasks.length; j++) {
+        var row = document.createElement("div");
+        row.className = "ls-task";
+        var tn = document.createElement("span");
+        tn.className = "ls-task-name";
+        tn.textContent = tasks[j].name || "task";
+        var tw = document.createElement("span");
+        tw.textContent = tasks[j].agent
+          ? tasks[j].agent + " \u00b7 " + tasks[j].schedule
+          : tasks[j].schedule;
+        row.appendChild(tn); row.appendChild(tw);
+        tasksEl.appendChild(row);
+      }
+      if (data.task_total > tasks.length) {
+        var more = document.createElement("div");
+        more.className = "ls-task";
+        more.textContent = "+" + (data.task_total - tasks.length) + " more scheduled";
+        tasksEl.appendChild(more);
+      }
+      card.hidden = false;
+    }
+
+    function pollActivity() {
+      fetch("/auth/lock-widgets", { credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { if (d) paintActivity(d); })
+        .catch(function () { /* offline or off-console: leave the card as is */ });
+    }
+    if (card) {
+      pollActivity();
+      setInterval(pollActivity, 15000);
+    }
+
+    // Switching to the password form leaves the lock screen: that form needs a
+    // real keyboard, and the keypad/clock chrome has nothing to do with it.
+    // Dropping the class restores the ordinary centred sign-in card, keyboard
+    // toggle included, without this script re-implementing either.
+    var toPw = document.getElementById("use-password");
+    if (toPw) {
+      toPw.addEventListener("click", function () {
+        document.body.classList.remove("lockscreen-on");
+      });
+    }
+
+    // Keypad -> the existing PIN input.
+    var pad = document.getElementById("ls-pad");
+    var input = document.getElementById("pin-input");
+    if (!pad || !input) return;
+
+    function emit() {
+      // The pin-panel script paints the dots from an "input" event, so the
+      // keypad must raise one -- assigning .value alone fires nothing.
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+
+    pad.addEventListener("click", function (ev) {
+      var key = ev.target.closest(".ls-key");
+      if (!key) return;
+      var digit = key.getAttribute("data-digit");
+      if (digit !== null) {
+        var max = parseInt(input.getAttribute("maxlength") || "12", 10);
+        if (input.value.length < max) {
+          input.value += digit;
+          emit();
+        }
+        return;
+      }
+      if (key.getAttribute("data-action") === "back") {
+        input.value = input.value.slice(0, -1);
+        emit();
+      }
+    });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+"""
 
 
 def _login_page(
@@ -443,12 +1063,33 @@ def _login_page(
     # request is console-local AND a PIN is set. Off-console the page is exactly
     # what it has always been, so a LAN browser is never shown a method it would
     # be refused (and never learns that a PIN exists on this box).
-    pin_panel = _pin_panel_html(next_url) if pin_available else ""
+    # pin_available is already console-only, so the lock screen never reaches a
+    # LAN browser: off-console this page stays exactly the card it has always been.
+    lock_screen = pin_available
+    pin_panel = _pin_panel_html(next_url, keypad=lock_screen) if pin_available else ""
     pin_switch = (
         '<button type="button" class="method-switch" id="use-pin">Use my PIN instead</button>'
         if pin_available else ""
     )
     pin_script = '<script src="/auth/pin-panel.js" defer></script>' if pin_available else ""
+    # The lock screen replaces the card entirely: a passcode screen that still
+    # draws a bordered panel in the middle of a 2400px phone reads as a web page.
+    # The device's own name is the only server-supplied value on it -- everything
+    # else (clock, battery) is read client-side, so nothing account-derived is
+    # rendered before the user has authenticated.
+    body_class = "lockscreen-on" if lock_screen else ""
+    shell_class = "ls-foot" if lock_screen else "card"
+    brand = "" if lock_screen else (
+        '<div class="brand">\n'
+        '      <h1 class="wordmark">taOS</h1>\n'
+        '      <p>Sign in to continue</p>\n'
+        '    </div>'
+    )
+    lock_head = _lock_head_html() if lock_screen else ""
+    lock_foot = "</div>" if lock_screen else ""
+    lock_script = '<script src="/auth/lock-screen.js" defer></script>' if lock_screen else ""
+    lock_style = f"<style>{_LOCK_SCREEN_STYLE}</style>" if lock_screen else ""
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -457,13 +1098,12 @@ def _login_page(
 <title>Sign in — taOS</title>
 <style>{_AUTH_BASE_STYLE}</style>
 <style>{_PIN_PANEL_STYLE}</style>
+{lock_style}
 </head>
-<body>
-  <div class="card">
-    <div class="brand">
-      <h1 class="wordmark">taOS</h1>
-      <p>Sign in to continue</p>
-    </div>
+<body class="{body_class}">
+  {lock_head}
+  <div class="{shell_class}">
+    {brand}
     {err}
     {pin_panel}
     <form class="pw-panel" id="pw-panel" method="POST" action="/auth/login">
@@ -481,8 +1121,10 @@ def _login_page(
       {pin_switch}
     </form>
   </div>
+  {lock_foot}
 {osk_assets()}
 {pin_script}
+{lock_script}
 </body>
 </html>
 """
@@ -816,6 +1458,208 @@ async def pin_panel_script(request: Request):
         content=_PIN_PANEL_SCRIPT,
         media_type="application/javascript",
         headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
+
+@router.get("/lock-screen.js")
+async def lock_screen_script(request: Request):
+    """Serve the lock-screen chrome. Same CSP reasoning as /auth/osk.js."""
+    return Response(
+        content=_LOCK_SCREEN_SCRIPT,
+        media_type="application/javascript",
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
+
+
+
+#: Where the App Store keeps framework/brand artwork. The lock screen reuses
+#: those files rather than carrying a second copy, so a logo updated for the
+#: store is updated here too.
+_STORE_ICON_DIRS = ("static/store-icons", "static/store-icons/brands")
+
+
+def _framework_icon(framework: str) -> str:
+    """URL of the App Store icon for a framework, or "" when none is shipped.
+
+    Resolved server-side so the page only ever points at a file that exists: the
+    client falls back to its drawn mark immediately instead of after a 404.
+    /static/ is already served and already exempt from auth, so this adds no new
+    pre-auth surface.
+    """
+    fw = "".join(c for c in framework.lower() if c.isalnum())
+    if not fw:
+        return ""
+    root = Path(__file__).resolve().parent.parent.parent
+    for folder in _STORE_ICON_DIRS:
+        for ext in ("svg", "png", "jpg", "webp"):
+            rel = f"{folder}/{fw}.{ext}"
+            if (root / rel).is_file():
+                return "/" + rel
+    return ""
+
+
+def _avatar_url(name: str) -> str:
+    """URL for this agent's avatar, or "" when no image is installed.
+
+    Checked server-side so the page never points an <img> at a 404 -- the client
+    falls back to a monogram, and it should do that from the start rather than
+    after a failed request paints a broken frame.
+    """
+    slug = _avatar_slug(name)
+    if not slug:
+        return ""
+    if not (Path(LOCK_AVATAR_DIR) / f"{slug}.jpg").is_file():
+        return ""
+    return f"/auth/lock-avatar/{slug}"
+
+
+@router.get("/lock-widgets")
+async def lock_widgets(request: Request):
+    """Agent activity + scheduled tasks for the lock screen. Console-only.
+
+    This is rendered BEFORE sign-in, which is exactly why it is narrow: it
+    returns NAMES, STATUSES AND COUNTS and nothing else. The agent config is
+    never serialised here -- it carries per-agent LLM keys, and this endpoint is
+    reachable without a session. The console gate is the second half of that
+    containment: a LAN browser gets 403 and learns nothing, so the exposure is
+    the same one a phone lock screen already makes to whoever is holding it.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+
+    agents: list[dict] = []
+    try:
+        configured = request.app.state.config.agents or []
+    except AttributeError:
+        configured = []
+    # Container status is best-effort: on a host with no container runtime the
+    # import or the call raises, and a lock screen that 500s because the phone
+    # has no LXC is worse than one that simply shows no status.
+    status_by_name: dict[str, str] = {}
+    try:
+        from tinyagentos.containers import list_containers
+
+        for c in await list_containers(prefix="taos-agent-"):
+            status_by_name[c.name.removeprefix("taos-agent-")] = c.status
+    except Exception:  # noqa: BLE001 - any runtime absence degrades to "no status"
+        status_by_name = {}
+
+    for entry in configured:
+        name = entry.get("name") if isinstance(entry, dict) else str(entry)
+        if not name:
+            continue
+        framework = ""
+        if isinstance(entry, dict):
+            framework = str(entry.get("framework") or entry.get("harness") or "")
+        agents.append({
+            "name": str(name),
+            "framework": framework.lower(),
+            "framework_icon": _framework_icon(framework),
+            "status": status_by_name.get(str(name), ""),
+            "avatar": _avatar_url(str(name)),
+        })
+
+    tasks: list[dict] = []
+    try:
+        scheduler = request.app.state.scheduler
+        for task in await scheduler.list_tasks():
+            item = task if isinstance(task, dict) else {}
+            tasks.append({
+                "name": str(item.get("name", "") or ""),
+                "schedule": str(item.get("schedule", "") or ""),
+                "agent": str(item.get("agent_name", "") or ""),
+            })
+    except Exception:  # noqa: BLE001 - no scheduler on this host: show no tasks
+        tasks = []
+
+    # Demo override. OFF unless TAOS_LOCK_DEMO_AGENTS is set, and it only ever
+    # ADDS named placeholders to this one read-only lock-screen endpoint -- it
+    # writes nothing, creates no agents and changes no other surface. It exists
+    # so a demo machine can show a populated lock screen without standing up
+    # three real container-backed agents first; anything it lists is a
+    # placeholder, not a running process.
+    demo = os.environ.get("TAOS_LOCK_DEMO_AGENTS", "").strip()
+    if demo:
+        existing = {a["name"] for a in agents}
+        for raw in demo.split(","):
+            # "Name", "Name:framework" or "Name:framework:status text"
+            parts = [seg.strip() for seg in raw.split(":")]
+            label = parts[0] if parts else ""
+            if label and label not in existing:
+                agents.append({
+                    "name": label,
+                    "framework": parts[1].lower() if len(parts) > 1 and parts[1] else "",
+                    "framework_icon": _framework_icon(parts[1] if len(parts) > 1 else ""),
+                    "status": parts[2] if len(parts) > 2 and parts[2] else "running",
+                    "avatar": _avatar_url(label),
+                })
+
+    # Anything with a status that is not an explicit resting word is doing
+    # something -- the demo statuses are free text ("Drafting replies"), so an
+    # equality test against "running" would report every busy agent as idle.
+    resting = {"", "stopped", "idle", "exited", "error"}
+    running = sum(1 for a in agents if a["status"].strip().lower() not in resting)
+    return JSONResponse({
+        "agents": agents[:6],
+        "agent_total": len(agents),
+        "agent_running": running,
+        "tasks": tasks[:4],
+        "task_total": len(tasks),
+    })
+
+
+
+#: Where lock-screen agent avatars are read from. One flat directory of
+#: "<slug>.jpg" files, slug being the agent name lowercased with non-alphanumerics
+#: collapsed to "-". Overridable so a packaged install can point it at its own
+#: data dir rather than this default.
+LOCK_AVATAR_DIR = os.environ.get("TAOS_LOCK_AVATAR_DIR", "/var/lib/taos/lock-avatars")
+
+
+def _avatar_slug(name: str) -> str:
+    """Slug for an agent name, restricted to characters that cannot traverse.
+
+    Anything outside [a-z0-9-] is dropped rather than escaped: this value is
+    used to build a filesystem path, so a conservative whitelist is the control
+    that keeps "../" and absolute paths out, not a sanitiser that tries to spot
+    bad input.
+    """
+    out = []
+    for ch in name.strip().lower():
+        if ch.isalnum() and ch.isascii():
+            out.append(ch)
+        elif out and out[-1] != "-":
+            out.append("-")
+    return "".join(out).strip("-")
+
+
+@router.get("/lock-avatar/{slug}")
+async def lock_avatar(slug: str, request: Request):
+    """Serve one lock-screen avatar. Console-only, same reasoning as the widgets.
+
+    The slug is re-derived through the same whitelist before it touches the
+    filesystem, so a crafted request cannot address a file outside the avatar
+    directory even if the router hands us a path-shaped segment.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+
+    safe = _avatar_slug(slug)
+    if not safe:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    path = Path(LOCK_AVATAR_DIR) / f"{safe}.jpg"
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
     )
 
 

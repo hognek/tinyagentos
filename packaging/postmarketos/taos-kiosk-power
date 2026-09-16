@@ -1,0 +1,24 @@
+#!/bin/sh
+# Toggle the panel, the way a phone's power key does.
+#
+# WHY A SCRIPT AND NOT `output * power toggle`: sway REFUSES toggle against the
+# wildcard -- `swaymsg "output * power toggle"` answers
+#   {"success": false, "parse_error": true,
+#    "error": "Cannot apply toggle to all outputs"}
+# and, because a bindsym's exec output goes nowhere, the key silently did
+# nothing. Measured on the device 2026-09-16. `off` and `on` DO accept the
+# wildcard, so read the current state and send the explicit one.
+set -eu
+
+# --raw so the reply is one JSON object per line rather than pretty-printed;
+# busybox has no jq, and the first "power" field is the panel we care about
+# (this is a single-output handset).
+state=$(swaymsg -t get_outputs --raw 2>/dev/null \
+        | grep -o '"power": *[a-z]*' \
+        | head -1 \
+        | sed 's/.*: *//')
+
+if [ "$state" = "true" ]; then
+    exec swaymsg "output * power off"
+fi
+exec swaymsg "output * power on"

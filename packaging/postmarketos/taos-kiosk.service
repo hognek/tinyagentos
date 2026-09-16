@@ -38,8 +38,10 @@ Environment=XDG_SESSION_TYPE=wayland
 Environment=XDG_CURRENT_DESKTOP=taOS
 Environment=MOZ_ENABLE_WAYLAND=1
 
-# cage is a single-application Wayland compositor: the browser IS the session,
-# so there is no desktop, panel or window chrome behind it.
+# sway runs here as a single-surface KIOSK compositor (see sway-kiosk.conf):
+# the browser is the only window, there is no bar and no decorations, so the
+# session looks like a native OS rather than a browser on a desktop. sway was
+# chosen over cage because cage cannot power the output down -- see the config.
 ExecStart=/usr/local/bin/taos-kiosk-launch
 
 # Do NOT Restart=always: a crash-looping kiosk would fight OnFailure= and the

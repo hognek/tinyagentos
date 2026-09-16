@@ -11,7 +11,7 @@ import re
 
 import pytest
 
-from tinyagentos.routes.auth import _login_page, _setup_page
+from tinyagentos.routes.auth import _login_page, _pin_panel_html, _setup_page
 from tinyagentos.routes.onscreen_keyboard import (
     OSK_SCRIPT,
     OSK_SCRIPT_PATH,
@@ -185,10 +185,31 @@ class TestNumericLayoutForPin:
     def test_numeric_layout_selected_by_inputmode(self):
         assert 'mode === "numeric"' in OSK_SCRIPT
 
-    def test_pin_field_requests_the_numeric_pad(self, login_console):
+    def test_pin_field_suppresses_the_shared_keyboard_on_the_lock_screen(self, login_console):
+        """The console page is the lock screen, which draws its OWN keypad.
+
+        inputmode="none" is what keeps the shared on-screen keyboard (and the
+        compositor's Wayland keyboard) from opening a SECOND keypad over the
+        first -- and the OSK's open state re-anchors the page to the top of the
+        viewport, which is what pushed the passcode off a tall phone screen.
+        """
         match = re.search(r'<input[^>]*id="pin-input"[^>]*>', login_console)
         assert match
+        assert 'inputmode="none"' in match.group(0)
+
+    def test_pin_field_still_requests_the_numeric_pad_without_a_keypad(self):
+        """Off the lock screen the shared numeric OSK is still the way in.
+
+        _pin_panel_html is what the non-keypad caller renders, so this asserts
+        the branch a future non-lock-screen page would get -- without it the
+        keypad=False path is untested and could rot to inputmode="none" too,
+        leaving that page with no keyboard at all.
+        """
+        panel = _pin_panel_html("/desktop", keypad=False)
+        match = re.search(r'<input[^>]*id="pin-input"[^>]*>', panel)
+        assert match
         assert 'inputmode="numeric"' in match.group(0)
+        assert 'data-osk-submit="pin-submit"' in match.group(0)
 
     def test_pin_field_is_masked(self, login_console):
         match = re.search(r'<input[^>]*id="pin-input"[^>]*>', login_console)
@@ -198,12 +219,36 @@ class TestNumericLayoutForPin:
         match = re.search(r'<input[^>]*id="pin-input"[^>]*>', login_console)
         assert 'autocomplete="off"' in match.group(0)
 
-    def test_enter_on_the_keypad_submits_the_pin_not_the_password_form(self, login_console):
+    def test_shared_keyboards_enter_routing_is_still_wired(self):
         """data-osk-submit routes Enter to the PIN handler; without it Enter
-        would fall through to the password form and post an empty password."""
-        match = re.search(r'<input[^>]*id="pin-input"[^>]*>', login_console)
+        would fall through to the password form and post an empty password.
+
+        The lock screen does not use the shared keyboard, but the mechanism must
+        stay intact for the keypad=False rendering that does.
+        """
+        panel = _pin_panel_html("/desktop", keypad=False)
+        match = re.search(r'<input[^>]*id="pin-input"[^>]*>', panel)
         assert 'data-osk-submit="pin-submit"' in match.group(0)
         assert "data-osk-submit" in OSK_SCRIPT
+
+    def test_lock_screen_keypad_can_actually_submit(self, login_console):
+        """A keypad with no reachable submit is a phone nobody can unlock.
+
+        There is no auto-submit -- the PIN's length is server-side, so the page
+        cannot know when the user has finished typing. #pin-submit is therefore
+        the ONLY way in, and a CSS rule that hides it strands the user on the
+        lock screen with no way to authenticate.
+        """
+        assert 'id="pin-submit"' in login_console
+        assert not re.search(
+            r"\.lockscreen\s+#pin-submit\s*\{[^}]*display:\s*none", login_console
+        )
+
+    def test_lock_screen_renders_its_own_keypad(self, login_console):
+        assert 'id="ls-pad"' in login_console
+        for digit in "0123456789":
+            assert f'data-digit="{digit}"' in login_console
+        assert 'data-action="back"' in login_console
 
 
 class TestPinPanelIsConsoleOnly:

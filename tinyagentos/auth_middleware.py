@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # console (see auth.is_console_origin) and throttles per user on top of that.
 # Note /auth/pin (set/clear a PIN) is deliberately absent from this set: those
 # require a live session and must stay gated here.
-EXEMPT_PATHS = {"/auth/login", "/auth/pin-login", "/auth/osk.js", "/auth/pin-panel.js", "/auth/setup", "/auth/status", "/auth/me", "/auth/complete", "/auth/lock", "/api/health", "/api/version", "/setup", "/setup/complete", "/redeem", "/api/desktop/browser/push/vapid-public-key", "/api/desktop/browser/proxy-config", "/sw.js", "/desktop", "/desktop/index.html", "/chat-pwa", "/app.html", "/manifest", "/api/agents/registry/pubkey", "/api/share/destinations"}
+EXEMPT_PATHS = {"/auth/login", "/auth/pin-login", "/auth/osk.js", "/auth/pin-panel.js", "/auth/lock-screen.js", "/auth/lock-widgets", "/auth/setup", "/auth/status", "/auth/me", "/auth/complete", "/auth/lock", "/api/health", "/api/version", "/setup", "/setup/complete", "/redeem", "/api/desktop/browser/push/vapid-public-key", "/api/desktop/browser/proxy-config", "/sw.js", "/desktop", "/desktop/index.html", "/chat-pwa", "/app.html", "/manifest", "/api/agents/registry/pubkey", "/api/share/destinations"}
 
 # Registry feed endpoints accept EITHER an admin session OR a registry JWT.
 # When a Bearer token is present for these paths the request bypasses the
@@ -393,7 +393,7 @@ def _is_agent_container_quota_path(method: str, path: str) -> bool:
 # wrapping a WS upgrade can cause connection-level issues in some Starlette
 # versions, so /ws/ remains exempt at the middleware layer; the per-endpoint
 # check is the authoritative guard for all WebSocket endpoints.
-EXEMPT_PREFIXES = ("/static/", "/desktop/", "/chat-pwa/", "/ws/", "/shortcut/", "/api/peer/")
+EXEMPT_PREFIXES = ("/static/", "/desktop/", "/chat-pwa/", "/ws/", "/shortcut/", "/api/peer/", "/auth/lock-avatar/")
 
 # Consent-loop status-poll paths are unauthenticated (the opaque request_id is
 # the capability), but the sub-action paths (/approve, /deny) require admin
