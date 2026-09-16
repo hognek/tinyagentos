@@ -4969,7 +4969,19 @@ async def osk_script(request: Request):
     return Response(
         content=OSK_SCRIPT,
         media_type="application/javascript",
-        headers={"Cache-Control": "public, max-age=300"},
+        headers={
+            # no-cache, NOT no-store: the browser may keep the copy, it just has
+            # to revalidate, so an unchanged script still costs a 304.
+            #
+            # max-age=300 was five minutes of the kiosk running code that had
+            # already been replaced. Twice this cost real time: a fix was
+            # deployed, the service restarted, the page still ran the old
+            # script, and the bug looked unfixed -- once badly enough that the
+            # cause was "ruled out" on a grep that could not tell the two
+            # builds apart. This screen is iterated on against the glass, so
+            # staleness is the expensive failure and a revalidation is cheap.
+            "Cache-Control": "no-cache",
+        },
     )
 
 
@@ -4979,7 +4991,19 @@ async def pin_panel_script(request: Request):
     return Response(
         content=_PIN_PANEL_SCRIPT,
         media_type="application/javascript",
-        headers={"Cache-Control": "public, max-age=300"},
+        headers={
+            # no-cache, NOT no-store: the browser may keep the copy, it just has
+            # to revalidate, so an unchanged script still costs a 304.
+            #
+            # max-age=300 was five minutes of the kiosk running code that had
+            # already been replaced. Twice this cost real time: a fix was
+            # deployed, the service restarted, the page still ran the old
+            # script, and the bug looked unfixed -- once badly enough that the
+            # cause was "ruled out" on a grep that could not tell the two
+            # builds apart. This screen is iterated on against the glass, so
+            # staleness is the expensive failure and a revalidation is cheap.
+            "Cache-Control": "no-cache",
+        },
     )
 
 
@@ -5020,7 +5044,19 @@ async def lock_screen_script(request: Request):
     return Response(
         content=_lock_screen_js(),
         media_type="application/javascript",
-        headers={"Cache-Control": "public, max-age=300"},
+        headers={
+            # no-cache, NOT no-store: the browser may keep the copy, it just has
+            # to revalidate, so an unchanged script still costs a 304.
+            #
+            # max-age=300 was five minutes of the kiosk running code that had
+            # already been replaced. Twice this cost real time: a fix was
+            # deployed, the service restarted, the page still ran the old
+            # script, and the bug looked unfixed -- once badly enough that the
+            # cause was "ruled out" on a grep that could not tell the two
+            # builds apart. This screen is iterated on against the glass, so
+            # staleness is the expensive failure and a revalidation is cheap.
+            "Cache-Control": "no-cache",
+        },
     )
 
 
