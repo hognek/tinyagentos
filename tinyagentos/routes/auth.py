@@ -434,7 +434,11 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
 .ls-statusbar .ls-widget b { color: rgba(255,255,255,0.80); }
 .ls-brand { grid-column: 2; justify-self: center; }
 .ls-brand b { font-weight: 700; }
-#ls-battery { grid-column: 3; justify-self: end; margin-right: 4px; }
+/* 7px, not 4: Jay asked for the percentage 3px further left (it sat too close
+   to the rounded corner). It is justify-self:end, so the RIGHT margin is what
+   moves it -- padding or a transform would either move the brand with it or
+   leave the real box where it was. */
+#ls-battery { grid-column: 3; justify-self: end; margin-right: 7px; }
 /* Widgets are CLIENT-SIDE only (clock, battery) plus the device's own name.
    Nothing here reads the account or its data: this surface is shown BEFORE
    authentication, so anything account-derived would be a pre-auth leak. */
@@ -592,6 +596,142 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
   font-size: 14px; line-height: 1.45;
 }
 .ls-empty b { display: block; font-weight: 600; color: rgba(255,255,255,0.62); font-size: 15px; }
+
+/* THE ROW. Phone, mailbox and decisions are all the same object -- a tinted
+   source mark, a line about it, and how long ago -- so they are one shape in
+   one material rather than three panels that happen to look similar. It is the
+   notification card's material deliberately: on this screen a missed call and a
+   notification ARE the same kind of thing. */
+.ls-row {
+  display: flex; align-items: flex-start; gap: 10px;
+  width: 100%; max-width: var(--ls-card-w);
+  padding: 10px 13px;
+  border-radius: 20px;
+  text-align: left;
+  background: rgba(30, 30, 34, 0.92);
+  box-shadow: 0 6px 18px -6px rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(24px) saturate(1.3);
+  -webkit-backdrop-filter: blur(24px) saturate(1.3);
+  /* Entrance animation, `backwards` like the islands. The whole point of
+     reconciling by key is that a row which persists across a repaint never
+     re-enters this animation -- see the repaint tests. */
+  animation: ls-island-in 520ms cubic-bezier(0.32, 0.72, 0, 1) backwards;
+}
+.ls-row-tile {
+  flex: none; width: 30px; height: 30px; border-radius: 9px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700; color: #fff;
+  background: var(--ls-n, #4c9aff);
+}
+.ls-row-tile svg { width: 17px; height: 17px; fill: none; stroke: #fff; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.ls-row-body { min-width: 0; flex: 1; }
+.ls-row-meta {
+  display: flex; align-items: baseline; gap: 6px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+  color: rgba(255,255,255,0.45);
+}
+.ls-row-app { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ls-row-when { margin-left: auto; flex: none; text-transform: none; letter-spacing: 0; font-weight: 500; }
+.ls-row-title {
+  margin-top: 2px;
+  font-size: 14px; font-weight: 600; color: #fff;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ls-row-sub {
+  margin-top: 1px;
+  font-size: 13px; line-height: 1.35; color: rgba(255,255,255,0.68);
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+}
+/* In a unified list the SUBJECT is what the eye lands on after the sender, so
+   it is brighter than the preview under it. */
+.ls-row-subject { color: rgba(255,255,255,0.88); font-weight: 500; -webkit-line-clamp: 1; }
+/* A missed call is the one row whose SOURCE line is the alarming part, so the
+   red sits on "Missed call", not on the caller's name. */
+.ls-row[data-kind="missed"] .ls-row-app { color: #ff6b6b; }
+/* Unread, in the place a phone puts it: a dot on the leading edge of the row.
+   It is drawn on the row rather than added as an element so marking something
+   read is one attribute, not a DOM change. */
+.ls-row[data-unread="1"] { border-left: 3px solid #4c9aff; padding-left: 10px; }
+
+/* APPS. A grid, because these are the only things on the screen the user picks
+   rather than reads. */
+.ls-apps-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+  width: 100%; max-width: var(--ls-card-w);
+}
+.ls-app {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 13px; border-radius: 20px;
+  background: rgba(30, 30, 34, 0.92);
+  box-shadow: 0 6px 18px -6px rgba(0, 0, 0, 0.75);
+  animation: ls-island-in 520ms cubic-bezier(0.32, 0.72, 0, 1) backwards;
+}
+.ls-app-body { min-width: 0; flex: 1; }
+.ls-app-name {
+  font-size: 14px; font-weight: 600; color: #fff;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ls-app-note {
+  margin-top: 1px; font-size: 12px; line-height: 1.3; color: rgba(255,255,255,0.6);
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+}
+/* The badge rides on the tile, the way it does on a home screen. The wrapper
+   exists so the badge is a sibling of the mark rather than a child of it --
+   the mark's contents are rewritten by the painter. */
+.ls-app-tile { position: relative; flex: none; }
+.ls-app-badge {
+  position: absolute; top: -6px; right: -7px;
+  min-width: 17px; height: 17px; padding: 0 4px; box-sizing: border-box;
+  border-radius: 999px; background: #ff3b30; color: #fff;
+  font-size: 11px; font-weight: 700; line-height: 17px; text-align: center;
+  box-shadow: 0 0 0 2px rgba(20,20,22,0.92);
+}
+
+/* DECISIONS. The only rows on this screen the user ANSWERS, so they carry
+   buttons and the buttons are the widest thing in the card. */
+.ls-dec-actions { display: flex; gap: 8px; margin-top: 9px; }
+.ls-dec-btn {
+  flex: 1; padding: 8px 10px; border: 0; border-radius: 12px;
+  font: inherit; font-size: 13px; font-weight: 600; color: #fff;
+  background: rgba(255,255,255,0.12);
+}
+.ls-dec-btn[data-act="approve"] { background: rgba(48,209,88,0.22); color: #6ee787; }
+.ls-dec-btn:focus-visible { outline: 3px solid #4c9aff; outline-offset: 2px; }
+.ls-dec-done {
+  margin-top: 9px; font-size: 13px; font-weight: 600; color: rgba(255,255,255,0.6);
+}
+.ls-row[data-answered="1"] .ls-dec-actions { display: none; }
+
+/* PROJECTS. The tab that replaced settings, second in the row after the
+   agents: this is a projects-focused OS, so what the agents are working ON
+   belongs next to the agents themselves. Same row material as everything else
+   here, plus the one quantity on this screen. */
+.ls-proj-bar {
+  margin-top: 8px; height: 4px; border-radius: 999px;
+  background: rgba(255,255,255,0.14); overflow: hidden;
+}
+.ls-proj-fill {
+  display: block; height: 100%; width: var(--ls-pct, 0%);
+  border-radius: 999px; background: var(--ls-n, #4c9aff);
+  /* The width is written by the painter on a node that PERSISTS across a
+     repaint, so this animates from where it was rather than from zero. Had the
+     rows been rebuilt, every bar would have re-run this from 0% every poll --
+     the same flicker as the islands, in a different costume. */
+  transition: width 420ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+.ls-row[data-blocked="1"] .ls-proj-fill { background: #ffb020; }
+/* Blocked: work that has stopped and is waiting on a person. It is the reason
+   this panel is on a LOCK screen, so it is the one thing in the row that is
+   allowed to shout. */
+.ls-proj-flag {
+  flex: none; padding: 1px 7px; border-radius: 999px;
+  background: rgba(255,176,32,0.18); color: #ffb020;
+  letter-spacing: 0.04em;
+}
+@media (prefers-reduced-motion: reduce) {
+  .ls-row, .ls-app { animation: none; }
+  .ls-proj-fill { transition: none; }
+}
 
 /* THE STATS CARD. One card in the same material as an island, so the system
    readings read as another thing this screen shows rather than as a settings
@@ -1561,6 +1701,14 @@ _VIEW_SPRITE = """
             <rect x="4" y="13.5" width="6.5" height="6.5" rx="1.8" />
             <rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.8" />
           </symbol>
+          <symbol id="lv-projects" viewBox="0 0 24 24">
+            <!-- stacked layers, the shape of a thing with work under it. Not a
+                 folder: a folder says "files", and a project here is a body of
+                 work agents are moving, not a place documents are kept. -->
+            <path d="M12 3.2 21 7.6 12 12 3 7.6z" />
+            <path d="M3.4 12 12 16.3 20.6 12" />
+            <path d="M3.4 16.4 12 20.7l8.6-4.3" />
+          </symbol>
           <symbol id="lv-alerts" viewBox="0 0 24 24">
             <!-- exclamation in a ring. The dot is a 0-length line with a round
                  cap: a filled circle would be the only solid shape in the set. -->
@@ -1574,13 +1722,6 @@ _VIEW_SPRITE = """
             <path d="M7.5 20v-5.5" />
             <path d="M12 20V8" />
             <path d="M16.5 20v-8.5" />
-          </symbol>
-          <symbol id="lv-settings" viewBox="0 0 24 24">
-            <!-- cog: an octagonal rosette, not a 12-tooth gear, which turns to
-                 mud at 18px on a phone -->
-            <circle cx="12" cy="12" r="3" />
-            <path d="M12 2.8v2.4M12 18.8v2.4M21.2 12h-2.4M5.2 12H2.8" />
-            <path d="m18.5 5.5-1.7 1.7M7.2 16.8l-1.7 1.7M18.5 18.5l-1.7-1.7M7.2 7.2 5.5 5.5" />
           </symbol>
         </defs>
       </svg>
@@ -1615,13 +1756,18 @@ def _device_label() -> str:
 # is #ls-notifs. Deriving the id would have pointed aria-controls at the inner
 # agents box and at an #ls-alerts that does not exist.
 _LOCK_VIEWS = (
+    # Jay's order, from the glass: agents, projects, alerts, mailbox, phone,
+    # stats -- then apps, which he asked to keep but did not place. Projects
+    # sits second because this is a projects-focused OS and it replaced the
+    # settings tab outright; pending decisions are not a tab of their own, they
+    # ride at the top of ALERTS where they can be answered quickly.
     ("agents", "Agents", "lv-agents", "ls-activity"),
-    ("phone", "Phone", "lv-phone", "ls-phone"),
-    ("mailbox", "Mailbox", "lv-mailbox", "ls-mailbox"),
-    ("apps", "Apps", "lv-apps", "ls-apps"),
+    ("projects", "Projects", "lv-projects", "ls-projects"),
     ("alerts", "Alerts", "lv-alerts", "ls-notifs"),
+    ("mailbox", "Mailbox", "lv-mailbox", "ls-mailbox"),
+    ("phone", "Phone", "lv-phone", "ls-phone"),
     ("stats", "System", "lv-stats", "ls-stats"),
-    ("settings", "Settings", "lv-settings", "ls-settings"),
+    ("apps", "Apps", "lv-apps", "ls-apps"),
 )
 _LOCK_DEFAULT_VIEW = "agents"
 
@@ -1688,17 +1834,23 @@ def _lock_head_html() -> str:
           <div class="ls-tasks" id="ls-tasks"></div>
         </div>
         <div class="ls-notifs" id="ls-notifs" data-view="alerts"
-             role="tabpanel" aria-labelledby="ls-tab-alerts" aria-label="Notifications" hidden></div>
+             role="tabpanel" aria-labelledby="ls-tab-alerts" aria-label="Alerts" hidden>
+          <!-- Pending decisions live at the TOP OF ALERTS rather than in a tab
+               of their own (Jay, from the glass: "thats where decisions will go
+               for quick answering"). They are the only thing in this panel the
+               user answers rather than reads, so they sit above the stacks. -->
+          <div class="ls-decisions" id="ls-decisions"></div>
+        </div>
         <div class="ls-panel" id="ls-phone" data-view="phone"
              role="tabpanel" aria-labelledby="ls-tab-phone" aria-label="Phone" hidden></div>
         <div class="ls-panel" id="ls-mailbox" data-view="mailbox"
              role="tabpanel" aria-labelledby="ls-tab-mailbox" aria-label="Mailbox" hidden></div>
         <div class="ls-panel" id="ls-apps" data-view="apps"
              role="tabpanel" aria-labelledby="ls-tab-apps" aria-label="Apps" hidden></div>
+        <div class="ls-panel" id="ls-projects" data-view="projects"
+             role="tabpanel" aria-labelledby="ls-tab-projects" aria-label="Projects" hidden></div>
         <div class="ls-panel" id="ls-stats" data-view="stats"
              role="tabpanel" aria-labelledby="ls-tab-stats" aria-label="System" hidden></div>
-        <div class="ls-panel" id="ls-settings" data-view="settings"
-             role="tabpanel" aria-labelledby="ls-tab-settings" aria-label="Settings" hidden></div>
       </div>
       {_FRAMEWORK_SPRITE}
       {_VIEW_SPRITE}
@@ -2623,7 +2775,9 @@ _LOCK_SCREEN_SCRIPT = r"""
     var NOTIF_GLYPHS = {
       mail: '<path d="M3 6.5h18v11H3z"/><path d="M3.4 7l8.6 6 8.6-6"/>',
       phone: '<path d="M6.2 3.5l2.4 4-1.9 2a11 11 0 0 0 5.8 5.8l2-1.9 4 2.4v3.1a1.7 1.7 0 0 1-1.9 1.7A16.5 16.5 0 0 1 3.4 5.4 1.7 1.7 0 0 1 5.1 3.5z"/>',
-      sms: '<path d="M4 4.5h16v11H8.5L4 19z"/><path d="M8 8.6h8M8 11.6h5"/>'
+      sms: '<path d="M4 4.5h16v11H8.5L4 19z"/><path d="M8 8.6h8M8 11.6h5"/>',
+      // Two rings joined by a bar: the mark every phone uses for voicemail.
+      voicemail: '<circle cx="6.8" cy="13.5" r="4.3"/><circle cx="17.2" cy="13.5" r="4.3"/><path d="M6.8 17.8h10.4"/>'
     };
 
     // Which stacks the user has fanned out, kept OUTSIDE the paint so a repaint
@@ -2798,6 +2952,14 @@ _LOCK_SCREEN_SCRIPT = r"""
         delete existing[source];
         want.push(el);
       }
+      // Pending decisions ride at the TOP of this panel -- they are the only
+      // thing in it the user ANSWERS rather than reads. Included in `want`
+      // rather than left where they sit, because placeInOrder removes
+      // everything past the last wanted element: left out, the decisions would
+      // be deleted by the next notification poll.
+      var decEl = document.getElementById("ls-decisions");
+      if (decEl && decEl.children.length) want.unshift(decEl);
+
       placeInOrder(notifsEl, want);
 
       // The minute labels are retouched in place on their own timer, so the
@@ -2829,6 +2991,335 @@ _LOCK_SCREEN_SCRIPT = r"""
       setInterval(function () {
         for (var i = 0; i < notifClocks.length; i++) {
           notifClocks[i].el.textContent = whenText(notifClocks[i].at);
+        }
+      }, 60000);
+    }
+
+    // ------------------------------------------------------------------
+    // THE SCRIPTED PANELS: phone, mailbox, apps, decisions, settings.
+    //
+    // Five more pollers on a screen whose last bug was "every poller that wipes
+    // its container and rebuilds makes the whole panel flicker". So not one of
+    // these ever wipes. Every row is found by its payload key through partOf(),
+    // updated in place through setText()/setAttrIfChanged(), and ordered with
+    // placeInOrder() -- a row that persists across a repaint keeps its identity
+    // and therefore never replays its entrance animation. That is the property
+    // the repaint tests assert, and it is why these were built this way from
+    // the first line rather than fixed afterwards five times over.
+    //
+    // Everything here is scripted demo content served by /auth/lock-panels,
+    // which 404s unless the demo flags are on. This screen renders BEFORE
+    // sign-in: there is no code path from any of it to a real account.
+    // ------------------------------------------------------------------
+    var panelEls = {
+      phone: document.getElementById("ls-phone"),
+      mailbox: document.getElementById("ls-mailbox"),
+      apps: document.getElementById("ls-apps"),
+      projects: document.getElementById("ls-projects"),
+      // Not a panel of its own: this container lives INSIDE the alerts panel,
+      // above the notification stacks.
+      decisions: document.getElementById("ls-decisions")
+    };
+    // Every minute label currently on a panel, rebuilt from the DOM after each
+    // paint so a row left untouched still gets its minutes retouched.
+    var panelClocks = [];
+    // User state that must OUTLIVE a repaint: which decisions they have
+    // answered. Kept out here for the same reason notifOpen is -- a paint must
+    // never undo what the user just did, and a poll lands whatever they are in
+    // the middle of.
+    var decAnswered = {};
+
+    // The tile every row leads with. Written only when it changes, so a repaint
+    // of an unchanged row touches no DOM at all.
+    function paintTile(tile, spec) {
+      // Only a colour literal is ever taken from the payload, and only after it
+      // is checked -- an unchecked value here would be written into a style.
+      if (/^#[0-9a-fA-F]{3,8}$/.test(spec.tint || "")
+          && tile.style.getPropertyValue("--ls-n") !== spec.tint) {
+        tile.style.setProperty("--ls-n", spec.tint);
+      }
+      var glyph = (spec.glyph && NOTIF_GLYPHS[spec.glyph]) ? spec.glyph : "";
+      if (tile.getAttribute("data-glyph") !== glyph) {
+        tile.setAttribute("data-glyph", glyph);
+        // innerHTML only ever from NOTIF_GLYPHS, which is a literal in this
+        // file. The payload chooses a key; it never supplies markup.
+        tile.innerHTML = glyph ? '<svg viewBox="0 0 24 24">' + NOTIF_GLYPHS[glyph] + "</svg>" : "";
+      }
+      if (!glyph) setText(tile, (spec.mono || spec.app || "?").slice(0, 2));
+    }
+
+    // The head of a row: tile, APP · when, title, and up to two sub-lines.
+    //
+    // `extra` is a function given the body element and returning any further
+    // parts to sit under the sub-lines. It exists because this function ends in
+    // placeInOrder(), which REMOVES everything past the last wanted element --
+    // a caller that appended its buttons afterwards would have them deleted on
+    // the next repaint and silently rebuilt, which is the very rebuild all of
+    // this is here to avoid.
+    function paintRowHead(parent, item, cls, title, sub, subject, extra) {
+      var row = partOf(parent, item.key, cls);
+      var tile = partOf(row, "tile", "ls-row-tile");
+      paintTile(tile, item);
+      var body = partOf(row, "body", "ls-row-body");
+      var meta = partOf(body, "meta", "ls-row-meta");
+      var app = setText(partOf(meta, "app", "ls-row-app"), item.app || "");
+      var parts = [app];
+      if (item.at) {
+        var when = setText(partOf(meta, "when", "ls-row-when"), whenText(item.at));
+        when.setAttribute("data-at", item.at);
+        parts.push(when);
+      }
+      placeInOrder(meta, parts);
+      var bodyParts = [meta, setText(partOf(body, "title", "ls-row-title"), title)];
+      if (subject) {
+        bodyParts.push(setText(partOf(body, "subject", "ls-row-sub ls-row-subject"), subject));
+      }
+      if (sub) bodyParts.push(setText(partOf(body, "sub", "ls-row-sub"), sub));
+      if (extra) bodyParts = bodyParts.concat(extra(body));
+      placeInOrder(body, bodyParts);
+      placeInOrder(row, [tile, body]);
+      return row;
+    }
+
+    // "Nothing here" rather than a blank screen, so a panel that served no rows
+    // is distinguishable from one that failed to load.
+    function paintEmpty(el, head, line) {
+      var empty = partOf(el, "empty", "ls-empty");
+      var b = setText(partOf(empty, "head", "", "b"), head);
+      var p = setText(partOf(empty, "line", "", "span"), line);
+      placeInOrder(empty, [b, p]);
+      placeInOrder(el, [empty]);
+    }
+
+    function paintPhone(items) {
+      var el = panelEls.phone;
+      if (!el) return;
+      if (!items.length) return paintEmpty(el, "No missed calls", "The dialer and your agents' lines are quiet.");
+      var want = [];
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        var row = paintRowHead(el, it, "ls-row ls-call", it.who || "", it.detail || "", "");
+        setAttrIfChanged(row, "data-kind", it.kind || "missed");
+        want.push(row);
+      }
+      placeInOrder(el, want);
+    }
+
+    function paintMailbox(items) {
+      var el = panelEls.mailbox;
+      if (!el) return;
+      if (!items.length) return paintEmpty(el, "Nothing new", "Mail, messages and DMs all read.");
+      var want = [];
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        // One stream, ordered by arrival, each line saying where it came from:
+        // that IS the unified-inbox design, not decoration on top of one.
+        var row = paintRowHead(el, it, "ls-row ls-msg", it.who || "", it.preview || "", it.subject || "");
+        if (it.unread) setAttrIfChanged(row, "data-unread", "1");
+        else if (row.hasAttribute("data-unread")) row.removeAttribute("data-unread");
+        want.push(row);
+      }
+      placeInOrder(el, want);
+    }
+
+    function paintApps(items) {
+      var el = panelEls.apps;
+      if (!el) return;
+      if (!items.length) return paintEmpty(el, "No apps", "Nothing is waiting in your apps.");
+      var grid = partOf(el, "grid", "ls-apps-grid");
+      var want = [];
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        var tile = partOf(grid, it.key, "ls-app");
+        // The badge is a SIBLING of the mark, not a child of it: paintTile owns
+        // the mark's contents outright -- it writes the monogram with setText,
+        // which replaces every child -- so a badge parented there would be
+        // wiped on the first paint of any tile without a glyph, which is all
+        // four of these.
+        var wrap = partOf(tile, "tile", "ls-app-tile");
+        var mark = partOf(wrap, "mark", "ls-row-tile");
+        paintTile(mark, it);
+        var wrapParts = [mark];
+        if (it.badge) {
+          wrapParts.push(setText(partOf(wrap, "badge", "ls-app-badge", "span"), String(it.badge)));
+        }
+        placeInOrder(wrap, wrapParts);
+        var body = partOf(tile, "body", "ls-app-body");
+        var name = setText(partOf(body, "name", "ls-app-name"), it.app || "");
+        var note = setText(partOf(body, "note", "ls-app-note"), it.note || "");
+        placeInOrder(body, [name, note]);
+        placeInOrder(tile, [wrap, body]);
+        want.push(tile);
+      }
+      placeInOrder(grid, want);
+      placeInOrder(el, [grid]);
+    }
+
+    function paintDecisions(items) {
+      var el = panelEls.decisions;
+      if (!el) return;
+      // No "nothing to decide" card: this container is not a panel, it is the
+      // head of the ALERTS panel, and an empty-state card sitting above the
+      // notification stacks would be noise on the screen the user opened to
+      // read the stacks. With nothing pending it empties and steps out of the
+      // way entirely.
+      if (!items.length) {
+        placeInOrder(el, []);
+        if (el.parentNode) el.parentNode.removeChild(el);
+        return;
+      }
+      var want = [];
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        // The agent that is blocked is this row's "source", so a decision reads
+        // as "who is waiting on me" in the same shape as everything else here.
+        var spec = {
+          key: it.key, app: it.agent || "agent", at: it.at,
+          mono: (it.agent || "?").slice(0, 2), tint: "#ffb020"
+        };
+        var row = paintRowHead(el, spec, "ls-row ls-dec", it.title || "", it.detail || "", "",
+          (function (key) {
+            return function (body) {
+              var answer = decAnswered[key];
+              if (answer) {
+                return [setText(partOf(body, "done", "ls-dec-done"),
+                  (answer === "approve" ? "Approved" : "Denied") + " (demo)")];
+              }
+              var actions = partOf(body, "actions", "ls-dec-actions");
+              var deny = partOf(actions, "deny", "ls-dec-btn", "button");
+              var approve = partOf(actions, "approve", "ls-dec-btn ls-dec-approve", "button");
+              // Wired once, when the elements are first created: re-binding on
+              // every paint is how a reconciled list quietly grows duplicate
+              // handlers and fires an action four times on the fourth repaint.
+              if (deny.type !== "button") {
+                deny.type = "button";
+                deny.setAttribute("data-act", "deny");
+                setText(deny, "Not now");
+                approve.type = "button";
+                approve.setAttribute("data-act", "approve");
+                setText(approve, "Approve");
+                actions.addEventListener("click", function (ev) {
+                  var btn = ev.target.closest ? ev.target.closest(".ls-dec-btn") : null;
+                  if (!btn) return;
+                  // DEMO ONLY. This screen renders before sign-in, so an answer
+                  // is remembered in the page and goes nowhere near an agent.
+                  decAnswered[key] = btn.getAttribute("data-act");
+                  paintDecisions(lastPanels.decisions || []);
+                });
+              }
+              placeInOrder(actions, [deny, approve]);
+              return [actions];
+            };
+          })(it.key));
+        if (decAnswered[it.key]) setAttrIfChanged(row, "data-answered", "1");
+        want.push(row);
+      }
+      placeInOrder(el, want);
+      // Put the container back at the top of the alerts panel if a
+      // notification paint has dropped it: paintNotifications ends in
+      // placeInOrder(notifsEl, groups), which removes everything past the last
+      // group, and the two run on independent timers. Without this the
+      // decisions would survive in a detached node -- painted, correct, and
+      // invisible, which is the worst of the three.
+      if (notifsEl && el.parentNode !== notifsEl) {
+        notifsEl.insertBefore(el, notifsEl.firstChild);
+      }
+      if (notifsEl) notifsEl.hidden = false;
+    }
+
+    function paintProjects(items) {
+      var el = panelEls.projects;
+      if (!el) return;
+      if (!items.length) return paintEmpty(el, "No projects", "Nothing is on the go.");
+      var want = [];
+      for (var i = 0; i < items.length; i++) {
+        var it = items[i];
+        var row = partOf(el, it.key, "ls-row ls-project");
+        // Blocked is the state this panel exists to surface: work that has
+        // stopped and is waiting on a person.
+        if (it.blocked) setAttrIfChanged(row, "data-blocked", "1");
+        else if (row.hasAttribute("data-blocked")) row.removeAttribute("data-blocked");
+        var tile = partOf(row, "tile", "ls-row-tile");
+        paintTile(tile, it);
+        var body = partOf(row, "body", "ls-row-body");
+        var meta = partOf(body, "meta", "ls-row-meta");
+        var who = setText(partOf(meta, "app", "ls-row-app"),
+          it.agents === 1 ? "1 agent" : (it.agents || 0) + " agents");
+        var metaParts = [who];
+        if (it.blocked) {
+          metaParts.push(setText(partOf(meta, "flag", "ls-proj-flag", "span"), "Blocked"));
+        }
+        if (it.at) {
+          var when = setText(partOf(meta, "when", "ls-row-when"), whenText(it.at));
+          when.setAttribute("data-at", it.at);
+          metaParts.push(when);
+        }
+        placeInOrder(meta, metaParts);
+        var name = setText(partOf(body, "title", "ls-row-title"), it.name || "");
+        var note = setText(partOf(body, "sub", "ls-row-sub"), it.note || "");
+        // The bar is the only quantity on this screen, so it is drawn rather
+        // than written: a row of percentages reads as a spreadsheet.
+        var bar = partOf(body, "bar", "ls-proj-bar");
+        var fill = partOf(bar, "fill", "ls-proj-fill");
+        var pct = Math.max(0, Math.min(100, Number(it.progress) || 0));
+        if (fill.style.getPropertyValue("--ls-pct") !== pct + "%") {
+          fill.style.setProperty("--ls-pct", pct + "%");
+        }
+        setAttrIfChanged(bar, "role", "progressbar");
+        setAttrIfChanged(bar, "aria-valuenow", String(pct));
+        setAttrIfChanged(bar, "aria-valuemin", "0");
+        setAttrIfChanged(bar, "aria-valuemax", "100");
+        setAttrIfChanged(bar, "aria-label", (it.name || "Project") + " progress");
+        placeInOrder(bar, [fill]);
+        placeInOrder(body, [meta, name, note, bar]);
+        placeInOrder(row, [tile, body]);
+        want.push(row);
+      }
+      placeInOrder(el, want);
+    }
+
+    // The last payload, so an in-page answer can repaint one panel without
+    // waiting for the next poll.
+    var lastPanels = {};
+
+    function paintPanels(data) {
+      lastPanels = data || {};
+      paintPhone(data.phone || []);
+      paintMailbox(data.mailbox || []);
+      paintApps(data.apps || []);
+      paintProjects(data.projects || []);
+      paintDecisions(data.decisions || []);
+      // Rebuilt from what is ACTUALLY on screen, for the same reason the
+      // notification stacks do it: rows left untouched still own their labels.
+      panelClocks = [];
+      for (var name in panelEls) {
+        if (!panelEls[name]) continue;
+        var whens = panelEls[name].querySelectorAll(".ls-row-when[data-at]");
+        for (var k = 0; k < whens.length; k++) {
+          panelClocks.push({ el: whens[k], at: Number(whens[k].getAttribute("data-at")) });
+        }
+      }
+      syncFeedFade();
+    }
+
+    function pollPanels() {
+      fetch("/auth/lock-panels", { credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { if (d) paintPanels(d); })
+        // 404 is the ordinary answer with demo content off: the panels stay
+        // empty and say so. Not an error.
+        .catch(function () { /* leave the panels as they are */ });
+    }
+    if (panelEls.phone || panelEls.mailbox || panelEls.apps
+        || panelEls.projects || panelEls.decisions) {
+      pollPanels();
+      // Scripted tables do not change, so this is slow on purpose: it exists to
+      // pick the content up if the flag is turned on while the phone is sitting
+      // on the lock screen, not to animate anything.
+      setInterval(pollPanels, 15 * 60 * 1000);
+      setInterval(function () {
+        for (var i = 0; i < panelClocks.length; i++) {
+          panelClocks[i].el.textContent = whenText(panelClocks[i].at);
         }
       }, 60000);
     }
@@ -4734,6 +5225,20 @@ def _demo_notifications_enabled() -> bool:
     return bool(os.environ.get("TAOS_LOCK_DEMO_NOTIFICATIONS", "").strip())
 
 
+def _demo_panels_enabled() -> bool:
+    """Whether the scripted phone/mailbox/apps/decisions/settings panels are on.
+
+    Same two-flag shape as the stacks, and for the same reason: the master flag
+    must remain the one move that takes down everything invented on this
+    pre-sign-in screen. It also means a device can run the agent islands -- the
+    part of this screen that shows REAL state -- with none of the scripted
+    inbox content beside them.
+    """
+    if not _demo_enabled():
+        return False
+    return bool(os.environ.get("TAOS_LOCK_DEMO_PANELS", "").strip())
+
+
 def _demo_thread(slug: str) -> list[dict]:
     """Build one scripted thread as absolute timestamps relative to now."""
     script = _DEMO_THREADS.get(slug, _DEMO_THREAD_FALLBACK)
@@ -5042,6 +5547,348 @@ def _demo_notifications() -> list[dict]:
     return groups
 
 
+#: The four panels the view row reaches and nothing had ever put anything in:
+#: phone, mailbox, apps and decisions, plus the settings sheet. Same rule as the
+#: notification stacks and for the same reason -- THIS SCREEN RENDERS BEFORE
+#: SIGN-IN, so every line here is scripted and server-side and there is no code
+#: path from any of it to a real account. A "helpful" wiring of the mailbox to
+#: the user's actual inbox would be a pre-auth leak, not a feature.
+#:
+#: `at` offsets are minutes-ago rather than timestamps, so the phone reads as
+#: having had a plausible morning whenever the demo is run.
+#:
+#: Phone numbers are drawn from Ofcom's 07700 900xxx drama range, which is
+#: reserved for fiction and can never reach a real subscriber.
+_DEMO_PHONE: tuple[dict, ...] = (
+    {
+        "key": "call-kenwright",
+        "kind": "missed",
+        "app": "Phone",
+        "who": "Dave Kenwright",
+        "detail": "Mobile · 07700 900461",
+        "minutes": 22,
+        "glyph": "phone",
+        "tint": "#34c759",
+    },
+    {
+        "key": "call-wa-brightside",
+        "kind": "missed",
+        # Jay named the app by the name it carries on the phone.
+        "app": "WA+",
+        "who": "Brightside Joinery",
+        "detail": "WhatsApp Business · voice call",
+        "minutes": 47,
+        "mono": "WA",
+        "tint": "#25d366",
+    },
+    {
+        "key": "call-twilio-agent",
+        "kind": "missed",
+        "app": "Twilio",
+        "who": "taOS agent line",
+        # The one entry that is about the product rather than the person: an
+        # agent holds a phone number and something rang it while the user was
+        # away. That is the whole point of the demo.
+        "detail": "Inbound · 07700 900118 · agent was mid-task",
+        "minutes": 63,
+        "mono": "TW",
+        "tint": "#f22f46",
+    },
+    {
+        "key": "call-wa-ellis",
+        "kind": "missed",
+        "app": "WA+",
+        "who": "Ellis & Daughters",
+        "detail": "WhatsApp Business · 2 calls",
+        "minutes": 140,
+        "mono": "WA",
+        "tint": "#25d366",
+    },
+    {
+        "key": "voicemail-hargreaves",
+        "kind": "voicemail",
+        "app": "Voicemail",
+        "who": "Hargreaves & Co",
+        "detail": "0:38 · “…bringing the revised drawings Thursday…”",
+        "minutes": 96,
+        "glyph": "voicemail",
+        "tint": "#8e8e93",
+    },
+)
+
+#: Unified messaging, explicitly the BlackBerry Hub shape Jay asked for: mail,
+#: SMS, X DMs and LinkedIn in ONE stream ordered by arrival. The per-item source
+#: is the design, not decoration -- a unified list that does not say where each
+#: line came from is just a worse inbox.
+_DEMO_MAILBOX: tuple[dict, ...] = (
+    {
+        "key": "mail-hargreaves",
+        "source": "mail",
+        "app": "Mail",
+        "who": "Hargreaves & Co",
+        "subject": "Re: Thursday's site visit",
+        "preview": "09:15 works for us. I'll bring the revised drawings.",
+        "minutes": 12,
+        "glyph": "mail",
+        "tint": "#2f6fd0",
+        "unread": True,
+    },
+    {
+        "key": "dm-x-marcus",
+        "source": "x",
+        "app": "X",
+        "who": "@marcus_dev",
+        "subject": "Direct message",
+        "preview": "what's the actual memory floor for running this on a 4GB board?",
+        "minutes": 26,
+        "mono": "X",
+        "tint": "#3b3b42",
+        "unread": True,
+    },
+    {
+        "key": "sms-sam",
+        "source": "sms",
+        "app": "Messages",
+        "who": "Sam",
+        "subject": "SMS",
+        "preview": "are you still alright for Sunday?",
+        "minutes": 19,
+        "glyph": "sms",
+        "tint": "#25c05d",
+        "unread": True,
+    },
+    {
+        "key": "li-recruiter",
+        "source": "linkedin",
+        "app": "LinkedIn",
+        "who": "Priya Raman",
+        "subject": "InMail",
+        "preview": "Saw the on-device agent work — are you open to a conversation?",
+        "minutes": 88,
+        "mono": "in",
+        "tint": "#0a66c2",
+        "unread": True,
+    },
+    {
+        "key": "mail-companies-house",
+        "source": "mail",
+        "app": "Mail",
+        "who": "Companies House",
+        "subject": "Confirmation statement due 3 October",
+        "preview": "No action needed if your details are unchanged.",
+        "minutes": 74,
+        "glyph": "mail",
+        "tint": "#2f6fd0",
+        "unread": False,
+    },
+    {
+        "key": "li-post",
+        "source": "linkedin",
+        "app": "LinkedIn",
+        "who": "Northlight Systems",
+        "subject": "Message",
+        "preview": "Thanks for the demo yesterday — sending the write-up over.",
+        "minutes": 190,
+        "mono": "in",
+        "tint": "#0a66c2",
+        "unread": False,
+    },
+    {
+        "key": "sms-o2",
+        "source": "sms",
+        "app": "Messages",
+        "who": "O2",
+        "subject": "SMS",
+        "preview": "You've used 80% of your data allowance this month.",
+        "minutes": 310,
+        "glyph": "sms",
+        "tint": "#25c05d",
+        "unread": False,
+    },
+)
+
+#: The four apps Jay named. A badge is a count; `note` is the one line the tile
+#: shows underneath, because a grid of bare icons on a lock screen says nothing
+#: a user could act on.
+_DEMO_APPS: tuple[dict, ...] = (
+    {
+        "key": "app-instagram",
+        "app": "Instagram",
+        "mono": "ig",
+        "tint": "#c13584",
+        "badge": 7,
+        "note": "3 DMs, 4 mentions",
+    },
+    {
+        "key": "app-reddit",
+        "app": "Reddit",
+        "mono": "r",
+        "tint": "#ff4500",
+        "badge": 12,
+        "note": "r/selfhosted replies",
+    },
+    {
+        "key": "app-bank",
+        "app": "Bank",
+        "mono": "£",
+        "tint": "#1b7f5a",
+        "badge": 1,
+        # A balance would be the one genuinely sensitive-looking line on a
+        # pre-auth screen, so the tile says a payment needs a look and no more.
+        "note": "Card payment needs approval",
+    },
+    {
+        "key": "app-youtube",
+        "app": "YouTube",
+        "mono": "▶",
+        "tint": "#ff0000",
+        "badge": 3,
+        "note": "3 new from your subscriptions",
+    },
+)
+
+#: Pending approvals waiting on the user. These are the lock screen's reason to
+#: exist: an agent got far enough to need a human and stopped. Each carries the
+#: agent that is blocked, so the panel reads as "who is waiting on me".
+_DEMO_DECISIONS: tuple[dict, ...] = (
+    {
+        "key": "dec-invoice",
+        "title": "Pay Brightside Joinery invoice",
+        "detail": "£1,840.00 · matches quote BJ-2291 · due Friday",
+        "agent": "finance",
+        "minutes": 31,
+    },
+    {
+        "key": "dec-reply",
+        "title": "Send drafted reply to Hargreaves & Co",
+        "detail": "Confirms 09:15 Thursday and asks for parking details",
+        "agent": "inbox",
+        "minutes": 54,
+    },
+    {
+        "key": "dec-deploy",
+        "title": "Deploy taos-website build 412",
+        "detail": "All checks green · changes the pricing page copy",
+        "agent": "builder",
+        "minutes": 120,
+    },
+)
+
+#: PROJECTS -- the tab that replaced settings (Jay: "makes sense as its a
+#: projects focused os"). It sits second in the row, right after the agents.
+#:
+#: A project is a body of work with agents on it, so each row says how far along
+#: it is, how many agents are working it, and the one thing that happened most
+#: recently. `blocked` is the state the lock screen exists to surface: work that
+#: has stopped and is waiting on a person.
+#:
+#: Read-only, and deliberately so. This replaced a panel of pre-auth ACTIONS
+#: ("stop all agents" reachable by anyone holding the phone), and swapping it
+#: for content removed that exposure rather than moving it somewhere else.
+_DEMO_PROJECTS: tuple[dict, ...] = (
+    {
+        "key": "prj-brightside",
+        "name": "Brightside Joinery fit-out",
+        "note": "Quote accepted · scheduling the survey",
+        "progress": 72,
+        "agents": 3,
+        "blocked": True,
+        "mono": "BJ",
+        "tint": "#ffb020",
+        "minutes": 31,
+    },
+    {
+        "key": "prj-taos-site",
+        "name": "taOS website relaunch",
+        "note": "Build 412 green · pricing copy rewritten",
+        "progress": 88,
+        "agents": 2,
+        "blocked": False,
+        "mono": "tw",
+        "tint": "#4c9aff",
+        "minutes": 54,
+    },
+    {
+        "key": "prj-handset",
+        "name": "Handset demo build",
+        "note": "Lock screen panels landed · splash handover next",
+        "progress": 64,
+        "agents": 4,
+        "blocked": False,
+        "mono": "hd",
+        "tint": "#30d158",
+        "minutes": 12,
+    },
+    {
+        "key": "prj-accounts",
+        "name": "Year end accounts",
+        "note": "Waiting on two receipts · filing due 3 October",
+        "progress": 40,
+        "agents": 1,
+        "blocked": True,
+        "mono": "ya",
+        "tint": "#bf5af2",
+        "minutes": 190,
+    },
+    {
+        "key": "prj-northlight",
+        "name": "Northlight pilot",
+        "note": "Write-up drafted, ready to send",
+        "progress": 95,
+        "agents": 1,
+        "blocked": False,
+        "mono": "np",
+        "tint": "#64d2ff",
+        "minutes": 300,
+    },
+)
+
+
+def _demo_panels() -> dict:
+    """Every scripted panel, timestamped relative to now and newest-first.
+
+    One payload for all five rather than an endpoint each: they are all the same
+    switch, they are all static tables, and five pollers on one screen is five
+    chances to repaint something the user is reading. The client paints each
+    panel from its own key, so a panel the payload omits is simply empty.
+    """
+    now = time.time()
+
+    def stamped(rows: tuple[dict, ...]) -> list[dict]:
+        out = []
+        for spec in rows:
+            item = dict(spec)
+            if "minutes" in item:
+                item["at"] = now - (item.pop("minutes") * 60)
+            # Marked at construction, like the stacks: nothing downstream should
+            # have to work out that these are placeholders by elimination.
+            item["demo"] = True
+            out.append(item)
+        return out
+
+    phone = stamped(_DEMO_PHONE)
+    phone.sort(key=lambda item: item["at"], reverse=True)
+    mailbox = stamped(_DEMO_MAILBOX)
+    mailbox.sort(key=lambda item: item["at"], reverse=True)
+    decisions = stamped(_DEMO_DECISIONS)
+    decisions.sort(key=lambda item: item["at"], reverse=True)
+    # Projects lead with whatever moved most recently, the way the rest of this
+    # screen does -- except that anything BLOCKED comes first regardless. A
+    # project waiting on a person is the reason to look at this panel, and it
+    # going quiet is precisely what would sink it to the bottom of a pure
+    # recency sort.
+    projects = stamped(_DEMO_PROJECTS)
+    projects.sort(key=lambda item: (item["blocked"], item["at"]), reverse=True)
+    return {
+        "phone": phone,
+        "mailbox": mailbox,
+        # Apps are a fixed grid: their order is the author's, not the clock's.
+        "apps": stamped(_DEMO_APPS),
+        "decisions": decisions,
+        "projects": projects,
+    }
+
+
 #: Previous /proc/stat reading, so CPU can be a PERCENTAGE. A single sample of
 #: /proc/stat gives cumulative jiffies since boot; dividing those by uptime
 #: yields the average load since the phone was switched on, which on a device
@@ -5276,6 +6123,30 @@ async def lock_notifications(request: Request):
     if not _demo_notifications_enabled():
         return JSONResponse({"error": "not found"}, status_code=404)
     return JSONResponse({"groups": _demo_notifications(), "demo": True})
+
+
+@router.get("/lock-panels")
+async def lock_panels(request: Request):
+    """Scripted contents of the phone, mailbox, apps, projects and decisions
+    panels. Console-only, demo-only.
+
+    Gated exactly like the notification stacks: TAOS_LOCK_DEMO_PANELS on top of
+    the master TAOS_LOCK_DEMO_AGENTS flag, so a real device shows five empty
+    panels rather than an invented inbox, and one flag takes the whole lot down.
+    404 with either flag off; the page treats that as "nothing to show".
+
+    Everything served here is READ-ONLY content. The panel that used to carry
+    actions ("stop all agents", reachable by anyone holding the phone) was
+    replaced by projects, which removed that pre-auth exposure rather than
+    relocating it.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    if not _demo_panels_enabled():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    payload = _demo_panels()
+    payload["demo"] = True
+    return JSONResponse(payload)
 
 
 @router.post("/pin-login")
