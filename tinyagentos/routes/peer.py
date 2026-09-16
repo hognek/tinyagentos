@@ -206,8 +206,10 @@ async def peer_inbox(body: PeerEnvelope, request: Request):
     if not await store.record_nonce(nonce, contact_id, kind):
         raise HTTPException(status_code=409, detail="nonce replay detected")
 
-    # Mark peer as seen
-    await store.mark_peer_seen(contact_id)
+    # Mark peer as seen and surface the due outbox rows for delivery.
+    # Delivery itself is not performed here.
+    peer_outbox = getattr(request.app.state, "peer_outbox", None)
+    await store.mark_peer_seen(contact_id, peer_outbox=peer_outbox)
 
     # Dispatch the envelope by kind.
     kind = envelope.get("kind", "unknown")

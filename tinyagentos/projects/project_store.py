@@ -156,6 +156,60 @@ class ProjectStore(ProjectsDBStore):
                 "UPDATE projects SET lead_member_id = ? WHERE id = ?",
                 (member_id, project_id),
             )
+            if member_id is not None:
+                # Promote the new lead in its member row.
+                await self._db.execute(
+                    "UPDATE project_members SET is_lead = 1, role = 'lead' "
+                    "WHERE project_id = ? AND member_id = ?",
+                    (project_id, member_id),
+                )
+                # Demote any previous lead so the flag stays exclusive.
+                await self._db.execute(
+                    "UPDATE project_members SET is_lead = 0, role = 'member' "
+                    "WHERE project_id = ? AND member_id != ? AND is_lead = 1",
+                    (project_id, member_id),
+                )
+            else:
+                # Clearing lead — unset the flag everywhere on this project.
+                await self._db.execute(
+                    "UPDATE project_members SET is_lead = 0, role = 'member' "
+                    "WHERE project_id = ? AND is_lead = 1",
+                    (project_id,),
+                )
+
+    async def create_project_with_lead(
+        self,
+        name: str,
+        slug: str,
+        created_by: str,
+        member_id: str,
+        description: str = "",
+        settings: dict | None = None,
+        user_id: str = "",
+    ) -> dict:
+        """Create a project and add the lead member atomically.
+
+        Wraps ``create_project``, ``add_member`` and ``set_lead`` in a single
+        transaction so a failure after project creation never leaves an orphan
+        project with no lead.
+        """
+        async with self._tx():
+            project = await self.create_project(
+                name=name,
+                slug=slug,
+                created_by=created_by,
+                description=description,
+                settings=settings,
+                user_id=user_id,
+            )
+            await self.add_member(
+                project_id=project["id"],
+                member_id=member_id,
+                member_kind="native",
+                role="lead",
+            )
+            await self.set_lead(project["id"], member_id)
+            return project
 
     async def create_project(
         self,

@@ -4,4 +4,4 @@
 
 - **Slack Connector:** Fixed message delivery bug by moving the cursor advance to after successful message dispatch, ensuring at-least-once delivery semantics instead of losing messages when dispatch fails.
 
-**Note:** The Discord connector now handles 429 responses correctly by respecting the `Retry-After` header and implementing backoff windows, but still uses REST polling. According to the audit documentation, a full replacement with discord.py's Gateway WebSocket is needed for true push delivery. Slack has a similar limitation with REST polling instead of SocketMode.
+- **Note:** The Discord connector now handles 429 responses correctly by respecting the `Retry-After` header and implementing backoff windows, but still uses REST polling. According to the audit documentation, a full replacement with discord.py's Gateway WebSocket is needed for true push delivery. Slack has a similar limitation with REST polling instead of SocketMode.

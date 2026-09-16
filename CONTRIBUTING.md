@@ -230,7 +230,7 @@ Run a specific test file:
 pytest tests/test_catalog_sync.py -v
 ```
 
-The project has ~10,250 tests. CI runs against Python 3.12 and 3.13 on every pull request. Python 3.11 is added on the nightly scheduled run. A PR cannot be merged until all required checks pass.
+The project has ~10,250 tests. CI runs against Python 3.12 and 3.13 on every pull request. A dedicated Python 3.11 import-smoke job also runs on every PR targeting dev or master to catch floor-version import regressions; Python 3.11 remains in the nightly shard matrix as well. A PR cannot be merged until all required checks pass.
 
 When adding a feature, add tests that cover the new behaviour. When fixing a bug, add a regression test.
 

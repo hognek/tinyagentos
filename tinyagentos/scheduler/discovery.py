@@ -22,6 +22,38 @@ from tinyagentos.scheduler.score_cache import ScoreCache
 from tinyagentos.scheduler.types import ResourceSignature
 
 
+def normalise_vram_probe(free_mb: int, total_mb: int) -> int:
+    """Map a raw VRAM probe to a schedulable free-VRAM value.
+
+    ``_probe_nvidia_vram()`` returns ``(free, total)``, and the ``total`` half is
+    the signal that distinguishes two very different states a bare ``free``
+    collapses together:
+
+    * ``total_mb <= 0`` — the probe could not run at all (``nvidia-smi`` absent on
+      AMD/ROCm, Apple Silicon, Rockchip, …).  This is *unknown*, not "full": fail
+      OPEN with a large value so a non-NVIDIA host whose GPU resources are still
+      registered (``discovery.py`` assigns runtime ``rocm``/``native``) is not
+      permanently refused by ``Resource.can_admit()``'s
+      ``avail < estimated_memory_mb + 1024`` check.
+    * ``total_mb > 0 and free_mb <= 0`` — the probe ran and genuinely measured no
+      free VRAM.  Fail CLOSED (report 0): the real "full / over-committed" case
+      the scheduler must refuse, not inflate.
+
+    A positive ``free_mb`` is used as-is.  (taOS #1992 M2.)
+
+    Lives module-level so the fail-open/fail-closed split is unit-testable; the
+    prior inline ``free if free > 0 else 999_999`` (always optimistic) and the
+    first-cut ``free if free > 0 else 0`` (always pessimistic) each collapsed
+    the unavailable-vs-full distinction in the wrong direction.
+    """
+    if total_mb <= 0:
+        # Probe unavailable — fail OPEN, mirroring `_default_memory_probe`'s
+        # "don't block on probe failure" convention (resource.py:185).
+        return 999_999
+    return free_mb if free_mb > 0 else 0
+
+
+
 # Every capability a CPU can run given the right backend. CPU is the
 # universal fallback, nothing is exclusive to GPU/NPU at the capability
 # level, just faster on those devices. This set feeds the CPU resource's
@@ -214,8 +246,10 @@ def build_scheduler(
         )
 
         def _gpu_vram_probe() -> int:
-            free, _total = _probe_nvidia_vram()
-            return free if free > 0 else 999_999  # optimistic
+            free, total = _probe_nvidia_vram()
+            # Split "probe unavailable" (fail open) from "probe ran, 0 free"
+            # (fail closed). See normalise_vram_probe (M2 fix, taOS #1992).
+            return normalise_vram_probe(free, total)
 
         def _gpu_capabilities() -> set[str]:
             caps: set[str] = set()

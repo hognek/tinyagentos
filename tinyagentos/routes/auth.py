@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import json
+import socket
+from pathlib import Path
 import logging
+import os
 import threading
 import time
 from collections import OrderedDict
+from datetime import datetime, timedelta
 
+import httpx
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from tinyagentos.auth import (
@@ -268,6 +274,754 @@ body.osk-open .pin-dots { margin: 2px 0 8px; }
 .method-switch:focus-visible { outline: 3px solid #4c9aff; outline-offset: 2px; }
 """
 
+
+# Phone lock-screen chrome. Only ever rendered for a console-local request that
+# already qualifies for PIN sign-in, so a LAN browser still gets the plain card.
+_LOCK_SCREEN_STYLE = """
+/* A handset is tall, and a sign-in card floating in the middle of 2400px of
+   glass reads as a web page, not as an OS. The lock screen splits the height
+   the way iOS and Android do: status up top, passcode down by the thumb. */
+/* display:block, NOT a flex row. The base stylesheet makes <body> a centring
+   flex container for the sign-in card, and the on-screen keyboard appends its
+   panel, toggle and live region to <body> -- under a flex ROW those become
+   SIBLING FLEX ITEMS of the lock screen, squeezing it to a fraction of the
+   width (its max-width never binds) and spilling a stray control above the
+   clock. As a block the lock screen owns the full width and those appended
+   elements sit out of flow where they belong. */
+body.lockscreen-on {
+  display: block; padding: 0; overflow: hidden;
+  /* This is an OS screen, not a web page. Without these a press-and-hold on an
+     island does what a browser does -- starts a text selection and raises the
+     copy/share callout -- which is exactly the gesture the islands bind, so the
+     long press fought the selection every time. Selection stays ON inside the
+     conversation, where copying a message is a reasonable thing to want. */
+  -webkit-user-select: none; user-select: none;
+  -webkit-touch-callout: none;
+}
+.ls-msg, .ls-compose-input { -webkit-user-select: text; user-select: text; }
+/* The on-screen keyboard's layout override (padding-bottom + flex-start) is for
+   the password form. The lock screen carries its own keypad and never opens it,
+   but be explicit so a stray .osk-open cannot re-anchor the screen to the top. */
+body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; overflow-y: hidden; }
+.lockscreen {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100vh;
+  height: 100dvh;
+  padding: calc(env(safe-area-inset-top, 0px) + 14px) 10px calc(env(safe-area-inset-bottom, 0px) + 18px);
+  gap: 16px;
+}
+/* The clock keeps its distance from the status bar rather than the screen top. */
+.lockscreen .ls-head { margin-top: 4vh; }
+/* Top block: the glanceable half. */
+.ls-head {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  align-self: stretch;
+  /* min-height:0 so this block is allowed to shrink instead of pushing the
+     keypad off-screen; a flex item's default min-height:auto refuses to. */
+  min-height: 0;
+}
+.ls-time {
+  font-size: clamp(56px, 17vw, 88px);
+  font-weight: 250;
+  line-height: 1;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  color: #fff;
+}
+.ls-date { font-size: 16px; font-weight: 500; color: rgba(255,255,255,0.62); }
+/* Weather. It sits between the clock and the agent islands because that is the
+   order the eye already reads this screen in: what time is it, what is it like
+   outside, what are my agents doing. A fixed location (Liverpool) in Celsius
+   and mph -- this device does not ask for geolocation, and a lock screen that
+   prompted for it before sign-in would be asking the wrong question of the
+   wrong person.
+
+   Everything here is fetched SERVER-SIDE by /auth/lock-weather. A fetch from
+   the page would hand the device's address to a third party on every
+   lock-screen paint, from a surface that renders before anyone has signed in. */
+.ls-weather {
+  display: flex; align-items: center; gap: 12px;
+  margin-top: 10px; padding: 0 4px;
+  transition: filter 320ms cubic-bezier(0.32, 0.72, 0, 1), opacity 320ms ease;
+}
+.lockscreen:not([data-sheet="none"]) .ls-weather { filter: blur(7px); opacity: 0.55; }
+/* No pill, no card. Up here this is a continuation of the clock -- a bordered
+   box around it would read as the first of a row of widgets and pull the eye
+   down off the time. */
+.ls-weather-icon { flex: none; width: 34px; height: 34px; color: rgba(255,255,255,0.92); }
+.ls-weather-icon svg { width: 100%; height: 100%; display: block; }
+.ls-weather-icon svg [fill="none"], .ls-weather-icon svg path, .ls-weather-icon svg circle {
+  fill: none; stroke: currentColor; stroke-width: 1.7;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.ls-weather-read { display: flex; flex-direction: column; align-items: flex-start; gap: 1px; }
+.ls-weather-now { display: flex; align-items: baseline; gap: 9px; }
+.ls-weather-temp {
+  font-size: 26px; font-weight: 300; line-height: 1;
+  letter-spacing: -0.01em; font-variant-numeric: tabular-nums; color: #fff;
+}
+.ls-weather-label { font-size: 15px; font-weight: 500; color: rgba(255,255,255,0.74); }
+.ls-weather-sub {
+  font-size: 13px; color: rgba(255,255,255,0.52);
+  font-variant-numeric: tabular-nums;
+}
+/* Status bar. The product name and the battery are STATUS, not content: they
+   belong on the top edge where a phone puts them, not stacked under the date
+   competing with the clock. The device's hostname is gone -- it told the
+   person holding their own phone something they already know. */
+.ls-statusbar {
+  /* Three columns, brand in the middle: a flex row would re-centre the brand
+     every time the battery string changed width (9% -> 100%). */
+  display: grid; grid-template-columns: 1fr auto 1fr; align-items: center;
+  align-self: stretch; flex: none;
+  width: 100%; padding: 0 6px; gap: 10px;
+  transition: filter 320ms cubic-bezier(0.32, 0.72, 0, 1), opacity 320ms ease;
+}
+.lockscreen:not([data-sheet="none"]) .ls-statusbar { filter: blur(7px); opacity: 0.55; }
+/* Text, not chips. Up here these are a status line the eye skips over; a
+   bordered translucent pill around each one turns the top edge into two
+   buttons that cannot be pressed. */
+.ls-statusbar .ls-widget {
+  padding: 0; border: 0; background: none;
+  backdrop-filter: none; -webkit-backdrop-filter: none;
+  font-size: 14px; color: rgba(255,255,255,0.58);
+}
+.ls-statusbar .ls-widget b { color: rgba(255,255,255,0.80); }
+.ls-brand { grid-column: 2; justify-self: center; }
+.ls-brand b { font-weight: 700; }
+#ls-battery { grid-column: 3; justify-self: end; margin-right: 4px; }
+/* Widgets are CLIENT-SIDE only (clock, battery) plus the device's own name.
+   Nothing here reads the account or its data: this surface is shown BEFORE
+   authentication, so anything account-derived would be a pre-auth leak. */
+.ls-widget {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 12px; border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.05);
+  font-size: 13px; color: rgba(255,255,255,0.70);
+  backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
+}
+.ls-widget b { font-weight: 600; color: rgba(255,255,255,0.88); }
+/* Agent islands. Each running agent is its own floating pill -- a row of
+   identical cards would make three agents look like a list of settings; a
+   detached island reads as a thing that is alive and can speak up on its own.
+   Elevation is declared ONCE, as a shadow: no hairline border under it. */
+.ls-islands {
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  width: 100%; align-self: stretch; margin-top: 16px;
+}
+/* #ls-agents is the box the islands are appended INTO. Without a width of its
+   own it is a shrink-to-fit block inside a centre-aligned flex column, so every
+   island's width:100% and max-width resolved against its CONTENT box -- the cap
+   could never bind and side padding changed nothing. It carries the stack. */
+.ls-agents {
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  width: 100%; align-self: stretch;
+  min-height: 0;
+}
+/* THE SCROLL SEAM. The agent stack used to be the scrolling element itself.
+   With a second stack (notifications) under it that is wrong twice over: the
+   two would scroll independently -- islands sliding under a pinned pile of
+   banners -- and the notifications, being outside the only scrollable box,
+   would push the passcode sheet off the bottom of a full screen instead of
+   scrolling.
+
+   So the scroll moves up one level, to the box that holds BOTH stacks. They
+   travel together as one feed, and this is still the only part of the lock
+   screen allowed to overflow: min-height:0 keeps it shrinking rather than
+   growing the column, so the unlock bar and the passcode keep their room. */
+.ls-feed {
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  width: 100%; align-self: stretch;
+  min-height: 0;
+  overflow-y: auto;
+  /* A visible scrollbar on a lock screen reads as a web page. */
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  overscroll-behavior: contain;
+}
+.ls-feed::-webkit-scrollbar { width: 0; height: 0; display: none; }
+/* The cut edge. With the bar hidden, a scrolling feed ends in a card sliced
+   clean in half against the unlock bar, which reads as a rendering fault rather
+   than as more content. A fade says "this continues".
+   Applied only while the feed ACTUALLY overflows -- an unconditional mask would
+   eat the bottom of the last card on a device with one agent and no
+   notifications, where there is nothing to scroll to. */
+.ls-feed[data-fade="bottom"] {
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 34px), transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 34px), transparent 100%);
+}
+.ls-feed[data-fade="top"] {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 26px);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 26px);
+}
+.ls-feed[data-fade="both"] {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 34px), transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 34px), transparent 100%);
+}
+/* NOTIFICATIONS. Collated the way a phone does it: one stack per source, the
+   newest banner on top and the rest of that source's banners tucked behind it
+   as peeking edges. A flat list of every notification would bury the agent
+   islands under mail, and the islands are what this screen is for.
+
+   Pressing a stack fans it out in place. That is ALL a press does: this screen
+   renders before sign-in, so there is nothing here to open into. */
+.ls-notifs {
+  display: flex; flex-direction: column; align-items: center; gap: 12px;
+  width: 100%; align-self: stretch;
+}
+.ls-notif-group {
+  position: relative;
+  width: 100%; max-width: 396px;
+  animation: ls-island-in 520ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+/* Collapsed: only the newest card is in flow, so the group is exactly one card
+   tall and the ones behind it cannot change its height however long they are.
+   The padding is the gap the peeking edges show through. */
+.ls-notif-group:not([data-open="1"]) { padding-bottom: 13px; }
+.ls-notif-group:not([data-open="1"]) .ls-notif { position: relative; z-index: 2; }
+.ls-notif-group:not([data-open="1"]) .ls-notif ~ .ls-notif {
+  position: absolute; left: 0; right: 0; top: 0; height: 100%;
+  overflow: hidden; pointer-events: none;
+}
+.ls-notif-group:not([data-open="1"]) .ls-notif:nth-child(2) {
+  transform: translateY(7px) scale(0.955); opacity: 0.85; z-index: 1;
+}
+.ls-notif-group:not([data-open="1"]) .ls-notif:nth-child(3) {
+  transform: translateY(13px) scale(0.912); opacity: 0.55; z-index: 0;
+}
+/* A fourth card would peek out from under a stack that already reads as deep.
+   The count on the newest card is what says how many there really are. */
+.ls-notif-group:not([data-open="1"]) .ls-notif:nth-child(n+4) { opacity: 0; z-index: 0; }
+.ls-notif-group[data-open="1"] { display: flex; flex-direction: column; gap: 8px; }
+.ls-notif {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 10px 13px;
+  border-radius: 20px;
+  text-align: left;
+  background: rgba(30, 30, 34, 0.92);
+  box-shadow: 0 6px 18px -6px rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(24px) saturate(1.3);
+  -webkit-backdrop-filter: blur(24px) saturate(1.3);
+  transition: transform 340ms cubic-bezier(0.32, 0.72, 0, 1),
+              opacity 260ms ease;
+}
+.ls-notif-group:focus-visible { outline: 3px solid #4c9aff; outline-offset: 4px; border-radius: 22px; }
+.ls-notif-group:focus { outline: none; }
+/* The app tile. A monogram on a tinted square is the shape a phone uses for an
+   app, and it keeps every source the same size whether it has a real glyph or
+   just a letter. */
+.ls-notif-tile {
+  flex: none; width: 30px; height: 30px; border-radius: 9px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700; color: #fff;
+  background: var(--ls-n, #4c9aff);
+}
+.ls-notif-tile svg { width: 17px; height: 17px; fill: none; stroke: #fff; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.ls-notif-body { min-width: 0; flex: 1; }
+.ls-notif-meta {
+  display: flex; align-items: baseline; gap: 6px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+  color: rgba(255,255,255,0.45);
+}
+.ls-notif-app { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ls-notif-when { margin-left: auto; flex: none; text-transform: none; letter-spacing: 0; font-weight: 500; }
+.ls-notif-title {
+  margin-top: 2px;
+  font-size: 14px; font-weight: 600; color: #fff;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.ls-notif-text {
+  margin-top: 1px;
+  font-size: 13px; line-height: 1.35; color: rgba(255,255,255,0.68);
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+}
+.ls-notif-group[data-open="1"] .ls-notif-text { -webkit-line-clamp: 6; }
+/* The pile count. Only meaningful while the stack is closed -- once it is fanned
+   out the cards themselves are the count. */
+.ls-notif-count {
+  flex: none; padding: 1px 7px; border-radius: 999px;
+  background: rgba(255,255,255,0.13); color: rgba(255,255,255,0.72);
+  font-size: 11px; font-weight: 600; letter-spacing: 0;
+}
+.ls-notif-group[data-open="1"] .ls-notif-count { display: none; }
+.ls-island {
+  display: flex; align-items: center; gap: 10px;
+  width: 100%; max-width: 396px;
+  padding: 7px 16px 7px 7px;
+  border-radius: 999px;
+  background: rgba(30, 30, 34, 0.92);
+  box-shadow: 0 6px 18px -6px rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(24px) saturate(1.3);
+  -webkit-backdrop-filter: blur(24px) saturate(1.3);
+  /* Entrance: already-visible default, one authored moment, exponential ease. */
+  animation: ls-island-in 520ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+.ls-island:nth-child(2) { animation-delay: 70ms; }
+.ls-island:nth-child(3) { animation-delay: 140ms; }
+@keyframes ls-island-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.96); filter: blur(3px); }
+  to   { opacity: 1; transform: none; filter: none; }
+}
+/* The avatar and the harness mark sit as a pair, the mark tucked over the
+   avatar's edge the way a platform badge does -- two separate circles side by
+   side read as two unrelated buttons. */
+.ls-marks { position: relative; flex: none; width: 52px; height: 34px; }
+.ls-avatar {
+  position: absolute; inset: 0 auto 0 0;
+  width: 34px; height: 34px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 600; letter-spacing: 0.01em; color: #fff;
+  background: linear-gradient(145deg, var(--ls-a, #4c9aff), var(--ls-b, #2f6fd0));
+}
+.ls-fw {
+  position: absolute; right: 0; bottom: -1px;
+  width: 22px; height: 22px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: #0f0f12;
+  /* The ring is the separation from the avatar behind it, not decoration. */
+  box-shadow: 0 0 0 2px rgba(30, 30, 34, 0.92);
+  color: rgba(255, 255, 255, 0.86);
+}
+.ls-fw svg { width: 15px; height: 15px; }
+/* A real store logo fills the badge; the drawn marks are inset because they are
+   line art and need the breathing room a solid mark does not. */
+.ls-fw-img { background: #fff; overflow: hidden; }
+.ls-fw-img img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* A photo fills the circle edge to edge; the monogram gradient stays behind it
+   as the loading ground rather than a grey box. */
+.ls-avatar-img { width: 100%; height: 100%; border-radius: 50%; object-fit: cover; display: block; }
+/* The OS's own agent carries the product mark. A mark is not a portrait: no
+   circular crop, no gradient ground and no monogram behind it -- those exist to
+   make arbitrary photos and initials sit together, and cropping a landscape
+   wordmark into a 34px circle would cut the word in half. It gets a wider slot
+   and is contained inside it, while the harness badge stays exactly where it is
+   on every other island. */
+/* Same circle, same size as every other avatar -- a row of pills whose first
+   mark is a different shape and size reads as a mis-render, not as emphasis.
+   The only differences are the ground (a flat dark disc rather than the
+   per-name gradient, which is there to make INITIALS legible) and `contain`,
+   because the wordmark is landscape and `cover` would crop it to "aO". */
+.ls-island[data-system="1"] .ls-avatar { background: #0f0f12; }
+.ls-island[data-system="1"] .ls-avatar-img { object-fit: contain; }
+.ls-sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+/* One stroke weight and one cap style across the marks. */
+.ls-fw svg, .ls-sprite {
+  fill: none; stroke: currentColor; stroke-width: 1.7;
+  stroke-linecap: round; stroke-linejoin: round;
+}
+.ls-body { min-width: 0; flex: 1 1 auto; }
+.ls-name {
+  font-size: 13.5px; font-weight: 600; color: rgba(255,255,255,0.92);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  letter-spacing: -0.01em;
+}
+.ls-status {
+  font-size: 11.5px; color: rgba(255,255,255,0.52);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Live pip: present only while the agent is actually doing something. */
+.ls-pip {
+  flex: none; width: 7px; height: 7px; border-radius: 50%;
+  background: #3ddc84;
+}
+.ls-island[data-state="idle"] .ls-pip { background: rgba(255,255,255,0.28); }
+/* ATTENTION. The island itself breathes -- a ring that grows out of its own
+   silhouette, so it is legible from across a room without reading a word. */
+.ls-island[data-attention="1"] {
+  animation: ls-island-in 520ms cubic-bezier(0.16, 1, 0.3, 1) backwards,
+             ls-attention 2.6s ease-out 520ms infinite;
+}
+.ls-island[data-attention="1"] .ls-pip { background: #ffb020; }
+.ls-island[data-attention="1"] .ls-status { color: rgba(255, 176, 32, 0.92); }
+@keyframes ls-attention {
+  0%   { box-shadow: 0 6px 18px -6px rgba(0,0,0,0.75), 0 0 0 0 rgba(255,176,32,0.45); }
+  70%  { box-shadow: 0 6px 18px -6px rgba(0,0,0,0.75), 0 0 0 10px rgba(255,176,32,0); }
+  100% { box-shadow: 0 6px 18px -6px rgba(0,0,0,0.75), 0 0 0 0 rgba(255,176,32,0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ls-island, .ls-island[data-attention="1"] { animation: none; }
+  .ls-island[data-attention="1"] { outline: 2px solid rgba(255,176,32,0.7); outline-offset: 2px; }
+}
+/* Scheduled tasks stay quieter than the agents: they are context, not actors. */
+.ls-tasks { width: 100%; align-self: stretch; }
+.ls-tasks:not(:empty) {
+  display: flex; flex-direction: column; align-items: center; gap: 4px;
+  margin-top: 6px; width: 100%;
+}
+.ls-task {
+  display: flex; justify-content: space-between; gap: 10px;
+  padding: 0 18px; font-size: 11.5px; color: rgba(255,255,255,0.42);
+}
+.ls-task-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ls-empty { font-size: 13px; color: rgba(255,255,255,0.40); padding: 2px 0; }
+/* The spacer, not a margin: it collapses first when the viewport is short, so
+   the keypad stays reachable on a small phone instead of being pushed off. */
+.ls-spacer { flex: 1 1 auto; min-height: 8px; }
+.ls-foot { display: flex; flex-direction: column; align-items: center; gap: 10px; align-self: stretch; flex: none; }
+.ls-hint { margin: 0; font-size: 14px; color: rgba(255,255,255,0.55); }
+/* Keypad: 3 columns, targets well above the 44px minimum because this is the
+   one control on the device that must work with a thumb, in the dark. */
+.ls-pad {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  width: 100%;
+  max-width: 300px;
+  margin-top: 4px;
+}
+.ls-key {
+  aspect-ratio: 1 / 1;
+  max-height: 74px;
+  border-radius: 50%;
+  border: 1px solid rgba(255,255,255,0.10);
+  background: rgba(255,255,255,0.07);
+  color: #fff;
+  font: 300 30px/1 inherit;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 90ms ease, transform 90ms ease;
+}
+.ls-key:active { background: rgba(255,255,255,0.20); transform: scale(0.94); }
+.ls-key:focus-visible { outline: 3px solid #4c9aff; outline-offset: 2px; }
+/* Backspace and the password escape are actions, not digits: no filled pill, so
+   the ten digits stay the obvious targets. */
+.ls-key[data-action] { background: none; border-color: transparent; font-size: 22px; }
+.ls-key[data-action]:active { background: rgba(255,255,255,0.12); }
+.ls-key.ls-key-blank { visibility: hidden; pointer-events: none; }
+/* The lock screen supplies its own dots/keypad, so the card chrome that the
+   plain sign-in page needs is not wanted here. */
+.lockscreen .pin-panel:not([hidden]) { display: contents; }
+.lockscreen #pin-submit {
+  width: 100%; max-width: 300px; margin-top: 4px;
+  border-radius: 999px; background: rgba(255,255,255,0.14);
+  border: 1px solid rgba(255,255,255,0.12); color: #fff;
+}
+.lockscreen .pin-panel label.field { display: none; }
+.lockscreen .pin-dots { margin: 0; }
+.lockscreen .pin-dot { width: 12px; height: 12px; }
+.lockscreen .error { margin: 0; min-height: 18px; text-align: center; }
+.lockscreen .method-switch { margin-top: 2px; }
+.lockscreen .pw-panel { width: 100%; max-width: 320px; }
+/* No keyboard and no keyboard BUTTON on the passcode screen: the keypad is the
+   only input this screen takes, and a floating keyboard FAB over a lock screen
+   reads as a stray browser control. The toggle comes back with the password
+   form, which does need typing -- lock-screen.js drops .lockscreen-on when the
+   user switches to it. */
+body.lockscreen-on .osk-toggle { display: none !important; }
+/* ---------------------------------------------------------------------------
+   SHEETS. The lock screen has one resting state and three things that can rise
+   over it: the passcode, an agent conversation and a decision. They are all the
+   same object -- a bottom sheet -- so they share geometry, scrim and dismissal
+   and differ only in content.
+
+   data-sheet on .lockscreen is the single source of truth for which one is up.
+   Everything else (the scrim, the blur, the unlock bar, which sheet is
+   translated into view) is derived from it, so there is no state to get out of
+   sync and no way to have two sheets open at once.
+   --------------------------------------------------------------------------- */
+.lockscreen { position: relative; }
+/* The resting screen: no passcode, no keypad. Same reasoning as a phone --
+   the glanceable half is what the screen is FOR, and the way in is one
+   affordance at the bottom rather than a permanent keypad.
+
+   The passcode shell is taken OUT OF FLOW to do this. Translating it while it
+   still occupied its row would leave a keypad-sized hole above the unlock bar,
+   pushing the bar into the middle of the screen; as a fixed sheet it shares the
+   geometry of the other two and the resting layout is simply head + unlock. */
+.lockscreen .ls-foot {
+  position: fixed; left: 0; right: 0; bottom: var(--ls-kb, 0px); z-index: 50;
+  width: 100%; max-width: 520px; margin: 0 auto;
+  max-height: min(88dvh, 720px, calc(100dvh - var(--ls-kb, 0px) - 24px));
+  padding: 14px 14px calc(env(safe-area-inset-bottom, 0px) + 18px);
+  border-radius: 26px 26px 0 0;
+  background: rgba(24, 24, 27, 0.86);
+  backdrop-filter: blur(34px) saturate(1.4);
+  -webkit-backdrop-filter: blur(34px) saturate(1.4);
+  box-shadow: 0 -12px 40px -12px rgba(0,0,0,0.8);
+}
+.lockscreen:not([data-sheet="passcode"]) .ls-foot {
+  transform: translateY(101%);
+  pointer-events: none;
+}
+/* The head recedes while a sheet is up: blurred and slightly shrunk, so the
+   sheet reads as being IN FRONT rather than as a panel pasted on. */
+.lockscreen:not([data-sheet="none"]) .ls-head {
+  filter: blur(7px);
+  transform: scale(0.965);
+  opacity: 0.55;
+  pointer-events: none;
+}
+.ls-head {
+  transition: filter 320ms cubic-bezier(0.32, 0.72, 0, 1),
+              transform 320ms cubic-bezier(0.32, 0.72, 0, 1),
+              opacity 320ms ease;
+  will-change: filter, transform;
+}
+/* The scrim darkens what is behind the sheet AND is the tap-to-dismiss target,
+   so a sheet can always be closed by tapping away from it. */
+.ls-scrim {
+  position: fixed; inset: 0; z-index: 40;
+  background: rgba(0, 0, 0, 0.42);
+  opacity: 0;
+  transition: opacity 320ms ease;
+}
+.lockscreen:not([data-sheet="none"]) ~ .ls-scrim,
+.ls-scrim[data-on="1"] { opacity: 1; }
+.ls-scrim[hidden] { display: none; }
+
+/* The way in. A real button, not a swipe-only gesture: a screen whose only
+   unlock is a drag is unusable to anyone who cannot make that drag, and a
+   kiosk has no other way in. The swipe is the shortcut, the button is the
+   guarantee. */
+.ls-unlock {
+  display: flex; flex-direction: column; align-items: center; gap: 2px;
+  align-self: stretch; flex: none;
+  padding-bottom: 2px;
+  transition: opacity 240ms ease, transform 240ms ease;
+}
+.lockscreen:not([data-sheet="none"]) .ls-unlock {
+  opacity: 0; transform: translateY(12px); pointer-events: none;
+}
+.ls-unlock-btn {
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  width: 100%; padding: 14px 0 6px;
+  background: none; border: 0; color: inherit; font: inherit;
+  cursor: pointer; -webkit-tap-highlight-color: transparent;
+}
+.ls-unlock-btn:focus-visible { outline: 3px solid #4c9aff; outline-offset: 4px; border-radius: 16px; }
+.ls-unlock-label {
+  font-size: 13.5px; font-weight: 500; letter-spacing: 0.01em;
+  color: rgba(255,255,255,0.62);
+}
+/* The home-indicator bar. It breathes upward once every few seconds -- the
+   hint that the gesture goes UP, without a word of instruction. */
+.ls-grabber {
+  display: block; width: 116px; height: 5px; border-radius: 999px;
+  background: rgba(255,255,255,0.42);
+}
+.ls-unlock-btn .ls-grabber { animation: ls-nudge 3.4s ease-in-out infinite; }
+@keyframes ls-nudge {
+  0%, 62%, 100% { transform: translateY(0); opacity: 0.55; }
+  74%           { transform: translateY(-5px); opacity: 1; }
+}
+
+/* Shared sheet geometry. Fixed to the bottom edge so the keyboard, the scrim
+   and the sheet all reference the same edge; --ls-kb is the measured height of
+   the on-screen keyboard, so a raised keyboard lifts the sheet instead of
+   burying its input. */
+.ls-sheet {
+  position: fixed; left: 0; right: 0; bottom: var(--ls-kb, 0px); z-index: 50;
+  display: flex; flex-direction: column;
+  /* Subtract --ls-kb: the sheet's bottom edge is already raised by the
+     keyboard, so a cap measured from the full viewport lets the box run off
+     the TOP of the screen. When that happened the message list -- a
+     flex:1/min-height:0 child -- collapsed to zero and the thread rendered
+     with every bubble invisible. */
+  max-height: min(76dvh, 640px, calc(100dvh - var(--ls-kb, 0px) - 24px));
+  margin: 0 auto; width: 100%; max-width: 520px;
+  padding: 8px 14px calc(env(safe-area-inset-bottom, 0px) + 14px);
+  border-radius: 26px 26px 0 0;
+  background: rgba(24, 24, 27, 0.86);
+  backdrop-filter: blur(34px) saturate(1.4);
+  -webkit-backdrop-filter: blur(34px) saturate(1.4);
+  box-shadow: 0 -12px 40px -12px rgba(0,0,0,0.8);
+  transform: translateY(101%);
+  transition: transform 380ms cubic-bezier(0.32, 0.72, 0, 1), bottom 180ms ease;
+}
+.ls-sheet[hidden] { display: none; }
+.lockscreen[data-sheet="chat"] ~ #ls-chat,
+.lockscreen[data-sheet="decision"] ~ #ls-decision { transform: translateY(0); }
+/* The passcode sheet is the sign-in shell itself, so it gets the same motion
+   rather than a second implementation of "a sheet". */
+.lockscreen .ls-foot {
+  transition: transform 380ms cubic-bezier(0.32, 0.72, 0, 1), bottom 180ms ease;
+}
+.ls-sheet-head {
+  display: grid; grid-template-columns: 1fr auto; align-items: center;
+  gap: 10px; padding: 0 2px 10px;
+}
+.ls-sheet-head .ls-grabber {
+  grid-column: 1 / -1; justify-self: center; margin: 2px 0 12px;
+}
+.ls-sheet-title { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.ls-sheet-avatar {
+  flex: none; width: 38px; height: 38px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; font-weight: 600; color: #fff; overflow: hidden;
+  background: linear-gradient(145deg, var(--ls-a, #4c9aff), var(--ls-b, #2f6fd0));
+}
+.ls-sheet-avatar img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.ls-sheet-avatar[data-system="1"] { background: #0f0f12; }
+.ls-sheet-avatar[data-system="1"] img { object-fit: contain; }
+.ls-sheet-name {
+  font-size: 15px; font-weight: 600; color: rgba(255,255,255,0.94);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ls-sheet-sub { font-size: 11.5px; color: rgba(255,255,255,0.48); }
+.ls-sheet-close {
+  flex: none; width: 32px; height: 32px; border-radius: 50%;
+  border: 0; background: rgba(255,255,255,0.10); color: rgba(255,255,255,0.75);
+  font-size: 15px; line-height: 1; cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.ls-sheet-close:active { background: rgba(255,255,255,0.20); }
+.ls-sheet-close:focus-visible { outline: 3px solid #4c9aff; outline-offset: 2px; }
+
+/* Conversation. Scrolls on its own so the composer never leaves the thumb. */
+.ls-msgs {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 5px;
+  padding: 2px 2px 10px;
+  scrollbar-width: none; -ms-overflow-style: none;
+  overscroll-behavior: contain;
+}
+.ls-msgs::-webkit-scrollbar { width: 0; height: 0; display: none; }
+.ls-day {
+  align-self: center; margin: 12px 0 6px;
+  font-size: 11px; font-weight: 600; letter-spacing: 0.04em;
+  text-transform: uppercase; color: rgba(255,255,255,0.34);
+}
+.ls-msg {
+  max-width: 82%; padding: 9px 13px; border-radius: 19px;
+  font-size: 14.5px; line-height: 1.38;
+  overflow-wrap: anywhere;
+  animation: ls-msg-in 260ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+@keyframes ls-msg-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+  to   { opacity: 1; transform: none; }
+}
+/* The two voices are told apart by SIDE and GROUND, not by a label: a name on
+   every bubble is noise in a conversation with exactly two participants. */
+.ls-msg[data-role="agent"] {
+  align-self: flex-start; border-bottom-left-radius: 7px;
+  background: rgba(255,255,255,0.10); color: rgba(255,255,255,0.92);
+}
+.ls-msg[data-role="user"] {
+  align-self: flex-end; border-bottom-right-radius: 7px;
+  background: #0a84ff; color: #fff;
+}
+/* Consecutive bubbles from the same voice tighten into one group. */
+.ls-msg[data-role="agent"] + .ls-msg[data-role="agent"] { border-bottom-left-radius: 19px; margin-top: -2px; }
+.ls-msg[data-role="user"] + .ls-msg[data-role="user"] { border-bottom-right-radius: 19px; margin-top: -2px; }
+.ls-compose { display: flex; align-items: flex-end; gap: 8px; padding-top: 4px; }
+.ls-compose-input {
+  flex: 1 1 auto; min-width: 0;
+  padding: 11px 15px; border-radius: 22px;
+  border: 1px solid rgba(255,255,255,0.12);
+  background: rgba(255,255,255,0.07);
+  color: #fff; font: inherit; font-size: 15px;
+}
+.ls-compose-input::placeholder { color: rgba(255,255,255,0.38); }
+.ls-compose-input:focus { outline: none; border-color: rgba(255,255,255,0.28); }
+.ls-send {
+  flex: none; width: 40px; height: 40px; border-radius: 50%;
+  border: 0; background: #0a84ff; color: #fff; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  -webkit-tap-highlight-color: transparent;
+  transition: opacity 140ms ease, transform 90ms ease;
+}
+.ls-send:disabled { opacity: 0.35; cursor: default; }
+.ls-send:not(:disabled):active { transform: scale(0.92); }
+.ls-send:focus-visible { outline: 3px solid #4c9aff; outline-offset: 2px; }
+.ls-send svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+
+/* Decision. Short by design: a question, what it is worth knowing, two ways
+   out. Anything longer belongs in the Decisions app behind the passcode. */
+.ls-decision-body { padding: 4px 4px 16px; }
+.ls-decision-q {
+  font-size: 19px; line-height: 1.32; font-weight: 500;
+  letter-spacing: -0.01em; color: #fff; margin: 0 0 8px;
+}
+.ls-decision-meta { font-size: 12.5px; color: rgba(255,255,255,0.46); margin: 0; }
+.ls-decision-note {
+  margin: 14px 0 0; padding: 10px 12px; border-radius: 12px;
+  background: rgba(255,176,32,0.10);
+  font-size: 12.5px; line-height: 1.45; color: rgba(255,196,96,0.92);
+}
+.ls-decision-acts { display: flex; gap: 10px; padding-top: 4px; }
+.ls-act {
+  flex: 1 1 0; padding: 14px 10px; border-radius: 16px;
+  border: 1px solid rgba(255,255,255,0.12);
+  font: inherit; font-size: 15px; font-weight: 600; color: #fff;
+  background: rgba(255,255,255,0.08); cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: transform 90ms ease, background 140ms ease;
+}
+.ls-act:active { transform: scale(0.97); }
+.ls-act:focus-visible { outline: 3px solid #4c9aff; outline-offset: 2px; }
+.ls-act[data-act="approve"] { background: #1f8f4e; border-color: transparent; }
+.ls-act[data-act="deny"] { background: rgba(255,255,255,0.09); }
+.ls-decision-done {
+  padding: 10px 4px 6px; text-align: center;
+  font-size: 14px; color: rgba(255,255,255,0.72);
+}
+
+/* Dictation button. Quiet until touched -- it sits on every island, so a filled
+   control would turn the stack into a row of buttons. */
+.ls-mic {
+  flex: none; width: 30px; height: 30px; margin-left: 2px;
+  border-radius: 50%; border: 0; padding: 0;
+  background: rgba(255,255,255,0.07); color: rgba(255,255,255,0.62);
+  display: flex; align-items: center; justify-content: center; cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  transition: background 140ms ease, color 140ms ease, transform 90ms ease;
+}
+.ls-mic svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+.ls-mic:active { transform: scale(0.9); background: rgba(255,255,255,0.18); color: #fff; }
+.ls-mic:focus-visible { outline: 3px solid #4c9aff; outline-offset: 2px; }
+
+/* Voice sheet. The waveform is the whole interface: it is the only thing that
+   proves the microphone is actually hearing you, so it gets the room. */
+.ls-voice-body { display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 10px 4px 18px; }
+.ls-wave { width: 100%; max-width: 420px; height: 120px; display: block; }
+.ls-voice-text {
+  margin: 0; min-height: 44px; text-align: center;
+  font-size: 17px; line-height: 1.35; color: rgba(255,255,255,0.92);
+}
+.ls-voice-text:empty::before {
+  content: "Say something\2026"; color: rgba(255,255,255,0.32);
+}
+.ls-voice-text[data-error="1"] { font-size: 14px; color: rgba(255,176,32,0.92); }
+.ls-voice-acts { display: flex; gap: 10px; padding-top: 2px; }
+.lockscreen[data-sheet="voice"] ~ #ls-voice { transform: translateY(0); }
+
+/* Force-touch feel: the island sinks under the finger, then pops as it opens.
+   Without the sink there is no feedback that a HOLD is doing anything, and the
+   gesture reads as an unresponsive tap. */
+.ls-island { cursor: pointer; -webkit-tap-highlight-color: transparent; transition: transform 160ms cubic-bezier(0.32, 0.72, 0, 1); }
+.ls-island[data-press="1"] { transform: scale(0.955); }
+.ls-island[data-press="2"] { transform: scale(1.035); transition-duration: 220ms; }
+.ls-island:focus-visible { outline: 3px solid #4c9aff; outline-offset: 3px; }
+
+@media (prefers-reduced-motion: reduce) {
+  .ls-sheet, .ls-foot, .ls-head, .ls-unlock, .ls-scrim, .ls-island { transition: none; }
+  .ls-msg { animation: none; }
+  .ls-unlock-btn .ls-grabber { animation: none; }
+  .ls-notif-group { animation: none; }
+  .ls-notif { transition: none; }
+  .lockscreen:not([data-sheet="none"]) .ls-head { filter: none; }
+}
+/* Landscape: the keypad and the clock sit side by side or neither fits. */
+@media (orientation: landscape) and (max-height: 560px) {
+  .lockscreen { flex-direction: row; align-items: center; gap: 24px; padding-top: 12px; }
+  .ls-head { flex: 1 1 0; }
+  .ls-spacer { display: none; }
+  /* .ls-foot is a fixed bottom sheet, not a flex child, so it needs a height
+     cap here rather than a flex ratio: at this height the keypad must scroll
+     inside the sheet instead of growing past the top of the screen. */
+  .lockscreen .ls-foot { max-height: 92dvh; overflow-y: auto; }
+  .ls-sheet { max-height: 88dvh; }
+  .ls-time { font-size: clamp(40px, 9vw, 64px); }
+  .ls-widgets { margin-top: 10px; }
+  .ls-key { max-height: 52px; }
+}
+"""
+
 # Plain (non-f) string: interpolated into the page as a value, so braces here
 # must not be doubled.
 _PIN_PANEL_SCRIPT = r"""
@@ -359,8 +1113,18 @@ _PIN_PANEL_SCRIPT = r"""
     if (showPin) {
       input.value = "";
       paint();
-      if (window.taosOSK) { window.taosOSK.enable(); window.taosOSK.focusField(input); }
-      else input.focus();
+      // The lock screen draws its own keypad (#ls-pad), so the shared keyboard
+      // must stay shut: enabling it here opened a full QWERTY over the passcode
+      // pad and covered the lower third of the phone. Only the page WITHOUT a
+      // keypad needs the shared keyboard to type a PIN at all.
+      if (document.getElementById("ls-pad")) {
+        if (window.taosOSK) window.taosOSK.disable();
+      } else if (window.taosOSK) {
+        window.taosOSK.enable();
+        window.taosOSK.focusField(input);
+      } else {
+        input.focus();
+      }
     } else {
       var pw = pwPanel.querySelector("input[type=password]");
       if (pw && window.taosOSK) window.taosOSK.focusField(pw);
@@ -392,13 +1156,45 @@ _PIN_PANEL_SCRIPT = r"""
 """
 
 
-def _pin_panel_html(next_url: str) -> str:
+
+#: The lock-screen keypad. A plain grid of buttons rather than a re-use of the
+#: shared on-screen keyboard: that one is a full text keyboard docked to the
+#: bottom of the viewport, and a passcode pad wants ten large round targets
+#: under the thumb. Digits carry aria-labels because the visible glyph alone is
+#: ambiguous to a screen reader announcing a grid of buttons.
+_KEYPAD_HTML = """
+      <div class="ls-pad" id="ls-pad" role="group" aria-label="PIN keypad">
+        <button type="button" class="ls-key" data-digit="1">1</button>
+        <button type="button" class="ls-key" data-digit="2">2</button>
+        <button type="button" class="ls-key" data-digit="3">3</button>
+        <button type="button" class="ls-key" data-digit="4">4</button>
+        <button type="button" class="ls-key" data-digit="5">5</button>
+        <button type="button" class="ls-key" data-digit="6">6</button>
+        <button type="button" class="ls-key" data-digit="7">7</button>
+        <button type="button" class="ls-key" data-digit="8">8</button>
+        <button type="button" class="ls-key" data-digit="9">9</button>
+        <span class="ls-key ls-key-blank" aria-hidden="true"></span>
+        <button type="button" class="ls-key" data-digit="0">0</button>
+        <button type="button" class="ls-key" data-action="back" aria-label="Delete">&#9003;</button>
+      </div>
+"""
+
+
+def _pin_panel_html(next_url: str, keypad: bool = False) -> str:
     """The PIN entry panel, shown only when the request is console-local.
 
     Rendered HIDDEN. /auth/pin-panel.js reveals it (and hides the password
     form) once it has wired itself up; see the note on the swap in that script.
     """
     safe_next = html.escape(next_url or "/desktop")
+    # The lock screen draws its own keypad, so the shared on-screen keyboard must
+    # not also open: two keypads fight for the same input, and the OSK's layout
+    # override top-anchors the screen. inputmode="none" also stops the
+    # compositor's Wayland keyboard (squeekboard) from appearing over the pad.
+    osk_mode = "none" if keypad else "numeric"
+    osk_attr = "" if keypad else 'data-osk-submit="pin-submit"'
+    keypad_html = _KEYPAD_HTML if keypad else ""
+
     # No username is sent with a PIN: this panel is only ever rendered for a
     # single-user store, because AuthManager.has_pin(None) refuses to guess
     # which account a PIN belongs to on a multi-user one.
@@ -406,8 +1202,8 @@ def _pin_panel_html(next_url: str) -> str:
     <div class="pin-panel" id="pin-panel" data-next="{safe_next}" data-username="" hidden>
       <label class="field">
         <span>PIN</span>
-        <input type="password" id="pin-input" inputmode="numeric" autocomplete="off"
-               data-osk-submit="pin-submit" aria-describedby="pin-error"
+        <input type="password" id="pin-input" inputmode="{osk_mode}" autocomplete="off"
+               {osk_attr} aria-describedby="pin-error"
                maxlength="12" required>
       </label>
       <div class="pin-dots" id="pin-dots" aria-hidden="true">
@@ -415,12 +1211,1486 @@ def _pin_panel_html(next_url: str) -> str:
         <span class="pin-dot"></span><span class="pin-dot"></span>
       </div>
       <p class="error" id="pin-error" role="alert"></p>
+      {keypad_html}
       <button type="button" id="pin-submit">Sign in with PIN</button>
       <button type="button" class="method-switch" id="use-password">
         Use my password instead
       </button>
     </div>
     """
+
+
+
+
+#: Framework marks, drawn as geometry rather than shipped as logo files: the
+#: lock screen must render with no network and no asset pipeline, and a glyph or
+#: emoji standing in for an icon set is not an icon set. One stroke weight and
+#: one cap style across all three so they read as a family at 18px. These are
+#: stylised marks for the harness a taOS agent runs on, not the vendors' logos.
+_FRAMEWORK_SPRITE = """
+      <svg class="ls-sprite" aria-hidden="true" focusable="false" width="0" height="0">
+        <defs>
+          <symbol id="fw-hermes" viewBox="0 0 24 24">
+            <!-- winged helm: a dome with two upswept wings -->
+            <path d="M7.5 15.5a4.5 4.5 0 0 1 9 0" />
+            <path d="M6 15.5h12" />
+            <path d="M16.5 11.5c1.6-1.1 3-1.4 4.5-1.1-1 1.3-2.3 2.2-4 2.6" />
+            <path d="M7.5 11.5C5.9 10.4 4.5 10.1 3 10.4c1 1.3 2.3 2.2 4 2.6" />
+          </symbol>
+          <symbol id="fw-openclaw" viewBox="0 0 24 24">
+            <!-- three tapered talons converging on a palm arc -->
+            <path d="M8 4.5v7" />
+            <path d="M12 3.5v8" />
+            <path d="M16 4.5v7" />
+            <path d="M6.5 11.5a5.5 5.5 0 0 0 11 0" />
+          </symbol>
+          <symbol id="fw-deepseek" viewBox="0 0 24 24">
+            <!-- breaching whale: body arc, tail fluke, spout -->
+            <path d="M3.5 14.5c3.2 2.6 7.2 3.4 11 2.1 2.6-.9 4.4-2.8 5.2-5.4" />
+            <path d="M19.7 11.2c.9.5 1.4 1.4 1.3 2.5-1-.3-1.8-.9-2.3-1.7" />
+            <path d="M8.2 16.8c-.6 1.2-1.7 2-3.1 2.2.2-1.3.9-2.3 2-2.9" />
+            <path d="M12.5 9.2c.6-1.2 1.6-2 3-2.3" />
+          </symbol>
+          <symbol id="fw-omp" viewBox="0 0 24 24">
+            <!-- OMP is "oh-my-pi" and ships no logo of its own, so this is an
+                 AUTHORED mark in the same line-art set as the others, not a
+                 vendor logo: a pi glyph, its legs standing on a base rule. -->
+            <path d="M5.5 7.5h13" />
+            <path d="M9 7.5v9" />
+            <path d="M15 7.5v7a2 2 0 0 0 2.8 1.8" />
+            <path d="M6 16.5h6" />
+          </symbol>
+        </defs>
+      </svg>
+"""
+
+
+def _device_label() -> str:
+    """The handset's own name, for the lock-screen chip.
+
+    Falls back to the product name: a lock screen that renders an empty chip
+    because the host has no resolvable name looks broken, and the name is
+    cosmetic here.
+    """
+    try:
+        name = socket.gethostname().split(".")[0].strip()
+    except OSError:
+        name = ""
+    return name or "taOS"
+
+
+def _lock_head_html() -> str:
+    """Opening half of the lock screen: clock, date and the widget row.
+
+    Emitted as the page's first element and closed by the caller, so the
+    passcode shell below it is the SAME markup the plain card path renders --
+    the lock screen is chrome around the sign-in, not a second implementation
+    of it.
+
+    The clock renders empty and is filled by /auth/lock-screen.js: a
+    server-rendered time would be the SERVER's clock and, worse, frozen at page
+    load, so a phone left on the lock screen would show a stale time.
+    """
+    return f"""
+  <div class="lockscreen" id="lockscreen">
+    <div class="ls-statusbar">
+      <span class="ls-widget ls-brand"><b>taOS</b></span>
+      <span class="ls-widget" id="ls-battery" hidden></span>
+    </div>
+    <div class="ls-head">
+      <div class="ls-time" id="ls-time" role="timer" aria-live="off">&nbsp;</div>
+      <div class="ls-date" id="ls-date"></div>
+      <div class="ls-weather" id="ls-weather" role="group" aria-label="Weather" hidden></div>
+      <div class="ls-feed" id="ls-feed">
+        <div class="ls-islands" id="ls-activity" role="group" aria-label="Agent activity" hidden>
+          <div class="ls-agents" id="ls-agents"></div>
+          <div class="ls-tasks" id="ls-tasks"></div>
+        </div>
+        <div class="ls-notifs" id="ls-notifs" role="group" aria-label="Notifications" hidden></div>
+      </div>
+      {_FRAMEWORK_SPRITE}
+    </div>
+    <div class="ls-spacer"></div>
+    <div class="ls-unlock" id="ls-unlock">
+      <button type="button" class="ls-unlock-btn" id="ls-unlock-btn"
+              aria-expanded="false" aria-controls="ls-foot">
+        <span class="ls-grabber"></span>
+        <span class="ls-unlock-label">Swipe up to unlock</span>
+      </button>
+    </div>"""
+
+
+def _lock_tail_html() -> str:
+    """Closing half: the scrim and the two sheets that rise over the screen.
+
+    Emitted AFTER </div> so the sheets are siblings of .lockscreen, not children
+    of it. That matters: the head is blurred while a sheet is open, and a child
+    would inherit that filter -- a blurred conversation is not a conversation.
+    A filter on an ancestor also establishes a containing block, which would
+    pin these fixed sheets to the lock screen's box instead of the viewport.
+
+    Both sheets are rendered empty and hidden. They are console-only chrome, and
+    everything inside them is written by /auth/lock-screen.js from data the
+    server only serves to the device's own screen.
+    """
+    return """</div>
+  <div class="ls-scrim" id="ls-scrim" hidden></div>
+  <section class="ls-sheet" id="ls-chat" role="dialog" aria-modal="true"
+           aria-labelledby="ls-chat-name" hidden>
+    <header class="ls-sheet-head">
+      <span class="ls-grabber"></span>
+      <div class="ls-sheet-title">
+        <div class="ls-sheet-avatar" id="ls-chat-avatar" aria-hidden="true"></div>
+        <div>
+          <div class="ls-sheet-name" id="ls-chat-name"></div>
+          <div class="ls-sheet-sub" id="ls-chat-sub"></div>
+        </div>
+      </div>
+      <button type="button" class="ls-sheet-close" id="ls-chat-close" aria-label="Close conversation">&#10005;</button>
+    </header>
+    <div class="ls-msgs" id="ls-msgs" role="log" aria-live="polite" tabindex="0"></div>
+    <div class="ls-compose">
+      <input type="text" class="ls-compose-input" id="ls-compose-input"
+             placeholder="Message" autocomplete="off" autocapitalize="sentences"
+             aria-label="Message" data-osk-submit="ls-send" maxlength="500">
+      <button type="button" class="ls-send" id="ls-send" aria-label="Send message" disabled>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h15M13 6l6 6-6 6"/></svg>
+      </button>
+    </div>
+  </section>
+  <section class="ls-sheet" id="ls-decision" role="dialog" aria-modal="true"
+           aria-labelledby="ls-decision-q" hidden>
+    <header class="ls-sheet-head">
+      <span class="ls-grabber"></span>
+      <div class="ls-sheet-title">
+        <div class="ls-sheet-avatar" id="ls-decision-avatar" aria-hidden="true"></div>
+        <div>
+          <div class="ls-sheet-name" id="ls-decision-name"></div>
+          <div class="ls-sheet-sub">Needs your decision</div>
+        </div>
+      </div>
+      <button type="button" class="ls-sheet-close" id="ls-decision-close" aria-label="Close">&#10005;</button>
+    </header>
+    <div class="ls-decision-body">
+      <p class="ls-decision-q" id="ls-decision-q"></p>
+      <p class="ls-decision-meta" id="ls-decision-meta"></p>
+      <p class="ls-decision-note" id="ls-decision-note" hidden></p>
+    </div>
+    <div class="ls-decision-acts" id="ls-decision-acts">
+      <button type="button" class="ls-act" data-act="deny">Deny</button>
+      <button type="button" class="ls-act" data-act="approve">Approve</button>
+    </div>
+    <p class="ls-decision-done" id="ls-decision-done" hidden></p>
+  </section>
+  <section class="ls-sheet ls-sheet-voice" id="ls-voice" role="dialog" aria-modal="true"
+           aria-labelledby="ls-voice-title" hidden>
+    <header class="ls-sheet-head">
+      <span class="ls-grabber"></span>
+      <div class="ls-sheet-title">
+        <div class="ls-sheet-avatar" id="ls-voice-avatar" aria-hidden="true"></div>
+        <div>
+          <div class="ls-sheet-name" id="ls-voice-title"></div>
+          <div class="ls-sheet-sub" id="ls-voice-state">Listening\u2026</div>
+        </div>
+      </div>
+      <button type="button" class="ls-sheet-close" id="ls-voice-close" aria-label="Cancel dictation">&#10005;</button>
+    </header>
+    <div class="ls-voice-body">
+      <canvas class="ls-wave" id="ls-wave" width="600" height="120" aria-hidden="true"></canvas>
+      <p class="ls-voice-text" id="ls-voice-text" aria-live="polite"></p>
+    </div>
+    <div class="ls-voice-acts">
+      <button type="button" class="ls-act" id="ls-voice-cancel">Cancel</button>
+      <button type="button" class="ls-act" data-act="approve" id="ls-voice-send" disabled>Send</button>
+    </div>
+  </section>"""
+
+
+# Plain (non-f) string: braces are JavaScript, not format fields.
+_LOCK_SCREEN_SCRIPT = r"""
+(function () {
+  "use strict";
+  // Lock-screen chrome only: the clock, the battery chip and the keypad. PIN
+  // submission, the dots and the error line stay in /auth/pin-panel.js -- this
+  // script types into the same #pin-input and lets that one do the rest, so
+  // there is exactly one implementation of "what happens when a PIN is entered".
+  function init() {
+    var timeEl = document.getElementById("ls-time");
+    var dateEl = document.getElementById("ls-date");
+
+    function tick() {
+      var now = new Date();
+      // Locale-driven: a 24h phone shows 24h. hour12 is left to the locale
+      // rather than forced, because forcing it is wrong in half the world.
+      if (timeEl) {
+        timeEl.textContent = now.toLocaleTimeString([], {
+          hour: "numeric", minute: "2-digit"
+        });
+      }
+      if (dateEl) {
+        dateEl.textContent = now.toLocaleDateString([], {
+          weekday: "long", day: "numeric", month: "long"
+        });
+      }
+      // Re-align to the top of the next minute instead of polling every second:
+      // the display only changes once a minute and this is a battery-powered
+      // device sitting on this screen whenever it is idle.
+      var ms = (60 - now.getSeconds()) * 1000 - now.getMilliseconds();
+      setTimeout(tick, ms > 0 ? ms : 60000);
+    }
+    tick();
+
+    // Battery: navigator.getBattery is not universal (and is absent on desktop
+    // Firefox), so the chip stays hidden unless the API actually answers.
+    var batEl = document.getElementById("ls-battery");
+    if (batEl && navigator.getBattery) {
+      navigator.getBattery().then(function (bat) {
+        function paint() {
+          var pct = Math.round(bat.level * 100);
+          batEl.textContent = (bat.charging ? "⚡ " : "") + pct + "%";
+          batEl.hidden = false;
+        }
+        paint();
+        bat.addEventListener("levelchange", paint);
+        bat.addEventListener("chargingchange", paint);
+      }).catch(function () { /* no battery info: leave the chip hidden */ });
+    }
+
+    // Agent activity. Re-fetched on a timer because a lock screen is a LIVE
+    // surface: it is what the phone shows while it sits there, so a card that
+    // only reflects page-load time is wrong within a minute.
+    var screenEl = document.getElementById("lockscreen");
+    var card = document.getElementById("ls-activity");
+    var agentsEl = document.getElementById("ls-agents");
+    var tasksEl = document.getElementById("ls-tasks");
+
+    // Deterministic hue per agent, so an agent keeps its colour between
+    // refreshes and between boots. A random palette would reshuffle the lock
+    // screen every 15 seconds.
+    function hueFor(name) {
+      var h = 0;
+      for (var i = 0; i < name.length; i++) { h = (h * 31 + name.charCodeAt(i)) % 360; }
+      return h;
+    }
+
+    function initials(name) {
+      var words = name.trim().split(/\s+/);
+      if (!words[0]) return "?";
+      if (words.length === 1) return words[0].slice(0, 2).toUpperCase();
+      return (words[0][0] + words[words.length - 1][0]).toUpperCase();
+    }
+
+    var FRAMEWORKS = { hermes: 1, openclaw: 1, deepseek: 1, omp: 1 };
+    var RESTING = ["", "stopped", "idle", "exited", "error"];
+
+    function island(agent) {
+      var name = agent.name || "agent";
+      var status = agent.status || "idle";
+      var busy = RESTING.indexOf(status.trim().toLowerCase()) === -1;
+
+      var el = document.createElement("div");
+      el.className = "ls-island";
+      // Stable identity across repaints. The 15s poll rebuilds this list, and
+      // without a key there is no way to put keyboard focus back on the island
+      // the user was actually on -- an index would silently move the focus to a
+      // different agent whenever the list reorders.
+      el.setAttribute("data-agent", name);
+      el.setAttribute("data-state", busy ? "busy" : "idle");
+      if (agent.attention) el.setAttribute("data-attention", "1");
+      // An island OPENS something, so it is a button, not a list item: it has
+      // to be reachable by tab and operable by Enter, not only by a press.
+      el.setAttribute("role", "button");
+      el.setAttribute("tabindex", "0");
+      el.setAttribute("aria-label", (agent.attention && agent.decision)
+        ? name + " needs a decision: " + (agent.decision.question || "")
+        : name + ", " + status + ". Open conversation.");
+      // The handlers read the whole record off the element rather than
+      // re-looking it up by name: names are not unique keys, and a repaint
+      // between the press and the open would make an index stale.
+      el.__agent = agent;
+      if (agent.system) el.setAttribute("data-system", "1");
+
+      var marks = document.createElement("div");
+      marks.className = "ls-marks";
+
+      var av = document.createElement("div");
+      av.className = "ls-avatar";
+      var hue = hueFor(name);
+      av.style.setProperty("--ls-a", "hsl(" + hue + " 62% 58%)");
+      av.style.setProperty("--ls-b", "hsl(" + ((hue + 28) % 360) + " 58% 38%)");
+      // A photo when one is configured; the monogram is the fallback, so a
+      // missing file degrades to initials rather than a broken image frame.
+      if (agent.avatar) {
+        var img = document.createElement("img");
+        img.className = "ls-avatar-img";
+        img.alt = "";
+        img.src = agent.avatar;
+        img.addEventListener("error", function () {
+          img.remove();
+          // The product mark is shipped in /static, so a failure here is a
+          // broken install rather than a missing optional portrait. Initials
+          // are the fallback for a PERSON; "TA" in a circle is not the OS.
+          if (!agent.system) av.textContent = initials(name);
+        });
+        av.appendChild(img);
+      } else {
+        av.textContent = initials(name);
+      }
+      marks.appendChild(av);
+
+      var fw = String(agent.framework || "").toLowerCase();
+      if (agent.framework_icon) {
+        // The App Store's own artwork, when this framework ships one.
+        var badge = document.createElement("div");
+        badge.className = "ls-fw ls-fw-img";
+        var logo = document.createElement("img");
+        logo.alt = "";
+        logo.src = agent.framework_icon;
+        badge.appendChild(logo);
+        marks.appendChild(badge);
+      } else if (FRAMEWORKS[fw]) {
+        var badge = document.createElement("div");
+        badge.className = "ls-fw";
+        var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        var use = document.createElementNS("http://www.w3.org/2000/svg", "use");
+        // setAttribute, not the xlink-prefixed form: plain href on <use>
+        // resolves in every browser this ships to and xlink is deprecated.
+        use.setAttribute("href", "#fw-" + fw);
+        svg.appendChild(use);
+        badge.appendChild(svg);
+        marks.appendChild(badge);
+      }
+      el.appendChild(marks);
+
+      var body = document.createElement("div");
+      body.className = "ls-body";
+      var n = document.createElement("div");
+      n.className = "ls-name";
+      n.textContent = name;                 // textContent, never innerHTML
+      var s = document.createElement("div");
+      s.className = "ls-status";
+      s.textContent = status;
+      body.appendChild(n); body.appendChild(s);
+      el.appendChild(body);
+
+      var pip = document.createElement("span");
+      pip.className = "ls-pip";
+      el.appendChild(pip);
+
+      // Dictation, next to the live pip: the fastest way to say something to an
+      // agent from a locked phone is to say it. Its own button rather than a
+      // gesture on the island, because it does something DIFFERENT from opening
+      // the conversation and must not be reachable by accident.
+      var mic = document.createElement("button");
+      mic.type = "button";
+      mic.className = "ls-mic";
+      mic.setAttribute("aria-label", "Dictate a message to " + name);
+      mic.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true">'
+        + '<rect x="9" y="3" width="6" height="11" rx="3"/>'
+        + '<path d="M5.5 11.5a6.5 6.5 0 0 0 13 0"/><path d="M12 18v3"/></svg>';
+      el.appendChild(mic);
+      return el;
+    }
+
+    function paintActivity(data) {
+      // A repaint while a sheet is open would destroy the very island the sheet
+      // was opened from -- dropping its record, restarting every entrance
+      // animation and scrolling the list under the user's finger. The poll
+      // keeps running; the next tick after the sheet closes paints.
+      var openSheetName = screenEl ? screenEl.getAttribute("data-sheet") : "none";
+      if (openSheetName && openSheetName !== "none") return;
+
+      // Wiping agentsEl destroys whichever island holds keyboard focus, and the
+      // browser drops focus to the body. At a 15s poll that means a keyboard or
+      // switch-access user is thrown back to the top of the page every 15
+      // seconds -- and since the islands and their mic buttons come BEFORE the
+      // notification stacks in tab order, they could never tab far enough to
+      // reach a stack at all. Remember where focus was and put it back.
+      var focusKey = null;
+      var focusWasMic = false;
+      var active = document.activeElement;
+      if (active && agentsEl.contains(active)) {
+        var owner = active.closest ? active.closest(".ls-island") : null;
+        if (owner) {
+          focusKey = owner.getAttribute("data-agent");
+          focusWasMic = active !== owner;
+        }
+      }
+
+      agentsEl.textContent = "";
+      tasksEl.textContent = "";
+      var agents = data.agents || [];
+      var tasks = data.tasks || [];
+      if (!agents.length && !tasks.length) { card.hidden = true; return; }
+
+      for (var i = 0; i < agents.length; i++) {
+        agentsEl.appendChild(island(agents[i]));
+      }
+      for (var j = 0; j < tasks.length; j++) {
+        var row = document.createElement("div");
+        row.className = "ls-task";
+        var tn = document.createElement("span");
+        tn.className = "ls-task-name";
+        tn.textContent = tasks[j].name || "task";
+        var tw = document.createElement("span");
+        tw.textContent = tasks[j].agent
+          ? tasks[j].agent + " \u00b7 " + tasks[j].schedule
+          : tasks[j].schedule;
+        row.appendChild(tn); row.appendChild(tw);
+        tasksEl.appendChild(row);
+      }
+      if (data.task_total > tasks.length) {
+        var more = document.createElement("div");
+        more.className = "ls-task";
+        more.textContent = "+" + (data.task_total - tasks.length) + " more scheduled";
+        tasksEl.appendChild(more);
+      }
+      card.hidden = false;
+
+      // Put focus back on the same agent, and on the same control within it.
+      // Only when the element is still there: if that agent has gone away,
+      // leaving focus on the body is correct -- moving it to a neighbour would
+      // aim the user's next Enter at an agent they never selected.
+      if (focusKey !== null) {
+        var again = agentsEl.querySelector(
+          '.ls-island[data-agent="' + (window.CSS && CSS.escape
+            ? CSS.escape(focusKey) : focusKey.replace(/["\\]/g, "\\$&")) + '"]');
+        if (again) {
+          var target = focusWasMic ? (again.querySelector(".ls-mic") || again) : again;
+          target.focus();
+        }
+      }
+
+      syncFeedFade();
+    }
+
+    function pollActivity() {
+      fetch("/auth/lock-widgets", { credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { if (d) paintActivity(d); })
+        .catch(function () { /* offline or off-console: leave the card as is */ });
+    }
+    if (card) {
+      pollActivity();
+      setInterval(pollActivity, 15000);
+    }
+
+    // -----------------------------------------------------------------------
+    // WEATHER. The reading comes from /auth/lock-weather, which does the call
+    // out to the forecast API itself. This page never talks to a third party:
+    // it renders before sign-in, and a fetch from here would announce the
+    // device to an outside host every time the screen lit up.
+    //
+    // This file knows how to DRAW eight shapes and nothing else. Which shape a
+    // given sky gets is policy and lives in the route, so the code that decides
+    // "overcast" and the code that decides which icon that is stay together.
+    // -----------------------------------------------------------------------
+    var weatherEl = document.getElementById("ls-weather");
+    var WEATHER_ICONS = {
+      clear: '<circle cx="12" cy="12" r="4.1"/><path d="M12 2.6v2.3M12 19.1v2.3M4.3 4.3l1.6 1.6M18.1 18.1l1.6 1.6M2.6 12h2.3M19.1 12h2.3M4.3 19.7l1.6-1.6M18.1 5.9l1.6-1.6"/>',
+      night: '<path d="M20.2 14.4A8.3 8.3 0 0 1 9.6 3.8a8.5 8.5 0 1 0 10.6 10.6z"/>',
+      partly: '<path d="M8 6.2V4.4M4.3 7.9L3 6.6M12.4 7.9l1.3-1.3M3.2 12.2H1.4"/><path d="M11 10.4a4 4 0 1 0-6.4 3"/><path d="M17.5 20H8.4a3.9 3.9 0 0 1-.5-7.8 5.2 5.2 0 0 1 10 1 3.4 3.4 0 0 1-.4 6.8z"/>',
+      cloud: '<path d="M17.5 19.5H8.2a4.2 4.2 0 0 1-.5-8.4 5.6 5.6 0 0 1 10.7 1.1 3.7 3.7 0 0 1-.9 7.3z"/>',
+      fog: '<path d="M17.2 14.4H8.3a3.9 3.9 0 0 1-.5-7.7 5.2 5.2 0 0 1 10 1 3.4 3.4 0 0 1-.6 6.7z"/><path d="M4.5 18h15M7 21.3h10"/>',
+      drizzle: '<path d="M17.2 14.4H8.3a3.9 3.9 0 0 1-.5-7.7 5.2 5.2 0 0 1 10 1 3.4 3.4 0 0 1-.6 6.7z"/><path d="M9 17.6l-.8 2.2M13 17.6l-.8 2.2M17 17.6l-.8 2.2"/>',
+      rain: '<path d="M17.2 13.8H8.3a3.9 3.9 0 0 1-.5-7.7 5.2 5.2 0 0 1 10 1 3.4 3.4 0 0 1-.6 6.7z"/><path d="M8.6 16.6L7 21.4M12.8 16.6l-1.6 4.8M17 16.6l-1.6 4.8"/>',
+      snow: '<path d="M17.2 13.8H8.3a3.9 3.9 0 0 1-.5-7.7 5.2 5.2 0 0 1 10 1 3.4 3.4 0 0 1-.6 6.7z"/><path d="M8.4 17.6v3.6M6.8 18.5l3.2 1.8M10 18.5l-3.2 1.8M15.6 17.6v3.6M14 18.5l3.2 1.8M17.2 18.5L14 20.3"/>',
+      storm: '<path d="M17.2 13.4H8.3a3.9 3.9 0 0 1-.5-7.7 5.2 5.2 0 0 1 10 1 3.4 3.4 0 0 1-.6 6.7z"/><path d="M13.2 15.6l-3.4 4.1h3.2l-1.3 3.1"/>'
+    };
+
+    function paintWeather(d) {
+      if (!weatherEl || !d || typeof d.temp !== "number") return;
+      weatherEl.textContent = "";
+
+      var icon = document.createElement("div");
+      icon.className = "ls-weather-icon";
+      icon.setAttribute("aria-hidden", "true");
+      // innerHTML with a path from THIS FILE's own table, selected by a key --
+      // no server string is ever parsed as markup here. Everything the route
+      // sends is written with textContent below.
+      icon.innerHTML = '<svg viewBox="0 0 24 24">'
+        + (WEATHER_ICONS[d.icon] || WEATHER_ICONS.cloud) + "</svg>";
+
+      var read = document.createElement("div");
+      read.className = "ls-weather-read";
+      var now = document.createElement("div");
+      now.className = "ls-weather-now";
+      var temp = document.createElement("span");
+      temp.className = "ls-weather-temp";
+      temp.textContent = Math.round(d.temp) + "°";
+      var label = document.createElement("span");
+      label.className = "ls-weather-label";
+      label.textContent = d.label || "";
+      now.appendChild(temp); now.appendChild(label);
+
+      var sub = document.createElement("div");
+      sub.className = "ls-weather-sub";
+      var bits = [];
+      if (typeof d.high === "number" && typeof d.low === "number") {
+        bits.push("H:" + Math.round(d.high) + "°  L:" + Math.round(d.low) + "°");
+      }
+      if (typeof d.wind === "number") bits.push(Math.round(d.wind) + " mph");
+      if (d.place) bits.push(d.place);
+      sub.textContent = bits.join("  ·  ");
+
+      read.appendChild(now); read.appendChild(sub);
+      weatherEl.appendChild(icon); weatherEl.appendChild(read);
+      // The icon is decorative, so the group carries the reading in words.
+      weatherEl.setAttribute("aria-label",
+        "Weather in " + (d.place || "") + ": " + Math.round(d.temp)
+        + " degrees celsius, " + (d.label || "") + ". " + sub.textContent);
+      weatherEl.hidden = false;
+    }
+
+    function pollWeather() {
+      fetch("/auth/lock-weather", { credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { if (d) paintWeather(d); })
+        // No error text on a lock screen: an unreachable forecast shows as no
+        // weather line at all, which is what the screen looked like before.
+        .catch(function () { /* offline: leave the row hidden */ });
+    }
+    if (weatherEl) {
+      pollWeather();
+      // The route caches for 15 minutes, so a tighter poll would only re-read
+      // the same answer. This is the interval that actually moves the number.
+      setInterval(pollWeather, 15 * 60 * 1000);
+    }
+
+    // -----------------------------------------------------------------------
+    // NOTIFICATIONS. One stack per source, collated the way a phone does it.
+    //
+    // SCRIPTED DEMO CONTENT ONLY, and the route enforces that: this screen
+    // renders before sign-in, so real mail or real messages here would be
+    // readable by whoever picked the phone up. There is no code path from this
+    // stack to a real inbox, which is why there is no gate here to get wrong.
+    // -----------------------------------------------------------------------
+    var feedEl = document.getElementById("ls-feed");
+
+    // Which edges of the feed are cut. Measured rather than assumed: whether
+    // this device's screen can hold its agents and notifications at once
+    // depends on how many of each it has and how tall the panel is.
+    function syncFeedFade() {
+      if (!feedEl) return;
+      var over = feedEl.scrollHeight - feedEl.clientHeight > 4;
+      var atTop = feedEl.scrollTop <= 2;
+      var atEnd = feedEl.scrollTop + feedEl.clientHeight >= feedEl.scrollHeight - 2;
+      var fade = "none";
+      if (over) fade = atTop ? "bottom" : (atEnd ? "top" : "both");
+      feedEl.setAttribute("data-fade", fade);
+    }
+    if (feedEl) {
+      feedEl.addEventListener("scroll", syncFeedFade, { passive: true });
+      window.addEventListener("resize", syncFeedFade);
+      syncFeedFade();
+    }
+
+    var notifsEl = document.getElementById("ls-notifs");
+    var NOTIF_GLYPHS = {
+      mail: '<path d="M3 6.5h18v11H3z"/><path d="M3.4 7l8.6 6 8.6-6"/>',
+      phone: '<path d="M6.2 3.5l2.4 4-1.9 2a11 11 0 0 0 5.8 5.8l2-1.9 4 2.4v3.1a1.7 1.7 0 0 1-1.9 1.7A16.5 16.5 0 0 1 3.4 5.4 1.7 1.7 0 0 1 5.1 3.5z"/>',
+      sms: '<path d="M4 4.5h16v11H8.5L4 19z"/><path d="M8 8.6h8M8 11.6h5"/>'
+    };
+
+    // Which stacks the user has fanned out, kept OUTSIDE the paint so a repaint
+    // does not fold the pile the user just opened.
+    var notifOpen = {};
+    // Every rendered time label, so the minutes can tick without rebuilding the
+    // DOM -- a rebuild would restart every entrance animation on a screen the
+    // user may be looking at.
+    var notifClocks = [];
+
+    function whenText(ts) {
+      var secs = (Date.now() / 1000) - ts;
+      if (secs < 60) return "now";
+      var mins = Math.round(secs / 60);
+      if (mins < 60) return mins + "m ago";
+      var hrs = Math.round(mins / 60);
+      if (hrs < 24) return hrs + "h ago";
+      var days = Math.round(hrs / 24);
+      return days <= 1 ? "Yesterday" : days + "d ago";
+    }
+
+    function notifCard(group, item) {
+      var el = document.createElement("div");
+      el.className = "ls-notif";
+
+      var tile = document.createElement("div");
+      tile.className = "ls-notif-tile";
+      tile.setAttribute("aria-hidden", "true");
+      // Only a colour literal is ever taken from the payload, and only after it
+      // is checked -- an unchecked value here would be written into a style.
+      if (/^#[0-9a-fA-F]{3,8}$/.test(group.tint || "")) {
+        tile.style.setProperty("--ls-n", group.tint);
+      }
+      if (group.glyph && NOTIF_GLYPHS[group.glyph]) {
+        tile.innerHTML = '<svg viewBox="0 0 24 24">' + NOTIF_GLYPHS[group.glyph] + "</svg>";
+      } else {
+        tile.textContent = (group.mono || group.app || "?").slice(0, 2);
+      }
+
+      var body = document.createElement("div");
+      body.className = "ls-notif-body";
+
+      var meta = document.createElement("div");
+      meta.className = "ls-notif-meta";
+      var app = document.createElement("span");
+      app.className = "ls-notif-app";
+      app.textContent = group.app || "";
+      meta.appendChild(app);
+      // The pile count rides on the newest card, where the eye already is. CSS
+      // hides it once the stack is fanned out, when the cards are the count.
+      if (group.items.length > 1 && item === group.items[0]) {
+        var count = document.createElement("span");
+        count.className = "ls-notif-count";
+        count.textContent = group.items.length;
+        meta.appendChild(count);
+      }
+      var when = document.createElement("span");
+      when.className = "ls-notif-when";
+      when.textContent = whenText(item.at);
+      notifClocks.push({ el: when, at: item.at });
+      meta.appendChild(when);
+
+      var title = document.createElement("div");
+      title.className = "ls-notif-title";
+      title.textContent = item.title || "";          // textContent, never innerHTML
+      var text = document.createElement("div");
+      text.className = "ls-notif-text";
+      text.textContent = item.text || "";
+
+      body.appendChild(meta); body.appendChild(title);
+      if (item.text) body.appendChild(text);
+      el.appendChild(tile); el.appendChild(body);
+      return el;
+    }
+
+    function notifGroup(group) {
+      var el = document.createElement("div");
+      el.className = "ls-notif-group";
+      // A stack OPENS, so it is a button: reachable by tab, operable by Enter,
+      // same rule the islands follow.
+      el.setAttribute("role", "button");
+      el.setAttribute("tabindex", "0");
+      var open = notifOpen[group.source] ? "1" : "0";
+      el.setAttribute("data-open", open);
+      el.setAttribute("aria-expanded", open === "1" ? "true" : "false");
+      el.setAttribute("aria-label", group.items.length > 1
+        ? group.app + ", " + group.items.length + " notifications. "
+          + (open === "1" ? "Collapse." : "Show all.")
+        : group.app + ": " + (group.items[0].title || ""));
+
+      for (var i = 0; i < group.items.length; i++) {
+        el.appendChild(notifCard(group, group.items[i]));
+      }
+
+      function toggle() {
+        var nowOpen = el.getAttribute("data-open") !== "1";
+        // Single-item stacks have nothing to fan out.
+        if (group.items.length < 2) return;
+        notifOpen[group.source] = nowOpen;
+        el.setAttribute("data-open", nowOpen ? "1" : "0");
+        el.setAttribute("aria-expanded", nowOpen ? "true" : "false");
+        el.setAttribute("aria-label", group.app + ", " + group.items.length
+          + " notifications. " + (nowOpen ? "Collapse." : "Show all."));
+        syncFeedFade();
+      }
+      el.addEventListener("click", toggle);
+      el.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter" || ev.key === " " || ev.key === "Spacebar") {
+          ev.preventDefault();
+          toggle();
+        }
+      });
+      return el;
+    }
+
+    function paintNotifications(data) {
+      if (!notifsEl) return;
+      // Same rule as the islands: never rebuild under an open sheet.
+      var sheetNow = screenEl ? screenEl.getAttribute("data-sheet") : "none";
+      if (sheetNow && sheetNow !== "none") return;
+      var groups = (data && data.groups) || [];
+      notifsEl.textContent = "";
+      notifClocks = [];
+      if (!groups.length) { notifsEl.hidden = true; return; }
+      for (var i = 0; i < groups.length; i++) {
+        if (!groups[i].items || !groups[i].items.length) continue;
+        notifsEl.appendChild(notifGroup(groups[i]));
+      }
+      notifsEl.hidden = !notifsEl.firstChild;
+      syncFeedFade();
+    }
+
+    function pollNotifications() {
+      fetch("/auth/lock-notifications", { credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { if (d) paintNotifications(d); })
+        // 404 is the ordinary answer with demo content off: no stack, no error.
+        .catch(function () { /* leave the stack as it is */ });
+    }
+    if (notifsEl) {
+      pollNotifications();
+      setInterval(pollNotifications, 15 * 60 * 1000);
+      // The minutes move far faster than the content does, so they are retouched
+      // in place rather than by re-rendering the stack.
+      setInterval(function () {
+        for (var i = 0; i < notifClocks.length; i++) {
+          notifClocks[i].el.textContent = whenText(notifClocks[i].at);
+        }
+      }, 60000);
+    }
+
+    // Switching to the password form STAYS on the lock screen.
+    //
+    // This used to drop .lockscreen-on to get the ordinary card and the shared
+    // keyboard back. On a handset kiosk that is wrong in three visible ways at
+    // once: the page loses `overflow:hidden` and grows a chromium SCROLLBAR
+    // down the edge, the keyboard's floating toggle button reappears over the
+    // screen, and the whole lock screen visually falls apart mid-sign-in. The
+    // password form is just another thing that rises in the passcode sheet, so
+    // raise the keyboard for it and leave the chrome alone.
+    var toPw = document.getElementById("use-password");
+    if (toPw) {
+      toPw.addEventListener("click", function () {
+        openSheet("passcode");
+        var pw = document.querySelector("#pw-panel input[type=password]");
+        if (pw && window.taosOSK) {
+          window.taosOSK.enable();
+          window.taosOSK.focusField(pw);
+        }
+        window.setTimeout(syncKeyboard, 60);
+      });
+    }
+
+    // Coming BACK to the PIN closes the keyboard again: the keypad is this
+    // screen's input method and the two must never both be up.
+    var toPin = document.getElementById("use-pin");
+    if (toPin) {
+      toPin.addEventListener("click", function () {
+        if (window.taosOSK) window.taosOSK.disable();
+        setKeyboardOffset(0);
+      });
+    }
+
+    // -----------------------------------------------------------------------
+    // SHEETS. One state variable (data-sheet on .lockscreen) drives the scrim,
+    // the head blur, the unlock bar and which sheet is raised. Every open and
+    // close goes through openSheet/closeSheet so those can never disagree.
+    // -----------------------------------------------------------------------
+    var scrim     = document.getElementById("ls-scrim");
+    var unlockBar = document.getElementById("ls-unlock");
+    var unlockBtn = document.getElementById("ls-unlock-btn");
+    var chatSheet = document.getElementById("ls-chat");
+    var decSheet  = document.getElementById("ls-decision");
+    var lastFocus = null;
+
+    if (screenEl) screenEl.setAttribute("data-sheet", "none");
+
+    var voiceSheet = document.getElementById("ls-voice");
+
+    function sheetEl(name) {
+      if (name === "chat") return chatSheet;
+      if (name === "decision") return decSheet;
+      if (name === "voice") return voiceSheet;
+      if (name === "passcode") return document.getElementById("ls-foot");
+      return null;
+    }
+
+    function openSheet(name) {
+      if (!screenEl) return;
+      var current = screenEl.getAttribute("data-sheet");
+      if (current === name) return;
+      // Remember where the user was so closing returns them there rather than
+      // dropping focus to the top of the document.
+      if (current === "none") lastFocus = document.activeElement;
+      // Only ever one sheet: hide whatever was up before revealing the next.
+      if (current && current !== "none") {
+        var prev = sheetEl(current);
+        if (prev && prev.id !== "ls-foot") prev.hidden = true;
+      }
+      var el = sheetEl(name);
+      if (el) el.hidden = false;
+      if (scrim) scrim.hidden = false;
+      // The attribute is set on the NEXT frame when the sheet was hidden a
+      // moment ago: a transform transition on an element that was display:none
+      // in the same frame has no start value and the sheet would appear
+      // instantly instead of sliding.
+      requestAnimationFrame(function () {
+        screenEl.setAttribute("data-sheet", name);
+      });
+      if (unlockBtn) unlockBtn.setAttribute("aria-expanded", name === "passcode" ? "true" : "false");
+    }
+
+    function closeSheet() {
+      if (!screenEl) return;
+      var current = screenEl.getAttribute("data-sheet");
+      if (!current || current === "none") return;
+      screenEl.setAttribute("data-sheet", "none");
+      if (unlockBtn) unlockBtn.setAttribute("aria-expanded", "false");
+      // The composer must not keep the keyboard up over a closed sheet, and the
+      // microphone must never outlive the sheet that opened it.
+      if (window.taosOSK) window.taosOSK.disable();
+      stopVoice();
+      setKeyboardOffset(0);
+      var el = sheetEl(current);
+      // Wait out the slide before hiding, or the sheet vanishes mid-animation.
+      // hidden (not display) so it also leaves the accessibility tree.
+      window.setTimeout(function () {
+        if (screenEl.getAttribute("data-sheet") !== "none") return;
+        if (el && el.id !== "ls-foot") el.hidden = true;
+        if (scrim) scrim.hidden = true;
+      }, 400);
+      if (lastFocus && lastFocus.focus) { try { lastFocus.focus(); } catch (e) {} }
+      lastFocus = null;
+    }
+
+    // Tap-to-dismiss on the scrim, but only a real tap: a drag that began on the
+    // sheet and ended over the scrim is not a dismissal.
+    if (scrim) {
+      var sx = 0, sy = 0;
+      scrim.addEventListener("pointerdown", function (ev) { sx = ev.clientX; sy = ev.clientY; });
+      scrim.addEventListener("click", function (ev) {
+        if (Math.abs(ev.clientX - sx) > 12 || Math.abs(ev.clientY - sy) > 12) return;
+        closeSheet();
+      });
+    }
+    document.addEventListener("keydown", function (ev) {
+      if (ev.key === "Escape") closeSheet();
+    });
+    var chatClose = document.getElementById("ls-chat-close");
+    if (chatClose) chatClose.addEventListener("click", closeSheet);
+    var decClose = document.getElementById("ls-decision-close");
+    if (decClose) decClose.addEventListener("click", closeSheet);
+
+    // -----------------------------------------------------------------------
+    // KEYBOARD OFFSET. The sheets are anchored to the bottom edge and the
+    // on-screen keyboard is a fixed panel on that same edge, so without this
+    // the composer sits UNDER the keys. The OSK reserves its space as body
+    // padding, which does nothing for a fixed element -- so measure the panel
+    // itself rather than duplicating its height as a guess that drifts when the
+    // keyboard switches between its letter, symbol and numeric layers.
+    // -----------------------------------------------------------------------
+    function setKeyboardOffset(px) {
+      document.documentElement.style.setProperty("--ls-kb", (px || 0) + "px");
+    }
+
+    var oskPanel = document.querySelector(".osk");
+    function syncKeyboard() {
+      if (!oskPanel) { oskPanel = document.querySelector(".osk"); }
+      if (!oskPanel || oskPanel.hidden) { setKeyboardOffset(0); return; }
+      setKeyboardOffset(oskPanel.offsetHeight);
+      // Switching keyboard layers (letters/symbols/numeric) changes its height
+      // and therefore the sheet's, so re-anchor the thread each time.
+      if (screenEl && screenEl.getAttribute("data-sheet") === "chat") bottomOut();
+    }
+    if (window.ResizeObserver) {
+      var ro = new ResizeObserver(syncKeyboard);
+      if (oskPanel) ro.observe(oskPanel);
+      // The panel is appended on DOMContentLoaded, which may not have happened
+      // yet when this runs, so pick it up once it exists.
+      var mo = new MutationObserver(function () {
+        var found = document.querySelector(".osk");
+        if (found && found !== oskPanel) { oskPanel = found; ro.observe(found); }
+        syncKeyboard();
+      });
+      mo.observe(document.body, { childList: true, attributes: true, attributeFilter: ["hidden", "class"], subtree: true });
+    }
+
+    // -----------------------------------------------------------------------
+    // UNLOCK. A button AND a swipe, not a swipe alone: the gesture is the
+    // shortcut for someone who knows it, the button is what makes the phone
+    // openable by someone who does not (or cannot make the drag at all).
+    // -----------------------------------------------------------------------
+    function openPasscode() {
+      openSheet("passcode");
+      var pinInput = document.getElementById("pin-input");
+      // Focus the field so a physical keyboard types into it, but do NOT raise
+      // the shared on-screen keyboard: this screen draws its own keypad.
+      if (pinInput) { try { pinInput.focus({ preventScroll: true }); } catch (e) { pinInput.focus(); } }
+    }
+    if (unlockBtn) unlockBtn.addEventListener("click", openPasscode);
+
+    // Two SEPARATE gestures, deliberately not one handler on the body.
+    //
+    // A single body-wide handler that read any downward drag as "dismiss" made
+    // the conversation impossible to scroll: dragging down through older
+    // messages IS a downward drag, so the sheet closed under the finger. The
+    // dismiss gesture now lives ONLY on the sheet's header -- the grabber is
+    // the handle, which is what the grabber is for -- and the unlock swipe is
+    // only armed while nothing is open.
+    function swipe(surface, onUp, onDown, guard) {
+      var y0 = null, x0 = null, moved = false;
+      surface.addEventListener("touchstart", function (ev) {
+        var t = ev.touches[0];
+        y0 = t.clientY; x0 = t.clientX; moved = false;
+      }, { passive: true });
+      surface.addEventListener("touchmove", function (ev) {
+        if (y0 === null) return;
+        var t = ev.touches[0];
+        if (Math.abs(t.clientY - y0) > 10 || Math.abs(t.clientX - x0) > 10) moved = true;
+      }, { passive: true });
+      surface.addEventListener("touchend", function (ev) {
+        if (y0 === null) return;
+        var t = ev.changedTouches[0];
+        var dy = t.clientY - y0, dx = t.clientX - x0;
+        y0 = null; x0 = null;
+        // Vertical intent, and a long one. The threshold is deliberately well
+        // past a scroll flick, and a drag more horizontal than vertical is
+        // never a dismiss.
+        if (!moved || Math.abs(dy) < 90 || Math.abs(dx) > Math.abs(dy) * 0.6) return;
+        if (guard && !guard()) return;
+        if (dy < 0 && onUp) onUp();
+        else if (dy > 0 && onDown) onDown();
+      }, { passive: true });
+    }
+
+    // Unlock: only from the resting screen, so it can never fight a sheet.
+    swipe(document.body, openPasscode, null, function () {
+      return !screenEl || screenEl.getAttribute("data-sheet") === "none";
+    });
+    // Dismiss: only by dragging the sheet's own header.
+    var chatHead = chatSheet ? chatSheet.querySelector(".ls-sheet-head") : null;
+    if (chatHead) swipe(chatHead, null, closeSheet);
+    var decHead = decSheet ? decSheet.querySelector(".ls-sheet-head") : null;
+    if (decHead) swipe(decHead, null, closeSheet);
+    var footEl = document.getElementById("ls-foot");
+    if (footEl) swipe(footEl, null, closeSheet);
+
+    // -----------------------------------------------------------------------
+    // CONVERSATION SHEET.
+    // -----------------------------------------------------------------------
+    var msgsEl    = document.getElementById("ls-msgs");
+    var composer  = document.getElementById("ls-compose-input");
+    var sendBtn   = document.getElementById("ls-send");
+    var chatName  = document.getElementById("ls-chat-name");
+    var chatSub   = document.getElementById("ls-chat-sub");
+    var chatAv    = document.getElementById("ls-chat-avatar");
+    var chatAgent = null;
+
+    function slugFor(name) {
+      // Must match the server's _avatar_slug exactly or the thread 404s.
+      var out = "";
+      var lower = String(name).trim().toLowerCase();
+      for (var i = 0; i < lower.length; i++) {
+        var ch = lower[i];
+        if (/[a-z0-9]/.test(ch)) out += ch;
+        else if (out && out[out.length - 1] !== "-") out += "-";
+      }
+      return out.replace(/^-+|-+$/g, "");
+    }
+
+    function fillAvatar(box, agent) {
+      box.textContent = "";
+      // Same rule as the island: the product mark is contained, not cropped.
+      if (agent.system) box.setAttribute("data-system", "1");
+      else box.removeAttribute("data-system");
+      var hue = hueFor(agent.name || "agent");
+      box.style.setProperty("--ls-a", "hsl(" + hue + " 62% 58%)");
+      box.style.setProperty("--ls-b", "hsl(" + ((hue + 28) % 360) + " 58% 38%)");
+      if (agent.avatar) {
+        var img = document.createElement("img");
+        img.alt = ""; img.src = agent.avatar;
+        img.addEventListener("error", function () {
+          img.remove();
+          if (!agent.system) box.textContent = initials(agent.name || "agent");
+        });
+        box.appendChild(img);
+      } else {
+        box.textContent = initials(agent.name || "agent");
+      }
+    }
+
+    function dayLabel(d) {
+      var today = new Date(); today.setHours(0, 0, 0, 0);
+      var that = new Date(d.getTime()); that.setHours(0, 0, 0, 0);
+      var days = Math.round((today - that) / 86400000);
+      if (days === 0) return "Today";
+      if (days === 1) return "Yesterday";
+      if (days < 7) return d.toLocaleDateString([], { weekday: "long" });
+      return d.toLocaleDateString([], { day: "numeric", month: "long" });
+    }
+
+    function bubble(msg) {
+      var b = document.createElement("div");
+      b.className = "ls-msg";
+      b.setAttribute("data-role", msg.role === "user" ? "user" : "agent");
+      b.textContent = msg.text || "";     // textContent, never innerHTML
+      return b;
+    }
+
+    function renderThread(messages) {
+      msgsEl.textContent = "";
+      var lastDay = "";
+      for (var i = 0; i < messages.length; i++) {
+        var m = messages[i];
+        var when = new Date((m.at || 0) * 1000);
+        var label = dayLabel(when);
+        if (label !== lastDay) {
+          var sep = document.createElement("div");
+          sep.className = "ls-day";
+          sep.textContent = label;
+          msgsEl.appendChild(sep);
+          lastDay = label;
+        }
+        msgsEl.appendChild(bubble(m));
+      }
+      // Open at the newest message, the way every messaging app does. Set
+      // directly rather than scrollIntoView so it does not also scroll the page
+      // behind the sheet.
+      //
+      // Twice, on the next frame: setting scrollTop in the same frame the
+      // bubbles were appended measures a scrollHeight that layout has not
+      // finished computing, and the thread opens with its last message clipped
+      // behind the composer. The second frame catches the reflow that wrapping
+      // the final bubble causes. Measured on the device.
+      bottomOut();
+    }
+
+    // Anchor the thread to its newest message. Repeated across frames because
+    // the height it is measuring against keeps changing underneath it: bubbles
+    // wrap on layout, and the keyboard shortens the sheet a moment later.
+    function bottomOut() {
+      if (!msgsEl) return;
+      msgsEl.scrollTop = msgsEl.scrollHeight;
+      requestAnimationFrame(function () {
+        msgsEl.scrollTop = msgsEl.scrollHeight;
+        requestAnimationFrame(function () {
+          msgsEl.scrollTop = msgsEl.scrollHeight;
+        });
+      });
+    }
+
+    function openChat(agent) {
+      chatAgent = agent;
+      chatName.textContent = agent.name || "agent";
+      chatSub.textContent = agent.demo ? "Demo conversation" : (agent.status || "");
+      fillAvatar(chatAv, agent);
+      msgsEl.textContent = "";
+      composer.value = "";
+      if (sendBtn) sendBtn.disabled = true;
+      openSheet("chat");
+
+      // The keyboard comes up with the sheet: this is a conversation, and the
+      // reason to open one is to say something. Waiting for a tap on the field
+      // costs a tap and leaves the sheet looking like a read-only transcript.
+      window.setTimeout(function () {
+        if (!screenEl || screenEl.getAttribute("data-sheet") !== "chat") return;
+        if (window.taosOSK) {
+          window.taosOSK.enable();
+          window.taosOSK.focusField(composer);
+        }
+        window.setTimeout(function () {
+          syncKeyboard();
+          // Raising the keyboard SHORTENS the sheet, so the scroll position
+          // computed for the full-height sheet is no longer the bottom. Without
+          // this the thread opens parked mid-conversation with the newest
+          // message behind the composer.
+          bottomOut();
+        }, 60);
+      }, 420);
+
+      fetch("/auth/lock-thread/" + encodeURIComponent(slugFor(agent.name || "")), {
+        credentials: "same-origin"
+      }).then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (!d || !d.messages || !d.messages.length) {
+            var empty = document.createElement("div");
+            empty.className = "ls-day";
+            empty.textContent = "No messages yet";
+            msgsEl.appendChild(empty);
+            return;
+          }
+          renderThread(d.messages);
+        })
+        .catch(function () { /* leave the thread empty rather than erroring */ });
+    }
+
+    if (composer) {
+      composer.addEventListener("input", function () {
+        if (sendBtn) sendBtn.disabled = !composer.value.trim();
+      });
+      // Typing is the ONE place on this screen that wants the full keyboard.
+      // The lock screen keeps the shared OSK disabled for the passcode (it has
+      // its own keypad), so it has to be turned back on here and off again on
+      // close -- which closeSheet does.
+      composer.addEventListener("focus", function () {
+        if (window.taosOSK) {
+          window.taosOSK.enable();
+          window.taosOSK.focusField(composer);
+        }
+        window.setTimeout(syncKeyboard, 60);
+      });
+    }
+
+    function send() {
+      if (!composer) return;
+      var text = composer.value.trim();
+      if (!text) return;
+      var now = Date.now() / 1000;
+      msgsEl.appendChild(bubble({ role: "user", text: text, at: now }));
+      composer.value = "";
+      if (sendBtn) sendBtn.disabled = true;
+      msgsEl.scrollTop = msgsEl.scrollHeight;
+      // A reply only comes back in a demo thread. Outside demo mode there is no
+      // agent on the other end of this sheet -- the lock screen is pre-auth and
+      // deliberately cannot reach the chat store -- so inventing a reply would
+      // be telling the user something happened when nothing did.
+      if (!chatAgent || !chatAgent.demo) return;
+      window.setTimeout(function () {
+        if (!screenEl || screenEl.getAttribute("data-sheet") !== "chat") return;
+        msgsEl.appendChild(bubble({
+          role: "agent",
+          text: "Got it — I'll pick that up.",
+          at: Date.now() / 1000
+        }));
+        msgsEl.scrollTop = msgsEl.scrollHeight;
+      }, 900);
+    }
+    if (sendBtn) sendBtn.addEventListener("click", send);
+    if (composer) {
+      composer.addEventListener("keydown", function (ev) {
+        if (ev.key === "Enter") { ev.preventDefault(); send(); }
+      });
+    }
+
+    // -----------------------------------------------------------------------
+    // DECISION SHEET. Approve/Deny on a LOCKED screen is deliberately limited:
+    // a demo prompt resolves in place, but a real decision carries an id and
+    // answering it is an authenticated write. The lock screen does not hold a
+    // session, so the honest move is to take the intent, raise the passcode and
+    // let the answer happen as the signed-in user -- never to accept a decision
+    // from whoever happens to be holding the phone.
+    // -----------------------------------------------------------------------
+    var decQ     = document.getElementById("ls-decision-q");
+    var decMeta  = document.getElementById("ls-decision-meta");
+    var decNote  = document.getElementById("ls-decision-note");
+    var decName  = document.getElementById("ls-decision-name");
+    var decAv    = document.getElementById("ls-decision-avatar");
+    var decActs  = document.getElementById("ls-decision-acts");
+    var decDone  = document.getElementById("ls-decision-done");
+
+    function openDecision(agent) {
+      var d = agent.decision || {};
+      decName.textContent = agent.name || "agent";
+      fillAvatar(decAv, agent);
+      decQ.textContent = d.question || "This agent needs a decision.";
+      decMeta.textContent = d.priority && d.priority !== "normal"
+        ? d.priority.charAt(0).toUpperCase() + d.priority.slice(1) + " priority"
+        : "";
+      decNote.hidden = !!d.id;
+      decNote.textContent = d.id ? "" : "Demo prompt — nothing is actually approved.";
+      decActs.hidden = false;
+      decDone.hidden = true;
+      decActs.setAttribute("data-decision-id", d.id || "");
+      openSheet("decision");
+    }
+
+    if (decActs) {
+      decActs.addEventListener("click", function (ev) {
+        var btn = ev.target.closest(".ls-act");
+        if (!btn) return;
+        var approved = btn.getAttribute("data-act") === "approve";
+        var id = decActs.getAttribute("data-decision-id") || "";
+        if (!id) {
+          // Demo prompt: resolve in place and say so.
+          decActs.hidden = true;
+          decDone.hidden = false;
+          decDone.textContent = approved ? "Approved (demo)" : "Denied (demo)";
+          window.setTimeout(closeSheet, 1100);
+          return;
+        }
+        // Real decision: this needs a session, so send the user to the passcode
+        // and let them answer it signed in.
+        decActs.hidden = true;
+        decDone.hidden = false;
+        decDone.textContent = "Unlock to " + (approved ? "approve" : "deny") + " this.";
+        window.setTimeout(openPasscode, 700);
+      });
+    }
+
+    // -----------------------------------------------------------------------
+    // ISLAND PRESS. Press-and-hold opens the conversation, the way a long press
+    // expands a notification on a phone. A short tap opens too -- the decision
+    // when the island is asking for one, the conversation otherwise -- because
+    // an island that looks pressable and does nothing on a tap reads as broken.
+    // The sink-then-pop is what tells the finger the HOLD is being received.
+    // -----------------------------------------------------------------------
+    var HOLD_MS = 420;
+    (function () {
+      var timer = null, held = false, startY = 0, startX = 0, pressed = null;
+
+      function clear() {
+        if (timer) { window.clearTimeout(timer); timer = null; }
+        if (pressed) { pressed.removeAttribute("data-press"); }
+        pressed = null;
+      }
+
+      function open(el) {
+        var agent = el.__agent;
+        if (!agent) return;
+        if (agent.attention && agent.decision) openDecision(agent);
+        else openChat(agent);
+      }
+
+      agentsEl.addEventListener("pointerdown", function (ev) {
+        // The mic is its own control sitting inside the island; without this the
+        // island's press handler would open the conversation underneath it.
+        if (ev.target.closest(".ls-mic")) return;
+        var el = ev.target.closest(".ls-island");
+        if (!el) return;
+        held = false;
+        startY = ev.clientY; startX = ev.clientX;
+        pressed = el;
+        el.setAttribute("data-press", "1");
+        timer = window.setTimeout(function () {
+          held = true;
+          el.setAttribute("data-press", "2");
+          // Haptics where the platform offers them: a long press that only
+          // changes pixels does not feel like a press.
+          if (navigator.vibrate) { try { navigator.vibrate(12); } catch (e) {} }
+          window.setTimeout(function () { el.removeAttribute("data-press"); }, 200);
+          openChat(el.__agent || {});
+        }, HOLD_MS);
+      });
+
+      // A drag is a scroll of the agent list, not a press.
+      agentsEl.addEventListener("pointermove", function (ev) {
+        if (!pressed) return;
+        if (Math.abs(ev.clientY - startY) > 10 || Math.abs(ev.clientX - startX) > 10) clear();
+      });
+
+      agentsEl.addEventListener("pointerup", function (ev) {
+        if (ev.target.closest(".ls-mic")) return;
+        var el = pressed;
+        clear();
+        if (held) { held = false; return; }   // the hold already opened it
+        if (!el) return;
+        var target = ev.target.closest(".ls-island");
+        if (target === el) open(el);
+      });
+
+      agentsEl.addEventListener("pointercancel", clear);
+      agentsEl.addEventListener("pointerleave", clear);
+
+      // Keyboard parity: an island is a button, so Enter and Space must open it.
+      agentsEl.addEventListener("keydown", function (ev) {
+        if (ev.key !== "Enter" && ev.key !== " ") return;
+        var el = ev.target.closest(".ls-island");
+        if (!el) return;
+        ev.preventDefault();
+        open(el);
+      });
+    })();
+
+    // -----------------------------------------------------------------------
+    // DICTATION. The waveform is driven by the REAL microphone through an
+    // AnalyserNode, not by a canned animation: a fake waveform that moves while
+    // the mic is muted or denied is worse than no waveform, because it tells
+    // the user they are being heard when they are not.
+    //
+    // Transcription is a separate capability from capture. Where the browser
+    // has SpeechRecognition it is used; where it does not, the sheet says so
+    // plainly instead of listening forever into nothing.
+    // -----------------------------------------------------------------------
+    var waveCanvas = document.getElementById("ls-wave");
+    var voiceText  = document.getElementById("ls-voice-text");
+    var voiceState = document.getElementById("ls-voice-state");
+    var voiceTitle = document.getElementById("ls-voice-title");
+    var voiceAv    = document.getElementById("ls-voice-avatar");
+    var voiceSend  = document.getElementById("ls-voice-send");
+    var voiceAgent = null;
+    var mediaStream = null, audioCtx = null, analyser = null, waveRAF = null;
+    var recog = null, finalText = "";
+
+    function drawWave(level) {
+      if (!waveCanvas) return;
+      var ctx = waveCanvas.getContext("2d");
+      var w = waveCanvas.width, h = waveCanvas.height, mid = h / 2;
+      ctx.clearRect(0, 0, w, h);
+      var bars = 48, gap = 3, bw = (w - gap * (bars - 1)) / bars;
+      for (var i = 0; i < bars; i++) {
+        // A travelling envelope so the bars read as a moving waveform rather
+        // than a level meter; scaled by the ACTUAL measured level.
+        var phase = (Date.now() / 260) + i * 0.38;
+        var env = 0.32 + 0.68 * Math.abs(Math.sin(phase));
+        var mag = Math.max(2, level * env * mid * 1.9);
+        var x = i * (bw + gap);
+        ctx.fillStyle = "rgba(10,132,255," + (0.45 + 0.55 * env) + ")";
+        ctx.beginPath();
+        if (ctx.roundRect) ctx.roundRect(x, mid - mag, bw, mag * 2, bw / 2);
+        else ctx.rect(x, mid - mag, bw, mag * 2);
+        ctx.fill();
+      }
+    }
+
+    function pumpWave() {
+      if (!analyser) return;
+      var buf = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteTimeDomainData(buf);
+      // RMS around the 128 midpoint: a peak reading spikes on a single click
+      // and makes a quiet room look loud.
+      var sum = 0;
+      for (var i = 0; i < buf.length; i++) {
+        var v = (buf[i] - 128) / 128;
+        sum += v * v;
+      }
+      drawWave(Math.min(1, Math.sqrt(sum / buf.length) * 3.2));
+      waveRAF = requestAnimationFrame(pumpWave);
+    }
+
+    function stopVoice() {
+      if (waveRAF) { cancelAnimationFrame(waveRAF); waveRAF = null; }
+      if (recog) { try { recog.onend = null; recog.abort(); } catch (e) {} recog = null; }
+      if (mediaStream) {
+        mediaStream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) {} });
+        mediaStream = null;
+      }
+      if (audioCtx) { try { audioCtx.close(); } catch (e) {} audioCtx = null; }
+      analyser = null;
+    }
+
+    function voiceFail(msg) {
+      stopVoice();
+      if (voiceState) voiceState.textContent = "Not available";
+      if (voiceText) { voiceText.setAttribute("data-error", "1"); voiceText.textContent = msg; }
+      drawWave(0);
+    }
+
+    function openVoice(agent) {
+      voiceAgent = agent;
+      finalText = "";
+      if (voiceTitle) voiceTitle.textContent = agent.name || "agent";
+      if (voiceAv) fillAvatar(voiceAv, agent);
+      if (voiceText) { voiceText.removeAttribute("data-error"); voiceText.textContent = ""; }
+      if (voiceState) voiceState.textContent = "Listening\u2026";
+      if (voiceSend) voiceSend.disabled = true;
+      openSheet("voice");
+
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        voiceFail("This device has no microphone available to the browser.");
+        return;
+      }
+      navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+        if (!screenEl || screenEl.getAttribute("data-sheet") !== "voice") {
+          stream.getTracks().forEach(function (t) { t.stop(); });
+          return;
+        }
+        mediaStream = stream;
+        var AC = window.AudioContext || window.webkitAudioContext;
+        audioCtx = new AC();
+        analyser = audioCtx.createAnalyser();
+        analyser.fftSize = 1024;
+        audioCtx.createMediaStreamSource(stream).connect(analyser);
+        pumpWave();
+
+        var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+        if (!SR) {
+          // Capture works, transcription does not. Say exactly that rather than
+          // leaving a waveform moving under a caption that never appears.
+          if (voiceState) voiceState.textContent = "Dictation unavailable";
+          if (voiceText) {
+            voiceText.setAttribute("data-error", "1");
+            voiceText.textContent = "This build has no speech recognition, so it cannot turn speech into text. Type instead.";
+          }
+          return;
+        }
+        recog = new SR();
+        recog.continuous = true;
+        recog.interimResults = true;
+        recog.lang = navigator.language || "en-GB";
+        recog.onresult = function (ev) {
+          var interim = "";
+          for (var i = ev.resultIndex; i < ev.results.length; i++) {
+            var chunk = ev.results[i][0].transcript;
+            if (ev.results[i].isFinal) finalText += chunk;
+            else interim += chunk;
+          }
+          if (voiceText) voiceText.textContent = (finalText + interim).trim();
+          if (voiceSend) voiceSend.disabled = !(finalText + interim).trim();
+        };
+        recog.onerror = function (ev) {
+          voiceFail(ev && ev.error === "not-allowed"
+            ? "Microphone access was refused."
+            : "Dictation stopped. Type instead.");
+        };
+        try { recog.start(); } catch (e) { /* already running */ }
+      }).catch(function () {
+        voiceFail("Microphone access was refused, so nothing is being recorded.");
+      });
+    }
+
+    if (agentsEl) {
+      agentsEl.addEventListener("click", function (ev) {
+        var mic = ev.target.closest(".ls-mic");
+        if (!mic) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        var el = mic.closest(".ls-island");
+        if (el && el.__agent) openVoice(el.__agent);
+      });
+    }
+
+    var voiceClose = document.getElementById("ls-voice-close");
+    if (voiceClose) voiceClose.addEventListener("click", closeSheet);
+    var voiceCancel = document.getElementById("ls-voice-cancel");
+    if (voiceCancel) voiceCancel.addEventListener("click", closeSheet);
+    if (voiceSend) {
+      voiceSend.addEventListener("click", function () {
+        var text = (voiceText ? voiceText.textContent : "").trim();
+        var agent = voiceAgent;
+        stopVoice();
+        if (!text || !agent) { closeSheet(); return; }
+        // Hand the dictation to the conversation rather than sending it from
+        // here: the thread is where a message belongs, and it is then visible
+        // as having been said.
+        openChat(agent);
+        window.setTimeout(function () {
+          if (composer) {
+            composer.value = text;
+            composer.dispatchEvent(new Event("input", { bubbles: true }));
+          }
+        }, 60);
+      });
+    }
+
+    // Keypad -> the existing PIN input.
+    var pad = document.getElementById("ls-pad");
+    var input = document.getElementById("pin-input");
+    if (!pad || !input) return;
+
+    function emit() {
+      // The pin-panel script paints the dots from an "input" event, so the
+      // keypad must raise one -- assigning .value alone fires nothing.
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+
+    pad.addEventListener("click", function (ev) {
+      var key = ev.target.closest(".ls-key");
+      if (!key) return;
+      var digit = key.getAttribute("data-digit");
+      if (digit !== null) {
+        var max = parseInt(input.getAttribute("maxlength") || "12", 10);
+        if (input.value.length < max) {
+          input.value += digit;
+          emit();
+        }
+        return;
+      }
+      if (key.getAttribute("data-action") === "back") {
+        input.value = input.value.slice(0, -1);
+        emit();
+      }
+    });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+"""
 
 
 def _login_page(
@@ -443,12 +2713,34 @@ def _login_page(
     # request is console-local AND a PIN is set. Off-console the page is exactly
     # what it has always been, so a LAN browser is never shown a method it would
     # be refused (and never learns that a PIN exists on this box).
-    pin_panel = _pin_panel_html(next_url) if pin_available else ""
+    # pin_available is already console-only, so the lock screen never reaches a
+    # LAN browser: off-console this page stays exactly the card it has always been.
+    lock_screen = pin_available
+    pin_panel = _pin_panel_html(next_url, keypad=lock_screen) if pin_available else ""
     pin_switch = (
         '<button type="button" class="method-switch" id="use-pin">Use my PIN instead</button>'
         if pin_available else ""
     )
     pin_script = '<script src="/auth/pin-panel.js" defer></script>' if pin_available else ""
+    # The lock screen replaces the card entirely: a passcode screen that still
+    # draws a bordered panel in the middle of a 2400px phone reads as a web page.
+    # The device's own name is the only server-supplied value on it -- everything
+    # else (clock, battery) is read client-side, so nothing account-derived is
+    # rendered before the user has authenticated.
+    body_class = "lockscreen-on" if lock_screen else ""
+    shell_class = "ls-foot" if lock_screen else "card"
+    shell_id = ' id="ls-foot"' if lock_screen else ""
+    brand = "" if lock_screen else (
+        '<div class="brand">\n'
+        '      <h1 class="wordmark">taOS</h1>\n'
+        '      <p>Sign in to continue</p>\n'
+        '    </div>'
+    )
+    lock_head = _lock_head_html() if lock_screen else ""
+    lock_foot = _lock_tail_html() if lock_screen else ""
+    lock_script = '<script src="/auth/lock-screen.js" defer></script>' if lock_screen else ""
+    lock_style = f"<style>{_LOCK_SCREEN_STYLE}</style>" if lock_screen else ""
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -457,13 +2749,12 @@ def _login_page(
 <title>Sign in — taOS</title>
 <style>{_AUTH_BASE_STYLE}</style>
 <style>{_PIN_PANEL_STYLE}</style>
+{lock_style}
 </head>
-<body>
-  <div class="card">
-    <div class="brand">
-      <h1 class="wordmark">taOS</h1>
-      <p>Sign in to continue</p>
-    </div>
+<body class="{body_class}">
+  {lock_head}
+  <div class="{shell_class}"{shell_id}>
+    {brand}
     {err}
     {pin_panel}
     <form class="pw-panel" id="pw-panel" method="POST" action="/auth/login">
@@ -481,8 +2772,10 @@ def _login_page(
       {pin_switch}
     </form>
   </div>
+  {lock_foot}
 {osk_assets()}
 {pin_script}
+{lock_script}
 </body>
 </html>
 """
@@ -817,6 +3110,772 @@ async def pin_panel_script(request: Request):
         media_type="application/javascript",
         headers={"Cache-Control": "public, max-age=300"},
     )
+
+
+
+@router.get("/lock-screen.js")
+async def lock_screen_script(request: Request):
+    """Serve the lock-screen chrome. Same CSP reasoning as /auth/osk.js."""
+    return Response(
+        content=_LOCK_SCREEN_SCRIPT,
+        media_type="application/javascript",
+        headers={"Cache-Control": "public, max-age=300"},
+    )
+
+
+
+
+
+#: Where the App Store keeps framework/brand artwork. The lock screen reuses
+#: those files rather than carrying a second copy, so a logo updated for the
+#: store is updated here too.
+_STORE_ICON_DIRS = ("static/store-icons", "static/store-icons/brands")
+
+
+def _framework_icon(framework: str) -> str:
+    """URL of the App Store icon for a framework, or "" when none is shipped.
+
+    Resolved server-side so the page only ever points at a file that exists: the
+    client falls back to its drawn mark immediately instead of after a 404.
+    /static/ is already served and already exempt from auth, so this adds no new
+    pre-auth surface.
+    """
+    fw = "".join(c for c in framework.lower() if c.isalnum())
+    if not fw:
+        return ""
+    root = Path(__file__).resolve().parent.parent.parent
+    for folder in _STORE_ICON_DIRS:
+        for ext in ("svg", "png", "jpg", "webp"):
+            rel = f"{folder}/{fw}.{ext}"
+            if (root / rel).is_file():
+                return "/" + rel
+    return ""
+
+
+def _avatar_url(name: str) -> str:
+    """URL for this agent's avatar, or "" when no image is installed.
+
+    Checked server-side so the page never points an <img> at a 404 -- the client
+    falls back to a monogram, and it should do that from the start rather than
+    after a failed request paints a broken frame.
+    """
+    slug = _avatar_slug(name)
+    if not slug:
+        return ""
+    if not (Path(LOCK_AVATAR_DIR) / f"{slug}.jpg").is_file():
+        return ""
+    return f"/auth/lock-avatar/{slug}"
+
+
+@router.get("/lock-widgets")
+async def lock_widgets(request: Request):
+    """Agent activity + scheduled tasks for the lock screen. Console-only.
+
+    This is rendered BEFORE sign-in, which is exactly why it is narrow: it
+    returns NAMES, STATUSES AND COUNTS and nothing else. The agent config is
+    never serialised here -- it carries per-agent LLM keys, and this endpoint is
+    reachable without a session. The console gate is the second half of that
+    containment: a LAN browser gets 403 and learns nothing, so the exposure is
+    the same one a phone lock screen already makes to whoever is holding it.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+
+    agents: list[dict] = []
+    try:
+        configured = request.app.state.config.agents or []
+    except AttributeError:
+        configured = []
+    # Container status is best-effort: on a host with no container runtime the
+    # import or the call raises, and a lock screen that 500s because the phone
+    # has no LXC is worse than one that simply shows no status.
+    status_by_name: dict[str, str] = {}
+    try:
+        from tinyagentos.containers import list_containers
+
+        for c in await list_containers(prefix="taos-agent-"):
+            status_by_name[c.name.removeprefix("taos-agent-")] = c.status
+    except Exception:  # noqa: BLE001 - any runtime absence degrades to "no status"
+        status_by_name = {}
+
+    for entry in configured:
+        name = entry.get("name") if isinstance(entry, dict) else str(entry)
+        if not name:
+            continue
+        framework = ""
+        if isinstance(entry, dict):
+            framework = str(entry.get("framework") or entry.get("harness") or "")
+        agents.append({
+            "name": str(name),
+            "framework": framework.lower(),
+            "framework_icon": _framework_icon(framework),
+            "status": status_by_name.get(str(name), ""),
+            "avatar": _avatar_url(str(name)),
+        })
+
+    # The OS's own agent is pinned to the top and is not one of the configured
+    # ones: it is part of the device rather than something the user added. It
+    # carries the product mark rather than a monogram, and the OMP harness badge
+    # like any other agent -- it runs on OMP (oh-my-pi) over ACP, see
+    # tinyagentos/adapters/omp_adapter.py.
+    # Its "status" says WHERE it is, not that it is busy -- this endpoint runs
+    # pre-auth and has no cheap, truthful way to read the agent's activity.
+    agents.insert(0, {
+        "name": "taOS Agent",
+        "framework": "omp",
+        "framework_icon": _framework_icon("omp"),
+        "status": "On device",
+        "avatar": "/static/taos-logo.png",
+        "system": True,
+    })
+
+    tasks: list[dict] = []
+    try:
+        scheduler = request.app.state.scheduler
+        for task in await scheduler.list_tasks():
+            item = task if isinstance(task, dict) else {}
+            tasks.append({
+                "name": str(item.get("name", "") or ""),
+                "schedule": str(item.get("schedule", "") or ""),
+                "agent": str(item.get("agent_name", "") or ""),
+            })
+    except Exception:  # noqa: BLE001 - no scheduler on this host: show no tasks
+        tasks = []
+
+    # Demo override. OFF unless TAOS_LOCK_DEMO_AGENTS is set, and it only ever
+    # ADDS named placeholders to this one read-only lock-screen endpoint -- it
+    # writes nothing, creates no agents and changes no other surface. It exists
+    # so a demo machine can show a populated lock screen without standing up
+    # three real container-backed agents first; anything it lists is a
+    # placeholder, not a running process.
+    demo = os.environ.get("TAOS_LOCK_DEMO_AGENTS", "").strip()
+    if demo:
+        existing = {a["name"] for a in agents}
+        for raw in demo.split(","):
+            # "Name", "Name:framework" or "Name:framework:status text"
+            parts = [seg.strip() for seg in raw.split(":")]
+            label = parts[0] if parts else ""
+            if label and label not in existing:
+                agents.append({
+                    "name": label,
+                    "framework": parts[1].lower() if len(parts) > 1 and parts[1] else "",
+                    "framework_icon": _framework_icon(parts[1] if len(parts) > 1 else ""),
+                    "status": parts[2] if len(parts) > 2 and parts[2] else "running",
+                    "avatar": _avatar_url(label),
+                    # Marked at creation so nothing downstream has to work out
+                    # which of these entries is a placeholder by elimination.
+                    "demo": True,
+                })
+
+    # Pending decisions. An agent that is blocked waiting on a human is the one
+    # thing on this screen that is actually ASKING for something, so it gets the
+    # attention ring -- everything else here is status. Best-effort for the same
+    # reason as the container statuses: a host with no decision store should
+    # show a lock screen, not a 500.
+    #
+    # Only the question and its options cross the pre-auth boundary, never the
+    # decision's context or notes: the question is a one-line prompt the holder
+    # of the phone needs in order to know the phone wants them, while the
+    # context is free text an agent may have filled with anything.
+    pending: list[dict] = []
+    try:
+        store = request.app.state.decision_store
+        pending = await store.list(status="pending", limit=20)
+    except Exception:  # noqa: BLE001 - no decision store on this host: no ring
+        pending = []
+
+    # The store returns newest-first. If an agent has asked twice, the question
+    # to surface is the one that has been WAITING longest, so walk oldest-first
+    # and keep the first hit per agent.
+    by_agent: dict[str, dict] = {}
+    for d in reversed(pending):
+        agent_key = str(d.get("from_agent") or "").strip().lower()
+        if agent_key and agent_key not in by_agent:
+            by_agent[agent_key] = d
+
+    def _attach(agent: dict) -> None:
+        d = by_agent.get(agent["name"].strip().lower())
+        if not d:
+            return
+        options = d.get("options") or []
+        labels = [
+            str(o.get("label") or o.get("value") or "")
+            for o in options
+            if isinstance(o, dict)
+        ]
+        agent["attention"] = True
+        agent["decision"] = {
+            "id": str(d.get("id") or ""),
+            "question": str(d.get("question") or ""),
+            "priority": str(d.get("priority") or "normal"),
+            "options": [lbl for lbl in labels if lbl][:4],
+        }
+
+    for agent in agents:
+        _attach(agent)
+
+    # Demo decision. Same single flag as the demo agents, and it is attached to
+    # an agent that is already a placeholder -- it never marks a REAL agent as
+    # waiting on a human, because a fabricated ring on a real agent would be a
+    # lie about the state of the machine. It carries no decision id, which is
+    # what the client uses to tell a demo prompt from an answerable one.
+    if demo and not any(a.get("attention") for a in agents):
+        want = os.environ.get("TAOS_LOCK_DEMO_DECISION_AGENT", "").strip().lower()
+        target = None
+        for a in agents:
+            if not a.get("demo") or a.get("system"):
+                continue
+            if want and a["name"].strip().lower() != want:
+                continue
+            target = a
+            break
+        if target is not None:
+            target["attention"] = True
+            target["decision"] = {
+                "id": "",
+                "question": os.environ.get(
+                    "TAOS_LOCK_DEMO_DECISION",
+                    "Approve \u00a31,340 for the second Raspberry Pi order?",
+                ),
+                "priority": "normal",
+                "options": ["Approve", "Deny"],
+                "demo": True,
+            }
+
+    # Anything with a status that is not an explicit resting word is doing
+    # something -- the demo statuses are free text ("Drafting replies"), so an
+    # equality test against "running" would report every busy agent as idle.
+    resting = {"", "stopped", "idle", "exited", "error"}
+    running = sum(
+        1 for a in agents
+        if not a.get("system") and a["status"].strip().lower() not in resting
+    )
+    return JSONResponse({
+        "agents": agents[:6],
+        "agent_total": len(agents),
+        "agent_running": running,
+        "tasks": tasks[:4],
+        "task_total": len(tasks),
+        "threads": bool(demo),
+    })
+
+
+
+#: Where lock-screen agent avatars are read from. One flat directory of
+#: "<slug>.jpg" files, slug being the agent name lowercased with non-alphanumerics
+#: collapsed to "-". Overridable so a packaged install can point it at its own
+#: data dir rather than this default.
+LOCK_AVATAR_DIR = os.environ.get("TAOS_LOCK_AVATAR_DIR", "/var/lib/taos/lock-avatars")
+
+
+def _avatar_slug(name: str) -> str:
+    """Slug for an agent name, restricted to characters that cannot traverse.
+
+    Anything outside [a-z0-9-] is dropped rather than escaped: this value is
+    used to build a filesystem path, so a conservative whitelist is the control
+    that keeps "../" and absolute paths out, not a sanitiser that tries to spot
+    bad input.
+    """
+    out = []
+    for ch in name.strip().lower():
+        if ch.isalnum() and ch.isascii():
+            out.append(ch)
+        elif out and out[-1] != "-":
+            out.append("-")
+    return "".join(out).strip("-")
+
+
+@router.get("/lock-avatar/{slug}")
+async def lock_avatar(slug: str, request: Request):
+    """Serve one lock-screen avatar. Console-only, same reasoning as the widgets.
+
+    The slug is re-derived through the same whitelist before it touches the
+    filesystem, so a crafted request cannot address a file outside the avatar
+    directory even if the router hands us a path-shaped segment.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+
+    safe = _avatar_slug(slug)
+    if not safe:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    path = Path(LOCK_AVATAR_DIR) / f"{safe}.jpg"
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return Response(
+        content=data,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+#: Demo conversation scripts for the lock-screen chat sheet, keyed by avatar
+#: slug. These exist so a DEMO device can show a populated thread; they are not
+#: an agent's real conversation and never touch the chat store.
+#:
+#: The lock screen renders BEFORE sign-in, so serving an agent's real messages
+#: here would hand whoever is holding the phone the contents of every
+#: conversation on it. That is why this endpoint serves SCRIPTED TEXT ONLY and
+#: 404s when demo mode is off: there is no code path from the lock screen to a
+#: real transcript, so there is nothing to get the gate wrong about.
+#:
+#: Each entry is (days_ago, hh, mm, role, text). Fixed offsets rather than
+#: stored timestamps so the thread always reads as "the last few weeks",
+#: whenever the demo happens to be run.
+_DEMO_THREADS: dict[str, tuple[tuple[int, int, int, str, str], ...]] = {
+    "taos-agent": (
+        (18, 9, 15, "user", "What can you actually do?"),
+        (18, 9, 15, "agent", "I run this device. Open and arrange apps, manage your projects and files, remember things for you, and talk to the other agents on here. If you ask me for something one of them is better at, I hand it over."),
+        (16, 21, 30, "user", "the phone felt warm earlier"),
+        (16, 21, 31, "agent", "CPU sat at 78\u00b0C for about 20 minutes during the model download. It is back to 41\u00b0C now. Nothing was throttled."),
+        (13, 8, 45, "agent", "Storage is at 71%. The biggest single item is the model cache at 9.2 GB. I can clear the unused ones whenever you want."),
+        (13, 8, 50, "user", "not yet"),
+        (10, 19, 5, "user", "can you put the calendar next to the chat"),
+        (10, 19, 5, "agent", "Done \u2014 calendar on the left, chat on the right, split even."),
+        (7, 11, 20, "agent", "An update is available: beta.52. It is a packaging fix plus the install reliability work. Nothing on this device depends on it, so it can wait for you."),
+        (4, 15, 40, "user", "remind me what we changed on the kiosk"),
+        (4, 15, 41, "agent", "The compositor moved from cage to sway so the screen can genuinely power off after 30 seconds. Before that it could only dim, which left the panel lit and touch live."),
+        (1, 8, 0, "agent", "Backup completed overnight. 4 of 4 sets, nothing skipped."),
+        (0, 7, 35, "agent", "Everything is healthy this morning. Battery 82%, no pending updates, five agents running."),
+    ),
+    "personal-assistant": (
+        (19, 8, 12, "user", "Morning. What does today look like?"),
+        (19, 8, 12, "agent", "Three things. Dentist at 11:40, the Hargreaves call moved to 15:00, and your sister's flight lands 19:25. I left a gap either side of the call."),
+        (19, 8, 13, "user", "Can you push the dentist?"),
+        (19, 8, 15, "agent", "Moved to Thursday 09:15 \u2014 they had a cancellation. Confirmed by text."),
+        (17, 20, 41, "agent", "Heads up: the car insurance renews on the 3rd at \u00a3612, up from \u00a3489. I pulled four quotes, cheapest comparable is \u00a3501. Want me to lay them out?"),
+        (17, 20, 44, "user", "Yes but not tonight"),
+        (17, 20, 44, "agent", "Filed it for Saturday morning."),
+        (14, 9, 2, "user", "Did I ever reply to Marcus?"),
+        (14, 9, 3, "agent", "No. His last message was the 28th asking about the workshop dates. Draft ready if you want it."),
+        (14, 9, 5, "user", "Send it"),
+        (14, 9, 5, "agent", "Sent."),
+        (11, 13, 30, "agent", "Your passport expires in 5 months. Several countries want 6, so if anything is booked after March it needs renewing now. The form takes about 20 minutes."),
+        (8, 7, 55, "user", "Remind me to call mum"),
+        (8, 7, 55, "agent", "Every Sunday at 18:00, or just this week?"),
+        (8, 7, 56, "user", "every sunday"),
+        (8, 7, 56, "agent", "Done. First one this Sunday."),
+        (5, 16, 20, "agent", "The Hargreaves invoice is 21 days overdue. I have a polite chase drafted and a firmer one. Neither is sent."),
+        (2, 10, 11, "user", "How much did we spend on groceries last month?"),
+        (2, 10, 11, "agent", "\u00a3418, across 14 shops. That is \u00a367 up on the month before, almost all of it two big Ocado orders on the 8th and the 22nd."),
+        (0, 7, 40, "agent", "Good morning. Quiet day \u2014 one call at 14:00 and the parcel is out for delivery."),
+    ),
+    "social-media-manager": (
+        (20, 11, 5, "agent", "The Tuesday build-in-public post did well: 2.4k views, 41 replies. The thread format is clearly beating the single post."),
+        (20, 11, 9, "user", "do more of those"),
+        (20, 11, 9, "agent", "Switching the Tuesday and Friday slots to threads. I will keep the Monday one short."),
+        (18, 15, 44, "agent", "Someone with 80k followers quoted the roadmap post and called it \u201cthe first self-hosted thing I would actually give my parents\u201d. Worth a reply?"),
+        (18, 15, 50, "user", "reply but dont be weird about it"),
+        (18, 15, 52, "agent", "Replied: thanked them, no pitch, no link."),
+        (15, 9, 30, "agent", "Drafted 6 posts for next week. Three are screenshots, two are short clips, one is the release note. All queued, none published."),
+        (12, 18, 2, "user", "why did engagement drop friday"),
+        (12, 18, 3, "agent", "Posted at 16:40 local, which is 11:40 for most of the audience \u2014 the worst slot in the data. The 09:00 slot averages 3.1x that."),
+        (12, 18, 4, "user", "move everything to 9"),
+        (12, 18, 4, "agent", "Moved."),
+        (9, 12, 15, "agent", "A reply is getting heated on the pricing post. Two people arguing, neither with us. I have not engaged."),
+        (9, 12, 20, "user", "leave it"),
+        (6, 8, 48, "agent", "The clip of the phone booting into taOS is the best-performing asset this month by a distance. I can cut three more from the same recording."),
+        (6, 8, 49, "user", "yes"),
+        (3, 14, 0, "agent", "Follower count crossed 5,000 this morning. Up 640 in three weeks, mostly from the two thread posts."),
+        (1, 10, 30, "agent", "Next week's queue is full and reviewed. Nothing goes out without your yes on the release post."),
+        (0, 9, 10, "agent", "Morning. One post scheduled for 09:00, already out."),
+    ),
+    "accountant": (
+        (21, 10, 0, "agent", "Q3 books are reconciled. Two transactions I could not categorise \u2014 \u00a3240 on the 14th and \u00a389 on the 22nd, both card, no description."),
+        (21, 10, 6, "user", "240 was the monitor, 89 was a domain renewal"),
+        (21, 10, 6, "agent", "Filed as equipment and software. Both allowable."),
+        (16, 9, 20, "agent", "VAT return is due in 11 days. The figure is \u00a34,182.60. I have it prepared but not submitted."),
+        (16, 9, 40, "user", "does that account for the refund"),
+        (16, 9, 42, "agent", "It does \u2014 the \u00a3610 refund on the 9th is netted off. Without it the figure would be \u00a34,304.60."),
+        (13, 17, 12, "agent", "Your accountant's fee invoice arrived, \u00a3750. It is 40% higher than last year with no explanation attached. Want me to ask?"),
+        (13, 17, 30, "user", "ask, politely"),
+        (13, 17, 31, "agent", "Asked."),
+        (10, 11, 45, "agent", "They replied: the increase is the extra payroll run you added in June. Legitimate. I have approved it for payment on the due date."),
+        (7, 8, 30, "agent", "Cash position: \u00a318,420 available, \u00a36,900 committed in the next 30 days. Comfortable."),
+        (4, 15, 55, "user", "can we afford the second Pi order"),
+        (4, 15, 56, "agent", "Yes. \u00a31,340 leaves \u00a310,180 of headroom after the VAT payment. It is a capital purchase, so it also reduces this year's profit."),
+        (4, 15, 58, "user", "order it"),
+        (4, 15, 58, "agent", "That is a payment, so it needs your explicit approval in the Decisions app. Raised."),
+        (1, 9, 15, "agent", "Two invoices went out this morning, \u00a32,100 total. Both 14-day terms."),
+        (0, 8, 5, "agent", "Nothing overdue today. VAT is the only live deadline."),
+    ),
+    "sales-manager": (
+        (20, 9, 40, "agent", "Pipeline is 11 live conversations. Four are warm, two have budget confirmed, the rest are early."),
+        (18, 14, 10, "agent", "Westbrook asked for a 20% discount on a 12-seat deal. That is below the floor you set. I have not answered."),
+        (18, 14, 22, "user", "offer 10 and annual prepay"),
+        (18, 14, 23, "agent", "Sent. Framed as a prepay discount rather than a price cut, so it does not reset their anchor."),
+        (15, 11, 30, "agent", "Westbrook accepted. 12 seats, annual, signed. That is the biggest deal this quarter."),
+        (15, 11, 31, "user", "nice"),
+        (12, 16, 45, "agent", "Two deals have gone quiet for 9 days. Both went silent right after the security questionnaire, which suggests the questionnaire is the problem, not the price."),
+        (12, 16, 50, "user", "what do they ask that we fail"),
+        (12, 16, 52, "agent", "SOC 2 and a documented incident response. We have neither. Every other question we pass."),
+        (9, 10, 5, "agent", "Drafted a one-page security summary that answers 80% of the questionnaire honestly and says plainly what we do not have yet. Ready for your review."),
+        (5, 13, 20, "agent", "The honest summary unstuck one of the two. They booked a call for Thursday."),
+        (2, 9, 55, "agent", "Renewals: three accounts come up in the next 6 weeks, \u00a38,400 combined. All three have used the product in the last 7 days, so none look at risk."),
+        (0, 8, 30, "agent", "One call today at 15:00. Brief is in your inbox."),
+    ),
+    "customer-service": (
+        (21, 8, 0, "agent", "Inbox cleared overnight. 14 tickets, 11 resolved, 3 escalated to you."),
+        (19, 12, 30, "agent", "Same install error from four different people this week \u2014 the installer dies silently partway through when the SSH session drops. I filed it rather than answering each one."),
+        (19, 12, 40, "user", "good catch"),
+        (16, 9, 10, "agent", "The fix shipped. I replied to all four with the release and an apology. Two have already confirmed it works."),
+        (14, 15, 20, "agent", "A user is unhappy about the beta cadence \u2014 says updates break things too often. It reads as a real complaint, not noise."),
+        (14, 15, 35, "user", "what do you suggest"),
+        (14, 15, 37, "agent", "Offer them the stable channel and be honest that beta is beta. I would not promise a slower cadence."),
+        (14, 15, 38, "user", "do that"),
+        (11, 10, 0, "agent", "They moved to stable and thanked us. Ticket closed."),
+        (8, 17, 45, "agent", "Median first reply is now 22 minutes, down from 3 hours when I started. 96% resolved without escalation."),
+        (5, 11, 12, "agent", "Someone asked for a refund outside the window. That is a money decision, so it is yours \u2014 raised in Decisions, not answered."),
+        (2, 9, 30, "agent", "Quiet week. 6 tickets, all resolved, none escalated."),
+        (0, 7, 50, "agent", "Two tickets open, both answered and waiting on the user."),
+    ),
+}
+
+#: Shown when a demo agent has no scripted thread of its own. Deliberately
+#: short: a generic filler thread pretending to be weeks of history would be
+#: more misleading than an obviously new conversation.
+_DEMO_THREAD_FALLBACK: tuple[tuple[int, int, int, str, str], ...] = (
+    (2, 9, 30, "agent", "I am set up and running. Nothing to report yet."),
+    (0, 8, 15, "agent", "Still nothing that needs you. I will speak up when there is."),
+)
+
+
+def _demo_enabled() -> bool:
+    """Whether the lock screen's demo content is switched on.
+
+    One flag governs the placeholder agents, their scripted threads and the
+    demo decision, so a machine cannot end up showing invented conversations
+    while believing it is in its real state.
+    """
+    return bool(os.environ.get("TAOS_LOCK_DEMO_AGENTS", "").strip())
+
+
+def _demo_thread(slug: str) -> list[dict]:
+    """Build one scripted thread as absolute timestamps relative to now."""
+    script = _DEMO_THREADS.get(slug, _DEMO_THREAD_FALLBACK)
+    now = datetime.now()
+    out: list[dict] = []
+    for days_ago, hh, mm, role, text in script:
+        when = (now - timedelta(days=days_ago)).replace(
+            hour=hh, minute=mm, second=0, microsecond=0
+        )
+        out.append({"role": role, "text": text, "at": when.timestamp()})
+    return out
+
+
+@router.get("/lock-thread/{slug}")
+async def lock_thread(slug: str, request: Request):
+    """Scripted conversation for the lock screen's chat sheet. Console-only.
+
+    DEMO CONTENT ONLY. This never reads the chat store: the lock screen is
+    pre-authentication, so a real transcript served here would be readable by
+    anyone holding the phone. With demo mode off there is no thread to serve
+    and the answer is 404, which is also what an unknown agent gets.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    if not _demo_enabled():
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    safe = _avatar_slug(slug)
+    if not safe:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({"slug": safe, "messages": _demo_thread(safe), "demo": True})
+
+
+#: The lock screen's weather is FIXED to Liverpool, in Celsius and mph.
+#:
+#: Not a preference and not a lookup: this surface renders BEFORE sign-in, so
+#: there is no account to read a home town from, and the alternative -- asking
+#: the browser for geolocation -- would put a permission prompt on a locked
+#: phone, aimed at whoever is holding it. A constant is the honest answer.
+_WEATHER_PLACE = "Liverpool"
+_WEATHER_LAT = 53.4084
+_WEATHER_LON = -2.9916
+
+#: Open-Meteo needs no API key, which is the whole reason it is the source: a
+#: key would have to live on the device, and this endpoint answers anyone
+#: holding the phone.
+_WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+
+#: A lock screen repaints every time the phone is woken. Without a cache a
+#: pocketed handset would call the forecast API dozens of times an hour for a
+#: number that changes four times a day.
+_WEATHER_TTL_SECONDS = 900
+_WEATHER_TIMEOUT_SECONDS = 6.0
+
+_weather_cached: dict | None = None
+_weather_cached_at: float = 0.0
+#: Serialises the refresh, so a wake that paints several times does one call
+#: rather than one per paint.
+_weather_lock = asyncio.Lock()
+
+#: WMO weather code -> (what to call it, which icon the page should draw).
+#:
+#: The icon name is decided HERE rather than in the script so the wording and
+#: the picture cannot drift apart: the page owns eight shapes and is told which
+#: one to use. Codes absent from this table fall back to plain cloud, which is
+#: wrong-ish rather than blank.
+_WMO_CONDITIONS: dict[int, tuple[str, str]] = {
+    0: ("Clear", "clear"),
+    1: ("Mainly clear", "clear"),
+    2: ("Partly cloudy", "partly"),
+    3: ("Overcast", "cloud"),
+    45: ("Fog", "fog"),
+    48: ("Freezing fog", "fog"),
+    51: ("Light drizzle", "drizzle"),
+    53: ("Drizzle", "drizzle"),
+    55: ("Heavy drizzle", "drizzle"),
+    56: ("Freezing drizzle", "drizzle"),
+    57: ("Freezing drizzle", "drizzle"),
+    61: ("Light rain", "rain"),
+    63: ("Rain", "rain"),
+    65: ("Heavy rain", "rain"),
+    66: ("Freezing rain", "rain"),
+    67: ("Freezing rain", "rain"),
+    71: ("Light snow", "snow"),
+    73: ("Snow", "snow"),
+    75: ("Heavy snow", "snow"),
+    77: ("Snow grains", "snow"),
+    80: ("Light showers", "rain"),
+    81: ("Showers", "rain"),
+    82: ("Heavy showers", "rain"),
+    85: ("Snow showers", "snow"),
+    86: ("Snow showers", "snow"),
+    95: ("Thunderstorm", "storm"),
+    96: ("Thunderstorm", "storm"),
+    99: ("Thunderstorm", "storm"),
+}
+
+
+def _weather_condition(code: int, is_day: bool) -> tuple[str, str]:
+    """Name and icon for one WMO code, with the night variant of a clear sky."""
+    label, icon = _WMO_CONDITIONS.get(int(code), ("Cloudy", "cloud"))
+    if icon == "clear" and not is_day:
+        return (label, "night")
+    return (label, icon)
+
+
+async def _fetch_weather() -> dict | None:
+    """One call to the forecast API, shaped into what the lock screen draws.
+
+    Returns None on any failure. Every caller treats that as "show no weather":
+    a lock screen that renders an error string because a forecast host was slow
+    is worse than one that simply has no weather line.
+    """
+    params = {
+        "latitude": _WEATHER_LAT,
+        "longitude": _WEATHER_LON,
+        "current": "temperature_2m,apparent_temperature,is_day,weather_code,wind_speed_10m",
+        "daily": "temperature_2m_max,temperature_2m_min",
+        "timezone": "Europe/London",
+        "temperature_unit": "celsius",
+        "wind_speed_unit": "mph",
+        "forecast_days": 1,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=_WEATHER_TIMEOUT_SECONDS) as client:
+            resp = await client.get(_WEATHER_URL, params=params)
+            resp.raise_for_status()
+            payload = resp.json()
+    except Exception as exc:  # noqa: BLE001 - offline, DNS, timeout, bad JSON
+        logger.debug("lock-screen weather fetch failed: %s", exc)
+        return None
+
+    current = payload.get("current") or {}
+    daily = payload.get("daily") or {}
+    temp = current.get("temperature_2m")
+    if temp is None:
+        return None
+
+    label, icon = _weather_condition(
+        current.get("weather_code") or 0,
+        bool(current.get("is_day", 1)),
+    )
+
+    def first(seq, default=None):
+        return seq[0] if isinstance(seq, list) and seq else default
+
+    return {
+        "place": _WEATHER_PLACE,
+        "temp": float(temp),
+        "feels": current.get("apparent_temperature"),
+        "label": label,
+        "icon": icon,
+        "wind": current.get("wind_speed_10m"),
+        "high": first(daily.get("temperature_2m_max")),
+        "low": first(daily.get("temperature_2m_min")),
+        # Stated rather than implied: the page renders "°" and "mph" and should
+        # not have to assume which system produced the numbers.
+        "units": {"temperature": "celsius", "wind": "mph"},
+    }
+
+
+async def _weather_reading() -> dict | None:
+    """The cached reading, refreshed at most every _WEATHER_TTL_SECONDS.
+
+    A failed refresh keeps serving the last good reading rather than blanking
+    the row: a stale temperature is still roughly true, and a line that
+    disappears every time the phone's link drops looks broken.
+    """
+    global _weather_cached, _weather_cached_at
+
+    now = time.time()
+    if _weather_cached is not None and now - _weather_cached_at < _WEATHER_TTL_SECONDS:
+        return _weather_cached
+
+    async with _weather_lock:
+        # Re-check under the lock: several paints can queue behind one refresh.
+        now = time.time()
+        if _weather_cached is not None and now - _weather_cached_at < _WEATHER_TTL_SECONDS:
+            return _weather_cached
+        fresh = await _fetch_weather()
+        if fresh is not None:
+            _weather_cached = fresh
+            _weather_cached_at = now
+    return _weather_cached
+
+
+@router.get("/lock-weather")
+async def lock_weather(request: Request):
+    """Weather for the lock screen. Console-only, fetched SERVER-SIDE.
+
+    The page deliberately does not call the forecast API itself. The lock screen
+    paints before sign-in and every time the screen wakes, so a browser-side
+    call would announce this device to a third-party host on every wake, from a
+    surface nobody has authenticated to. Going through the server also means the
+    result can be cached once for the device instead of per page load.
+
+    Nothing here is account-derived: a fixed city, a public forecast, no key.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    reading = await _weather_reading()
+    if reading is None:
+        # The page treats a non-200 as "no weather" and leaves the row hidden.
+        return JSONResponse({"error": "unavailable"}, status_code=503)
+    return JSONResponse(reading)
+
+
+#: Scripted lock-screen notifications, collated per source.
+#:
+#: DEMO CONTENT, and it can never be anything else. The lock screen renders
+#: BEFORE sign-in, so serving real mail, real messages or a real call log here
+#: would hand the contents of the phone to whoever picked it up. This table is
+#: the only thing /auth/lock-notifications can serve, which is why there is no
+#: gate to get wrong: there is no code path from this screen to an inbox.
+#:
+#: Each item is (minutes_ago, title, text). Offsets rather than timestamps so
+#: the stack always reads as "this morning", whenever the demo is run. The
+#: tints are the colours the app tiles are drawn in; `glyph` picks one of the
+#: page's three drawn marks and `mono` is the letterform used when there is no
+#: glyph for that source.
+_DEMO_NOTIFICATIONS: tuple[dict, ...] = (
+    {
+        "source": "mail",
+        "app": "Mail",
+        "glyph": "mail",
+        "tint": "#2f6fd0",
+        "items": (
+            (12, "Hargreaves & Co", "Re: Thursday's site visit — 09:15 works for us. I'll bring the revised drawings."),
+            (74, "Companies House", "Your confirmation statement is due on 3 October."),
+            (221, "Liverpool FC", "Your ticket ballot result for Newcastle (H) is ready to view."),
+        ),
+    },
+    {
+        "source": "x",
+        "app": "X",
+        "mono": "X",
+        "tint": "#3b3b42",
+        "items": (
+            (8, "@marcus_dev mentioned you", "what's the actual memory floor for running this on a 4GB board?"),
+            (96, "12 posts from people you follow", "including 3 about on-device inference"),
+        ),
+    },
+    {
+        "source": "reddit",
+        "app": "Reddit",
+        "mono": "r",
+        "tint": "#ff4500",
+        "items": (
+            (34, "r/selfhosted · 47 upvotes", "Someone replied to your comment on “Running an agent OS on a single board”."),
+            (150, "r/LocalLLaMA", "Today's discussion thread is up."),
+        ),
+    },
+    {
+        "source": "phone",
+        "app": "Phone",
+        "glyph": "phone",
+        "tint": "#34c759",
+        "items": (
+            (41, "Missed call", "2 missed calls"),
+        ),
+    },
+    {
+        "source": "sms",
+        "app": "Messages",
+        "glyph": "sms",
+        "tint": "#25c05d",
+        "items": (
+            (19, "Sam", "are you still alright for Sunday?"),
+            (310, "O2", "You've used 80% of your data allowance this month."),
+        ),
+    },
+)
+
+
+def _demo_notifications() -> list[dict]:
+    """The scripted stacks, timestamped relative to now and newest-first.
+
+    Sorted by each stack's newest item, the way a phone orders its notification
+    list -- a fixed table order would leave an hours-old stack sitting above one
+    that arrived a minute ago.
+    """
+    now = time.time()
+    groups: list[dict] = []
+    for spec in _DEMO_NOTIFICATIONS:
+        items = [
+            {
+                "title": title,
+                "text": text,
+                "at": now - (minutes_ago * 60),
+            }
+            for minutes_ago, title, text in spec["items"]
+        ]
+        items.sort(key=lambda item: item["at"], reverse=True)
+        groups.append({
+            "source": spec["source"],
+            "app": spec["app"],
+            "glyph": spec.get("glyph", ""),
+            "mono": spec.get("mono", ""),
+            "tint": spec.get("tint", ""),
+            "items": items,
+            # Marked at construction so nothing downstream has to work out that
+            # these are placeholders by elimination.
+            "demo": True,
+        })
+    groups.sort(key=lambda group: group["items"][0]["at"], reverse=True)
+    return groups
+
+
+@router.get("/lock-notifications")
+async def lock_notifications(request: Request):
+    """Collated notification stacks for the lock screen. Console-only.
+
+    DEMO CONTENT ONLY, on the same flag as the placeholder agents and their
+    scripted threads: one switch governs everything invented on this screen, so
+    a device cannot end up showing made-up mail while believing it is in its
+    real state. With demo mode off there is nothing to serve and the answer is
+    404 -- the page treats that as "no notifications" and renders no stack.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    if not _demo_enabled():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse({"groups": _demo_notifications(), "demo": True})
 
 
 @router.post("/pin-login")

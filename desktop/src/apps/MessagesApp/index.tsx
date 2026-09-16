@@ -16,6 +16,7 @@ import {
   Clock,
   Play,
   Sparkles,
+  Globe,
 } from "lucide-react";
 import {
   Button,
@@ -100,7 +101,7 @@ interface OpenMessagesDetail {
 interface Channel {
   id: string;
   name: string;
-  type: "dm" | "topic" | "group";
+  type: "dm" | "dm-remote" | "topic" | "group";
   description?: string;
   topic?: string;
   members?: string[];
@@ -1981,6 +1982,7 @@ export function MessagesApp({
     scope?.projectId ? c.project_id === scope.projectId : !c.project_id;
   const grouped = {
     dm: channels.filter((c) => c.type === "dm" && inSidebarSection(c)),
+    "dm-remote": channels.filter((c) => c.type === "dm-remote" && inSidebarSection(c)),
     topic: channels.filter((c) => c.type === "topic" && inSidebarSection(c)),
     group: channels.filter((c) => c.type === "group" && inSidebarSection(c)),
   };
@@ -2004,7 +2006,7 @@ export function MessagesApp({
   // In a DM (2 members: user + 1 agent), a leading "/" opens the agent's
   // slash menu.  In a group channel (3+ members), the user must prefix
   // with "@agentname /" so we know which agent's commands to show.
-  const isDm = (currentChannel?.members?.length ?? 0) === 2;
+  const isDm = (currentChannel?.members?.length ?? 0) === 2 || currentChannel?.type === "dm-remote";
   const showSlash = isDm ? input.startsWith("/") : /^@\S+\s+\//.test(input);
   // The agent scoped by "@agentname /" (group only; undefined in DM).
   const slashAgent = !isDm && showSlash ? input.match(/^@(\S+)\s+\//)?.[1] || undefined : undefined;
@@ -2085,6 +2087,9 @@ export function MessagesApp({
     { label: "Channels", icon: <Hash size={13} />, items: [...grouped.topic, ...grouped.group] },
     { label: "Agents-DMs", icon: <Bot size={13} />, items: [...dmSections.live, ...dmSections.suspended, ...dmSections.archived] },
     { label: "Direct Messages", icon: <AtSign size={13} />, items: dmSections.nonAgent },
+    ...(grouped["dm-remote"].length > 0
+      ? [{ label: "Remote", icon: <Globe size={13} />, items: grouped["dm-remote"] }]
+      : []),
   ].filter((s) => s.items.length > 0 || s.label === "Channels");
 
   const allEmpty =

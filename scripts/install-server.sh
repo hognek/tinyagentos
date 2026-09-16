@@ -6,7 +6,7 @@
 # http://<host>:6969 immediately after the script exits.
 #
 # Usage:
-#     curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo bash
+#     curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo sh
 #
 # or download + inspect + run:
 #     curl -O https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh
@@ -32,6 +32,60 @@
 #                               auto = use btrfs/zfs if /var/lib is on CoW fs, fall back to dir
 #                               btrfs/zfs = force a specific CoW driver (requires matching fs)
 #                               dir = force directory-backed pool (no CoW, slower clones)
+# --- POSIX bootstrap ------------------------------------------------------
+# Everything from here down to the re-exec must parse and run under POSIX sh.
+#
+# The interpreter is chosen by the PIPE, not by the shebang above: the README
+# one-liner feeds this file to `sudo sh`, so on an image that ships no bash the
+# old `sudo bash` form died at `sudo: 'bash': command not found` before a single
+# line ran -- which meant ensure_linux_deps() below, including its apk branch,
+# could never install anything. Alpine and postmarketOS ship neither bash nor
+# git. Reported by an end-user tester on postmarketOS, 2026-09-15.
+#
+# Installing bash and re-execing is the whole job here. The rest of the script
+# stays bash on purpose; it is thousands of lines of bash-only constructs and
+# rewriting it in POSIX sh is not the fix.
+if [ -z "${BASH_VERSION:-}" ]; then
+    if ! command -v bash >/dev/null 2>&1; then
+        echo "[taos-install] bash is required and this image does not ship it; installing" >&2
+        if command -v apk >/dev/null 2>&1; then
+            sudo apk add --no-cache bash
+        elif command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq bash
+        elif command -v dnf >/dev/null 2>&1; then
+            sudo dnf install -y -q bash
+        elif command -v pacman >/dev/null 2>&1; then
+            sudo pacman -Sy --noconfirm --needed bash
+        else
+            echo "[taos-install] FATAL: no supported package manager found, so bash cannot be" >&2
+            echo "[taos-install] installed automatically. Install bash by hand, then re-run this" >&2
+            echo "[taos-install] command." >&2
+            exit 1
+        fi
+    fi
+    if ! command -v bash >/dev/null 2>&1; then
+        echo "[taos-install] FATAL: bash is still not on PATH after the install attempt." >&2
+        exit 1
+    fi
+    # Re-exec under bash. Under `curl | sh` this script arrives on STDIN, so "$0"
+    # is not a readable path and the remaining input has already been partly
+    # consumed by the parser -- re-reading stdin would hand bash a truncated
+    # script. Fetch a clean copy instead. When the file IS on disk (the
+    # download-inspect-run path) just use it, so an audited local copy is the
+    # thing that actually executes.
+    if [ -r "$0" ] && [ "$0" != "sh" ] && [ "$0" != "-" ]; then
+        exec bash "$0" "$@"
+    fi
+    _taos_boot_url="${TAOS_BOOTSTRAP_URL:-https://raw.githubusercontent.com/jaylfc/taOS/${TAOS_BRANCH:-master}/scripts/install-server.sh}"
+    _taos_self="$(mktemp)" || exit 1
+    if ! curl -fsSL "$_taos_boot_url" -o "$_taos_self"; then
+        echo "[taos-install] FATAL: could not re-fetch the installer from $_taos_boot_url" >&2
+        rm -f "$_taos_self"
+        exit 1
+    fi
+    exec bash "$_taos_self" "$@"
+fi
+
 set -euo pipefail
 
 # If taOS is already installed, default to ITS directory so a re-run updates the
@@ -127,7 +181,7 @@ ensure_linux_deps() {
             libtorrent-rasterbar boost sqlite nodejs npm sqlcipher vulkan-tools
     elif command -v apk >/dev/null 2>&1; then
         log "installing apk deps"
-        sudo apk add --no-cache python3 py3-pip git curl libtorrent-rasterbar sqlite nodejs npm sqlcipher-dev vulkan-tools
+        sudo apk add --no-cache bash python3 py3-pip git curl libtorrent-rasterbar sqlite nodejs npm sqlcipher-dev vulkan-tools
     else
         warn "unrecognised package manager — assuming python3/git/curl/libtorrent/nodejs already present"
     fi
@@ -1463,10 +1517,11 @@ else
         # since the reset below will surface any real ownership problem.
         chown -R "$_repo_owner" "$INSTALL_DIR" \
             || warn "chown -R $_repo_owner $INSTALL_DIR partially failed; the update may not apply cleanly"
-        sudo -u "$_repo_owner" git -C "$INSTALL_DIR" fetch --depth 1 origin "$BRANCH" \
-            && sudo -u "$_repo_owner" git -C "$INSTALL_DIR" reset --hard "origin/$BRANCH"
+        sudo -u "$_repo_owner" git -C "$INSTALL_DIR" remote set-branches origin "$BRANCH" \
+            && sudo -u "$_repo_owner" git -C "$INSTALL_DIR" fetch --depth 1 origin "$BRANCH" \
+            && sudo -u "$_repo_owner" git -C "$INSTALL_DIR" reset --hard FETCH_HEAD
     else
-        (cd "$INSTALL_DIR" && git fetch --depth 1 origin "$BRANCH" && git reset --hard "origin/$BRANCH")
+        (cd "$INSTALL_DIR" && git remote set-branches origin "$BRANCH" && git fetch --depth 1 origin "$BRANCH" && git reset --hard FETCH_HEAD)
     fi
 fi
 
@@ -2226,7 +2281,7 @@ install_linux_systemd_system() {
     # Inject bind host/port + proxy port into the unit's Environment block.
     # ExecStart now runs `python -m tinyagentos`, which reads these (rather
     # than uvicorn CLI args), so the dual-port browser-proxy origin starts.
-    $sudo_cmd sed -i "s|^Environment=PYTHONUNBUFFERED=1|Environment=PYTHONUNBUFFERED=1\nEnvironment=TAOS_HOST=0.0.0.0\nEnvironment=TAOS_PORT=$TAOS_PORT\nEnvironment=TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT|" "$unit"
+    $sudo_cmd sed -i "s|^Environment=PYTHONUNBUFFERED=1|Environment=PYTHONUNBUFFERED=1\nEnvironment=TAOS_HOST=0.0.0.0\nEnvironment=TAOS_PORT=$TAOS_PORT\nEnvironment=TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT\nEnvironment=TAOS_SPA_DIR=$INSTALL_DIR/static/desktop|" "$unit"
     log "installed $unit (system unit, runs as 'taos')"
 
     # Install desktop-rebuild service (runs async after controller starts; taOS #807)
@@ -2293,7 +2348,7 @@ install_linux_systemd_user() {
     # Inject bind host/port + proxy port into the unit's Environment block.
     # ExecStart now runs `python -m tinyagentos`, which reads these (rather
     # than uvicorn CLI args), so the dual-port browser-proxy origin starts.
-    sed -i "s|^Environment=PYTHONUNBUFFERED=1|Environment=PYTHONUNBUFFERED=1\nEnvironment=TAOS_HOST=0.0.0.0\nEnvironment=TAOS_PORT=$TAOS_PORT\nEnvironment=TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT|" "$unit"
+    sed -i "s|^Environment=PYTHONUNBUFFERED=1|Environment=PYTHONUNBUFFERED=1\nEnvironment=TAOS_HOST=0.0.0.0\nEnvironment=TAOS_PORT=$TAOS_PORT\nEnvironment=TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT\nEnvironment=TAOS_SPA_DIR=$INSTALL_DIR/static/desktop|" "$unit"
     log "installed $unit (user unit fallback — sudo unavailable)"
 
     # Install desktop-rebuild service (runs async after controller starts; taOS #807)
@@ -2381,14 +2436,14 @@ if [ "\$(id -u)" = "0" ] && [ "\$(id -un)" != "$runuser" ]; then
     elif command -v sudo >/dev/null 2>&1; then exec sudo -u "$runuser" /bin/bash "\$0"
     elif command -v su >/dev/null 2>&1; then exec su -s /bin/bash "$runuser" -c "exec /bin/bash '\$0'"; fi
 fi
-export PYTHONUNBUFFERED=1 TAOS_HOST=0.0.0.0 TAOS_PORT=$TAOS_PORT TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT
+export PYTHONUNBUFFERED=1 TAOS_HOST=0.0.0.0 TAOS_PORT=$TAOS_PORT TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT TAOS_SPA_DIR="$INSTALL_DIR/static/desktop"
 exec "$pyenv" -m tinyagentos
 EOF
     chmod +x "$runner"
     [[ "$runuser" != "$(id -un)" ]] && chown "$runuser": "$runner" 2>/dev/null || true
 
     log "systemd is not the init here (e.g. WSL without systemd) -- starting the controller directly"
-    local launch="cd '$INSTALL_DIR'; PYTHONUNBUFFERED=1 TAOS_HOST=0.0.0.0 TAOS_PORT=$TAOS_PORT TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT nohup '$pyenv' -m tinyagentos >> '$logf' 2>&1 &"
+    local launch="cd '$INSTALL_DIR'; PYTHONUNBUFFERED=1 TAOS_HOST=0.0.0.0 TAOS_PORT=$TAOS_PORT TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT TAOS_SPA_DIR='$INSTALL_DIR/static/desktop' nohup '$pyenv' -m tinyagentos >> '$logf' 2>&1 &"
     if [[ "$runuser" != "$(id -un)" ]]; then
         # Drop to the service user without assuming sudo: minimal containers (a
         # target of this fallback) frequently run as root with no sudo binary.
@@ -2464,6 +2519,7 @@ install_macos_launchd() {
     <dict>
         <key>PYTHONUNBUFFERED</key><string>1</string>
         <key>TAOS_BROWSER_PROXY_PORT</key><string>$TAOS_BROWSER_PROXY_PORT</string>
+        <key>TAOS_SPA_DIR</key><string>$INSTALL_DIR/static/desktop</string>
     </dict>
 </dict>
 </plist>
@@ -2478,7 +2534,7 @@ EOF
 
 if [[ "$SERVICE_MODE" == "skip" ]]; then
     log "TAOS_SERVICE=skip — not installing a service unit"
-    log "run manually: cd $INSTALL_DIR && TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT ./.venv/bin/python -m tinyagentos"
+    log "run manually: cd $INSTALL_DIR && TAOS_BROWSER_PROXY_PORT=$TAOS_BROWSER_PROXY_PORT TAOS_SPA_DIR='$INSTALL_DIR/static/desktop' ./.venv/bin/python -m tinyagentos"
 else
     case "$os_name" in
         Linux)  install_linux_systemd ;;
@@ -2597,6 +2653,25 @@ verify_hardware_capabilities() {
     local claimed_vulkan=0 claimed_cuda=0 claimed_rocm=0 claimed_rknpu=0 claimed_mlx=0
     local verified_ok=0 verified_warn=0
 
+    # Read the local auth token for controller API access. The token file is
+    # created at first boot by the controller (see tinyagentos/auth.py:get_local_token)
+    # and is the same-host trust anchor for scripts/CLI. If it doesn't exist yet,
+    # the controller is in a pre-admin state and cannot authenticate us -- we must
+    # fail loud rather than silently skipping (taOS #2 class: cannot-see-reads-as-pass).
+    local local_token_path="$INSTALL_DIR/data/.auth_local_token"
+    local local_token=""
+    if [[ -r "$local_token_path" ]]; then
+        local_token=$(cat "$local_token_path" 2>/dev/null || true)
+    fi
+    if [[ -z "$local_token" ]]; then
+        warn "local auth token not found at $local_token_path"
+        warn "  the controller has not yet minted its local token (pre-admin state)"
+        warn "  hardware capability verification requires authenticated API access"
+        warn "  this is a fresh-install blocker -- the controller must complete first-boot"
+        warn "  init (litellm prisma migration, store creation) before verification runs"
+        die "hardware verification cannot proceed without local auth token"
+    fi
+
     # Fetch the hardware profile from the now-running controller. POST is the
     # only method the route accepts; a GET gets 405 and looks like "empty".
     # Retry for up to 30 s so the controller can finish first-boot init
@@ -2609,6 +2684,7 @@ verify_hardware_capabilities() {
         [[ $_remaining -le 0 ]] && break
         _curl_timeout=$(( _remaining > 1 ? _remaining : 1 ))
         hw_json=$(curl -sf --max-time "$_curl_timeout" -X POST \
+            -H "Authorization: Bearer $local_token" \
             "http://localhost:$TAOS_PORT/api/system/hardware/refresh" 2>/dev/null || true)
         [[ -n "$hw_json" ]] && break
         _remaining=$(( _hw_deadline - SECONDS ))

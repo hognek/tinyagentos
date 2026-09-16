@@ -25,6 +25,7 @@ from tinyagentos.projects.folders import (
     write_project_yaml,
 )
 from tinyagentos.projects.project_store import ProjectConflict
+from tinyagentos.projects.task_store import TaskStatus
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -34,7 +35,7 @@ router = APIRouter()
 # ``quarantined``), but the READ/aggregate API surface only advertises these
 # three and must reject anything else rather than silently filter to an empty
 # list (which would hide a caller's typo).
-_TASK_STATUS_ENUM = ("open", "claimed", "closed")
+_TASK_STATUS_ENUM = tuple(member.value for member in TaskStatus)
 
 
 async def _is_field_free(store, field: str, value: str) -> bool:
@@ -526,7 +527,7 @@ class UpdateTaskIn(_TaskRequestModelMixin, BaseModel):
     body: str | None = None
     priority: int | None = None
     labels: list[str] | None = None
-    status: str | None = None
+    status: TaskStatus | None = None
     # Omitted -> unchanged; null -> cleared (the board's "Unassigned" and
     # "Orphans" lanes send exactly that).
     assignee_id: str | None = None
@@ -823,7 +824,7 @@ async def create_task(
 async def list_tasks(
     project_id: str,
     request: Request,
-    status: str | None = None,
+    status: TaskStatus | None = None,
     element_id: str | None = None,
 ):
     pstore = request.app.state.project_store
@@ -1562,7 +1563,7 @@ async def list_relationships(
     project_id: str,
     task_id: str,
     request: Request,
-    direction: str = "from",
+    direction: Literal["from", "to"] = "from",
     user: CurrentUser = Depends(current_user),
 ):
     pstore = request.app.state.project_store
@@ -1628,7 +1629,8 @@ async def project_events(
     if isinstance(project_or_err, JSONResponse):
         return project_or_err
     broker = request.app.state.project_event_broker
-    queue = await broker.subscribe(project_id)
+    last_event_id = request.headers.get("last-event-id")
+    queue = await broker.subscribe(project_id, last_event_id=last_event_id)
 
     async def event_stream():
         try:
@@ -1638,7 +1640,11 @@ async def project_events(
                 try:
                     ev = await _asyncio.wait_for(queue.get(), timeout=15.0)
                     payload = {"kind": ev.kind, "payload": ev.payload, "ts": ev.ts}
-                    yield f"data: {_json.dumps(payload)}\n\n"
+                    lines = [f"data: {_json.dumps(payload)}"]
+                    if ev.id is not None:
+                        lines.append(f"id: {ev.id}")
+                    lines.append("")
+                    yield "\n".join(lines) + "\n"
                 except _asyncio.TimeoutError:
                     yield ": heartbeat\n\n"
         finally:

@@ -894,6 +894,82 @@ async def test_multi_select_invalid_option_still_rejected(client):
     assert resp.status_code == 400
 
 
+# --------------------------------------------------------------------------- #
+# tsk-zmltwu: empty multi_select answer must be rejected with 400
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.asyncio
+async def test_empty_multi_select_answer_is_rejected(client):
+    """An empty list as a multi_select answer is rejected: it would otherwise
+    record the decision as answered with no selections, indistinguishable from
+    a real choice downstream."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "multi_select",
+        "options": [{"label": "A", "value": "a"}, {"label": "B", "value": "b"}],
+    })
+    d = resp.json()
+    resp = await client.post(f"/api/decisions/{d['id']}/answer", json={"value": []})
+    assert resp.status_code == 400
+    assert resp.json()["error"] == "answer must be a subset of the options"
+
+
+@pytest.mark.asyncio
+async def test_multi_select_valid_subset_still_accepted(client):
+    """A valid non-empty subset of multi_select options still returns 200."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "multi_select",
+        "options": [{"label": "A", "value": "a"}, {"label": "B", "value": "b"}],
+    })
+    d = resp.json()
+    resp = await client.post(f"/api/decisions/{d['id']}/answer", json={"value": ["a"]})
+    assert resp.status_code == 200
+    assert resp.json()["answer"]["value"] == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_multi_select_invalid_option_still_rejected_tsk_zmltwu(client):
+    """A multi_select answer containing a value not in the options is still 400."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "multi_select",
+        "options": [{"label": "A", "value": "a"}, {"label": "B", "value": "b"}],
+    })
+    d = resp.json()
+    resp = await client.post(
+        f"/api/decisions/{d['id']}/answer",
+        json={"value": ["a", "nope"]},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_single_select_list_answer_still_rejected(client):
+    """A list submitted as a single_select answer must still 400 (TypeError
+    from unhashable list in set membership is caught and returned as 400)."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "single_select",
+        "options": [{"label": "A", "value": "a"}],
+    })
+    d = resp.json()
+    resp = await client.post(
+        f"/api/decisions/{d['id']}/answer",
+        json={"value": ["a"]},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_single_select_valid_scalar_still_accepted(client):
+    """A valid scalar single_select answer still returns 200."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "single_select",
+        "options": [{"label": "A", "value": "a"}, {"label": "B", "value": "b"}],
+    })
+    d = resp.json()
+    resp = await client.post(f"/api/decisions/{d['id']}/answer", json={"value": "a"})
+    assert resp.status_code == 200
+    assert resp.json()["answer"]["value"] == "a"
+
+
 @pytest.mark.asyncio
 async def test_other_answer_routes_to_agent_with_note(client, monkeypatch):
     """A free-text Other answer with a note reaches the agent in the same
@@ -1137,3 +1213,317 @@ async def test_create_decision_notification_enriches_data(client, app):
     assert data["from_agent"] == "@taOS-dev"
     assert data["kind"] == "decision"
     assert len(data["options"]) <= 4
+
+
+# --------------------------------------------------------------------------- #
+# tsk-u72wpc: decision notes
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_note_only_body_to_answer_route_rejected(client):
+    """A note-only body to /answer 422s because value is required. This proves
+    the gap: the client cannot use /answer as an annotation path."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "free_text",
+    })
+    d = resp.json()
+    resp = await client.post(f"/api/decisions/{d['id']}/answer", json={"text": "just a note"})
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_post_note_route_exists(client):
+    """POST /api/decisions/{id}/note records a note and returns it. FAILS with
+    404 before the route is implemented."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "free_text",
+    })
+    d = resp.json()
+    resp = await client.post(f"/api/decisions/{d['id']}/note", json={"text": "a note"})
+    assert resp.status_code == 200
+    assert len(resp.json()["notes"]) == 1
+    assert resp.json()["notes"][0]["text"] == "a note"
+
+
+@pytest.mark.asyncio
+async def test_note_empty_text_rejected(client):
+    """An empty or whitespace-only note text is rejected with 400."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "free_text",
+    })
+    d = resp.json()
+    for bad in ("", "   "):
+        resp = await client.post(f"/api/decisions/{d['id']}/note", json={"text": bad})
+        assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_device_bearer_can_note_gate_decision(client, app):
+    """A device bearer may post a note on a gate-kind decision: a note carries
+    no grant, so the phone notification-surface restriction from answer_decision
+    does not apply. FAILS with 404 before the route is implemented."""
+    admin_uid = _admin_uid(app)
+    device = await _register_device(app, admin_uid)
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "agent-a",
+        "question": "Agent agent-a wants to run code_exec (code-exec)",
+        "type": "approve_deny",
+        "priority": "blocking",
+        "metadata": {"kind": "execution_gate", "agent_name": "agent-a",
+                     "action_class": "code-exec", "tool": "code_exec"},
+    })
+    assert resp.status_code == 200
+    d = resp.json()
+    resp = await client.post(
+        f"/api/decisions/{d['id']}/note",
+        json={"text": "checking this"},
+        headers=_bearer(device["scoped_token"]),
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()["notes"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_note_on_answered_decision_preserves_state(client):
+    """Posting a note on an answered decision must not change status, answer
+    or answered_at. FAILS with 404 before the route is implemented."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "free_text",
+    })
+    d = resp.json()
+    await client.post(f"/api/decisions/{d['id']}/answer", json={"value": "yes"})
+    answered = await client.get(f"/api/decisions/{d['id']}")
+    answered = answered.json()
+    before_status = answered["status"]
+    before_answer = json.dumps(answered["answer"], sort_keys=True)
+    before_answered_at = answered["answered_at"]
+
+    resp = await client.post(f"/api/decisions/{d['id']}/note", json={"text": "after answer"})
+    assert resp.status_code == 200
+
+    after = await client.get(f"/api/decisions/{d['id']}")
+    after = after.json()
+    assert after["status"] == before_status
+    assert json.dumps(after["answer"], sort_keys=True) == before_answer
+    assert after["answered_at"] == before_answered_at
+
+
+@pytest.mark.asyncio
+async def test_notes_appear_in_get_and_list(client):
+    """Notes are returned from GET /api/decisions/{id} and list."""
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@a", "question": "q", "type": "free_text",
+    })
+    d = resp.json()
+    await client.post(f"/api/decisions/{d['id']}/note", json={"text": "first"})
+    await client.post(f"/api/decisions/{d['id']}/note", json={"text": "second"})
+
+    got = await client.get(f"/api/decisions/{d['id']}")
+    assert got.status_code == 200
+    notes = got.json()["notes"]
+    assert len(notes) == 2
+    assert [n["text"] for n in notes] == ["first", "second"]
+
+    items = await client.get("/api/decisions?status=pending")
+    assert items.status_code == 200
+    d2 = next(x for x in items.json()["items"] if x["id"] == d["id"])
+    assert len(d2["notes"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_note_publishes_event(client, monkeypatch):
+    """Posting a note publishes a decision.note event on the owner's channel."""
+    from tinyagentos.events.bus import EventBus
+
+    import tinyagentos.routes.decisions as dmod
+
+    monkeypatch.setattr(dmod.httpx, "AsyncClient", _NoOpAsyncClient)
+
+    app = client._transport.app
+    bus = EventBus()
+    app.state.event_bus = bus
+
+    resp = await client.post("/api/decisions", json={
+        "from_agent": "@taOS-dev", "question": "q", "type": "approve_deny",
+    })
+    did = resp.json()["id"]
+    owner = (await app.state.decision_store.get(did))["user_id"]
+    assert owner
+    owner_q = await bus.subscribe(f"user:{owner}")
+
+    resp = await client.post(f"/api/decisions/{did}/note", json={"text": "note"})
+    assert resp.status_code == 200
+
+    ev = owner_q.get_nowait()
+    assert ev.kind == "decision.note"
+    assert ev.payload["decision_id"] == did
+
+
+@pytest.mark.asyncio
+async def test_project_create_approve_refuses_auth_request_when_accepted_returns_none(
+    client, monkeypatch, tmp_path
+):
+    """When set_decision('accepted') returns None, the auth request is refused
+    and the agent gets a specific failure reply, not the generic 'approve'."""
+    import tinyagentos.routes.decisions as dmod
+
+    routed_calls = []
+
+    async def recording_route(decision, value, note=None):
+        routed_calls.append((decision.get("id"), value))
+        return None
+
+    monkeypatch.setattr(dmod, "_route_answer_to_agent", recording_route)
+
+    app = client._transport.app
+
+    from tinyagentos.auth_requests_store import AuthRequestsStore
+    from tinyagentos.agent_grants_store import AgentGrantsStore
+    from tinyagentos.projects.project_store import ProjectStore
+
+    auth_store = AuthRequestsStore(tmp_path / "auth-refused-none.db")
+    await auth_store.init()
+    pstore = ProjectStore(tmp_path / "projects-refused-none.db")
+    await pstore.init()
+    grants = AgentGrantsStore(tmp_path / "grants-refused-none.db")
+    await grants.init()
+
+    monkeypatch.setattr(app.state, "auth_requests", auth_store)
+    monkeypatch.setattr(app.state, "project_store", pstore)
+    monkeypatch.setattr(app.state, "agent_grants", grants)
+
+    auth_request = await auth_store.create(
+        identity_claim="@agent-a",
+        framework="openclaw",
+        requested_scopes=[],
+        requested_skills=[],
+        reason="",
+        kind="project_create",
+        requested_project_name="Test Project",
+        requested_project_slug="test-refused-none",
+        purpose="test",
+    )
+    auth_request_id = auth_request["id"]
+
+    d = await app.state.decision_store.create(
+        from_agent="@agent-a",
+        question="Create test project?",
+        type="approve_deny",
+        user_id="u",
+        metadata={
+            dmod.SERVER_RAISED_KEY: True,
+            "kind": "project_create",
+            "auth_request_id": auth_request_id,
+            "requested_name": "Test Project",
+            "requested_slug": "test-refused-none",
+            "from_agent": "@agent-a",
+        },
+    )
+
+    original_set_decision = auth_store.set_decision
+
+    async def fake_set_decision(request_id, status, **kwargs):
+        if status == "accepted":
+            return None
+        return await original_set_decision(request_id, status, **kwargs)
+
+    monkeypatch.setattr(auth_store, "set_decision", fake_set_decision)
+
+    resp = await client.post(f"/api/decisions/{d['id']}/answer", json={"value": "approve"})
+    assert resp.status_code == 200, resp.text
+
+    auth_record = await auth_store.get(auth_request_id)
+    assert auth_record["status"] == "refused", f"expected refused, got {auth_record['status']}"
+
+    generic_routed = any(
+        v == "approve" for did, v in routed_calls if did == d["id"]
+    )
+    assert not generic_routed, f"generic approve was routed: {routed_calls}"
+
+
+@pytest.mark.asyncio
+async def test_project_create_grant_failure_routes_specific_reply_and_deletes_project(
+    client, monkeypatch, tmp_path
+):
+    """When add_grant raises, the agent gets a specific failure reply mentioning
+    failure, the project is deleted, and the generic 'approve' is not sent."""
+    import tinyagentos.routes.decisions as dmod
+
+    routed_calls = []
+
+    async def recording_route(decision, value, note=None):
+        routed_calls.append((decision.get("id"), value))
+        return None
+
+    monkeypatch.setattr(dmod, "_route_answer_to_agent", recording_route)
+
+    app = client._transport.app
+
+    from tinyagentos.auth_requests_store import AuthRequestsStore
+    from tinyagentos.agent_grants_store import AgentGrantsStore
+    from tinyagentos.projects.project_store import ProjectStore
+
+    auth_store = AuthRequestsStore(tmp_path / "auth-grant-fail.db")
+    await auth_store.init()
+    pstore = ProjectStore(tmp_path / "projects-grant-fail.db")
+    await pstore.init()
+    grants = AgentGrantsStore(tmp_path / "grants-grant-fail.db")
+    await grants.init()
+
+    monkeypatch.setattr(app.state, "auth_requests", auth_store)
+    monkeypatch.setattr(app.state, "project_store", pstore)
+    monkeypatch.setattr(app.state, "agent_grants", grants)
+
+    auth_request = await auth_store.create(
+        identity_claim="@agent-a",
+        framework="openclaw",
+        requested_scopes=[],
+        requested_skills=[],
+        reason="",
+        kind="project_create",
+        requested_project_name="Test Project",
+        requested_project_slug="test-grant-fail",
+        purpose="test",
+    )
+    auth_request_id = auth_request["id"]
+
+    d = await app.state.decision_store.create(
+        from_agent="@agent-a",
+        question="Create test project?",
+        type="approve_deny",
+        user_id="u",
+        metadata={
+            dmod.SERVER_RAISED_KEY: True,
+            "kind": "project_create",
+            "auth_request_id": auth_request_id,
+            "requested_name": "Test Project",
+            "requested_slug": "test-grant-fail",
+            "from_agent": "@agent-a",
+        },
+    )
+
+    async def failing_add_grant(*args, **kwargs):
+        raise RuntimeError("simulated grant failure")
+
+    monkeypatch.setattr(grants, "add_grant", failing_add_grant)
+
+    resp = await client.post(f"/api/decisions/{d['id']}/answer", json={"value": "approve"})
+    assert resp.status_code == 200, resp.text
+
+    auth_record = await auth_store.get(auth_request_id)
+    assert auth_record["status"] == "refused", f"expected refused, got {auth_record['status']}"
+
+    project = await pstore.get_project_by_slug("test-grant-fail")
+    assert project is not None
+    assert project.get("status") == "deleted", f"expected deleted, got {project.get('status')}"
+
+    generic_routed = any(
+        v == "approve" for did, v in routed_calls if did == d["id"]
+    )
+    assert not generic_routed, f"generic approve was routed: {routed_calls}"
+
+    failure_routed = any(
+        "fail" in str(v).lower() for did, v in routed_calls if did == d["id"]
+    )
+    assert failure_routed, f"no failure reply was routed: {routed_calls}"

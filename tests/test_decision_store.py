@@ -165,3 +165,48 @@ async def test_create_retries_on_id_collision(store, monkeypatch):
     )
     assert d2["id"] == fresh_id
     assert call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_notes_table_created_on_existing_db(tmp_path):
+    """The decision_notes table is added to an existing database on init,
+    not only on fresh install."""
+    import aiosqlite
+
+    db_path = tmp_path / "existing.db"
+    conn = await aiosqlite.connect(str(db_path))
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS decisions (
+            id TEXT PRIMARY KEY, from_agent TEXT NOT NULL, project_id TEXT,
+            user_id TEXT NOT NULL DEFAULT '', question TEXT NOT NULL,
+            type TEXT NOT NULL, options TEXT NOT NULL DEFAULT '[]',
+            context TEXT NOT NULL DEFAULT '', priority TEXT NOT NULL DEFAULT 'normal',
+            status TEXT NOT NULL DEFAULT 'pending', answer TEXT,
+            created_at REAL NOT NULL, answered_at REAL, deadline REAL,
+            checkpoint_ref TEXT, parent_decision_id TEXT, timeline_id TEXT,
+            metadata TEXT NOT NULL DEFAULT '{}'
+        )
+    """)
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status, created_at DESC)"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project_id, status)"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_decisions_user ON decisions(user_id, status)"
+    )
+    await conn.commit()
+    await conn.close()
+
+    store = DecisionStore(db_path)
+    await store.init()
+    # list_notes on a missing decision must not crash -- the table must exist.
+    notes = await store.list_notes("dec-nonexistent")
+    assert notes == []
+    # And add_note must work on that upgraded database.
+    d = await store.create("@a", "q", "free_text", user_id="u1")
+    updated = await store.add_note(d["id"], "hello", "u1")
+    assert updated is not None
+    assert len(updated["notes"]) == 1
+    assert updated["notes"][0]["text"] == "hello"

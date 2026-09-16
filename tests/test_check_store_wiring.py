@@ -821,3 +821,31 @@ class TestDuplicateClassNamesAcrossModules:
 
         assert ("tinyagentos/alpha/shared.py", "SharedStore") in intermediate
         assert ("tinyagentos/beta/shared.py", "SharedStore") not in intermediate
+
+
+class TestDefectCommentAsClassDef:
+    def test_comment_line_is_not_a_class_definition(self, tmp_path: Path):
+        """A comment mentioning class Foo(BaseStore) must not be flagged as new."""
+        repo = tmp_path / "repo"
+        _init_repo(repo)
+        _commit(repo, "tinyagentos/__init__.py", "", "init")
+        _commit(
+            repo, "tinyagentos/base_store.py",
+            "class BaseStore:\n    SCHEMA = ''\n    MIGRATIONS = []\n",
+            "feat: add BaseStore",
+        )
+        base_tip = _get_head(repo)
+
+        _branch(repo, "pr")
+        _checkout(repo, "pr")
+        _commit(
+            repo, "tinyagentos/foo_store.py",
+            "# class Foo(BaseStore):\n",
+            "feat: mention Foo in comment",
+        )
+        _checkout(repo, "main")
+        _git(repo, "merge", "pr", "--no-edit")
+
+        assert not csw._class_def_in_added_lines(
+            "tinyagentos/foo_store.py", "Foo", base_tip, repo,
+        )

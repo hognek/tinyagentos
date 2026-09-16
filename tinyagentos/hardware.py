@@ -580,8 +580,23 @@ def _detect_disk() -> DiskInfo:
             if "nvme" in tran or "nvme" in name:
                 dtype = "nvme"
                 break
-            elif "mmc" in parts[0]:
-                dtype = "emmc" if "mmcblk" in parts[0] else "sd"
+            elif "mmc" in name:
+                # Distinguish eMMC vs microSD on mmcblk devices.
+                # eMMC exposes boot partitions (mmcblkXboot0, mmcblkXboot1) and
+                # an rpmb partition; microSD does not. Also check the device
+                # type attribute in sysfs (MMC vs SD).
+                dtype = "sd"
+                if _path_exists_safe(Path(f"/sys/block/{name}boot0")) or _path_exists_safe(Path(f"/sys/block/{name}boot1")) or _path_exists_safe(Path(f"/sys/block/{name}rpmb")):
+                    dtype = "emmc"
+                else:
+                    type_path = Path(f"/sys/block/{name}/device/type")
+                    if _path_exists_safe(type_path):
+                        try:
+                            dev_type = type_path.read_text().strip().upper()
+                            if dev_type == "MMC":
+                                dtype = "emmc"
+                        except OSError:
+                            pass
                 break
             elif rota == "0":
                 dtype = "ssd"

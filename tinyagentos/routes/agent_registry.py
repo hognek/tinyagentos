@@ -90,17 +90,16 @@ class OrgUpdateRequest(BaseModel):
 # consent-flow VALID_SCOPES; the mint route must not be a back door to invent
 # arbitrary scopes that the rest of the system does not understand.
 _ALLOWED_SCOPES = frozenset({
-    "memory_read", "memory_write",
     "a2a_send", "a2a_receive",
     "files_read", "files_write",
-    "tools_execute", "registry_feeds_read",
+    "registry_feeds_read",
     "project_tasks",
     "project_tasks_create",
     "project_tasks_update",
-     "project_doc_review",
-     "project_notes",
-     "project_lists",
-     "canvas_read", "canvas_write",
+    "project_doc_review",
+    "project_notes",
+    "project_lists",
+    "canvas_read", "canvas_write",
     "decisions_read", "decisions_write",
     "observatory_control",
 })

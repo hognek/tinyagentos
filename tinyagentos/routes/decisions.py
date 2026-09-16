@@ -84,6 +84,27 @@ async def _route_answer_to_agent(decision: dict, value, note: str | None = None)
         pass
 
 
+async def _route_note_to_agent(decision: dict, note_text: str, source: str) -> None:
+    """Best-effort: post the note back to the asking agent on the A2A bus.
+    Never raises; the note is already persisted and the agent can also poll
+    GET /api/decisions/{id}."""
+    agent = (decision.get("from_agent") or "").strip()
+    if not agent.startswith("@"):
+        return
+    body = (
+        f"{agent} decision {decision.get('id')} noted: "
+        f"{decision.get('question', '')} -> {note_text}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                f"{_bus_url()}/a2a/send",
+                json={"from": "@taOS-decisions", "thread": _ANSWER_THREAD, "body": body},
+            )
+    except Exception:
+        pass
+
+
 async def _publish_answer_event(request: Request, decision: dict) -> None:
     """Best-effort: push a ``decision.answered`` event to SSE clients so every open
     surface (the chat thread that rendered the block, plus the Decisions app)
@@ -116,6 +137,32 @@ async def _publish_answer_event(request: Request, decision: dict) -> None:
     except Exception:
         logger.warning(
             "decision.answered SSE broadcast failed for %s",
+            decision.get("id"),
+            exc_info=True,
+        )
+
+
+async def _publish_note_event(request: Request, decision: dict) -> None:
+    """Best-effort: push a ``decision.note`` event to SSE clients so open
+    Decisions windows refresh live when a note is added."""
+    bus = getattr(request.app.state, "event_bus", None)
+    if bus is None:
+        return
+    payload = dict(decision) if isinstance(decision, dict) else {"id": decision.get("id")}
+    payload["decision_id"] = payload.get("id")
+    owner = str(payload.get("user_id") or "").strip()
+    if not owner:
+        return
+    try:
+        await bus.publish_to(f"user:{owner}", SystemEvent(
+            kind="decision.note",
+            source="decisions",
+            targets=["user"],
+            payload=payload,
+        ))
+    except Exception:
+        logger.warning(
+            "decision.note SSE broadcast failed for %s",
             decision.get("id"),
             exc_info=True,
         )
@@ -178,6 +225,11 @@ class AnswerIn(BaseModel):
     other_value: str | None = None
     note: str | None = None
     answered_by: str = ""
+    source: str = "in_app"
+
+
+class NoteIn(BaseModel):
+    text: str
     source: str = "in_app"
 
 
@@ -501,7 +553,15 @@ async def decision_history(decision_id: str, request: Request, user: CurrentUser
 
 
 @router.post("/api/decisions/{decision_id}/answer")
-async def answer_decision(decision_id: str, body: AnswerIn, request: Request, user: CurrentUser = Depends(current_user_or_device)):
+async def answer_decision(
+    decision_id: str, body: AnswerIn, request: Request, user: CurrentUser = Depends(current_user_or_device)
+):
+    """Record an answer for a pending decision.
+
+    For ``multi_select`` decisions, an empty list is rejected with 400: an
+    answer must contain at least one selected option so that a decision cannot
+    silently transition to answered while carrying no choice.
+    """
     store = request.app.state.decision_store
     existing = await store.get(decision_id)
     # Authorization check: humans can answer decisions they own or admins; agents are
@@ -547,7 +607,7 @@ async def answer_decision(decision_id: str, body: AnswerIn, request: Request, us
                     for o in (existing.get("options") or [])
                     if o.get("value") is not None
                 }
-                if valid and any(v not in valid for v in vals):
+                if valid and (not vals or any(v not in valid for v in vals)):
                     return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
         else:
             # Option-only path: existing strict validation.
@@ -563,7 +623,7 @@ async def answer_decision(decision_id: str, body: AnswerIn, request: Request, us
                             return JSONResponse({"error": "answer is not one of the options"}, status_code=400)
                     else:
                         vals = body.value if isinstance(body.value, list) else None
-                        if vals is None or any(v not in valid for v in vals):
+                        if not vals or any(v not in valid for v in vals):
                             return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
                 except TypeError:
                     return JSONResponse({"error": "invalid answer value shape"}, status_code=400)
@@ -606,8 +666,42 @@ async def answer_decision(decision_id: str, body: AnswerIn, request: Request, us
     routed_exec = await _apply_execution_grant(request, updated, stored_value)
     routed_deleg = await _apply_delegation_grant(request, updated, stored_value)
     routed_pair = await _apply_device_pairing_grant(request, updated, stored_value)
-    if not (routed_app or routed_exec or routed_deleg or routed_pair):
+    routed_project_create = await _apply_project_create_grant(request, updated, stored_value)
+    if not (routed_app or routed_exec or routed_deleg or routed_pair or routed_project_create):
         await _route_answer_to_agent(updated, stored_value, note=body.note)
+    return updated
+
+
+@router.post("/api/decisions/{decision_id}/note")
+async def add_note_to_decision(
+    decision_id: str,
+    body: NoteIn,
+    request: Request,
+    user: CurrentUser = Depends(current_user_or_device),
+):
+    """Append a note to a decision without changing its state.
+
+    A note is commentary only -- it carries no grant, so a device bearer may
+    post one on ANY decision including gate-kind ones.  The phone is a
+    notification surface, not an approval channel, but annotation is safe on
+    every decision kind.  Do NOT copy the answer_decision 409 here; the two
+    paths have different security properties.
+    """
+    store = request.app.state.decision_store
+    existing = await store.get(decision_id)
+    if existing is None or (not user.is_admin and existing["user_id"] != user.user_id):
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    text = body.text.strip()
+    if not text:
+        return JSONResponse({"error": "text must not be empty"}, status_code=400)
+
+    updated = await store.add_note(decision_id, text, user.user_id or "user", source=body.source)
+    if updated is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    await _publish_note_event(request, updated)
+    await _route_note_to_agent(updated, text, body.source)
     return updated
 
 
@@ -887,7 +981,7 @@ async def answer_decision_as_agent(
                     for o in (existing.get("options") or [])
                     if o.get("value") is not None
                 }
-                if valid and any(v not in valid for v in vals):
+                if valid and (not vals or any(v not in valid for v in vals)):
                     return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
         else:
             valid = {
@@ -902,7 +996,7 @@ async def answer_decision_as_agent(
                             return JSONResponse({"error": "answer is not one of the options"}, status_code=400)
                     else:
                         vals = body.value if isinstance(body.value, list) else None
-                        if vals is None or any(v not in valid for v in vals):
+                        if not vals or any(v not in valid for v in vals):
                             return JSONResponse({"error": "answer must be a subset of the options"}, status_code=400)
                 except TypeError:
                     return JSONResponse({"error": "invalid answer value shape"}, status_code=400)
@@ -978,3 +1072,180 @@ async def _apply_app_grant(request: Request, decision: dict, value) -> bool:
             app_id, decision.get("id"), exc_info=True,
         )
     return False
+
+
+async def _apply_project_create_grant(request: Request, decision: dict, value) -> bool:
+    """Side effect for a project_create Decision: on approve, create the project
+    and make the requester the lead member. On deny, mark the linked auth
+    request as refused. Best-effort: the answer is already persisted, so a
+    project-store hiccup must not fail the answer. Returns True when the
+    decision was a project_create one so the caller skips the generic agent
+    reply routing."""
+    meta = decision.get("metadata") or {}
+    if meta.get(SERVER_RAISED_KEY) is not True:
+        logger.warning(
+            "project_create decision %s refused: missing server provenance",
+            decision.get("id"),
+        )
+        return False
+    if meta.get("kind") != "project_create":
+        return False
+
+    auth_request_id = meta.get("auth_request_id")
+    if not auth_request_id:
+        return False
+
+    auth_store = getattr(request.app.state, "auth_requests", None)
+    if auth_store is None:
+        return False
+
+    auth_record = await auth_store.get(auth_request_id)
+    if auth_record is None or auth_record.get("status") != "pending":
+        return False
+
+    approved = value == "approve"
+
+    if approved:
+        pstore = getattr(request.app.state, "project_store", None)
+        if pstore is None:
+            logger.warning("project_create: project_store missing for decision %s", decision.get("id"))
+            return False
+
+        requested_name = meta.get("requested_name", "")
+        requested_slug = meta.get("requested_slug", "")
+        from_agent = meta.get("from_agent", "")
+
+        project = None
+        try:
+            project = await pstore.create_project_with_lead(
+                name=requested_name,
+                slug=requested_slug,
+                created_by=from_agent,
+                member_id=from_agent,
+                user_id=decision.get("user_id") or "",
+            )
+        except Exception:
+            logger.warning(
+                "project_create project creation failed for decision %s",
+                decision.get("id"), exc_info=True,
+            )
+            try:
+                await auth_store.set_decision(
+                    auth_request_id,
+                    "refused",
+                    decided_by=decision.get("user_id") or "",
+                )
+            except Exception:
+                logger.warning(
+                    "project_create refusal after project failure failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            await _route_answer_to_agent(
+                decision,
+                f"project creation failed - auth request {auth_request_id} refused",
+            )
+            return True
+
+        granted = False
+        try:
+            grants_store = getattr(request.app.state, "agent_grants", None)
+            if grants_store is not None:
+                await grants_store.add_grant(
+                    from_agent, "project_tasks", tier="once", project_id=project["id"]
+                )
+            granted = True
+        except Exception:
+            logger.warning(
+                "project_create grant write failed for decision %s",
+                decision.get("id"), exc_info=True,
+            )
+
+        if not granted:
+            try:
+                await pstore.set_status(project["id"], "deleted")
+            except Exception:
+                logger.warning(
+                    "project_create project cleanup failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            try:
+                await auth_store.set_decision(
+                    auth_request_id,
+                    "refused",
+                    decided_by=decision.get("user_id") or "",
+                )
+            except Exception:
+                logger.warning(
+                    "project_create refusal after grant failure failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            await _route_answer_to_agent(
+                decision,
+                f"project creation approved, but saving the grant failed - auth request {auth_request_id} refused",
+            )
+            return True
+
+        try:
+            accepted = await auth_store.set_decision(
+                auth_request_id,
+                "accepted",
+                canonical_id=from_agent,
+                granted_scopes=["project_tasks"],
+                decided_by=decision.get("user_id") or "",
+            )
+        except Exception:
+            logger.warning(
+                "project_create acceptance failed for decision %s",
+                decision.get("id"), exc_info=True,
+            )
+            accepted = None
+
+        if not accepted:
+            try:
+                await pstore.set_status(project["id"], "deleted")
+            except Exception:
+                logger.warning(
+                    "project_create project cleanup failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            grants_store = getattr(request.app.state, "agent_grants", None)
+            if grants_store is not None:
+                try:
+                    await grants_store.revoke_grant(
+                        from_agent, "project_tasks", project_id=project["id"]
+                    )
+                except Exception:
+                    logger.warning(
+                        "project_create grant revoke failed for decision %s",
+                        decision.get("id"), exc_info=True,
+                    )
+            try:
+                await auth_store.set_decision(
+                    auth_request_id,
+                    "refused",
+                    decided_by=decision.get("user_id") or "",
+                )
+            except Exception:
+                logger.warning(
+                    "project_create refusal after acceptance failure failed for decision %s",
+                    decision.get("id"), exc_info=True,
+                )
+            await _route_answer_to_agent(
+                decision,
+                f"project creation approved, but acceptance failed - auth request {auth_request_id} refused",
+            )
+            return True
+    else:
+        try:
+            await auth_store.set_decision(
+                auth_request_id,
+                "refused",
+                decided_by=decision.get("user_id") or "",
+            )
+        except Exception:
+            logger.warning(
+                "project_create refusal failed for decision %s",
+                decision.get("id"), exc_info=True,
+            )
+
+    return True
