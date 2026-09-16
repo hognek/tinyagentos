@@ -203,9 +203,11 @@ class TestJaysContent:
         for item in auth._demo_panels()["mailbox"]:
             assert item["app"], item
 
-    def test_the_apps_panel_is_the_four_apps_jay_named(self):
+    def test_the_apps_panel_carries_the_four_apps_jay_named(self):
+        """A superset is fine -- he asked for more content, not fewer apps --
+        but his four are the ones he named and must all be there."""
         apps = {item["app"] for item in auth._demo_panels()["apps"]}
-        assert apps == {"Instagram", "Reddit", "Bank", "YouTube"}, apps
+        assert {"Instagram", "Reddit", "Bank", "YouTube"} <= apps, apps
 
     def test_the_bank_tile_shows_no_balance(self):
         """The one genuinely sensitive-looking line on a pre-auth screen. The
@@ -746,8 +748,12 @@ class TestTheContentReachesTheGlass:
         one, = _run([_payload()])
         assert _keys(one, "phone") == [i["key"] for i in auth._demo_panels()["phone"]]
         missed = [r for r in one["phone"] if r["kind"] == "missed"]
-        assert len(missed) == 4, one["phone"]
-        assert any(r["kind"] == "voicemail" for r in one["phone"])
+        voicemail = [r for r in one["phone"] if r["kind"] == "voicemail"]
+        # Counts come from the table rather than being written in: the content
+        # is Jay's to grow, and a hard number here turns every addition red.
+        assert len(missed) == len(
+            [i for i in auth._demo_panels()["phone"] if i["kind"] == "missed"])
+        assert missed and voicemail, one["phone"]
 
     def test_the_mailbox_marks_unread_rows_and_leaves_read_ones_alone(self):
         """Both arms. An attribute set on everything is not a mark."""
