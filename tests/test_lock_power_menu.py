@@ -945,10 +945,38 @@ class TestClosingTheArcLeavesTheRightThingOnScreen:
         assert body.index("carUsed[") < first_teardown, body
 
     def test_darkness_is_read_from_the_element_not_a_variable(self):
-        """The attribute is what the stylesheet acted on, so it cannot disagree
-        with what is on screen, and no other path can clear it early."""
+        """On the element, because two separate handlers need the answer and an
+        attribute cannot drift from what is on screen."""
         body = self._hide_all()
-        assert 'getAttribute("data-radial") === "dark"' in body, body
+        assert 'hasAttribute("data-fromdark")' in body, body
+
+    def test_both_volume_surfaces_record_the_dark_summon(self):
+        """data-radial is set by the ARC only, so reading it left a
+        volume-bezel session on the lock screen. Jay: "the same after changing
+        the volume with the screen off ... im left at the lock screen instead
+        of screen off." The flag is set in the shared from-rest branch, before
+        either surface is chosen."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        src = js[js.index("function volumeKey("):]
+        src = src[:src.index("// ------")]
+        rest = src[src.index("if (!carOpen && !volOpen)"):]
+        setter = rest[:rest.index('if (key === "up")')]
+        assert 'setAttribute("data-fromdark", "1")' in setter, setter
+
+    def test_the_wake_does_not_reveal_the_lock_screen_under_either_surface(self):
+        """The screen-on handler asked about the arc alone, which is why the
+        lock screen appeared behind the slider the moment the panel woke."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        at = js.index('addEventListener("screen-on"')
+        handler = js[at:js.index("});", at)]
+        assert 'hasAttribute("data-fromdark")' in handler, handler
+        assert handler.index("data-fromdark") < handler.index("removeAttribute"), handler
+
+    def test_the_flag_is_cleared_when_the_surface_closes(self):
+        """Left set, the next ordinary wake would stay black -- a phone that
+        looks dead."""
+        body = self._hide_all()
+        assert 'removeAttribute("data-fromdark")' in body, body
 
     def test_the_page_does_not_power_the_panel_itself(self):
         """Keeping the page black is how the screen is returned to dark. The

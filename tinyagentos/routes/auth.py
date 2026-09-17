@@ -3586,7 +3586,7 @@ _LOCK_SCREEN_SCRIPT = r"""
     ["touchstart", "keydown", "pointerdown"].forEach(function (evt) {
       document.addEventListener(evt, function () {
         if (screenEl && screenEl.hasAttribute("data-blanked")
-            && !(carEl && carEl.getAttribute("data-on") === "1")) {
+            && !screenEl.hasAttribute("data-fromdark")) {
           screenEl.removeAttribute("data-blanked");
           setBlack(false);
         }
@@ -3669,7 +3669,10 @@ _LOCK_SCREEN_SCRIPT = r"""
       // attribute is the thing the stylesheet actually acted on, so it cannot
       // disagree with what is on screen, and it cannot be cleared early by some
       // other path resetting a flag.
-      var wasDark = !!(screenEl && screenEl.getAttribute("data-radial") === "dark");
+      // Read from data-fromdark, which BOTH surfaces set, rather than from
+      // data-radial, which only the arc does -- that asymmetry is what left a
+      // volume-only session on the lock screen.
+      var wasDark = !!(screenEl && screenEl.hasAttribute("data-fromdark"));
 
       // WHERE YOU LEFT IT COUNTS AS USING IT -- recorded before anything is
       // dismantled, and only when the arc was genuinely open: hideAll also runs
@@ -3700,6 +3703,7 @@ _LOCK_SCREEN_SCRIPT = r"""
       // timer is running.
       if (screenEl) {
         screenEl.removeAttribute("data-radial");
+        screenEl.removeAttribute("data-fromdark");
         if (wasDark) { screenEl.setAttribute("data-blanked", "1"); setBlack(true); }
         else { screenEl.removeAttribute("data-blanked"); setBlack(false); }
       }
@@ -4019,6 +4023,21 @@ _LOCK_SCREEN_SCRIPT = r"""
           // From rest: which key was pressed decides which surface appears.
           // This press is spent on APPEARING -- its release must not also act.
           pressOpened = true;
+          // SUMMONED FROM A DARK PANEL -- recorded for either surface, not just
+          // the arc. Jay: "the same after changing the volume with the screen
+          // off, when the volume slider goes away im left at the lock screen
+          // instead of screen off." The bezel never set data-radial, so the
+          // close read "not dark" and revealed the lock screen -- and the
+          // screen-on handler, which only skipped clearing for the ARC, had
+          // already revealed it the moment the panel woke.
+          //
+          // On the element rather than in a variable, because two separate
+          // handlers need the answer and the attribute is the one thing that
+          // cannot drift from what is on screen.
+          if (screenEl) {
+            if (fromDark) screenEl.setAttribute("data-fromdark", "1");
+            else screenEl.removeAttribute("data-fromdark");
+          }
           if (key === "up") { loadVolume(); volShow(); volArmed = true; return; }
           // Opened from a dark panel: the arc goes over black, not over the
           // whole lock screen. Jay: "it will look nice against the black oled
@@ -4440,7 +4459,10 @@ _LOCK_SCREEN_SCRIPT = r"""
         // that is the case where black is the point.
         lockStream.addEventListener("screen-on", function () {
           if (!screenEl) return;
-          if (carEl && carEl.getAttribute("data-on") === "1") return;
+          // Anything summoned onto a dark panel keeps its black: the arc, and
+          // the volume bezel just the same. Asking about the arc alone was what
+          // let the lock screen appear behind the slider.
+          if (screenEl.hasAttribute("data-fromdark")) return;
           screenEl.removeAttribute("data-blanked");
           setBlack(false);
         });
@@ -4890,6 +4912,9 @@ _LOCK_SCREEN_SCRIPT = r"""
         var prev = sheetEl(current);
         if (prev && prev.id !== "ls-foot") prev.hidden = true;
       }
+      // Before the sheet is revealed, so its single slide lands at the final
+      // position rather than being pushed up again once the keyboard measures.
+      if (name === "chat" || name === "passcode") preloadKeyboardOffset();
       var el = sheetEl(name);
       if (el) el.hidden = false;
       if (scrim) scrim.hidden = false;
@@ -4952,8 +4977,46 @@ _LOCK_SCREEN_SCRIPT = r"""
     // itself rather than duplicating its height as a guess that drifts when the
     // keyboard switches between its letter, symbol and numeric layers.
     // -----------------------------------------------------------------------
+    // The last MEASURED keyboard height, remembered so the next sheet can be
+    // opened at its final position instead of being pushed there afterwards.
+    //
+    // Jay: "the thread slides up, then the keybard appears and pushes that app
+    // creating almost a jerkiness motion. can the message thread and keybard
+    // not be linked so they slide up as one animation?"
+    //
+    // They were two motions because the height was not KNOWN until the keyboard
+    // had rendered: the sheet slid up over 380ms against --ls-kb:0, the OSK then
+    // appeared, the ResizeObserver measured it, and the sheet's `bottom`
+    // animated a second time. Nothing was wrong with either animation; the
+    // trouble was that the first one ran against a number that was not final.
+    //
+    // Cached in localStorage because the height is a property of the DEVICE and
+    // its layout, not of a visit -- so it is already right on the first open
+    // after a restart, which is when a demo gets looked at.
+    var KB_STORE = "taos.ls.kb";
+    var kbCache = 0;
+    try { kbCache = Number(window.localStorage.getItem(KB_STORE)) || 0; } catch (err) { kbCache = 0; }
+
     function setKeyboardOffset(px) {
-      document.documentElement.style.setProperty("--ls-kb", (px || 0) + "px");
+      var value = px || 0;
+      document.documentElement.style.setProperty("--ls-kb", value + "px");
+      // Only remember a REAL measurement. Caching the zero we set on close
+      // would defeat the whole thing on the very next open.
+      if (value > 0 && value !== kbCache) {
+        kbCache = value;
+        try { window.localStorage.setItem(KB_STORE, String(value)); } catch (err) { /* fine */ }
+      }
+    }
+
+    // Applied at the moment a keyboard-bearing sheet opens, so the sheet's one
+    // transform lands where it will finally sit. If the measurement that
+    // follows disagrees, the difference is a few pixels and the existing
+    // `bottom` transition absorbs it -- which is also what handles the keyboard
+    // switching between its letter, symbol and numeric layers.
+    function preloadKeyboardOffset() {
+      if (kbCache > 0) {
+        document.documentElement.style.setProperty("--ls-kb", kbCache + "px");
+      }
     }
 
     var oskPanel = document.querySelector(".osk");
