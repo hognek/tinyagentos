@@ -388,10 +388,13 @@ class TestTheVolumeKeys:
         see; this makes the first press the one that shows you what you are
         about to change."""
         js = auth._LOCK_SCREEN_SCRIPT
+        # Sliced to the END of the from-rest block, not to the first `return;`:
+        # the block now returns early for the up case, and a slice that stopped
+        # there cut the carousel arm off and reddened this for no reason.
         start = js.index("function volumeKey(")
-        body = js[start:js.index("\n    }", start)]
+        body = js[start:js.index("// ------", start)]
         rest = body[body.index("if (!carOpen && !volOpen)"):]
-        reveal = rest[:rest.index("return;")]
+        reveal = rest[:rest.index("restartIdleHide();")]
         # The reveal branch shows the bezel and does NOT nudge.
         assert "volShow()" in reveal, reveal
         assert "nudgeVolume" not in reveal, reveal
@@ -399,17 +402,17 @@ class TestTheVolumeKeys:
     def test_down_from_rest_opens_the_carousel_not_the_bezel(self):
         js = auth._LOCK_SCREEN_SCRIPT
         start = js.index("function volumeKey(")
-        body = js[start:js.index("\n    }", start)]
+        body = js[start:js.index("// ------", start)]
         rest = body[body.index("if (!carOpen && !volOpen)"):]
-        reveal = rest[:rest.index("return;")]
+        reveal = rest[:rest.index("restartIdleHide();")]
         assert "carShow()" in reveal, reveal
 
     def test_a_hold_starts_the_walkie_talkie_and_a_release_stops_it(self):
         js = auth._LOCK_SCREEN_SCRIPT
         assert "PTT_HOLD_MS" in js
         start = js.index("function volumeKey(")
-        body = js[start:js.index("\n    }", start)]
-        assert "startTalking" in body and "stopTalking" in body
+        body = js[start:js.index("// ------", start)]
+        assert "armTalk" in body and "stopTalking" in body
 
     def test_the_walkie_talkie_opens_no_microphone(self):
         """Jay: "just for demo/mock purposes for now". A mock that quietly grew
@@ -443,7 +446,7 @@ class TestTheVolumeKeys:
         typing a PIN into."""
         js = auth._LOCK_SCREEN_SCRIPT
         start = js.index("function volumeKey(")
-        body = js[start:js.index("\n    }", start)]
+        body = js[start:js.index("// ------", start)]
         head = body[:body.index("var carOpen")]
         assert 'data-sheet' in head and "return" in head, head
 
@@ -540,3 +543,121 @@ class TestTheRadioSwitches:
         start = js.index("function paintRadios(")
         body = js[start:js.index("function setRadio(", start)]
         assert "btn.disabled = true" in body, body[-400:]
+
+
+class TestTheRadialChooserBlursTheScreen:
+    """Jay: "blur the screen when the rotary agent chooser is activated".
+
+    It earns its place rather than being decoration: the faces are small,
+    low-contrast circles over a feed of cards and text, and the focused one is
+    hard to pick out without separation -- which is the one thing a chooser
+    driven by a PHYSICAL KEY has to get right, because your eye is not already
+    on the screen when it opens.
+    """
+
+    def test_opening_the_carousel_sets_the_blur_and_the_dim(self):
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function carShow(")
+        body = js[start:js.index("function startTalking(", start)]
+        assert 'setAttribute("data-radial", "1")' in body, body
+        assert 'scrim.hidden = false' in body, body
+
+    def test_hiding_clears_the_blur(self):
+        """Left set, the whole screen stays blurred after the arc goes away --
+        a phone that looks broken until something else happens to clear it."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function hideAll(")
+        body = js[start:js.index("function restartIdleHide(", start)]
+        assert 'removeAttribute("data-radial")' in body, body
+
+    def test_hiding_leaves_the_scrim_alone_while_a_sheet_is_open(self):
+        """The scrim is shared. A sheet keeps it up through its own rule, so
+        hiding the element here would pull the dim out from under an open menu
+        the moment the volume bezel timed out behind it."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function hideAll(")
+        body = js[start:js.index("function restartIdleHide(", start)]
+        assert 'data-sheet' in body, body
+        assert 'scrim.hidden = true' in body, body
+
+    def test_the_stylesheet_honours_the_blur_attribute(self):
+        """Both halves, or the attribute is set and nothing happens."""
+        css = auth._LOCK_SCREEN_STYLE
+        assert 'data-radial="1"' in css
+        rule = css[css.index('.lockscreen[data-radial="1"]'):][:200]
+        assert "blur(" in rule, rule
+
+    def test_the_volume_bezel_does_not_blur_the_screen(self):
+        """Deliberately not: the bezel is a transient heads-up for a key you
+        are already holding, and blurring the whole screen to show a volume
+        level would be heavy-handed."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function volShow(")
+        body = js[start:js.index("function hideAll(", start)]
+        assert "data-radial" not in body, body
+
+
+class TestHoldingToTalkDoesNotAlsoCycle:
+    """Jay, from the glass: "holding to talk doesnt work, it moves to the next
+    agent and then starts input capture".
+
+    The press branch advanced the selection immediately and the hold timer then
+    fired on top of it, so one hold did both. A press cannot be classified until
+    it ENDS, so the only thing a press may do while the arc is open is start the
+    clock; the cycle happens on release, and only if the press was a tap.
+    """
+
+    @staticmethod
+    def _volume_key_source():
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function volumeKey(")
+        return js[start:js.index("// ------", start)]
+
+    def test_the_press_branch_does_not_cycle_the_selection(self):
+        """The bug, asserted where it lived. carIndex must not move on a press
+        while the arc is open."""
+        src = self._volume_key_source()
+        press = src[src.index('if (action === "press")'):src.index("// RELEASE")]
+        assert "carIndex +=" not in press, press
+
+    def test_the_release_branch_is_what_cycles(self):
+        src = self._volume_key_source()
+        release = src[src.index("// RELEASE"):]
+        assert "carIndex +=" in release, release
+        assert "paintCarousel()" in release, release
+
+    def test_a_release_after_talking_stops_and_does_not_cycle(self):
+        """The discriminating case: the same release must end a transmission
+        OR move one agent, never both."""
+        src = self._volume_key_source()
+        release = src[src.index("// RELEASE"):]
+        talk = release[release.index("if (talking)"):]
+        # stopTalking comes first and returns before the cycle is reached.
+        assert talk.index("stopTalking()") < talk.index("carIndex +="), talk
+        assert "return" in talk[:talk.index("carIndex +=")], talk
+
+    def test_a_hold_that_failed_to_start_talking_is_still_not_a_tap(self):
+        """If the arc closed under the hold, `talking` is false -- but it was
+        still a hold, and reading it as a tap would advance the selection on
+        release. pressWasHold carries that."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        assert "pressWasHold" in js
+        src = self._volume_key_source()
+        release = src[src.index("// RELEASE"):]
+        assert release.index("pressWasHold") < release.index("carIndex +="), release
+
+    def test_the_hold_timer_marks_the_press_before_talking(self):
+        """One place sets the flag and starts the transmission, so the two
+        cannot drift apart."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function armTalk(")
+        body = js[start:js.index("function startTalking(", start)]
+        assert "pressWasHold = true" in body and "startTalking()" in body, body
+
+    def test_the_bezel_still_nudges_on_press(self):
+        """Hold has no second meaning over the bezel, and a volume key that
+        waited for the release would feel laggy where people expect it to be
+        immediate."""
+        src = self._volume_key_source()
+        press = src[src.index('if (action === "press")'):src.index("// RELEASE")]
+        assert "nudgeVolume(" in press, press

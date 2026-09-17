@@ -886,6 +886,28 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
   transition: opacity 200ms ease;
 }
 .ls-carousel[data-on="1"] { opacity: 1; }
+/* THE SCREEN BEHIND THE ARC IS BLURRED. Jay asked for it, and it earns its
+   place: the faces are small, low-contrast circles sitting over a feed of cards
+   and text, and without separation the focused one is genuinely hard to pick
+   out at a glance -- which is the one thing a chooser driven by a physical key
+   has to get right, because your eye is not already on the screen.
+ *
+ * Applied to .lockscreen, which is a SIBLING of the carousel and the scrim, so
+ * neither the arc nor the dim gets blurred with it. The existing sheets blur
+ * their chrome piecemeal (.ls-head, .ls-statusbar, .ls-weather) because a sheet
+ * only covers the bottom; this covers the middle of the screen, so the whole
+ * surface goes.
+ *
+ * NOT applied to the volume bezel, deliberately: that is a transient heads-up
+ * for a key you are already holding, and blurring the entire screen to show a
+ * volume level would be heavy-handed for it. */
+.lockscreen[data-radial="1"] {
+  filter: blur(7px);
+  transition: filter 260ms ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .lockscreen[data-radial="1"] { transition: none; }
+}
 /* The pivot itself: a zero-size origin on the left edge at the rocker's
    height. Every face is placed relative to THIS, so moving the pivot moves the
    whole arc and nothing else needs to know. */
@@ -3473,6 +3495,10 @@ _LOCK_SCREEN_SCRIPT = r"""
     var carIndex = 0;
     var holdTimer = null;
     var talking = false;
+    // Set when the hold timer fires, so the RELEASE can tell a tap from a hold.
+    // Without it, a hold that did not manage to start talking -- the arc closed
+    // under it, say -- would be read as a tap and advance the selection.
+    var pressWasHold = false;
     // 600ms: past a deliberate press, short enough that holding to talk feels
     // immediate rather than like waiting for the phone to agree.
     //
@@ -3496,6 +3522,15 @@ _LOCK_SCREEN_SCRIPT = r"""
     function hideAll() {
       if (volEl) volEl.removeAttribute("data-on");
       if (carEl) { carEl.removeAttribute("data-on"); carEl.removeAttribute("data-talking"); }
+      if (screenEl) screenEl.removeAttribute("data-radial");
+      if (scrim) {
+        scrim.removeAttribute("data-on");
+        // Only take the scrim away if nothing ELSE is using it. A sheet keeps it
+        // up through its own rule, and hiding the element here would pull the
+        // dim out from under an open menu.
+        var sheetNow = screenEl ? screenEl.getAttribute("data-sheet") : "none";
+        if (!sheetNow || sheetNow === "none") scrim.hidden = true;
+      }
       volArmed = false;
       talking = false;
     }
@@ -3620,7 +3655,15 @@ _LOCK_SCREEN_SCRIPT = r"""
       if (!carEl) return;
       paintCarousel();
       carEl.setAttribute("data-on", "1");
+      // Blur and dim what is behind, so the faces read against the feed.
+      if (screenEl) screenEl.setAttribute("data-radial", "1");
+      if (scrim) { scrim.hidden = false; scrim.setAttribute("data-on", "1"); }
       restartIdleHide();
+    }
+
+    function armTalk() {
+      pressWasHold = true;
+      startTalking();
     }
 
     function startTalking() {
@@ -3650,33 +3693,57 @@ _LOCK_SCREEN_SCRIPT = r"""
       var carOpen = carEl && carEl.getAttribute("data-on") === "1";
       var volOpen = volEl && volEl.getAttribute("data-on") === "1";
 
-      if (action === "release") {
+      if (action === "press") {
         if (holdTimer) { window.clearTimeout(holdTimer); holdTimer = null; }
+        pressWasHold = false;
+
+        if (!carOpen && !volOpen) {
+          // From rest: which key was pressed decides which surface appears.
+          if (key === "up") { loadVolume(); volShow(); volArmed = true; return; }
+          carIndex = 0;
+          carShow();
+          // Holding down from rest opens the arc and then talks to whoever is
+          // focused, which is what "press down then hold" should naturally do.
+          holdTimer = window.setTimeout(armTalk, PTT_HOLD_MS);
+          return;
+        }
+
+        restartIdleHide();
+        if (carOpen) {
+          // ⚠ CYCLING HAPPENS ON RELEASE, NOT HERE. Jay, from the glass:
+          // "holding to talk doesnt work, it moves to the next agent and then
+          // starts input capture" -- because this branch used to advance the
+          // selection on the press and the hold timer then fired on top of it.
+          // A press cannot be classified until it ends, so the only thing a
+          // press may do here is start the clock.
+          holdTimer = window.setTimeout(armTalk, PTT_HOLD_MS);
+          return;
+        }
+
+        // The bezel is showing, so the keys move the level. Nudged on PRESS
+        // rather than release: hold has no second meaning here, and a volume
+        // key that waited for the release would feel laggy in the one place
+        // people expect it to be immediate.
+        nudgeVolume(key === "up" ? 5 : -5);
+        return;
+      }
+
+      // RELEASE. This is where a press gets classified.
+      if (holdTimer) { window.clearTimeout(holdTimer); holdTimer = null; }
+
+      if (talking) {          // it was a hold: end the transmission, do not cycle
         stopTalking();
         return;
       }
-
-      // A hold starts counting on every press, but only ever means anything
-      // while the carousel is up.
-      if (holdTimer) window.clearTimeout(holdTimer);
-      holdTimer = window.setTimeout(startTalking, PTT_HOLD_MS);
-
-      if (!carOpen && !volOpen) {
-        // From rest: which key was pressed decides which surface appears.
-        if (key === "up") { loadVolume(); volShow(); volArmed = true; }
-        else { carIndex = 0; carShow(); }
+      if (pressWasHold) {     // the hold fired but talking did not take
+        pressWasHold = false;
         return;
       }
-
-      restartIdleHide();
-      if (carOpen) {
-        carIndex += (key === "up" ? -1 : 1);   // up moves UP the strip
+      if (carOpen) {          // a genuine tap: move one agent
+        carIndex += (key === "up" ? -1 : 1);
         paintCarousel();
-        return;
+        restartIdleHide();
       }
-      // The bezel is showing, so now the keys move the level. The reveal press
-      // was spent getting here, which is the whole point of `volArmed`.
-      nudgeVolume(key === "up" ? 5 : -5);
     }
 
     // ------------------------------------------------------------------
