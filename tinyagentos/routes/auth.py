@@ -916,6 +916,26 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
 }
 .lockscreen[data-radial="dark"] ~ .ls-scrim { background: #000; opacity: 1; }
 
+/* BLANKED: what the panel holds in its scanout buffer while it is off.
+ *
+ * No transition on the way IN -- the panel is about to go down and there is no
+ * time for one; the point is that the last painted frame is black. Coming back
+ * it fades, so an ordinary wake rises out of black rather than snapping on,
+ * which is both nicer and the same motion the arc uses.
+ *
+ * opacity, not visibility: it animates, and an OLED showing opacity 0 over a
+ * black page body is emitting nothing anyway. */
+.lockscreen[data-blanked="1"] {
+  opacity: 0;
+  transition: none;
+}
+.lockscreen {
+  transition: opacity 320ms ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  .lockscreen { transition: none; }
+}
+
 /* EMERGING FROM THE BLACK. Jay: "it would be nice if the the rotary menu could
  * have an appear effect like fading into view out of the deep black oled
  * display."
@@ -3542,6 +3562,20 @@ _LOCK_SCREEN_SCRIPT = r"""
       }, 60000);
     }
 
+    // THE SAFETY NET for data-blanked. If the screen-on event never arrives --
+    // a dead stream, a restarted controller -- the page must not be left black
+    // on a lit panel, which is indistinguishable from a broken phone. Any real
+    // input clears it, and input is exactly what is happening when someone is
+    // looking at a screen they expected to be showing something.
+    ["touchstart", "keydown", "pointerdown"].forEach(function (evt) {
+      document.addEventListener(evt, function () {
+        if (screenEl && screenEl.hasAttribute("data-blanked")
+            && !(carEl && carEl.getAttribute("data-on") === "1")) {
+          screenEl.removeAttribute("data-blanked");
+        }
+      }, { passive: true, capture: true });
+    });
+
     // ------------------------------------------------------------------
     // THE VOLUME KEYS. Jay's spec, and all of the policy lives here because it
     // is all STATE -- the compositor only reports press and release.
@@ -4314,6 +4348,33 @@ _LOCK_SCREEN_SCRIPT = r"""
           // can be invisible.
           screenEl.setAttribute("data-instant", "1");
           closeSheet();
+        });
+
+        // BLACKEN BEFORE THE PANEL GOES DOWN.
+        //
+        // Jay, twice: "the lock screen still flashes into view first." The
+        // first fix told the page before waking the panel, which was the wrong
+        // half of the problem -- THE PAGE CANNOT PAINT WHILE THE OUTPUT IS OFF.
+        // Wayland stops delivering frame callbacks to a surface on a
+        // powered-down output, which is the same reason the power menu's close
+        // animation used to play on WAKE rather than while dark. So the DOM
+        // change landed and the panel lit showing the stale frame still in the
+        // scanout buffer: the lock screen exactly as it was when the screen
+        // went off.
+        //
+        // The only frame that can be on a waking panel is the last one painted
+        // BEFORE it blanked. So that frame is made black here, while there is
+        // still a compositor listening.
+        lockStream.addEventListener("screen-off", function () {
+          if (screenEl) screenEl.setAttribute("data-blanked", "1");
+        });
+
+        // And back. Un-blackened on wake -- but NOT when the arc is up, because
+        // that is the case where black is the point.
+        lockStream.addEventListener("screen-on", function () {
+          if (!screenEl) return;
+          if (carEl && carEl.getAttribute("data-on") === "1") return;
+          screenEl.removeAttribute("data-blanked");
         });
         // One listener shape for all four, reading the payload rather than
         // relying on the event name to carry the screen state.
@@ -8260,6 +8321,20 @@ async def lock_screen_off(request: Request):
     if not _request_is_console(request):
         return JSONResponse({"error": "console only"}, status_code=403)
     return JSONResponse({"ok": True, "delivered": _push_lock_event("screen-off")})
+
+
+@router.post("/lock-screen-on")
+async def lock_screen_on(request: Request):
+    """The panel is coming back up. Un-blacken the page. Console-only.
+
+    The pair to /auth/lock-screen-off, and the reason both exist: the page
+    cannot paint while the output is off, so whatever is on a waking panel is
+    the last frame painted before it blanked. That frame is deliberately black,
+    and this is what takes it away again.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    return JSONResponse({"ok": True, "delivered": _push_lock_event("screen-on")})
 
 
 @router.post("/lock-power-menu")
