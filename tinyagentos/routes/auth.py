@@ -915,6 +915,57 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
   transition: none;
 }
 .lockscreen[data-radial="dark"] ~ .ls-scrim { background: #000; opacity: 1; }
+
+/* EMERGING FROM THE BLACK. Jay: "it would be nice if the the rotary menu could
+ * have an appear effect like fading into view out of the deep black oled
+ * display."
+ *
+ * Slower and softer than the lit-screen case on purpose. Over a blurred lock
+ * screen the arc only has to arrive; over true black it is the ONLY thing on
+ * the panel, so the eye follows it completely and a 200ms snap reads as a
+ * flash. This gives it time to resolve out of nothing.
+ *
+ * The scale grows from the PIVOT, not the centre, so it unfurls from under the
+ * thumb rather than swelling out of the middle of a dark screen -- the pivot is
+ * the whole conceit of this layout and the animation should say so.
+ *
+ * Opacity is eased out of zero slowly at first (the cubic starts shallow):
+ * on OLED the first few percent of brightness off true black is the most
+ * visible step there is, and a linear fade shows a hard edge appearing. */
+.lockscreen[data-radial="dark"] ~ #ls-carousel {
+  transform-origin: 0 var(--ls-car-pivot);
+  transform: scale(0.9);
+  transition: opacity 520ms cubic-bezier(0.4, 0, 0.2, 1),
+              transform 620ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+.lockscreen[data-radial="dark"] ~ #ls-carousel[data-on="1"] {
+  transform: scale(1);
+}
+/* The faces arrive just behind the ring they sit on, so the arc reads as a
+   thing that appeared and then filled, rather than everything at once. */
+.lockscreen[data-radial="dark"] ~ #ls-carousel .ls-face {
+  transition: transform 420ms cubic-bezier(0.32,0.72,0,1),
+              opacity 480ms ease 90ms,
+              box-shadow 180ms ease;
+}
+/* The banner last. It is text, and text arriving first on a black screen is
+   what makes an animation feel like a page load. */
+.lockscreen[data-radial="dark"] ~ #ls-carousel .ls-carousel-banner {
+  transition: opacity 420ms ease 180ms;
+}
+.lockscreen[data-radial="dark"] ~ #ls-carousel:not([data-on="1"]) .ls-carousel-banner {
+  opacity: 0;
+}
+@media (prefers-reduced-motion: reduce) {
+  .lockscreen[data-radial="dark"] ~ #ls-carousel,
+  .lockscreen[data-radial="dark"] ~ #ls-carousel[data-on="1"] {
+    transform: none; transition: opacity 200ms ease;
+  }
+  .lockscreen[data-radial="dark"] ~ #ls-carousel .ls-face,
+  .lockscreen[data-radial="dark"] ~ #ls-carousel .ls-carousel-banner {
+    transition: none;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
   .lockscreen[data-radial="1"] { transition: none; }
 }

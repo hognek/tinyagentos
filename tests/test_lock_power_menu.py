@@ -839,3 +839,56 @@ class TestTheOpeningPressOnlyOpens:
         src = self._src()
         press = src[src.index('if (action === "press")'):src.index("// RELEASE")]
         assert "pressOpened = false" in press, press
+
+
+class TestTheArcEmergesFromTheBlack:
+    """Jay: "when i activate the rotary menu with the screen off the lock screen
+    flashes into view first, it breaks the visual appeal" and "it would be nice
+    if the the rotary menu could have an appear effect like fading into view out
+    of the deep black oled display."
+
+    The flash was an ORDERING fault in the compositor script, not CSS: it woke
+    the panel before telling the page, so a genuinely lit frame of full lock
+    screen was shown before the page could hide it.
+    """
+
+    def test_the_dark_arc_scales_from_the_pivot_not_the_centre(self):
+        """The pivot is the whole conceit of this layout, so the animation
+        should unfurl from under the thumb rather than swell out of the middle
+        of a dark screen."""
+        css = auth._LOCK_SCREEN_STYLE
+        rule = css[css.index('data-radial="dark"] ~ #ls-carousel {'):][:400]
+        assert "transform-origin: 0 var(--ls-car-pivot)" in rule, rule
+        assert "scale(" in rule, rule
+
+    def test_the_dark_fade_is_slower_than_the_lit_one(self):
+        """Over a blurred lock screen the arc only has to arrive; over true
+        black it is the only thing on the panel, so a 200ms snap reads as a
+        flash. Compared as NUMBERS rather than trusting the comment."""
+        import re
+
+        css = auth._LOCK_SCREEN_STYLE
+        lit = css[css.index(".ls-carousel {"):]
+        lit = lit[:lit.index("}")]
+        lit_ms = max(int(m) for m in re.findall(r"(\d+)ms", lit))
+        dark = css[css.index('data-radial="dark"] ~ #ls-carousel {'):][:400]
+        dark_ms = max(int(m) for m in re.findall(r"(\d+)ms", dark))
+        assert dark_ms > lit_ms, (dark_ms, lit_ms)
+
+    def test_the_banner_arrives_after_the_faces(self):
+        """Text arriving first on a black screen is what makes an animation
+        feel like a page load rather than a thing appearing."""
+        import re
+
+        css = auth._LOCK_SCREEN_STYLE
+        faces = css[css.index('data-radial="dark"] ~ #ls-carousel .ls-face'):][:300]
+        banner = css[css.index('data-radial="dark"] ~ #ls-carousel .ls-carousel-banner'):][:300]
+        face_delay = max(int(m) for m in re.findall(r"ease (\d+)ms", faces) or ["0"])
+        banner_delay = max(int(m) for m in re.findall(r"ease (\d+)ms", banner) or ["0"])
+        assert banner_delay > face_delay, (banner_delay, face_delay)
+
+    def test_reduced_motion_drops_the_emergence(self):
+        css = auth._LOCK_SCREEN_STYLE
+        assert css.count("prefers-reduced-motion") >= 1
+        tail = css[css.index('data-radial="dark"] ~ #ls-carousel'):]
+        assert "prefers-reduced-motion" in tail, "the dark arc ignores reduced motion"
