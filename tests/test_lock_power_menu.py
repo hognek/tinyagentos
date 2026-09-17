@@ -437,9 +437,14 @@ class TestTheVolumeKeys:
             assert forbidden not in block, forbidden
 
     def test_the_talking_state_says_demo_on_screen(self):
+        # Sliced to the next function, not a fixed byte count. Adding the
+        # last-used recording inside startTalking pushed "(demo)" past a
+        # 600-char window and reddened this -- the fourth time in this file a
+        # fixed-length slice has broken on code growing inside its window.
         js = auth._LOCK_SCREEN_SCRIPT
         start = js.index("function startTalking(")
-        assert "(demo)" in js[start:start + 600]
+        body = js[start:js.index("function stopTalking(", start)]
+        assert "(demo)" in body, body
 
     def test_the_volume_surfaces_never_cover_the_passcode(self):
         """A volume nudge must not drop a bezel over the keypad someone is
@@ -454,12 +459,16 @@ class TestTheVolumeKeys:
         """It must never show an agent the screen behind it does not. A second
         fetch would let the two disagree the moment one of them was stale."""
         js = auth._LOCK_SCREEN_SCRIPT
-        start = js.index("function carAgents(")
-        body = js[start:js.index("function paintCarousel(", start)]
-        assert "agentsEl" in body
+        # carLive is the one that reads the islands; carAgents composes it with
+        # the remembered order. Both are checked, because the property is that
+        # NEITHER goes to the network for the agent list.
+        live_at = js.index("function carLive(")
+        live = js[live_at:js.index("function carArrange(", live_at)]
+        assert "agentsEl" in live, live
+        both = js[live_at:js.index("function paintCarousel(", live_at)]
         # "fetch(" and not "fetch": the comment above it explains why
         # RE-FETCHING would be wrong, and matching the bare word caught that.
-        assert "fetch(" not in body, body
+        assert "fetch(" not in both, both
 
 
 class TestTheRadioSwitches:
@@ -661,3 +670,101 @@ class TestHoldingToTalkDoesNotAlsoCycle:
         src = self._volume_key_source()
         press = src[src.index('if (action === "press")'):src.index("// RELEASE")]
         assert "nudgeVolume(" in press, press
+
+
+class TestTheArcRemembersWhereItWasLeft:
+    """Jay: "we need the rotary chooser to remember its position, so a person
+    can leave their most used agent ready in walking talkie mode. Might be best
+    to have them auto arrange in order of last used too."
+
+    Two separate pieces of state, because they answer different questions:
+    which agent the arc OPENS on, and what ORDER the faces are in. They agree
+    when the agent you parked on is the one you last used, and diverge when you
+    park on one without talking to it.
+    """
+
+    def test_the_remembered_focus_is_a_NAME_not_an_index(self):
+        """Agents come and go and the reordering moves them, so a remembered
+        index would quietly point at a different face -- the kind of bug that
+        looks like the feature working until it picks the wrong agent."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function carShow(")
+        body = js[start:js.index("function startTalking(", start)]
+        assert "carFocusName" in body, body
+        assert ".name === carFocusName" in body, body
+
+    def test_opening_does_not_reset_the_position(self):
+        """The branch that opens the arc from rest must NOT zero carIndex, or
+        every open lands on the front however it was left."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function volumeKey(")
+        body = js[start:js.index("// ------", start)]
+        rest = body[body.index("if (!carOpen && !volOpen)"):]
+        reveal = rest[:rest.index("restartIdleHide();")]
+        assert "carIndex = 0" not in reveal, reveal
+
+    def test_a_departed_agent_falls_back_to_the_front(self):
+        """If the remembered agent is gone, the arc must land somewhere real
+        rather than on an index that no longer exists."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function carShow(")
+        body = js[start:js.index("function startTalking(", start)]
+        assert "carIndex = 0" in body, body
+        assert body.index("carIndex = 0") < body.index("carFocusName"), body
+
+    def test_nothing_clobbers_the_restored_position_before_it_is_painted(self):
+        """The property Jay actually asked for, and the one my first pass
+        missed.
+
+        A mutation that let the restore run and then wrote `carIndex = 0`
+        AFTER it left every other test in this class green: they assert the
+        restore MECHANISM exists, not that its result survives to the paint.
+        Same shape as the repair path that 63 assertions missed -- presence is
+        not effect. So this reads the span between the restore and the paint
+        and requires nothing to touch carIndex in it.
+        """
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function carShow(")
+        body = js[start:js.index("function startTalking(", start)]
+        restore_end = body.index("=== carFocusName")
+        paint_at = body.index("paintCarousel()", restore_end)
+        # Past the end of the restore loop's own statement, up to the paint.
+        after_loop = body[body.index("}", body.index("}", restore_end) + 1):paint_at]
+        assert "carIndex" not in after_loop, (
+            "something writes carIndex between the restore and the paint, so "
+            "the remembered position is computed and thrown away:\n" + after_loop
+        )
+
+    def test_the_order_is_frozen_while_the_arc_is_open(self):
+        """Re-sorting on every repaint would shuffle the faces under the thumb
+        between one key press and the next."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        show = js[js.index("function carShow("):js.index("function startTalking(")]
+        assert "carOrder = carArrange()" in show, show
+        hide = js[js.index("function hideAll("):js.index("function restartIdleHide(")]
+        assert "carOrder = null" in hide, hide
+
+    def test_last_used_is_recorded_on_TALKING_not_on_focus(self):
+        """Cycling past six agents to reach one would otherwise rewrite the
+        whole order on the way there."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        talk = js[js.index("function startTalking("):js.index("function stopTalking(")]
+        assert "carUsed[" in talk, talk
+        remember = js[js.index("function rememberFocus("):js.index("function startTalking(")]
+        assert "carUsed[" not in remember, remember
+
+    def test_ties_keep_the_islands_own_order(self):
+        """Agents never talked to should stay in the arrangement the user
+        already sees behind the arc, not an arbitrary one."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        arrange = js[js.index("function carArrange("):js.index("function carAgents(")]
+        assert "a.index - b.index" in arrange, arrange
+
+    def test_storage_failures_do_not_break_a_keypress(self):
+        """localStorage throws in a private context and can come back empty.
+        Nothing here is worth failing a volume key over."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        save = js[js.index("function carSave("):js.index("function carLive(")]
+        assert "try {" in save and "catch" in save, save
+        # And the restore on load is guarded too.
+        assert "JSON.parse(window.localStorage.getItem(CAR_STORE)" in js

@@ -3522,6 +3522,8 @@ _LOCK_SCREEN_SCRIPT = r"""
     function hideAll() {
       if (volEl) volEl.removeAttribute("data-on");
       if (carEl) { carEl.removeAttribute("data-on"); carEl.removeAttribute("data-talking"); }
+      // Let the next open re-arrange. Held only while the arc is visible.
+      carOrder = null;
       if (screenEl) screenEl.removeAttribute("data-radial");
       if (scrim) {
         scrim.removeAttribute("data-on");
@@ -3580,7 +3582,55 @@ _LOCK_SCREEN_SCRIPT = r"""
         .catch(function () { /* the bar has already moved; leave it */ });
     }
 
-    function carAgents() {
+    // WHAT THE ARC REMEMBERS, and where.
+    //
+    // Jay: "we need the rotary chooser to remember its position, so a person
+    // can leave their most used agent ready in walking talkie mode. Might be
+    // best to have them auto arrange in order of last used too."
+    //
+    // Two SEPARATE pieces of state, because they answer different questions:
+    //   carFocusName  which agent the arc opens on -- "where I left it"
+    //   carUsed       when each agent was last talked to -- the sort order
+    // They agree when the agent you parked on is the one you last used, and
+    // diverge when you park on one without talking to it. Keeping them apart
+    // is what makes that case behave.
+    //
+    // KEYED BY NAME, NEVER BY INDEX. Agents come and go, and the reordering
+    // below moves them, so a remembered index would quietly point at a
+    // different face -- exactly the sort of bug that looks like the feature
+    // working until you notice it picked the wrong agent.
+    //
+    // localStorage because the kiosk profile is persistent
+    // (--user-data-dir=/var/lib/taos-kiosk/chrome), so it survives a restart
+    // without the pre-auth screen needing a write path to the server. Wrapped
+    // because it throws in a private context and can come back empty.
+    var CAR_STORE = "taos.ls.carousel";
+    var carFocusName = null;
+    var carUsed = {};
+    // The order the arc is CURRENTLY showing. Computed when it opens and held
+    // while it is up: re-sorting on every repaint would shuffle the faces under
+    // the thumb mid-cycle.
+    var carOrder = null;
+
+    try {
+      var saved = JSON.parse(window.localStorage.getItem(CAR_STORE) || "{}");
+      if (saved && typeof saved === "object") {
+        carFocusName = typeof saved.focus === "string" ? saved.focus : null;
+        carUsed = (saved.used && typeof saved.used === "object") ? saved.used : {};
+      }
+    } catch (err) {
+      // No memory is a fine state to start in; it just opens on the first agent.
+    }
+
+    function carSave() {
+      try {
+        window.localStorage.setItem(CAR_STORE, JSON.stringify({
+          focus: carFocusName, used: carUsed
+        }));
+      } catch (err) { /* nothing here is worth failing a keypress over */ }
+    }
+
+    function carLive() {
       // The islands are the source. The carousel must never show an agent the
       // screen behind it does not, and re-fetching would let the two disagree.
       var out = [];
@@ -3589,6 +3639,41 @@ _LOCK_SCREEN_SCRIPT = r"""
         var el = agentsEl.children[i];
         var rec = el.__agent;
         if (rec && rec.name) out.push(rec);
+      }
+      return out;
+    }
+
+    // The order to show, most recently used first. Ties keep the islands' own
+    // order, so agents that have never been talked to stay in the arrangement
+    // the user already sees behind the arc rather than in an arbitrary one.
+    function carArrange() {
+      var live = carLive();
+      var decorated = live.map(function (agent, index) {
+        return { agent: agent, index: index, used: Number(carUsed[agent.name]) || 0 };
+      });
+      decorated.sort(function (a, b) {
+        if (b.used !== a.used) return b.used - a.used;
+        return a.index - b.index;
+      });
+      return decorated.map(function (d) { return d.agent; });
+    }
+
+    function carAgents() {
+      // While the arc is open, the order is frozen -- see carOrder. The live
+      // list is still consulted for agents that APPEARED or LEFT, so a poll
+      // adding an agent does not leave a gap in the ring.
+      var live = carLive();
+      if (!carOrder) return carArrange();
+      var names = {};
+      for (var i = 0; i < live.length; i++) names[live[i].name] = live[i];
+      var out = [];
+      for (var j = 0; j < carOrder.length; j++) {
+        var kept = names[carOrder[j].name];
+        if (kept) { out.push(kept); delete names[kept.name]; }
+      }
+      // Anything new goes on the end rather than reshuffling what is on screen.
+      for (var k = 0; k < live.length; k++) {
+        if (names[live[k].name]) out.push(live[k]);
       }
       return out;
     }
@@ -3653,6 +3738,18 @@ _LOCK_SCREEN_SCRIPT = r"""
 
     function carShow() {
       if (!carEl) return;
+      // Arrange ONCE, here. Held for as long as the arc is up so the faces do
+      // not shuffle under the thumb between one key press and the next.
+      carOrder = carArrange();
+      // Open where it was left. By name, so a reorder or a departed agent
+      // cannot leave this pointing at the wrong face; if that agent is gone,
+      // fall back to the front of the arc rather than an arbitrary index.
+      carIndex = 0;
+      if (carFocusName) {
+        for (var i = 0; i < carOrder.length; i++) {
+          if (carOrder[i].name === carFocusName) { carIndex = i; break; }
+        }
+      }
       paintCarousel();
       carEl.setAttribute("data-on", "1");
       // Blur and dim what is behind, so the faces read against the feed.
@@ -3666,10 +3763,36 @@ _LOCK_SCREEN_SCRIPT = r"""
       startTalking();
     }
 
+    // Where the arc was left. Read back off the painted list rather than from
+    // carIndex alone, so a wrap-around or a changed list cannot record a name
+    // that is not the one under the pointer.
+    function rememberFocus() {
+      var list = carAgents();
+      if (!list.length) return;
+      var at = carIndex;
+      if (at < 0) at = list.length - 1;
+      if (at >= list.length) at = 0;
+      var focused = list[at];
+      if (focused && focused.name && focused.name !== carFocusName) {
+        carFocusName = focused.name;
+        carSave();
+      }
+    }
+
     function startTalking() {
       if (!carEl || carEl.getAttribute("data-on") !== "1") return;
       talking = true;
       carEl.setAttribute("data-talking", "1");
+      // Talking to an agent is what "last used" MEANS, so it is recorded here
+      // and not on mere focus: cycling past six agents to reach one would
+      // otherwise rewrite the whole order on the way.
+      var list = carAgents();
+      var focused = list[carIndex];
+      if (focused && focused.name) {
+        carUsed[focused.name] = Date.now();
+        carFocusName = focused.name;
+        carSave();
+      }
       // MOCK. No getUserMedia, no recorder, no upload. The word "demo" stays on
       // screen so this can never be mistaken for a live channel.
       setText(carPtt, "Talking… (demo)");
@@ -3700,7 +3823,9 @@ _LOCK_SCREEN_SCRIPT = r"""
         if (!carOpen && !volOpen) {
           // From rest: which key was pressed decides which surface appears.
           if (key === "up") { loadVolume(); volShow(); volArmed = true; return; }
-          carIndex = 0;
+          // carIndex is NOT reset here: carShow() restores where the arc was
+          // left, which is the whole point of remembering it. Zeroing it first
+          // would make every open land on the front regardless.
           carShow();
           // Holding down from rest opens the arc and then talks to whoever is
           // focused, which is what "press down then hold" should naturally do.
@@ -3742,6 +3867,7 @@ _LOCK_SCREEN_SCRIPT = r"""
       if (carOpen) {          // a genuine tap: move one agent
         carIndex += (key === "up" ? -1 : 1);
         paintCarousel();
+        rememberFocus();
         restartIdleHide();
       }
     }
