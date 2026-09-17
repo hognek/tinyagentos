@@ -265,9 +265,13 @@ class TestTurningTheScreenOffPutsTheMenuAway:
         start = js.index('addEventListener("screen-off"')
         handler = js[start:start + 1200]
         assert 'setAttribute("data-instant"' in handler, handler[:300]
+        # Sliced to the rule's closing brace, not a byte count: the selector
+        # list grew when the volume surfaces were added and pushed
+        # "transition: none" past a 400-char window.
         css = auth._LOCK_SCREEN_STYLE
         assert 'data-instant="1"' in css
-        assert "transition: none" in css[css.index('data-instant="1"'):][:400]
+        at = css.index('data-instant="1"')
+        assert "transition: none" in css[at:css.index("}", at) + 1], css[at:at + 600]
 
     def test_the_no_animation_flag_is_cleared_when_a_sheet_reopens(self):
         """Left set, every later sheet would snap open with no animation -- a
@@ -1114,3 +1118,45 @@ class TestDownReachesTheSecondMostUsedAgent:
         js = auth._LOCK_SCREEN_SCRIPT
         arrange = js[js.index("function carArrange("):js.index("function carAgents(")]
         assert "a.index - b.index" in arrange, arrange
+
+
+class TestBlankingTakesTheVolumeSurfacesWithIt:
+    """Jay: "if i change volume with screen off after using the rotary menu the
+    rotary menu flashes up first and vice versa."
+
+    The symmetry is the tell -- whichever surface was used LAST is the one that
+    flashes. data-blanked hides .lockscreen, but the bezel and the arc are
+    SIBLINGS of it, so a panel that blanked while one was up left a last
+    painted frame of black WITH that surface still on it, and the next wake
+    showed it before the new one could paint.
+    """
+
+    @staticmethod
+    def _blank_handler():
+        js = auth._LOCK_SCREEN_SCRIPT
+        at = js.index('screenEl.setAttribute("data-instant", "1");\n          hideAll();')
+        return js[at - 1400:at + 400]
+
+    def test_blanking_dismisses_them(self):
+        assert "hideAll();" in self._blank_handler()
+
+    def test_it_dismisses_them_without_a_fade(self):
+        """A 200ms fade has nowhere to go on a panel powering down in 120ms,
+        and an unfinished fade is exactly the half-lit ghost."""
+        h = self._blank_handler()
+        assert h.index('setAttribute("data-instant", "1")') < h.index("hideAll();"), h
+
+    def test_the_instant_flag_reaches_the_volume_surfaces(self):
+        """It only covered the sheets, which is why hiding the lock screen
+        never reached the arc."""
+        css = auth._LOCK_SCREEN_STYLE
+        at = css.index('data-instant="1"')
+        rule = css[at:css.index("}", at) + 1]
+        assert "#ls-carousel" in rule, rule
+        assert "#ls-vol" in rule, rule
+
+    def test_blackness_is_set_after_the_dismissal(self):
+        """hideAll decides blackness for itself, so setting it first would be
+        undone by the very call that is supposed to tidy up."""
+        h = self._blank_handler()
+        assert h.index("hideAll();") < h.index('setAttribute("data-blanked", "1")'), h

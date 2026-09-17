@@ -1194,7 +1194,14 @@ body.ls-black { background: #000; }
    the screen comes back, which reads as the phone catching up with itself. */
 .lockscreen[data-instant="1"] ~ .ls-modal,
 .lockscreen[data-instant="1"] ~ .ls-shade,
-.lockscreen[data-instant="1"] ~ .ls-sheet { transition: none; }
+.lockscreen[data-instant="1"] ~ .ls-sheet,
+/* The volume surfaces too. They are siblings of .lockscreen, so hiding the
+   lock screen never touched them -- a panel blanking mid-fade kept a half-lit
+   arc in its buffer and showed it on the next wake. */
+.lockscreen[data-instant="1"] ~ #ls-vol,
+.lockscreen[data-instant="1"] ~ #ls-carousel,
+.lockscreen[data-instant="1"] ~ #ls-carousel .ls-face,
+.lockscreen[data-instant="1"] ~ #ls-carousel .ls-carousel-banner { transition: none; }
 .lockscreen[data-sheet="power"] ~ #ls-power {
   opacity: 1; pointer-events: auto; transform: scale(1);
 }
@@ -4464,7 +4471,28 @@ _LOCK_SCREEN_SCRIPT = r"""
         // BEFORE it blanked. So that frame is made black here, while there is
         // still a compositor listening.
         lockStream.addEventListener("screen-off", function () {
-          if (screenEl) screenEl.setAttribute("data-blanked", "1");
+          if (!screenEl) return;
+          // TAKE THE VOLUME SURFACES DOWN TOO, and without a fade.
+          //
+          // Jay: "if i change volume with screen off after using the rotary
+          // menu the rotary menu flashes up first and vice versa." The
+          // symmetry -- whichever was used LAST is what flashes -- is the tell:
+          // it is the scanout buffer again.
+          //
+          // data-blanked hides .lockscreen, but the bezel and the arc are
+          // SIBLINGS of it, not children. So a panel that blanked while one of
+          // them was up left a last painted frame of black WITH that surface
+          // still on it, and the next wake showed it before the new surface
+          // could paint. Hiding the lock screen was never going to reach them.
+          //
+          // data-instant first, so their transitions do not run: a 200ms fade
+          // has nowhere to go on a panel that is powering down in 120ms, and
+          // an unfinished fade is exactly the half-lit ghost being described.
+          screenEl.setAttribute("data-instant", "1");
+          hideAll();
+          // After hideAll, which decides blackness for itself and would
+          // otherwise clear what is set here.
+          screenEl.setAttribute("data-blanked", "1");
           setBlack(true);
         });
 
