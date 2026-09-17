@@ -4054,15 +4054,32 @@ _LOCK_SCREEN_SCRIPT = r"""
           // On the element rather than in a variable, because two separate
           // handlers need the answer and the attribute is the one thing that
           // cannot drift from what is on screen.
+          // THE RULE, in Jay's words: "if opened from standby, back to
+          // standby." And standby means THE PAGE WAS BLACK, not that the panel
+          // was powered down.
+          //
+          // Those come apart, which is why this was intermittent. After a dark
+          // session the page is left black while the panel is still ON --
+          // swayidle has not reached its timeout yet. A second summon inside
+          // that window asked the compositor, got "panel is on", and treated it
+          // as an awake summon: the arc opened blurred over the lock screen and
+          // the close revealed it. Jay: "sometimes ... im still being sent to
+          // the lock screen instead of screen off."
+          //
+          // So the PAGE's own state decides, and the compositor's hint is only
+          // a fallback -- it still matters for the first summon after a
+          // controller restart, when the page has never seen a screen-off.
+          var dark = !!fromDark
+            || !!(screenEl && screenEl.hasAttribute("data-blanked"));
           if (screenEl) {
-            if (fromDark) screenEl.setAttribute("data-fromdark", "1");
+            if (dark) screenEl.setAttribute("data-fromdark", "1");
             else screenEl.removeAttribute("data-fromdark");
           }
           if (key === "up") { loadVolume(); volShow(); volArmed = true; return; }
           // Opened from a dark panel: the arc goes over black, not over the
           // whole lock screen. Jay: "it will look nice against the black oled
           // screen". The compositor woke the panel before telling us.
-          carDark = !!fromDark;
+          carDark = dark;
           // carIndex is NOT reset here: carShow() restores where the arc was
           // left, which is the whole point of remembering it. Zeroing it first
           // would make every open land on the front regardless.

@@ -1160,3 +1160,45 @@ class TestBlankingTakesTheVolumeSurfacesWithIt:
         undone by the very call that is supposed to tidy up."""
         h = self._blank_handler()
         assert h.index("hideAll();") < h.index('setAttribute("data-blanked", "1")'), h
+
+
+class TestOpenedFromStandbyReturnsToStandby:
+    """Jay: "sometimes after using the radial dial and it times out im still
+    being sent to the lock screen instead of screen off, can we not have a
+    rule, if opened from standby, back to standby."
+
+    The rule was already the intent; what was wrong was the definition of
+    standby. It was being taken from the COMPOSITOR -- whether the output was
+    powered -- and those two facts come apart: after a dark session the page is
+    black while the panel is still on, because swayidle has not reached its
+    timeout. A second summon in that window read "panel is on", treated it as
+    an awake summon, and revealed the lock screen on close. Hence "sometimes".
+    """
+
+    @staticmethod
+    def _rest_branch():
+        js = auth._LOCK_SCREEN_SCRIPT
+        src = js[js.index("function volumeKey("):]
+        src = src[:src.index("// ------")]
+        rest = src[src.index("if (!carOpen && !volOpen)"):]
+        return rest[:rest.index("restartIdleHide();")]
+
+    def test_standby_is_decided_by_the_page_not_the_compositor(self):
+        branch = self._rest_branch()
+        assert 'hasAttribute("data-blanked")' in branch, branch
+
+    def test_the_compositor_hint_is_still_honoured(self):
+        """It is the only signal available for the first summon after a
+        controller restart, when the page has never seen a screen-off."""
+        branch = self._rest_branch()
+        assert "fromDark" in branch, branch
+        # Either source is enough.
+        assert "||" in branch[branch.index("var dark ="):branch.index("var dark =") + 160], branch
+
+    def test_the_arc_styling_follows_the_same_decision(self):
+        """carDark drives whether the arc goes dark or merely blurs. Left on
+        fromDark alone it would blur over a lock screen nobody can see, and
+        then the close would reveal it."""
+        branch = self._rest_branch()
+        assert "carDark = dark;" in branch, branch
+        assert "carDark = !!fromDark" not in branch, branch
