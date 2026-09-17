@@ -1713,7 +1713,19 @@ body.lockscreen-on .osk-toggle { display: none !important; }
 }
 .ls-voice-text[data-error="1"] { font-size: 14px; color: rgba(255,176,32,0.92); }
 .ls-voice-acts { display: flex; gap: 10px; padding-top: 2px; }
-.lockscreen[data-sheet="voice"] ~ #ls-voice { transform: translateY(0); }
+/* The dictation dialog is a MODAL now, not a sheet, so it scales up out of the
+   blur like the power menu instead of sliding from the bottom edge. Its reveal
+   rule has to live beside the other modal one, or it opens invisibly -- the
+   failure the sheet-name test exists to catch. */
+.lockscreen[data-sheet="voice"] ~ #ls-voice {
+  opacity: 1; pointer-events: auto; transform: scale(1);
+}
+.ls-modal-voice .ls-voice-head {
+  display: flex; align-items: center; gap: 11px; padding-bottom: 4px;
+}
+.ls-modal-voice .ls-voice-who { min-width: 0; flex: 1; text-align: left; }
+.ls-modal-voice .ls-sheet-close { flex: none; }
+.ls-modal-voice .ls-voice-acts { padding-top: 4px; }
 
 /* Force-touch feel: the island sinks under the finger, then pops as it opens.
    Without the sink there is no feedback that a HOLD is doing anything, and the
@@ -2377,26 +2389,32 @@ def _lock_tail_html() -> str:
     </div>
     <p class="ls-decision-done" id="ls-decision-done" hidden></p>
   </section>
-  <section class="ls-sheet ls-sheet-voice" id="ls-voice" role="dialog" aria-modal="true"
+  <!-- Dictation. A CENTRED DIALOG, not a bottom sheet: Jay, of the microphone
+       on an agent island -- "instead of a slide up menu at the bottom can we
+       have a dialog in the centre of the screen against a blur effect". Same
+       .ls-modal shell as the power menu, so the two modal surfaces on this
+       screen read as one thing rather than two designs.
+       The grabber is gone with the sheet: it was the affordance for dragging a
+       sheet down, and there is nothing to drag now. -->
+  <section class="ls-modal ls-modal-voice" id="ls-voice" role="dialog" aria-modal="true"
            aria-labelledby="ls-voice-title" hidden>
-    <header class="ls-sheet-head">
-      <span class="ls-grabber"></span>
-      <div class="ls-sheet-title">
+    <div class="ls-modal-card">
+      <div class="ls-voice-head">
         <div class="ls-sheet-avatar" id="ls-voice-avatar" aria-hidden="true"></div>
-        <div>
+        <div class="ls-voice-who">
           <div class="ls-sheet-name" id="ls-voice-title"></div>
           <div class="ls-sheet-sub" id="ls-voice-state">Listening\u2026</div>
         </div>
+        <button type="button" class="ls-sheet-close" id="ls-voice-close" aria-label="Cancel dictation">&#10005;</button>
       </div>
-      <button type="button" class="ls-sheet-close" id="ls-voice-close" aria-label="Cancel dictation">&#10005;</button>
-    </header>
-    <div class="ls-voice-body">
-      <canvas class="ls-wave" id="ls-wave" width="600" height="120" aria-hidden="true"></canvas>
-      <p class="ls-voice-text" id="ls-voice-text" aria-live="polite"></p>
-    </div>
-    <div class="ls-voice-acts">
-      <button type="button" class="ls-act" id="ls-voice-cancel">Cancel</button>
-      <button type="button" class="ls-act" data-act="approve" id="ls-voice-send" disabled>Send</button>
+      <div class="ls-voice-body">
+        <canvas class="ls-wave" id="ls-wave" width="600" height="120" aria-hidden="true"></canvas>
+        <p class="ls-voice-text" id="ls-voice-text" aria-live="polite"></p>
+      </div>
+      <div class="ls-voice-acts">
+        <button type="button" class="ls-act" id="ls-voice-cancel">Cancel</button>
+        <button type="button" class="ls-act" data-act="approve" id="ls-voice-send" disabled>Send</button>
+      </div>
     </div>
   </section>"""
 
@@ -3720,7 +3738,11 @@ _LOCK_SCREEN_SCRIPT = r"""
         if (off > list.length / 2) off -= list.length;
         if (off < -list.length / 2) off += list.length;
         var away = Math.abs(off);
-        face.style.setProperty("--a", (off * STEP) + "deg");
+        // NEGATED: a lower index -- a more recently used agent -- sits BELOW
+        // the pointer, so the face that volume-down brings up to the pointer is
+        // the one that was visually below it. With the old sign, down moved the
+        // ring toward older agents while the faces travelled the other way.
+        face.style.setProperty("--a", (-off * STEP) + "deg");
         face.style.setProperty("--s", off === 0 ? "1.1" : (away === 1 ? "0.86" : "0.7"));
         // Past the span they fade out entirely rather than piling up behind the
         // visible ones, where they would show as a smudge on the arc.
@@ -3865,7 +3887,13 @@ _LOCK_SCREEN_SCRIPT = r"""
         return;
       }
       if (carOpen) {          // a genuine tap: move one agent
-        carIndex += (key === "up" ? -1 : 1);
+        // DOWN walks TOWARD the front of the arc, which is the most recently
+        // used agent. Jay: "currently to go to the last used agent on the
+        // rotary I have to press volume up, can you change it so it's on
+        // volume down." The arc's angles are flipped to match (see
+        // paintCarousel), so "down" still means down on the glass -- swapping
+        // the keys alone would have made the ring travel the wrong way.
+        carIndex += (key === "up" ? 1 : -1);
         paintCarousel();
         rememberFocus();
         restartIdleHide();
