@@ -4521,6 +4521,42 @@ _LOCK_SCREEN_SCRIPT = r"""
       }
     }
 
+    // THE PASSCODE GATE ON "STOP ALL AGENTS". Jay ruled it, and the shape is
+    // the one this screen already uses twice: the agent menu "collects the
+    // INTENT and then asks for the passcode", and the decision sheet says
+    // "Unlock to approve this". This is that rule applied a third time rather
+    // than a new one -- stopping a SINGLE agent already demanded an unlock, and
+    // stopping all of them was the one place the rule was not applied.
+    //
+    // The verb is GATED, NOT REMOVED: _POWER_ACTIONS still carries it and
+    // /auth/lock-power-action still answers it once a session exists. The gate
+    // belongs in the page, which is where the locked screen is.
+    //
+    // Power off and restart stay pre-auth on their own argument: holding the
+    // hardware key already took the phone down from this state, so the menu
+    // adds no capability there. The key cannot drain every agent on the device.
+    // That asymmetry IS the reason this is the one verb.
+    //
+    // Its own store rather than __lsPendingAgentAction: that one is keyed on an
+    // agent, and this is the verb that is about all of them.
+    window.__lsPendingPowerAction = null;
+
+    function requirePasscodeForPower(item) {
+      window.__lsPendingPowerAction = { action: item[1], at: Date.now() };
+      // NOT closeSheet() first: openSheet already hides whatever sheet is up
+      // before revealing the next, and closing first would leave closeSheet's
+      // 400ms hide to find data-sheet already "passcode" and bail -- the power
+      // sheet would stay in the tree, behind the keypad.
+      var note = document.getElementById("ls-unlock-note");
+      if (note) {
+        // What they are unlocking FOR. An unexplained keypad straight after a
+        // menu tap reads as the phone having simply re-locked itself.
+        note.textContent = "Unlock to stop all agents";
+        note.hidden = false;
+      }
+      openPasscode();
+    }
+
     // Replace the row with its own question. Jay: "stop all agents and
     // emergency call needs confirmation".
     function confirmPower(btn, item) {
@@ -4553,6 +4589,16 @@ _LOCK_SCREEN_SCRIPT = r"""
       no.addEventListener("click", paintPowerMenu);
       yes.addEventListener("click", function () {
         box.remove();
+        // JAY'S RULING: "Stop all agents" demands the passcode. It is the one
+        // verb here that moves, and see requirePasscodeForPower for why.
+        if (item[1] === "stop-agents") {
+          // Put the menu back first: the confirm REPLACED this row, so leaving
+          // it removed would mean the next time the power key is held the menu
+          // is one item short.
+          paintPowerMenu();
+          requirePasscodeForPower(item);
+          return;
+        }
         runPowerAction(item[1], item[0]);
       });
       row.appendChild(no); row.appendChild(yes);
@@ -4994,10 +5040,17 @@ _LOCK_SCREEN_SCRIPT = r"""
     function pollPanels() {
       fetch("/auth/lock-panels", { credentials: "same-origin" })
         .then(function (r) { return r.ok ? r.json() : null; })
-        .then(function (d) { if (d) paintPanels(d); })
-        // 404 is the ordinary answer with demo content off: the panels stay
-        // empty and say so. Not an error.
-        .catch(function () { /* leave the panels as they are */ });
+        // A dead network answers the same way a flagged-off device does: with
+        // nothing. Both are ordinary here, so both go down the same path.
+        .catch(function () { return null; })
+        // PAINT EVEN WITH NOTHING TO PAINT. A 404 is the ordinary answer with
+        // the demo content off, and `paintPanels` is the ONLY thing that clears
+        // the markup's `hidden` -- so skipping the call on that branch left all
+        // four panels not empty but BLANK on every device that is not in demo
+        // mode, which is every real one. `paintPanels({})` unhides them and
+        // paints each "nothing here" card; `paintDecisions([])` detaches the
+        // decisions head, which is right on a device with nothing pending.
+        .then(function (d) { paintPanels(d || {}); });
     }
     if (panelEls.phone || panelEls.mailbox || panelEls.apps
         || panelEls.projects || panelEls.decisions) {
@@ -8850,9 +8903,11 @@ async def lock_panels(request: Request):
     404 with either flag off; the page treats that as "nothing to show".
 
     Everything served here is READ-ONLY content. The panel that used to carry
-    actions ("stop all agents", reachable by anyone holding the phone) was
-    replaced by projects, which removed that pre-auth exposure rather than
-    relocating it.
+    actions was replaced by projects; the actions themselves moved to the power
+    menu, where "stop all agents" is now gated behind the passcode rather than
+    being reachable by anyone holding the phone. Relocated AND gated, not
+    removed -- poweroff and reboot stay pre-auth because the hardware key
+    already does both from this screen.
     """
     if not _request_is_console(request):
         return JSONResponse({"error": "console only"}, status_code=403)

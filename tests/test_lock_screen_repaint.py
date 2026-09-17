@@ -136,6 +136,14 @@ function makeNode(tag) {
       this._text = String(v);
     }
   });
+  // parentNode, the name the SHIPPED code uses. The stand-in stored the link
+  // as `parent` only, so `el.parentNode` was undefined in here: paintDecisions'
+  // "step out of the alerts panel" never ran, and the re-attach guard
+  // (`el.parentNode !== notifsEl`) was true unconditionally. Both read as
+  // working. An alias rather than a second field, or the two names drift.
+  Object.defineProperty(el, "parentNode", {
+    get: function () { return this.parent; }
+  });
   Object.defineProperty(el, "firstChild", {
     get: function () { return this.children.length ? this.children[0] : null; }
   });

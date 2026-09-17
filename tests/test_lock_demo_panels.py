@@ -479,7 +479,7 @@ paintPanels = function (data) {
 };
 """
 
-_DRIVER = r"""
+_SNAPSHOT = r"""
 function snapshot() {
   var out = {};
   for (var k in panelEls) {
@@ -539,6 +539,9 @@ function clickIn(panel, rowKey, cls) {
   return btn;
 }
 
+"""
+
+_TICKS = r"""
 var SCN = JSON.parse(process.env.LS_PANELS);
 var snapshots = [];
 for (var t = 0; t < SCN.ticks.length; t++) {
@@ -554,6 +557,56 @@ for (var t = 0; t < SCN.ticks.length; t++) {
   snapshots.push(snapshot());
 }
 process.stdout.write(JSON.stringify(snapshots));
+"""
+
+_DRIVER = _SNAPSHOT + _TICKS
+
+
+#: THE POLL, not the painter. Everything above drives `paintPanels` with a
+#: payload; this drives `pollPanels` with a RESPONSE, because the bug that
+#: reached the glass lived in the branch between the two -- on a device with
+#: the demo flags off the route 404s, and the client skipped the paint.
+#:
+#: `paintPanels` is the only thing that clears the markup's `hidden`, so
+#: skipping it left all four panels not empty but blank. Every assertion in
+#: this file passed while that was true: they all start from a 200.
+_POLL_DRIVER = r"""
+var RESP = JSON.parse(process.env.LS_POLL);
+
+// The response the device actually gets, modelled at the fetch boundary rather
+// than by calling paintPanels differently -- the branch under test is inside
+// pollPanels, so a harness that reached past it would test nothing.
+function fetch(url, opts) {
+  __FETCHED__.push(url);
+  if (RESP.rejects) return Promise.reject(new Error("no network"));
+  return Promise.resolve({
+    ok: !!RESP.ok,
+    status: RESP.status,
+    json: function () { return Promise.resolve(RESP.body); }
+  });
+}
+var __FETCHED__ = [];
+
+pollPanels();
+
+// The whole chain is microtasks, and node drains those before any timer runs,
+// so one zero-delay macrotask lands after the last .then.
+setTimeout(function () {
+  var out = snapshot();
+  out.__fetched = __FETCHED__.length;
+  process.stdout.write(JSON.stringify(out));
+}, 0);
+"""
+
+#: The defect put back: the not-ok branch skips the paint. Rendered output is
+#: identical on the 200 path -- which is why nothing here caught it.
+_SKIP_ON_NOTHING = r"""
+pollPanels = function () {
+  fetch("/auth/lock-panels", { credentials: "same-origin" })
+    .then(function (r) { return r.ok ? r.json() : null; })
+    .then(function (d) { if (d) paintPanels(d); })
+    .catch(function () {});
+};
 """
 
 
@@ -609,6 +662,30 @@ def _run(ticks, *, clicks=None, reconciled: bool = True, notify_after: bool = Fa
         "notifyAfter": notify_after,
         "groups": auth._demo_notifications(),
     })
+    proc = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, env=env, timeout=60
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    return json.loads(proc.stdout)
+
+
+def _run_poll(*, ok=True, status=200, body=None, rejects=False, skip=False):
+    """Drive the POLL with a response, rather than the painter with a payload.
+
+    `skip` puts the pre-fix client back, so the control can show this harness
+    is able to observe the defect at all.
+    """
+    node = shutil.which("node") or shutil.which("nodejs")
+    if not node:
+        pytest.skip("node is not installed")
+    src = _panel_source() + _function("pollPanels")
+    if skip:
+        src += _SKIP_ON_NOTHING
+    script = _DOM + _EVENTS + _PANEL_STATE + src + _SNAPSHOT + _POLL_DRIVER
+    env = dict(os.environ)
+    env["LS_POLL"] = json.dumps(
+        {"ok": ok, "status": status, "body": body, "rejects": rejects}
+    )
     proc = subprocess.run(
         [node, "-e", script], capture_output=True, text=True, env=env, timeout=60
     )
@@ -1082,3 +1159,74 @@ class TestPerAgentUsageInTheStatsPanel:
         assert "ram_mb" in block and "storage_mb" in block
         # ...but only cpu_percent is passed as the percentage argument.
         assert "statRow(acard" in block
+
+
+class TestADeviceWithTheDemoFlagsOffStillHasPanels:
+    """The starting state this file never varied: a response that is NOT 200.
+
+    @taOS-dev found it in review and it is the same lesson one level up. Every
+    other test here begins at `_payload()`, which is the 200 path; the flags-off
+    path was asserted only as far as `status_code == 404`, and the client half
+    of that sentence -- "the panels render their own nothing-here" -- was never
+    run. It was not true. `paintPanels` is the ONLY thing that clears the
+    markup's `hidden`, the old client called it only on the `r.ok` branch, and
+    so on every device that is not in demo mode -- which is every real one --
+    tapping Phone, Mailbox, Apps or Projects rendered nothing at all. Not an
+    empty state: blank.
+
+    `test_the_harness_observes_the_skip` puts the old branch back and requires
+    these assertions to go red, because "the panel is visible" is exactly the
+    sort of claim a harness can satisfy by accident.
+    """
+
+    OWNED = ["phone", "mailbox", "apps", "projects"]
+
+    def test_a_404_unhides_all_four_panels(self):
+        snap = _run_poll(ok=False, status=404, body=None)
+        assert snap["__fetched"] == 1
+        for panel in self.OWNED:
+            assert snap["__hidden"][panel] is False, panel
+
+    def test_a_404_paints_each_panel_its_own_empty_state(self):
+        """Visible AND saying something. A panel unhidden but never painted is
+        an empty box on the glass, which is not what the route's docstring
+        promises either."""
+        snap = _run_poll(ok=False, status=404, body=None)
+        for panel in self.OWNED:
+            assert _keys(snap, panel) == ["empty"], (panel, _keys(snap, panel))
+            assert "ls-empty" in snap[panel][0]["cls"], panel
+
+    def test_a_404_leaves_no_decisions_head_in_the_alerts_panel(self):
+        """With nothing pending the head is detached rather than sitting there
+        empty -- the one panel whose absence is correct."""
+        snap = _run_poll(ok=False, status=404, body=None)
+        assert snap["__decisions_parented"] is False
+        assert snap["decisions"] == []
+
+    def test_a_dead_network_is_treated_as_nothing_to_show(self):
+        """A rejected fetch and a 404 are the same thing to a user: no content.
+        They must not be the same as a blank screen."""
+        snap = _run_poll(rejects=True)
+        for panel in self.OWNED:
+            assert snap["__hidden"][panel] is False, panel
+            assert _keys(snap, panel) == ["empty"], panel
+
+    def test_the_demo_path_still_paints_the_real_tables(self):
+        """The discriminating case: with the flags ON nothing above applies, and
+        the panels carry content rather than an empty state. Without this, an
+        implementation that painted the empty state unconditionally would
+        satisfy every assertion in this class."""
+        snap = _run_poll(ok=True, status=200, body=_payload())
+        for panel in self.OWNED:
+            assert snap["__hidden"][panel] is False, panel
+            assert _keys(snap, panel) != ["empty"], panel
+            assert len(snap[panel]) > 1, panel
+
+    def test_the_harness_observes_the_skip(self):
+        """The control. The pre-fix client, against the same 404: the panels
+        stay exactly as the server rendered them, which is hidden."""
+        snap = _run_poll(ok=False, status=404, body=None, skip=True)
+        assert snap["__fetched"] == 1
+        for panel in self.OWNED:
+            assert snap["__hidden"][panel] is True, panel
+            assert snap[panel] == [], panel

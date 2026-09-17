@@ -23,12 +23,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import shutil
+import subprocess
 
 import pytest
 
 import tinyagentos.routes.auth as auth
 from tinyagentos.auth_middleware import EXEMPT_PATHS
+
+from test_lock_demo_panels import _EVENTS
+from test_lock_screen_gestures import _function
+from test_lock_screen_repaint import _DOM, _var
 
 
 class _Req:
@@ -1202,3 +1209,186 @@ class TestOpenedFromStandbyReturnsToStandby:
         branch = self._rest_branch()
         assert "carDark = dark;" in branch, branch
         assert "carDark = !!fromDark" not in branch, branch
+
+
+#: The menu driven as a menu: build it, tap a row, answer its question.
+#:
+#: Source-text assertions can say the gate is WRITTEN. They cannot say it is
+#: REACHED -- and the thing being asserted here is what a locked phone sends
+#: when a stranger taps "Stop all agents", which is a property of the handlers,
+#: not of the file.
+_MENU_HARNESS = _DOM + _EVENTS + r"""
+var powerBody = makeNode("div");
+powerBody.setAttribute("id", "ls-power-body");
+var unlockNote = makeNode("div");
+unlockNote.setAttribute("id", "ls-unlock-note");
+unlockNote.hidden = true;
+
+// replaceWith, which confirmPower uses to swap the tapped row for its own
+// question. Not in the shared stand-in: absent, it is a TypeError that reads
+// from here as the confirm step being broken rather than as a harness gap.
+var __baseMake = makeNode;
+makeNode = function (tag) {
+  var el = __baseMake(tag);
+  el.replaceWith = function (next) {
+    var p = this.parent;
+    if (!p) return;
+    p.children.splice(p.children.indexOf(this), 1, next);
+    next.parent = p;
+    this.parent = null;
+  };
+  return el;
+};
+document.createElement = makeNode;
+
+// RECORDED, not stubbed away. A fetch that silently did nothing would satisfy
+// "no request was sent" for the wrong reason, and what reaches the server from
+// a locked screen is this file's entire subject.
+var POSTED = [];
+function fetch(url, opts) {
+  POSTED.push({ url: url, body: (opts && opts.body) || null });
+  var chain = { then: function () { return chain; },
+                catch: function () { return chain; } };
+  return chain;
+}
+
+// The real one opens the passcode sheet. Here it is the signal being measured.
+var PASSCODE = 0;
+function openPasscode() { PASSCODE += 1; }
+
+__SOURCE__
+
+function deepText(el, label) {
+  if (el.textContent === label) return true;
+  for (var i = 0; i < el.children.length; i++) {
+    if (deepText(el.children[i], label)) return true;
+  }
+  return false;
+}
+function rowFor(label) {
+  for (var i = 0; i < powerBody.children.length; i++) {
+    if (deepText(powerBody.children[i], label)) return powerBody.children[i];
+  }
+  throw new Error("no menu row labelled " + label);
+}
+function confirmBox() {
+  for (var i = 0; i < powerBody.children.length; i++) {
+    var c = powerBody.children[i];
+    if (String(c.className).indexOf("ls-power-confirm") !== -1) return c;
+  }
+  return null;
+}
+
+var SCN = JSON.parse(process.env.LS_MENU);
+paintPowerMenu();
+fire(rowFor(SCN.label), "click");
+var box = confirmBox();
+var out = { confirmed: !!box };
+if (box && SCN.go) {
+  var row = box.querySelector(".ls-power-confirm-row"), go = null;
+  for (var i = 0; row && i < row.children.length; i++) {
+    if (row.children[i].getAttribute("data-go") === "1") go = row.children[i];
+  }
+  if (!go) throw new Error("the confirm offers no way to go ahead");
+  fire(go, "click");
+}
+out.posted = POSTED;
+out.passcode = PASSCODE;
+out.pending = window.__lsPendingPowerAction || null;
+out.note = { text: unlockNote.textContent, hidden: !!unlockNote.hidden };
+out.rows = powerBody.children.length;
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+def _menu_source() -> str:
+    """The SHIPPED menu, lifted out of the served script rather than re-typed."""
+    return "\n".join([
+        _var("POWER_ITEMS"),
+        _function("powerResult"),
+        _function("runPowerAction"),
+        _function("requirePasscodeForPower"),
+        _function("paintPowerMenu"),
+        _function("confirmPower"),
+    ])
+
+
+def _tap(label, *, go=True):
+    node = shutil.which("node") or shutil.which("nodejs")
+    if not node:
+        pytest.skip("node is not installed")
+    script = _MENU_HARNESS.replace("__SOURCE__", _menu_source())
+    env = dict(os.environ)
+    env["LS_MENU"] = json.dumps({"label": label, "go": go})
+    proc = subprocess.run(
+        [node, "-e", script], capture_output=True, text=True, env=env, timeout=60
+    )
+    assert proc.returncode == 0, proc.stderr[-4000:]
+    return json.loads(proc.stdout)
+
+
+class TestStoppingEveryAgentDemandsThePasscode:
+    """Jay's ruling, after @taOS-dev put the question to him in review.
+
+    The rule was already written on this screen twice -- the agent menu
+    "collects the INTENT and then asks for the passcode", the decision sheet
+    says "Unlock to approve this" -- and the power menu was the one place it
+    was not applied. Stopping a SINGLE agent demanded an unlock; stopping all
+    of them did not.
+
+    Power off and Restart are deliberately untouched: holding the hardware key
+    already took the phone down from this screen, so the menu adds nothing
+    there. The key cannot drain every agent on the device. That asymmetry is
+    the whole reason this is the one verb that moved, which is why
+    `test_power_off_is_not_gated_with_it` is here -- without it, gating the
+    entire menu would pass everything else in this class.
+    """
+
+    def test_the_confirm_alone_sends_nothing(self):
+        """Tapping the row asks the question and stops there."""
+        out = _tap("Stop all agents", go=False)
+        assert out["confirmed"] is True
+        assert out["posted"] == []
+        assert out["passcode"] == 0
+
+    def test_answering_yes_raises_the_passcode_instead_of_stopping_them(self):
+        out = _tap("Stop all agents")
+        assert out["posted"] == [], (
+            "a locked screen sent the stop to the server: %r" % (out["posted"],)
+        )
+        assert out["passcode"] == 1
+
+    def test_the_intent_is_kept_for_the_signed_in_user(self):
+        """Taken, not thrown away: the drain happens once a session exists."""
+        out = _tap("Stop all agents")
+        assert out["pending"] and out["pending"]["action"] == "stop-agents"
+
+    def test_the_keypad_says_what_it_is_for(self):
+        """An unexplained keypad straight after a menu tap reads as the phone
+        having simply re-locked itself. Same note the agent menu writes."""
+        out = _tap("Stop all agents")
+        assert out["note"]["hidden"] is False
+        assert out["note"]["text"] == "Unlock to stop all agents"
+
+    def test_the_menu_is_whole_again_behind_the_keypad(self):
+        """The confirm REPLACED the row. Left removed, the next hold of the
+        power key shows a menu one item short."""
+        out = _tap("Stop all agents")
+        start = auth._LOCK_SCREEN_SCRIPT.index("var POWER_ITEMS")
+        table = auth._LOCK_SCREEN_SCRIPT[start:auth._LOCK_SCREEN_SCRIPT.index("];", start)]
+        assert out["rows"] == table.count('["')
+
+    def test_power_off_is_not_gated_with_it(self):
+        """The discriminating case, and the positive control for the recorder:
+        a verb that IS meant to go through pre-auth still does, and the harness
+        can see a POST when one happens."""
+        out = _tap("Power off")
+        assert out["passcode"] == 0
+        assert len(out["posted"]) == 1
+        assert out["posted"][0]["url"] == "/auth/lock-power-action"
+        assert json.loads(out["posted"][0]["body"])["action"] == "poweroff"
+
+    def test_the_verb_is_gated_not_removed(self):
+        """@taOS-dev's warning: the server must still answer `stop-agents` once
+        a session exists. What changed is who can ask, not what exists."""
+        assert "stop-agents" in auth._POWER_ACTIONS
