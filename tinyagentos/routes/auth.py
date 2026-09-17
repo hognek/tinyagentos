@@ -866,53 +866,86 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
   color: rgba(255,176,32,0.92);
 }
 
-/* THE AGENT CAROUSEL. Left edge, because that is where the keys are. */
+/* THE AGENT CAROUSEL -- RADIAL, pivoting on the volume rocker.
+ *
+ * Jay: "left edge thumb pivot around the button". So the faces sit on an ARC
+ * swept from the left edge at the rocker's height, not in a vertical strip.
+ * The thumb stays on the button and the agents come to it, which is the whole
+ * point of pivoting there rather than centring the arc on the screen.
+ *
+ * --ls-car-pivot is where the rocker is, as a share of screen height. 34% is a
+ * STARTING GUESS, not a measurement -- unlike the camera cutout, there is no
+ * vendor file that gives the button's position, so this is the one number here
+ * that wants a human to look at it. It is a single custom property so nudging
+ * it is a one-line change.
+ */
+:root { --ls-car-pivot: 34%; --ls-car-radius: 104px; }
 .ls-carousel {
-  position: fixed; left: 0; top: 0; bottom: 0; z-index: 80;
-  display: flex; align-items: center; gap: 12px;
-  padding: 0 14px 0 8px;
-  transform: translateX(-110%);
-  opacity: 0;
-  transition: transform 300ms cubic-bezier(0.32,0.72,0,1), opacity 200ms ease;
+  position: fixed; left: 0; top: 0; bottom: 0; right: 0; z-index: 80;
+  opacity: 0; pointer-events: none;
+  transition: opacity 200ms ease;
+}
+.ls-carousel[data-on="1"] { opacity: 1; }
+/* The pivot itself: a zero-size origin on the left edge at the rocker's
+   height. Every face is placed relative to THIS, so moving the pivot moves the
+   whole arc and nothing else needs to know. */
+.ls-carousel-strip {
+  position: absolute; left: 0; top: var(--ls-car-pivot);
+  width: 0; height: 0;
+}
+/* Each face rides the arc. The double rotation is what keeps a face UPRIGHT
+   while sitting on a curve: rotate to its angle, push out along the radius,
+   then rotate back by the same amount. Without the second rotation the avatars
+   tilt, which on a ring of faces reads as a rendering fault rather than style. */
+.ls-face {
+  position: absolute; left: 0; top: 0;
+  width: 46px; height: 46px; margin: -23px;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.1) center/cover no-repeat;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; font-weight: 700; color: rgba(255,255,255,0.7);
+  transform:
+    rotate(var(--a, 0deg))
+    translateX(var(--ls-car-radius))
+    rotate(calc(-1 * var(--a, 0deg)))
+    scale(var(--s, 0.82));
+  opacity: var(--o, 0.35);
+  transition: transform 300ms cubic-bezier(0.32,0.72,0,1), opacity 220ms ease,
+              box-shadow 180ms ease;
+}
+.ls-face[data-focus="1"] {
+  box-shadow: 0 0 0 2px rgba(255,255,255,0.9), 0 8px 22px -6px rgba(0,0,0,0.8);
+  color: #fff;
+}
+/* A faint arc behind the faces, so the ring reads as one object rather than
+   scattered dots. Drawn as a ring clipped to the pivot side. */
+.ls-carousel-arc {
+  position: absolute; left: 0; top: var(--ls-car-pivot);
+  width: calc(var(--ls-car-radius) * 2); height: calc(var(--ls-car-radius) * 2);
+  margin: calc(var(--ls-car-radius) * -1);
+  border-radius: 50%;
+  border: 1px solid rgba(255,255,255,0.1);
   pointer-events: none;
 }
-.ls-carousel[data-on="1"] { transform: translateX(0); opacity: 1; }
-.ls-carousel-strip {
-  display: flex; flex-direction: column; gap: 10px;
-  padding: 12px 8px; border-radius: 26px;
-  background: rgba(24,24,27,0.86);
+/* The banner sits OUTSIDE the arc, level with the pivot, so the name is beside
+   the focused face rather than under the thumb. */
+.ls-carousel-banner {
+  position: absolute; top: var(--ls-car-pivot);
+  left: calc(var(--ls-car-radius) + 46px);
+  transform: translateY(-50%);
+  max-width: 200px;
+  padding: 12px 15px; border-radius: 20px;
+  background: rgba(24,24,27,0.9);
   backdrop-filter: blur(26px) saturate(1.3);
   -webkit-backdrop-filter: blur(26px) saturate(1.3);
   box-shadow: 0 14px 40px -12px rgba(0,0,0,0.85);
 }
-/* Each face. The focused one grows and brightens; the rest stay small and dim,
-   so which is selected is readable at a glance from the corner of the eye --
-   this is driven by a key, not a tap, so the eye is not already on it. */
-.ls-face {
-  width: 40px; height: 40px; border-radius: 50%;
-  background: rgba(255,255,255,0.1) center/cover no-repeat;
-  display: flex; align-items: center; justify-content: center;
-  font-size: 14px; font-weight: 700; color: rgba(255,255,255,0.7);
-  opacity: 0.42; transform: scale(0.88);
-  transition: opacity 180ms ease, transform 220ms cubic-bezier(0.32,0.72,0,1),
-              box-shadow 180ms ease;
-}
-.ls-face[data-focus="1"] {
-  opacity: 1; transform: scale(1.12);
-  box-shadow: 0 0 0 2px rgba(255,255,255,0.85);
-  color: #fff;
-}
-.ls-carousel-banner { max-width: 190px; }
 .ls-carousel-name { font-size: 16px; font-weight: 700; color: #fff; }
 .ls-carousel-role {
-  margin-top: 1px; font-size: 12px; color: rgba(255,255,255,0.62);
+  margin-top: 1px; font-size: 11px; color: rgba(255,255,255,0.62);
   text-transform: uppercase; letter-spacing: 0.05em;
 }
-.ls-carousel-ptt {
-  margin-top: 8px; font-size: 12px; color: rgba(255,255,255,0.45);
-}
-/* Talking: the whole banner picks it up, because at arm's length the words are
-   not what you read -- the colour is. */
+.ls-carousel-ptt { margin-top: 8px; font-size: 12px; color: rgba(255,255,255,0.45); }
 .ls-carousel[data-talking="1"] .ls-carousel-ptt { color: #6ee787; font-weight: 600; }
 .ls-carousel[data-talking="1"] .ls-face[data-focus="1"] {
   box-shadow: 0 0 0 3px #30d158;
@@ -920,7 +953,7 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
 }
 @keyframes ls-ptt {
   0%, 100% { box-shadow: 0 0 0 3px #30d158; }
-  50%      { box-shadow: 0 0 0 7px rgba(48,209,88,0.35); }
+  50%      { box-shadow: 0 0 0 8px rgba(48,209,88,0.32); }
 }
 @media (prefers-reduced-motion: reduce) {
   .ls-vol, .ls-carousel, .ls-face, .ls-vol-fill { transition: none; }
@@ -2228,9 +2261,12 @@ def _lock_tail_html() -> str:
   </div>
 
   <!-- THE AGENT CAROUSEL. Jay: "a carousel type animation slides out from the
-       left of the screen where the buttons are with the agents avatars/faces".
-       Left edge, vertical, because the keys that drive it are vertical. -->
+       left of the screen where the buttons are with the agents avatars/faces",
+       then: "left edge thumb pivot around the button". So it is RADIAL --
+       faces on an arc swept from the left edge at the volume rocker's height,
+       and the thumb stays on the button while the agents come to it. -->
   <div class="ls-carousel" id="ls-carousel" aria-hidden="true">
+    <div class="ls-carousel-arc" aria-hidden="true"></div>
     <div class="ls-carousel-strip" id="ls-carousel-strip"></div>
     <div class="ls-carousel-banner" id="ls-carousel-banner">
       <div class="ls-carousel-name" id="ls-carousel-name"></div>
@@ -3511,17 +3547,22 @@ _LOCK_SCREEN_SCRIPT = r"""
       if (carIndex >= list.length) carIndex = 0;
       if (carIndex < 0) carIndex = list.length - 1;
       var want = [];
+      // The arc rotates under a fixed pointer rather than a marker moving along
+      // it: the focused face is always at 0deg -- straight out from the pivot,
+      // level with the thumb -- and cycling swings the others past it. A marker
+      // that travelled instead would walk the selection away from the button
+      // the thumb is resting on, which is the one thing this layout is for.
+      var STEP = 34;        // degrees between faces
+      var SPAN = 2;         // how many either side stay visible
       for (var i = 0; i < list.length; i++) {
         var agent = list[i];
         var face = partOf(carStrip, agent.name, "ls-face");
         if (agent.avatar) {
           // Sanitised with split/join rather than a REGEX LITERAL. A regex
-          // containing a quote -- /["\\]/ -- breaks the JS extractor the tests
-          // use to lift functions out of this script: it is quote-aware but not
+          // containing a quote breaks the JS extractor the tests use to lift
+          // functions out of this script: it is quote-aware but not
           // regex-aware, so the quote inside the literal opens a string that
           // never closes and the capture runs off the end of the file.
-          // "SyntaxError: Unexpected end of input", five tests red, in code
-          // that was itself perfectly valid.
           var safe = String(agent.avatar).split("\"").join("").split("\\").join("");
           var url = "url(\"" + safe + "\")";
           if (face.style.getPropertyValue("background-image") !== url) {
@@ -3530,7 +3571,20 @@ _LOCK_SCREEN_SCRIPT = r"""
         } else {
           setText(face, (agent.name || "?").slice(0, 2));
         }
-        setAttrIfChanged(face, "data-focus", i === carIndex ? "1" : "0");
+        // Offset from the focused one, wrapped the SHORT way round so a list of
+        // six does not send a face the long way across the arc when the
+        // selection passes the end.
+        var off = i - carIndex;
+        if (off > list.length / 2) off -= list.length;
+        if (off < -list.length / 2) off += list.length;
+        var away = Math.abs(off);
+        face.style.setProperty("--a", (off * STEP) + "deg");
+        face.style.setProperty("--s", off === 0 ? "1.1" : (away === 1 ? "0.86" : "0.7"));
+        // Past the span they fade out entirely rather than piling up behind the
+        // visible ones, where they would show as a smudge on the arc.
+        face.style.setProperty("--o", away === 0 ? "1"
+          : (away <= SPAN ? String(0.62 - (away - 1) * 0.22) : "0"));
+        setAttrIfChanged(face, "data-focus", off === 0 ? "1" : "0");
         want.push(face);
       }
       placeInOrder(carStrip, want);
