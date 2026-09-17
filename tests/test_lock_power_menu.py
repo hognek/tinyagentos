@@ -1079,3 +1079,38 @@ class TestParkingOnAnAgentCountsAsUsingIt:
         hide = js[js.index("function hideAll("):js.index("function restartIdleHide(")]
         guard = hide.index('carEl.getAttribute("data-on") === "1"')
         assert guard < hide.index("carUsed["), hide
+
+
+class TestDownReachesTheSecondMostUsedAgent:
+    """Jay: "the ordering of recently used needs reversing so i can press down
+    to get to my second most used agent quickly using the volume down button."
+
+    This is a consequence of two earlier decisions rather than a free choice:
+    the arc opens focused on the most recently used agent, and volume-down
+    decrements the index. With the most recent at the FRONT, down had nowhere
+    to go but round the back to the least used. With it at the END, down walks
+    most-used -> second -> third.
+    """
+
+    def test_the_sort_puts_the_most_recent_LAST(self):
+        js = auth._LOCK_SCREEN_SCRIPT
+        arrange = js[js.index("function carArrange("):js.index("function carAgents(")]
+        assert "a.used - b.used" in arrange, arrange
+        assert "b.used - a.used" not in arrange, arrange
+
+    def test_down_still_decrements(self):
+        """The direction of travel is unchanged; only the arrangement moved. If
+        both were flipped the bug would be back with two wrongs cancelling into
+        the same wrong."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        src = js[js.index("function volumeKey("):]
+        src = src[:src.index("// ------")]
+        release = src[src.index("// RELEASE"):]
+        assert 'carIndex += (key === "up" ? 1 : -1)' in release, release
+
+    def test_ties_still_keep_the_islands_own_order(self):
+        """Agents never talked to all share used=0, so without a stable tie
+        they would shuffle on every open."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        arrange = js[js.index("function carArrange("):js.index("function carAgents(")]
+        assert "a.index - b.index" in arrange, arrange

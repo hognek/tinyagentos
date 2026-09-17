@@ -3842,8 +3842,21 @@ _LOCK_SCREEN_SCRIPT = r"""
       var decorated = live.map(function (agent, index) {
         return { agent: agent, index: index, used: Number(carUsed[agent.name]) || 0 };
       });
+      // OLDEST FIRST, MOST RECENT LAST -- and that is deliberate, not a slip.
+      //
+      // Jay: "the ordering of recently used needs reversing so i can press down
+      // to get to my second most used agent quickly using the volume down
+      // button." It follows from the two decisions already made: the arc OPENS
+      // focused on the most recently used agent, and volume-down DECREMENTS the
+      // index. With the most recent at the front, down had nowhere to go but
+      // round the back to the least used one.
+      //
+      // With it at the END, down walks most-used -> second -> third, which is
+      // the order someone actually reaches for, and up goes back the way it
+      // came. The arrangement on screen is the same ring either way; what
+      // changes is which direction the rocker travels through it.
       decorated.sort(function (a, b) {
-        if (b.used !== a.used) return b.used - a.used;
+        if (a.used !== b.used) return a.used - b.used;
         return a.index - b.index;
       });
       return decorated.map(function (d) { return d.agent; });
