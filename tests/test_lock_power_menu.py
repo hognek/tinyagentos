@@ -935,3 +935,97 @@ class TestClosingTheArcLeavesTheRightThingOnScreen:
         body = self._hide_all()
         for forbidden in ("power off", "lock-screen-off", "taos-kiosk-screen"):
             assert forbidden not in body, forbidden
+
+
+class TestNothingGreyShowsThrough:
+    """Jay, twice: "it shows the lock screen background grey" and "it even
+    flashes sometimes on rotary start/open".
+
+    `body` carries a dark GREY GRADIENT for the ordinary sign-in card, and
+    .lockscreen has no background of its own -- so hiding the lock screen
+    revealed that gradient. Hiding a transparent layer over grey shows grey.
+    Both of my earlier fixes moved the transparent layer around and never
+    touched what was underneath it.
+    """
+
+    def test_the_body_has_a_black_state(self):
+        # The RULE, not the name: the comment above it spells out
+        # "body.ls-black (0,1,1) beats body (0,0,1)" and matching the bare
+        # selector found the prose. Fifth time tonight.
+        css = auth._LOCK_SCREEN_STYLE
+        assert "body.ls-black {" in css
+        rule = css[css.index("body.ls-black {"):][:80]
+        assert "#000" in rule, rule
+
+    def test_the_grey_gradient_is_what_it_overrides(self):
+        """Named here so the next person knows WHY a black body rule exists,
+        and so this test fails loudly if the gradient is ever removed and the
+        override becomes cargo."""
+        # The gradient is in _AUTH_BASE_STYLE, not the lock screen's own sheet
+        # -- which is part of why it went unnoticed: the grey was being set by a
+        # stylesheet the lock screen work never touched.
+        base = auth._AUTH_BASE_STYLE
+        body = base[base.index("body {"):]
+        body = body[:body.index("}")]
+        assert "linear-gradient" in body, body
+        assert "#141415" in body or "#202024" in body, body
+        # And the override must be able to beat it: higher specificity, and it
+        # is served after the base sheet on the page.
+        assert "body.ls-black {" in auth._LOCK_SCREEN_STYLE
+
+    def test_every_hide_of_the_lock_screen_also_blackens_the_body(self):
+        """One helper owns it. Two flags for one visual state is how a grey
+        frame gets in, which is exactly what happened."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        assert "function setBlack(" in js
+        # Each site that sets or clears data-blanked must pair with setBlack.
+        for marker in ('screenEl.setAttribute("data-blanked", "1");',
+                       'screenEl.removeAttribute("data-blanked");'):
+            at = 0
+            while True:
+                at = js.find(marker, at)
+                if at == -1:
+                    break
+                window = js[at:at + 260]
+                assert "setBlack(" in window, (
+                    "a data-blanked change with no matching setBlack:\n" + window
+                )
+                at += len(marker)
+
+    def test_the_dark_arc_blackens_the_body_too(self):
+        """The open flash: the lock screen went hidden while the black scrim
+        had not painted, so the gradient showed for a frame."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        show = js[js.index("function carShow("):js.index("function startTalking(")]
+        assert "setBlack(true)" in show, show
+
+
+class TestParkingOnAnAgentCountsAsUsingIt:
+    """Jay: "the last used agent isnt always the first one in the list."
+
+    `used` was only written when a transmission STARTED, so parking on an agent
+    without holding to talk left the order untouched -- and that agent did not
+    come first next time, which is precisely what he was seeing.
+    """
+
+    def test_closing_records_the_parked_agent(self):
+        js = auth._LOCK_SCREEN_SCRIPT
+        hide = js[js.index("function hideAll("):js.index("function restartIdleHide(")]
+        assert "carUsed[" in hide, hide
+        assert "carSave()" in hide, hide
+
+    def test_it_is_recorded_once_on_close_not_on_every_step(self):
+        """Recording each step would rewrite the whole order while cycling past
+        six agents to reach one."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        src = js[js.index("function volumeKey("):js.index("// ------", js.index("function volumeKey("))]
+        release = src[src.index("// RELEASE"):]
+        assert "carUsed[" not in release, release
+
+    def test_it_only_records_while_the_arc_was_actually_open(self):
+        """hideAll also runs for the volume bezel, which has no focused agent
+        and must not write an ordering entry."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        hide = js[js.index("function hideAll("):js.index("function restartIdleHide(")]
+        guard = hide.index('carEl.getAttribute("data-on") === "1"')
+        assert guard < hide.index("carUsed["), hide

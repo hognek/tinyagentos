@@ -929,6 +929,22 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
   opacity: 0;
   transition: none;
 }
+/* THE BODY GOES BLACK TOO, and this is the bit I kept missing.
+ *
+ * `body` carries a dark GREY GRADIENT (#141415 -> #202024) for the ordinary
+ * sign-in card, and .lockscreen has no background of its own. So hiding the
+ * lock screen revealed that gradient, which is exactly what Jay reported twice:
+ * "it shows the lock screen background grey", and "it even flashes sometimes on
+ * rotary start/open" -- the flash being the frame where the lock screen was
+ * hidden and the black scrim had not painted yet.
+ *
+ * Hiding a transparent layer over grey shows grey. The layer underneath has to
+ * be black, so it is, in the same style recalculation -- there is no frame in
+ * between for the gradient to appear in.
+ *
+ * Specificity does the work: body.ls-black (0,1,1) beats body (0,0,1), so no
+ * !important is needed. */
+body.ls-black { background: #000; }
 .lockscreen {
   transition: opacity 320ms ease;
 }
@@ -3572,6 +3588,7 @@ _LOCK_SCREEN_SCRIPT = r"""
         if (screenEl && screenEl.hasAttribute("data-blanked")
             && !(carEl && carEl.getAttribute("data-on") === "1")) {
           screenEl.removeAttribute("data-blanked");
+          setBlack(false);
         }
       }, { passive: true, capture: true });
     });
@@ -3659,11 +3676,25 @@ _LOCK_SCREEN_SCRIPT = r"""
       // black frame emits nothing, so it reads as off, and swayidle blanks the
       // panel properly a moment later -- the volume key re-armed it, so the
       // timer is running.
+      // WHERE YOU LEFT IT COUNTS AS USING IT. Jay: "the last used agent isnt
+      // always the first one in the list" -- because `used` was only written
+      // when a transmission STARTED, so parking on an agent without holding to
+      // talk left the order untouched and that agent did not come first next
+      // time. Recorded on CLOSE rather than on every step, so cycling past six
+      // agents still does not rewrite the order on the way through.
+      if (carEl && carEl.getAttribute("data-on") === "1") {
+        var parked = carAgents()[carIndex];
+        if (parked && parked.name) {
+          carUsed[parked.name] = Date.now();
+          carFocusName = parked.name;
+          carSave();
+        }
+      }
       var wasDark = carDark;
       if (screenEl) {
         screenEl.removeAttribute("data-radial");
-        if (wasDark) screenEl.setAttribute("data-blanked", "1");
-        else screenEl.removeAttribute("data-blanked");
+        if (wasDark) { screenEl.setAttribute("data-blanked", "1"); setBlack(true); }
+        else { screenEl.removeAttribute("data-blanked"); setBlack(false); }
       }
       carDark = false;
       if (scrim) {
@@ -3748,6 +3779,12 @@ _LOCK_SCREEN_SCRIPT = r"""
     var CAR_STORE = "taos.ls.carousel";
     var carFocusName = null;
     var carUsed = {};
+    // Black behind everything. Toggled with the lock screen's own hiding, never
+    // separately: two flags for one visual state is how a grey frame gets in.
+    function setBlack(on) {
+      if (document.body) document.body.classList.toggle("ls-black", !!on);
+    }
+
     // Whether this showing of the arc began on a dark panel.
     var carDark = false;
     // The order the arc is CURRENTLY showing. Computed when it opens and held
@@ -3903,6 +3940,7 @@ _LOCK_SCREEN_SCRIPT = r"""
       // or hide it outright when the arc was summoned onto a dark screen,
       // which on OLED means the faces float on real black.
       if (screenEl) screenEl.setAttribute("data-radial", carDark ? "dark" : "1");
+      if (carDark) setBlack(true);
       if (scrim) { scrim.hidden = false; scrim.setAttribute("data-on", "1"); }
       restartIdleHide();
     }
@@ -4388,6 +4426,7 @@ _LOCK_SCREEN_SCRIPT = r"""
         // still a compositor listening.
         lockStream.addEventListener("screen-off", function () {
           if (screenEl) screenEl.setAttribute("data-blanked", "1");
+          setBlack(true);
         });
 
         // And back. Un-blackened on wake -- but NOT when the arc is up, because
@@ -4396,6 +4435,7 @@ _LOCK_SCREEN_SCRIPT = r"""
           if (!screenEl) return;
           if (carEl && carEl.getAttribute("data-on") === "1") return;
           screenEl.removeAttribute("data-blanked");
+          setBlack(false);
         });
         // One listener shape for all four, reading the payload rather than
         // relying on the event name to carry the screen state.
