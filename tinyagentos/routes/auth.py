@@ -3656,33 +3656,25 @@ _LOCK_SCREEN_SCRIPT = r"""
     }
 
     function hideAll() {
-      if (volEl) volEl.removeAttribute("data-on");
-      if (carEl) { carEl.removeAttribute("data-on"); carEl.removeAttribute("data-talking"); }
-      // Let the next open re-arrange. Held only while the arc is visible.
-      carOrder = null;
-      // THE PANEL WAS DARK WHEN THIS STARTED, so put it back to dark rather
-      // than revealing a lock screen nobody asked for.
+      // READ EVERYTHING FIRST, THEN TEAR DOWN.
       //
-      // Jay: "after using the rotary menu instead of the screen going off it
-      // shows the lock screen background grey." Two faults in one. data-blanked
-      // was never cleared -- the screen-on handler deliberately skips it while
-      // the arc is up, and nothing else did it -- so the lock screen stayed at
-      // opacity 0 and what showed through was the page body. And even cleared,
-      // revealing the lock screen is wrong: the screen was off before the arc,
-      // so it should be off after.
-      //
-      // Keeping the page black is how that is done without the page needing a
-      // way to power the panel down, which it has no business having. On OLED a
-      // black frame emits nothing, so it reads as off, and swayidle blanks the
-      // panel properly a moment later -- the volume key re-armed it, so the
-      // timer is running.
-      // WHERE YOU LEFT IT COUNTS AS USING IT. Jay: "the last used agent isnt
-      // always the first one in the list" -- because `used` was only written
-      // when a transmission STARTED, so parking on an agent without holding to
-      // talk left the order untouched and that agent did not come first next
-      // time. Recorded on CLOSE rather than on every step, so cycling past six
-      // agents still does not rewrite the order on the way through.
-      if (carEl && carEl.getAttribute("data-on") === "1") {
+      // This function used to remove data-on at the top and then ask, further
+      // down, whether data-on was set -- so the branch that records the parked
+      // agent could never run. Jay: "the last used agent isnt always the first
+      // one in the list." The fix for that was live code that never executed,
+      // and the test asserting its order was satisfied by text that could not
+      // fire. Presence is not effect, for the second time on this feature.
+      var wasOpen = !!(carEl && carEl.getAttribute("data-on") === "1");
+      // Darkness is read off the ELEMENT rather than the carDark variable. The
+      // attribute is the thing the stylesheet actually acted on, so it cannot
+      // disagree with what is on screen, and it cannot be cleared early by some
+      // other path resetting a flag.
+      var wasDark = !!(screenEl && screenEl.getAttribute("data-radial") === "dark");
+
+      // WHERE YOU LEFT IT COUNTS AS USING IT -- recorded before anything is
+      // dismantled, and only when the arc was genuinely open: hideAll also runs
+      // for the volume bezel, which has no focused agent.
+      if (wasOpen) {
         var parked = carAgents()[carIndex];
         if (parked && parked.name) {
           carUsed[parked.name] = Date.now();
@@ -3690,7 +3682,22 @@ _LOCK_SCREEN_SCRIPT = r"""
           carSave();
         }
       }
-      var wasDark = carDark;
+
+      if (volEl) volEl.removeAttribute("data-on");
+      if (carEl) { carEl.removeAttribute("data-on"); carEl.removeAttribute("data-talking"); }
+      // Let the next open re-arrange. Held only while the arc is visible.
+      carOrder = null;
+
+      // THE PANEL WAS DARK WHEN THIS STARTED, so put it back to dark rather
+      // than revealing a lock screen nobody asked for. Jay: "if i PRESS the
+      // volume down to reveal the menu but dont use it, it then leaves me on
+      // the lock screen. the screen should be off."
+      //
+      // Keeping the page black is how that is done without the page needing a
+      // way to power the panel down, which it has no business having. On OLED a
+      // black frame emits nothing, so it reads as off, and swayidle blanks the
+      // panel properly a moment later -- the volume key re-armed it, so the
+      // timer is running.
       if (screenEl) {
         screenEl.removeAttribute("data-radial");
         if (wasDark) { screenEl.setAttribute("data-blanked", "1"); setBlack(true); }

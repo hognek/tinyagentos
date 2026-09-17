@@ -922,11 +922,33 @@ class TestClosingTheArcLeavesTheRightThingOnScreen:
         body = self._hide_all()
         assert 'removeAttribute("data-blanked")' in body, body
 
-    def test_the_dark_flag_is_read_before_it_is_reset(self):
-        """carDark is cleared in the same function, so reading it afterwards
-        would always take the ordinary branch and the fix would do nothing."""
+    def test_hideAll_reads_its_state_before_destroying_any_of_it(self):
+        """The bug that made two separate fixes inert.
+
+        hideAll used to removeAttribute("data-on") at the top and then ask,
+        further down, whether data-on was set -- so the branch recording the
+        parked agent could never run. Jay: "the last used agent isnt always the
+        first one in the list." The code was there, in the right order by text,
+        and could not fire. Presence is not effect.
+
+        So both reads now happen before any removal, and this asserts that
+        ordering directly: every read of state comes before the first
+        removeAttribute in the function.
+        """
         body = self._hide_all()
-        assert body.index("var wasDark = carDark") < body.index("carDark = false"), body
+        first_teardown = body.index("removeAttribute")
+        for read in ('var wasOpen =', 'var wasDark ='):
+            assert body.index(read) < first_teardown, (
+                read + " happens after state is already destroyed:\n" + body
+            )
+        # And the recording itself, which depends on wasOpen.
+        assert body.index("carUsed[") < first_teardown, body
+
+    def test_darkness_is_read_from_the_element_not_a_variable(self):
+        """The attribute is what the stylesheet acted on, so it cannot disagree
+        with what is on screen, and no other path can clear it early."""
+        body = self._hide_all()
+        assert 'getAttribute("data-radial") === "dark"' in body, body
 
     def test_the_page_does_not_power_the_panel_itself(self):
         """Keeping the page black is how the screen is returned to dark. The
