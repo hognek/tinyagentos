@@ -3702,17 +3702,33 @@ _LOCK_SCREEN_SCRIPT = r"""
     }
 
     if (cameraBtn) {
-      // ⚠ THERE IS NO CAMERA APP ON THIS HANDSET. Measured: no megapixels, no
-      // snapshot, no camera binary, and libcamera reports no sensor for
-      // /dev/media0 even though /dev/video* exist. So this says so instead of
-      // pretending -- the same rule the emergency-call entry and the screenshot
-      // action follow. A shortcut that silently does nothing is worse than one
-      // that admits it, because the user retries it.
+      // There IS a camera app now: taos-camerad serves it and taos-app-launch
+      // opens it in its own window, on its own workspace, so it covers the
+      // lock screen the way a camera shortcut does on any phone.
+      //
+      // The honest note stays for the FAILURE path, and for the same reason it
+      // existed when there was no app at all: a shortcut that silently does
+      // nothing is worse than one that admits it, because the user retries it.
       cameraBtn.addEventListener("click", function () {
-        cameraBtn.setAttribute("data-note", "No camera app yet");
-        window.setTimeout(function () {
-          cameraBtn.removeAttribute("data-note");
-        }, 1800);
+        function note(text) {
+          cameraBtn.setAttribute("data-note", text);
+          window.setTimeout(function () {
+            cameraBtn.removeAttribute("data-note");
+          }, 1800);
+        }
+        fetch("/auth/lock-app", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ app: "camera" })
+        })
+          .then(function (r) { return r.json().catch(function () { return {}; }); })
+          .then(function (d) {
+            // The window takes a couple of seconds to map, so there is nothing
+            // to show on success -- it simply appears over this screen.
+            if (!d || !d.ok) note((d && d.detail) || "Camera unavailable");
+          })
+          .catch(function () { note("Camera unavailable"); });
       });
     }
 
@@ -8803,6 +8819,18 @@ async def lock_power_menu(request: Request):
 #: place.
 _POWER_ACTIONS = ("poweroff", "reboot", "stop-agents", "screenshot", "emergency")
 
+#: Apps the lock screen may open, and the drop-box verb that opens each.
+#:
+#: A CLOSED MAP, not a name the page hands over: whatever ends up in the drop
+#: box is run as root by taos-power-apply, so the page must never be able to
+#: name the command. It chooses from this list or it gets a 400.
+#:
+#: Deliberately NOT part of _POWER_ACTIONS. That set is the power menu's five
+#: verbs and @taOS-dev asked for it to stay closed and exactly that; opening an
+#: app is not a power action and putting it there would blur what that list
+#: means. The privileged channel underneath is shared, the vocabulary is not.
+_LOCK_APPS = {"camera": "app-camera"}
+
 
 @router.post("/lock-power-action")
 async def lock_power_action(request: Request):
@@ -8916,6 +8944,46 @@ async def lock_panels(request: Request):
     payload = _demo_panels()
     payload["demo"] = True
     return JSONResponse(payload)
+
+
+@router.post("/lock-app")
+async def lock_app(request: Request):
+    """Open one of the lock screen's apps. Console-only.
+
+    THE PRE-AUTH QUESTION, answered rather than assumed: this runs before
+    anyone signs in, so the only apps that may be listed here are ones that a
+    stranger holding the phone may already reach. The camera qualifies on every
+    phone ever made, and taOS's camera app shows a viewfinder and the photos
+    taken from it -- it is not a door into a signed-in user's files, because at
+    this point there is no signed-in user.
+
+    The app is launched by the same root drop box the power menu uses. The page
+    picks a NAME from a closed map; the verb that reaches root is never anything
+    the page said.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    app = str(body.get("app", "")).strip()
+    verb = _LOCK_APPS.get(app)
+    if verb is None:
+        return JSONResponse({"error": "unknown app"}, status_code=400)
+    try:
+        # Written whole, then renamed, for the reason the power path gives: the
+        # watcher fires on the path EXISTING, so a partial write could be read
+        # as a verb that was never finished.
+        tmp = _POWER_REQUEST + ".part"
+        with open(tmp, "w") as handle:
+            handle.write(verb)
+        os.replace(tmp, _POWER_REQUEST)
+    except OSError as exc:
+        return JSONResponse(
+            {"error": "launch failed", "detail": str(exc)}, status_code=503
+        )
+    return JSONResponse({"ok": True, "app": app})
 
 
 @router.post("/pin-login")

@@ -1392,3 +1392,70 @@ class TestStoppingEveryAgentDemandsThePasscode:
         """@taOS-dev's warning: the server must still answer `stop-agents` once
         a session exists. What changed is who can ask, not what exists."""
         assert "stop-agents" in auth._POWER_ACTIONS
+
+
+class TestTheLockScreenCameraShortcut:
+    """Jay: "wire it up to the lock screen button".
+
+    The button existed before the app did and said "No camera app yet", which
+    was the honest answer at the time. There is a camera app now -- taos-camerad
+    serves it and taos-app-launch opens it in its own window -- so the button
+    opens it.
+
+    The pre-auth question is the same one the power menu had to answer, and it
+    is answered in the route's docstring: a camera reachable from a locked phone
+    is what every phone does, and this one shows a viewfinder and the photos
+    taken from it, not a signed-in user's files.
+    """
+
+    def test_the_page_no_longer_claims_there_is_no_camera_app(self):
+        js = auth._LOCK_SCREEN_SCRIPT
+        assert "No camera app yet" not in js
+        assert '"/auth/lock-app"' in js
+
+    def test_the_app_list_is_a_closed_map_the_page_cannot_name_into(self):
+        """The value reaches ROOT through the drop box, so the page must choose
+        from a list rather than supply a command."""
+        assert auth._LOCK_APPS == {"camera": "app-camera"}
+
+    def test_opening_the_camera_writes_the_drop_box_verb(self, monkeypatch, tmp_path):
+        req = tmp_path / "request"
+        monkeypatch.setattr(auth, "_POWER_REQUEST", str(req))
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: True)
+        resp = _call(auth.lock_app(_Req({"app": "camera"})))
+        assert resp.status_code == 200
+        assert _body(resp)["ok"] is True
+        # The VERB, not the app name: what reaches root is what this asserts.
+        assert req.read_text() == "app-camera"
+
+    def test_an_app_that_is_not_listed_is_refused_and_writes_nothing(
+        self, monkeypatch, tmp_path
+    ):
+        """The discriminating case. Without it, a handler that wrote whatever it
+        was given would satisfy the test above."""
+        req = tmp_path / "request"
+        monkeypatch.setattr(auth, "_POWER_REQUEST", str(req))
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: True)
+        for name in ("poweroff", "app-camera", "../../etc/passwd", "", "Camera"):
+            resp = _call(auth.lock_app(_Req({"app": name})))
+            assert resp.status_code == 400, name
+            assert not req.exists(), name
+
+    def test_it_is_console_only(self, monkeypatch, tmp_path):
+        req = tmp_path / "request"
+        monkeypatch.setattr(auth, "_POWER_REQUEST", str(req))
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: False)
+        resp = _call(auth.lock_app(_Req({"app": "camera"})))
+        assert resp.status_code == 403
+        assert not req.exists()
+
+    def test_it_is_reachable_before_sign_in(self):
+        """It is pressed FROM the lock screen, so a route that 401s is a button
+        that does nothing -- the failure the stats panel already had once."""
+        assert "/auth/lock-app" in EXEMPT_PATHS
+
+    def test_the_power_verbs_did_not_grow(self):
+        """@taOS-dev asked for _POWER_ACTIONS to stay a closed set of five.
+        Opening an app shares the channel, not the vocabulary."""
+        assert len(auth._POWER_ACTIONS) == 5
+        assert "app-camera" not in auth._POWER_ACTIONS
