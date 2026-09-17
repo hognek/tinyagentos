@@ -983,6 +983,25 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
   backdrop-filter: blur(30px) saturate(1.3);
   -webkit-backdrop-filter: blur(30px) saturate(1.3);
 }
+.ls-shade-toggles {
+  display: flex; gap: 10px; padding-bottom: 14px;
+}
+.ls-toggle {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px;
+  padding: 12px 6px; border: 0; border-radius: 20px;
+  font: inherit; font-size: 11px; font-weight: 600;
+  background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.6);
+  transition: background 200ms ease, color 200ms ease;
+}
+/* ON is a filled tile, not a tick: at a glance across a room the FILL is what
+   reads, and these are glanced at rather than studied. */
+.ls-toggle[aria-pressed="true"] { background: #4c9aff; color: #fff; }
+.ls-toggle:focus-visible { outline: 3px solid #4c9aff; outline-offset: 2px; }
+.ls-toggle svg { width: 22px; height: 22px; fill: none; stroke: currentColor;
+                 stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+/* Mid-flight. A radio takes a moment to come up, and a switch that snapped back
+   to its old position while waiting would read as having refused the tap. */
+.ls-toggle[data-busy="1"] { opacity: 0.55; }
 .ls-shade-row { display: flex; align-items: center; gap: 12px; }
 .ls-shade-icon {
   flex: none; width: 22px; height: 22px;
@@ -2283,6 +2302,9 @@ def _lock_tail_html() -> str:
   <section class="ls-shade" id="ls-shade" role="dialog" aria-modal="true"
            aria-label="Quick settings" hidden>
     <div class="ls-shade-inner">
+      <!-- Radio switches. Big round targets in a row, the way a phone's control
+           centre does it, because these are hit with a thumb and not read. -->
+      <div class="ls-shade-toggles" id="ls-shade-toggles"></div>
       <div class="ls-shade-row">
         <svg class="ls-shade-icon" viewBox="0 0 24 24" aria-hidden="true">
           <circle cx="12" cy="12" r="4.2" />
@@ -3671,6 +3693,83 @@ _LOCK_SCREEN_SCRIPT = r"""
     var brightValEl = document.getElementById("ls-brightness-value");
     var shadeNote = document.getElementById("ls-shade-note");
 
+    // The radio switches. Built once and then only their pressed state changes,
+    // like everything else on this screen.
+    var togglesEl = document.getElementById("ls-shade-toggles");
+    var RADIO_GLYPHS = {
+      wifi: '<path d="M2.6 9.2a14 14 0 0 1 18.8 0"/><path d="M5.8 12.6a9.4 9.4 0 0 1 12.4 0"/>'
+          + '<path d="M9 16a4.8 4.8 0 0 1 6 0"/><path d="M12 19.4v0"/>',
+      bluetooth: '<path d="M7.5 7.6 16.5 16 12 20V4l4.5 4-9 8.4"/>'
+    };
+    var RADIOS = [["wifi", "Wi‑Fi"], ["bluetooth", "Bluetooth"]];
+
+    function paintRadios(state) {
+      if (!togglesEl) return;
+      var want = [];
+      for (var i = 0; i < RADIOS.length; i++) {
+        (function (key, label) {
+          var btn = partOf(togglesEl, key, "ls-toggle", "button");
+          if (btn.type !== "button") {
+            btn.type = "button";
+            btn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true">'
+              + RADIO_GLYPHS[key] + "</svg>";
+            var cap = document.createElement("span");
+            cap.textContent = label;
+            btn.appendChild(cap);
+            btn.addEventListener("click", function () {
+              // Read the CURRENT pressed state rather than a captured one: the
+              // handler outlives many repaints, and a stale closure would send
+              // the same request forever.
+              var now = btn.getAttribute("aria-pressed") === "true";
+              setRadio(key, !now, btn);
+            });
+          }
+          // Unknown (the reading failed) is NOT the same as off. The button is
+          // disabled rather than shown convincingly in a state nobody measured.
+          if (typeof state[key] === "boolean") {
+            btn.disabled = false;
+            setAttrIfChanged(btn, "aria-pressed", state[key] ? "true" : "false");
+          } else {
+            btn.disabled = true;
+            setAttrIfChanged(btn, "aria-pressed", "false");
+          }
+          want.push(btn);
+        })(RADIOS[i][0], RADIOS[i][1]);
+      }
+      placeInOrder(togglesEl, want);
+    }
+
+    function setRadio(key, on, btn) {
+      // Optimistic, then corrected by the read-back. A radio takes a moment to
+      // come up and a switch that did not move until it had would feel broken.
+      setAttrIfChanged(btn, "aria-pressed", on ? "true" : "false");
+      btn.setAttribute("data-busy", "1");
+      fetch("/auth/lock-radios", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ radio: key, on: on })
+      }).then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          btn.removeAttribute("data-busy");
+          // The server reports what the RADIO did, not what was asked. If it
+          // refused, the switch goes back -- which is the only honest thing a
+          // switch can do.
+          if (d) paintRadios(d);
+        })
+        .catch(function () {
+          btn.removeAttribute("data-busy");
+          loadRadios();
+        });
+    }
+
+    function loadRadios() {
+      fetch("/auth/lock-radios", { credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { if (d) paintRadios(d); })
+        .catch(function () { /* leave the switches as they are */ });
+    }
+
     function showBrightness(reading) {
       if (!reading || typeof reading.percent !== "number") return;
       var pct = Math.round(reading.percent);
@@ -3733,6 +3832,7 @@ _LOCK_SCREEN_SCRIPT = r"""
 
     function openShade() {
       loadBrightness();
+      loadRadios();
       openSheet("shade");
     }
 
@@ -7563,6 +7663,100 @@ def _write_brightness(level: int) -> dict | None:
         # The read-back below is the measurement.
         pass
     return _read_brightness()
+
+
+def _read_radios() -> dict:
+    """WiFi and Bluetooth state. Reading needs no privilege; writing does.
+
+    WiFi is read from NetworkManager because NM owns it, and Bluetooth from
+    rfkill because that is what the switch actually sets. Reading each from the
+    thing that controls it means the switch can never show a state its own
+    write would not produce.
+    """
+    import subprocess
+
+    state: dict = {}
+    try:
+        got = subprocess.run(
+            ["nmcli", "-t", "-f", "WIFI", "g"],
+            capture_output=True, text=True, timeout=4,
+        )
+        if got.returncode == 0:
+            state["wifi"] = got.stdout.strip().lower().startswith("enabled")
+    except Exception:
+        pass
+    try:
+        got = subprocess.run(
+            ["rfkill", "-n", "-o", "TYPE,SOFT,HARD", "list", "bluetooth"],
+            capture_output=True, text=True, timeout=4,
+        )
+        if got.returncode == 0 and got.stdout.strip():
+            fields = got.stdout.split()
+            # "bluetooth unblocked unblocked" -- on only when NEITHER block is
+            # set. A hard block is a physical kill switch and software cannot
+            # clear it, so a switch that ignored it would be a lie.
+            state["bluetooth"] = ("blocked" not in fields[1:3])
+    except Exception:
+        pass
+    return state
+
+
+@router.get("/lock-radios")
+async def lock_radios(request: Request):
+    """Current WiFi/Bluetooth state. Console-only."""
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    return JSONResponse(_read_radios())
+
+
+#: Radio verbs the drop box will accept, mapped from what the page sends.
+_RADIO_VERBS = {
+    ("wifi", True): "wifi-on",
+    ("wifi", False): "wifi-off",
+    ("bluetooth", True): "bt-on",
+    ("bluetooth", False): "bt-off",
+}
+
+
+@router.post("/lock-radios")
+async def set_lock_radios(request: Request):
+    """Turn WiFi or Bluetooth on or off. Console-only.
+
+    Goes through the same root drop box as the power menu: NetworkManager
+    answers `no` to enable-disable-wifi for this user, and /dev/rfkill is not
+    writable by it either.
+
+    ⚠ Turning WiFi off from here can cut the only route to a headless handset.
+    That is correct for a switch a PERSON flicks -- every phone allows it -- and
+    it is exactly why the verb list is closed and nothing automated writes it.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    radio = str(body.get("radio", "")).strip()
+    want = body.get("on")
+    if radio not in ("wifi", "bluetooth") or not isinstance(want, bool):
+        return JSONResponse({"error": "radio and on required"}, status_code=400)
+
+    verb = _RADIO_VERBS[(radio, want)]
+    try:
+        tmp = _POWER_REQUEST + ".part"
+        with open(tmp, "w") as handle:
+            handle.write(verb)
+        os.replace(tmp, _POWER_REQUEST)
+    except OSError as exc:
+        return JSONResponse(
+            {"error": "request failed", "detail": str(exc)}, status_code=503
+        )
+    # The helper is triggered by a systemd path unit, so it runs a moment after
+    # the file lands. Wait, then report the READ-BACK rather than the request --
+    # a switch that reports what it asked for is a switch that lies when the
+    # radio refuses.
+    await asyncio.sleep(1.2)
+    return JSONResponse(_read_radios())
 
 
 @router.post("/lock-volume-key")
