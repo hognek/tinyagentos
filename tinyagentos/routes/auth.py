@@ -905,6 +905,16 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
   filter: blur(7px);
   transition: filter 260ms ease;
 }
+/* Summoned onto a DARK panel: the lock screen is not blurred, it is gone. On
+   OLED an unlit pixel emits nothing, so the faces sit on real black rather than
+   on a dimmed photograph of a lock screen -- which is the effect Jay was after
+   and the one thing an OLED does that no amount of blur imitates.
+   visibility rather than display:none, so nothing reflows on the way in. */
+.lockscreen[data-radial="dark"] {
+  visibility: hidden;
+  transition: none;
+}
+.lockscreen[data-radial="dark"] ~ .ls-scrim { background: #000; opacity: 1; }
 @media (prefers-reduced-motion: reduce) {
   .lockscreen[data-radial="1"] { transition: none; }
 }
@@ -3513,6 +3523,12 @@ _LOCK_SCREEN_SCRIPT = r"""
     var carIndex = 0;
     var holdTimer = null;
     var talking = false;
+    // Set when a press OPENS a surface, so that press's own release does not
+    // then act on what it just opened. Jay: "the first click of the volume down
+    // should not rotate the menu just make it appear" -- without this, the
+    // release of the opening press sees an open arc and cycles it, so the arc
+    // appeared already one agent along.
+    var pressOpened = false;
     // Set when the hold timer fires, so the RELEASE can tell a tap from a hold.
     // Without it, a hold that did not manage to start talking -- the arc closed
     // under it, say -- would be read as a tap and advance the selection.
@@ -3543,6 +3559,7 @@ _LOCK_SCREEN_SCRIPT = r"""
       // Let the next open re-arrange. Held only while the arc is visible.
       carOrder = null;
       if (screenEl) screenEl.removeAttribute("data-radial");
+      carDark = false;
       if (scrim) {
         scrim.removeAttribute("data-on");
         // Only take the scrim away if nothing ELSE is using it. A sheet keeps it
@@ -3625,6 +3642,8 @@ _LOCK_SCREEN_SCRIPT = r"""
     var CAR_STORE = "taos.ls.carousel";
     var carFocusName = null;
     var carUsed = {};
+    // Whether this showing of the arc began on a dark panel.
+    var carDark = false;
     // The order the arc is CURRENTLY showing. Computed when it opens and held
     // while it is up: re-sorting on every repaint would shuffle the faces under
     // the thumb mid-cycle.
@@ -3774,8 +3793,10 @@ _LOCK_SCREEN_SCRIPT = r"""
       }
       paintCarousel();
       carEl.setAttribute("data-on", "1");
-      // Blur and dim what is behind, so the faces read against the feed.
-      if (screenEl) screenEl.setAttribute("data-radial", "1");
+      // Blur and dim what is behind, so the faces read against the feed --
+      // or hide it outright when the arc was summoned onto a dark screen,
+      // which on OLED means the faces float on real black.
+      if (screenEl) screenEl.setAttribute("data-radial", carDark ? "dark" : "1");
       if (scrim) { scrim.hidden = false; scrim.setAttribute("data-on", "1"); }
       restartIdleHide();
     }
@@ -3829,7 +3850,7 @@ _LOCK_SCREEN_SCRIPT = r"""
       restartIdleHide();
     }
 
-    function volumeKey(key, action) {
+    function volumeKey(key, action, fromDark) {
       // Never over the passcode: a volume nudge must not cover the keypad
       // someone is typing a PIN into.
       var sheet = screenEl ? screenEl.getAttribute("data-sheet") : "none";
@@ -3841,10 +3862,17 @@ _LOCK_SCREEN_SCRIPT = r"""
       if (action === "press") {
         if (holdTimer) { window.clearTimeout(holdTimer); holdTimer = null; }
         pressWasHold = false;
+        pressOpened = false;
 
         if (!carOpen && !volOpen) {
           // From rest: which key was pressed decides which surface appears.
+          // This press is spent on APPEARING -- its release must not also act.
+          pressOpened = true;
           if (key === "up") { loadVolume(); volShow(); volArmed = true; return; }
+          // Opened from a dark panel: the arc goes over black, not over the
+          // whole lock screen. Jay: "it will look nice against the black oled
+          // screen". The compositor woke the panel before telling us.
+          carDark = !!fromDark;
           // carIndex is NOT reset here: carShow() restores where the arc was
           // left, which is the whole point of remembering it. Zeroing it first
           // would make every open land on the front regardless.
@@ -3884,6 +3912,10 @@ _LOCK_SCREEN_SCRIPT = r"""
       }
       if (pressWasHold) {     // the hold fired but talking did not take
         pressWasHold = false;
+        return;
+      }
+      if (pressOpened) {      // this press made the surface appear; that is all
+        pressOpened = false;
         return;
       }
       if (carOpen) {          // a genuine tap: move one agent
@@ -4232,10 +4264,19 @@ _LOCK_SCREEN_SCRIPT = r"""
           screenEl.setAttribute("data-instant", "1");
           closeSheet();
         });
-        lockStream.addEventListener("volume-up-press", function () { volumeKey("up", "press"); });
-        lockStream.addEventListener("volume-up-release", function () { volumeKey("up", "release"); });
-        lockStream.addEventListener("volume-down-press", function () { volumeKey("down", "press"); });
-        lockStream.addEventListener("volume-down-release", function () { volumeKey("down", "release"); });
+        // One listener shape for all four, reading the payload rather than
+        // relying on the event name to carry the screen state.
+        var volKeys = [["up", "press"], ["up", "release"],
+                       ["down", "press"], ["down", "release"]];
+        for (var vk = 0; vk < volKeys.length; vk++) {
+          (function (key, action) {
+            lockStream.addEventListener("volume-" + key + "-" + action, function (ev) {
+              var data = {};
+              try { data = JSON.parse(ev.data || "{}"); } catch (err) { data = {}; }
+              volumeKey(key, action, data.screen === "off");
+            });
+          })(volKeys[vk][0], volKeys[vk][1]);
+        }
         lockStream.addEventListener("power-menu", function () {
           paintPowerMenu();
           if (powerSub) {
@@ -7754,7 +7795,7 @@ _POWER_REQUEST = "/run/taos-power/request"
 _LOCK_EVENT_WAITERS: set = set()
 
 
-def _push_lock_event(kind: str) -> int:
+def _push_lock_event(kind: str, payload: dict | None = None) -> int:
     """Fan an event out to every open lock-screen stream. Returns the count.
 
     The count is returned rather than discarded so the caller -- and the test --
@@ -7764,7 +7805,7 @@ def _push_lock_event(kind: str) -> int:
     delivered = 0
     for queue in list(_LOCK_EVENT_WAITERS):
         try:
-            queue.put_nowait(kind)
+            queue.put_nowait((kind, payload or {}))
             delivered += 1
         except Exception:
             # A full or closed queue is one dead listener, not a reason to drop
@@ -7798,14 +7839,18 @@ async def lock_events(request: Request):
                 if await request.is_disconnected():
                     break
                 try:
-                    kind = await asyncio.wait_for(queue.get(), timeout=20)
+                    kind, payload = await asyncio.wait_for(queue.get(), timeout=20)
                 except asyncio.TimeoutError:
                     # A comment line. Without it a silent stream is
                     # indistinguishable from a dead one, and the socket is free
                     # to be reaped by anything in between.
                     yield ": keepalive\n\n"
                     continue
-                yield "event: %s\ndata: {}\n\n" % kind
+                # The payload rides in `data` rather than being baked into the
+                # event NAME. Encoding it in the name meant one listener per
+                # combination -- four volume events became eight the moment the
+                # screen state joined them -- and each new dimension doubled it.
+                yield "event: %s\ndata: %s\n\n" % (kind, json.dumps(payload))
         finally:
             _LOCK_EVENT_WAITERS.discard(queue)
 
@@ -7999,7 +8044,13 @@ async def lock_volume_key(request: Request):
     action = str(body.get("action", "")).strip()
     if key not in ("up", "down") or action not in ("press", "release"):
         return JSONResponse({"error": "bad key or action"}, status_code=400)
-    delivered = _push_lock_event("volume-%s-%s" % (key, action))
+    # Whether the panel was dark when the key went down. The compositor knows
+    # and the page does not, and it changes how the arc is drawn: over black
+    # rather than over the whole lock screen.
+    screen = "off" if str(body.get("screen", "")).strip() == "off" else "on"
+    delivered = _push_lock_event(
+        "volume-%s-%s" % (key, action), {"screen": screen}
+    )
     return JSONResponse({"ok": True, "delivered": delivered})
 
 

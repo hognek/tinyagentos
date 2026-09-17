@@ -182,7 +182,8 @@ class TestThePushChannel:
         try:
             got = _body(_call(auth.lock_power_menu(_Req())))
             assert got["delivered"] == 1
-            assert queue.get_nowait() == "power-menu"
+            # Events now carry a payload, so the queue holds (kind, data).
+            assert queue.get_nowait() == ("power-menu", {})
         finally:
             auth._LOCK_EVENT_WAITERS.discard(queue)
 
@@ -206,7 +207,7 @@ class TestThePushChannel:
         auth._LOCK_EVENT_WAITERS.add(live)
         try:
             assert auth._push_lock_event("power-menu") == 1
-            assert live.get_nowait() == "power-menu"
+            assert live.get_nowait() == ("power-menu", {})
             assert full not in auth._LOCK_EVENT_WAITERS
         finally:
             auth._LOCK_EVENT_WAITERS.clear()
@@ -225,7 +226,7 @@ class TestTurningTheScreenOffPutsTheMenuAway:
         try:
             got = _body(_call(auth.lock_screen_off(_Req())))
             assert got["delivered"] == 1
-            assert queue.get_nowait() == "screen-off"
+            assert queue.get_nowait() == ("screen-off", {})
         finally:
             auth._LOCK_EVENT_WAITERS.clear()
 
@@ -362,7 +363,10 @@ class TestTheVolumeKeys:
             got = _body(_call(auth.lock_volume_key(
                 _Req({"key": key, "action": action}))))
             assert got["delivered"] == 1
-            assert queue.get_nowait() == "volume-%s-%s" % (key, action)
+            kind, data = queue.get_nowait()
+            assert kind == "volume-%s-%s" % (key, action)
+            # The screen state rides in the payload rather than the event name.
+            assert data.get("screen") in ("on", "off"), data
         finally:
             auth._LOCK_EVENT_WAITERS.clear()
 
@@ -568,7 +572,11 @@ class TestTheRadialChooserBlursTheScreen:
         js = auth._LOCK_SCREEN_SCRIPT
         start = js.index("function carShow(")
         body = js[start:js.index("function startTalking(", start)]
-        assert 'setAttribute("data-radial", "1")' in body, body
+        # The value is now chosen between "1" (blur) and "dark" (hide), so the
+        # assertion is on the attribute being set, with the variants checked
+        # separately below.
+        assert 'setAttribute("data-radial"' in body, body
+        assert '"dark" : "1"' in body, body
         assert 'scrim.hidden = false' in body, body
 
     def test_hiding_clears_the_blur(self):
@@ -595,6 +603,30 @@ class TestTheRadialChooserBlursTheScreen:
         assert 'data-radial="1"' in css
         rule = css[css.index('.lockscreen[data-radial="1"]'):][:200]
         assert "blur(" in rule, rule
+
+    def test_summoned_onto_a_dark_panel_the_lock_screen_is_HIDDEN_not_blurred(self):
+        """Jay: "maybe we should enable the rotary menu when screen is off. It
+        will look nice against the black oled screen."
+
+        On OLED an unlit pixel emits nothing, so hiding the lock screen puts the
+        faces on real black -- which is the effect, and the one thing an OLED
+        does that no amount of blur imitates. A blurred lock screen would still
+        be a lit photograph of a lock screen.
+        """
+        css = auth._LOCK_SCREEN_STYLE
+        assert 'data-radial="dark"' in css
+        rule = css[css.index('.lockscreen[data-radial="dark"]'):][:260]
+        assert "visibility: hidden" in rule, rule
+        assert "blur(" not in rule, rule
+        # And the scrim goes to true black behind it.
+        assert 'data-radial="dark"] ~ .ls-scrim' in css
+
+    def test_the_dark_variant_is_cleared_when_the_arc_closes(self):
+        """Left set, the next ordinary open would hide the lock screen instead
+        of blurring it -- and the phone would look like it had gone blank."""
+        js = auth._LOCK_SCREEN_SCRIPT
+        hide = js[js.index("function hideAll("):js.index("function restartIdleHide(")]
+        assert "carDark = false" in hide, hide
 
     def test_the_volume_bezel_does_not_blur_the_screen(self):
         """Deliberately not: the bezel is a transient heads-up for a key you
@@ -768,3 +800,42 @@ class TestTheArcRemembersWhereItWasLeft:
         assert "try {" in save and "catch" in save, save
         # And the restore on load is guarded too.
         assert "JSON.parse(window.localStorage.getItem(CAR_STORE)" in js
+
+
+class TestTheOpeningPressOnlyOpens:
+    """Jay: "the first click of the volume down should not rotate the menu just
+    make it appear."
+
+    The arc opens on the press, and by the time that press is RELEASED the arc
+    is open -- so the release handler saw an open arc and cycled it. The menu
+    appeared already one agent along. Same shape as the hold bug: a press that
+    did something on the way down must not also act on the way up.
+    """
+
+    @staticmethod
+    def _src():
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function volumeKey(")
+        return js[start:js.index("// ------", start)]
+
+    def test_the_opening_press_is_marked(self):
+        src = self._src()
+        rest = src[src.index("if (!carOpen && !volOpen)"):]
+        assert "pressOpened = true" in rest[:rest.index("restartIdleHide();")], rest
+
+    def test_the_release_of_an_opening_press_does_not_cycle(self):
+        """The discriminating order: the pressOpened guard has to return BEFORE
+        the cycle is reached, or marking it changes nothing."""
+        src = self._src()
+        release = src[src.index("// RELEASE"):]
+        guard = release.index("pressOpened")
+        cycle = release.index("carIndex +=")
+        assert guard < cycle, release
+        assert "return" in release[guard:cycle], release[guard:cycle]
+
+    def test_the_flag_is_cleared_on_every_press(self):
+        """Left set, the NEXT tap would be swallowed too -- a menu that needs
+        two presses per step."""
+        src = self._src()
+        press = src[src.index('if (action === "press")'):src.index("// RELEASE")]
+        assert "pressOpened = false" in press, press
