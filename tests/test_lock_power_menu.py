@@ -49,6 +49,12 @@ def _call(coro):
     return asyncio.run(coro)
 
 
+async def _no_sleep(_seconds):
+    """asyncio.sleep, removed. The route waits for the root helper to act; in a
+    test that wait is a second of nothing per case."""
+    return None
+
+
 def _body(resp):
     return json.loads(bytes(resp.body))
 
@@ -451,3 +457,86 @@ class TestTheVolumeKeys:
         # "fetch(" and not "fetch": the comment above it explains why
         # RE-FETCHING would be wrong, and matching the bare word caught that.
         assert "fetch(" not in body, body
+
+
+class TestTheRadioSwitches:
+    """Wi-Fi and Bluetooth in the pull-down shade.
+
+    Both go through the root drop box the power menu uses, because the obstacle
+    is the same one twice: the controller runs as `taos`, logind answers
+    "challenge" to CanPowerOff, NetworkManager answers `no` to
+    enable-disable-wifi, and /dev/rfkill is not writable by that user either.
+    """
+
+    @pytest.mark.parametrize("radio,on,verb", [
+        ("wifi", True, "wifi-on"),
+        ("wifi", False, "wifi-off"),
+        ("bluetooth", True, "bt-on"),
+        ("bluetooth", False, "bt-off"),
+    ])
+    def test_each_switch_writes_its_own_verb(self, monkeypatch, tmp_path, radio, on, verb):
+        """What lands in that file IS the contract with the root helper, so the
+        mapping is asserted rather than trusted to a dict literal."""
+        target = tmp_path / "request"
+        monkeypatch.setattr(auth, "_POWER_REQUEST", str(target))
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: True)
+        monkeypatch.setattr(auth, "_read_radios", lambda: {"wifi": True})
+        monkeypatch.setattr(auth.asyncio, "sleep", _no_sleep)
+        resp = _call(auth.set_lock_radios(_Req({"radio": radio, "on": on})))
+        assert resp.status_code == 200
+        assert target.read_text() == verb
+
+    def test_an_unknown_radio_is_refused(self, monkeypatch):
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: True)
+        for body in ({"radio": "microwave", "on": True},
+                     {"radio": "wifi"},
+                     {"radio": "wifi", "on": "yes"},
+                     {}):
+            assert _call(auth.set_lock_radios(_Req(body))).status_code == 400
+
+    def test_it_is_console_only_and_exempt(self, monkeypatch):
+        assert "/auth/lock-radios" in EXEMPT_PATHS
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: False)
+        assert _call(auth.lock_radios(_Req())).status_code == 403
+        assert _call(auth.set_lock_radios(
+            _Req({"radio": "wifi", "on": True}))).status_code == 403
+
+    def test_the_answer_is_the_read_back_not_the_request(self, monkeypatch, tmp_path):
+        """A switch that reports what it ASKED for lies the moment the radio
+        refuses. This asks for wifi ON while the reader insists it is OFF, and
+        requires the refusal to win."""
+        monkeypatch.setattr(auth, "_POWER_REQUEST", str(tmp_path / "request"))
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: True)
+        monkeypatch.setattr(auth, "_read_radios", lambda: {"wifi": False})
+        monkeypatch.setattr(auth.asyncio, "sleep", _no_sleep)
+        got = _body(_call(auth.set_lock_radios(_Req({"radio": "wifi", "on": True}))))
+        assert got["wifi"] is False, got
+
+    def test_a_hard_blocked_radio_reads_as_off(self, monkeypatch):
+        """A physical kill switch is not something software can clear, so a
+        switch that ignored a hard block would show on and do nothing."""
+        class Done:
+            returncode = 0
+            stdout = "bluetooth unblocked blocked"
+        monkeypatch.setattr(auth.subprocess if hasattr(auth, "subprocess") else auth,
+                            "run", lambda *a, **k: Done(), raising=False)
+        import subprocess as real
+        monkeypatch.setattr(real, "run", lambda *a, **k: Done())
+        assert auth._read_radios().get("bluetooth") is False
+
+    def test_an_unreadable_radio_is_absent_not_false(self, monkeypatch):
+        """Absent and off are different answers: the page disables the button
+        rather than showing a state nobody measured."""
+        import subprocess as real
+
+        def boom(*_a, **_k):
+            raise OSError("no such tool")
+
+        monkeypatch.setattr(real, "run", boom)
+        assert auth._read_radios() == {}
+
+    def test_the_page_disables_a_switch_it_could_not_read(self):
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function paintRadios(")
+        body = js[start:js.index("function setRadio(", start)]
+        assert "btn.disabled = true" in body, body[-400:]
