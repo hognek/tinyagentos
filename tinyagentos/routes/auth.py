@@ -1079,6 +1079,46 @@ body.ls-black { background: #000; }
   .ls-carousel[data-talking="1"] .ls-face[data-focus="1"] { animation: none; }
 }
 
+/* TORCH AND CAMERA, flanking the unlock bar.
+ *
+ * Round, dim, and the same size as each other: they are landmarks found by
+ * position rather than read, which is why they sit at the edges with the bar
+ * between them. Big targets because they are pressed with a thumb, often in
+ * the dark -- the torch especially, which is the one control on this screen
+ * someone reaches for precisely when they cannot see. */
+.ls-unlock-row {
+  display: flex; align-items: center; justify-content: center; gap: 14px;
+  width: 100%; max-width: var(--ls-card-w); margin: 0 auto;
+}
+.ls-unlock-row .ls-unlock-btn { flex: 1; min-width: 0; }
+.ls-quick {
+  flex: none; width: 46px; height: 46px; padding: 0;
+  border: 0; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(255,255,255,0.12); color: rgba(255,255,255,0.82);
+  transition: background 200ms ease, color 200ms ease, transform 140ms ease;
+}
+.ls-quick svg {
+  width: 21px; height: 21px; fill: none; stroke: currentColor;
+  stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round;
+}
+.ls-quick:active { transform: scale(0.92); }
+.ls-quick:focus-visible { outline: 3px solid #4c9aff; outline-offset: 3px; }
+/* Lit: the torch inverts, the way it does on every phone, so its state is
+   unmistakable from the corner of the eye in a dark room. */
+.ls-quick[aria-pressed="true"] { background: #fff; color: #111; }
+/* Unavailable rather than hidden. A missing control is a thing the user hunts
+   for; a dimmed one answers the question. */
+.ls-quick[disabled] { opacity: 0.38; }
+.ls-quick[data-note]::after {
+  content: attr(data-note);
+  position: absolute; bottom: 54px; left: 50%; transform: translateX(-50%);
+  white-space: nowrap; padding: 6px 10px; border-radius: 10px;
+  background: rgba(24,24,27,0.94); color: rgba(255,255,255,0.8);
+  font-size: 11px; font-weight: 500;
+}
+.ls-quick { position: relative; }
+
 /* THE PULL-DOWN SHADE, from the TOP edge -- the one surface on this screen that
    does not come from the bottom, because that is where the gesture starts. It
    deliberately does NOT cover the whole screen: a shade that fills the display
@@ -2355,11 +2395,29 @@ def _lock_head_html() -> str:
     <div class="ls-spacer"></div>
     <div class="ls-unlock" id="ls-unlock">
       <div class="ls-unlock-note" id="ls-unlock-note" role="status" hidden></div>
-      <button type="button" class="ls-unlock-btn" id="ls-unlock-btn"
-              aria-expanded="false" aria-controls="ls-foot">
-        <span class="ls-grabber"></span>
-        <span class="ls-unlock-label">Swipe up to unlock</span>
-      </button>
+      <!-- Torch and camera flank the unlock bar, where every phone puts them.
+           They are OUTSIDE the unlock button, not inside it: a tap meant for
+           the torch must never be read as a swipe toward the keypad. -->
+      <div class="ls-unlock-row">
+        <button type="button" class="ls-quick" id="ls-torch"
+                aria-pressed="false" aria-label="Torch">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M9 2.6h6l-.7 3.2H9.7z"/>
+            <path d="M9.7 5.8h4.6l.5 2.6-1 1.4v11.6h-3.6V9.8l-1-1.4z"/>
+          </svg>
+        </button>
+        <button type="button" class="ls-unlock-btn" id="ls-unlock-btn"
+                aria-expanded="false" aria-controls="ls-foot">
+          <span class="ls-grabber"></span>
+          <span class="ls-unlock-label">Swipe up to unlock</span>
+        </button>
+        <button type="button" class="ls-quick" id="ls-camera" aria-label="Camera">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M3.4 8.2h3l1.3-2h6.6l1.3 2h3a1.4 1.4 0 0 1 1.4 1.4v8.6a1.4 1.4 0 0 1-1.4 1.4H3.4A1.4 1.4 0 0 1 2 18.2V9.6a1.4 1.4 0 0 1 1.4-1.4z"/>
+            <circle cx="12" cy="13.6" r="3.4"/>
+          </svg>
+        </button>
+      </div>
     </div>"""
 
 
@@ -3599,6 +3657,64 @@ _LOCK_SCREEN_SCRIPT = r"""
         }
       }, { passive: true, capture: true });
     });
+
+    // ------------------------------------------------------------------
+    // TORCH AND CAMERA, either side of the unlock bar.
+    // ------------------------------------------------------------------
+    var torchBtn = document.getElementById("ls-torch");
+    var cameraBtn = document.getElementById("ls-camera");
+
+    function paintTorch(state) {
+      if (!torchBtn) return;
+      if (!state || typeof state.on !== "boolean") {
+        // No torch on this device. Dimmed and inert rather than removed: a
+        // missing control is something the user hunts for, a dimmed one
+        // answers the question.
+        torchBtn.disabled = true;
+        return;
+      }
+      torchBtn.disabled = false;
+      setAttrIfChanged(torchBtn, "aria-pressed", state.on ? "true" : "false");
+    }
+
+    if (torchBtn) {
+      fetch("/auth/lock-torch", { credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(paintTorch)
+        .catch(function () { paintTorch(null); });
+
+      torchBtn.addEventListener("click", function () {
+        var want = torchBtn.getAttribute("aria-pressed") !== "true";
+        // Optimistic, then corrected by the read-back: an LED is instant, so
+        // waiting for the round trip would make a real control feel dead.
+        setAttrIfChanged(torchBtn, "aria-pressed", want ? "true" : "false");
+        fetch("/auth/lock-torch", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ on: want })
+        }).then(function (r) { return r.ok ? r.json() : null; })
+          // What the LED took, not what was asked -- the level is clamped well
+          // below maximum, so the answer is not always the question.
+          .then(function (d) { if (d) paintTorch(d); })
+          .catch(function () { paintTorch(null); });
+      });
+    }
+
+    if (cameraBtn) {
+      // ⚠ THERE IS NO CAMERA APP ON THIS HANDSET. Measured: no megapixels, no
+      // snapshot, no camera binary, and libcamera reports no sensor for
+      // /dev/media0 even though /dev/video* exist. So this says so instead of
+      // pretending -- the same rule the emergency-call entry and the screenshot
+      // action follow. A shortcut that silently does nothing is worse than one
+      // that admits it, because the user retries it.
+      cameraBtn.addEventListener("click", function () {
+        cameraBtn.setAttribute("data-note", "No camera app yet");
+        window.setTimeout(function () {
+          cameraBtn.removeAttribute("data-note");
+        }, 1800);
+      });
+    }
 
     // ------------------------------------------------------------------
     // THE VOLUME KEYS. Jay's spec, and all of the policy lives here because it
@@ -8448,6 +8564,93 @@ async def set_lock_volume(request: Request):
     if after is None:
         return JSONResponse({"error": "no audio"}, status_code=404)
     return JSONResponse(after)
+
+
+#: The torch. Discovered rather than hardcoded: this handset's node is
+#: `white:flash`, but the name is the driver's and another panel or kernel would
+#: call it something else.
+_LEDS_DIR = "/sys/class/leds"
+
+#: Torch brightness as a share of the LED's maximum. NOT full: this is a CAMERA
+#: FLASH LED being held on continuously, which is not what it was designed for,
+#: and whether this driver limits the current is not something this code can
+#: see. 40% is bright enough to be a torch and well inside what the part will
+#: take indefinitely.
+_TORCH_SHARE = 0.4
+
+
+def _torch_path() -> str | None:
+    """The first flash/torch LED, or None if this device has none."""
+    try:
+        names = sorted(os.listdir(_LEDS_DIR))
+    except OSError:
+        return None
+    for name in names:
+        low = name.lower()
+        if "flash" in low or "torch" in low:
+            return os.path.join(_LEDS_DIR, name)
+    return None
+
+
+def _read_torch() -> dict | None:
+    base = _torch_path()
+    if not base:
+        return None
+    try:
+        with open(os.path.join(base, "brightness")) as handle:
+            current = int(handle.read().strip())
+        with open(os.path.join(base, "max_brightness")) as handle:
+            maximum = int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+    return {"on": current > 0, "level": current, "max": maximum}
+
+
+@router.get("/lock-torch")
+async def lock_torch(request: Request):
+    """Whether the torch is lit. Console-only."""
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    reading = _read_torch()
+    if reading is None:
+        return JSONResponse({"error": "no torch"}, status_code=404)
+    return JSONResponse(reading)
+
+
+@router.post("/lock-torch")
+async def set_lock_torch(request: Request):
+    """Light or extinguish the torch. Console-only.
+
+    No root helper needed, unlike the radios: this handset's LED node is
+    world-writable (root:feedbackd, rw-rw-rw-), so the controller can drive it
+    as itself. Measured before relying on it.
+
+    Returns the READ-BACK, for the same reason brightness does: what the LED
+    took is the only honest answer.
+    """
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    want = body.get("on")
+    if not isinstance(want, bool):
+        return JSONResponse({"error": "on required"}, status_code=400)
+    base = _torch_path()
+    reading = _read_torch()
+    if not base or reading is None:
+        return JSONResponse({"error": "no torch"}, status_code=404)
+    level = int(reading["max"] * _TORCH_SHARE) if want else 0
+    try:
+        with open(os.path.join(base, "brightness"), "w") as handle:
+            handle.write(str(level))
+    except OSError as exc:
+        return JSONResponse(
+            {"error": "torch write failed", "detail": str(exc)}, status_code=503
+        )
+    after = _read_torch()
+    return JSONResponse(after or {"error": "unreadable"})
 
 
 @router.get("/lock-brightness")
