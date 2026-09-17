@@ -3643,7 +3643,28 @@ _LOCK_SCREEN_SCRIPT = r"""
       if (carEl) { carEl.removeAttribute("data-on"); carEl.removeAttribute("data-talking"); }
       // Let the next open re-arrange. Held only while the arc is visible.
       carOrder = null;
-      if (screenEl) screenEl.removeAttribute("data-radial");
+      // THE PANEL WAS DARK WHEN THIS STARTED, so put it back to dark rather
+      // than revealing a lock screen nobody asked for.
+      //
+      // Jay: "after using the rotary menu instead of the screen going off it
+      // shows the lock screen background grey." Two faults in one. data-blanked
+      // was never cleared -- the screen-on handler deliberately skips it while
+      // the arc is up, and nothing else did it -- so the lock screen stayed at
+      // opacity 0 and what showed through was the page body. And even cleared,
+      // revealing the lock screen is wrong: the screen was off before the arc,
+      // so it should be off after.
+      //
+      // Keeping the page black is how that is done without the page needing a
+      // way to power the panel down, which it has no business having. On OLED a
+      // black frame emits nothing, so it reads as off, and swayidle blanks the
+      // panel properly a moment later -- the volume key re-armed it, so the
+      // timer is running.
+      var wasDark = carDark;
+      if (screenEl) {
+        screenEl.removeAttribute("data-radial");
+        if (wasDark) screenEl.setAttribute("data-blanked", "1");
+        else screenEl.removeAttribute("data-blanked");
+      }
       carDark = false;
       if (scrim) {
         scrim.removeAttribute("data-on");

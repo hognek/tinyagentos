@@ -892,3 +892,46 @@ class TestTheArcEmergesFromTheBlack:
         assert css.count("prefers-reduced-motion") >= 1
         tail = css[css.index('data-radial="dark"] ~ #ls-carousel'):]
         assert "prefers-reduced-motion" in tail, "the dark arc ignores reduced motion"
+
+
+class TestClosingTheArcLeavesTheRightThingOnScreen:
+    """Jay: "after using the rotary menu instead of the screen going off it
+    shows the lock screen background grey."
+
+    Two faults in one symptom. data-blanked was never cleared -- the screen-on
+    handler skips it while the arc is up, and nothing else did it -- so the
+    lock screen stayed at opacity 0 and the page body showed through. And even
+    cleared, revealing the lock screen is the wrong answer: the screen was off
+    before the arc, so it should be off after.
+    """
+
+    @staticmethod
+    def _hide_all():
+        js = auth._LOCK_SCREEN_SCRIPT
+        start = js.index("function hideAll(")
+        return js[start:js.index("function restartIdleHide(", start)]
+
+    def test_a_dark_summon_goes_back_to_black(self):
+        body = self._hide_all()
+        assert "wasDark" in body, body
+        assert 'setAttribute("data-blanked", "1")' in body, body
+
+    def test_an_ordinary_close_restores_the_lock_screen(self):
+        """The other arm. Always re-blackening would leave a phone that was
+        awake staring at a black screen."""
+        body = self._hide_all()
+        assert 'removeAttribute("data-blanked")' in body, body
+
+    def test_the_dark_flag_is_read_before_it_is_reset(self):
+        """carDark is cleared in the same function, so reading it afterwards
+        would always take the ordinary branch and the fix would do nothing."""
+        body = self._hide_all()
+        assert body.index("var wasDark = carDark") < body.index("carDark = false"), body
+
+    def test_the_page_does_not_power_the_panel_itself(self):
+        """Keeping the page black is how the screen is returned to dark. The
+        page has no business being able to power the output down, and swayidle
+        blanks it properly a moment later."""
+        body = self._hide_all()
+        for forbidden in ("power off", "lock-screen-off", "taos-kiosk-screen"):
+            assert forbidden not in body, forbidden
