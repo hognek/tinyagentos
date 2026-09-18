@@ -499,6 +499,34 @@ body.lockscreen-on.osk-open { display: block; padding-bottom: 0 !important; over
   overscroll-behavior: contain;
 }
 .ls-feed::-webkit-scrollbar { width: 0; height: 0; display: none; }
+
+/* PRESSING THE ACTIVE CATEGORY CLEARS THE FEED AWAY. Jay asked for it, and it
+   is the one thing a lock screen full of cards could not do: see the screen
+   underneath without unlocking or waiting for it to blank.
+
+   Faded, NOT display:none. The row of category icons has to stay exactly where
+   it is so the same press brings the content back, and a display change would
+   collapse the column and jump the row down the screen mid-animation.
+   translateY gives the fade somewhere to go so it reads as the cards dropping
+   away rather than the screen dimming.
+
+   pointer-events is what makes it honest: an invisible feed must not swallow a
+   touch. It also hands the unlock swipe back the whole screen, because the
+   swipe's veto only fires for touches that start inside .ls-feed -- with the
+   cards gone, a swipe up unlocks from anywhere, which is what an empty screen
+   should do. */
+.ls-feed {
+  transition: opacity 260ms cubic-bezier(.2, .8, .2, 1),
+              transform 260ms cubic-bezier(.2, .8, .2, 1);
+}
+.ls-feed[data-hidden="1"] {
+  opacity: 0;
+  transform: translateY(10px);
+  pointer-events: none;
+}
+/* The tab that is holding its content hidden says so rather than looking
+   identical to one that is showing it. */
+.ls-view-tab[aria-expanded="false"] { opacity: .55; }
 /* The cut edge. With the bar hidden, a scrolling feed ends in a card sliced
    clean in half against the unlock bar, which reads as a rendering fault rather
    than as more content. A fade says "this continues".
@@ -3166,8 +3194,40 @@ _LOCK_SCREEN_SCRIPT = r"""
         feedEl.scrollTop = 0;
       }
 
+      // Reached by a tap on another tab, by the arrow keys, or at startup.
+      // Any of them means "show me this", so the feed comes back.
+      setFeedHidden(false);
       renderView(key);
       syncFeedFade();
+    }
+
+    // Pressing the ACTIVE category hides the feed; pressing it again restores
+    // it. Jay: "pressing on the active category icon on the lock screen hides
+    // the notifications/banners etc."
+    //
+    // The state lives on the feed rather than in a variable so the CSS owns the
+    // animation and nothing here has to know how long it takes.
+    function setFeedHidden(hidden) {
+      if (!feedEl) return;
+      if (hidden) feedEl.setAttribute("data-hidden", "1");
+      else feedEl.removeAttribute("data-hidden");
+      // The whole point is that it is out of the way, so it must be out of the
+      // way for a screen reader too -- a faded panel is still readable to one.
+      feedEl.setAttribute("aria-hidden", hidden ? "true" : "false");
+      var tabs = viewTabs();
+      for (var i = 0; i < tabs.length; i++) {
+        // Only the SELECTED tab carries the state: the others are not holding
+        // anything hidden, and saying they are would be a lie to a reader.
+        if (tabs[i].getAttribute("aria-selected") === "true") {
+          tabs[i].setAttribute("aria-expanded", hidden ? "false" : "true");
+        } else {
+          tabs[i].removeAttribute("aria-expanded");
+        }
+      }
+    }
+
+    function feedIsHidden() {
+      return !!(feedEl && feedEl.hasAttribute("data-hidden"));
     }
 
     // Panels that are built on demand rather than polled. Agents and alerts
@@ -3393,7 +3453,15 @@ _LOCK_SCREEN_SCRIPT = r"""
       viewsEl.addEventListener("click", function (ev) {
         var tab = ev.target.closest(".ls-view-tab");
         if (!tab) return;
-        showView(tab.getAttribute("data-view"), false);
+        var key = tab.getAttribute("data-view");
+        // The ACTIVE one toggles; any other one switches to it, and switching
+        // always brings the feed back -- asking for a different category means
+        // asking to see it.
+        if (key === currentView) {
+          setFeedHidden(!feedIsHidden());
+          return;
+        }
+        showView(key, false);
       });
 
       // Arrow-key traversal is what makes this a tablist rather than seven
