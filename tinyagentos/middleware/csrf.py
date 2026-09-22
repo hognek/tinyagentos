@@ -99,12 +99,17 @@ class CSRFMiddleware(BaseHTTPMiddleware):
                 path="/",
             )
         if getattr(request.state, "clear_stale_session", False):
-            response.delete_cookie(
-                "taos_session",
-                httponly=True,
-                samesite="strict",
-                path="/",
+            already_set = any(
+                line.split(";")[0].strip().split("=", 1)[0].strip() == "taos_session"
+                for line in response.headers.getlist("set-cookie")
             )
+            if not already_set:
+                response.delete_cookie(
+                    "taos_session",
+                    httponly=True,
+                    samesite="strict",
+                    path="/",
+                )
         return response
 
 
@@ -156,7 +161,9 @@ def verify_csrf(conn: HTTPConnection) -> None:
             auth_mgr = conn.app.state.auth
         except (KeyError, AttributeError):
             auth_mgr = None
-        if auth_mgr is not None and auth_mgr.validate_session(session_token) is None:
+        if auth_mgr is not None and auth_mgr.validate_session(
+            session_token, conn.headers.get("user-agent")
+        ) is None:
             conn.state.clear_stale_session = True
             return
 
