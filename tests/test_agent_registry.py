@@ -166,24 +166,22 @@ class TestAgentRegistryStore:
         finally:
             await store.close()
 
-    async def test_revoke_unknown_returns_none(self, tmp_path):
+    async def test_revoke_unknown_raises_key_error(self, tmp_path):
         store = await self._make_store(tmp_path / "reg.db")
         try:
-            assert await store.revoke("does-not-exist") is None
+            with pytest.raises(KeyError):
+                await store.revoke("does-not-exist")
         finally:
             await store.close()
 
-    async def test_revoke_already_revoked_returns_none(self, tmp_path):
-        """Revoking a second time returns None (already revoked)."""
+    async def test_revoke_already_revoked_raises_value_error(self, tmp_path):
+        """Revoking an already-revoked agent is an illegal lifecycle transition."""
         store = await self._make_store(tmp_path / "reg.db")
         try:
             rec = await store.register(framework="openclaw")
             await store.revoke(rec["canonical_id"])
-            result = await store.revoke(rec["canonical_id"])
-            # The record still exists but the second UPDATE matched 0 rows;
-            # the helper returns the record (with revoked_at set) either way.
-            # The important thing is no exception is raised.
-            assert result is not None
+            with pytest.raises(ValueError, match="invalid lifecycle transition"):
+                await store.revoke(rec["canonical_id"])
         finally:
             await store.close()
 
