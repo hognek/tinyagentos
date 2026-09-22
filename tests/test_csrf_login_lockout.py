@@ -158,6 +158,35 @@ class TestStaleCookieDoesNotBlockSignIn:
         assert resp.status_code != 403, resp.text
 
     @pytest.mark.asyncio
+    async def test_first_run_setup_clears_a_stale_session_cookie(
+        self, unconfigured_app
+    ):
+        """A stale taos_session cookie must be cleared in the response so the
+        browser stops sending it on subsequent requests."""
+        async with _console_client(
+            unconfigured_app, {"taos_session": STALE_SESSION}
+        ) as c:
+            resp = await c.post(
+                "/auth/setup",
+                json={
+                    "username": "tester",
+                    "display_name": "Bring-up Test",
+                    "email": "",
+                    "password": PASSWORD,
+                },
+                follow_redirects=False,
+            )
+        assert resp.status_code == 200, resp.text
+        set_cookie = resp.headers.get("set-cookie", "")
+        assert "taos_session" in set_cookie, (
+            "response did not set a taos_session cookie at all"
+        )
+        assert "Max-Age=0" in set_cookie or 'expires=' in set_cookie.lower(), (
+            "stale taos_session cookie was not cleared: "
+            f"Set-Cookie headers: {set_cookie!r}"
+        )
+
+    @pytest.mark.asyncio
     async def test_first_boot_wizard_is_not_blocked_by_a_stale_session_cookie(
         self, unconfigured_app
     ):
