@@ -137,7 +137,7 @@ class TestFirstPartyTagNaming:
         # Read all -t lines from workflows, keyed by (image, tag)
         workflow_image_tags = set()
         workflow_dir = Path(__file__).resolve().parent.parent.parent / ".github" / "workflows"
-        for wf in workflow_dir.glob("*.yml"):
+        for wf in workflow_dir.glob("*.y*ml"):
             content = wf.read_text()
             for line in content.splitlines():
                 m = re.search(r'-t\s+ghcr\.io/jaylfc/([^\s:]+):(.+?)\\?\s*$', line)
@@ -154,7 +154,7 @@ class TestFirstPartyTagNaming:
         for df in app_catalog.rglob("Dockerfile*"):
             content = df.read_text()
             for line in content.splitlines():
-                m = re.match(r'FROM\s+ghcr\.io/jaylfc/([^\s@]+)(?:[@:](.+))?', line)
+                m = re.match(r'FROM\s+(?:--platform=\S+\s+)?ghcr\.io/jaylfc/([^\s@:]+)(?:[@:](.+))?', line)
                 if m:
                     image_part = m.group(1)
                     tag_or_digest = m.group(2) or "latest"
@@ -166,6 +166,62 @@ class TestFirstPartyTagNaming:
                         bad_pins.append(f"{df}: {image_part}:{tag_or_digest}")
 
         assert not bad_pins, f"Pins not covered by workflow tags: {bad_pins}"
+
+    def test_tag_pin_forms_parameterised(self, tmp_path: Path):
+        """All four tag-pin arms plus --platform: drives off a fixture tree."""
+        import re
+
+        workflow_dir = tmp_path / ".github" / "workflows"
+        workflow_dir.mkdir(parents=True)
+        (workflow_dir / "publish.yaml").write_text(
+            "steps:\n"
+            "  - run: docker build \\\n"
+            "    -t ghcr.io/jaylfc/taos-neko-cdp:latest \\\n"
+            "    -t ghcr.io/jaylfc/taos-neko-cdp:2.4.0\n"
+        )
+
+        app_catalog = tmp_path / "app-catalog" / "streaming" / "neko-browser"
+        app_catalog.mkdir(parents=True)
+
+        workflow_image_tags = set()
+        for wf in workflow_dir.glob("*.y*ml"):
+            content = wf.read_text()
+            for line in content.splitlines():
+                m = re.search(r'-t\s+ghcr\.io/jaylfc/([^\s:]+):(.+?)\\?\s*$', line)
+                if m:
+                    image = m.group(1).strip()
+                    tag = m.group(2).strip()
+                    if tag.startswith("${"):
+                        continue
+                    workflow_image_tags.add((image, tag))
+
+        cases = [
+            ("FROM ghcr.io/jaylfc/taos-neko-cdp:2.4.0\n", False, "published tag for same image"),
+            ("FROM ghcr.io/jaylfc/taos-neko-cdp:latest\n", False, "latest published"),
+            ("FROM ghcr.io/jaylfc/other-image:2.4.0\n", True, "same tag published for different image"),
+            ("FROM ghcr.io/jaylfc/taos-neko-cdp:9.9.9-nope\n", True, "unpublished tag"),
+            ("FROM ghcr.io/jaylfc/taos-neko-cdp@sha256:abc123\n", False, "digest pin"),
+            ("FROM --platform=linux/arm64 ghcr.io/jaylfc/taos-neko-cdp:2.4.0\n", False, "platform-prefixed published tag"),
+        ]
+
+        for df_content, expect_failure, desc in cases:
+                (app_catalog / "Dockerfile.tmp").write_text(df_content)
+                bad_pins = []
+                for df in app_catalog.rglob("Dockerfile*"):
+                    content = df.read_text()
+                    for line in content.splitlines():
+                        m = re.match(r'FROM\s+(?:--platform=\S+\s+)?ghcr\.io/jaylfc/([^\s@:]+)(?:[@:](.+))?', line)
+                        if m:
+                            image_part = m.group(1)
+                            tag_or_digest = m.group(2) or "latest"
+                            if tag_or_digest.startswith("sha256:"):
+                                continue
+                            if (image_part, tag_or_digest) not in workflow_image_tags:
+                                bad_pins.append(f"{df.name}: {image_part}:{tag_or_digest}")
+                if expect_failure:
+                    assert bad_pins, f"Expected failure for {desc}, but passed"
+                else:
+                    assert not bad_pins, f"Expected pass for {desc}, but got: {bad_pins}"
 
 class TestStaleIgnoreCheck:
     def test_fails_when_ignored_cve_no_longer_reported(self, tmp_path: Path, capsys: pytest.CaptureFixture):
