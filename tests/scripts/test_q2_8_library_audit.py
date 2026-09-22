@@ -119,8 +119,44 @@ class TestAuditManifestsDrift:
 
 
 # ---------------------------------------------------------------------------
-# Test 4: stale-ignore check fails on a fixture ignore for a CVE the scanner does not report
+# Test 5: first-party tag naming check
 # ---------------------------------------------------------------------------
+
+class TestFirstPartyTagNaming:
+    def test_every_fp_tag_has_corresponding_workflow(self):
+        """Every FROM ghcr.io/jaylfc/... pin in app-catalog/ must name a tag
+        that the repo's own workflows actually publish, or be a @sha256: digest."""
+        import re
+        from pathlib import Path
+
+        # Read all -t lines from workflows, extract the tag portion
+        workflow_tags = set()
+        workflow_dir = Path(__file__).resolve().parent.parent.parent / ".github" / "workflows"
+        for wf in workflow_dir.glob("*.yml"):
+            content = wf.read_text()
+            for line in content.splitlines():
+                m = re.search(r'-t\s+ghcr\.io/jaylfc/([^\s:]+):(.+?)\\?\s*$', line)
+                if m:
+                    workflow_tags.add(m.group(2).strip())
+
+        # Find all FROM ghcr.io/jaylfc/... in app-catalog/
+        app_catalog = Path(__file__).resolve().parent.parent.parent / "app-catalog"
+        bad_pins = []
+        for df in app_catalog.rglob("Dockerfile*"):
+            content = df.read_text()
+            for line in content.splitlines():
+                m = re.match(r'FROM\s+ghcr\.io/jaylfc/([^\s:]+)(?::(.+))?', line)
+                if m:
+                    image_part = m.group(1)
+                    tag_or_digest = m.group(2) or "latest"
+                    # Check if it's a digest
+                    if tag_or_digest.startswith("sha256:"):
+                        continue  # digest is always OK
+                    # Check if tag is in workflow tags
+                    if tag_or_digest not in workflow_tags:
+                        bad_pins.append(f"{df}: {image_part}:{tag_or_digest}")
+
+        assert not bad_pins, f"Pins not covered by workflow tags: {bad_pins}"
 
 class TestStaleIgnoreCheck:
     def test_fails_when_ignored_cve_no_longer_reported(self, tmp_path: Path, capsys: pytest.CaptureFixture):
