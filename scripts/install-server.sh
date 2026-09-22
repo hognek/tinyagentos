@@ -648,8 +648,13 @@ install_hailo_if_pending() {
         return 0
     fi
     log "chaining into $hailo_script (hailo-ollama auto-install)"
-    sudo -E bash "$hailo_script" --yes \
-        || warn "install-hailo.sh failed - continuing controller install anyway"
+    sudo -E bash "$hailo_script" --yes
+    local hailo_rc=$?
+    if (( hailo_rc == 3 )); then
+        warn "skipping hailo-ollama install: a pre-existing hailo-ollama is already serving on :8000; leaving it in place"
+    elif (( hailo_rc != 0 )); then
+        warn "install-hailo.sh failed - continuing controller install anyway"
+    fi
 }
 
 # Install the RK3588 performance-mode systemd service when the NPU is

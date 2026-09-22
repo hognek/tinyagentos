@@ -249,7 +249,7 @@ detect_hailo() {
 # llama-cpp/vllm candidate, so a coexisting server there also makes those probes
 # ambiguous. See issue #2083.
 detect_preexisting_hailoollama() {
-    local url="http://0.0.0.0:8000/api/tags"
+    local url="http://localhost:8000/api/tags"
     local tags
     tags="$(curl -fs "$url" 2>/dev/null || true)"
     if [[ -n "$tags" ]] && grep -q '"models"' <<<"$tags"; then
@@ -258,7 +258,12 @@ detect_preexisting_hailoollama() {
         echo "$tags" | sed 's/^/    /' || true
         warn "This installer would have built a second server on port $HAILO_OLLAMA_PORT."
         log "The existing instance on :8000 will be left alone (not modified by this script)."
-        exit 0
+        # Exit 3 (not 0): a pre-existing upstream instance is a REFUSAL to
+        # install taOS's own :7836 backend, and the auto-install callers key off
+        # this distinct code to tell the operator why nothing was installed.
+        # exit 0 here made `|| warn` pass and the chained install report a
+        # silent success while leaving the box with no taOS backend.
+        exit 3
     fi
 }
 

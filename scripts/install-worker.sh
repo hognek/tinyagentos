@@ -1077,8 +1077,13 @@ detect_and_advise_accelerators() {
                 fi
                 if [[ -n "$hailo_script" ]]; then
                     log "TAOS_HAILO_SETUP=1 - chaining into $hailo_script"
-                    TAOS_HAILO_SETUP=1 sudo -E bash "$hailo_script" --yes \
-                        || warn "install-hailo.sh failed - continuing worker install anyway"
+                    TAOS_HAILO_SETUP=1 sudo -E bash "$hailo_script" --yes
+                    local hailo_rc=$?
+                    if (( hailo_rc == 3 )); then
+                        warn "skipping hailo-ollama install: a pre-existing hailo-ollama is already serving on :8000; leaving it in place"
+                    elif (( hailo_rc != 0 )); then
+                        warn "install-hailo.sh failed - continuing worker install anyway"
+                    fi
                 else
                     warn "TAOS_HAILO_SETUP=1 but install-hailo.sh not found locally yet"
                     warn "  it will be available after the worker repo is cloned; run it then"

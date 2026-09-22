@@ -8,3 +8,13 @@
   prevents the silent coexistence bug from issue #2083 where an upstream
   hailo-ollama (running on its default `0.0.0.0:8000`) would go unseen while
   taOS built a second server and installed no systemd unit.
+
+### Fixed
+
+- Detection of a pre-existing instance now exits with a distinct code (`3`)
+  instead of `0`, so the auto-install callers (`install-server.sh`,
+  `install-worker.sh`) no longer report silent success through their
+  `|| warn` chain while leaving the box with no taOS backend on port 7836.
+  Both callers key off exit 3 to tell the operator the install was skipped
+  because a pre-existing hailo-ollama is already serving :8000, and the
+  probe URL now uses `localhost` rather than `0.0.0.0`.
