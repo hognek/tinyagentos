@@ -10,6 +10,7 @@ name: Changelog fragment gate
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled, edited]
     branches: [master, dev]
 
 # This gate only reads the checkout; nothing here writes to the repo.

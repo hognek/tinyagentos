@@ -55,7 +55,7 @@ def _is_test_path(path: str) -> bool:
     if base.startswith("test_") and base.endswith(".py"):
         return True
     return base.endswith(
-        (".test.tsx", ".test.ts", ".test.jsx", ".test.js", ".spec.tsx", ".spec.ts")
+        (".test.tsx", ".test.ts", ".test.jsx", ".test.js", ".spec.tsx", ".spec.ts", ".spec.jsx", ".spec.js")
     )
 
 
@@ -140,16 +140,6 @@ def _check_fragment_requirement(
 
 class GitCommandError(Exception):
     """Raised when a git command fails, so infrastructure failures are distinguishable."""
-
-
-def _run_git(args: list[str], ref: str | None = None) -> str:
-    try:
-        return run_git(args, cwd=REPO_ROOT)
-    except subprocess.CalledProcessError:
-        msg = f"git {' '.join(args)} failed"
-        if ref:
-            msg += f" (ref: {ref})"
-        raise GitCommandError(msg) from None
 
 
 def _git_changed_base(base_ref: str) -> list[tuple[str, str]]:
