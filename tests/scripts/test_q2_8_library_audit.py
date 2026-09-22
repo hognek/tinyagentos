@@ -122,21 +122,12 @@ class TestAuditManifestsDrift:
 # Test 5: first-party tag naming check
 # ---------------------------------------------------------------------------
 
-class TestFirstPartyTagNaming:
-    def test_every_fp_tag_has_corresponding_workflow(self):
-        """Check the repo's declared publish list, NOT the registry.
+def _unpublished_first_party_pins(root: Path) -> list[str]:
+    import re
 
-        Every FROM ghcr.io/jaylfc/... pin in app-catalog/ must name a tag
-        that the repo's own workflows actually publish, or be a @sha256: digest.
-        A green here means the pin appears in the workflow YAML - it is NOT
-        proof the image resolves in the registry.
-        """
-        import re
-        from pathlib import Path
-
-        # Read all -t lines from workflows, keyed by (image, tag)
-        workflow_image_tags = set()
-        workflow_dir = Path(__file__).resolve().parent.parent.parent / ".github" / "workflows"
+    workflow_image_tags = set()
+    workflow_dir = root / ".github" / "workflows"
+    if workflow_dir.exists():
         for wf in workflow_dir.glob("*.y*ml"):
             content = wf.read_text()
             for line in content.splitlines():
@@ -148,29 +139,44 @@ class TestFirstPartyTagNaming:
                         continue
                     workflow_image_tags.add((image, tag))
 
-        # Find all FROM ghcr.io/jaylfc/... in app-catalog/
-        app_catalog = Path(__file__).resolve().parent.parent.parent / "app-catalog"
-        bad_pins = []
-        for df in app_catalog.rglob("Dockerfile*"):
-            content = df.read_text()
-            for line in content.splitlines():
-                m = re.match(r'FROM\s+(?:--platform=\S+\s+)?ghcr\.io/jaylfc/([^\s@:]+)(?:[@:](.+))?', line)
-                if m:
-                    image_part = m.group(1)
-                    tag_or_digest = m.group(2) or "latest"
-                    # Check if it's a digest
-                    if tag_or_digest.startswith("sha256:"):
-                        continue
-                    # Check if (image, tag) is in workflow tags
-                    if (image_part, tag_or_digest) not in workflow_image_tags:
-                        bad_pins.append(f"{df}: {image_part}:{tag_or_digest}")
+    bad_pins = []
+    app_catalog = root / "app-catalog"
+    if not app_catalog.exists():
+        return bad_pins
+    for df in app_catalog.rglob("Dockerfile*"):
+        content = df.read_text()
+        for line in content.splitlines():
+            m = re.match(r'FROM\s+(?:--platform=\S+\s+)?ghcr\.io/jaylfc/([^\s@:]+)(?:[@:](.+))?', line)
+            if m:
+                image_part = m.group(1)
+                tag_or_digest = m.group(2) or "latest"
+                if tag_or_digest.startswith("sha256:"):
+                    continue
+                if (image_part, tag_or_digest) not in workflow_image_tags:
+                    bad_pins.append(f"{df}: {image_part}:{tag_or_digest}")
+    return bad_pins
 
+
+# ---------------------------------------------------------------------------
+# Test 5: first-party tag naming check
+# ---------------------------------------------------------------------------
+
+class TestFirstPartyTagNaming:
+    def test_every_fp_tag_has_corresponding_workflow(self):
+        """Check the repo's declared publish list, NOT the registry.
+
+        Every FROM ghcr.io/jaylfc/... pin in app-catalog/ must name a tag
+        that the repo's own workflows actually publish, or be a @sha256: digest.
+        A green here means the pin appears in the workflow YAML - it is NOT
+        proof the image resolves in the registry.
+        """
+        bad_pins = _unpublished_first_party_pins(
+            Path(__file__).resolve().parent.parent.parent
+        )
         assert not bad_pins, f"Pins not covered by workflow tags: {bad_pins}"
 
     def test_tag_pin_forms_parameterised(self, tmp_path: Path):
         """All four tag-pin arms plus --platform: drives off a fixture tree."""
-        import re
-
         workflow_dir = tmp_path / ".github" / "workflows"
         workflow_dir.mkdir(parents=True)
         (workflow_dir / "publish.yaml").write_text(
@@ -183,18 +189,6 @@ class TestFirstPartyTagNaming:
         app_catalog = tmp_path / "app-catalog" / "streaming" / "neko-browser"
         app_catalog.mkdir(parents=True)
 
-        workflow_image_tags = set()
-        for wf in workflow_dir.glob("*.y*ml"):
-            content = wf.read_text()
-            for line in content.splitlines():
-                m = re.search(r'-t\s+ghcr\.io/jaylfc/([^\s:]+):(.+?)\\?\s*$', line)
-                if m:
-                    image = m.group(1).strip()
-                    tag = m.group(2).strip()
-                    if tag.startswith("${"):
-                        continue
-                    workflow_image_tags.add((image, tag))
-
         cases = [
             ("FROM ghcr.io/jaylfc/taos-neko-cdp:2.4.0\n", False, "published tag for same image"),
             ("FROM ghcr.io/jaylfc/taos-neko-cdp:latest\n", False, "latest published"),
@@ -205,23 +199,12 @@ class TestFirstPartyTagNaming:
         ]
 
         for df_content, expect_failure, desc in cases:
-                (app_catalog / "Dockerfile.tmp").write_text(df_content)
-                bad_pins = []
-                for df in app_catalog.rglob("Dockerfile*"):
-                    content = df.read_text()
-                    for line in content.splitlines():
-                        m = re.match(r'FROM\s+(?:--platform=\S+\s+)?ghcr\.io/jaylfc/([^\s@:]+)(?:[@:](.+))?', line)
-                        if m:
-                            image_part = m.group(1)
-                            tag_or_digest = m.group(2) or "latest"
-                            if tag_or_digest.startswith("sha256:"):
-                                continue
-                            if (image_part, tag_or_digest) not in workflow_image_tags:
-                                bad_pins.append(f"{df.name}: {image_part}:{tag_or_digest}")
-                if expect_failure:
-                    assert bad_pins, f"Expected failure for {desc}, but passed"
-                else:
-                    assert not bad_pins, f"Expected pass for {desc}, but got: {bad_pins}"
+            (app_catalog / "Dockerfile.tmp").write_text(df_content)
+            bad_pins = _unpublished_first_party_pins(tmp_path)
+            if expect_failure:
+                assert bad_pins, f"Expected failure for {desc}, but passed"
+            else:
+                assert not bad_pins, f"Expected pass for {desc}, but got: {bad_pins}"
 
 class TestStaleIgnoreCheck:
     def test_fails_when_ignored_cve_no_longer_reported(self, tmp_path: Path, capsys: pytest.CaptureFixture):
