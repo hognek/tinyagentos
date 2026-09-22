@@ -244,12 +244,14 @@ detect_hailo() {
 
 # Checks for a pre-existing hailo-ollama instance running on upstream port 8000
 # (Hailo's own default / the Ollama-compatible tags endpoint). When found, logs
-# what was detected and exits — taOS must not silently build a second server.
-# Port 8000 is the Django slot in taOS port hygiene and is already probed as a
+# what was detected and exits 3 -- taOS must not silently build a second server.
+# Exit 3 is reserved for "refused: pre-existing instance" so auto-install callers
+# can distinguish the conflict from an ordinary installer failure. Port 8000 is
+# the Django slot in taOS port hygiene and is already probed as a
 # llama-cpp/vllm candidate, so a coexisting server there also makes those probes
 # ambiguous. See issue #2083.
 detect_preexisting_hailoollama() {
-    local url="http://0.0.0.0:8000/api/tags"
+    local url="http://localhost:8000/api/tags"
     local tags
     tags="$(curl -fs "$url" 2>/dev/null || true)"
     if [[ -n "$tags" ]] && grep -q '"models"' <<<"$tags"; then
@@ -258,7 +260,7 @@ detect_preexisting_hailoollama() {
         echo "$tags" | sed 's/^/    /' || true
         warn "This installer would have built a second server on port $HAILO_OLLAMA_PORT."
         log "The existing instance on :8000 will be left alone (not modified by this script)."
-        exit 0
+        exit 3
     fi
 }
 
