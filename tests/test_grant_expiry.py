@@ -84,7 +84,7 @@ class TestApprovePathWiresExpiry:
         # project_id binding or membership sync needed).
         rec = await auth_store.create(
             identity_claim="@expiry-agent", framework="openclaw",
-            requested_scopes=["memory_read"], requested_skills=None, reason="",
+            requested_scopes=["registry_feeds_read"], requested_skills=None, reason="",
             duration_secs=duration_secs, project_id=None,
         )
         monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
@@ -94,14 +94,14 @@ class TestApprovePathWiresExpiry:
 
         resp = await client.post(
             f"/api/agents/auth-requests/{rec['id']}/approve",
-            json={"granted_scopes": ["memory_read"]},
+            json={"granted_scopes": ["registry_feeds_read"]},
         )
         assert resp.status_code == 200, resp.text
         cid = resp.json()["canonical_id"]
 
         agent_grants = await grants.list_grants(cid)
-        scoped = [g for g in agent_grants if g["scope"] == "memory_read"]
-        assert len(scoped) == 1, f"expected one memory_read grant, got {agent_grants}"
+        scoped = [g for g in agent_grants if g["scope"] == "registry_feeds_read"]
+        assert len(scoped) == 1, f"expected one registry_feeds_read grant, got {agent_grants}"
         expiry = scoped[0].get("expires_at")
 
         await registry.close()
@@ -126,3 +126,93 @@ class TestApprovePathWiresExpiry:
     ):
         expiry = await self._approve(client, monkeypatch, tmp_path, None)
         assert expiry is None, "grant must stay unbounded when duration_secs is absent"
+
+
+class TestReusePathWiresExpiry:
+    """The third wiring site (jaylfc 2026-09-22 review): when an already-ACTIVE
+    agent's handle collides and the approval is project-scoped, the reuse/ADD
+    branch calls ``add_agent_to_project`` — which forwards ``expires_at`` into
+    the *second* project's grant. Deleting ``expires_at=expires_at`` from that
+    call leaves the rest of the suite green while this path silently reverts to
+    unbounded grants. This test is the red that catches that wiring."""
+
+    @pytest.mark.asyncio
+    async def test_reused_identity_second_project_keeps_expiry(
+        self, client, monkeypatch, tmp_path
+    ):
+        from tinyagentos.agent_registry_store import (
+            AgentRegistryStore,
+            load_or_create_signing_keypair,
+        )
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.agent_grants_store import AgentGrantsStore
+        from tinyagentos.projects.project_store import ProjectStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-rp.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-rp.db")
+        await auth_store.init()
+        grants = AgentGrantsStore(tmp_path / "grants-rp.db")
+        await grants.init()
+        pstore = ProjectStore(tmp_path / "projects-rp.db")
+        await pstore.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-rp")
+
+        pA = await pstore.create_project(name="A", slug="proj-a", created_by="u")
+        pB = await pstore.create_project(name="B", slug="proj-b", created_by="u")
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "agent_grants", grants)
+        monkeypatch.setattr(client._transport.app.state, "agent_registry_keypair", (priv, pub))
+        monkeypatch.setattr(client._transport.app.state, "project_store", pstore)
+
+        # Establish the active identity on project A (handle "taosmd-dev").
+        rA = await auth_store.create(
+            identity_claim="@taosmd-dev", framework="openclaw",
+            requested_scopes=["project_tasks"], requested_skills=None, reason="",
+            duration_secs=None, project_id=pA["id"],
+        )
+        respA = await client.post(
+            f"/api/agents/auth-requests/{rA['id']}/approve",
+            json={"granted_scopes": ["project_tasks"], "project_id": pA["id"]},
+        )
+        assert respA.status_code == 200, respA.text
+        cid = respA.json()["canonical_id"]
+
+        # Second request, same handle, project B, WITH a duration_secs. This must
+        # reuse the identity (no 409) and the project-B grant must carry a real
+        # future expiry — the exact wiring jaylfc's mutation test showed is
+        # otherwise unasserted.
+        rB = await auth_store.create(
+            identity_claim="@taosmd-dev", framework="openclaw",
+            requested_scopes=["project_tasks"], requested_skills=None, reason="",
+            duration_secs=3600, project_id=pB["id"],
+        )
+        respB = await client.post(
+            f"/api/agents/auth-requests/{rB['id']}/approve",
+            json={"granted_scopes": ["project_tasks"], "project_id": pB["id"]},
+        )
+        assert respB.status_code == 200, respB.text
+        assert respB.json()["canonical_id"] == cid
+
+        agent_grants = await grants.list_grants(cid)
+        prjB = [
+            g for g in agent_grants
+            if g.get("project_id") == pB["id"] and g["scope"] == "project_tasks"
+        ]
+        assert len(prjB) == 1, f"expected one project-B project_tasks grant, got {agent_grants}"
+        expiry = prjB[0].get("expires_at")
+        assert expiry is not None, (
+            "project-B grant must carry a future expiry when duration_secs was set "
+            "(expires_at dropped from the add_agent_to_project call?)"
+        )
+        parsed = _parse(expiry)
+        assert parsed.tzinfo is not None, "persisted expiry must be timezone-aware"
+        delta = parsed - datetime.now(timezone.utc)
+        assert timedelta(minutes=59) < delta <= timedelta(hours=1, minutes=1)
+
+        await registry.close()
+        await auth_store.close()
+        await grants.close()
+        await pstore.close()
