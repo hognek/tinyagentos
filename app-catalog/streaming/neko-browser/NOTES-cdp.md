@@ -28,7 +28,7 @@ not a publicly-exposed port.
 ## Image name
 
 ```
-ghcr.io/jaylfc/taos-neko-cdp:2.4.0
+ghcr.io/jaylfc/taos-neko-cdp@sha256:62125342dcd5cbed92340d98d3c0e94962fd5cd0acc6da31d34cc5dba38b72d3
 ```
 
 Architectures: `linux/arm64` (primary — RK3588), `linux/amd64` (x86 nodes).
@@ -46,7 +46,7 @@ Architectures: `linux/arm64` (primary — RK3588), `linux/amd64` (x86 nodes).
 ### Step 1 — pull the image
 
 ```bash
-docker pull ghcr.io/jaylfc/taos-neko-cdp:2.4.0
+docker pull ghcr.io/jaylfc/taos-neko-cdp@sha256:62125342dcd5cbed92340d98d3c0e94962fd5cd0acc6da31d34cc5dba38b72d3
 docker inspect ghcr.io/jaylfc/taos-neko-cdp:2.4.0 | grep -i arch
 # expect: "Architecture": "arm64"
 ```

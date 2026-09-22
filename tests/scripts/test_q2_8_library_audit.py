@@ -124,20 +124,29 @@ class TestAuditManifestsDrift:
 
 class TestFirstPartyTagNaming:
     def test_every_fp_tag_has_corresponding_workflow(self):
-        """Every FROM ghcr.io/jaylfc/... pin in app-catalog/ must name a tag
-        that the repo's own workflows actually publish, or be a @sha256: digest."""
+        """Check the repo's declared publish list, NOT the registry.
+
+        Every FROM ghcr.io/jaylfc/... pin in app-catalog/ must name a tag
+        that the repo's own workflows actually publish, or be a @sha256: digest.
+        A green here means the pin appears in the workflow YAML - it is NOT
+        proof the image resolves in the registry.
+        """
         import re
         from pathlib import Path
 
-        # Read all -t lines from workflows, extract the tag portion
-        workflow_tags = set()
+        # Read all -t lines from workflows, keyed by (image, tag)
+        workflow_image_tags = set()
         workflow_dir = Path(__file__).resolve().parent.parent.parent / ".github" / "workflows"
         for wf in workflow_dir.glob("*.yml"):
             content = wf.read_text()
             for line in content.splitlines():
                 m = re.search(r'-t\s+ghcr\.io/jaylfc/([^\s:]+):(.+?)\\?\s*$', line)
                 if m:
-                    workflow_tags.add(m.group(2).strip())
+                    image = m.group(1).strip()
+                    tag = m.group(2).strip()
+                    if tag.startswith("${"):
+                        continue
+                    workflow_image_tags.add((image, tag))
 
         # Find all FROM ghcr.io/jaylfc/... in app-catalog/
         app_catalog = Path(__file__).resolve().parent.parent.parent / "app-catalog"
@@ -145,15 +154,15 @@ class TestFirstPartyTagNaming:
         for df in app_catalog.rglob("Dockerfile*"):
             content = df.read_text()
             for line in content.splitlines():
-                m = re.match(r'FROM\s+ghcr\.io/jaylfc/([^\s:]+)(?::(.+))?', line)
+                m = re.match(r'FROM\s+ghcr\.io/jaylfc/([^\s@]+)(?:[@:](.+))?', line)
                 if m:
                     image_part = m.group(1)
                     tag_or_digest = m.group(2) or "latest"
                     # Check if it's a digest
                     if tag_or_digest.startswith("sha256:"):
-                        continue  # digest is always OK
-                    # Check if tag is in workflow tags
-                    if tag_or_digest not in workflow_tags:
+                        continue
+                    # Check if (image, tag) is in workflow tags
+                    if (image_part, tag_or_digest) not in workflow_image_tags:
                         bad_pins.append(f"{df}: {image_part}:{tag_or_digest}")
 
         assert not bad_pins, f"Pins not covered by workflow tags: {bad_pins}"
