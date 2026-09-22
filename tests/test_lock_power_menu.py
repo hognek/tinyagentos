@@ -22,6 +22,7 @@ for a log line so the phone did not reboot mid-session).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -1459,3 +1460,43 @@ class TestTheLockScreenCameraShortcut:
         Opening an app shares the channel, not the vocabulary."""
         assert len(auth._POWER_ACTIONS) == 5
         assert "app-camera" not in auth._POWER_ACTIONS
+
+
+class TestTheDropBoxDirectoryIsNeverCreatedHere:
+    """`atomic_io.atomic_write_text` mkdirs the parent. This one must not.
+
+    /run/taos-power is 0700 taos:taos by design, and taos-power-apply's trust
+    argument rests on exactly that: "the directory is 0700 owned by taos, so
+    that means the controller and root". A directory this process created
+    under the default umask would be 0755, widening that boundary silently --
+    the write would succeed, the demo would work, and the only evidence would
+    be the mode bits on a tmpfs directory nobody looks at.
+    """
+
+    def test_a_missing_drop_box_is_reported_rather_than_created(
+        self, monkeypatch, tmp_path
+    ):
+        box = tmp_path / "nope"
+        monkeypatch.setattr(auth, "_POWER_REQUEST", str(box / "request"))
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: True)
+
+        resp = _call(auth.lock_power_action(_Req({"action": "poweroff"})))
+
+        assert resp.status_code == 503
+        assert not box.exists(), (
+            "the drop box directory was created; on the device that is a 0755 "
+            "directory where a 0700 one is required"
+        )
+
+    def test_every_caller_goes_through_the_one_writer(self):
+        """Three routes drop verbs for root. They shared a fixed temp name
+        until @taOS-dev found it, so two near-simultaneous taps could let the
+        camera button turn Wi-Fi off. One writer is what stops that coming
+        back a fourth time."""
+        # The hand-rolled temp+replace is caught repo-wide by
+        # test_no_module_outside_atomic_io_hand_rolls_temp_plus_replace, which
+        # reads the AST rather than the text -- asserting on the source here
+        # tripped over the comment explaining the fix. This asserts the part
+        # that gate cannot see: that the three routes share ONE writer.
+        src = inspect.getsource(auth)
+        assert src.count("_write_power_request(") >= 4  # 1 def + 3 callers

@@ -32,6 +32,7 @@ from tinyagentos.auth import (
     is_console_origin,
     validate_pin,
 )
+from tinyagentos.atomic_io import atomic_write_text
 from tinyagentos.middleware.csrf import verify_csrf
 from tinyagentos.routes.onscreen_keyboard import OSK_SCRIPT, osk_assets
 
@@ -8530,6 +8531,29 @@ async def lock_radios(request: Request):
 
 
 #: Radio verbs the drop box will accept, mapped from what the page sends.
+def _write_power_request(verb: str) -> None:
+    """Drop a verb for the root helper, durably and in one place.
+
+    atomic_io gives what the hand-rolled temp+replace here did not: an fsync,
+    which matters on a verb that powers the machine off, and a RANDOM temp
+    name opened O_EXCL. All three callers used to share the fixed name
+    `<request>.part`, so two near-simultaneous taps could interleave and let
+    the camera button turn Wi-Fi off. (@taOS-dev, reviewing #3108.)
+
+    ⚠ IT WILL ALSO CREATE THE PARENT, AND THIS PARENT MUST NOT BE CREATED
+    HERE. /run/taos-power is 0700 taos:taos by design, and a directory this
+    process made under the default umask would be 0755 -- widening the single
+    boundary taos-power-apply's trust argument rests on ("the directory is
+    0700 owned by taos, so that means the controller and root"). A missing
+    drop box means the helper is not installed, which is worth saying out
+    loud rather than papering over: every caller already promised a 503.
+    """
+    parent = Path(_POWER_REQUEST).parent
+    if not parent.is_dir():
+        raise FileNotFoundError("drop box directory is missing: %s" % parent)
+    atomic_write_text(Path(_POWER_REQUEST), verb)
+
+
 _RADIO_VERBS = {
     ("wifi", True): "wifi-on",
     ("wifi", False): "wifi-off",
@@ -8563,10 +8587,7 @@ async def set_lock_radios(request: Request):
 
     verb = _RADIO_VERBS[(radio, want)]
     try:
-        tmp = _POWER_REQUEST + ".part"
-        with open(tmp, "w") as handle:
-            handle.write(verb)
-        os.replace(tmp, _POWER_REQUEST)
+        _write_power_request(verb)
     except OSError as exc:
         return JSONResponse(
             {"error": "request failed", "detail": str(exc)}, status_code=503
@@ -8920,13 +8941,10 @@ async def lock_power_action(request: Request):
 
     if action in ("poweroff", "reboot"):
         try:
-            # Written whole, then renamed: the watcher fires on the path
-            # EXISTING, so a partially written file could be read as a verb
-            # that was never finished.
-            tmp = _POWER_REQUEST + ".part"
-            with open(tmp, "w") as handle:
-                handle.write(action)
-            os.replace(tmp, _POWER_REQUEST)
+            # atomic_write_text: fires-on-existence is preserved, an fsync is
+            # gained on the verb that powers the machine off, and the shared
+            # fixed temp name is gone. See lock_app for the full reasoning.
+            _write_power_request(action)
         except OSError as exc:
             return JSONResponse(
                 {"error": "power request failed", "detail": str(exc)}, status_code=503
@@ -9040,13 +9058,14 @@ async def lock_app(request: Request):
     if verb is None:
         return JSONResponse({"error": "unknown app"}, status_code=400)
     try:
-        # Written whole, then renamed, for the reason the power path gives: the
-        # watcher fires on the path EXISTING, so a partial write could be read
-        # as a verb that was never finished.
-        tmp = _POWER_REQUEST + ".part"
-        with open(tmp, "w") as handle:
-            handle.write(verb)
-        os.replace(tmp, _POWER_REQUEST)
+        # atomic_write_text, not a hand-rolled temp+replace. The watcher fires
+        # on the path EXISTING, so a partial write could be read as a verb that
+        # was never finished -- and the helper also fsyncs, which matters on a
+        # verb that powers the machine off, and uses a RANDOM temp name with
+        # O_EXCL. All three writers here shared the fixed name
+        # `_POWER_REQUEST + ".part"`, so two near-simultaneous taps could let
+        # the camera button turn Wi-Fi off. (@taOS-dev, reviewing #3108.)
+        _write_power_request(verb)
     except OSError as exc:
         return JSONResponse(
             {"error": "launch failed", "detail": str(exc)}, status_code=503
