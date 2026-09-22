@@ -1000,7 +1000,8 @@ class AgentRegistryStore(BaseStore):
     async def revoke(self, canonical_id: str) -> Optional[dict]:
         """Transition *canonical_id* to 'revoked' via the state-transition guard.
 
-        Returns the updated record, or None if *canonical_id* does not exist.
+        Returns the updated record.
+        Raises ``KeyError`` if *canonical_id* does not exist.
         Raises ``ValueError`` if the transition is not allowed.
         """
         if self._db is None:
