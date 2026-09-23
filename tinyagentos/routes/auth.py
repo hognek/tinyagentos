@@ -7480,13 +7480,15 @@ async def lock_widgets(request: Request):
     # ones: it is part of the device rather than something the user added. It
     # carries the product mark rather than a monogram, and the harness badge
     # reflects the actual runtime adapter the agent goes through.
-    # Its "status" says WHERE it is, not that it is busy -- this endpoint runs
-    # pre-auth and has no cheap, truthful way to read the agent's activity.
+    # Its status reads "Idle" (Jay; it used to say "On device", i.e. WHERE it
+    # is). This endpoint runs pre-auth and has no cheap, truthful way to read
+    # the agent's activity, and "Idle" is also a resting status to the page,
+    # so the island draws at rest.
     agents.insert(0, {
         "name": "taOS Agent",
         "framework": system_agent_framework(request.app.state),
         "framework_icon": _framework_icon(system_agent_framework(request.app.state)),
-        "status": "On device",
+        "status": "Idle",
         "avatar": "/static/taos-logo.png",
         "system": True,
     })
