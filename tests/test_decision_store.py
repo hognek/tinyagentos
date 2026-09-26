@@ -210,6 +210,7 @@ async def test_notes_table_created_on_existing_db(tmp_path):
     assert updated is not None
     assert len(updated["notes"]) == 1
     assert updated["notes"][0]["text"] == "hello"
+@pytest.mark.asyncio
 async def test_find_by_metadata_exact_match(store):
     """find_by_metadata returns only decisions whose metadata[key] == value."""
     await store.create(
