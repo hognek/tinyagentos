@@ -9860,9 +9860,13 @@ async def lock_charge(request: Request):
     body: the watcher only knows a plug event happened, and a pre-auth route
     that relayed a caller's percentage would be a way to paint any number on
     the phone.
+
+    Gated like every lock-* POST (_lock_post_refusal): loopback AND non-simple.
+    The session watcher sends LOCK_CONSOLE_HEADER.
     """
-    if not _request_is_console(request):
-        return JSONResponse({"error": "console only"}, status_code=403)
+    refusal = _lock_post_refusal(request)
+    if refusal is not None:
+        return refusal
     try:
         body = await request.json()
     except Exception:

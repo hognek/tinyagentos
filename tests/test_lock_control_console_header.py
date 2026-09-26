@@ -52,6 +52,7 @@ LOCK_POSTS = [
     ("/auth/lock-power-action", {"action": "reboot"}),
     ("/auth/lock-power-action", {"action": "stop-agents"}),
     ("/auth/lock-app", {"app": "camera"}),
+    ("/auth/lock-charge", {"screen": "on"}),
 ]
 
 
@@ -189,6 +190,33 @@ class TestTheConsoleHeaderIsAccepted:
         """What the page's fetch() already sends. A no-cors request cannot."""
         resp = await console.post("/auth/lock-screen-off", json={})
         assert resp.status_code == 200, resp.text
+
+    @pytest.mark.asyncio
+    async def test_charge_simple_post_refused_then_header_plays(self, console):
+        """The session watcher's charger POST: a no-cors-shaped request is
+        refused and reaches no page; the same body with the console header
+        plays the animation (204) and pushes exactly one charger event."""
+        import asyncio
+
+        queue: asyncio.Queue = asyncio.Queue(maxsize=8)
+        auth_routes._LOCK_EVENT_WAITERS.add(queue)
+        try:
+            resp = await console.post(
+                "/auth/lock-charge", content='{"screen":"on"}',
+                headers={"Content-Type": "text/plain"},
+            )
+            assert resp.status_code == 403, resp.text
+            assert queue.empty(), "a refused charge POST reached the page"
+
+            resp = await console.post(
+                "/auth/lock-charge", content='{"screen":"on"}',
+                headers={**CONSOLE_HEADER, "Content-Type": "text/plain"},
+            )
+            assert resp.status_code == 204, resp.text
+            kind, data = queue.get_nowait()
+            assert kind == "charger" and data["screen"] == "on"
+        finally:
+            auth_routes._LOCK_EVENT_WAITERS.discard(queue)
 
     @pytest.mark.asyncio
     async def test_poweroff_reaches_the_drop_box(self, console, tmp_path):

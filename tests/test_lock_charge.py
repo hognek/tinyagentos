@@ -30,9 +30,13 @@ from test_lock_screen_repaint import _var
 
 
 class _Req:
-    def __init__(self, body=None, raw_error=False):
+    """A console request as the session watcher sends it: the M5 console header
+    (see auth._lock_post_refusal) plus a JSON body."""
+
+    def __init__(self, body=None, raw_error=False, headers=None):
         self._body = body
         self._raw_error = raw_error
+        self.headers = {auth.LOCK_CONSOLE_HEADER: "1"} if headers is None else headers
 
     async def json(self):
         if self._raw_error:
@@ -71,6 +75,20 @@ class TestTheRouteRefusesWhatItShould:
         queue = _listen()
         try:
             resp = _call(auth.lock_charge(_Req({"screen": "on"})))
+            assert resp.status_code == 403
+            assert queue.empty(), "a refused request must not reach the page"
+        finally:
+            auth._LOCK_EVENT_WAITERS.clear()
+
+    def test_a_simple_request_is_refused_and_pushes_nothing(self, monkeypatch):
+        """M5: loopback alone is not enough. No console header and no JSON
+        content type is what a no-cors fetch sends -- refused before the body
+        is read."""
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: True)
+        queue = _listen()
+        try:
+            req = _Req({"screen": "on"}, headers={"content-type": "text/plain"})
+            resp = _call(auth.lock_charge(req))
             assert resp.status_code == 403
             assert queue.empty(), "a refused request must not reach the page"
         finally:
