@@ -1135,7 +1135,14 @@ class TestPerAgentUsageInTheStatsPanel:
         assert first["storage_mb"] == again["storage_mb"]
 
     def test_different_agents_get_different_baselines(self, monkeypatch):
-        """Otherwise six identical rows, which reads as a rendering bug."""
+        """Otherwise six identical rows, which reads as a rendering bug.
+
+        The clock is pinned: the readings wander over time, and at ~1% of
+        instants two of these four happen to cross on the same whole MB, which
+        made this flaky on the wall clock. Different BASELINES is the claim, so
+        one fixed instant is the fair test of it."""
+        clock = [1_700_000_000.0]
+        monkeypatch.setattr(auth.time, "time", lambda: clock[0])
         monkeypatch.setenv("TAOS_LOCK_DEMO_AGENTS", "Ann:x,Bob:y,Cal:z,Dee:w")
         rams = [r["ram_mb"] for r in auth._demo_agent_usage(_DEMO_REQ)]
         assert len(set(rams)) == len(rams), rams
