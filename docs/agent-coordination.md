@@ -691,6 +691,13 @@ A bool, string, float, zero, negative or over-ten-years value is refused with
 **422** at request time. The rule is: a grant with no duration is unbounded,
 and a bound that is set is never silently dropped or lengthened.
 
+Deferred binding (`defer_binding=True`) mints the token and grants UNBOUND
+(project_id=None) with the same `expires_at` from `duration_secs`. When the
+agent is later bound to a project via `POST /api/projects/{id}/members/assign-agent`,
+the project-bound grant **inherits that `expires_at`**. If the deferred grant
+has expired, the binding is refused. When both a deferred grant with expiry and
+a request with expiry exist, the earlier bound is kept (never lengthened).
+
 Multi-project identities (taOS #1862): one agent identity (the registry JWT) may
 belong to several projects at once. The grants table keys a grant on
 `(canonical_id, scope, project_id)`, so the same scope can be held for multiple

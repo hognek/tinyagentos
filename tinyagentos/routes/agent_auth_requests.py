@@ -1050,6 +1050,12 @@ async def add_agent_to_project(
     timezone-aware ISO timestamp for a time-boxed grant (the consent approve
     path passes ``now + duration_secs``), or ``None`` for an unbounded grant.
 
+    When adding an agent to a project, this function checks for existing
+    deferred grants (project_id=None) with an expires_at. If found:
+    - It inherits that expires_at for the new project-bound grant
+    - It refuses the binding if the deferred grant has expired (4xx, no grant row written)
+    - Never lengthens: if both a stored bound and a request bound exist, keeps the earlier one
+
     Returns ``{"canonical_id": ..., "project_id": ..., "granted_scopes": ...}``
     plus, when reconciling, ``revoked_scopes`` and ``active_scopes`` (read back
     from the store, so the response cannot claim a revocation that did not
@@ -1057,6 +1063,45 @@ async def add_agent_to_project(
     """
     grants_store = _get_grants_store(request)
     rel_mgr = _get_relationships(request)
+
+    # Check for existing deferred grants (project_id=None) with expires_at
+    deferred_grants = await grants_store.list_grants(canonical_id)
+    deferred_grant_with_expiry = None
+    now = datetime.now(timezone.utc).isoformat()
+    
+    for grant in deferred_grants:
+        if grant.get("project_id") is None and grant.get("expires_at"):
+            deferred_grant_with_expiry = grant
+            break
+    
+    # Determine the expires_at to use:
+    # 1. Use the deferred grant's expiry if it exists and is not expired
+    # 2. Otherwise, use the expires_at parameter passed to this function
+    # 3. Never lengthen: if both deferred and request expiry exist, use the earlier one
+    target_expires_at = expires_at
+    
+    if deferred_grant_with_expiry:
+        deferred_expires_at = deferred_grant_with_expiry["expires_at"]
+        # Parse both times for comparison
+        deferred_dt = datetime.fromisoformat(deferred_expires_at)
+        now_dt = datetime.fromisoformat(now)
+        if deferred_dt <= now_dt:
+            # Deferred grant has expired - refuse the binding
+            raise HTTPException(
+                status_code=400,
+                detail=f"cannot bind agent {canonical_id} to project {project_id}: "
+                       f"the agent's deferred grant expired at {deferred_expires_at}",
+            )
+        elif target_expires_at is None:
+            # Only deferred grant has expiry - inherit it
+            target_expires_at = deferred_expires_at
+        elif target_expires_at < deferred_expires_at:
+            # Request expires earlier than deferred - keep the earlier (request) bound
+            pass
+        else:
+            # Request expires later than or at same time as deferred - keep the earlier (deferred) bound
+            # This follows "never lengthen" rule: keep the earlier bound, not the later one
+            target_expires_at = deferred_expires_at
 
     # Revoke BEFORE adding: the project's grant set becomes exactly
     # ``granted_scopes``. A grant this call does not name is one the operator
@@ -1105,7 +1150,7 @@ async def add_agent_to_project(
     # Write the grants bound to this project and the relationship edge.
     for scope in granted_scopes:
         await grants_store.add_grant(
-            canonical_id, scope, tier="once", project_id=project_id, expires_at=expires_at
+            canonical_id, scope, tier="once", project_id=project_id, expires_at=target_expires_at
         )
         await rel_mgr.set_permission(canonical_id, "taos-instance", scope)
 
