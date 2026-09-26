@@ -564,7 +564,7 @@ async def create_auth_request(request: Request, body: CreateAuthRequest):
             scopes = record["requested_scopes"] or []
             await notifs.add(
                 title="Access request",
-                message=f"{record['identity_claim']} is requesting {', '.join(scopes)}",
+                message=f"{record['identity_claim']} is requesting {', '.join(scopes)}{' ' + _human_duration(record.get('duration_secs')) if record.get('duration_secs') else ''}",
                 level="info",
                 source="auth_requests",
                 data={
@@ -579,6 +579,8 @@ async def create_auth_request(request: Request, body: CreateAuthRequest):
                     # blank and the approver cannot tell what they are consenting
                     # to (#tsk-flc5sp).
                     "project_id": record.get("project_id"),
+                    "duration_secs": record.get("duration_secs"),
+                    "human_duration": _human_duration(record.get("duration_secs")),
                 },
             )
         except Exception:
@@ -601,6 +603,9 @@ async def get_auth_request_status(request: Request, request_id: str):
         raise HTTPException(status_code=404, detail="request not found")
 
     result: dict = {"status": record["status"]}
+    # Add duration and human-readable duration to the response
+    result["duration_secs"] = record.get("duration_secs")
+    result["human_duration"] = _human_duration(record.get("duration_secs"))
     if record["status"] == "accepted":
         result["canonical_id"] = record["canonical_id"]
         result["token"] = record["token"]
@@ -648,6 +653,33 @@ async def approve_auth_request(
                 locks.pop(request_id, None)
 
 
+def _human_duration(duration_secs: object) -> str:
+    """Format duration_secs to a human-readable string for UI display.
+
+    Returns:
+    - "expires in {X} hours" for 3+ hours OR when it's an exact multiple of hours
+    - "expires in {X} minutes" for 1-2 hours OR when it's less than 3 hours but >= 60 minutes
+    - "expires in {X} seconds" for < 1 minute
+    - "no expiry" when duration_secs is None, zero, or invalid
+    """
+    if type(duration_secs) is int and duration_secs > 0:
+        # Use hours for full hours (e.g., 3600 seconds = 1 hour, 7200 seconds = 2 hours)
+        if duration_secs >= 60 and duration_secs % 3600 == 0:
+            hours = duration_secs // 3600
+            return f"expires in {hours} hour{'s' if hours != 1 else ''}"
+        # Use minutes for durations between 1-2 hours
+        elif duration_secs >= 60 and duration_secs < 7200:
+            minutes = duration_secs // 60
+            return f"expires in {minutes} minute{'s' if minutes != 1 else ''}"
+        # Use hours for durations 3+ hours
+        elif duration_secs >= 3 * 3600:
+            hours = duration_secs // 3600
+            return f"expires in {hours} hour{'s' if hours != 1 else ''}"
+        # Use minutes for durations < 3 hours but >= 60 minutes
+        else:
+            minutes = duration_secs // 60
+            return f"expires in {minutes} minute{'s' if minutes != 1 else ''}"
+    return "no expiry"
 def _expires_at_from_duration(duration_secs: object) -> str | None:
     """Map a scope request's ``duration_secs`` to a grant expiry timestamp.
 
@@ -1463,7 +1495,7 @@ async def _do_approve(request: Request, request_id: str, body: ApproveBody, user
             detail="defer_binding cannot be combined with an explicit project_id",
         )
 
-    return await approve_request_record(
+    approval_result = await approve_request_record(
         request,
         record=record,
         granted_scopes=body.granted_scopes,
@@ -1472,6 +1504,14 @@ async def _do_approve(request: Request, request_id: str, body: ApproveBody, user
         project_id=body.project_id,
         defer_binding=body.defer_binding,
     )
+
+    # Attach duration information to the approval result.
+    approval_result.update({
+        "duration_secs": record.get("duration_secs"),
+        "human_duration": _human_duration(record.get("duration_secs")),
+    })
+
+    return approval_result
 
 
 @router.post("/api/agents/auth-requests/{request_id}/deny")
@@ -1535,6 +1575,12 @@ async def list_auth_requests(
 
     store = _get_auth_requests_store(request)
     pending = await store.list_pending()
+    # Add duration and human-readable duration to each request in the list
+    for req in pending:
+        req.update({
+            "duration_secs": req.get("duration_secs"),
+            "human_duration": _human_duration(req.get("duration_secs")),
+        })
     return {"requests": pending}
 
 
