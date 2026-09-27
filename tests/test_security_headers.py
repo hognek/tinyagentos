@@ -1,7 +1,7 @@
 """Tests for SecurityHeadersMiddleware (#655)."""
 from __future__ import annotations
 
-import re
+from html.parser import HTMLParser
 from pathlib import Path
 from unittest.mock import patch
 
@@ -79,8 +79,33 @@ _DESKTOP_DIR = Path(__file__).resolve().parents[1] / "desktop"
 # blocked by the browser and its code silently stops running.
 _SPA_HTML_FILES = ("index.html", "chat.html", "app.html")
 
-_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
-_SCRIPT_OPEN_TAG_RE = re.compile(r"<script\b[^>]*>", re.I)
+
+class _ScriptTagCollector(HTMLParser):
+    """Collect the attributes of every <script> start tag in a document.
+
+    Parsing beats a regex here: a ``<script>`` tag whose attribute value contains
+    a ``>`` (e.g. ``<script data-x="a>b">``) is mis-split by a naive
+    ``<script\\b[^>]*>`` pattern, and a substring check for ``src=`` is satisfied
+    by an unrelated attribute such as ``data-src``. HTMLParser also skips HTML
+    comments and script bodies for free, so neither commented-out markup nor JS
+    containing ``<`` can fool the check.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.scripts: list[dict[str, str | None]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() == "script":
+            self.scripts.append({name.lower(): value for name, value in attrs})
+
+
+def _script_tags(html: str) -> list[dict[str, str | None]]:
+    """Return the attributes of every <script> start tag in ``html``."""
+    parser = _ScriptTagCollector()
+    parser.feed(html)
+    parser.close()
+    return parser.scripts
 
 
 class TestSpaShellCspCompatibility:
@@ -96,16 +121,24 @@ class TestSpaShellCspCompatibility:
 
     @pytest.mark.parametrize("name", _SPA_HTML_FILES)
     def test_spa_html_has_no_inline_scripts(self, name):
-        html = _HTML_COMMENT_RE.sub("", (_DESKTOP_DIR / name).read_text(encoding="utf-8"))
-        for tag in _SCRIPT_OPEN_TAG_RE.findall(html):
-            assert "src=" in tag.lower(), (
-                f"desktop/{name}: inline {tag!r} is blocked by the CSP "
+        for attrs in _script_tags((_DESKTOP_DIR / name).read_text(encoding="utf-8")):
+            assert attrs.get("src"), (
+                f"desktop/{name}: inline <script> is blocked by the CSP "
                 f"(script-src 'self') — move the code to an external file"
             )
 
     def test_prepaint_boot_script_is_external_and_present(self):
-        html = _HTML_COMMENT_RE.sub("", (_DESKTOP_DIR / "index.html").read_text(encoding="utf-8"))
-        assert '<script src="/boot.js"></script>' in html
+        srcs = [
+            attrs["src"]
+            for attrs in _script_tags((_DESKTOP_DIR / "index.html").read_text(encoding="utf-8"))
+            if attrs.get("src")
+        ]
+        assert "/boot.js" in srcs, (
+            "desktop/index.html must load the pre-paint script from /boot.js — "
+            "Vite's public-dir convention; `base: '/desktop/'` rewrites it to "
+            "/desktop/boot.js in the build. Found scripts: "
+            f"{srcs!r}"
+        )
         boot = _DESKTOP_DIR / "public" / "boot.js"
         assert boot.is_file(), "desktop/public/boot.js must exist (copied to the build root)"
         assert "data-perf" in boot.read_text(encoding="utf-8")
