@@ -123,11 +123,14 @@ export function modelIconKind(model: string): ModelIconKind {
 export function formatDuration(ms: number | null | undefined): string {
   if (ms === null || ms === undefined || Number.isNaN(ms)) return "";
   if (ms < 1000) return `${Math.round(ms)} ms`;
-  const totalSeconds = ms / 1000;
-  if (totalSeconds < 60) return `${totalSeconds.toFixed(totalSeconds < 10 ? 1 : 0)} s`;
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = Math.round(totalSeconds - minutes * 60);
-  return `${minutes}m ${seconds}s`;
+  // Round to whole seconds FIRST, then split: rounding the remainder after
+  // splitting yields "59m 60s" for 59500-59999 ms.
+  const totalSeconds = Math.round(ms / 1000);
+  if (totalSeconds < 60) {
+    const seconds = ms / 1000;
+    return `${seconds < 10 ? seconds.toFixed(1) : Math.round(seconds)} s`;
+  }
+  return `${Math.floor(totalSeconds / 60)}m ${totalSeconds % 60}s`;
 }
 
 export function formatTokens(ev: ModelActivityEvent): string {

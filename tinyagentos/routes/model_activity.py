@@ -4,19 +4,21 @@
 ``GET /api/activity/models/stream`` SSE stream of model-level events
 
 Both are session-only: they expose which models the controller is loading and
-who is calling them, so an unauthenticated request is rejected (the SSE path is
-NOT in ``auth_middleware.EXEMPT_PATHS``; the handler re-checks ``user_id`` so a
-middleware bypass produces a clear 401 rather than an open stream).
+who is calling them, so both require the ``get_current_user`` session dependency
+(neither path is in ``auth_middleware.EXEMPT_PATHS``). A local/admin bearer
+token, which the middleware would otherwise let through with a ``user_id``, is
+NOT sufficient here.
 
 Filters (``model`` / ``worker`` / ``event``) apply to the history snapshot and
-to the live SSE frames alike.
+to the live SSE frames alike; an unknown ``event`` is a 400 rather than a
+silently empty feed.
 """
 from __future__ import annotations
 
 import asyncio
 import json
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from tinyagentos.auth import get_current_user
@@ -33,6 +35,43 @@ _KEEPALIVE_SECONDS = 10.0
 
 def _feed(request: Request):
     return getattr(request.app.state, "model_activity", None)
+
+
+def _validated_event(event: str | None) -> str | None:
+    """Reject an unknown ``event`` filter instead of answering with nothing.
+
+    A typo'd filter that silently returns an empty feed reads as "no activity
+    happened", which is the wrong conclusion to hand a caller. Same posture as
+    the a2a bus, which 400s unknown query parameters so an ignored filter can
+    never look like a working one.
+    """
+    if event is not None and event not in EVENT_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"unknown event type {event!r}; expected one of: "
+                f"{', '.join(EVENT_TYPES)}"
+            ),
+        )
+    return event
+
+
+def _resume_seq(request: Request) -> int | None:
+    """The last ``seq`` the client saw, from the SSE ``Last-Event-ID`` header.
+
+    Browsers send this automatically on ``EventSource`` reconnect, so a client
+    that drops for a moment is caught up from the ring instead of silently
+    missing everything recorded during the gap. A malformed header is treated
+    as "no resume" rather than an error: the worst case is the pre-existing
+    behaviour (start from the current window).
+    """
+    raw = request.headers.get("last-event-id")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _matches(
@@ -65,6 +104,7 @@ async def model_activity_history(
     _user: dict = Depends(get_current_user),
 ):
     """Recent model-level events, newest first."""
+    event = _validated_event(event)
     feed = _feed(request)
     if feed is None:
         return {"events": [], "count": 0, "event_types": list(EVENT_TYPES)}
@@ -83,27 +123,42 @@ async def model_activity_stream(
     model: str | None = None,
     worker: str | None = None,
     event: str | None = None,
+    _user: dict = Depends(get_current_user),
 ):
     """SSE stream of model-level events.
 
     A new subscriber is first sent the current ring-buffer window (oldest of
     that window first) and then every live event matching the filters.
     Keepalives go out every 10 s so proxies don't drop the connection.
+
+    Reconnect: frames carry ``id: <seq>``, so a browser's ``EventSource`` sends
+    ``Last-Event-ID`` on reconnect and the events recorded during the gap are
+    replayed from the ring (still filtered). That is why the id is the event's
+    monotonic ``seq`` rather than a per-connection counter.
     """
-    user_id = getattr(request.state, "user_id", None)
-    if not user_id:
-        return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+    event = _validated_event(event)
 
     feed = _feed(request)
     if feed is None:
         return JSONResponse({"detail": "Service starting"}, status_code=503)
 
+    resume_seq = _resume_seq(request)
+
     # Subscribe BEFORE snapshotting so no event can slip between the two; the
     # snapshot's highest seq is the dedupe watermark for the live queue.
     queue = feed.subscribe()
-    replay = list(reversed(feed.snapshot(limit=limit, model=model, worker=worker, event=event)))
+    # On a resume the whole ring is eligible (the gap may exceed `limit`);
+    # otherwise `limit` bounds the initial catch-up window.
+    replay = list(reversed(feed.snapshot(
+        limit=feed.maxlen if resume_seq is not None else limit,
+        model=model,
+        worker=worker,
+        event=event,
+    )))
+    if resume_seq is not None:
+        replay = [ev for ev in replay if ev.seq > resume_seq]
     # Mutable cell: gen() reassigns it, so a closure-local would read unbound.
-    state = {"watermark": replay[-1].seq if replay else 0}
+    state = {"watermark": max(resume_seq or 0, replay[-1].seq if replay else 0)}
 
     async def gen():
         try:

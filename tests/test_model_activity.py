@@ -329,6 +329,50 @@ async def test_failover_records_a_route_change():
     assert routes[0].detail["previous_backend"] == "down-backend"
 
 
+@respx.mock
+async def test_stream_completion_records_finish_with_tokens():
+    feed = ModelActivityFeed()
+    state = _fake_state(feed)
+    sse = (
+        b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        b'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+    respx.post(_NPU_URL).mock(return_value=httpx.Response(200, content=sse))
+
+    from tinyagentos.llm_gateway.forward import _event_stream_for_route
+
+    gen = _event_stream_for_route(_route("test-backend", "http://npu.test/v1"), _chat_body(), "agent-a", state)
+    chunks = [chunk async for chunk in gen]
+
+    assert any(b"hi" in c for c in chunks)
+    finishes = [e for e in feed.snapshot() if e.event == REQUEST_FINISH]
+    assert len(finishes) == 1
+    assert finishes[0].reason is None
+    assert finishes[0].tokens_in == 5
+    assert finishes[0].tokens_out == 2
+
+
+@respx.mock
+async def test_stream_abort_still_records_a_finish():
+    """A client disconnect must not leave an orphan request.start."""
+    feed = ModelActivityFeed()
+    state = _fake_state(feed)
+    sse = b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+    respx.post(_NPU_URL).mock(return_value=httpx.Response(200, content=sse))
+
+    from tinyagentos.llm_gateway.forward import _event_stream_for_route
+
+    gen = _event_stream_for_route(_route("test-backend", "http://npu.test/v1"), _chat_body(), "agent-a", state)
+    first = await gen.__anext__()
+    assert b"hi" in first
+    await gen.aclose()
+
+    events = feed.snapshot()
+    assert [e.event for e in events] == [REQUEST_FINISH, REQUEST_START]
+    assert events[0].reason == "aborted"
+
+
 async def test_feed_is_optional_for_the_gateway():
     """No app.state.model_activity (e.g. flag off): a request still succeeds."""
     state = SimpleNamespace(trace_registry=None, data_dir=None, secrets=None)
@@ -342,9 +386,13 @@ async def test_feed_is_optional_for_the_gateway():
 # (b) SSE endpoint -> subscriber
 # ---------------------------------------------------------------------------
 
-def _sse_request(feed: ModelActivityFeed, user_id: str | None = "user-1") -> MagicMock:
+def _sse_request(
+    feed: ModelActivityFeed | None,
+    *,
+    headers: dict | None = None,
+) -> MagicMock:
     req = MagicMock()
-    req.state.user_id = user_id
+    req.headers = headers or {}
     req.app.state.model_activity = feed
 
     async def _not_disconnected() -> bool:
@@ -352,6 +400,10 @@ def _sse_request(feed: ModelActivityFeed, user_id: str | None = "user-1") -> Mag
 
     req.is_disconnected = _not_disconnected
     return req
+
+
+#: The stream requires the session dependency; direct handler calls pass it in.
+_USER = {"id": "user-1"}
 
 
 def _parse_frame(chunk: bytes | str) -> dict:
@@ -366,7 +418,7 @@ async def test_stream_replays_recorded_events_oldest_first():
     feed.record(MODEL_LOAD, model="first")
     feed.record(MODEL_UNLOAD, model="second")
 
-    resp = await model_activity_stream(_sse_request(feed), limit=50, model=None, worker=None, event=None)
+    resp = await model_activity_stream(_sse_request(feed), limit=50, model=None, worker=None, event=None, _user=_USER)
     it = resp.body_iterator
     try:
         first = _parse_frame(await asyncio.wait_for(it.__anext__(), timeout=5))
@@ -381,7 +433,7 @@ async def test_stream_replays_recorded_events_oldest_first():
 async def test_stream_pushes_a_live_event_to_its_subscriber():
     """The card's (b): a recorded event reaches a connected subscriber."""
     feed = ModelActivityFeed()
-    resp = await model_activity_stream(_sse_request(feed), limit=50, model=None, worker=None, event=None)
+    resp = await model_activity_stream(_sse_request(feed), limit=50, model=None, worker=None, event=None, _user=_USER)
     it = resp.body_iterator
 
     async def _emit() -> None:
@@ -406,7 +458,7 @@ async def test_stream_pushes_a_live_event_to_its_subscriber():
 async def test_stream_applies_filters_to_live_events():
     feed = ModelActivityFeed()
     resp = await model_activity_stream(
-        _sse_request(feed), limit=50, model=None, worker="pi-4", event=None,
+        _sse_request(feed), limit=50, model=None, worker="pi-4", event=None, _user=_USER,
     )
     it = resp.body_iterator
 
@@ -428,18 +480,80 @@ async def test_stream_applies_filters_to_live_events():
     assert ev["worker"] == "pi-4"
 
 
-async def test_stream_requires_auth():
-    feed = ModelActivityFeed()
-    resp = await model_activity_stream(_sse_request(feed, user_id=None), limit=50)
+async def test_stream_requires_a_session(app, feed):
+    """Session-only: no cookie means 401 from the dependency, not an open
+    stream. A local/admin bearer token is not accepted here either."""
+    from httpx import ASGITransport, AsyncClient
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as no_auth:
+        resp = await no_auth.get("/api/activity/models/stream")
     assert resp.status_code == 401
 
 
 async def test_stream_without_a_feed_reports_service_starting():
-    req = MagicMock()
-    req.state.user_id = "user-1"
+    req = _sse_request(None)
     req.app.state.model_activity = None
-    resp = await model_activity_stream(req, limit=50)
+    resp = await model_activity_stream(req, limit=50, _user=_USER)
     assert resp.status_code == 503
+
+
+async def test_stream_resumes_from_last_event_id():
+    """A reconnect replays only the events newer than the client's last seq."""
+    feed = ModelActivityFeed()
+    for i in range(1, 4):
+        feed.record(MODEL_LOAD, model=f"m{i}")
+
+    resp = await model_activity_stream(
+        _sse_request(feed, headers={"last-event-id": "2"}),
+        limit=50, model=None, worker=None, event=None, _user=_USER,
+    )
+    it = resp.body_iterator
+    try:
+        resumed = _parse_frame(await asyncio.wait_for(it.__anext__(), timeout=5))
+    finally:
+        await it.aclose()
+
+    assert resumed["seq"] == 3
+    assert resumed["model"] == "m3"
+
+
+async def test_stream_resume_ignores_the_catch_up_limit():
+    """The gap can exceed `limit`; a resume must still see the whole ring."""
+    feed = ModelActivityFeed()
+    for i in range(1, 4):
+        feed.record(MODEL_LOAD, model=f"m{i}")
+
+    resp = await model_activity_stream(
+        _sse_request(feed, headers={"last-event-id": "1"}),
+        limit=0, model=None, worker=None, event=None, _user=_USER,
+    )
+    it = resp.body_iterator
+    try:
+        seqs = []
+        for _ in range(2):
+            seqs.append(_parse_frame(await asyncio.wait_for(it.__anext__(), timeout=5))["seq"])
+    finally:
+        await it.aclose()
+
+    assert seqs == [2, 3]
+
+
+async def test_stream_treats_a_malformed_last_event_id_as_no_resume():
+    feed = ModelActivityFeed()
+    feed.record(MODEL_LOAD, model="only")
+
+    resp = await model_activity_stream(
+        _sse_request(feed, headers={"last-event-id": "not-a-number"}),
+        limit=50, model=None, worker=None, event=None, _user=_USER,
+    )
+    it = resp.body_iterator
+    try:
+        first = _parse_frame(await asyncio.wait_for(it.__anext__(), timeout=5))
+    finally:
+        await it.aclose()
+
+    assert first["model"] == "only"
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +607,34 @@ async def test_sse_stream_route_is_registered(app):
     paths = {getattr(r, "path", None) for r in app.routes}
     assert "/api/activity/models/stream" in paths
     assert "/api/activity/models" in paths
+
+
+async def test_history_endpoint_rejects_an_unknown_event_filter(client, feed):
+    """A typo'd filter must not read as "nothing happened"."""
+    resp = await client.get("/api/activity/models", params={"event": "model.explode"})
+    assert resp.status_code == 400
+    assert "model.explode" in resp.json()["detail"]
+
+
+async def test_stream_rejects_an_unknown_event_filter():
+    from fastapi import HTTPException
+
+    feed = ModelActivityFeed()
+    with pytest.raises(HTTPException) as excinfo:
+        await model_activity_stream(_sse_request(feed), limit=50, event="nope", _user=_USER)
+    assert excinfo.value.status_code == 400
+
+
+async def test_to_dict_hands_out_a_copy_of_detail():
+    """The record is frozen; a caller mutating the serialised dict must not
+    reach back into the stored event."""
+    feed = ModelActivityFeed()
+    feed.record(MODEL_LOAD, model="a", detail={"tp_mode": "all"})
+
+    payload = feed.snapshot()[0].to_dict()
+    payload["detail"]["tp_mode"] = "mutated"
+
+    assert feed.snapshot()[0].detail == {"tp_mode": "all"}
 
 
 async def test_app_lifespan_attaches_the_feed(app):

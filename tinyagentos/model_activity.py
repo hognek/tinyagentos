@@ -100,7 +100,9 @@ class ModelActivityEvent:
             "tokens_out": self.tokens_out,
             "token_rate": self.token_rate,
             "reason": self.reason,
-            "detail": self.detail,
+            # Copy: this record is frozen, and a caller mutating the returned
+            # dict must not be able to reach back into it.
+            "detail": dict(self.detail),
         }
 
 
