@@ -42,6 +42,20 @@ def _hardware(gpu_type=None, npu_type=None):
     )
 
 
+@pytest.fixture(autouse=True)
+def _pin_metal_probe_off(monkeypatch):
+    """Keep these tests independent of the host they run on.
+
+    ``build_scheduler`` consults ``metal_available()`` when the synthetic
+    hardware profile names no GPU type, so on an Apple Silicon dev box every
+    NVIDIA/AMD expectation here would otherwise register ``gpu-metal``. The
+    Metal tests re-patch it to True themselves.
+    """
+    monkeypatch.setattr(
+        "tinyagentos.scheduler.discovery.metal_available", lambda: False
+    )
+
+
 class TestBuildScheduler:
     def test_cpu_always_registered(self, monkeypatch):
         monkeypatch.setattr(
@@ -181,6 +195,10 @@ class TestBuildScheduler:
         assert "gpu-cuda-0" not in resources
 
     def test_gpu_apple_metal_platform(self, monkeypatch):
+        """An Apple Silicon GPU is registered under its own resource class —
+        `gpu-metal` (docs/design/resource-scheduler.md) — never the
+        CUDA-indexed name, which would misname lease ids and worker
+        inventories on a Mac."""
         monkeypatch.setattr(
             "tinyagentos.scheduler.discovery._physical_cores", lambda: 8
         )
@@ -194,9 +212,50 @@ class TestBuildScheduler:
         sched = build_scheduler(hw, catalog)
 
         resources = {r.name: r for r in sched._resources.values()}
-        gpu = resources["gpu-cuda-0"]
+        assert "gpu-cuda-0" not in resources
+        gpu = resources["gpu-metal"]
         assert gpu.signature.platform == "metal"
         assert gpu.signature.runtime == "native"
+        assert gpu.tier == Tier.GPU
+
+    def test_gpu_metal_registered_on_metal_availability_alone(self, monkeypatch):
+        """A Mac whose hardware probe did not identify the GPU still gets the
+        gpu-metal resource: Metal availability is the fallback signal."""
+        monkeypatch.setattr(
+            "tinyagentos.scheduler.discovery._physical_cores", lambda: 8
+        )
+        monkeypatch.setattr(
+            "tinyagentos.scheduler.discovery.metal_available", lambda: True
+        )
+
+        catalog = _make_catalog([])
+        hw = _hardware()  # probe reported no GPU type
+
+        sched = build_scheduler(hw, catalog)
+
+        resources = {r.name: r for r in sched._resources.values()}
+        assert resources["gpu-metal"].signature.platform == "metal"
+
+    def test_non_metal_gpu_keeps_the_cuda_indexed_name(self, monkeypatch):
+        """NVIDIA/AMD hosts are unaffected by the Apple path."""
+        monkeypatch.setattr(
+            "tinyagentos.scheduler.discovery._physical_cores", lambda: 8
+        )
+        monkeypatch.setattr(
+            "tinyagentos.scheduler.discovery.metal_available", lambda: False
+        )
+
+        backends = [
+            _make_backend("ollama-1", "ollama", capabilities={"llm-chat"}),
+        ]
+        catalog = _make_catalog(backends)
+        hw = _hardware(gpu_type="nvidia")
+
+        sched = build_scheduler(hw, catalog)
+
+        resources = {r.name: r for r in sched._resources.values()}
+        assert "gpu-cuda-0" in resources
+        assert "gpu-metal" not in resources
 
     def test_cpu_concurrency_derived_from_physical_cores(self, monkeypatch):
         monkeypatch.setattr(
