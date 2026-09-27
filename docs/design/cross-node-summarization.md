@@ -30,7 +30,7 @@ Relationship to existing pieces:
   `SessionCatalog.enrich_session()` (`taosmd/session_catalog.py`) runs an LLM
   over a split session and writes topic / description / category;
   `taosmd/crystallize.py` compresses a completed session into a "crystal"
-  (narrative + outcomes + lessons). The taOSmd pipeline job queue
+  (narrative + outcomes + lessons). The taosmd pipeline job queue
   (`tinyagentos/scheduling/job_queue.py`) serialises exactly this class of work
   (`JOB_ENRICH`, `JOB_CRYSTALLIZE`, `JOB_EMBED`, `JOB_SPLIT`) — and its own
   module docstring is explicit that it is **not** a distributed task system:
@@ -116,11 +116,24 @@ A node is eligible to run a summarization job when **all** of these hold:
 
 Notes that matter for correctness:
 
-- **Condition 5 is the hard one; condition 6 is advisory.** Leases
-  (`ClusterManager.claim_lease`) are an explicit reservation, so their absence
-  is trustworthy evidence the accelerator is not in use. `load` is a
-  self-reported estimate and is used only to prefer the idlest of several
-  eligible nodes, never as a sole gate on a GPU node.
+- **Condition 6 is a real gate, not a tiebreak.** A node above
+  `idle_load_ceiling` is not eligible and the job stays pending — that is what
+  S1 asserts. The load figure is *self-reported*, so the ceiling is set
+  conservatively; it is not a precise instrument. Leases (condition 5) are the
+  hard reservation signal, and the ranking between two already-eligible nodes is
+  a separate concern from admission.
+- **Lease absence is exactly as trustworthy as lease coverage — which is
+  currently incomplete.** `ClusterManager.claim_lease` is the only path that
+  creates a visible `GpuLease`, and not every GPU-capable inference path takes
+  one. The mounted LLM gateway is the concrete counter-example: with
+  `TAOS_LLM_GATEWAY=1`, `POST /api/llm/v1/chat/completions`
+  (`tinyagentos/llm_gateway/forward.py`) forwards straight to the configured
+  backend, and an Ollama backend on that route can be using the GPU with **no
+  lease recorded**. Condition 5 must therefore not be treated as a proof of
+  idleness until either (a) every GPU-capable inference path claims, renews and
+  releases a visible lease, or (b) the predicate corroborates lease absence with
+  the VRAM sample / load signal. This is a prerequisite for S2, not a detail —
+  see open question 6.
 - **Eligibility is per *node*, not per *resource*.** A CPU-only node reports
   `cpu-inference` in `WorkerInfo.resources` and holds no leases at all, which is
   exactly the "idle CPU-heavy node" the issue describes. The predicate does not
@@ -206,9 +219,17 @@ summaries(
 )
 ```
 
-The primary key makes summarisation **idempotent by construction**: re-running
-an unchanged segment is a no-op insert, and a changed segment gets a new row
-while the old one stops matching `source_sha256` and is ignored.
+The primary key makes summarisation **idempotent by construction — provided
+the insert carries an explicit conflict policy**: SQLite's default on a
+constraint violation is `ABORT`, so the write is
+`INSERT ... ON CONFLICT (conversation_id, segment_id, source_sha256) DO NOTHING`
+(the house already uses this form — see the `ON CONFLICT(node_id) DO UPDATE`
+upsert in `cluster/capability_map.py`). With that, re-running an unchanged
+segment is a no-op, and a changed segment gets a new row while the old one stops
+matching `source_sha256` and is ignored.
+
+The summary row does **not** cover the vector index write — see the crash-recovery
+row in section 5 for how the two are kept consistent.
 
 The embedding goes to the existing vector index (`taosmd/vector_memory.py`
 stores `text` + `embedding` + `metadata_json` in SQLite; the qmd serve index is
@@ -238,8 +259,9 @@ segment and the hot window always win.**
 | Failure | Semantics |
 |---|---|
 | **Stale summary vs live context** | Summaries are keyed on `source_sha256`. A summary whose key no longer matches the current raw segment is *ignored*, never merged. The raw text (hot window, then archive) is authoritative at all times; splices are additive. |
-| **Duplicate / concurrent summarisation of one segment** | The composite primary key makes the second write a no-op. Two producers racing is wasteful, not corrupting. |
-| **Producer node dies mid-job** | The job is a `BACKGROUND` job with a lease/claim TTL; expiry re-queues it. No partial writes are possible because the only write is the controller's single commit of the completed result (summary row + index entry in one transaction). |
+| **Duplicate / concurrent summarisation of one segment** | The composite primary key plus an explicit `ON CONFLICT ... DO NOTHING` makes the second write a no-op rather than a constraint error. Two producers racing is wasteful, not corrupting. |
+| **Summary row committed, index entry missing** | The vector index is **not** in the summary store's SQLite transaction: it is owned by the qmd serve process and reached over HTTP (`tinyagentos/qmd_client.py`, proxied by `routes/memory.py`), so it cannot join a local commit. Committing the summary row and a durable **index-write outbox** row together, drained by a reconciler that retries an idempotent qmd upsert until it succeeds, is the recovery contract — the house already has this pattern in `tinyagentos/chat/peer_outbox.py` (attempt counter, `next_retry_at`, exponential backoff). A summary row whose index entry never landed is still correct and still splices; it is merely not yet findable by vector search. |
+| **Producer node dies mid-job** | The job is a `BACKGROUND` job with a lease/claim TTL; expiry re-queues it. No partial writes are possible because the producer never writes controller state at all — the controller's only write is the completed-result commit described in the row above. |
 | **Controller restarts mid-job** | `JobQueue._sync_init()` already marks stale `running` rows as `failed` ("stale: process restarted"). A summarization job lost this way is re-enqueued on the next pass from the same idempotent source, and re-running it cannot double-write. |
 | **Index node offline / no summary found** | The splice lookup misses and the runtime falls back to **today's exact behaviour** — the oldest-dropped window from `build_context_window()` — with one WARNING log. No user-visible error, no blocked turn. This is the required degraded mode, not an afterthought. |
 | **Live inference must not be interrupted** | Eligibility requires no active lease *and* idle, so a job is placed only on a node the cluster believes is free. The live path additionally never blocks on summarisation: enqueue is fire-and-forget and the only synchronous summarisation work is the S3 lookup. |
@@ -281,6 +303,13 @@ Acceptance:
       summary rows for that agent.
 - [ ] A metrics surface reports, per agent: segments condensed, compression
       ratio (source tokens ÷ summary tokens), CPU time spent.
+- [ ] Duplicate completion is a no-op, not an error: a second commit of the same
+      `(conversation_id, segment_id, source_sha256)` raises nothing and adds no
+      row (explicit `ON CONFLICT ... DO NOTHING`).
+- [ ] Crash between the summary commit and the qmd upsert leaves a **pending
+      index-write outbox row**; a reconciler drains it and the index entry
+      appears. Until then the summary row still exists and is still usable for a
+      splice.
 - [ ] Golden test: `build_context_window()` output is identical with the
       feature enabled and disabled.
 
@@ -297,6 +326,12 @@ Acceptance:
 - [ ] Placement never selects a node with an active lease on any of its
       resources, a draining node, a stale-heartbeat node, or a `kind="device"`
       node.
+- [ ] The lease-absence signal is corroborated before it is trusted: either
+      every GPU-capable inference path (including the `TAOS_LLM_GATEWAY=1`
+      `/api/llm/v1/chat/completions` route) claims a visible lease, or the
+      predicate also checks the node's `free_vram_mb` / `load` sample — with a
+      test that a node whose GPU is busy through a **non-leasing** path is not
+      selected.
 - [ ] An end-to-end round trip (enqueue → remote produce → controller commits
       summary row + index entry) passes against a stubbed worker.
 - [ ] Worker offline mid-job → job re-queued after TTL, **no partial row**, and
@@ -387,6 +422,13 @@ pre-registered VMAF criteria:
    assumes one authoritative controller, which matches the current design of
    `tinyagentos/scheduling/mesh_sync.py` ("Controller is authoritative (source
    of truth)").
+6. **Lease coverage is incomplete today.** Condition 5 only sees leases created
+   through `ClusterManager.claim_lease`. GPU-capable paths that bypass it — the
+   `TAOS_LLM_GATEWAY=1` chat-completions route is the known one — can occupy a
+   GPU invisibly, so "no lease" is not yet proof of idleness. S2 must either
+   close that gap (all GPU-capable inference paths claim/renew/release a visible
+   lease) or corroborate lease absence with the VRAM/load sample. **Decide this
+   alongside open question 1, before S2 is dispatched.**
 
 ## 10. What has to be true for this to be worth building
 
