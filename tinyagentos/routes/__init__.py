@@ -270,6 +270,11 @@ def register_all_routers(app):
     from tinyagentos.routes.activity import router as activity_router
     app.include_router(activity_router, dependencies=_csrf)
 
+    # Model Activity feed (#208): ring-buffer snapshot + SSE stream. Owned by
+    # routes/model_activity.py; the buffer itself is app.state.model_activity.
+    from tinyagentos.routes.model_activity import router as model_activity_router
+    app.include_router(model_activity_router, dependencies=_csrf)
+
     from tinyagentos.routes.frameworks import router as frameworks_router
     app.include_router(frameworks_router, dependencies=_csrf)
 
