@@ -212,6 +212,26 @@ class TestSwipeUnlockRefuses:
         assert "taos_session" not in r.cookies
 
     @pytest.mark.asyncio
+    async def test_an_engaged_lockout_is_not_announced_to_a_refused_caller(
+        self, app, lan, bare_console,
+    ):
+        """The simple-request / console gate runs BEFORE the throttle is read.
+        With the owner locked out, an off-console or header-less POST must get
+        the gate's 403 and no Retry-After -- never the 429 that would tell a LAN
+        client or a web page that a lockout is running and for how long."""
+        from tinyagentos.routes import auth as auth_routes
+
+        _force_method(app, "owner", "swipe")
+        uid = _mgr(app).find_user("owner")["id"]
+        for _ in range(5):
+            auth_routes._pin_limiter.record_failure(uid)
+        for caller in (lan, bare_console):
+            r = await caller.post("/auth/swipe-unlock")
+            assert r.status_code == 403, r.text
+            assert "Retry-After" not in r.headers
+            assert "taos_session" not in r.cookies
+
+    @pytest.mark.asyncio
     async def test_lan_refusals_cannot_lock_the_owner_out(self, app, lan, console):
         """The throttle is touched only for console callers."""
         _force_method(app, "owner", "swipe")
