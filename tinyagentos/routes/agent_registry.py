@@ -830,14 +830,19 @@ async def rotate_tokens(
     Every other caller gets the same 404 as an unknown id (existence-hiding,
     matching the registry PATCH/DELETE routes).
 
-    The cutoff moves STRICTLY past the identity's current one: it is set to
-    ``max(now + 1, current_cutoff + 1)``.  ``now + 1`` alone is not enough --
-    two rotations inside the same second would land on the same cutoff, so the
-    first rotation's replacement would survive the second (its ``iat`` equals
-    the cutoff, and the cutoff check rejects only a strictly older ``iat``).
-    Advancing monotonically also means a same-second token minted just before
-    the rotation is strictly behind the new cutoff.  The replacement token is
-    minted AT the resulting cutoff so it always clears it.
+    The cutoff moves STRICTLY past the identity's current one, and past this
+    second: ``target = max(now + 1, current_cutoff + 1)``, applied by the store
+    as a single ``MAX(token_min_iat + 1, ?)`` statement so two rotations cannot
+    land on the same cutoff.  ``now + 1`` alone is not enough: a token minted in
+    the same second would carry ``iat == cutoff`` and survive its own
+    supersession, and two rotations in one second would let the first
+    replacement outlive the second.  The replacement token is minted AT the
+    resulting cutoff so it always clears it.
+
+    The replacement is minted BEFORE the cutoff moves.  Minting is the step that
+    can fail, and a moved cutoff with no replacement would leave the identity
+    holding no usable credential at all -- the opposite of what recovery is for.
+    If minting raises, nothing was written and the existing token stays live.
 
     Leaves a forensic audit-log entry, actor = the session user, a literal
     ``agent:<canonical_id>`` marker for a self-rotation.
@@ -855,24 +860,32 @@ async def rotate_tokens(
 
     private_pem, _public_pem = _get_keypair(request)
 
-    # Strictly monotonic cutoff: past the current one AND past this second, so
-    # every token ever issued (including one minted moments ago) is superseded
-    # by this rotation.  bump_token_min_iat takes MAX(old, ts) -- with a target
-    # above the current cutoff the read-back value IS the target.
     before_iat = record.get("token_min_iat") or 0
     target = max(int(time.time()) + 1, before_iat + 1)
+
+    def _mint(at: int) -> str:
+        return mint_registry_token(
+            canonical_id,
+            private_pem,
+            user_id=record.get("user_id", ""),
+            framework=record.get("framework", ""),
+            iat=at,
+        )
+
+    # Nothing is written yet: a signing failure here leaves the identity exactly
+    # as it was, with its current token still valid.
+    token = _mint(target)
+
     updated = await store.bump_token_min_iat(canonical_id, target)
     if updated is None:
         return JSONResponse({"error": "not found"}, status_code=404)
 
     cutoff = int(updated.get("token_min_iat") or 0)
-    token = mint_registry_token(
-        canonical_id,
-        private_pem,
-        user_id=record.get("user_id", ""),
-        framework=record.get("framework", ""),
-        iat=cutoff,
-    )
+    if cutoff != target:
+        # A concurrent rotation advanced the cutoff past this call's target, so
+        # the token just minted would be superseded.  Re-mint at the cutoff that
+        # actually landed (the store allocates it atomically, so it is final).
+        token = _mint(cutoff)
 
     await _audit_governance(
         request,

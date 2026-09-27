@@ -322,24 +322,32 @@ async def rotate_native_agent_token(
         return None
 
     # Bump token_min_iat to invalidate all existing tokens for this identity.
-    # The target is above both the current cutoff and this second; read the
-    # effective cutoff back and mint at it -- the replacement then always
-    # clears its own cutoff.
+    # The target is above both the current cutoff and this second; the store
+    # applies it as a single MAX(token_min_iat + 1, ?), so concurrent rotations
+    # cannot share a cutoff.  Mint BEFORE the cutoff moves: minting is the step
+    # that can fail, and a moved cutoff with no replacement leaves the agent
+    # with no usable credential.
     import time
     before_iat = record.get("token_min_iat") or 0
-    updated = await registry.bump_token_min_iat(
-        record["canonical_id"], max(int(time.time()) + 1, before_iat + 1)
-    )
-    cutoff = int((updated or record).get("token_min_iat") or 0)
+    target = max(int(time.time()) + 1, before_iat + 1)
 
-    # Mint a new token at the new cutoff.
-    token = mint_registry_token(
-        record["canonical_id"],
-        signing_key_pem,
-        user_id=record.get("user_id", ""),
-        framework=record.get("framework", NATIVE_AGENT_ORIGIN),
-        iat=cutoff,
-    )
+    def _mint(at: int) -> str:
+        return mint_registry_token(
+            record["canonical_id"],
+            signing_key_pem,
+            user_id=record.get("user_id", ""),
+            framework=record.get("framework", NATIVE_AGENT_ORIGIN),
+            iat=at,
+        )
+
+    token = _mint(target)
+
+    updated = await registry.bump_token_min_iat(record["canonical_id"], target)
+    cutoff = int((updated or record).get("token_min_iat") or 0)
+    if updated is not None and cutoff != target:
+        # A concurrent rotation advanced the cutoff past our target; re-mint at
+        # the cutoff that actually landed so the credential we write clears it.
+        token = _mint(cutoff)
 
     # Write the new token, replacing the old one.
     path = token_path(data_dir)

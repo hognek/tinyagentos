@@ -1032,8 +1032,16 @@ class AgentRegistryStore(BaseStore):
         return await self.set_status(canonical_id, "revoked")
 
     async def bump_token_min_iat(self, canonical_id: str, ts: int) -> Optional[dict]:
-        """Set *canonical_id*'s ``token_min_iat`` to *ts*, invalidating every
-        token minted before that Unix timestamp.
+        """Advance *canonical_id*'s ``token_min_iat`` to at least *ts*, and
+        STRICTLY past whatever it was, invalidating every token minted before
+        the new cutoff.
+
+        The advance happens in ONE statement -- ``MAX(token_min_iat + 1, ?)`` --
+        so a caller cannot compute a cutoff from a stale read and land on a
+        value a concurrent rotation already used.  Two rotations must never
+        share a cutoff: the second would mint a token whose ``iat`` equals the
+        cutoff and the first rotation's replacement would survive it, silently
+        leaving a superseded credential live.
 
         The caller is responsible for authorisation (admin/session-owner checks).
         Returns the updated record, or ``None`` if *canonical_id* does not exist.
@@ -1044,7 +1052,8 @@ class AgentRegistryStore(BaseStore):
         if record is None:
             return None
         await self._db.execute(
-            "UPDATE agent_registry SET token_min_iat = MAX(token_min_iat, ?) WHERE canonical_id = ?",
+            "UPDATE agent_registry SET token_min_iat = MAX(token_min_iat + 1, ?) "
+            "WHERE canonical_id = ?",
             (ts, canonical_id),
         )
         await self._db.commit()
