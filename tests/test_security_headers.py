@@ -1,6 +1,8 @@
 """Tests for SecurityHeadersMiddleware (#655)."""
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -68,6 +70,57 @@ class TestProxyFrameSrc:
         # A crafted Host header must not be interpolatable into the CSP.
         for h in ("evil.com; script-src *", "a b", "x'y", 'x"y', "a;b", "a,b"):
             assert not _SAFE_HOST_RE.fullmatch(h)
+
+
+_DESKTOP_DIR = Path(__file__).resolve().parents[1] / "desktop"
+
+# The SPA HTML entry points. All are served under the strict CSP
+# (`script-src 'self'`, no 'unsafe-inline'), so any inline <script> in them is
+# blocked by the browser and its code silently stops running.
+_SPA_HTML_FILES = ("index.html", "chat.html", "app.html")
+
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.S)
+_SCRIPT_OPEN_TAG_RE = re.compile(r"<script\b[^>]*>", re.I)
+
+
+class TestSpaShellCspCompatibility:
+    """The SPA must not rely on inline scripts.
+
+    Regression guard for the CSP added in #687: `script-src 'self'` (no
+    'unsafe-inline', no nonce) blocks inline scripts outright. The reduce-effects
+    pre-paint snippet (#58) was inline and therefore silently stopped running —
+    the saved preference was only applied after React mounted, re-introducing the
+    flash the snippet existed to prevent. It now lives in public/boot.js and is
+    referenced by a blocking, same-origin <script src>.
+    """
+
+    @pytest.mark.parametrize("name", _SPA_HTML_FILES)
+    def test_spa_html_has_no_inline_scripts(self, name):
+        html = _HTML_COMMENT_RE.sub("", (_DESKTOP_DIR / name).read_text(encoding="utf-8"))
+        for tag in _SCRIPT_OPEN_TAG_RE.findall(html):
+            assert "src=" in tag.lower(), (
+                f"desktop/{name}: inline {tag!r} is blocked by the CSP "
+                f"(script-src 'self') — move the code to an external file"
+            )
+
+    def test_prepaint_boot_script_is_external_and_present(self):
+        html = _HTML_COMMENT_RE.sub("", (_DESKTOP_DIR / "index.html").read_text(encoding="utf-8"))
+        assert '<script src="/boot.js"></script>' in html
+        boot = _DESKTOP_DIR / "public" / "boot.js"
+        assert boot.is_file(), "desktop/public/boot.js must exist (copied to the build root)"
+        assert "data-perf" in boot.read_text(encoding="utf-8")
+
+    @pytest.mark.asyncio
+    async def test_csp_script_src_has_no_unsafe_inline(self, client):
+        resp = await client.get("/api/health")
+        csp = resp.headers.get("content-security-policy", "")
+        script_src = next(
+            (d.strip() for d in csp.split(";") if d.strip().startswith("script-src")),
+            "",
+        )
+        assert script_src, f"no script-src directive in CSP: {csp!r}"
+        assert "'unsafe-inline'" not in script_src
+        assert "'unsafe-eval'" not in script_src
 
 
 class TestApiNoStore:
