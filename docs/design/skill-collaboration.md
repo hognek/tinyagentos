@@ -1,7 +1,7 @@
 # Skill-collaboration layer: a user's own agents share what they learn
 
 Status: design spike (2026-09-27), doc only — no implementation in this change.
-Design locked for slices S1–S3; section 7 lists the questions that need a
+Design scoped for slices S1–S3; section 7 lists the questions that need a
 decision before S2. Tracking issue: #900. Related: #898 (the artifact this
 layer distributes), #896 (the surface it reviews through), #900's pointer to the
 canonical-skills idea (#595) and upstream-tracking catalog (#596).
@@ -24,7 +24,7 @@ registry — tool schemas, `frameworks` (native/adapter/unsupported), per-agent
 canonical guides. To keep the two apart:
 
 - **guide** — the knowledge artifact. The canonical guides (`docs/agent-manual/`,
-  read-only, compiled, injected by `build_manual()`) are guides. #898's
+  read-only, compiled, and shipped via `.claude/skills/taos-agent/SKILL.md`) are guides. #898's
   agent-authored guides are guides.
 - **supplement** — one agent's additive note over one guide. This layer stores,
   shares and governs supplements. Call it a *supplement*, never a "skill".
@@ -40,7 +40,7 @@ canonical guides. To keep the two apart:
 | Bus identity | The taOS send proxy mints `from` from the caller's registry JWT (`agent_token_auth.check_agent_scope`, scope `a2a_send`); the bus verifies `token sub == from` | Free provenance — a supplement's author cannot be spoofed |
 | Read side | `a2a_receive` scope or admin session gates reads | Who may subscribe |
 | Internal per-project a2a (`projects/a2a.py`) | One `kind="a2a"` group channel per project, @mention routing | Out of scope. That is project chat, not learning |
-| Read-only canonical guides (`docs/agent-manual/`) | Injected as system context by `build_manual()` (`agent_chat_router.py`) | The layer supplements sit over, never into |
+| Read-only canonical guides (`docs/agent-manual/`) | Compiled to `docs/taos-agent-manual.md` and shipped to agents via `.claude/skills/taos-agent/SKILL.md` (`build_manual()` in `agent_manual.py` is a pure function returning session constants, not this assembly) | The layer supplements sit over, never into |
 | Per-agent memory (taosmd/QMD, `memory_mode`) | Existing | Overlaps by design — see §7, build with @taOSmd |
 | Decisions app (`routes/decisions.py`) | Agents create decisions with a registry token; a human answers | The review gate surface in S3 |
 | #896 control plane (`trace_store`, `otel/*`, `scheduler/history_store.py`, Activity UI) | Spec'd/partly built | The evidence and audit surface the review gate links to |
@@ -118,7 +118,7 @@ An agent's local subscription is a **filter**, not a bus membership:
 scope = {
   guide:        "10-image-prompting",   # canonical guide id
   capability:   "image_generation",     # from the capability registry
-  hardware:     "rtx3060-12gb",         # the tier vocabulary capabilities.py / manifests use
+  hardware:     "x86-cuda-12gb",         # the tier vocabulary capabilities.py / manifests use
   framework:    null,                   # optional tighter match
 }
 ```
@@ -166,7 +166,7 @@ One JSON envelope in the bus `body`, and one row in a local store:
   "id": "gs-<sha256 of the immutable core: author+targets+scope+claim+body_md+evidence>",
   "author": {"handle": "@taos-dev", "canonical_id": "...", "instance": "pi-01"},
   "targets": {"guide": "10-image-prompting", "guide_version": "<pinned>"},
-  "scope": {"capability": "image_generation", "hardware": "rtx3060-12gb", "framework": null},
+  "scope": {"capability": "image_generation", "hardware": "x86-cuda-12gb", "framework": null},
   "claim": "FLUX Q3 fits a 12GB 3060; Q4 OOMs at 1024px.",
   "body_md": "Short, actionable, additive. Points at the canonical guide, never restates it.",
   "evidence": [{"run_id": "...", "trace": "<#896 trace id>", "observed": "OOM at step 2, Q4, 1024px"}],
@@ -205,7 +205,7 @@ The canonical guides are read-only (#898). A supplement therefore **never
 edits, overrides or shadows canonical text** — it is a separate layer rendered
 next to it.
 
-- **Rendering.** At guide-render time (the `build_manual()` path and any future
+- **Rendering.** At guide-render time (the `.claude/skills/taos-agent/SKILL.md` assembly path and any future
   guide loader), canonical text is emitted byte-identical; adopted supplements are
   appended under a clearly marked block, e.g. `### Local notes (agent-supplied,
   reviewed)`, each stamped with author + id. An agent reading its manual can
@@ -272,8 +272,9 @@ explicitly (no silent drop — the author is told).
 
 A bad lesson must be removable, and the mechanism has to work with the grant
 model as it actually is: `agent_grants_store` exposes `add_grant` / `list_grants`
-/ `list_active_grants` and **no revoke** — there is no revoking a published
-lesson's access. So rollback is a **tombstone event on the bus** (kind
+/ `list_active_grants`, plus `revoke_grant` / `revoke_all_for_project` — but a
+revoke removes a subscriber's *access*, not knowledge already stored there, so
+it cannot recall a published lesson. Rollback is therefore a **tombstone event on the bus** (kind
 `guide.tombstone`):
 
 - promotion writes a generation number into the local store; retraction
@@ -343,7 +344,10 @@ commands run from the repo root.
   discipline: supplements + generations + tombstones), `tinyagentos/guides/model.py`
   (envelope validation, content-addressed `id`, scope matching),
   `tinyagentos/guides/render.py` (the merge/append/stale rules of §5), wiring into
-  the `build_manual()` call path in `agent_chat_router.py`, session-only routes
+  a new supplement-aware guide-injection seam (`build_manual()` is a pure function
+  returning session constants and does not inject the compiled manual, which
+  reaches agents via `.claude/skills/taos-agent/SKILL.md`; S1 declares its own
+  seam), session-only routes
   `tinyagentos/routes/guides.py` (`GET/POST /api/guides/supplements`),
   `tests/test_guides_store.py`, `tests/test_guides_render.py`.
 - No bus traffic, no cross-agent effect: an agent can hold and render its *own*
