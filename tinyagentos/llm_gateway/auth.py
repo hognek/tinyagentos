@@ -17,10 +17,11 @@ Accepted, in order:
   would sidestep the agent's model scope;
 - the per-install LiteLLM master key (``<data_dir>/.litellm_master_key``) ->
   kind "admin", every model (parity with ``litellm_auth.user_api_key_auth``);
-- a gateway key (``sk-taosgw-...``) minted here, bound to an agent id or a
-  node (principal ``node:<id>``) -> kind "agent" / "node", its allowlist;
-- a legacy per-agent LiteLLM key (``sk-taos-...``, ``agent_keys``) -> kind
-  "agent", its allowlist.
+- a gateway key (``sk-taosgw-...``) minted here, bound to an agent id, a node
+  (principal ``node:<id>``) or an app (principal ``app:<id>``) -> kind "agent" /
+  "node" / "app", its allowlist;
+- a legacy LiteLLM key (``sk-taos-...``, ``agent_keys``) -> that row's kind
+  ("agent", or "app" for an installed app's key), its allowlist.
 
 Everything else -- missing, malformed, unknown, revoked or expired -- is a
 401 ``GatewayError`` (OpenAI-shaped). The key is never logged. An agent over
@@ -56,7 +57,11 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from tinyagentos.litellm_keystore import (
+    APP_PRINCIPAL_PREFIX,
+    KIND_AGENT,
+    KIND_APP,
     LiteLLMKeyStore,
+    app_principal,
     default_keystore_path,
     token_hash,
 )
@@ -69,7 +74,7 @@ GATEWAY_KEY_PREFIX = "sk-taosgw-"
 _KEY_BODY_LEN = 43
 GATEWAY_KEY_LEN = len(GATEWAY_KEY_PREFIX) + _KEY_BODY_LEN
 
-_SCOPED_KINDS = frozenset({"agent", "node"})
+_SCOPED_KINDS = frozenset({KIND_AGENT, "node", KIND_APP})
 # Kinds that carry allowed_models=None (every model), and only they may.
 ADMIN_KINDS = frozenset({"admin", "session", "local_token"})
 NODE_PRINCIPAL_PREFIX = "node:"
@@ -97,7 +102,7 @@ _stores: dict[str, LiteLLMKeyStore] = {}
 @dataclass(frozen=True)
 class GatewayCaller:
     caller_id: str
-    kind: str  # "agent" | "node" | "session" | "local_token" | "admin"
+    kind: str  # "agent" | "app" | "node" | "session" | "local_token" | "admin"
     allowed_models: frozenset[str] | None  # None = every model (admin kinds only)
     key_id: str | None = None
 
@@ -207,6 +212,27 @@ def _validate_models(allowed_models: Iterable[str]) -> list[str]:
     return sorted(set(models))
 
 
+def _validate_binding(bound_to: str, kind: str) -> None:
+    """A principal's name must not contradict its kind.
+
+    ``node`` keys bind ``node:<id>``, ``app`` keys bind ``app:<id>``, agent keys
+    bind a bare agent id. Same rule as the keystore's ``_validate_principal``,
+    extended with the node kind this module owns.
+    """
+    if not isinstance(bound_to, str) or not bound_to:
+        raise ValueError("bound_to must be a non-empty string")
+    is_node = bound_to.startswith(NODE_PRINCIPAL_PREFIX)
+    is_app = bound_to.startswith(APP_PRINCIPAL_PREFIX)
+    if (kind == "node") != is_node:
+        raise ValueError("node keys are bound to 'node:<id>'; other kinds never are")
+    if (kind == KIND_APP) != is_app:
+        raise ValueError("app keys are bound to 'app:<id>'; other kinds never are")
+    if is_node and len(bound_to) == len(NODE_PRINCIPAL_PREFIX):
+        raise ValueError("node principal has an empty id")
+    if is_app and len(bound_to) == len(APP_PRINCIPAL_PREFIX):
+        raise ValueError("app principal has an empty id")
+
+
 def mint_gateway_key(
     *,
     bound_to: str,
@@ -217,19 +243,14 @@ def mint_gateway_key(
 ) -> str:
     """Mint a key bound to ``bound_to``; return the plaintext ONCE.
 
-    ``kind`` is "agent" (``bound_to`` = agent id) or "node" (``bound_to`` =
-    ``node:<id>``; prefer :func:`mint_for_node`). An empty ``allowed_models``
+    ``kind`` is "agent" (``bound_to`` = agent id), "node" (``bound_to`` =
+    ``node:<id>``; prefer :func:`mint_for_node`) or "app" (``bound_to`` =
+    ``app:<id>``; prefer :func:`mint_for_app`). An empty ``allowed_models``
     mints a key that authenticates but may use no model.
     """
     if kind not in _SCOPED_KINDS:
         raise ValueError(f"kind must be one of {sorted(_SCOPED_KINDS)}")
-    if not isinstance(bound_to, str) or not bound_to:
-        raise ValueError("bound_to must be a non-empty string")
-    is_node = bound_to.startswith(NODE_PRINCIPAL_PREFIX)
-    if (kind == "node") != is_node:
-        raise ValueError("node keys are bound to 'node:<id>'; agent keys never are")
-    if is_node and len(bound_to) == len(NODE_PRINCIPAL_PREFIX):
-        raise ValueError("node principal has an empty id")
+    _validate_binding(bound_to, kind)
     models = _validate_models(allowed_models)
     expires_ts = None
     if ttl_seconds is not None:
@@ -282,6 +303,32 @@ def mint_for_node(
 
 def revoke_for_node(node_id: str, *, data_dir: str | Path | None = None) -> int:
     return revoke_keys_for(node_principal(node_id), data_dir=data_dir)
+
+
+def mint_for_app(
+    app_id: str,
+    allowed_models: Iterable[str],
+    *,
+    ttl_seconds: float | None = None,
+    data_dir: str | Path | None = None,
+) -> str:
+    """Mint a gateway key for an installed app's principal (#613).
+
+    The app-side counterpart of :func:`mint_for_node`: same allowlist rule, and
+    no agent budget (the caller's kind is ``app``, which ``gateway_caller``
+    exempts from the budget gate).
+    """
+    return mint_gateway_key(
+        bound_to=app_principal(app_id),
+        kind=KIND_APP,
+        allowed_models=allowed_models,
+        ttl_seconds=ttl_seconds,
+        data_dir=data_dir,
+    )
+
+
+def revoke_for_app(app_id: str, *, data_dir: str | Path | None = None) -> int:
+    return revoke_keys_for(app_principal(app_id), data_dir=data_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -345,9 +392,14 @@ def _resolve_scoped(store: LiteLLMKeyStore, presented: str) -> GatewayCaller | N
     rec = store.agent_key_by_hash(presented_hash)
     if rec is None or not _ct_equal(rec["token_hash"], presented_hash):
         return None
+    kind = rec.get("kind") or KIND_AGENT
+    if kind not in _SCOPED_KINDS:
+        # A row whose kind we do not recognise is not a scoped credential.
+        logger.info("llm gateway: rejected key with unknown kind %r", kind)
+        return None
     return GatewayCaller(
         caller_id=rec["agent"],
-        kind="agent",
+        kind=kind,
         allowed_models=frozenset(rec["allowed_models"]),
         key_id=None,
     )
@@ -440,9 +492,11 @@ __all__ = [
     "GatewayCaller",
     "configure_gateway_keystore",
     "gateway_caller",
+    "mint_for_app",
     "mint_for_node",
     "mint_gateway_key",
     "node_principal",
+    "revoke_for_app",
     "revoke_for_node",
     "revoke_keys_for",
 ]

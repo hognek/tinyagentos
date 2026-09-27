@@ -280,6 +280,8 @@ Most agent frameworks force you to wire up Telegram, Discord, or Slack directly 
 ### LLM Proxy (LiteLLM)
 Hidden internal gateway that unifies all inference providers behind a single OpenAI-compatible API. Each agent gets a virtual API key with budget and rate limits. The proxy is auto-configured from your backend list. Switch from a local Ollama backend to a cloud provider (or add both as fallbacks) and no agent config changes. The agent just calls its local API key and taOS routes to the best available backend.
 
+Installed apps are principals too: a catalog app that calls the model API declares `install: {llm_access: true}` (open-webui, for example) and install mints it its own LiteLLM key scoped to a model allowlist, injecting `OPENAI_BASE_URL` / `OPENAI_API_KEY` into the app's container instead of handing it a shared token that reaches every model. Read and widen the allowlist per app at `GET`/`PUT /api/apps/{app_id}/llm-access`; the same key re-scopes in place, so no container restart is needed.
+
 ### Dynamic Capabilities
 Features unlock automatically based on your hardware and cluster. Solo Pi sees core features. Add a GPU worker and image generation, video, and training appear. No configuration, the platform just knows what's possible.
 

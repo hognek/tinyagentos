@@ -16,7 +16,11 @@ def test_mint_and_lookup(tmp_path):
     token = store.mint("agent-a", ["gpt-4o", "default"])
     assert token.startswith("sk-taos-")
     rec = store.lookup(token)
-    assert rec == {"agent": "agent-a", "allowed_models": ["gpt-4o", "default"]}
+    assert rec == {
+        "agent": "agent-a",
+        "kind": "agent",
+        "allowed_models": ["gpt-4o", "default"],
+    }
 
 
 def test_lookup_unknown_returns_none(tmp_path):

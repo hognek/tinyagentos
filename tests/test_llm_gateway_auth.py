@@ -460,6 +460,40 @@ class TestHappyPaths:
         assert gw.revoke_for_node("pi-5", data_dir=app.state.data_dir) == 1
         _assert_openai_401(await bare.get(MODELS, headers=_b(key)))
 
+    async def test_app_key(self, bare, app):
+        """An installed app's principal is kind "app", scoped like any other
+        scoped caller (#613) -- and revocable by its app id."""
+        key = gw.mint_for_app("open-webui", ["gpt-small"], data_dir=app.state.data_dir)
+        caller = _resolve(app, key)
+        assert (caller.caller_id, caller.kind) == ("app:open-webui", "app")
+        assert caller.allowed_models == frozenset({"gpt-small"})
+        assert await _listed(bare, key) == ["gpt-small"]
+        assert gw.revoke_for_app("open-webui", data_dir=app.state.data_dir) == 1
+        _assert_openai_401(await bare.get(MODELS, headers=_b(key)))
+
+    @respx.mock
+    async def test_app_key_is_refused_a_model_outside_its_list(self, bare, app):
+        """Through the REAL gateway route: an app scoped to one model cannot
+        call another, and the upstream is never touched."""
+        upstream = respx.post(UPSTREAM_CHAT)
+        key = gw.mint_for_app("open-webui", ["gpt-small"], data_dir=app.state.data_dir)
+        resp = await bare.post(CHAT, json=_chat("qwen3-8b"), headers=_b(key))
+        assert resp.status_code == 403, resp.text
+        assert resp.json()["error"]["code"] == "model_not_permitted"
+        assert not upstream.called
+
+    async def test_mint_for_app_rejects_a_mismatched_binding(self, app):
+        """An app key must be bound to 'app:<id>', an agent key never is."""
+        with pytest.raises(ValueError):
+            gw.mint_gateway_key(
+                bound_to="open-webui", kind="app", allowed_models=["gpt-small"],
+                data_dir=app.state.data_dir,
+            )
+        with pytest.raises(ValueError):
+            gw.mint_gateway_key(
+                bound_to="app:open-webui", kind="agent", allowed_models=["gpt-small"],
+                data_dir=app.state.data_dir,
+            )
 
 
 @_ASYNC

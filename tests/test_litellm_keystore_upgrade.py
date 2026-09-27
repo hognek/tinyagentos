@@ -22,7 +22,12 @@ import pytest
 
 import tinyagentos.litellm_auth as hook_mod
 import tinyagentos.llm_gateway.auth as gw
-from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
+from tinyagentos.litellm_keystore import (
+    KIND_APP,
+    LiteLLMKeyStore,
+    app_principal,
+    default_keystore_path,
+)
 
 # dev's agent_keys schema before this change, verbatim.
 _ORIGINAL_SCHEMA = """
@@ -151,6 +156,66 @@ def test_key_minted_after_migration_gets_its_hash_at_insert(tmp_path):
     (row,) = [r for r in _rows(path) if r["agent"] == "agent-new"]
     assert row["token"] == tok
     assert row["token_hash"] == _sha(tok)
+
+
+def test_every_old_row_is_backfilled_to_kind_agent(tmp_path):
+    """#613 added ``agent_keys.kind``. A row that predates it is an AGENT row --
+    never an app one -- so the migration must not leave it NULL or guess."""
+    path = tmp_path / "keys.db"
+    _old_db(path)
+    LiteLLMKeyStore(path)
+    for row in _rows(path):
+        assert row["kind"] == "agent", row
+    # And the hook still reads it as an agent, with the allowlist intact.
+    store = LiteLLMKeyStore(path)
+    (row,) = [r for r in _rows(path) if r["agent"] == "agent-a"]
+    assert store.lookup(row["token"])["kind"] == "agent"
+    assert store.agent_key_by_hash(_sha(row["token"]))["kind"] == "agent"
+
+
+def test_kind_migration_is_idempotent_and_adds_one_column(tmp_path):
+    path = tmp_path / "keys.db"
+    _old_db(path)
+    LiteLLMKeyStore(path)
+    first = _rows(path)
+    LiteLLMKeyStore(path)
+    LiteLLMKeyStore(path)
+    assert _rows(path) == first
+    conn = sqlite3.connect(path)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(agent_keys)")]
+    conn.close()
+    assert cols.count("kind") == 1
+
+
+def test_row_written_by_an_old_process_still_lands_as_an_agent(tmp_path):
+    """Side-by-side upgrade: an older binary INSERTs without ``kind``, so the
+    column default (not a NULL) is what classifies it."""
+    path = tmp_path / "keys.db"
+    _old_db(path)
+    LiteLLMKeyStore(path)
+    tok = "sk-taos-" + secrets.token_urlsafe(32)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "INSERT INTO agent_keys (token, agent, allowed_models, created_ts) VALUES (?, ?, ?, ?)",
+        (tok, "agent-old-binary", '["gpt-small"]', time.time()),
+    )
+    conn.commit()
+    conn.close()
+    store = LiteLLMKeyStore(path)
+    assert store.lookup(tok)["kind"] == "agent"
+
+
+def test_an_app_key_survives_the_migration_and_keeps_its_kind(tmp_path):
+    path = tmp_path / "keys.db"
+    _old_db(path)
+    store = LiteLLMKeyStore(path)
+    token = store.mint(app_principal("open-webui"), ["gpt-small"], kind=KIND_APP)
+    reopened = LiteLLMKeyStore(path)
+    rec = reopened.lookup(token)
+    assert (rec["kind"], rec["agent"]) == (KIND_APP, "app:open-webui")
+    assert reopened.agent_key_by_hash(_sha(token))["kind"] == KIND_APP
+    (row,) = [r for r in _rows(path) if r["agent"] == "app:open-webui"]
+    assert row["kind"] == KIND_APP
 
 
 def test_row_written_by_an_old_process_is_backfilled_on_next_open(tmp_path):

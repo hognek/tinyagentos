@@ -11,11 +11,15 @@ subprocess:
   - ``LITELLM_MASTER_KEY``   -> admin passthrough
   - ``TAOS_LITELLM_KEYSTORE`` -> path to the SQLite key store
 
-Per-agent model scoping is enforced HERE (read the requested model from the
-body and reject out-of-scope calls) so correctness does not depend on
+Per-agent and per-app model scoping is enforced HERE (read the requested model
+from the body and reject out-of-scope calls) so correctness does not depend on
 LiteLLM's historically-flaky post-auth model-allowlist path. The returned
 object also carries the allowlist + metadata so LiteLLM's own enforcement
 and taOS's usage callback both work.
+
+An app principal (#613) is a row whose ``kind`` is ``app``: the same allowlist
+rule and the same store, minus the agent budget gate (an app has no LLM
+budget, exactly as in the in-process gateway).
 """
 from __future__ import annotations
 
@@ -23,12 +27,44 @@ import logging
 import os
 import secrets
 
+from tinyagentos.litellm_keystore import (
+    APP_PRINCIPAL_PREFIX,
+    KIND_APP,
+)
+
 logger = logging.getLogger(__name__)
 
 _store = None
 _store_path = None
 _budget_store_cache = None
 _budget_store_cache_path = None
+
+
+def model_scope_error(kind: str, allowed: list[str], requested: str | None) -> str | None:
+    """The allowlist verdict for one request: a refusal detail, or None.
+
+    Pure and litellm-free so the rule is testable without the proxy extra, and
+    so the hook has exactly one place to get it wrong. An EMPTY allowlist is
+    deny-all (the keystore's ``mint`` contract) -- never treated as "no
+    restriction", which is how LiteLLM reads an empty ``models`` list.
+    """
+    noun = "app" if kind == KIND_APP else "agent"
+    if not allowed:
+        return f"no models are permitted for this {noun}"
+    if requested and requested not in allowed:
+        return f"model {requested!r} is not permitted for this {noun}"
+    return None
+
+
+def key_alias_for(principal: str, kind: str) -> str:
+    """The LiteLLM-side name for a principal.
+
+    ``app:open-webui`` -> ``taos-app-open-webui``; an agent keeps the historical
+    ``taos-<name>``.
+    """
+    if kind == KIND_APP and principal.startswith(APP_PRINCIPAL_PREFIX):
+        return "taos-app-" + principal[len(APP_PRINCIPAL_PREFIX):]
+    return f"taos-{principal}"
 
 
 def _keystore():
@@ -102,41 +138,41 @@ async def user_api_key_auth(request, api_key: str):
     if rec is None:
         raise HTTPException(status_code=401, detail="invalid key")
 
-    agent = rec["agent"]
+    principal = rec["agent"]
+    kind = rec.get("kind") or "agent"
     allowed = rec["allowed_models"] or []
 
     # Hard-stop: reject calls for an agent that has exceeded its LLM
     # budget. Fails open (no check) when budgets are not configured at all
     # (env var unset), but once TAOS_AGENT_BUDGETS is set, an over-budget
-    # agent is blocked before a completion is ever dispatched.
+    # agent is blocked before a completion is ever dispatched. App principals
+    # are not agents and have no agent budget: skipping the gate here matches
+    # the in-process gateway, which checks budgets for kind "agent" only.
     budget_store = _budget_store()
-    if budget_store is not None and budget_store.is_over_budget(agent):
+    if kind != KIND_APP and budget_store is not None and budget_store.is_over_budget(principal):
         raise HTTPException(
             status_code=429,
-            detail=f"agent '{agent}' has exceeded its LLM budget",
+            detail=f"agent '{principal}' has exceeded its LLM budget",
         )
 
-    # Defense in depth: enforce the per-agent model allowlist in-hook so
-    # correctness does not depend on LiteLLM's post-auth enforcement (which
-    # is disabled here via custom_auth_run_common_checks=False). An empty
-    # allowlist is deny-all per the keystore's mint() contract — do NOT
-    # short-circuit it, because returning UserAPIKeyAuth(models=[]) would be
-    # read by LiteLLM as "no restriction" (allow-all), the opposite intent.
-    requested = await _requested_model(request)
-    if not allowed:
-        raise HTTPException(
-            status_code=403,
-            detail="no models are permitted for this agent",
-        )
-    if requested and requested not in allowed:
-        raise HTTPException(
-            status_code=403,
-            detail=f"model {requested!r} is not permitted for this agent",
-        )
+    # Defense in depth: enforce the model allowlist in-hook so correctness does
+    # not depend on LiteLLM's post-auth enforcement (which is disabled here via
+    # custom_auth_run_common_checks=False). An empty allowlist is deny-all per
+    # the keystore's mint() contract — do NOT short-circuit it, because
+    # returning UserAPIKeyAuth(models=[]) would be read by LiteLLM as "no
+    # restriction" (allow-all), the opposite intent.
+    refusal = model_scope_error(kind, allowed, await _requested_model(request))
+    if refusal is not None:
+        raise HTTPException(status_code=403, detail=refusal)
 
     return UserAPIKeyAuth(
         api_key=api_key,
-        key_alias=f"taos-{agent}",
+        key_alias=key_alias_for(principal, kind),
         models=list(allowed),
-        metadata={"agent": agent, "managed_by": "tinyagentos"},
+        metadata={
+            "agent": principal,
+            "principal": principal,
+            "principal_kind": kind,
+            "managed_by": "tinyagentos",
+        },
     )

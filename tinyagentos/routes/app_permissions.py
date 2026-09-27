@@ -1,4 +1,4 @@
-"""Per-app capability grant API (app permission system, #56).
+"""Per-app capability grant API (app permission system, #56) + LLM access (#613).
 
 The API surface over AppGrantsStore: a user reviews, grants/denies, and revokes
 the capabilities an installed app holds. Decision 6 (manifest declares + runtime
@@ -9,6 +9,14 @@ tinyagentos/userspace/capabilities.py (the same source of truth the broker
 enforces and the package parser validates manifests against), so a grant can
 never record a typo'd or made-up capability. Grants are scoped to the calling
 user.
+
+The same module carries the app's own settings surface for its MODEL access: an
+installed app that calls the model API is a principal holding a key scoped to a
+model allowlist (``tinyagentos.app_llm_access``), read and re-scoped through
+``GET/PUT /api/apps/{app_id}/llm-access``. It sits beside the capability grants
+because it answers the same question -- what may this app do -- from the app's
+own settings instead of from one shared credential. Writes are admin-only: a
+model allowlist is a credential scope, not a per-user consent.
 """
 from __future__ import annotations
 
@@ -17,6 +25,12 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from tinyagentos.routes.decisions import SERVER_RAISED_KEY
 
+from tinyagentos.app_llm_access import (
+    access_state,
+    manifest_opts_in,
+    rotate,
+    set_access,
+)
 from tinyagentos.auth_context import CurrentUser, current_user
 from tinyagentos.userspace.capabilities import (
     FREE_CAPS,
@@ -30,6 +44,24 @@ from tinyagentos.userspace.capabilities import (
 )
 
 router = APIRouter()
+
+
+def _require_admin_session(request: Request) -> JSONResponse | None:
+    """403 for a non-admin caller, else None.
+
+    Imported lazily: ``routes/auth`` is a large module and route modules must
+    not import each other at module scope (same pattern as routes/taos_agent).
+    """
+    from tinyagentos.routes.auth import _require_admin
+
+    ok, err = _require_admin(request)
+    return None if ok else (err or JSONResponse({"error": "forbidden"}, status_code=403))
+
+
+def _install_manifest(request: Request, app_id: str):
+    """The catalog manifest for ``app_id``, or None when it is not a catalog app."""
+    registry = getattr(request.app.state, "registry", None)
+    return registry.get(app_id) if registry is not None else None
 
 
 async def _resolve_provenance(request: Request, app_id: str) -> str | None:
@@ -242,3 +274,83 @@ async def request_app_consent(
         except Exception:
             pass
     return {"decision": decision, "pending": pending}
+
+
+# --------------------------------------------------------------------------- #
+# Per-app LLM access (#613) -- the app as its own model-API principal.
+# --------------------------------------------------------------------------- #
+
+
+class LlmAccessUpdate(BaseModel):
+    models: list[str]
+
+
+@router.get("/api/apps/{app_id}/llm-access")
+async def get_app_llm_access(
+    app_id: str, request: Request, user: CurrentUser = Depends(current_user)
+):
+    """The app's model allowlist and key state.
+
+    Readable by any signed-in user (a key's existence and its model scope are
+    not secret; the masked value is not usable). ``key_present`` is null when
+    the credential store cannot be read back, so a UI can distinguish "no key"
+    from "unknown".
+    """
+    proxy = getattr(request.app.state, "llm_proxy", None)
+    state = await access_state(proxy, app_id)
+    manifest = _install_manifest(request, app_id)
+    state["declares_llm_access"] = manifest_opts_in(manifest)
+    return state
+
+
+@router.put("/api/apps/{app_id}/llm-access")
+async def set_app_llm_access(
+    app_id: str, body: LlmAccessUpdate, request: Request,
+    user: CurrentUser = Depends(current_user),
+):
+    """Re-scope the app's permitted models. Admin only.
+
+    The key value is unchanged when the app already has one, so a running app
+    picks the new scope up without a restart; an app that never had a key gets
+    one. An empty list is refused: "no models" is expressed by not granting
+    access at all, not by a key that exists and can use nothing — and a typo'd
+    empty list silently bricking an app is the failure mode worth refusing.
+    """
+    forbidden = _require_admin_session(request)
+    if forbidden is not None:
+        return forbidden
+    models = [m.strip() for m in body.models if isinstance(m, str) and m.strip()]
+    if not models:
+        return JSONResponse({"error": "models must not be empty"}, status_code=400)
+    proxy = getattr(request.app.state, "llm_proxy", None)
+    result = await set_access(proxy, app_id, models)
+    if result["key_action"] == "none":
+        return JSONResponse(
+            {"error": "could not scope an app key (proxy unavailable or routing-only mode)",
+             **result},
+            status_code=503,
+        )
+    return result
+
+
+@router.post("/api/apps/{app_id}/llm-access/rotate")
+async def rotate_app_llm_key(
+    app_id: str, request: Request, user: CurrentUser = Depends(current_user),
+):
+    """Mint a fresh key for the app and drop the old one. Admin only.
+
+    The plaintext is returned exactly once, here — the app's own settings are
+    where it belongs. The previous key stops working immediately.
+    """
+    forbidden = _require_admin_session(request)
+    if forbidden is not None:
+        return forbidden
+    proxy = getattr(request.app.state, "llm_proxy", None)
+    token = await rotate(proxy, app_id)
+    if not token:
+        return JSONResponse(
+            {"error": "could not mint an app key (proxy unavailable or routing-only mode)"},
+            status_code=503,
+        )
+    state = await access_state(proxy, app_id)
+    return {"app_id": app_id, "key": token, "permitted_models": state["permitted_models"]}

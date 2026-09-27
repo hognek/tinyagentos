@@ -26,6 +26,7 @@ from tinyagentos.litellm_config import (
     generate_litellm_config,
     get_litellm_master_key,
 )
+from tinyagentos.litellm_keystore import KIND_APP, app_principal
 
 __all__ = ["EMBEDDING_ALIAS", "CLOUD_BACKEND_TYPES"]
 
@@ -691,6 +692,116 @@ class LLMProxy:
         except Exception as e:
             logger.warning(f"Failed to create LiteLLM key for {agent_name}: {e}")
         return None
+
+    async def create_app_key(self, app_id: str, models: list[str] | None = None) -> str | None:
+        """Mint a per-app principal's key (#613).
+
+        In-house mode mints a token in the local key store bound to
+        ``app:<app_id>`` (no DB, works on ARM); otherwise it calls LiteLLM's
+        Postgres-backed /key/generate. Returns None when no key can be minted
+        (routing-only mode, no Postgres) — the caller must then skip handing the
+        app a credential rather than give it an empty one.
+        """
+        if getattr(self, "inhouse_keys", False):
+            try:
+                # ``models or ["default"]`` mirrors create_agent_key: an app
+                # installed without an explicit permission set is scoped to the
+                # default chat alias (usable), not minted deny-all.
+                token = self._keystore().mint(
+                    app_principal(app_id), models or ["default"], kind=KIND_APP
+                )
+            except Exception as e:
+                logger.warning("inhouse app key mint failed for %s: %s", app_id, e)
+                return None
+            return token
+        if not self.is_running() or not self.database_url:
+            return None
+        principal = app_principal(app_id)
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                body = {
+                    "key_alias": f"taos-app-{app_id}",
+                    "models": models or ["default"],
+                    "metadata": {
+                        "agent": principal,
+                        "principal": principal,
+                        "principal_kind": KIND_APP,
+                        "app_id": app_id,
+                        "managed_by": "tinyagentos",
+                    },
+                }
+                resp = await client.post(f"{self.url}/key/generate", json=body,
+                                          headers={"Authorization": f"Bearer {get_litellm_master_key(self._data_dir)}"})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return data.get("key", data.get("token"))
+                logger.warning(
+                    "LiteLLM /key/generate returned %d for app=%s body=%.200s",
+                    resp.status_code, app_id, resp.text,
+                )
+        except Exception as e:
+            logger.warning("Failed to create LiteLLM key for app %s: %s", app_id, e)
+        return None
+
+    def app_key_state(self, app_id: str) -> dict | None:
+        """The app principal's current key + scope, or None if it has none.
+
+        In-house mode only: the plaintext token lives in the local key store.
+        A Postgres-backed install keeps its virtual keys inside LiteLLM, where
+        the controller cannot read one back — the access surface reports
+        ``key_present: null`` there rather than guessing.
+        """
+        if not getattr(self, "inhouse_keys", False):
+            return None
+        try:
+            keys = self._keystore().keys_for_principal(app_principal(app_id))
+        except Exception as e:
+            logger.warning("app key lookup failed for %s: %s", app_id, e)
+            return None
+        if not keys:
+            return None
+        # Newest wins: a rotate leaves the older rows behind only if a caller
+        # deleted them out of band, and the newest is what install injected.
+        return {"key": keys[-1]["token"], "allowed_models": keys[-1]["allowed_models"]}
+
+    async def set_app_models(self, app_id: str, models: list[str]) -> bool:
+        """Re-scope every key of an app principal in place (no redeploy).
+
+        Same promise as ``update_agent_key``: the key value is unchanged, so a
+        running container needs no restart — its ``/v1/models`` listing and its
+        permitted set both move to the new list.
+        """
+        if not models:
+            # An empty scope is a caller error, not a request to allow nothing
+            # (same refusal as update_agent_key).
+            logger.warning("set_app_models called with empty models; refusing to re-scope")
+            return False
+        if not getattr(self, "inhouse_keys", False):
+            # Postgres-backed app keys are re-scoped by value via /key/update,
+            # and the controller does not retain that value, so there is
+            # nothing to address here.
+            logger.warning("set_app_models: app key re-scope needs in-house keys; skipping")
+            return False
+        try:
+            store = self._keystore()
+            keys = store.keys_for_principal(app_principal(app_id))
+            rescoped = False
+            for rec in keys:
+                rescoped = store.set_models(rec["token"], models) or rescoped
+            return rescoped
+        except Exception as e:
+            logger.warning("app key re-scope failed: %s", e)
+            return False
+
+    async def delete_app_key(self, app_id: str) -> bool:
+        """Drop every key of an app principal (e.g. on uninstall)."""
+        if not getattr(self, "inhouse_keys", False):
+            return False
+        try:
+            return self._keystore().delete_agent(app_principal(app_id)) > 0
+        except Exception as e:
+            logger.warning("app key delete failed: %s", e)
+            return False
 
     async def update_agent_key(self, key: str, models: list[str]) -> bool:
         """Re-scope an existing virtual key's allowed models via /key/update.

@@ -13,6 +13,13 @@ install:
   env:
     OLLAMA_BASE_URL: http://host.docker.internal:11434
   image: ghcr.io/open-webui/open-webui:0.5.0
+  # This app talks to the model API, so install mints it a per-app LiteLLM
+  # principal (#613) and injects OPENAI_BASE_URL / OPENAI_API_KEY into the
+  # compose env: a key scoped to a model allowlist instead of one shared token
+  # that reaches every model. The scope defaults to the "default" chat alias
+  # (add "llm_models: [...]" to name a set) and is widened per install from the
+  # app's settings -- see GET/PUT /api/apps/{app_id}/llm-access.
+  llm_access: true
   method: docker
   ports:
   - 3000

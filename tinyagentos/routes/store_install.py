@@ -25,6 +25,12 @@ from tinyagentos.agent_image import (
     base_image_url_for_alias,
     ensure_image_present,
 )
+from tinyagentos.app_llm_access import (
+    inject_install_env,
+    manifest_opts_in,
+    permitted_models_for_install,
+    provision,
+)
 from tinyagentos.catalog.resolver import (
     DeviceCapability,
     ResolveErr,
@@ -218,6 +224,48 @@ def _get_current_user(request: Request) -> dict | None:
 def _registry_get(registry, app_id: str):
     """Look up a manifest by ID."""
     return registry.get(app_id)
+
+
+async def _inject_app_llm_env(request: Request, app_id: str, install_config, manifest) -> None:
+    """Give a model-consuming app its own LLM credential (#613), best-effort.
+
+    No-op unless the manifest opted in (``install.llm_access: true``). Any
+    failure is logged and swallowed: an app that cannot be handed a scoped key
+    still installs (it just has no model access), because failing the install
+    over a credential would be the worse outcome.
+    """
+    try:
+        if not manifest_opts_in(manifest):
+            return
+        if not isinstance(install_config, dict):
+            return
+        await inject_install_env(request, app_id, install_config, manifest)
+    except Exception:  # noqa: BLE001 - never fail an install over a credential
+        logger.exception("app llm access: injecting the credential for %s failed", app_id)
+
+
+async def _record_service_app_install(
+    request: Request, store, app_id: str, version: str, meta: dict, manifest=None,
+) -> None:
+    """Mark a service app installed, then mint its LLM principal if it opted in.
+
+    The env injection for docker installs happens earlier (before the container
+    is created); this covers every other backend, plus a reinstall — the mint is
+    idempotent and re-scopes the key the app already holds rather than minting a
+    second one. Not used by ``_install_agent_framework``: an agent framework is
+    deployed per-agent later, and its manifest never declares ``llm_access``.
+    """
+    await store.install(app_id, version, meta)
+    if not manifest_opts_in(manifest):
+        return
+    try:
+        await provision(
+            getattr(request.app.state, "llm_proxy", None),
+            app_id,
+            models=permitted_models_for_install(manifest),
+        )
+    except Exception:  # noqa: BLE001 - never fail an install over a credential
+        logger.exception("app llm access: minting the principal for %s failed", app_id)
 
 
 def _verify_manifest_for_install(
@@ -452,7 +500,9 @@ async def _legacy_install(request: Request, body: dict, app_id: str | None, targ
             )
         store = getattr(request.app.state, "installed_apps", None)
         if store is not None:
-            await store.install(app_id, body.get("version", ""), meta)
+            await _record_service_app_install(
+                request, store, app_id, body.get("version", ""), meta, manifest,
+            )
             await store.update_runtime_location(
                 app_id,
                 host=urlparse(rkllama_url).hostname or "localhost",
@@ -506,7 +556,9 @@ async def _legacy_install(request: Request, body: dict, app_id: str | None, targ
             return JSONResponse({"error": result.get("error", "install failed")}, status_code=500)
         store = getattr(request.app.state, "installed_apps", None)
         if store is not None:
-            await store.install(app_id, body.get("version", ""), meta)
+            await _record_service_app_install(
+                request, store, app_id, body.get("version", ""), meta, manifest,
+            )
             host_port = result.get("host_port")
             if host_port:
                 runtime_host = await _resolve_host(_target_remote)
@@ -545,7 +597,9 @@ async def _legacy_install(request: Request, body: dict, app_id: str | None, targ
             )
         store = getattr(request.app.state, "installed_apps", None)
         if store is not None:
-            await store.install(app_id, body.get("version", ""), meta)
+            await _record_service_app_install(
+                request, store, app_id, body.get("version", ""), meta, manifest,
+            )
             # Record where the now-verified-running service actually
             # listens, same as the docker branch below, so it gets a
             # Launchpad shortcut / proxy target. Script-backed services are
@@ -586,6 +640,15 @@ async def _legacy_install(request: Request, body: dict, app_id: str | None, targ
                 DockerInstaller(apps_dir=apps_dir) if backend == "docker"
                 else PipInstaller(apps_dir=apps_dir)
             )
+            if backend == "docker":
+                # A model-consuming app gets its own LiteLLM principal (#613):
+                # mint a model-scoped key and merge OPENAI_BASE_URL /
+                # OPENAI_API_KEY into the compose environment before the
+                # container is created. Best-effort by design — a mint failure
+                # leaves the app installing without a credential, it does not
+                # fail the install. pip installs are libraries, not containers,
+                # so there is no env to write.
+                await _inject_app_llm_env(request, app_id, install_config, manifest)
             inst_result = await installer.install(app_id, install_config)
         except (FileNotFoundError, ImportError) as exc:
             # Binary or installer module missing on this controller.
@@ -654,7 +717,9 @@ async def _legacy_install(request: Request, body: dict, app_id: str | None, targ
 
     # Default: delegate to InstalledAppsStore (records the install in db / store).
     store = request.app.state.installed_apps
-    await store.install(app_id, body.get("version", ""), meta)
+    await _record_service_app_install(
+        request, store, app_id, body.get("version", ""), meta, manifest,
+    )
     raw_remote = body.get("target_remote") or ""
     _target_remote = raw_remote if raw_remote and raw_remote != "local" else None
 

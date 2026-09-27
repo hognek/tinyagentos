@@ -1403,6 +1403,55 @@ A Civitai URL added to the Library takes the same path: `detect_kind` tags it
 `url:civitai` and `CivitaiProcessor` runs the identical ingest job, linking the
 resulting `lora_id` back onto the library item.
 
+## Per-app LLM access (`/api/apps/{app_id}/llm-access`, issue #613)
+
+Route module `tinyagentos/routes/app_permissions.py`; logic in
+`tinyagentos/app_llm_access.py`. Session-only: no registry scope reaches these
+routes, and the two writes additionally require an ADMIN session (a model
+allowlist is a credential scope, not a per-user consent).
+
+An installed app that calls the model API is a principal, not a shared-token
+holder. On install, a manifest that declares `install: {llm_access: true}` gets a
+LiteLLM key minted for the principal `app:<app_id>`, scoped to a model
+allowlist (`install.llm_models`, defaulting to the `default` chat alias), and the
+install merges `OPENAI_BASE_URL` / `OPENAI_API_KEY` (plus `LITELLM_API_KEY`)
+into the container env. `app-catalog/services/open-webui/manifest.yaml` is the
+reference declaration. A docker app reaches the proxy at
+`http://host.docker.internal:7834/v1`; DockerInstaller adds the matching
+`extra_hosts` entry for any env value that names that alias.
+
+- `GET /api/apps/{app_id}/llm-access` -- `{app_id, permitted_models,
+  key_present, key_masked, declares_llm_access}`. `key_present` is `null` (not
+  `false`) when the credential store cannot be read back -- a Postgres-backed
+  install keeps its virtual keys inside LiteLLM -- so a caller can tell "no key"
+  from "unknown".
+- `PUT /api/apps/{app_id}/llm-access` -- body `{models: [...]}`, admin only.
+  Re-scopes the existing key IN PLACE (value unchanged, so a running container
+  needs no restart); an app that never had a key is minted one. Answers
+  `{key_action: "rescoped" | "minted" | "unchanged"}`, `400` on an empty list,
+  `503` when no key can be written.
+- `POST /api/apps/{app_id}/llm-access/rotate` -- admin only. Mints a fresh key
+  and drops the old ones; the plaintext is returned exactly once. `503` if the
+  proxy cannot mint.
+
+Env injection happens for DOCKER installs, the backend whose environment taOS
+writes. An opting-in app installed on another backend (LXC, script) still gets
+its principal minted at install and is manageable through the same route, but
+the credential is pasted into that app's own configuration rather than injected.
+
+Enforcement is the same allowlist on both credential surfaces, because both read
+the same row: the LiteLLM `custom_auth` hook (`tinyagentos/litellm_auth.py`,
+`user_api_key_auth`) and the in-process LLM gateway
+(`tinyagentos/llm_gateway/auth.py`, caller kind `app`). An app principal is NOT
+subject to the per-agent LLM budget -- it is not an agent -- and its refusals
+read "for this app" rather than "for this agent".
+
+The principal itself lives in the shared keystore
+(`tinyagentos/litellm_keystore.py`): an `agent_keys` row with `kind = "app"`
+bound to `app:<app_id>`. That is what makes an app a first-class principal
+alongside agents and nodes, and what lets `revoke_keys_for("app:<app_id>")` kill
+its credential on uninstall.
+
 ## What `GET /api/decisions/agent` returns (grant scoping)
 
 Route module `tinyagentos/routes/decisions.py`, scope `decisions_write`. Lists
