@@ -98,18 +98,32 @@ def _placement_for(worker) -> list[dict]:
         btype = str(b.get("type") or "")
         bname = str(b.get("name") or btype)
         bstatus = str(b.get("status") or "")
-        # `loaded_models` is the resident subset when the worker reports it;
-        # `models` is the backend's whole catalog, so it is only used as the
-        # residency signal for older workers that never sent `loaded_models`.
+        # `loaded_models` is the resident (actually-loaded) subset when the
+        # worker reports it. An absent key means the worker published NO
+        # residency signal — never fall back to `models` (that is the whole
+        # catalog = pulled-but-idle), or we would claim every downloaded
+        # model is loaded.
         resident = b.get("loaded_models")
-        if resident is None:
-            resident = b.get("models") or []
-        resident_names = {_model_name(m) for m in resident if isinstance(m, dict)}
+        resident_names = (
+            {_model_name(m) for m in resident if isinstance(m, dict)}
+            if resident is not None
+            else set()
+        )
 
         available = [m for m in (b.get("available_models") or []) if isinstance(m, dict)]
         for m in available:
             model_id = str(m.get("model_id") or "")
-            state = "loaded" if model_id in resident_names else "installed"
+            mstatus = str(m.get("status") or "").strip().lower()
+            if mstatus == "loaded":
+                state = "loaded"
+            elif mstatus:
+                # An explicit non-"loaded" status ("available", "installed",
+                # "downloaded", ...) means present-but-not-resident.
+                state = "installed"
+            elif model_id in resident_names:
+                state = "loaded"
+            else:
+                state = "installed"
             _add(
                 model_id, bname, btype, bstatus, state,
                 capability=str(m.get("capability") or ""),
@@ -118,9 +132,11 @@ def _placement_for(worker) -> list[dict]:
             )
 
         if not available:
+            # No per-model availability declared: the catalog is present but
+            # there is no residency signal, so every model is "installed".
             for m in (b.get("models") or []):
                 if isinstance(m, dict):
-                    _add(_model_name(m), bname, btype, bstatus, "loaded")
+                    _add(_model_name(m), bname, btype, bstatus, "installed")
 
         # A resident model the manifest did not declare must still be placed.
         for name in sorted(resident_names):

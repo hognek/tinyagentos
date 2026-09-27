@@ -56,6 +56,7 @@ async def test_map_aggregates_capabilities_and_placement(client, app):
                     "status": "ok",
                     "capabilities": ["llm-chat"],
                     "models": [{"name": "qwen2.5-7b"}],
+                    "loaded_models": [{"name": "qwen2.5-7b"}],
                     "available_models": [
                         {
                             "model_id": "qwen2.5-7b",
@@ -145,6 +146,53 @@ async def test_map_aggregates_capabilities_and_placement(client, app):
     assert {"qwen2.5-7b", "llama3-8b"} <= {
         p["model_id"] for p in node["placement"] if p["capability"] == "chat"
     }
+
+
+@pytest.mark.asyncio
+async def test_map_legacy_backend_without_loaded_models_is_installed(client, app):
+    """A backend that never reports `loaded_models` must not have its whole
+    catalog counted as loaded — the absence of a residency signal means every
+    model is installed, not resident (regression for the fallback that treated
+    `models` as the residency set)."""
+    _put_worker(
+        app,
+        WorkerInfo(
+            name="legacy-box",
+            url="http://10.0.0.11:9000",
+            platform="linux",
+            status="online",
+            last_heartbeat=time.time(),
+            hardware={
+                "ram_mb": 16384,
+                "cpu": {"arch": "x86_64"},
+                "gpu": {"type": "nvidia", "cuda": True, "vram_mb": 8192},
+            },
+            backends=[
+                {
+                    "name": "ollama:11434",
+                    "type": "ollama",
+                    "status": "ok",
+                    "capabilities": ["llm-chat"],
+                    # Legacy worker: `models` (the whole catalog) but NO
+                    # `loaded_models` residency signal.
+                    "models": [{"name": "qwen2.5-7b"}, {"name": "phi-3-mini"}],
+                }
+            ],
+            models=["qwen2.5-7b", "phi-3-mini"],
+            capabilities=["chat"],
+        ),
+    )
+
+    resp = await client.get("/api/cluster/map")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    node = next((n for n in data["nodes"] if n["name"] == "legacy-box"), None)
+    assert node is not None, data
+    placement = {(p["model_id"], p["state"]) for p in node["placement"]}
+    # With no residency signal, nothing may be claimed "loaded".
+    assert ("qwen2.5-7b", "installed") in placement
+    assert ("phi-3-mini", "installed") in placement
+    assert all(state == "installed" for _, state in placement)
 
 
 @pytest.mark.asyncio
