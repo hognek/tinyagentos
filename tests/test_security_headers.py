@@ -141,7 +141,17 @@ class TestSpaShellCspCompatibility:
         )
         boot = _DESKTOP_DIR / "public" / "boot.js"
         assert boot.is_file(), "desktop/public/boot.js must exist (copied to the build root)"
-        assert "data-perf" in boot.read_text(encoding="utf-8")
+        # Assert the behaviour, not just that the file mentions `data-perf`: a
+        # boot.js that lost the preference read or the attribute write — or one
+        # where both survive only inside comments — would still pass a bare
+        # substring check while restoring the first-paint flash.
+        boot_source = boot.read_text(encoding="utf-8")
+        assert "taos-reduce-effects" in boot_source, (
+            "desktop/public/boot.js must read the saved reduce-effects preference"
+        )
+        assert 'setAttribute("data-perf", "reduced")' in boot_source, (
+            "desktop/public/boot.js must apply data-perf=reduced to the document element"
+        )
 
     @pytest.mark.asyncio
     async def test_csp_script_src_has_no_unsafe_inline(self, client):
