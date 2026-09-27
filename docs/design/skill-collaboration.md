@@ -136,21 +136,24 @@ are a 400 by design, so a broken cursor fails loudly rather than silently
 re-reading the window) and asks the local proxy for new `learning` rows. It:
 
 1. parses the envelope, drops malformed ones,
-2. drops anything out of scope or from a foreign instance namespace (§3.2),
-3. drops anything whose `status != "fleet"` or that duplicates a known
-   supplement id,
-4. **verifies the promotion record** (§6.2): `promotion.by` must resolve to a
+2. **applies authorized tombstones first** (§6.3). A tombstone is a distinct
+   event kind, not a supplement carrying `status: "retracted"`, so it is never
+   subject to the status filter below and is never "adopted" — it removes. It is
+   applied only if its authority checks out (§6.3). Applying tombstones before
+   anything else means a retraction and a re-publish travelling in the same batch
+   cannot leave the withdrawn version live,
+3. drops anything out of scope or from a foreign instance namespace (§3.2),
+4. drops anything whose `status != "fleet"` — `draft` and `review` are seen at
+   most — or that duplicates a known supplement id,
+5. **verifies the promotion record** (§6.2): `promotion.by` must resolve to a
    reviewer this instance trusts, and `promotion.decision_id` must match an
    approval this instance holds. A sender-declared `status: "fleet"` with no
    verifiable promotion is stored as *seen*, never adopted. The bus attests
    *who sent it* (the send proxy's `token sub == from` check); it does not attest
    *that anyone reviewed it*, and the two must not be conflated,
-5. writes surviving supplements into the local store,
-6. only then may raise a signal — batched on a short settle window — and only
+6. writes surviving supplements into the local store,
+7. only then may raise a signal — batched on a short settle window — and only
    for a supplement that is new *and* relevant *and* verifiably promoted.
-
-Retraction events (§6.3) ride the same path and are applied before any new
-supplement from the same batch.
 
 ## 4. The supplement: data shape
 
@@ -169,7 +172,7 @@ One JSON envelope in the bus `body`, and one row in a local store:
   "evidence": [{"run_id": "...", "trace": "<#896 trace id>", "observed": "OOM at step 2, Q4, 1024px"}],
   "provenance": {"created_ts": 0, "source_bus_msg": "...", "prev": null},
   "promotion": {"by": "@<reviewer handle>", "canonical_id": "...", "decision_id": "dec-...", "ts": 0},
-  "status": "draft|review|fleet|retracted",
+  "status": "draft|review|fleet",   // retraction is a separate guide.tombstone event
   "supersedes": null
 }
 ```
@@ -191,8 +194,10 @@ Rules that make the shape safe:
 - **`evidence` must point at a real artifact** (a #896 trace id, a run id). A
   supplement with no evidence is rejected at publish, not at review — the gate
   should not spend a human on an unfalsifiable claim.
-- **`status` is monotone-ish**: `draft → review → fleet`, and any state may go to
-  `retracted`. Promotion is the only transition that requires the gate (§6).
+- **`status` is monotone-ish**: `draft → review → fleet`. Promotion is the only
+  transition that requires the gate (§6); withdrawal is not a status change but a
+  `guide.tombstone` event (§6.3), which is why a tombstone can never be swallowed
+  by the status filter.
 
 ## 5. Merge and reconcile with the canonical guides
 
@@ -234,7 +239,8 @@ status other agents adopt — is unreachable without passing the gate.
 draft       author-local; rendered only for the author; never on the bus
 review      submitted; on the bus as status=review; NOT adopted by anyone
 fleet       promoted by the gate; adopted by in-scope subscribers
-retracted   tombstone; dropped fleet-wide on next sync; never resurrected
+(withdrawn) a guide.tombstone event drops a `fleet` supplement fleet-wide on the
+            next sync; the id is never resurrected
 ```
 
 A **personal** supplement (usable on the author alone) is a local `draft`+adopt
@@ -259,7 +265,7 @@ explicitly (no silent drop — the author is told).
 - **Promotion is an attested record, not a status flag.** Approving writes the
   `promotion` block (`by`, `canonical_id`, `decision_id`, `ts`) from the
   *reviewer's* identity — the republish is sent as the reviewer, not the author —
-  and subscribers check it before adopting (§3.5 step 4). A sender-supplied
+  and subscribers check it before adopting (§3.5 step 5). A sender-supplied
   `status: "fleet"` proves nothing.
 
 ### 6.3 Rollback
@@ -267,10 +273,20 @@ explicitly (no silent drop — the author is told).
 A bad lesson must be removable, and the mechanism has to work with the grant
 model as it actually is: `agent_grants_store` exposes `add_grant` / `list_grants`
 / `list_active_grants` and **no revoke** — there is no revoking a published
-lesson's access. So rollback is a **`retracted` tombstone event on the bus**:
+lesson's access. So rollback is a **tombstone event on the bus** (kind
+`guide.tombstone`):
 
 - promotion writes a generation number into the local store; retraction
-  increments it and publishes a minimal tombstone referencing the `id`;
+  increments it and publishes a minimal tombstone event referencing the `id`
+  (kind `guide.tombstone`, not a supplement with `status: "retracted"`, so the
+  status filter in §3.5 step 4 can never silently drop it);
+- **a tombstone only counts from an authority that could have promoted the
+  supplement**: the reviewer identity that promoted it, or the original author
+  withdrawing their own. Anyone else's tombstone is recorded as seen and ignored
+  — otherwise any agent with `a2a_send` could erase another agent's lesson. The
+  poller enforces this (§3.5 step 2) with the same reviewer check as the
+  promotion record, and the tombstone carries the same `promotion`-style
+  attestation block;
 - subscribers apply tombstones before new supplements in the same batch and drop
   the supplement *and* everything it superseded;
 - the tombstone is append-only — the history of "this was believed, then
@@ -343,12 +359,15 @@ commands run from the repo root.
   with no LLM turn spent (the poller is asserted to be script-only);
   (b) re-polling with the same cursor adopts nothing twice; (c) an out-of-scope
   supplement is stored as seen but not adopted; (d) a `status=review` supplement
-  is never adopted; (e) a tombstone removes the supplement and its supersedes
-  chain on the next sync; (f) publication is refused for an agent not on the
+  is never adopted; (e) an authorized tombstone removes the supplement and its
+  supersedes chain on the next sync; (f) publication is refused for an agent not on the
   allowlist; (g) a `status=fleet` supplement carrying **no verifiable
   `promotion`** — absent, or `by` resolving to a non-reviewer — is stored as seen
   and NOT adopted; (h) a supplement from a foreign instance namespace is not
-  adopted (§3.2).
+  adopted (§3.2); (i) a tombstone from an identity that neither promoted the
+  supplement nor authored it leaves the target and its superseded chain
+  unchanged; (j) a tombstone and a re-publish of the same id in one batch leave
+  the withdrawn version removed.
 - Verify: `uv run pytest tests/test_guides_bus.py -q`
 
 **S3. Review gate + #896 governance surface. MAINTAINER-REVIEW.**
