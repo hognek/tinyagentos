@@ -13,17 +13,23 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { beforeEach, describe, expect, it } from "vitest";
 
-const BOOT_SRC = readFileSync(
-  path.resolve(__dirname, "..", "..", "public", "boot.js"),
-  "utf-8",
-);
+const BOOT_PATH = path.resolve(__dirname, "..", "..", "public", "boot.js");
+
+/**
+ * Read the shipped script inside the test, not at module scope: a missing or
+ * renamed asset then shows up as a normal test failure instead of an import
+ * error that stops vitest from discovering the file's tests at all.
+ */
+function bootSource(): string {
+  return readFileSync(BOOT_PATH, "utf-8");
+}
 
 /** Run the shipped script the way the browser does — an IIFE in global scope. */
 function runBoot(saved: string | null): string | null {
   localStorage.clear();
   if (saved !== null) localStorage.setItem("taos-reduce-effects", saved);
   document.documentElement.removeAttribute("data-perf");
-  new Function(BOOT_SRC)();
+  new Function(bootSource())();
   return document.documentElement.getAttribute("data-perf");
 }
 
