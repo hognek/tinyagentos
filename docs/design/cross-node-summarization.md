@@ -248,14 +248,24 @@ window and, for a reference that falls outside it:
      path, routed by the collection's #155 locality policy) filtered to
      `kind: "summary"` for that conversation — this is the path that survives a
      summary-store/node relocation and is what #155 buys us;
-   - **fallback:** a direct summary-store read by
-     `(conversation_id, segment_id)` on the controller. This tier exists
-     precisely because a committed summary can be **spliceable while not yet
-     vector-searchable** (an index write still draining through the outbox in
-     section 5). Without it, a summary would be invisible for the whole retry
-     window despite already being correct.
-2. verify `source_sha256` against the current raw segment — the check is
-   identical whichever tier resolved it, so a stale row is rejected either way;
+   - **fallback:** a direct summary-store read keyed by
+     `(conversation_id, segment_id, source_sha256)` on the controller — the
+     **current** segment's hash, computed by the caller from the raw text, is
+     part of the key. Keying on the hash rather than on
+     `(conversation_id, segment_id)` alone matters: the store deliberately keeps
+     one row per hash, so a segment-level lookup could return a superseded row,
+     fail the step-2 check, and hide a perfectly good current summary for the
+     whole retry window. With the hash in the key this is a single point read
+     and the ambiguity cannot arise. This tier exists precisely because a
+     committed summary can be **spliceable while not yet vector-searchable** (an
+     index write still draining through the outbox in section 5); without it, a
+     summary would be invisible for the whole retry window despite already being
+     correct.
+2. verify `source_sha256` against the current raw segment. For the RAG tier this
+   is a real check — the query returns candidates by similarity and the row it
+   hands back may be superseded. For the direct tier the hash is already part of
+   the lookup key, so this step is a confirmation of the same value, not a
+   second, different filter. Either way a stale row is rejected.
 3. splice the summary text in **ahead of** the retained hot window as a
    distinctly marked block (segment time range + "summarised" marker) so the
    model — and, in a transcript view, the user — can tell derived text from
@@ -372,7 +382,9 @@ Acceptance:
       index write is still pending and the summary must still splice.
 - [ ] A committed summary is spliceable **before** its index write is
       reconciled (two-tier lookup), and a stale summary is rejected at both
-      tiers.
+      tiers. The direct tier keys on the current segment's `source_sha256`, so a
+      superseded row cannot shadow the current summary — covered by a test with
+      two rows for one segment (old hash + current hash, index pending).
 - [ ] A summary is never spliced for a segment whose messages are still inside
       the hot window (no duplication).
 - [ ] Spliced text is marked and attributable: segment id + time range are
