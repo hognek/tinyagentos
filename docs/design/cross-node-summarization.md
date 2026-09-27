@@ -235,21 +235,34 @@ The embedding goes to the existing vector index (`taosmd/vector_memory.py`
 stores `text` + `embedding` + `metadata_json` in SQLite; the qmd serve index is
 what `routes/memory.py` proxies per agent) with `metadata_json` carrying
 `{conversation_id, segment_id, source_sha256, kind: "summary"}`. Retrieval is
-therefore an ordinary RAG call, which is the whole point of the #155 dependency.
+therefore an ordinary RAG call, which is the whole point of the #155 dependency —
+though the RAG index is not the only lookup (section 4.4).
 
 ### 4.4 Pulling it back
 
 When the live node assembles context, it keeps the current behaviour for the hot
 window and, for a reference that falls outside it:
 
-1. issue an ordinary memory/RAG query (the `routes/memory.py` proxy path,
-   routed by the collection's #155 locality policy) filtered to
-   `kind: "summary"` for that conversation;
-2. verify `source_sha256` against the current raw segment;
+1. resolve the summary with a **two-tier lookup**:
+   - **preferred:** an ordinary memory/RAG query (the `routes/memory.py` proxy
+     path, routed by the collection's #155 locality policy) filtered to
+     `kind: "summary"` for that conversation — this is the path that survives a
+     summary-store/node relocation and is what #155 buys us;
+   - **fallback:** a direct summary-store read by
+     `(conversation_id, segment_id)` on the controller. This tier exists
+     precisely because a committed summary can be **spliceable while not yet
+     vector-searchable** (an index write still draining through the outbox in
+     section 5). Without it, a summary would be invisible for the whole retry
+     window despite already being correct.
+2. verify `source_sha256` against the current raw segment — the check is
+   identical whichever tier resolved it, so a stale row is rejected either way;
 3. splice the summary text in **ahead of** the retained hot window as a
    distinctly marked block (segment time range + "summarised" marker) so the
    model — and, in a transcript view, the user — can tell derived text from
    verbatim text.
+
+A summary becomes **spliceable at commit**, not at reconciliation: the two-tier
+lookup is what makes that true rather than merely asserted.
 
 Step 2 is what stops a stale summary from overruling live context: **the raw
 segment and the hot window always win.**
@@ -260,7 +273,7 @@ segment and the hot window always win.**
 |---|---|
 | **Stale summary vs live context** | Summaries are keyed on `source_sha256`. A summary whose key no longer matches the current raw segment is *ignored*, never merged. The raw text (hot window, then archive) is authoritative at all times; splices are additive. |
 | **Duplicate / concurrent summarisation of one segment** | The composite primary key plus an explicit `ON CONFLICT ... DO NOTHING` makes the second write a no-op rather than a constraint error. Two producers racing is wasteful, not corrupting. |
-| **Summary row committed, index entry missing** | The vector index is **not** in the summary store's SQLite transaction: it is owned by the qmd serve process and reached over HTTP (`tinyagentos/qmd_client.py`, proxied by `routes/memory.py`), so it cannot join a local commit. Committing the summary row and a durable **index-write outbox** row together, drained by a reconciler that retries an idempotent qmd upsert until it succeeds, is the recovery contract — the house already has this pattern in `tinyagentos/chat/peer_outbox.py` (attempt counter, `next_retry_at`, exponential backoff). A summary row whose index entry never landed is still correct and still splices; it is merely not yet findable by vector search. |
+| **Summary row committed, index entry missing** | The vector index is **not** in the summary store's SQLite transaction: it is owned by the qmd serve process and called over HTTP (`tinyagentos/qmd_client.py`, proxied by `routes/memory.py`), so it cannot join a local commit. Committing the summary row and a durable **index-write outbox** row together, drained by a reconciler that retries an idempotent qmd upsert until it succeeds, is the recovery contract — the house already has this pattern in `tinyagentos/chat/peer_outbox.py` (attempt counter, `next_retry_at`, exponential backoff). A summary row whose index entry has not landed yet is still correct and still spliceable through the direct store lookup (section 4.4); it is only vector *discovery* that is delayed. |
 | **Producer node dies mid-job** | The job is a `BACKGROUND` job with a lease/claim TTL; expiry re-queues it. No partial writes are possible because the producer never writes controller state at all — the controller's only write is the completed-result commit described in the row above. |
 | **Controller restarts mid-job** | `JobQueue._sync_init()` already marks stale `running` rows as `failed` ("stale: process restarted"). A summarization job lost this way is re-enqueued on the next pass from the same idempotent source, and re-running it cannot double-write. |
 | **Index node offline / no summary found** | The splice lookup misses and the runtime falls back to **today's exact behaviour** — the oldest-dropped window from `build_context_window()` — with one WARNING log. No user-visible error, no blocked turn. This is the required degraded mode, not an afterthought. |
@@ -354,7 +367,12 @@ splices a marked block ahead of the hot window.
 Acceptance:
 
 - [ ] Retrieval goes through the memory/RAG proxy with the collection's
-      `locality_policy` respected; no bespoke shard fetch is added.
+      `locality_policy` respected; no bespoke shard fetch is added. The direct
+      summary-store fallback (section 4.4) is exercised by a test in which the
+      index write is still pending and the summary must still splice.
+- [ ] A committed summary is spliceable **before** its index write is
+      reconciled (two-tier lookup), and a stale summary is rejected at both
+      tiers.
 - [ ] A summary is never spliced for a segment whose messages are still inside
       the hot window (no duplication).
 - [ ] Spliced text is marked and attributable: segment id + time range are
