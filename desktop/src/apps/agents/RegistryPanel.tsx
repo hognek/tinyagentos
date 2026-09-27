@@ -500,7 +500,7 @@ function RegistryEntryRow({
               <UserPlus size={14} />
             </Button>
           )}
-          {canAssign && (
+          {isAdmin && entry.status === "active" && (
             <Button
               variant="ghost"
               size="icon"

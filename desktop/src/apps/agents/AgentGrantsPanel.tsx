@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import {
@@ -62,14 +62,18 @@ export function AgentGrantsPanel({
   const [error, setError] = useState<string | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const loadSeq = useRef(0);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
 
-  async function load() {
+  // Wrapped so the effect dep is stable (matches RegistryPanel/LogsPanel); the
+  // loadSeq guard still drops stale completions when the target changes.
+  const load = useCallback(async () => {
     const seq = ++loadSeq.current;
     setError(null);
     try {
       const [gs, ps] = await Promise.all([
         listAgentGrants(target.canonical_id),
-        projectsApi.list(),
+        projectsApi.list().catch(() => []), // project labels are cosmetic; never block grants on them
       ]);
       if (seq !== loadSeq.current) return;
       setGrants(gs);
@@ -79,19 +83,19 @@ export function AgentGrantsPanel({
       setError(e instanceof Error ? e.message : "Failed to load grants");
       setGrants(null);
     }
-  }
-
-  useEffect(() => {
-    load();
   }, [target.canonical_id]);
 
   useEffect(() => {
+    load();
+  }, [load]);
+
+  useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") onCloseRef.current();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, []);
 
   const groups = useMemo<GrantGroup[]>(() => {
     const rows = grants ?? [];
@@ -138,7 +142,7 @@ export function AgentGrantsPanel({
       <div
         role="dialog"
         aria-modal="true"
-        aria-label={`Grant access for ${agentLabel(target)}`}
+        aria-label={`Manage grants for ${agentLabel(target)}`}
         className="relative bg-zinc-900 rounded-md shadow-xl border border-white/10 w-[560px] max-w-full max-h-[80vh] flex flex-col"
         onClick={(e) => e.stopPropagation()}
       >
