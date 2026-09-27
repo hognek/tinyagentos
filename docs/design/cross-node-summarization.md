@@ -150,7 +150,7 @@ Notes that matter for correctness:
   `JobQueue` enum ("overnight maintenance, rebuilds"), and maps to the `bulk`
   class in the SLO-aware scheduler addendum (`docs/design/slo-aware-scheduler.md`):
   *"Hours to days, job queue semantics — Run only on idle cycles."* That
-  addendum is not implemented (no `slo_class` in the tree today), so S1 records
+  addendum is not implemented (no `slo_class` in code today), so S1 records
   the class as a label on the job payload and does not require the scheduler
   work to land first.
 - **Where this lands in the capability map.** #897 owns the node/capability
@@ -284,7 +284,7 @@ segment and the hot window always win.**
 | **Stale summary vs live context** | Summaries are keyed on `source_sha256`. A summary whose key no longer matches the current raw segment is *ignored*, never merged. The raw text (hot window, then archive) is authoritative at all times; splices are additive. |
 | **Duplicate / concurrent summarisation of one segment** | The composite primary key plus an explicit `ON CONFLICT ... DO NOTHING` makes the second write a no-op rather than a constraint error. Two producers racing is wasteful, not corrupting. |
 | **Summary row committed, index entry missing** | The vector index is **not** in the summary store's SQLite transaction: it is owned by the qmd serve process and called over HTTP (`tinyagentos/qmd_client.py`, proxied by `routes/memory.py`), so it cannot join a local commit. Committing the summary row and a durable **index-write outbox** row together, drained by a reconciler that retries an idempotent qmd upsert until it succeeds, is the recovery contract — the house already has this pattern in `tinyagentos/chat/peer_outbox.py` (attempt counter, `next_retry_at`, exponential backoff). A summary row whose index entry has not landed yet is still correct and still spliceable through the direct store lookup (section 4.4); it is only vector *discovery* that is delayed. |
-| **Producer node dies mid-job** | The job is a `BACKGROUND` job with a lease/claim TTL; expiry re-queues it. No partial writes are possible because the producer never writes controller state at all — the controller's only write is the completed-result commit described in the row above. |
+| **Producer node dies mid-job** | The job is a `BACKGROUND` job claimed with an atomic pending→running UPDATE and **no heartbeat or claim TTL** (only GPU leases and BLE pairing carry TTLs today), so a producer that dies mid-job leaves its row `running` until the controller's startup sweep (`JobQueue._sync_init`) marks it `failed` on the next restart and a later pass re-enqueues it from the idempotent source. No partial writes are possible because the producer never writes controller state at all — the controller's only write is the completed-result commit above. A mid-job claim-TTL/reaper (recovery without a restart) is explicitly S2 scope. |
 | **Controller restarts mid-job** | `JobQueue._sync_init()` already marks stale `running` rows as `failed` ("stale: process restarted"). A summarization job lost this way is re-enqueued on the next pass from the same idempotent source, and re-running it cannot double-write. |
 | **Index node offline / no summary found** | The splice lookup misses and the runtime falls back to **today's exact behaviour** — the oldest-dropped window from `build_context_window()` — with one WARNING log. No user-visible error, no blocked turn. This is the required degraded mode, not an afterthought. |
 | **Live inference must not be interrupted** | Eligibility requires no active lease *and* idle, so a job is placed only on a node the cluster believes is free. The live path additionally never blocks on summarisation: enqueue is fire-and-forget and the only synchronous summarisation work is the S3 lookup. |
@@ -342,7 +342,10 @@ Depends on: S1; the worker-side job surface (see open question 1).
 
 Scope: the job runs on an **eligible remote node**. Placement reads the
 capability map + the eligibility predicate; the controller ships the segment
-text (or the #154 state handle) and commits the returned result.
+text (or the #154 state handle) and commits the returned result. This slice
+also adds the mid-job recovery the §5 table defers to it: a claim TTL/reaper
+(or re-enqueue from the idempotent source) so a worker stalled offline is
+recovered without waiting for a controller restart.
 
 Acceptance:
 
