@@ -131,6 +131,14 @@ async def test_ring_buffer_is_bounded_and_seq_is_monotonic():
     assert [e.seq for e in events] == [5, 4, 3]
     assert len(feed) == 3
     assert feed.stats()["capacity"] == 3
+    assert feed.last_seq == 5
+
+
+async def test_last_seq_is_zero_before_anything_is_recorded():
+    feed = ModelActivityFeed()
+    assert feed.last_seq == 0
+    feed.record(MODEL_LOAD, model="a")
+    assert feed.last_seq == 1
 
 
 async def test_snapshot_filters_by_model_worker_and_event():
@@ -537,6 +545,35 @@ async def test_stream_resume_ignores_the_catch_up_limit():
         await it.aclose()
 
     assert seqs == [2, 3]
+
+
+async def test_stream_treats_a_resume_id_ahead_of_the_feed_as_a_new_connection():
+    """A controller restart resets seq to 1. A client reconnecting with an id
+    from the previous process must not have every new event suppressed."""
+    feed = ModelActivityFeed()
+    feed.record(MODEL_LOAD, model="m1")
+
+    resp = await model_activity_stream(
+        _sse_request(feed, headers={"last-event-id": "9999"}),
+        limit=50, model=None, worker=None, event=None, _user=_USER,
+    )
+    it = resp.body_iterator
+
+    async def _emit() -> None:
+        await asyncio.sleep(0)
+        feed.record(MODEL_LOAD, model="m2")
+        await asyncio.sleep(0)
+
+    emitter = asyncio.ensure_future(_emit())
+    try:
+        first = _parse_frame(await asyncio.wait_for(it.__anext__(), timeout=5))
+        second = _parse_frame(await asyncio.wait_for(it.__anext__(), timeout=5))
+    finally:
+        emitter.cancel()
+        await it.aclose()
+
+    assert first["model"] == "m1"   # the window is replayed as a new connection
+    assert second["model"] == "m2"  # and the new live event is NOT suppressed
 
 
 async def test_stream_treats_a_malformed_last_event_id_as_no_resume():

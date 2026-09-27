@@ -237,6 +237,16 @@ class ModelActivityFeed:
     def maxlen(self) -> int:
         return self._ring.maxlen or 0
 
+    @property
+    def last_seq(self) -> int:
+        """Sequence of the most recent event, or 0 when nothing was recorded.
+
+        The counter is per-process: it restarts at 1 on a controller restart.
+        Consumers holding a resume id from a previous process must compare it
+        against this before trusting it.
+        """
+        return self._seq
+
     def __len__(self) -> int:
         return len(self._ring)
 

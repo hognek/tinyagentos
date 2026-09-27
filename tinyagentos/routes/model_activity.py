@@ -143,6 +143,13 @@ async def model_activity_stream(
         return JSONResponse({"detail": "Service starting"}, status_code=503)
 
     resume_seq = _resume_seq(request)
+    # A resume id above anything this feed has issued is from a previous
+    # process: the counter restarts at 1 after a controller restart, so
+    # honouring it would set a watermark no new event can ever pass and mute
+    # the feed for a client that was simply still reconnecting. Treat it as a
+    # new connection instead.
+    if resume_seq is not None and resume_seq > feed.last_seq:
+        resume_seq = None
 
     # Subscribe BEFORE snapshotting so no event can slip between the two; the
     # snapshot's highest seq is the dedupe watermark for the live queue.
