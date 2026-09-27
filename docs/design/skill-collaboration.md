@@ -36,7 +36,7 @@ canonical guides. To keep the two apart:
 
 | Piece | State | Used here as |
 |---|---|---|
-| taOSmd coordination bus (`routes/a2a_bus.py`, `TAOS_A2A_BUS_URL`, default `127.0.0.1:7900`) | Running; separate service | The transport. Channels, threads, `since` cursors, SSE stream |
+| taOSmd coordination bus (`routes/a2a_bus.py`, `TAOS_A2A_BUS_URL`, default `http://127.0.0.1:7900`) | Running; separate service | The transport. Channels, threads, `since` cursors, SSE stream |
 | Bus identity | The taOS send proxy mints `from` from the caller's registry JWT (`agent_token_auth.check_agent_scope`, scope `a2a_send`); the bus verifies `token sub == from` | Free provenance — a supplement's author cannot be spoofed |
 | Read side | `a2a_receive` scope or admin session gates reads | Who may subscribe |
 | Internal per-project a2a (`projects/a2a.py`) | One `kind="a2a"` group channel per project, @mention routing | Out of scope. That is project chat, not learning |
@@ -68,14 +68,34 @@ service: identity, ordering, cursors, replay and the offline-degradation path
 are already solved by the bus proxy, and the Messages app gets a readable view
 for free.
 
+### 3.2 Instance isolation is a precondition, not later hardening
+
+The bus proxy authorizes reads on the `a2a_receive` grant alone and forwards the
+channel unfiltered, and the default bus URL is a **shared local service**. Two
+taOS instances pointed at one bus would therefore see each other's supplements.
+`author.instance` is self-declared metadata and **must not be used as an
+isolation control** — an author that can lie about its handle is not prevented
+from lying about its instance.
+
+S2 must therefore require one of:
+
+- a **per-instance bus** (the configured `TAOS_A2A_BUS_URL` points at a bus that
+  serves exactly this instance), or
+- an **enforced instance namespace/ACL** applied in the bus path for both send
+  and receive — not a client-side filter over a shared stream.
+
+Until one of those is in place, S1–S2 stay inside one instance and the
+cross-instance path stays unbuilt (§9). Which mechanism to standardise on is
+open question 6.
+
 **Per-channel scoping is a real dependency, not a nicety.** Today the bus gates
 *send* on any active grant with `a2a_send` and *read* on any active grant with
 `a2a_receive` — `external-agent-onboarding.md` names per-channel grants as the
 v2 gap. S1 keeps the blast radius small by making **publication an explicit
-allowlist** (§3.3); S2 adopts per-agent local filtering (§3.4) regardless of what
+allowlist** (§3.3); S2 adopts per-agent local filtering (§3.5) regardless of what
 the bus does. Wiring stricter bus-side ACLs is a separate card.
 
-### 3.2 Who publishes, who subscribes
+### 3.3 Who publishes, who subscribes
 
 - **Publishers (S1):** an explicit allowlist in config. Publishing is the
   dangerous direction — it is what can put a bad lesson in front of other agents —
@@ -90,7 +110,7 @@ the bus does. Wiring stricter bus-side ACLs is a separate card.
   boundary. This is the explicit boundary between "my agents help each other"
   and "the internet can write my guides".
 
-### 3.3 What a subscription means
+### 3.4 What a subscription means
 
 An agent's local subscription is a **filter**, not a bus membership:
 
@@ -108,7 +128,7 @@ agent's declared capabilities/tier. An agent with no image-generation capability
 never sees image-generation lessons. Unscoped supplements ("general") are adopted
 by everyone but are held to the same review gate.
 
-### 3.4 Pull mechanics (no turn for emptiness)
+### 3.5 Pull mechanics (no turn for emptiness)
 
 Per subscribing agent, a small scheduled process — not an LLM turn — holds a
 `since` cursor (the bus returns a finite float message-ts; unknown query params
@@ -116,12 +136,18 @@ are a 400 by design, so a broken cursor fails loudly rather than silently
 re-reading the window) and asks the local proxy for new `learning` rows. It:
 
 1. parses the envelope, drops malformed ones,
-2. drops anything out of scope,
+2. drops anything out of scope or from a foreign instance namespace (§3.2),
 3. drops anything whose `status != "fleet"` or that duplicates a known
    supplement id,
-4. writes surviving supplements into the local store,
-5. only then may raise a signal — batched on a short settle window — and only
-   for a supplement that is new *and* relevant *and* promoted.
+4. **verifies the promotion record** (§6.2): `promotion.by` must resolve to a
+   reviewer this instance trusts, and `promotion.decision_id` must match an
+   approval this instance holds. A sender-declared `status: "fleet"` with no
+   verifiable promotion is stored as *seen*, never adopted. The bus attests
+   *who sent it* (the send proxy's `token sub == from` check); it does not attest
+   *that anyone reviewed it*, and the two must not be conflated,
+5. writes surviving supplements into the local store,
+6. only then may raise a signal — batched on a short settle window — and only
+   for a supplement that is new *and* relevant *and* verifiably promoted.
 
 Retraction events (§6.3) ride the same path and are applied before any new
 supplement from the same batch.
@@ -134,7 +160,7 @@ One JSON envelope in the bus `body`, and one row in a local store:
 {
   "kind": "guide.supplement",
   "schema": 1,
-  "id": "gs-<sha256 of the canonical serialisation>",
+  "id": "gs-<sha256 of the immutable core: author+targets+scope+claim+body_md+evidence>",
   "author": {"handle": "@taos-dev", "canonical_id": "...", "instance": "pi-01"},
   "targets": {"guide": "10-image-prompting", "guide_version": "<pinned>"},
   "scope": {"capability": "image_generation", "hardware": "rtx3060-12gb", "framework": null},
@@ -142,6 +168,7 @@ One JSON envelope in the bus `body`, and one row in a local store:
   "body_md": "Short, actionable, additive. Points at the canonical guide, never restates it.",
   "evidence": [{"run_id": "...", "trace": "<#896 trace id>", "observed": "OOM at step 2, Q4, 1024px"}],
   "provenance": {"created_ts": 0, "source_bus_msg": "...", "prev": null},
+  "promotion": {"by": "@<reviewer handle>", "canonical_id": "...", "decision_id": "dec-...", "ts": 0},
   "status": "draft|review|fleet|retracted",
   "supersedes": null
 }
@@ -149,10 +176,16 @@ One JSON envelope in the bus `body`, and one row in a local store:
 
 Rules that make the shape safe:
 
-- **`id` is content-addressed** over the envelope minus transport fields. Two
-  agents learning the same thing converge on one id; a re-publish is a no-op.
-  (The project file store has no content addressing and no per-file grants — see
-  the `taos-contributor` notes — so identity here is computed, not delegated.)
+- **`id` is content-addressed over the immutable core only** — `author`,
+  `targets`, `scope`, `claim`, `body_md`, `evidence`. Mutable lifecycle fields
+  (`status`, `promotion`, `supersedes`, generation) are deliberately **excluded**
+  so the same identity survives `review → fleet → retracted`; a lifecycle change
+  is an *event* about that id, not a new supplement. Two agents learning the same
+  thing converge on one id; a re-publish is a no-op. (Identity here is computed,
+  not delegated: the project Files store in `tinyagentos/routes/project_files.py`
+  is a plain tree with whole-tree project grants and no content addressing —
+  unlike `tinyagentos/hub/store.py`, which is content-addressed for hub posts —
+  so it cannot supply a stable handle for this.)
 - **`claim` is required and small.** It is what a human reviews and what a
   conflict is detected on; `body_md` is the detail.
 - **`evidence` must point at a real artifact** (a #896 trace id, a run id). A
@@ -223,6 +256,11 @@ explicitly (no silent drop — the author is told).
 - **Answers are recorded, not just applied**: who promoted what, when, on what
   evidence — the audit trail #896 wants, produced by the same act as the
   promotion.
+- **Promotion is an attested record, not a status flag.** Approving writes the
+  `promotion` block (`by`, `canonical_id`, `decision_id`, `ts`) from the
+  *reviewer's* identity — the republish is sent as the reviewer, not the author —
+  and subscribers check it before adopting (§3.5 step 4). A sender-supplied
+  `status: "fleet"` proves nothing.
 
 ### 6.3 Rollback
 
@@ -265,6 +303,10 @@ gateway, and the gateway is where redaction belongs — not at the reader).
    rather than inventing a second one.
 5. **Trusted-reviewer thresholds** for the post-S3 gate (who counts as trusted,
    how many confirm).
+6. **Isolation mechanism** (§3.2): a per-instance bus URL versus an enforced
+   instance namespace/ACL in the bus path. Recommend the namespace, because it
+   also gives per-channel scoping (the same v2 gap that gates `learning` today),
+   but the bus is a separate service so this needs @taOSmd's agreement before S2.
 
 ## 8. Slice plan
 
@@ -292,16 +334,21 @@ commands run from the repo root.
 
 **S2. Publish / subscribe on the `learning` channel.**
 - Files: `tinyagentos/guides/bus.py` (publish via the authenticated send proxy,
-  mechanical poller with a `since` cursor, batch ordering, tombstone-first),
-  config allowlist/opt-out in `config.py`, a startup task in `app.py`,
-  `tests/test_guides_bus.py` (mocked bus + mocked proxy, cursor and scope cases).
+  mechanical poller with a `since` cursor, instance-namespace check, promotion
+  verification, batch ordering, tombstone-first), config allowlist/opt-out and
+  the instance-isolation setting in `config.py`, a startup task in `app.py`,
+  `tests/test_guides_bus.py` (mocked bus + mocked proxy, cursor, scope,
+  isolation and unattested-promotion cases).
 - Acceptance: (a) a `fleet` supplement published by agent A renders on agent B
   with no LLM turn spent (the poller is asserted to be script-only);
   (b) re-polling with the same cursor adopts nothing twice; (c) an out-of-scope
   supplement is stored as seen but not adopted; (d) a `status=review` supplement
   is never adopted; (e) a tombstone removes the supplement and its supersedes
   chain on the next sync; (f) publication is refused for an agent not on the
-  allowlist.
+  allowlist; (g) a `status=fleet` supplement carrying **no verifiable
+  `promotion`** — absent, or `by` resolving to a non-reviewer — is stored as seen
+  and NOT adopted; (h) a supplement from a foreign instance namespace is not
+  adopted (§3.2).
 - Verify: `uv run pytest tests/test_guides_bus.py -q`
 
 **S3. Review gate + #896 governance surface. MAINTAINER-REVIEW.**
