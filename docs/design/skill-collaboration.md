@@ -283,10 +283,17 @@ lesson's access. So rollback is a **tombstone event on the bus** (kind
 - **a tombstone only counts from an authority that could have promoted the
   supplement**: the reviewer identity that promoted it, or the original author
   withdrawing their own. Anyone else's tombstone is recorded as seen and ignored
-  — otherwise any agent with `a2a_send` could erase another agent's lesson. The
-  poller enforces this (§3.5 step 2) with the same reviewer check as the
-  promotion record, and the tombstone carries the same `promotion`-style
-  attestation block;
+  — otherwise any agent with `a2a_send` could erase another agent's lesson;
+- **the two paths are checked differently, because they are different claims.**
+  A reviewer retraction must present the promotion attestation for that
+  `decision_id` (§6.2); an author withdrawal must present the author's own
+  authenticated identity, which the bus already proves (`token sub == from`) and
+  which must match the supplement's `author.canonical_id`. Requiring the
+  promotion attestation on the author path would reject a legitimate withdrawal
+  whenever the author was not also the reviewer, and requiring only authorship on
+  the reviewer path would let the author resurrect-then-re-retract around a
+  reviewer's decision. The poller accepts either, per the path the tombstone
+  declares, and enforces it at §3.5 step 2;
 - subscribers apply tombstones before new supplements in the same batch and drop
   the supplement *and* everything it superseded;
 - the tombstone is append-only — the history of "this was believed, then
