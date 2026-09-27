@@ -15,7 +15,7 @@ POST   /api/agents/registry/{id}/approve     - lifecycle: pending → active (ad
 POST   /api/agents/registry/{id}/reject      - lifecycle: pending → rejected (admin only)
 POST   /api/agents/registry/{id}/suspend     - lifecycle: active → suspended (admin only)
 POST   /api/agents/registry/{id}/reactivate  - lifecycle: suspended → active (admin only)
-POST   /api/agents/registry/{id}/rotate-tokens - bump token_min_iat, invalidate old tokens (owner/admin)
+POST   /api/agents/registry/{id}/rotate-tokens - rotate the credential ON this identity, return the new token (owner/admin, or the agent itself)
 
 Route ordering matters: /pubkey, /revoked, and /inactive are declared before
 /{canonical_id} so the literal strings are not captured as a path parameter.
@@ -31,7 +31,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 
-from tinyagentos.agent_registry_store import mint_registry_token
+from tinyagentos.agent_registry_store import TOKEN_STORAGE_GUIDANCE, mint_registry_token
 from tinyagentos.agent_token_auth import check_agent_scope
 from tinyagentos.auth_context import CurrentUser, current_user
 
@@ -293,6 +293,7 @@ async def register_agent(
     return {
         "canonical_id": record["canonical_id"],
         "token": token,
+        "storage_guidance": TOKEN_STORAGE_GUIDANCE,
         "record": record,
     }
 
@@ -403,6 +404,7 @@ async def _mint_internal_identity(
         "adopted": adopted,
         "scopes": scopes,
         "token": token,
+        "storage_guidance": TOKEN_STORAGE_GUIDANCE,
     }
 
 
@@ -811,41 +813,116 @@ async def reactivate_agent(
 async def rotate_tokens(
     request: Request,
     canonical_id: str,
-    user: CurrentUser = Depends(current_user),
 ):
-    """Bump ``token_min_iat`` to the current Unix timestamp, invalidating every
-    token minted before now for this identity.
+    """Rotate the credential ON this identity and return the replacement token.
 
-    Session owner or admin only.  The rotation is a single-write DB bump (no
-    new token is minted — the caller re-mints after).  Leaves a forensic
-    audit-log entry so every rotation is traceable to an actor.
+    The canonical_id is UNCHANGED: this is the recovery/rotation path that does
+    NOT mint a new identity.  It supersedes every existing token for the
+    identity by moving ``token_min_iat`` forward, then mints one fresh token
+    whose ``iat`` sits exactly AT the new cutoff, so the caller gets a working
+    credential back in the same call.  Minting a new identity instead would
+    orphan this one: its grants stay behind while the replacement starts empty
+    (taOS #2158).
+
+    Authorized for an owner/admin session, OR the agent's OWN live registry
+    bearer token (``sub`` == ``canonical_id``) so an agent that suspects its
+    token is stale or leaked can rotate itself without a human in the loop.
+    Every other caller gets the same 404 as an unknown id (existence-hiding,
+    matching the registry PATCH/DELETE routes).
+
+    The cutoff moves STRICTLY past the identity's current one: it is set to
+    ``max(now + 1, current_cutoff + 1)``.  ``now + 1`` alone is not enough --
+    two rotations inside the same second would land on the same cutoff, so the
+    first rotation's replacement would survive the second (its ``iat`` equals
+    the cutoff, and the cutoff check rejects only a strictly older ``iat``).
+    Advancing monotonically also means a same-second token minted just before
+    the rotation is strictly behind the new cutoff.  The replacement token is
+    minted AT the resulting cutoff so it always clears it.
+
+    Leaves a forensic audit-log entry, actor = the session user, a literal
+    ``agent:<canonical_id>`` marker for a self-rotation.
     """
     store = _get_store(request)
     record = await store.get(canonical_id)
     if record is None:
         logger.info("registry rotate-tokens 404-unknown for %s", canonical_id)
         return JSONResponse({"error": "not found"}, status_code=404)
-    if not user.is_admin and user.user_id != record["user_id"]:
-        logger.info("registry rotate-tokens 404-not-owner for %s by %s", canonical_id, user.user_id)
+
+    actor_user_id = await _authorize_rotate(request, canonical_id, record)
+    if actor_user_id is None:
+        logger.info("registry rotate-tokens 404-not-owner for %s", canonical_id)
         return JSONResponse({"error": "not found"}, status_code=404)
 
-    ts = int(time.time())
+    private_pem, _public_pem = _get_keypair(request)
+
+    # Strictly monotonic cutoff: past the current one AND past this second, so
+    # every token ever issued (including one minted moments ago) is superseded
+    # by this rotation.  bump_token_min_iat takes MAX(old, ts) -- with a target
+    # above the current cutoff the read-back value IS the target.
     before_iat = record.get("token_min_iat") or 0
-    updated = await store.bump_token_min_iat(canonical_id, ts)
+    target = max(int(time.time()) + 1, before_iat + 1)
+    updated = await store.bump_token_min_iat(canonical_id, target)
     if updated is None:
         return JSONResponse({"error": "not found"}, status_code=404)
+
+    cutoff = int(updated.get("token_min_iat") or 0)
+    token = mint_registry_token(
+        canonical_id,
+        private_pem,
+        user_id=record.get("user_id", ""),
+        framework=record.get("framework", ""),
+        iat=cutoff,
+    )
 
     await _audit_governance(
         request,
         action="rotate-tokens",
         canonical_id=canonical_id,
-        actor_user_id=user.user_id,
+        actor_user_id=actor_user_id,
         before_status=record.get("status") or "active",
         after_status=updated.get("status") or "active",
         before_token_min_iat=before_iat,
-        after_token_min_iat=ts,
+        after_token_min_iat=cutoff,
     )
-    return updated
+    return {
+        **updated,
+        "token": token,
+        "storage_guidance": TOKEN_STORAGE_GUIDANCE,
+    }
+
+
+async def _authorize_rotate(
+    request: Request, canonical_id: str, record: dict
+) -> Optional[str]:
+    """Return the audit actor for a rotation, or ``None`` when unauthorized.
+
+    Allowed: an owner/admin session (or admin local token), OR the agent's own
+    live registry bearer token whose ``sub`` matches *canonical_id*.  A
+    self-rotation reports an actor of ``agent:<canonical_id>`` -- there is no
+    user behind it, and inventing the owner's user_id would blame the human for
+    a change the agent made.
+    """
+    is_admin = bool(getattr(request.state, "is_admin", False))
+    uid = getattr(request.state, "user_id", None)
+    if is_admin or (uid and uid == record.get("user_id")):
+        return uid or "admin"
+
+    from tinyagentos.agent_token_auth import check_agent_identity
+
+    try:
+        agent_cid = await check_agent_identity(request)
+    except HTTPException as exc:
+        # A malformed / inactive / superseded token learns no more than an
+        # anonymous caller: surfacing the 401/403 here would pair with the
+        # 404-on-unknown above to form an existence oracle.
+        logger.info(
+            "registry rotate-tokens 404-bad-credentials for %s (%s)",
+            canonical_id, exc.detail,
+        )
+        return None
+    if agent_cid is not None and agent_cid == canonical_id:
+        return f"agent:{canonical_id}"
+    return None
 
 
 # ---------------------------------------------------------------------------

@@ -336,6 +336,17 @@ _AGENT_SCOPE_REQUEST_ROUTES = (
     ("GET", re.compile(rf"^/api/agents/registry/{_SEG}/scope-requests/{_SEG}$")),
 )
 
+# Credential rotation an agent may reach with its own registry JWT: an agent
+# that suspects its token is stale or leaked can rotate ITSELF without waiting
+# for a human. The route verifies the JWT identity == the path canonical_id (so
+# an agent may only rotate its own credential) and enforces the same rotation
+# cutoff as every other identity path, so a token that is already superseded
+# cannot use this to outlive its supersession. Owner/admin sessions reach the
+# same route through the normal session gate.
+_AGENT_ROTATE_ROUTES = (
+    ("POST", re.compile(rf"^/api/agents/registry/{_SEG}/rotate-tokens$")),
+)
+
 
 def _is_agent_task_path(method: str, path: str) -> bool:
     """True only for the exact subset of task routes a project_tasks token may
@@ -375,6 +386,13 @@ def _is_agent_scope_request_path(method: str, path: str) -> bool:
     routes verify the JWT identity == canonical_id; approve/deny are excluded
     (POST with an extra trailing segment) and stay owner/admin session-only."""
     return any(m == method and rx.match(path) for m, rx in _AGENT_SCOPE_REQUEST_ROUTES)
+
+
+def _is_agent_rotate_path(method: str, path: str) -> bool:
+    """True only for POST /api/agents/registry/{id}/rotate-tokens, which an
+    agent may reach with its own registry JWT to rotate its OWN credential. The
+    route verifies the JWT identity == canonical_id."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_ROTATE_ROUTES)
 
 
 def _is_container_request_action_path(method: str, path: str) -> bool:
@@ -756,6 +774,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     or _is_agent_decisions_path(request.method, path)
                     or _is_agent_files_path(request.method, path)
                     or _is_agent_scope_request_path(request.method, path)
+                    or _is_agent_rotate_path(request.method, path)
                     or _is_container_request_action_path(request.method, path)
                     or _is_agent_container_quota_path(request.method, path)
                     or _is_agent_skill_exec_path(request.method, path)

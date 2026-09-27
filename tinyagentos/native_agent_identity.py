@@ -301,6 +301,14 @@ async def rotate_native_agent_token(
     """Rotate the native agent's token by bumping token_min_iat and minting a new one.
 
     Returns the new token, or None if the native agent identity does not exist.
+
+    The cutoff is ``max(now + 1, current_cutoff + 1)`` and the replacement is
+    minted AT that cutoff.  Bumping to ``now`` would leave a token minted
+    earlier in the same second unsuperseded (its ``iat`` equals the cutoff, and
+    the cutoff check rejects only a strictly older ``iat``); advancing only by
+    the second would let two rotations in one second share a cutoff, so the
+    first replacement would survive the second. Monotonic advancement makes
+    every rotation supersede every token issued before it.
     """
     install = read_install_id(Path(data_dir))
     if not install:
@@ -314,17 +322,23 @@ async def rotate_native_agent_token(
         return None
 
     # Bump token_min_iat to invalidate all existing tokens for this identity.
-    # Use current timestamp (seconds since epoch) as the new cutoff.
+    # The target is above both the current cutoff and this second; read the
+    # effective cutoff back and mint at it -- the replacement then always
+    # clears its own cutoff.
     import time
-    new_min_iat = int(time.time())
-    await registry.bump_token_min_iat(record["canonical_id"], new_min_iat)
+    before_iat = record.get("token_min_iat") or 0
+    updated = await registry.bump_token_min_iat(
+        record["canonical_id"], max(int(time.time()) + 1, before_iat + 1)
+    )
+    cutoff = int((updated or record).get("token_min_iat") or 0)
 
-    # Mint a new token with the updated cutoff.
+    # Mint a new token at the new cutoff.
     token = mint_registry_token(
         record["canonical_id"],
         signing_key_pem,
         user_id=record.get("user_id", ""),
         framework=record.get("framework", NATIVE_AGENT_ORIGIN),
+        iat=cutoff,
     )
 
     # Write the new token, replacing the old one.
