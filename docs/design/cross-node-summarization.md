@@ -1,0 +1,399 @@
+# Cross-node conversation summarization
+
+Status: design spike for taOS #156 (phase-3 / future). Doc only — no
+implementation in this change. Slices S1–S3 below are the dispatchable plan;
+section 7 is a pre-registered quality gate that decides whether S3 ships.
+
+## 1. What it is
+
+Long-running agents accumulate conversation history that grows without bound.
+Today the live path answers that with **truncation**: `build_context_window()`
+in `tinyagentos/chat/context_window.py` trims to a message count limit and a
+token budget and **drops oldest messages first**. Nothing is summarised, so the
+oldest context is simply lost from the model's view; the zero-loss archive
+(taosmd `archive.py`, "never modified, never deleted, never summarised") still
+holds it, but nothing puts a *compressed* version back in front of the model.
+
+Cross-node summarization moves the compression work off the node doing the live
+interaction. Segments older than a configurable threshold are compressed — once,
+in the background — by **idle CPU-heavy nodes** that hold no GPU lease. The live
+node keeps only the recent hot window; older segments exist as summary chunks
+(text, plus an embedding) that the runtime can splice back in when a
+conversation references something old.
+
+Relationship to existing pieces:
+
+- **The zero-loss archive is the raw truth, and stays that way.** Summaries are
+  derivatives keyed back to the raw segment; they never replace or mutate it.
+  Any summary can be discarded and rebuilt from the archive.
+- **taosmd already ships the compression primitives, none of them clustered.**
+  `SessionCatalog.enrich_session()` (`taosmd/session_catalog.py`) runs an LLM
+  over a split session and writes topic / description / category;
+  `taosmd/crystallize.py` compresses a completed session into a "crystal"
+  (narrative + outcomes + lessons). The taOSmd pipeline job queue
+  (`tinyagentos/scheduling/job_queue.py`) serialises exactly this class of work
+  (`JOB_ENRICH`, `JOB_CRYSTALLIZE`, `JOB_EMBED`, `JOB_SPLIT`) — and its own
+  module docstring is explicit that it is **not** a distributed task system:
+  *"this is a single-device queue for one taOS controller. For cluster-level job
+  distribution, use taOS's worker dispatch."* Nor is its consumer wired up:
+  `JobWorker` (`scheduling/job_worker.py`) is never instantiated by
+  `app.py` today, and `app.state.job_queue` is created lazily by
+  `routes/jobs.py` on first request. This design is the "cluster-level
+  distribution" the docstring points at.
+- **`#154` (conversation state handles) is the addressing layer.** This design
+  consumes its vocabulary — `conversation_id`, `kv_summary_location`,
+  `vector_shard_ids`, `active_worker_id` — and defines no handle of its own.
+  Segments are named relative to a handle.
+- **`#155` (RAG data locality policies) is the retrieval layer.** Fetching a
+  summary chunk back is a normal RAG call routed by the collection's
+  `locality_policy` (`local` / `preferred-node` / `nearest` / `broadcast`), not
+  a bespoke cross-node fetch invented here.
+- **`#897` (Cluster app capability map + placement) is the placement layer.**
+  This design borrows its vocabulary — *node*, *capability map*, *placement
+  suggestion* (`tinyagentos/cluster/capability_map.py`, `cluster/optimiser.py`,
+  `routes/cluster_capability.py`) — and adds one predicate to it (section 3)
+  rather than a parallel placement model.
+- **GPU leases are the exclusivity signal.** `GpuLease`
+  (`cluster/worker_protocol.py`), claimed through
+  `POST /api/cluster/leases/claim` and tracked in `ClusterManager._leases`, is
+  the hard "this node's accelerator is taken" fact that eligibility reads.
+
+## 2. Architecture
+
+```
+   live node (agent runtime)                idle producer node (any eligible)
+        |                                          ^
+        | 1. hot window only                      | 3. run one bulk job
+        v                                          |    (LLM: segment -> summary)
+  chat_messages / archive (raw, append-only)       |
+        |                                          |
+        | 2. segment crosses age threshold         |
+        +--> JobQueue.enqueue("summarize_segment", BACKGROUND)
+                         |                         |
+                         | 4. placement: capability map + eligibility
+                         v                         v
+                   ClusterManager / TaskRouter -----+
+                         |
+                         | 5. result payload -> controller commits
+                         v
+                  summary store (text + provenance)  +-> vector index (embedding)
+                         |
+        +----------------+----------------+
+        |                                 |
+  6. live node references an old topic     7. stale check: source_sha256
+     -> RAG call (#155 policy)                matches current segment?
+     -> splice marked summary block           no -> ignore, re-summarise
+        ahead of the hot window
+```
+
+Two invariants the diagram encodes:
+
+1. **The raw segment store is written by exactly one thing: the conversation
+   itself.** Summarisation is a pure reader of it plus a writer of derived rows.
+2. **The live inference path never waits on summarisation.** Enqueue is
+   fire-and-forget; the only summarisation-related work the live node does
+   synchronously is the splice lookup in S3, and that degrades to today's
+   behaviour when it misses.
+
+## 3. Which nodes are eligible, and how eligibility is determined
+
+Eligibility is a **derived predicate evaluated at dispatch time**, never a
+persisted boolean — every input is live worker state that changes on the next
+heartbeat.
+
+A node is eligible to run a summarization job when **all** of these hold:
+
+| # | Condition | Source of truth |
+|---|---|---|
+| 1 | `worker.status == "online"` | `WorkerInfo.status`, set by `POST /api/cluster/heartbeat` |
+| 2 | `worker.kind != "device"` | `WorkerInfo.kind` — a Bluetooth-paired taOSusb board is never a placement candidate for any job type |
+| 3 | Not draining | `ClusterManager.drain_worker()` / `worker.status == "draining"` |
+| 4 | Heartbeat fresh | `WorkerInfo.last_heartbeat` within the monitor loop's staleness window |
+| 5 | **No active GPU lease on any of its resources** | `ClusterManager.get_leases()` matched on the `"{worker_name}:{resource_name}"` prefix of `GpuLease.resource_id` |
+| 6 | Idle: `worker.load <= idle_load_ceiling` | `WorkerInfo.load`, the 0–1 utilization the worker self-reports |
+| 7 | Can actually do the work: a chat-capable backend is resident **or** startable | `worker.capabilities` (backend-driven, `detect_capabilities()`), `WorkerInfo.available_models`, and the capability map's `potential_capabilities` via `cluster/capabilities.py` |
+| 8 | Free memory for the summariser model | `worker.free_vram_mb` / `worker.used_vram_mb`; `None` means **unknown, not zero** (the existing contract — a CPU node has no VRAM probe and must not be permanently un-eligible) |
+
+Notes that matter for correctness:
+
+- **Condition 5 is the hard one; condition 6 is advisory.** Leases
+  (`ClusterManager.claim_lease`) are an explicit reservation, so their absence
+  is trustworthy evidence the accelerator is not in use. `load` is a
+  self-reported estimate and is used only to prefer the idlest of several
+  eligible nodes, never as a sole gate on a GPU node.
+- **Eligibility is per *node*, not per *resource*.** A CPU-only node reports
+  `cpu-inference` in `WorkerInfo.resources` and holds no leases at all, which is
+  exactly the "idle CPU-heavy node" the issue describes. The predicate does not
+  special-case CPU: it says "this node is free", which CPU boxes trivially
+  satisfy.
+- **GPU nodes are eligible but not preferred.** A GPU box with no lease and no
+  load can summarise; it just should not be the first pick, because that
+  hardware is the scarce resource latency-class work wants. Ranking (not
+  eligibility) encodes the preference — reuse the `Tier` ordering in
+  `scheduler/resource.py` (`GPU=0 < NPU=1 < CPU=2 < CLUSTER=3` intentionally
+  ranks *fastest*, so summarization needs its own inverted preference: cheapest
+  first).
+- **Job class.** Summarization is `Priority.BACKGROUND` in the existing
+  `JobQueue` enum ("overnight maintenance, rebuilds"), and maps to the `bulk`
+  class in the SLO-aware scheduler addendum (`docs/design/slo-aware-scheduler.md`):
+  *"Hours to days, job queue semantics — Run only on idle cycles."* That
+  addendum is not implemented (no `slo_class` in the tree today), so S1 records
+  the class as a label on the job payload and does not require the scheduler
+  work to land first.
+- **Where this lands in the capability map.** #897 owns the node/capability
+  view. This design adds one derived field to it — an eligibility reason string
+  plus a boolean — so the Cluster app can *show why* a node is or is not in the
+  summarization pool. It must not add a second placement store.
+
+## 4. How compressed context is produced, stored, and pulled back
+
+### 4.1 What a segment is
+
+A **segment** is a contiguous run of messages in one conversation that is older
+than `summarization.threshold_messages` / `summarization.threshold_age`, and
+that is no longer inside the live hot window. The natural grouping already
+exists in the memory pipeline: `SessionCatalog.split_day()` groups archived
+events into sessions by time gap, so the summarizer reuses that split rather
+than inventing a new segmentation. A segment is identified by
+`(conversation_id, segment_id)` where `segment_id` comes from the
+`conversation_id` + shard addressing defined by #154.
+
+### 4.2 Producing a summary
+
+One job type, `summarize_segment`, with a payload of the form:
+
+```json
+{
+  "conversation_id": "...",
+  "segment_id": "...",
+  "agent_name": "...",
+  "source": {"first_message_id": "...", "last_message_id": "...", "sha256": "..."},
+  "state_handle": { "kv_summary_location": "...", "vector_shard_ids": [...] },
+  "model": "qwen3:4b",
+  "target_tokens": 400
+}
+```
+
+The producer is a normal LLM call — the same shape as today's
+`SessionCatalog.enrich_session()` / crystallize path — run on the eligible node,
+prompted to emit a compact summary plus structured items (topics, decisions,
+open threads). `sha256` over the canonical raw segment text is carried in the
+payload and stored on the result: it is the staleness key in section 5.
+
+**The controller commits; the producer does not.** A producer node never opens
+the controller's summary store or archive. It returns a result payload and the
+controller writes it. This is what keeps a compromised or merely buggy node from
+being able to write conversation memory.
+
+### 4.3 Storing it
+
+One new store following the house SCHEMA/MIGRATIONS discipline
+(`BaseStore`, `init()`/`close()`, attached to `app.state` in the lifespan):
+
+```
+summaries(
+  conversation_id  TEXT,
+  segment_id       TEXT,
+  agent_name       TEXT,
+  summary_text     TEXT,
+  source_sha256    TEXT,   -- staleness key
+  first_message_id TEXT,
+  last_message_id  TEXT,
+  model            TEXT,   -- which model produced it (quality attribution)
+  produced_on      TEXT,   -- which worker name
+  created_at       REAL,   -- UTC
+  PRIMARY KEY (conversation_id, segment_id, source_sha256)
+)
+```
+
+The primary key makes summarisation **idempotent by construction**: re-running
+an unchanged segment is a no-op insert, and a changed segment gets a new row
+while the old one stops matching `source_sha256` and is ignored.
+
+The embedding goes to the existing vector index (`taosmd/vector_memory.py`
+stores `text` + `embedding` + `metadata_json` in SQLite; the qmd serve index is
+what `routes/memory.py` proxies per agent) with `metadata_json` carrying
+`{conversation_id, segment_id, source_sha256, kind: "summary"}`. Retrieval is
+therefore an ordinary RAG call, which is the whole point of the #155 dependency.
+
+### 4.4 Pulling it back
+
+When the live node assembles context, it keeps the current behaviour for the hot
+window and, for a reference that falls outside it:
+
+1. issue an ordinary memory/RAG query (the `routes/memory.py` proxy path,
+   routed by the collection's #155 locality policy) filtered to
+   `kind: "summary"` for that conversation;
+2. verify `source_sha256` against the current raw segment;
+3. splice the summary text in **ahead of** the retained hot window as a
+   distinctly marked block (segment time range + "summarised" marker) so the
+   model — and, in a transcript view, the user — can tell derived text from
+   verbatim text.
+
+Step 2 is what stops a stale summary from overruling live context: **the raw
+segment and the hot window always win.**
+
+## 5. Failure and consistency semantics
+
+| Failure | Semantics |
+|---|---|
+| **Stale summary vs live context** | Summaries are keyed on `source_sha256`. A summary whose key no longer matches the current raw segment is *ignored*, never merged. The raw text (hot window, then archive) is authoritative at all times; splices are additive. |
+| **Duplicate / concurrent summarisation of one segment** | The composite primary key makes the second write a no-op. Two producers racing is wasteful, not corrupting. |
+| **Producer node dies mid-job** | The job is a `BACKGROUND` job with a lease/claim TTL; expiry re-queues it. No partial writes are possible because the only write is the controller's single commit of the completed result (summary row + index entry in one transaction). |
+| **Controller restarts mid-job** | `JobQueue._sync_init()` already marks stale `running` rows as `failed` ("stale: process restarted"). A summarization job lost this way is re-enqueued on the next pass from the same idempotent source, and re-running it cannot double-write. |
+| **Index node offline / no summary found** | The splice lookup misses and the runtime falls back to **today's exact behaviour** — the oldest-dropped window from `build_context_window()` — with one WARNING log. No user-visible error, no blocked turn. This is the required degraded mode, not an afterthought. |
+| **Live inference must not be interrupted** | Eligibility requires no active lease *and* idle, so a job is placed only on a node the cluster believes is free. The live path additionally never blocks on summarisation: enqueue is fire-and-forget and the only synchronous summarisation work is the S3 lookup. |
+| **Raw truth is never lost** | The archive is append-only (`taosmd/archive.py`). Summaries are rebuildable from it, so a bad summarizer costs CPU, never data. |
+| **Runaway CPU cost** | A summary nobody ever reads is wasted work. Cap per agent per hour (`summarization.max_jobs_per_hour`) and stop enqueuing when no segment has crossed the threshold. |
+| **Summarisation must be off-able** | Per-agent `summarization.enabled: false` disables enqueue, splice, and the RAG call entirely — same per-agent config surface as `memory_mode` / `memory_config` in `config.py`. Default is on with a conservative threshold, since the issue lists per-agent disable as the escape hatch rather than the default. |
+
+## 6. Slice plan
+
+Lanes follow the `library-app.md` convention: backend slices are the hognek
+lane; UI surfaces are fleet cards.
+
+### S1 — Local compression behind an idle + no-lease gate
+
+Depends on: nothing new (one node, existing `JobQueue`).
+
+Scope: the `summary` store, the `summarize_segment` job type, and the
+eligibility predicate from section 3 **evaluated for the local node only**. The
+job runs on the controller's own node. No cluster dispatch, no splice — the live
+path is byte-for-byte unchanged.
+
+Acceptance:
+
+- [ ] A segment older than the configured threshold enqueues exactly one
+      `summarize_segment` job at `Priority.BACKGROUND`; a segment that has not
+      crossed it enqueues nothing.
+- [ ] With a `GpuLease` held on any resource of the producing node, the job
+      **stays pending** — test injects a lease and asserts no execution.
+- [ ] With `worker.load` above `idle_load_ceiling`, the job stays pending.
+- [ ] A completed job writes one summary row with full provenance
+      (`conversation_id`, `segment_id`, `source_sha256`, message-id range,
+      model, producer node, UTC `created_at`).
+- [ ] Re-running the same segment with unchanged content writes **zero** new
+      rows; running it after the segment changes writes exactly one new row and
+      leaves the old one in place.
+- [ ] Raw messages are untouched: message-store and archive row counts are
+      asserted unchanged across a summarization run.
+- [ ] `agents[].summarization.enabled: false` produces no enqueue and no
+      summary rows for that agent.
+- [ ] A metrics surface reports, per agent: segments condensed, compression
+      ratio (source tokens ÷ summary tokens), CPU time spent.
+- [ ] Golden test: `build_context_window()` output is identical with the
+      feature enabled and disabled.
+
+### S2 — Cross-node dispatch
+
+Depends on: S1; the worker-side job surface (see open question 1).
+
+Scope: the job runs on an **eligible remote node**. Placement reads the
+capability map + the eligibility predicate; the controller ships the segment
+text (or the #154 state handle) and commits the returned result.
+
+Acceptance:
+
+- [ ] Placement never selects a node with an active lease on any of its
+      resources, a draining node, a stale-heartbeat node, or a `kind="device"`
+      node.
+- [ ] An end-to-end round trip (enqueue → remote produce → controller commits
+      summary row + index entry) passes against a stubbed worker.
+- [ ] Worker offline mid-job → job re-queued after TTL, **no partial row**, and
+      the retry writes at most one row.
+- [ ] The producer node performs **no** writes to controller stores (asserted:
+      it has no store handle).
+- [ ] The live inference path issues no summarisation RPC (asserted by
+      call-counting the live turn path).
+- [ ] Placement output appears in the Cluster app's node view with an
+      eligibility reason, using the #897 surface rather than a new one.
+
+### S3 — Splice into live context + RAG pull-back
+
+Depends on: S2; #154 (handles) and #155 (locality routing) landing.
+
+Scope: when a conversation references a segment outside the hot window, the
+runtime retrieves that segment's summary through the ordinary RAG path and
+splices a marked block ahead of the hot window.
+
+Acceptance:
+
+- [ ] Retrieval goes through the memory/RAG proxy with the collection's
+      `locality_policy` respected; no bespoke shard fetch is added.
+- [ ] A summary is never spliced for a segment whose messages are still inside
+      the hot window (no duplication).
+- [ ] Spliced text is marked and attributable: segment id + time range are
+      present in the injected block.
+- [ ] Stale summary (`source_sha256` mismatch) is ignored and the segment is
+      re-queued for summarisation; the live/raw text is used for that turn.
+- [ ] With no summary available, or the index node offline, behaviour is
+      identical to the pre-feature baseline (oldest-dropped window) plus one
+      WARNING — covered by a regression test that asserts the same context
+      window in both cases.
+- [ ] Per-agent disable suppresses enqueue, splice, and the RAG call.
+- [ ] Dashboard/Observatory shows compression ratio and segments condensed per
+      agent (issue acceptance criterion).
+
+## 7. Pre-registered quality gate (not a slice)
+
+Summarization that silently loses the facts a user refers back to is worse than
+truncation, because it looks like memory. Before S3 becomes a default, an eval
+must be run and published — same discipline as the Library spike's
+pre-registered VMAF criteria:
+
+- Fixed evaluation set chosen **before** the code exists: conversations with a
+  known set of later questions whose answers live only in old segments.
+- Measure: answer recall from the spliced summary vs answer recall from the raw
+  segment (the ceiling). Per-agent, on the target tier.
+- **Ship criterion:** summarised-context recall ≥ 90% of raw-context recall, and
+  compression ratio ≥ 3× on the eval set. Below either number, the feature stays
+  a flagged experiment and the numbers are published in the research notes.
+
+## 8. Non-goals (v1)
+
+- **No summarisation of the hot window.** Only segments past the threshold.
+- **Not a replacement for the zero-loss archive.** Nothing here deletes or
+  rewrites raw history.
+- **Not distributed inference.** The summariser is a normal LLM call on one
+  node, never a shard of a larger model.
+- **No cross-vendor KV transfer.** Hardware-level cache movement is
+  `docs/design/peer-vram-kv-cache.md`'s problem, not this one.
+- **Not the #154 handle store and not the #155 router.** This consumes both and
+  defines neither.
+- **No GPU-first placement.** GPU nodes are eligible but ranked last behind CPU
+  nodes, because their scarcity is the cluster's real constraint.
+- **No new retrieval API.** Skimming summaries is a RAG call; that is the only
+  query path.
+
+## 9. Open questions / risks
+
+1. **The worker-side job surface does not exist yet.** The worker's HTTP API is
+   deliberately tiny: `POST /api/worker/deploy` (fixed `ALLOWED_COMMANDS`) and
+   `POST /api/worker/remote` (command-prefix allowlist) — see
+   `tinyagentos/worker/deploy.py` and `routes/cluster.py`. S2 must either add a
+   narrow, typed job endpoint to the worker or route the work through the
+   existing inference backends via `TaskRouter` / `POST /api/cluster/route`.
+   **This is the one build-vs-reuse decision that should be made before S2 is
+   dispatched.**
+2. **Landing order.** S3 needs #154 and #155. If those slip, S1/S2 still deliver
+   value (cheaper compression, observable metrics) and should not be held.
+3. **Idle-signal quality.** `WorkerInfo.load` is self-reported; leases are the
+   only hard signal. If idle detection proves unreliable, the fallback is to
+   gate on leases plus a short "no in-flight job" window rather than trusting
+   `load`.
+4. **Never-read summaries.** Waste, not harm. Mitigated by the per-hour cap and
+   the threshold; watch the metrics before making the threshold more aggressive.
+5. **Multi-controller.** Out of scope — the archive index and summary store
+   assumes one authoritative controller, which matches the current design of
+   `tinyagentos/scheduling/mesh_sync.py` ("Controller is authoritative (source
+   of truth)").
+
+## 10. What has to be true for this to be worth building
+
+- Segments genuinely outlive the hot window for real agents on real hardware
+  (measurable today from the archive: how often does a conversation exceed the
+  window and then get asked about an old topic?).
+- Idle CPU capacity actually exists on typical deployments — a single-Pi install
+  has none, so the feature must be a no-op, not a regression, there.
+- The section 7 recall gate passes. If it does not, the honest outcome is to
+  keep truncation and publish why.
