@@ -90,6 +90,22 @@ _WILDCARDS = frozenset({"*", "all", "any", "full"})
 
 _ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
+# The only transport the built-in MCP supervisor can run: it launches a
+# subprocess and treats stdout as the JSON-RPC channel.  A manifest cannot ask
+# for anything else, because the install flow would otherwise register a server
+# the loader can never launch (no `cmd` to resolve) and the start route would
+# 500 on it.  Rejected at manifest validation, where the error names the entry.
+SUPPORTED_TRANSPORTS: frozenset[str] = frozenset({"stdio"})
+
+# Placeholder the installer replaces with a per-server workspace directory it
+# creates, so a curated entry can point a server at an empty private directory.
+WORKSPACE_TOKEN = "{workspace}"
+
+# Upper bound on a single install command.  Generous enough for a real
+# `npm install -g` / `docker pull` on slow hardware, bounded so a hung installer
+# cannot hold an admin's request open indefinitely.
+INSTALL_TIMEOUT_S = 600.0
+
 
 def validate_permissions(raw: Any) -> list[str]:
     """Validate and normalise a manifest's declared permission set.
@@ -195,9 +211,17 @@ class MCPInstallSpec(BaseModel):
 class MCPRunSpec(BaseModel):
     """How to launch the server once installed.
 
-    For ``stdio`` transports ``command``/``args`` are the argv the supervisor
-    spawns.  ``env`` holds non-secret environment defaults; credentials belong
-    in the secrets store and are injected at start time, never in a manifest.
+    ``command``/``args`` are the argv the supervisor spawns.  ``env`` holds
+    non-secret environment defaults; credentials belong in the secrets store and
+    are injected at start time, never in a manifest.
+
+    ``{workspace}`` in ``command``/``args``/``env`` values is substituted by the
+    installer with a per-server directory it creates (see
+    :data:`WORKSPACE_TOKEN`).  That is how a curated entry points a server at a
+    private, empty directory instead of an existing one — the filesystem and git
+    servers both need a directory that exists before they start, and pointing
+    them at the taOS data directory would hand them secrets and application
+    state.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -205,7 +229,6 @@ class MCPRunSpec(BaseModel):
     command: list[str] = Field(default_factory=list)
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
-    url: str = ""
 
     @field_validator("command", mode="before")
     @classmethod
@@ -216,6 +239,10 @@ class MCPRunSpec(BaseModel):
     @classmethod
     def _coerce_args(cls, value: Any) -> list[str]:
         return _coerce_argv(value, field="run.args")
+
+    def uses_workspace(self) -> bool:
+        tokens = [*self.command, *self.args, *self.env.values()]
+        return any(WORKSPACE_TOKEN in token for token in tokens)
 
 
 class MCPRegistryManifest(BaseModel):
@@ -247,17 +274,12 @@ class MCPRegistryManifest(BaseModel):
     @field_validator("id")
     @classmethod
     def _check_id(cls, value: str) -> str:
+        # The character class already requires an alphanumeric first character,
+        # so ids made only of separators (``.``, ``..``, ``-``) cannot pass it.
         if not _ID_RE.match(value or ""):
             raise ValueError(
                 f"id {value!r} is not a valid marketplace id "
                 "(lowercase letters, digits, '.', '_', '-' — must start alphanumeric)"
-            )
-        # The separator characters alone must not form the whole id: ".." and
-        # "." match the character class but are path-ish values with no sane
-        # meaning as a server id.
-        if not any(ch.isalnum() for ch in value):
-            raise ValueError(
-                f"id {value!r} must contain at least one letter or digit"
             )
         return value
 
@@ -295,25 +317,42 @@ class MCPRegistryManifest(BaseModel):
 
     @model_validator(mode="after")
     def _check_launchable(self) -> "MCPRegistryManifest":
-        if self.transport == "stdio":
-            if not self.run.command:
-                raise ValueError(
-                    "a stdio server needs run.command — there is nothing for "
-                    "the MCP supervisor to launch"
-                )
-        elif not self.run.url:
+        if self.transport not in SUPPORTED_TRANSPORTS:
+            # Accepting a transport the supervisor cannot run would register a
+            # server with no resolvable launch command — installed, listed, and
+            # impossible to start.
             raise ValueError(
-                f"a {self.transport} server needs run.url"
+                f"{self.transport!r} transport is not supported; the MCP "
+                f"supervisor launches "
+                f"{', '.join(sorted(SUPPORTED_TRANSPORTS))} servers only"
+            )
+        if not self.run.command:
+            raise ValueError(
+                "a stdio server needs run.command — there is nothing for "
+                "the MCP supervisor to launch"
             )
         return self
 
     # -- derived views ----------------------------------------------------
 
-    def launch_argv(self) -> list[str]:
-        """The full argv the MCP supervisor will execute (stdio only)."""
-        return [*self.run.command, *self.run.args]
+    def launch_argv(self, workspace: str | None = None) -> list[str]:
+        """The full argv the MCP supervisor will execute.
 
-    def server_config(self) -> dict:
+        ``workspace`` is substituted for every :data:`WORKSPACE_TOKEN`.  A
+        manifest that needs a workspace and is asked for its argv without one
+        raises rather than shipping an unexpanded ``{workspace}`` to the loader.
+        """
+        argv = [*self.run.command, *self.run.args]
+        if workspace is None:
+            if any(WORKSPACE_TOKEN in arg for arg in argv):
+                raise ValueError(
+                    f"manifest {self.id!r} uses {WORKSPACE_TOKEN} — a workspace "
+                    "path is required to build its launch command"
+                )
+            return argv
+        return [arg.replace(WORKSPACE_TOKEN, workspace) for arg in argv]
+
+    def server_config(self, workspace: str | None = None) -> dict:
         """The server config row that makes this manifest loadable.
 
         ``MCPSupervisor._resolve_cmd`` reads ``config["cmd"]`` first and falls
@@ -324,17 +363,26 @@ class MCPRegistryManifest(BaseModel):
         config: dict[str, Any] = {
             "source": "marketplace",
             "permissions": list(self.permissions),
+            "cmd": self.launch_argv(workspace),
         }
-        if self.transport == "stdio":
-            config["cmd"] = self.launch_argv()
-        else:
-            config["url"] = self.run.url
         if self.run.env:
-            config["env"] = dict(self.run.env)
+            env = dict(self.run.env)
+            if workspace is not None:
+                env = {
+                    key: value.replace(WORKSPACE_TOKEN, workspace)
+                    for key, value in env.items()
+                }
+            config["env"] = env
         return config
 
     def to_dict(self) -> dict:
-        """Browse payload: the manifest fields plus derived launch data."""
+        """Browse payload: the manifest fields plus derived launch data.
+
+        ``command`` keeps the raw ``{workspace}`` placeholder — this is a
+        *description* of the entry, and expanding it here would need a workspace
+        that does not exist until install.  ``uses_workspace`` tells a caller the
+        placeholder is there.
+        """
         return {
             "id": self.id,
             "name": self.name,
@@ -349,7 +397,8 @@ class MCPRegistryManifest(BaseModel):
             "verified": self.verified,
             "install_method": self.install.method,
             "install_package": self.install.package,
-            "command": self.launch_argv(),
+            "command": [*self.run.command, *self.run.args],
+            "uses_workspace": self.run.uses_workspace(),
         }
 
     # -- construction -----------------------------------------------------
@@ -470,9 +519,15 @@ class MCPRegistry:
             self._loaded = True
 
     def load(self) -> None:
-        """(Re)read the registry directory."""
-        # Parse outside the lock (a slow filesystem must not block a reader that
-        # already has a snapshot), publish inside it.
+        """(Re)read the registry directory.
+
+        A direct ``load()`` (or ``reload()``) parses outside the lock and then
+        publishes under it, so a reader holding an older snapshot is never
+        blocked behind a slow filesystem.  Called from :meth:`_ensure_loaded`
+        the parse runs *inside* the lock instead — that is deliberate: it is
+        what makes the lazy first read happen exactly once.  Either way the
+        parse is off the lock for readers who already have a snapshot.
+        """
         self._publish(*self._read_dir())
 
     def _ensure_loaded(self) -> None:
@@ -552,14 +607,50 @@ class MCPMarketplaceError(Exception):
         self.status_code = status_code
 
 
-async def _subprocess_runner(argv: list[str]) -> tuple[int, str, str]:
-    """Default runner: execute the install command and capture its output."""
+async def _terminate(proc: asyncio.subprocess.Process) -> None:
+    """SIGKILL a child and reap it, tolerating an already-dead process."""
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        await proc.wait()
+    except Exception:  # pragma: no cover - reaping best effort
+        logger.warning("mcp marketplace: could not reap install process", exc_info=True)
+
+
+async def _subprocess_runner(
+    argv: list[str],
+    *,
+    timeout: float = INSTALL_TIMEOUT_S,
+) -> tuple[int, str, str]:
+    """Default runner: execute the install command and capture its output.
+
+    Bounded on purpose.  The route awaits this directly and the ASGI server has
+    a graceful-shutdown timeout, not a request timeout, so an install command
+    that never exits would hold the request (and the admin's browser) open
+    forever.  On timeout the child is killed and reaped and a non-zero code is
+    returned, which ``install`` turns into the same 502-and-leave-the-store-alone
+    path as any other failed install.  Cancellation kills the child too — a
+    disconnected client must not leak a running installer.
+    """
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    out, err = await proc.communicate()
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        await _terminate(proc)
+        return (
+            124,
+            "",
+            f"install command timed out after {timeout:g}s and was killed",
+        )
+    except asyncio.CancelledError:
+        await _terminate(proc)
+        raise
     return (
         proc.returncode or 0,
         out.decode(errors="replace"),
@@ -575,6 +666,11 @@ class MCPMarketplace:
     without fetching anything from the network.  ``run_install_command=False``
     resolves and registers without executing, which is what a test or a
     dry-run preview uses.
+
+    ``workspace_root`` is where a manifest's :data:`WORKSPACE_TOKEN` is expanded
+    to: ``<workspace_root>/<id>``, created by the install flow.  A manifest that
+    needs a workspace cannot be installed without one — the installer refuses
+    rather than writing a config with a literal ``{workspace}`` in it.
     """
 
     def __init__(
@@ -583,11 +679,13 @@ class MCPMarketplace:
         store: MCPServerStore,
         supervisor: Any | None = None,
         runner: InstallRunner | None = None,
+        workspace_root: Path | None = None,
     ):
         self.registry = registry
         self.store = store
         self.supervisor = supervisor
         self._runner: InstallRunner = runner or _subprocess_runner
+        self.workspace_root = Path(workspace_root) if workspace_root else None
 
     # -- browse -----------------------------------------------------------
 
@@ -671,7 +769,8 @@ class MCPMarketplace:
                 f"{manifest.id!r} is already installed", status_code=409
             )
 
-        config = manifest.server_config()
+        workspace = self._provision_workspace(manifest)
+        config = manifest.server_config(workspace)
         install_output: str | None = None
 
         if run_install_command and manifest.install.command:
@@ -699,8 +798,38 @@ class MCPMarketplace:
             "transport": manifest.transport,
             "config": config,
             "permissions": list(manifest.permissions),
+            "workspace": workspace,
             "install_output": install_output,
         }
+
+    def _provision_workspace(self, manifest: MCPRegistryManifest) -> str | None:
+        """Create (and return) the per-entry workspace, or ``None`` if unused.
+
+        Only a manifest that actually references :data:`WORKSPACE_TOKEN` gets a
+        directory — an entry that needs no filesystem scope should not scatter
+        empty directories through the data dir.  A manifest that needs one and
+        cannot get it is refused here, before anything is registered: a config
+        with a literal ``{workspace}`` in its argv is not launchable, and
+        installing it would leave a server that can never start.
+        """
+        if not manifest.run.uses_workspace():
+            return None
+        if self.workspace_root is None:
+            raise MCPMarketplaceError(
+                f"{manifest.id!r} needs a workspace but the marketplace has no "
+                "workspace root configured",
+                status_code=500,
+            )
+        workspace = self.workspace_root / manifest.id
+        try:
+            workspace.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise MCPMarketplaceError(
+                f"could not create the workspace for {manifest.id!r} at "
+                f"{workspace}: {exc}",
+                status_code=500,
+            ) from exc
+        return str(workspace)
 
     async def uninstall(self, manifest_id: str) -> dict:
         """Remove an installed marketplace server.

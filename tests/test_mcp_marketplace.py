@@ -149,15 +149,35 @@ class TestManifestParsing:
         with pytest.raises(ValidationError):
             MCPRegistryManifest.model_validate({**FETCH_MANIFEST, "run": {}})
 
-    def test_remote_transport_requires_a_url(self):
-        with pytest.raises(ValidationError):
+    @pytest.mark.parametrize("transport", ["sse", "http"])
+    def test_non_stdio_transport_is_rejected(self, transport):
+        """The supervisor launches stdio servers only.
+
+        Accepting sse/http would register a config with no resolvable `cmd`,
+        which the start route can only 500 on.
+        """
+        with pytest.raises(ValidationError) as excinfo:
             MCPRegistryManifest.model_validate({
-                **FETCH_MANIFEST, "transport": "sse", "run": {"url": ""},
+                **FETCH_MANIFEST, "transport": transport,
             })
+        assert "not supported" in str(excinfo.value)
+
+    def test_workspace_placeholder_needs_a_workspace_to_expand(self):
         manifest = MCPRegistryManifest.model_validate({
-            **FETCH_MANIFEST, "transport": "sse", "run": {"url": "https://example.test/sse"},
+            **FETCH_MANIFEST,
+            "run": {"command": ["serve"], "args": ["{workspace}", "--flag"]},
         })
-        assert manifest.server_config()["url"] == "https://example.test/sse"
+        assert manifest.run.uses_workspace() is True
+        with pytest.raises(ValueError, match="workspace path is required"):
+            manifest.launch_argv()
+        assert manifest.launch_argv("/ws") == ["serve", "/ws", "--flag"]
+        assert manifest.server_config("/ws")["cmd"] == ["serve", "/ws", "--flag"]
+
+    def test_manifest_without_a_placeholder_ignores_the_workspace(self):
+        manifest = MCPRegistryManifest.model_validate(FETCH_MANIFEST)
+        assert manifest.run.uses_workspace() is False
+        assert manifest.launch_argv() == ["uvx", "mcp-server-fetch"]
+        assert manifest.launch_argv("/ws") == ["uvx", "mcp-server-fetch"]
 
 
 class TestPermissionValidation:
@@ -216,8 +236,15 @@ class TestCuratedRegistry:
             assert manifest.categories, f"{manifest.id} has no category to browse by"
             assert manifest.verified, f"{manifest.id} is not marked verified"
             assert manifest.run.command, f"{manifest.id} has no run command"
-            # The config the installer writes must be launchable as-is.
-            if manifest.transport == "stdio":
+            # The config the installer writes must be launchable as-is — with a
+            # placeholder-free argv it needs no workspace, and with one the
+            # workspace must actually be substituted.
+            if manifest.run.uses_workspace():
+                config = manifest.server_config(f"/ws/{manifest.id}")
+                assert all("{workspace}" not in arg for arg in config["cmd"])
+                assert config["cmd"][-1] == f"/ws/{manifest.id}" or \
+                    f"/ws/{manifest.id}" in config["cmd"]
+            else:
                 assert manifest.server_config()["cmd"] == manifest.launch_argv()
 
     def test_search_matches_name_description_and_category(self, registry_dir: Path):
@@ -447,6 +474,72 @@ class TestInstallFlow:
         assert detail["installed"] is True
         assert detail["installed_config"]["cmd"] == ["uvx", "mcp-server-fetch"]
 
+    async def test_the_install_runner_is_bounded_and_kills_a_hung_command(self, registry_dir, store):
+        """A never-exiting install command must not hold the request open."""
+        from functools import partial
+
+        from tinyagentos.mcp.marketplace import _subprocess_runner
+
+        sleeper = [sys.executable, "-c", "import time; time.sleep(30)"]
+        _write_manifest(registry_dir, "mcp-slow.yaml", {
+            "id": "mcp-slow",
+            "name": "Slow",
+            "version": "1.0.0",
+            "author": "taos",
+            "categories": ["test"],
+            "transport": "stdio",
+            "permissions": [],
+            "install": {"method": "script", "command": sleeper},
+            "run": {"command": sleeper},
+        })
+        marketplace = MCPMarketplace(
+            registry=MCPRegistry(registry_dir), store=store,
+            runner=partial(_subprocess_runner, timeout=0.3),
+        )
+        with pytest.raises(MCPMarketplaceError) as excinfo:
+            await marketplace.install("mcp-slow")
+        assert excinfo.value.status_code == 502
+        assert "timed out" in str(excinfo.value)
+        assert await store.get_server("mcp-slow") is None
+
+    async def test_install_provisions_the_workspace_a_manifest_needs(self, tmp_path, store):
+        """`{workspace}` is expanded to a freshly created, private directory."""
+        workspace_root = tmp_path / "mcp-servers"
+        marketplace = MCPMarketplace(
+            registry=MCPRegistry(default_registry_dir()), store=store,
+            workspace_root=workspace_root,
+        )
+        result = await marketplace.install("mcp-filesystem", run_install_command=False)
+        expected = str(workspace_root / "mcp-filesystem")
+        assert result["workspace"] == expected
+        assert Path(expected).is_dir()
+        assert result["config"]["cmd"][-1] == expected
+        assert "{workspace}" not in " ".join(result["config"]["cmd"])
+
+        server = await store.get_server("mcp-filesystem")
+        supervisor = MCPSupervisor(store=store, catalog=None, notif_store=None)
+        cmd = supervisor._resolve_cmd("mcp-filesystem", server)
+        assert cmd is not None
+        assert cmd[-1] == expected
+
+    async def test_install_refuses_a_workspace_entry_without_a_root(self, store):
+        marketplace = MCPMarketplace(
+            registry=MCPRegistry(default_registry_dir()), store=store,
+        )
+        with pytest.raises(MCPMarketplaceError) as excinfo:
+            await marketplace.install("mcp-filesystem", run_install_command=False)
+        assert excinfo.value.status_code == 500
+        assert await store.get_server("mcp-filesystem") is None
+
+    async def test_browse_keeps_the_workspace_placeholder(self, store):
+        marketplace = MCPMarketplace(
+            registry=MCPRegistry(default_registry_dir()), store=store,
+            workspace_root=None,
+        )
+        entry = next(e for e in await marketplace.browse() if e["id"] == "mcp-filesystem")
+        assert entry["uses_workspace"] is True
+        assert entry["command"][-1] == "{workspace}"
+
     async def test_installed_server_is_launchable_by_the_supervisor(self, tmp_path: Path, store):
         """The strongest form of "loadable": the supervisor actually spawns it."""
         registry_dir = tmp_path / "registry"
@@ -675,6 +768,8 @@ def test_marketplace_routes_are_registered_by_create_app(tmp_data_dir):
     assert app.state.mcp_marketplace is not None
     # The shipped registry is reachable through the app-level instance.
     assert len(app.state.mcp_marketplace.registry.list()) >= 5
+    # …and it can provision a workspace for the entries that need one.
+    assert app.state.mcp_marketplace.workspace_root == tmp_data_dir / "mcp-servers"
 
 
 def _dependency_names(dependant) -> set[str]:

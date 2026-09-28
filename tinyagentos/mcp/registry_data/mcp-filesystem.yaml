@@ -1,8 +1,9 @@
 id: mcp-filesystem
 name: Filesystem
 description: >-
-  Read, write and search files under an explicitly allowed root directory.
-  The reference MCP filesystem server.
+  Read, write and search files under one allowed directory. The reference MCP
+  filesystem server. Installing this entry provisions a private workspace
+  directory for it — no existing taOS directory (and no secrets) is exposed.
 version: 2025.7.1
 author: modelcontextprotocol
 homepage: https://github.com/modelcontextprotocol/servers
@@ -26,4 +27,4 @@ run:
     - "-y"
     - "@modelcontextprotocol/server-filesystem"
   args:
-    - /data
+    - "{workspace}"

@@ -361,6 +361,11 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     mcp_marketplace = MCPMarketplace(
         registry=MCPRegistry(default_registry_dir()),
         store=mcp_store,
+        # Where a manifest's `{workspace}` placeholder is expanded to, and the
+        # directory the install flow creates for it.  Deliberately NOT data_dir
+        # itself: a filesystem/git MCP server pointed at the data dir would see
+        # the secrets store and the SQLite databases.
+        workspace_root=data_dir / "mcp-servers",
     )
     qmd_client = QmdClient(config.qmd.get("url", "http://localhost:7832"))
     http_client = httpx.AsyncClient(timeout=30)

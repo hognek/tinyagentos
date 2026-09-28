@@ -1,8 +1,9 @@
 id: mcp-git
 name: Git
 description: >-
-  Inspect and operate on a local git repository: status, diff, log, commit
-  and branch. Scoped to a single repository path.
+  Inspect and operate on a local git repository: status, diff, log, commit and
+  branch. Scoped to the repository in its own private workspace, which the
+  installer provisions — put the repository to work on there.
 version: 2025.4.7
 author: modelcontextprotocol
 homepage: https://github.com/modelcontextprotocol/servers
@@ -26,4 +27,4 @@ run:
     - mcp-server-git
   args:
     - --repository
-    - /data/repo
+    - "{workspace}"
