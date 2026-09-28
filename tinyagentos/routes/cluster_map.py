@@ -68,8 +68,12 @@ def _placement_for(worker) -> list[dict]:
     source when present: it survives a stopped backend, so an installed model
     on a backend that is not currently running is still visible. Models the
     backend reports as resident but the manifest does not list are added
-    afterwards so a loaded model is never hidden. Workers that predate the
-    enrichment fall back to the legacy "backends[].models are loaded" reading.
+    afterwards so a loaded model is never hidden. A backend that declares no
+    ``available_models`` (no manifest, or a manifest that does not cover its
+    software) falls back to its ``models`` catalog, placed against the
+    worker's ``loaded_models`` residency: a catalog model the worker reports
+    resident is ``loaded``, the rest ``installed``. With no residency signal
+    at all (an absent ``loaded_models`` key) nothing may be claimed loaded.
     """
     rows: list[dict] = []
     seen: set[tuple[str, str]] = set()
@@ -132,11 +136,22 @@ def _placement_for(worker) -> list[dict]:
             )
 
         if not available:
-            # No per-model availability declared: the catalog is present but
-            # there is no residency signal, so every model is "installed".
+            # No per-model availability declared: the backend's `models`
+            # catalog is all we have. Residency still comes from
+            # `loaded_models` — a catalog model the worker reports resident is
+            # loaded, every other one is merely installed. Marking this from
+            # resident_names (not a blanket "installed") matters because `_add`
+            # dedupes on (model_id, backend), so a later resident pass cannot
+            # upgrade a row that was already emitted as installed. With no
+            # residency signal at all, resident_names is empty and nothing is
+            # claimed loaded.
             for m in (b.get("models") or []):
                 if isinstance(m, dict):
-                    _add(_model_name(m), bname, btype, bstatus, "installed")
+                    name = _model_name(m)
+                    _add(
+                        name, bname, btype, bstatus,
+                        "loaded" if name in resident_names else "installed",
+                    )
 
         # A resident model the manifest did not declare must still be placed.
         for name in sorted(resident_names):

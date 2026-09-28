@@ -149,6 +149,55 @@ async def test_map_aggregates_capabilities_and_placement(client, app):
 
 
 @pytest.mark.asyncio
+async def test_map_catalog_fallback_keeps_resident_model_loaded(client, app):
+    """A backend with a `models` catalog and a `loaded_models` residency signal
+    but NO `available_models`: the resident catalog model must read `loaded`,
+    the idle ones `installed`. Regression for the blanket-"installed" fallback,
+    which emitted the resident model as installed and then had the later
+    resident pass deduped away (same model_id + backend key)."""
+    _put_worker(
+        app,
+        WorkerInfo(
+            name="no-manifest-box",
+            url="http://10.0.0.12:9000",
+            platform="linux",
+            status="online",
+            last_heartbeat=time.time(),
+            hardware={
+                "ram_mb": 16384,
+                "cpu": {"arch": "x86_64"},
+                "gpu": {"type": "nvidia", "cuda": True, "vram_mb": 8192},
+            },
+            backends=[
+                {
+                    "name": "ollama:11434",
+                    "type": "ollama",
+                    "status": "ok",
+                    "capabilities": ["llm-chat"],
+                    # No worker manifest on this node => no `available_models`,
+                    # but the /api/ps residency probe still ran.
+                    "models": [{"name": "qwen2.5-7b"}, {"name": "phi-3-mini"}],
+                    "loaded_models": [{"name": "qwen2.5-7b"}],
+                }
+            ],
+            models=["qwen2.5-7b", "phi-3-mini"],
+            capabilities=["chat"],
+        ),
+    )
+
+    resp = await client.get("/api/cluster/map")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    node = next((n for n in data["nodes"] if n["name"] == "no-manifest-box"), None)
+    assert node is not None, data
+    placement = {(p["model_id"], p["state"]) for p in node["placement"]}
+    assert ("qwen2.5-7b", "loaded") in placement
+    assert ("phi-3-mini", "installed") in placement
+    # Exactly one row per model — the resident pass must not double-add.
+    assert len(node["placement"]) == 2
+
+
+@pytest.mark.asyncio
 async def test_map_legacy_backend_without_loaded_models_is_installed(client, app):
     """A backend that never reports `loaded_models` must not have its whole
     catalog counted as loaded — the absence of a residency signal means every

@@ -1606,10 +1606,17 @@ snapshot, not a lock.
   `total_mb`, `null` when the node reports no probe — never coerced to 0),
   `backends`, `placement` rows and any active GPU `leases`.
 - `placement` -- one row per model: `state` is `loaded` (resident now) or
-  `installed` (declared on the node, its backend is not serving it). Derived
-  from each worker's `backends[].available_models`, which survives a stopped
-  backend, so a node with everything installed and nothing running reports
-  installed-only rows instead of vanishing from the map.
+  `installed` (declared on the node, not resident). Derived from each worker's
+  `backends[].available_models` (`status` `loaded` / otherwise), which survives
+  a stopped backend, so a node with everything installed and nothing running
+  reports installed-only rows instead of vanishing from the map. A backend with
+  no `available_models` (no manifest, or one that does not cover its software)
+  falls back to its `models` catalog against the `loaded_models` residency set;
+  the absence of a `loaded_models` key is no residency signal, so nothing reads
+  `loaded`. Note the corollary: the non-ollama backends (llama.cpp / vLLM /
+  sd-cpp) publish no in-memory probe — their `loaded_models` is empty by design
+  — so a model they are actively serving still reads `installed`, following the
+  worker's own `available_models[].status`.
 - `capabilities` -- the union of capabilities across the mesh, each split into
   mutually exclusive buckets: `active_nodes` (serving now), `installed_nodes`
   (present but not serving) and `potential_nodes` (hardware could run it,
