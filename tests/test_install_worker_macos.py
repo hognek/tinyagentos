@@ -188,15 +188,19 @@ def test_force_metal_overrides_a_silent_probe(tmp_path: Path) -> None:
 def test_metal_support_unsupported_is_not_treated_as_metal(tmp_path: Path) -> None:
     """`grep -i metal` would read "Metal Support: Unsupported" as support.
 
-    CodeRabbit flagged the bare substring match on the second revision: an
-    Intel Mac with a GPU the OS cannot drive reports Unsupported, and
-    registering it as gpu-metal would be wrong.
+    CodeRabbit flagged the bare substring match on the second revision: a GPU
+    the OS cannot drive reports Unsupported, and registering it as gpu-metal
+    would be wrong. arm64 is deliberate — on x86_64 the arch check short-
+    circuits before the probe, so the test would pass without exercising the
+    regex at all (CodeRabbit nitpick on the third revision). Verified
+    discriminating: against a scratch copy of the script carrying the old bare
+    `grep -qi 'metal'`, this test fails with 'gpu-metal' != 'cpu-inference'.
     """
     result = _run_wrapper(
         tmp_path,
         _detection_wrapper(
             tmp_path,
-            mach="x86_64",
+            mach="arm64",
             sp_output="Metal Support: Unsupported",
             mlx_present=False,
         ),
