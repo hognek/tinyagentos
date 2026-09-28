@@ -1502,18 +1502,21 @@ accepting an `sse`/`http` entry would register a server with no resolvable
 launch command that the start route can only `500` on.
 
 `{workspace}` (`WORKSPACE_TOKEN`) in a manifest's `run.command`/`run.args`/env
-values is replaced by the installer with `<data_dir>/mcp-servers/<id>`, which
-the install flow creates. It exists so a curated entry can point a server at a
-private empty directory instead of an existing one — the filesystem and git
-servers both need a directory that exists before they start, and pointing them
-at the taOS data directory would expose the secrets store and the SQLite
-databases. A manifest that needs a workspace and has no workspace root
-configured is refused (500) rather than registered with a literal
-`{workspace}` in its argv. The install command itself runs under a bounded
-timeout (`INSTALL_TIMEOUT_S`, 600 s): on expiry the child is killed and reaped
-and the install reports 502 with the store untouched — an ASGI server has a
-graceful-shutdown timeout, not a request timeout, so an unbounded runner could
-hold an admin's request open forever.
+keys or values is replaced by the installer with `<data_dir>/mcp-servers/<id>`,
+which the install flow creates once the install command has succeeded — a
+failed or timed-out install leaves no directory behind. It exists so a curated
+entry can point a server at a private empty directory instead of an existing
+one: the filesystem and git servers both need a directory that exists before
+they start, and pointing them at the taOS data directory would expose the
+secrets store and the SQLite databases. A manifest that needs a workspace and
+has no workspace root configured is refused (500) before the install command
+runs, and a manifest that puts the placeholder in `install.command` is refused
+(400) — the placeholder is expanded from the run configuration only, so an
+install command carrying it would execute the literal token. The install
+command itself runs under a bounded timeout (`INSTALL_TIMEOUT_S`, 600 s): on
+expiry the child is killed and reaped and the install reports 502 with the
+store untouched — an ASGI server has a graceful-shutdown timeout, not a request
+timeout, so an unbounded runner could hold an admin's request open forever.
 
 **Declared permissions are requirements, not grants.** Install records them in
 the server config (`config["permissions"]`); who may call which tool is still

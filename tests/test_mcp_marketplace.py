@@ -179,6 +179,16 @@ class TestManifestParsing:
         assert manifest.launch_argv() == ["uvx", "mcp-server-fetch"]
         assert manifest.launch_argv("/ws") == ["uvx", "mcp-server-fetch"]
 
+    def test_workspace_placeholder_in_an_env_key_or_value_counts(self):
+        for env in ({"{workspace}": "1"}, {"HOME": "{workspace}"}):
+            manifest = MCPRegistryManifest.model_validate({
+                **FETCH_MANIFEST, "run": {"command": ["serve"], "env": env},
+            })
+            assert manifest.run.uses_workspace() is True, env
+            config = manifest.server_config("/ws")
+            assert all("{workspace}" not in key for key in config["env"])
+            assert all("{workspace}" not in value for value in config["env"].values())
+
 
 class TestPermissionValidation:
     def test_valid_set_is_sorted_and_deduplicated(self):
@@ -530,6 +540,50 @@ class TestInstallFlow:
             await marketplace.install("mcp-filesystem", run_install_command=False)
         assert excinfo.value.status_code == 500
         assert await store.get_server("mcp-filesystem") is None
+
+    async def test_a_failed_install_leaves_no_workspace_behind(self, registry_dir, store, tmp_path):
+        """A failed install must leave neither a store row nor a directory."""
+        workspace_root = tmp_path / "mcp-servers"
+        _write_manifest(registry_dir, "mcp-ws.yaml", {
+            "id": "mcp-ws",
+            "name": "Workspace demo",
+            "version": "1.0.0",
+            "author": "taos",
+            "categories": ["test"],
+            "transport": "stdio",
+            "permissions": [],
+            "install": {"method": "script", "command": ["false"]},
+            "run": {"command": ["serve"], "args": ["{workspace}"]},
+        })
+        marketplace = MCPMarketplace(
+            registry=MCPRegistry(registry_dir), store=store,
+            runner=RecordingRunner(returncode=1), workspace_root=workspace_root,
+        )
+        with pytest.raises(MCPMarketplaceError):
+            await marketplace.install("mcp-ws")
+        assert await store.get_server("mcp-ws") is None
+        assert not (workspace_root / "mcp-ws").exists()
+
+    async def test_the_install_command_cannot_use_the_workspace_placeholder(self, registry_dir, store, tmp_path):
+        _write_manifest(registry_dir, "mcp-bad-install.yaml", {
+            "id": "mcp-bad-install",
+            "name": "Bad install",
+            "version": "1.0.0",
+            "author": "taos",
+            "categories": ["test"],
+            "transport": "stdio",
+            "permissions": [],
+            "install": {"method": "script", "command": ["install-into", "{workspace}"]},
+            "run": {"command": ["serve"]},
+        })
+        marketplace = MCPMarketplace(
+            registry=MCPRegistry(registry_dir), store=store,
+            workspace_root=tmp_path / "mcp-servers",
+        )
+        with pytest.raises(MCPMarketplaceError) as excinfo:
+            await marketplace.install("mcp-bad-install")
+        assert excinfo.value.status_code == 400
+        assert await store.get_server("mcp-bad-install") is None
 
     async def test_browse_keeps_the_workspace_placeholder(self, store):
         marketplace = MCPMarketplace(

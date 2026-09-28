@@ -242,7 +242,7 @@ class MCPRunSpec(BaseModel):
         return _coerce_argv(value, field="run.args")
 
     def uses_workspace(self) -> bool:
-        tokens = [*self.command, *self.args, *self.env.values()]
+        tokens = [*self.command, *self.args, *self.env.keys(), *self.env.values()]
         return any(WORKSPACE_TOKEN in token for token in tokens)
 
 
@@ -370,7 +370,8 @@ class MCPRegistryManifest(BaseModel):
             env = dict(self.run.env)
             if workspace is not None:
                 env = {
-                    key: value.replace(WORKSPACE_TOKEN, workspace)
+                    key.replace(WORKSPACE_TOKEN, workspace):
+                        value.replace(WORKSPACE_TOKEN, workspace)
                     for key, value in env.items()
                 }
             config["env"] = env
@@ -778,8 +779,19 @@ class MCPMarketplace:
                 f"{manifest.id!r} is already installed", status_code=409
             )
 
-        workspace = self._provision_workspace(manifest)
-        config = manifest.server_config(workspace)
+        if any(WORKSPACE_TOKEN in arg for arg in manifest.install.command):
+            # The placeholder expands from the run configuration only; an install
+            # command carrying it would be executed with the literal token.
+            raise MCPMarketplaceError(
+                f"{manifest.id!r} uses {WORKSPACE_TOKEN} in install.command, "
+                "which is not supported — the placeholder belongs in the run "
+                "configuration",
+                status_code=400,
+            )
+
+        # Resolve (and validate) the workspace before anything is fetched, so a
+        # missing workspace root fails without running the install command.
+        workspace = self._workspace_path(manifest)
         install_output: str | None = None
 
         if run_install_command and manifest.install.command:
@@ -791,6 +803,11 @@ class MCPMarketplace:
                     status_code=502,
                 )
             install_output = stdout[-2000:]
+
+        # …and create it only once the install succeeded, so a failed or timed
+        # out install leaves no directory behind.
+        self._create_workspace(workspace)
+        config = manifest.server_config(workspace)
 
         await self.store.register_server(
             manifest.id, manifest.version, manifest.transport, config
@@ -811,15 +828,15 @@ class MCPMarketplace:
             "install_output": install_output,
         }
 
-    def _provision_workspace(self, manifest: MCPRegistryManifest) -> str | None:
-        """Create (and return) the per-entry workspace, or ``None`` if unused.
+    def _workspace_path(self, manifest: MCPRegistryManifest) -> str | None:
+        """The workspace a manifest needs, or ``None`` if it needs none.
 
         Only a manifest that actually references :data:`WORKSPACE_TOKEN` gets a
         directory — an entry that needs no filesystem scope should not scatter
         empty directories through the data dir.  A manifest that needs one and
-        cannot get it is refused here, before anything is registered: a config
-        with a literal ``{workspace}`` in its argv is not launchable, and
-        installing it would leave a server that can never start.
+        cannot get it is refused here, before anything is fetched or registered:
+        a config with a literal ``{workspace}`` in its argv is not launchable,
+        and installing it would leave a server that can never start.
         """
         if not manifest.run.uses_workspace():
             return None
@@ -829,16 +846,19 @@ class MCPMarketplace:
                 "workspace root configured",
                 status_code=500,
             )
-        workspace = self.workspace_root / manifest.id
+        return str(self.workspace_root / manifest.id)
+
+    def _create_workspace(self, workspace: str | None) -> None:
+        """Create the workspace directory, preserving anything already there."""
+        if workspace is None:
+            return
         try:
-            workspace.mkdir(parents=True, exist_ok=True)
+            Path(workspace).mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             raise MCPMarketplaceError(
-                f"could not create the workspace for {manifest.id!r} at "
-                f"{workspace}: {exc}",
+                f"could not create the workspace at {workspace}: {exc}",
                 status_code=500,
             ) from exc
-        return str(workspace)
 
     async def uninstall(self, manifest_id: str) -> dict:
         """Remove an installed marketplace server.
