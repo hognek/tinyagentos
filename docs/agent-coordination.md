@@ -1488,7 +1488,7 @@ installed, and `502` when the install command fails — **a failed install leave
 the store untouched**, so a half-installed entry never shows up as launchable.
 Uninstalling is `404` for something that was never installed.
 
-A manifest (`tinyagentos/mcp/registry_data/*.yaml`, min one per entry) declares
+A manifest (`app-catalog/mcp-registry/<id>.yaml`, one per entry) declares
 `id`, `name`, `description`, `version`, `author`, `categories`, `transport`,
 the install command (`install.command`), the launch command (`run.command` +
 `run.args`) and the **permissions the server states it needs**. The permission

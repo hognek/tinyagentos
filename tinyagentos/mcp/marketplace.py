@@ -17,9 +17,10 @@ a spawned process:
 
 ``MCPRegistry``
     A directory of manifests — the shipped curated snapshot
-    (``tinyagentos/mcp/registry_data/``).  ``MCPRegistry`` takes the directory as
-    a constructor argument, so the same loader reads a mounted or downloaded
-    copy of the hosted registry without a code change.
+    (``app-catalog/mcp-registry/``, where every other taOS manifest lives).
+    ``MCPRegistry`` takes the directory as a constructor argument, so the same
+    loader reads a mounted or downloaded copy of the hosted registry without a
+    code change.
 
 ``MCPMarketplace``
     The install flow: resolve a manifest -> optionally run its install command
@@ -426,8 +427,16 @@ class MCPRegistryManifest(BaseModel):
 
 
 def default_registry_dir() -> Path:
-    """The curated registry shipped with this build of taOS."""
-    return Path(__file__).parent / "registry_data"
+    """The curated registry shipped with this build of taOS.
+
+    It lives next to the rest of the app catalog (``app-catalog/mcp-registry/``,
+    one flat ``<id>.yaml`` per entry) rather than inside the package: that is
+    where every other taOS manifest already lives, and ``create_app`` locates the
+    catalog the same way (``PROJECT_DIR / "app-catalog"``).  ``MCPRegistry``
+    takes the directory as an argument, so pointing it at a downloaded or
+    mounted copy of the hosted registry is a one-line change.
+    """
+    return Path(__file__).resolve().parent.parent.parent / "app-catalog" / "mcp-registry"
 
 
 def _manifest_files(registry_dir: Path) -> Iterable[Path]:
