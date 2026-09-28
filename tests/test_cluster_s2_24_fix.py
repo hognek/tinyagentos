@@ -132,8 +132,11 @@ class TestS224_Routes:
 
 @pytest.mark.asyncio
 class TestS224_WorkerAgent:
-    async def test_worker_agent_register_sends_resources(self):
+    async def test_worker_agent_register_sends_resources(self, monkeypatch):
         """WorkerAgent.register() payload includes discovered resources."""
+        # install-worker.sh exports TAOS_WORKER_RESOURCES; the exact-list
+        # assertion below only holds with no installer classes in the env.
+        monkeypatch.delenv("TAOS_WORKER_RESOURCES", raising=False)
         from tinyagentos.worker.agent import WorkerAgent
         captured = {}
 
@@ -178,8 +181,10 @@ class TestS224_WorkerAgent:
         assert "resources" in captured["body"]
         assert captured["body"]["resources"] == ["cpu-inference"]
 
-    async def test_worker_agent_heartbeat_sends_resources(self):
+    async def test_worker_agent_heartbeat_sends_resources(self, monkeypatch):
         """WorkerAgent.heartbeat() payload includes discovered resources."""
+        # Same env-independence as the register case above.
+        monkeypatch.delenv("TAOS_WORKER_RESOURCES", raising=False)
         from tinyagentos.worker.agent import WorkerAgent
         captured = {}
 
