@@ -118,7 +118,7 @@ An agent's local subscription is a **filter**, not a bus membership:
 scope = {
   guide:        "10-image-prompting",   # canonical guide id
   capability:   "image_generation",     # from the capability registry
-  hardware:     "x86-cuda-12gb",         # the tier vocabulary capabilities.py / manifests use
+  hardware:     "x86-cuda-12gb",        # the app-manifest hardware_tiers vocabulary
   framework:    null,                   # optional tighter match
 }
 ```
@@ -323,8 +323,10 @@ gateway, and the gateway is where redaction belongs — not at the reader).
    into contradicting each other. This is the one thing #900 says to build WITH
    @taOSmd rather than decide alone.
 4. **Hardware-tier vocabulary.** Scoping is only as good as the tier names; bind
-   them to the vocabulary `capabilities.py` and skill manifests already use
-   rather than inventing a second one.
+   them to the app-manifest `hardware_tiers` vocabulary (`CONTRIBUTING.md`,
+   `x86-cuda-12gb` / `arm-npu-16gb` / `cpu-only`) rather than inventing a second
+   one. `capabilities.py` carries `min_vram_mb` capability requirements, not tier
+   names.
 5. **Trusted-reviewer thresholds** for the post-S3 gate (who counts as trusted,
    how many confirm).
 6. **Isolation mechanism** (§3.2): a per-instance bus URL versus an enforced
