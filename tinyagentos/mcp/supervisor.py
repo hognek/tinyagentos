@@ -57,6 +57,11 @@ def _merged_env(config: dict | None) -> dict[str, str] | None:
     An ``env`` mapping is merged *over* ``os.environ`` — never used to replace
     it — so a manifest can add ``FOO=bar`` without stripping ``PATH`` and
     silently breaking an ``npx``/``uvx`` launch command.
+
+    The per-key type filter is not redundant with the manifest model's
+    ``dict[str, str]``: ``config`` here is the JSON column of ``mcp_servers``,
+    which the ``PUT /api/mcp/servers/{id}/config`` route writes from an
+    unvalidated ``dict`` body, so a non-string value can reach this function.
     """
     if not isinstance(config, dict):
         return None

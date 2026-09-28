@@ -15,7 +15,9 @@ touches the network.
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -137,7 +139,7 @@ class TestManifestParsing:
 
     @pytest.mark.parametrize(
         "bad_id",
-        ["../escape", "Bad Id", "UPPER", "", "_leading", "a" * 65],
+        ["../escape", "Bad Id", "UPPER", "", "_leading", "a" * 65, "..", ".", "-"],
     )
     def test_invalid_id_is_rejected(self, bad_id):
         with pytest.raises(ValidationError):
@@ -256,6 +258,60 @@ class TestCuratedRegistry:
         (entry_dir / "manifest.yaml").write_text(yaml.safe_dump(FETCH_MANIFEST))
         registry = MCPRegistry(tmp_path / "registry")
         assert registry.get("mcp-fetch") is not None
+
+    def test_unreadable_entry_is_recorded_not_raised(self, registry_dir: Path):
+        """An unreadable file must degrade to a recorded error, not a 500."""
+        if os.geteuid() == 0:
+            pytest.skip("root ignores file mode bits")
+        victim = _write_manifest(registry_dir, "locked.yaml", {**FETCH_MANIFEST, "id": "mcp-locked"})
+        victim.chmod(0o000)
+        try:
+            registry = MCPRegistry(registry_dir)
+            assert {m.id for m in registry.list()} == {"mcp-fetch", "mcp-docker-demo"}
+            assert any(e["path"].endswith("locked.yaml") for e in registry.errors)
+            assert any("PermissionError" in e["error"] for e in registry.errors)
+        finally:
+            victim.chmod(0o600)
+
+    def test_unreadable_directory_is_not_an_error(self, tmp_path: Path):
+        if os.geteuid() == 0:
+            pytest.skip("root ignores directory mode bits")
+        locked = tmp_path / "locked-registry"
+        locked.mkdir()
+        locked.chmod(0o000)
+        try:
+            registry = MCPRegistry(locked)
+            assert registry.list() == []
+            assert registry.errors == []
+        finally:
+            locked.chmod(0o700)
+
+    def test_concurrent_first_reads_do_not_deadlock(self, registry_dir: Path):
+        """The lazy-load lock must be reentrant and check the flag under it.
+
+        Regression guard for the double-checked-locking shape: with a
+        non-reentrant lock (or a check taken outside the locked section) the
+        first concurrent readers either deadlock here or each re-parse the
+        directory.
+        """
+        registry = MCPRegistry(registry_dir)
+        results: list[list[str]] = []
+        errors: list[BaseException] = []
+
+        def read() -> None:
+            try:
+                results.append([m.id for m in registry.list()])
+            except BaseException as exc:  # pragma: no cover - failure path
+                errors.append(exc)
+
+        threads = [threading.Thread(target=read) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        assert not errors, errors
+        assert not [t for t in threads if t.is_alive()], "lazy load deadlocked"
+        assert results == [["mcp-docker-demo", "mcp-fetch"]] * 8
 
     def test_missing_directory_is_not_an_error(self, tmp_path: Path):
         registry = MCPRegistry(tmp_path / "does-not-exist")
@@ -579,6 +635,30 @@ class TestMarketplaceRoutes:
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             resp = await client.get("/api/mcp/marketplace/servers")
             assert resp.status_code == 503
+
+
+def test_merged_env_merges_over_the_controller_environment(monkeypatch):
+    """A config's env is merged, never used to replace os.environ."""
+    from tinyagentos.mcp.supervisor import _merged_env
+
+    monkeypatch.setenv("TAOS_MERGE_BASE", "base")
+    assert _merged_env(None) is None
+    assert _merged_env({}) is None
+    assert _merged_env({"env": {}}) is None
+
+    merged = _merged_env({"env": {"TAOS_MERGE_BASE": "override", "TAOS_MERGE_EXTRA": "x"}})
+    assert merged is not None
+    assert merged["TAOS_MERGE_BASE"] == "override"
+    assert merged["TAOS_MERGE_EXTRA"] == "x"
+    # PATH survives: replacing the environment would break npx/uvx launches.
+    assert "PATH" in merged
+
+    # A non-string value (reachable through PUT /api/mcp/servers/{id}/config)
+    # is skipped rather than crashing the spawn.
+    filtered = _merged_env({"env": {"OK": "1", "BAD": 7}})
+    assert filtered is not None
+    assert filtered["OK"] == "1"
+    assert "BAD" not in filtered
 
 
 def test_marketplace_routes_are_registered_by_create_app(tmp_data_dir):

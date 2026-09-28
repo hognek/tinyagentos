@@ -252,6 +252,13 @@ class MCPRegistryManifest(BaseModel):
                 f"id {value!r} is not a valid marketplace id "
                 "(lowercase letters, digits, '.', '_', '-' — must start alphanumeric)"
             )
+        # The separator characters alone must not form the whole id: ".." and
+        # "." match the character class but are path-ish values with no sane
+        # meaning as a server id.
+        if not any(ch.isalnum() for ch in value):
+            raise ValueError(
+                f"id {value!r} must contain at least one letter or digit"
+            )
         return value
 
     @field_validator("version", mode="before")
@@ -378,18 +385,29 @@ def _manifest_files(registry_dir: Path) -> Iterable[Path]:
     """Yield manifest files under *registry_dir* in a stable order.
 
     Both layouts the app catalog already uses are accepted: a flat
-    ``<id>.yaml`` and a per-entry ``<id>/manifest.yaml`` directory.
+    ``<id>.yaml`` and a per-entry ``<id>/manifest.yaml`` directory.  An
+    unreadable directory yields nothing rather than raising — the registry is
+    browsable-but-empty instead of a 500.
     """
-    if not registry_dir.is_dir():
+    try:
+        if not registry_dir.is_dir():
+            return []
+        entries = sorted(registry_dir.iterdir())
+    except OSError:
+        logger.warning("mcp marketplace: cannot read registry dir %s", registry_dir, exc_info=True)
         return []
     files: list[Path] = []
-    for path in sorted(registry_dir.iterdir()):
-        if path.is_dir():
-            candidate = path / "manifest.yaml"
-            if candidate.is_file():
-                files.append(candidate)
-        elif path.suffix in (".yaml", ".yml"):
-            files.append(path)
+    for path in entries:
+        try:
+            if path.is_dir():
+                candidate = path / "manifest.yaml"
+                if candidate.is_file():
+                    files.append(candidate)
+            elif path.suffix in (".yaml", ".yml"):
+                files.append(path)
+        except OSError:
+            logger.warning("mcp marketplace: cannot stat %s", path, exc_info=True)
+            continue
     return files
 
 
@@ -409,19 +427,26 @@ class MCPRegistry:
         self._manifests: dict[str, MCPRegistryManifest] = {}
         self._errors: list[dict[str, str]] = []
         self._loaded = False
-        self._lock = threading.Lock()
+        # Reentrant: _ensure_loaded() holds the lock while calling load(), which
+        # publishes under the same lock.  A plain Lock would deadlock there.
+        self._lock = threading.RLock()
 
     # -- loading ----------------------------------------------------------
 
     def _read_dir(self) -> tuple[dict[str, MCPRegistryManifest], list[dict[str, str]]]:
-        """Parse the registry directory.  Pure — no shared state touched."""
+        """Parse the registry directory.  Pure — no shared state touched.
+
+        A per-entry failure of *any* kind (unparseable YAML, schema violation,
+        an unreadable file) is collected into ``errors`` rather than raised:
+        one bad entry must never take the whole listing down with it.
+        """
         manifests: dict[str, MCPRegistryManifest] = {}
         errors: list[dict[str, str]] = []
         for path in _manifest_files(self.registry_dir):
             try:
                 manifest = MCPRegistryManifest.from_file(path)
-            except (ValidationError, ValueError) as exc:
-                errors.append({"path": str(path), "error": str(exc)})
+            except (ValidationError, ValueError, OSError) as exc:
+                errors.append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
                 continue
             if manifest.id in manifests:
                 errors.append({
@@ -446,18 +471,21 @@ class MCPRegistry:
 
     def load(self) -> None:
         """(Re)read the registry directory."""
+        # Parse outside the lock (a slow filesystem must not block a reader that
+        # already has a snapshot), publish inside it.
         self._publish(*self._read_dir())
 
     def _ensure_loaded(self) -> None:
-        # Double-checked locking, with the parse itself done outside the lock:
-        # `load()` takes the same lock, so parsing while holding it would
-        # deadlock the first read.
+        # Double-checked locking: the second check is taken *while holding* the
+        # lock (so it serialises concurrent first readers), and the parse then
+        # runs under that same reentrant lock. A concurrent reload() therefore
+        # cannot have its newer snapshot clobbered by an in-flight lazy load.
         if self._loaded:
             return
         with self._lock:
             if self._loaded:
                 return
-        self.load()
+            self.load()
 
     def reload(self) -> None:
         self.load()
@@ -626,6 +654,15 @@ class MCPMarketplace:
         install leaves the store untouched — the server is registered only
         after the fetch step succeeded, so a half-installed entry never shows
         up as launchable.
+
+        The already-installed check is not atomic with the registration that
+        follows it: two concurrent installs of the same id would both run the
+        install command.  That is bounded and accepted here — the route is
+        admin-only, both writers write the *same* config for the same manifest
+        (``register_server`` is an ``INSERT OR REPLACE`` on identical values),
+        and closing the window properly needs a per-id lock bound to the running
+        event loop (the platform has more than one).  The store row remains the
+        single record of truth.
         """
         manifest = self.get_manifest(manifest_id)
 
