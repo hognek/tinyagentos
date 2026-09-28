@@ -1466,6 +1466,51 @@ forever while `get_status()` still reported it `running` — for a
 stdio-transport server stdout is the JSON-RPC channel, so that was the primary
 data path, not an edge case.
 
+## MCP marketplace (`/api/mcp/marketplace/*`)
+
+Route module `tinyagentos/routes/mcp_marketplace.py`, backed by
+`tinyagentos/mcp/marketplace.py`. This is the *browse and install* half of the
+MCP surface: the bundled plugins under `app-catalog/plugins/` are installed
+through the app Store, while a marketplace entry is a community MCP server
+described by a manifest in the curated registry.
+
+| route | gate | what it does |
+|---|---|---|
+| `GET /api/mcp/marketplace/servers?q=&category=` | any signed-in user | browse/search the registry; each entry carries `installed` + `running` |
+| `GET /api/mcp/marketplace/categories` | any signed-in user | the union of entry categories |
+| `GET /api/mcp/marketplace/servers/{id}` | any signed-in user | one entry plus the stored config when installed |
+| `POST /api/mcp/marketplace/servers/{id}/install` | `require_admin` | resolve → run the install command → register the server |
+| `DELETE /api/mcp/marketplace/servers/{id}` | `require_admin` | uninstall (drops attachments and `mcp:<id>:` secrets) |
+| `POST /api/mcp/marketplace/reload` | `require_admin` | re-read the registry directory |
+
+Install answers `404` for an unknown entry, `409` when it is already
+installed, and `502` when the install command fails — **a failed install leaves
+the store untouched**, so a half-installed entry never shows up as launchable.
+Uninstalling is `404` for something that was never installed.
+
+A manifest (`tinyagentos/mcp/registry_data/*.yaml`, min one per entry) declares
+`id`, `name`, `description`, `version`, `author`, `categories`, `transport`,
+the install command (`install.command`), the launch command (`run.command` +
+`run.args`) and the **permissions the server states it needs**. The permission
+set is validated at load time against a closed vocabulary — an unknown
+permission, a wildcard (`*`/`all`), or a `:write` without the matching `:read`
+is rejected, and the entry is skipped and reported in `reload`'s `errors`
+rather than listed. `validate_permissions` in `tinyagentos/mcp/marketplace.py`
+is the single source of that rule.
+
+**Declared permissions are requirements, not grants.** Install records them in
+the server config (`config["permissions"]`); who may call which tool is still
+decided by the attachment model (`MCPServerStore` attachments +
+`check_permission`). Installing a server therefore never widens an agent's
+access on its own.
+
+`MCPMarketplace.install` writes the config `MCPSupervisor._resolve_cmd` already
+reads (`cmd`), so an installed server is launchable by the existing loader with
+no extra wiring; a manifest's non-secret `run.env` is merged over the
+controller's environment at spawn time (never replacing it — replacing `PATH`
+would break an `npx`/`uvx` launch command). Credentials belong in the secrets
+store, not in a registry manifest.
+
 ## Config save and restore (`/api/config`, session-only)
 
 Route module `tinyagentos/routes/settings.py`. Owner routes behind the session
