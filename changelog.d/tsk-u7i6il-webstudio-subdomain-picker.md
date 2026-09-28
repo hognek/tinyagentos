@@ -1,3 +1,3 @@
-### Added
+### Fixed
 
-- Web Studio Share view now includes a Publish to taos.my action with a subdomain picker fed by the account's active claims, an optional label, and copy-link and unpublish controls after publish. Empty states guide the user through sign-in, taOSgo subscription, subdomain claiming, and mesh join in order.
+- Web Studio Share view now includes a Publish to taOS.my action with a subdomain picker fed by the account's active claims, an optional label, and copy-link and unpublish controls after publish. Empty states guide the user through sign-in, taOSgo subscription, subdomain claiming, and mesh join in order. 404/501 from the publish endpoint now surfaces a dedicated empty state instead of a raw error, the loading account state no longer flashes a sign-in prompt, and the copy-link button now uses the system clipboard with fallback. the unpublish control is not reachable after a reload until slice N.

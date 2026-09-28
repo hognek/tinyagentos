@@ -53,13 +53,15 @@ export function ShareView({ siteId, provenance }: ShareViewProps) {
   const [exportError, setExportError] = useState<string | null>(null);
 
   const [accountState, setAccountState] = useState<AccountState>({ kind: "loading" });
-  const [meshStatus, setMeshStatus] = useState<{ joined: boolean; detail?: string }>({ joined: false });
+  const [meshStatus, setMeshStatus] = useState<{ kind: "unknown" } | { kind: "known"; joined: boolean; detail?: string }>({ kind: "unknown" });
 
   const [publishing, setPublishing] = useState(false);
   const [publishResult, setPublishResult] = useState<{ fqdn: string } | null>(null);
   const [publishError, setPublishError] = useState<string | null>(null);
+  const [publishNotAvailable, setPublishNotAvailable] = useState(false);
   const [selectedSubdomain, setSelectedSubdomain] = useState<string>("");
   const [label, setLabel] = useState("");
+  const [copyOk, setCopyOk] = useState<boolean | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -70,10 +72,12 @@ export function ShareView({ siteId, provenance }: ShareViewProps) {
         const res = await fetch("/api/account/mesh/status", { credentials: "include" });
         if (res.ok) {
           const data = await res.json();
-          if (!cancelled) setMeshStatus({ joined: Boolean(data?.joined), detail: data?.detail });
+          if (!cancelled) setMeshStatus({ kind: "known", joined: Boolean(data?.joined), detail: data?.detail });
+        } else if (!cancelled) {
+          setMeshStatus({ kind: "unknown" });
         }
       } catch {
-        // mesh status unavailable; stays at default joined=false
+        if (!cancelled) setMeshStatus({ kind: "unknown" });
       }
     })();
     return () => {
@@ -94,6 +98,8 @@ export function ShareView({ siteId, provenance }: ShareViewProps) {
     setExportError(null);
     setPublishResult(null);
     setPublishError(null);
+    setPublishNotAvailable(false);
+    setCopyOk(null);
     setSelectedSubdomain("");
     setLabel("");
     getSiteRow(siteId)
@@ -137,10 +143,13 @@ export function ShareView({ siteId, provenance }: ShareViewProps) {
   const activeSubdomains = account?.subdomains?.filter((s: SubdomainClaim) => s.status === "active") ?? [];
 
   const publishEmptyMessage = (() => {
-    if (accountState.kind !== "signed-in") return "Sign in to your taOS account to publish.";
+    if (publishNotAvailable) return "Publishing isn't available on this taOS yet.";
+    if (accountState.kind === "loading") return null;
+    if (accountState.kind === "unavailable") return "The account service is not available right now.";
+    if (accountState.kind === "signed-out") return "Sign in to your taOS account to publish.";
     if (!taosgo || taosgo.status === "none") return "taOSgo subscription required to publish.";
     if (activeSubdomains.length === 0) return "No claimed subdomains. Claim one in Settings to publish.";
-    if (!meshStatus.joined) return "Connect your taOS account to the mesh first.";
+    if (meshStatus.kind === "known" && !meshStatus.joined) return "Connect your taOS account to the mesh first.";
     return null;
   })();
 
@@ -187,11 +196,17 @@ export function ShareView({ siteId, provenance }: ShareViewProps) {
     setPublishing(true);
     setPublishError(null);
     setPublishResult(null);
+    setPublishNotAvailable(false);
     try {
       const result = await publishSite(siteId, selectedSubdomain, label || undefined);
       setPublishResult(result);
     } catch (e) {
-      setPublishError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("Request failed (404)") || msg.includes("Request failed (501)")) {
+        setPublishNotAvailable(true);
+      } else {
+        setPublishError(msg);
+      }
     } finally {
       setPublishing(false);
     }
@@ -201,11 +216,17 @@ export function ShareView({ siteId, provenance }: ShareViewProps) {
     if (!siteId) return;
     setPublishing(true);
     setPublishError(null);
+    setPublishNotAvailable(false);
     try {
       await unpublishSite(siteId);
       setPublishResult(null);
     } catch (e) {
-      setPublishError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes("Request failed (404)") || msg.includes("Request failed (501)")) {
+        setPublishNotAvailable(true);
+      } else {
+        setPublishError(msg);
+      }
     } finally {
       setPublishing(false);
     }
@@ -213,10 +234,27 @@ export function ShareView({ siteId, provenance }: ShareViewProps) {
 
   const copyFqdn = useCallback(async () => {
     if (!publishResult) return;
+    setCopyOk(null);
     try {
-      await navigator.clipboard.writeText(`https://${publishResult.fqdn}`);
+      const text = `https://${publishResult.fqdn}`;
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+        await navigator.clipboard.writeText(text);
+        setCopyOk(true);
+      } else if (typeof document !== "undefined" && document.execCommand) {
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.style.position = "fixed";
+        textarea.style.opacity = "0";
+        document.body.appendChild(textarea);
+        textarea.select();
+        const success = document.execCommand("copy");
+        document.body.removeChild(textarea);
+        setCopyOk(success);
+      } else {
+        setCopyOk(false);
+      }
     } catch {
-      // clipboard unavailable; silently ignore
+      setCopyOk(false);
     }
   }, [publishResult]);
 
@@ -301,13 +339,13 @@ export function ShareView({ siteId, provenance }: ShareViewProps) {
             <div className="mt-1 flex flex-col gap-2.5">
               <p className="text-[12.5px] font-medium text-shell-text-secondary">Publish to taos.my</p>
 
-              {publishEmptyMessage && (
+              {!publishResult && publishEmptyMessage && (
                 <div className="rounded-xl border border-shell-border bg-shell-surface/50 px-3.5 py-3 text-[12.5px] text-shell-text-secondary">
                   {publishEmptyMessage}
                 </div>
               )}
 
-              {!publishEmptyMessage && !publishResult && (
+              {!publishResult && !publishEmptyMessage && (
                 <div className="flex flex-wrap items-center gap-2.5">
                   <select
                     value={selectedSubdomain}
@@ -354,7 +392,7 @@ export function ShareView({ siteId, provenance }: ShareViewProps) {
                         className="flex h-[30px] items-center gap-1.5 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 text-[12px] font-medium text-emerald-200 transition-colors hover:bg-emerald-500/20"
                       >
                         <Link2 size={14} />
-                        Copy link
+                        {copyOk ? "Copied!" : copyOk === false ? "Copy failed" : "Copy link"}
                       </button>
                       <button
                         type="button"
