@@ -501,6 +501,22 @@ class MCPRegistry:
         """
         manifests: dict[str, MCPRegistryManifest] = {}
         errors: list[dict[str, str]] = []
+        if not self.registry_dir.is_dir():
+            # A registry directory that is not there is the one load failure an
+            # operator cannot see from the listing: the marketplace still
+            # renders, just empty.  Record it (the reload route reports
+            # ``errors``) instead of leaving an empty catalogue unexplained.
+            # `is_dir()` is False only for a genuinely missing path or a
+            # non-directory; an unreadable directory still stats as a directory
+            # and is reported by `_manifest_files` in the log.
+            errors.append({
+                "path": str(self.registry_dir),
+                "error": "registry directory not found",
+            })
+            logger.warning(
+                "mcp marketplace: registry dir %s does not exist", self.registry_dir
+            )
+            return manifests, errors
         for path in _manifest_files(self.registry_dir):
             try:
                 manifest = MCPRegistryManifest.from_file(path)

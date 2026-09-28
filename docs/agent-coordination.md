@@ -1518,6 +1518,18 @@ expiry the child is killed and reaped and the install reports 502 with the
 store untouched — an ASGI server has a graceful-shutdown timeout, not a request
 timeout, so an unbounded runner could hold an admin's request open forever.
 
+The curated registry is read from `app-catalog/mcp-registry/` —
+`default_registry_dir()` derives it from the checkout, the same way `create_app`
+derives the app catalog from `PROJECT_DIR`, and the supported install is a
+source checkout with an editable install (`scripts/install-server.sh` runs
+`pip install -e ".[proxy]"`). A registry directory that is not there is
+recorded in the registry's `errors` and logged, so
+`POST /api/mcp/marketplace/reload` reports *why* the marketplace is empty
+instead of showing a curated registry with zero entries; a readable but empty
+directory is not an error. `MCPRegistry` takes the directory as a constructor
+argument, so a mounted or downloaded copy of a hosted registry is a one-line
+change.
+
 **Declared permissions are requirements, not grants.** Install records them in
 the server config (`config["permissions"]`); who may call which tool is still
 decided by the attachment model (`MCPServerStore` attachments +

@@ -350,8 +350,22 @@ class TestCuratedRegistry:
         assert not [t for t in threads if t.is_alive()], "lazy load deadlocked"
         assert results == [["mcp-docker-demo", "mcp-fetch"]] * 8
 
-    def test_missing_directory_is_not_an_error(self, tmp_path: Path):
+    def test_missing_directory_is_reported(self, tmp_path: Path):
+        """A missing registry dir lists nothing, but says why.
+
+        The deployment this exists for is one without the ``app-catalog`` tree
+        (``default_registry_dir`` resolves relative to the checkout): the
+        marketplace must not look like a curated registry with zero entries.
+        """
         registry = MCPRegistry(tmp_path / "does-not-exist")
+        assert registry.list() == []
+        assert len(registry.errors) == 1
+        assert registry.errors[0]["path"].endswith("does-not-exist")
+        assert "not found" in registry.errors[0]["error"]
+
+    def test_empty_directory_is_not_an_error(self, tmp_path: Path):
+        registry = MCPRegistry(tmp_path / "empty-registry")
+        (tmp_path / "empty-registry").mkdir()
         assert registry.list() == []
         assert registry.errors == []
 
