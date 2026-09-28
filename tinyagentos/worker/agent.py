@@ -103,7 +103,11 @@ def _gpu_type(hardware: dict) -> str | None:
     return gpu.get("type") if isinstance(gpu, dict) else None
 
 
-def _collect_resources(backends: list[dict], gpu_type: str | None) -> list[str]:
+def _collect_resources(
+    backends: list[dict],
+    gpu_type: str | None,
+    platform_name: str | None = None,
+) -> list[str]:
     """Return the resource classes this worker advertises.
 
     Mirrors the resource table in docs/design/resource-scheduler.md.
@@ -113,6 +117,11 @@ def _collect_resources(backends: list[dict], gpu_type: str | None) -> list[str]:
     Args:
         backends: live backend probe results, each carrying a ``type``.
         gpu_type: ``hardware.gpu.type`` (``"apple"`` on Apple Silicon), or None.
+        platform_name: ``platform.system().lower()`` (``"darwin"`` on macOS).
+            A Mac that is not Apple Silicon has no CUDA or ROCm device, so a
+            CPU-mode Ollama/llama.cpp backend there must not advertise
+            ``gpu-cuda-0`` -- that would contradict install-worker.sh's
+            Intel-Mac ``cpu-inference`` fallback.
 
     Installer-detected classes are unioned in from ``TAOS_WORKER_RESOURCES``
     (comma-separated). install-worker.sh exports ``gpu-metal,cpu-inference``
@@ -125,7 +134,14 @@ def _collect_resources(backends: list[dict], gpu_type: str | None) -> list[str]:
     if any(b.get("type") == "rkllama" for b in backends):
         resources.append("npu-rk3588")
     if any(b.get("type") in _GPU_BACKEND_TYPES for b in backends):
-        resources.append("gpu-metal" if gpu_type == "apple" else "gpu-cuda-0")
+        if gpu_type == "apple":
+            resources.append("gpu-metal")
+        elif platform_name == "darwin":
+            # Intel Mac: macOS has no CUDA/ROCm class at all. The backend
+            # still serves, as cpu-inference.
+            pass
+        else:
+            resources.append("gpu-cuda-0")
     for name in os.environ.get("TAOS_WORKER_RESOURCES", "").split(","):
         name = name.strip()
         if name and name not in resources:
@@ -564,10 +580,11 @@ class WorkerAgent:
 
         hw = detect_hardware()
         hw_dict = asdict(hw)
+        platform_name = platform.system().lower()
         backends = await self.detect_backends()
         caps = sorted(set(self.detect_capabilities(backends)) | set(self.extra_capabilities))
         kv_quant = self.detect_kv_quant_support(backends)
-        resources = _collect_resources(backends, _gpu_type(hw_dict))
+        resources = _collect_resources(backends, _gpu_type(hw_dict), platform_name)
 
         # Use pinned advertise_url if provided; otherwise infer from backends or LAN IP.
         # TAOS_ADVERTISE_IP is set by the worker-LXC installer: inside the LXC the
@@ -594,7 +611,7 @@ class WorkerAgent:
             "hardware": hw_dict,
             "backends": backends,
             "capabilities": caps,
-            "platform": platform.system().lower(),
+            "platform": platform_name,
             "models": [],
             "resources": resources,
             "kv_cache_quant_support": kv_quant.get("legacy", ["fp16"]),
@@ -704,7 +721,9 @@ class WorkerAgent:
             caps = sorted(set(self.detect_capabilities(backends)) | set(self.extra_capabilities))
             live_hardware = asdict(detect_hardware())
             kv_quant = self.detect_kv_quant_support(backends)
-            resources = _collect_resources(backends, _gpu_type(live_hardware))
+            resources = _collect_resources(
+                backends, _gpu_type(live_hardware), platform.system().lower()
+            )
             snap = capacity_snapshot()
             vram_sample = gpu_vram_snapshot()
             vram_sampled_age_ms = None

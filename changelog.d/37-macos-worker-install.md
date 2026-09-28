@@ -22,3 +22,7 @@
   CUDA device), and unions the installer-detected classes from
   `TAOS_WORKER_RESOURCES` into the `resources` array it reports at
   registration and on every heartbeat.
+- On a Mac that is not Apple Silicon, a running Ollama/llama.cpp backend no
+  longer makes the worker advertise `gpu-cuda-0`: macOS has no CUDA or ROCm
+  class, so an Intel Mac stays `cpu-inference` in both its registration and
+  its heartbeats, matching the installer's fallback.

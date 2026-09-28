@@ -185,6 +185,38 @@ def test_force_metal_overrides_a_silent_probe(tmp_path: Path) -> None:
     assert _result(result.stdout, "RESULT_MACOS") == "gpu-metal"
 
 
+def test_metal_support_unsupported_is_not_treated_as_metal(tmp_path: Path) -> None:
+    """`grep -i metal` would read "Metal Support: Unsupported" as support.
+
+    CodeRabbit flagged the bare substring match on the second revision: an
+    Intel Mac with a GPU the OS cannot drive reports Unsupported, and
+    registering it as gpu-metal would be wrong.
+    """
+    result = _run_wrapper(
+        tmp_path,
+        _detection_wrapper(
+            tmp_path,
+            mach="x86_64",
+            sp_output="Metal Support: Unsupported",
+            mlx_present=False,
+        ),
+    )
+    assert result.returncode == 0, result.stderr
+    assert _result(result.stdout, "RESULT_MACOS") == "cpu-inference"
+    assert "gpu-metal" not in _result(result.stdout, "RESULT_RESOURCES")
+
+
+def test_metal_support_with_a_version_is_accepted(tmp_path: Path) -> None:
+    """The affirmative form is `Metal Support: Metal 3` — do not over-anchor."""
+    result = _run_wrapper(
+        tmp_path,
+        _detection_wrapper(
+            tmp_path, mach="arm64", sp_output="Metal Support: Metal 3", mlx_present=True
+        ),
+    )
+    assert _result(result.stdout, "RESULT_MACOS") == "gpu-metal"
+
+
 def test_unverifiable_metal_probe_falls_back_to_cpu(tmp_path: Path) -> None:
     """No system_profiler means the Metal probe cannot be trusted either way.
 
@@ -323,6 +355,28 @@ def test_worker_keeps_gpu_cuda_for_non_apple(monkeypatch: pytest.MonkeyPatch) ->
     ]
 
 
+def test_intel_mac_ollama_does_not_advertise_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
+    """CPU-mode Ollama on an Intel Mac must stay cpu-inference.
+
+    macOS has no CUDA/ROCm class, so the installer's Intel-Mac fallback and
+    the runtime resource report have to agree (CodeRabbit Major on the second
+    revision): 'ollama is running' is not evidence of a CUDA device.
+    """
+    from tinyagentos.worker.agent import _collect_resources
+
+    monkeypatch.delenv("TAOS_WORKER_RESOURCES", raising=False)
+    assert _collect_resources([{"type": "ollama"}], "", "darwin") == ["cpu-inference"]
+    assert _collect_resources([{"type": "mlx"}], "", "darwin") == ["cpu-inference"]
+    # The same backend on Linux is still the CUDA class.
+    assert _collect_resources([{"type": "ollama"}], "", "linux") == [
+        "cpu-inference",
+        "gpu-cuda-0",
+    ]
+    # And the installer's own Darwin classes still land.
+    monkeypatch.setenv("TAOS_WORKER_RESOURCES", "cpu-inference")
+    assert _collect_resources([{"type": "ollama"}], "", "darwin") == ["cpu-inference"]
+
+
 def test_worker_unions_installer_detected_resources(monkeypatch: pytest.MonkeyPatch) -> None:
     """install-worker.sh's TAOS_WORKER_RESOURCES survives a stopped backend."""
     from tinyagentos.worker.agent import _collect_resources
@@ -356,7 +410,9 @@ def test_gpu_type_helper_handles_serialised_profiles() -> None:
 def test_both_resource_call_sites_share_the_gpu_extraction() -> None:
     """No attribute-vs-dict drift between the register and heartbeat paths."""
     source = (REPO_ROOT / "tinyagentos" / "worker" / "agent.py").read_text()
-    assert source.count("_collect_resources(backends, _gpu_type(") == 2
+    assert "getattr(hw.gpu" not in source, "the attribute path was the drift risk"
+    # One definition plus exactly two call sites.
+    assert source.count("_gpu_type(") == 3
 
 
 def test_install_script_and_worker_agree_on_the_env_var() -> None:
@@ -384,8 +440,11 @@ def test_module_import_is_not_host_dependent() -> None:
     start = source.index("def _collect_resources(")
     end = source.index("\n\n\nclass WorkerAgent", start)
     body = source[start:end]
+    # Ignore the docstring: it *names* platform.system() when documenting the
+    # argument. The point is that the code never calls a host probe itself.
+    code = body.split('"""', 2)[2] if body.count('"""') >= 2 else body
     for host_probe in ("platform.system", "detect_hardware", "sys.platform", "uname"):
-        assert host_probe not in body, (
+        assert host_probe not in code, (
             f"_collect_resources must stay a pure function; found {host_probe}"
         )
-    assert 'os.environ.get("TAOS_WORKER_RESOURCES"' in body
+    assert 'os.environ.get("TAOS_WORKER_RESOURCES"' in code

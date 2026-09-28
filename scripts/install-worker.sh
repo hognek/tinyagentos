@@ -870,6 +870,10 @@ TAOS_MACOS_RESOURCE=""
 # Apple Silicon always exposes Metal, but a VM or a trimmed image can report
 # arm64 without an accelerator, so verify instead of assuming.
 # TAOS_FORCE_METAL=1 short-circuits the probe for bench boxes.
+#
+# The match is anchored on the affirmative value: system_profiler reports
+# "Metal Support: Unsupported" for a GPU it cannot drive, and a bare
+# `grep -i metal` would read that as support.
 macos_metal_available() {
     if [[ -n "${TAOS_FORCE_METAL:-}" ]]; then
         return 0
@@ -882,7 +886,7 @@ macos_metal_available() {
         warn "system_profiler not found — cannot verify Metal support"
         return 1
     fi
-    system_profiler SPDisplaysDataType 2>/dev/null | grep -qi 'metal'
+    system_profiler SPDisplaysDataType 2>/dev/null | grep -qiE 'Metal Support:[[:space:]]+Metal([[:space:]]+[0-9]+)?[[:space:]]*$'
 }
 
 macos_mlx_available() {
