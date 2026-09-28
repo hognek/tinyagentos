@@ -87,6 +87,41 @@ def _is_repair_rejection(resp) -> bool:
         return False
 
 
+# Backend types that mean "this host has a GPU-class accelerator". Mirrors the
+# GPU backend set in tinyagentos/scheduler/discovery.py.
+_GPU_BACKEND_TYPES = {"vllm", "ollama", "exo", "mlx"}
+
+
+def _collect_resources(backends: list[dict], gpu_type: str | None) -> list[str]:
+    """Return the resource classes this worker advertises.
+
+    Mirrors the resource table in docs/design/resource-scheduler.md.
+    ``gpu-metal`` is the Apple Silicon class (MLX / llama.cpp Metal / Core ML
+    on unified memory); CUDA-class accelerators report ``gpu-cuda-0``.
+
+    Args:
+        backends: live backend probe results, each carrying a ``type``.
+        gpu_type: ``hardware.gpu.type`` (``"apple"`` on Apple Silicon), or None.
+
+    Installer-detected classes are unioned in from ``TAOS_WORKER_RESOURCES``
+    (comma-separated). install-worker.sh exports ``gpu-metal,cpu-inference``
+    on Apple Silicon and ``cpu-inference`` on Intel Macs. The union keeps a
+    class advertised while its backend is stopped or not yet installed --
+    the missing backend shows up as an unavailable capability instead of the
+    worker silently vanishing from the scheduler's view.
+    """
+    resources = ["cpu-inference"]
+    if any(b.get("type") == "rkllama" for b in backends):
+        resources.append("npu-rk3588")
+    if any(b.get("type") in _GPU_BACKEND_TYPES for b in backends):
+        resources.append("gpu-metal" if gpu_type == "apple" else "gpu-cuda-0")
+    for name in os.environ.get("TAOS_WORKER_RESOURCES", "").split(","):
+        name = name.strip()
+        if name and name not in resources:
+            resources.append(name)
+    return resources
+
+
 class WorkerAgent:
     def __init__(
         self,
@@ -520,11 +555,7 @@ class WorkerAgent:
         backends = await self.detect_backends()
         caps = sorted(set(self.detect_capabilities(backends)) | set(self.extra_capabilities))
         kv_quant = self.detect_kv_quant_support(backends)
-        resources = ["cpu-inference"]
-        if any(b["type"] == "rkllama" for b in backends):
-            resources.append("npu-rk3588")
-        if any(b["type"] in {"vllm", "ollama", "exo", "mlx"} for b in backends):
-            resources.append("gpu-cuda-0")
+        resources = _collect_resources(backends, getattr(hw.gpu, "type", None))
 
         # Use pinned advertise_url if provided; otherwise infer from backends or LAN IP.
         # TAOS_ADVERTISE_IP is set by the worker-LXC installer: inside the LXC the
@@ -659,12 +690,11 @@ class WorkerAgent:
             load = psutil.cpu_percent() / 100.0
             backends = await self.detect_backends()
             caps = sorted(set(self.detect_capabilities(backends)) | set(self.extra_capabilities))
+            live_hardware = asdict(detect_hardware())
             kv_quant = self.detect_kv_quant_support(backends)
-            resources = ["cpu-inference"]
-            if any(b["type"] == "rkllama" for b in backends):
-                resources.append("npu-rk3588")
-            if any(b["type"] in {"vllm", "ollama", "exo", "mlx"} for b in backends):
-                resources.append("gpu-cuda-0")
+            resources = _collect_resources(
+                backends, (live_hardware.get("gpu") or {}).get("type")
+            )
             snap = capacity_snapshot()
             vram_sample = gpu_vram_snapshot()
             vram_sampled_age_ms = None
@@ -688,7 +718,6 @@ class WorkerAgent:
                 or (backends[0]["url"] if backends else self.get_worker_url())
             )
             live_host_lan_ip = adv_ip or _detect_lan_ip(self.controller_url)
-            live_hardware = asdict(detect_hardware())
             path = "/api/cluster/heartbeat"
             payload = {
                 "name": self.name,
