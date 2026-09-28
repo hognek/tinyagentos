@@ -92,6 +92,17 @@ def _is_repair_rejection(resp) -> bool:
 _GPU_BACKEND_TYPES = {"vllm", "ollama", "exo", "mlx"}
 
 
+def _gpu_type(hardware: dict) -> str | None:
+    """Return ``hardware.gpu.type`` from a serialised HardwareProfile.
+
+    Both resources call sites (register and heartbeat) serialise the profile
+    with ``asdict()``, so they resolve the GPU class through this one helper
+    instead of one attribute access and one dict walk that could drift apart.
+    """
+    gpu = hardware.get("gpu")
+    return gpu.get("type") if isinstance(gpu, dict) else None
+
+
 def _collect_resources(backends: list[dict], gpu_type: str | None) -> list[str]:
     """Return the resource classes this worker advertises.
 
@@ -552,10 +563,11 @@ class WorkerAgent:
             return False
 
         hw = detect_hardware()
+        hw_dict = asdict(hw)
         backends = await self.detect_backends()
         caps = sorted(set(self.detect_capabilities(backends)) | set(self.extra_capabilities))
         kv_quant = self.detect_kv_quant_support(backends)
-        resources = _collect_resources(backends, getattr(hw.gpu, "type", None))
+        resources = _collect_resources(backends, _gpu_type(hw_dict))
 
         # Use pinned advertise_url if provided; otherwise infer from backends or LAN IP.
         # TAOS_ADVERTISE_IP is set by the worker-LXC installer: inside the LXC the
@@ -579,7 +591,7 @@ class WorkerAgent:
             "name": self.name,
             "url": worker_url,
             "host_lan_ip": adv_ip or _detect_lan_ip(self.controller_url),
-            "hardware": asdict(hw),
+            "hardware": hw_dict,
             "backends": backends,
             "capabilities": caps,
             "platform": platform.system().lower(),
@@ -692,9 +704,7 @@ class WorkerAgent:
             caps = sorted(set(self.detect_capabilities(backends)) | set(self.extra_capabilities))
             live_hardware = asdict(detect_hardware())
             kv_quant = self.detect_kv_quant_support(backends)
-            resources = _collect_resources(
-                backends, (live_hardware.get("gpu") or {}).get("type")
-            )
+            resources = _collect_resources(backends, _gpu_type(live_hardware))
             snap = capacity_snapshot()
             vram_sample = gpu_vram_snapshot()
             vram_sampled_age_ms = None

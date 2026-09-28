@@ -867,18 +867,22 @@ ensure_macos_deps() {
 # the CPU-only fallback rather than failing the install.
 TAOS_MACOS_RESOURCE=""
 
-# Apple Silicon always exposes Metal, but a VM or a trimmed image may report
+# Apple Silicon always exposes Metal, but a VM or a trimmed image can report
 # arm64 without an accelerator, so verify instead of assuming.
 # TAOS_FORCE_METAL=1 short-circuits the probe for bench boxes.
 macos_metal_available() {
     if [[ -n "${TAOS_FORCE_METAL:-}" ]]; then
         return 0
     fi
-    if command -v system_profiler >/dev/null 2>&1; then
-        system_profiler SPDisplaysDataType 2>/dev/null | grep -qi 'metal'
-        return
+    if ! command -v system_profiler >/dev/null 2>&1; then
+        # Without system_profiler there is no way to tell a Metal GPU from an
+        # arm64 VM that has none (hw.optional.arm64 only reports the CPU
+        # architecture), so refuse to assume: fall back to CPU and let the
+        # operator force the branch with TAOS_FORCE_METAL=1.
+        warn "system_profiler not found — cannot verify Metal support"
+        return 1
     fi
-    [[ "$(sysctl -n hw.optional.arm64 2>/dev/null || echo 0)" == "1" ]]
+    system_profiler SPDisplaysDataType 2>/dev/null | grep -qi 'metal'
 }
 
 macos_mlx_available() {

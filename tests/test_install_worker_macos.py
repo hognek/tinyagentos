@@ -74,19 +74,31 @@ def _run_wrapper(tmp_path: Path, body: str, env: dict[str, str] | None = None):
     )
 
 
-def _detection_wrapper(tmp_path: Path, mach: str, sp_output: str, mlx_present: bool) -> str:
+def _detection_wrapper(
+    tmp_path: Path,
+    mach: str,
+    sp_output: str,
+    mlx_present: bool,
+    sp_available: bool = True,
+) -> str:
     """Build a wrapper that runs the shipped detect_macos_accelerator()."""
     functions = "\n".join(
         _extract_function(INSTALL_SCRIPT, name)
         for name in ("macos_metal_available", "macos_mlx_available", "detect_macos_accelerator")
+    )
+    # When sp_available is False the stub is omitted entirely, so
+    # `command -v system_profiler` fails exactly as it would on a trimmed
+    # image (the child runs with PATH=/usr/bin:/bin).
+    sp_stub = (
+        f"system_profiler() {{ printf '%s\\n' {sp_output!r}; }}\n" if sp_available else ""
     )
     return (
         "log() { printf '%s\\n' \"$*\"; }\n"
         "warn() { printf '%s\\n' \"$*\" >&2; }\n"
         f"INSTALL_DIR={tmp_path}/install\n"
         f'uname() {{ printf \'%s\\n\' "{mach}"; }}\n'
-        f"system_profiler() {{ printf '%s\\n' {sp_output!r}; }}\n"
-        f"python3() {{ return {0 if mlx_present else 1}; }}\n"
+        + sp_stub
+        + f"python3() {{ return {0 if mlx_present else 1}; }}\n"
         + functions
         + "\ndetect_macos_accelerator\n"
         + "printf 'RESULT_MACOS=%s\\n' \"$TAOS_MACOS_RESOURCE\"\n"
@@ -171,6 +183,39 @@ def test_force_metal_overrides_a_silent_probe(tmp_path: Path) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert _result(result.stdout, "RESULT_MACOS") == "gpu-metal"
+
+
+def test_unverifiable_metal_probe_falls_back_to_cpu(tmp_path: Path) -> None:
+    """No system_profiler means the Metal probe cannot be trusted either way.
+
+    An arm64 test VM with a trimmed image must not be registered as gpu-metal
+    on the strength of `hw.optional.arm64` alone (Kilo WARNING on the first
+    revision): the sysctl key reports the CPU architecture, not a GPU.
+    """
+    result = _run_wrapper(
+        tmp_path,
+        _detection_wrapper(
+            tmp_path, mach="arm64", sp_output="", mlx_present=False, sp_available=False
+        ),
+    )
+    assert result.returncode == 0, result.stderr
+    assert _result(result.stdout, "RESULT_MACOS") == "cpu-inference"
+    assert "gpu-metal" not in _result(result.stdout, "RESULT_RESOURCES")
+    assert "cannot verify Metal support" in result.stderr, result.stderr
+
+
+def test_force_metal_covers_an_unverifiable_probe(tmp_path: Path) -> None:
+    """TAOS_FORCE_METAL=1 is the operator override when the probe cannot tell."""
+    result = _run_wrapper(
+        tmp_path,
+        _detection_wrapper(
+            tmp_path, mach="arm64", sp_output="", mlx_present=False, sp_available=False
+        ),
+        env={"TAOS_FORCE_METAL": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert _result(result.stdout, "RESULT_MACOS") == "gpu-metal"
+    assert _result(result.stdout, "RESULT_RESOURCES") == "gpu-metal,cpu-inference"
 
 
 def test_explicit_resources_env_wins_over_detection(tmp_path: Path) -> None:
@@ -295,6 +340,23 @@ def test_worker_env_resources_never_duplicate(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setenv("TAOS_WORKER_RESOURCES", "cpu-inference,cpu-inference")
     assert _collect_resources([], None) == ["cpu-inference"]
+
+
+def test_gpu_type_helper_handles_serialised_profiles() -> None:
+    """register() and heartbeat() read the GPU class through one helper."""
+    from tinyagentos.worker.agent import _gpu_type
+
+    assert _gpu_type({"gpu": {"type": "apple"}}) == "apple"
+    assert _gpu_type({"gpu": {"type": "cuda"}}) == "cuda"
+    assert _gpu_type({"gpu": None}) is None
+    assert _gpu_type({}) is None
+    assert _gpu_type({"gpu": "apple"}) is None, "a non-dict gpu must not raise"
+
+
+def test_both_resource_call_sites_share_the_gpu_extraction() -> None:
+    """No attribute-vs-dict drift between the register and heartbeat paths."""
+    source = (REPO_ROOT / "tinyagentos" / "worker" / "agent.py").read_text()
+    assert source.count("_collect_resources(backends, _gpu_type(") == 2
 
 
 def test_install_script_and_worker_agree_on_the_env_var() -> None:
