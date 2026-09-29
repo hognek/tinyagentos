@@ -657,29 +657,42 @@ def _human_duration(duration_secs: object) -> str:
     """Format duration_secs to a human-readable string for UI display.
 
     Returns:
-    - "expires in {X} hours" for 3+ hours OR when it's an exact multiple of hours
-    - "expires in {X} minutes" for 1-2 hours OR when it's less than 3 hours but >= 60 minutes
-    - "expires in {X} seconds" for < 1 minute
+    - "expires N days after approval" for >= 48h
+    - "expires N hours after approval" for exact hours >= 1h
+    - "expires N hours M minutes after approval" for >= 1h with a minute remainder
+    - "expires in N minutes" for exact minutes >= 60s
+    - "expires in N minutes M seconds" for >= 60s with a second remainder
+    - "expires in under a minute" for 1 to 59 seconds
     - "no expiry" when duration_secs is None, zero, or invalid
     """
     if type(duration_secs) is int and duration_secs > 0:
-        # Use hours for full hours (e.g., 3600 seconds = 1 hour, 7200 seconds = 2 hours)
-        if duration_secs >= 60 and duration_secs % 3600 == 0:
+        if duration_secs >= 48 * 3600:
+            days = duration_secs // (24 * 3600)
+            return f"expires {days} day{'s' if days != 1 else ''} after approval"
+        elif duration_secs >= 3600:
             hours = duration_secs // 3600
-            return f"expires in {hours} hour{'s' if hours != 1 else ''}"
-        # Use minutes for durations between 1-2 hours
-        elif duration_secs >= 60 and duration_secs < 7200:
+            remainder = duration_secs % 3600
+            if remainder == 0:
+                return f"expires {hours} hour{'s' if hours != 1 else ''} after approval"
+            minutes = remainder // 60
+            return (
+                f"expires {hours} hour{'s' if hours != 1 else ''} "
+                f"{minutes} minute{'s' if minutes != 1 else ''} after approval"
+            )
+        elif duration_secs >= 60:
             minutes = duration_secs // 60
-            return f"expires in {minutes} minute{'s' if minutes != 1 else ''}"
-        # Use hours for durations 3+ hours
-        elif duration_secs >= 3 * 3600:
-            hours = duration_secs // 3600
-            return f"expires in {hours} hour{'s' if hours != 1 else ''}"
-        # Use minutes for durations < 3 hours but >= 60 minutes
+            remainder = duration_secs % 60
+            if remainder == 0:
+                return f"expires in {minutes} minute{'s' if minutes != 1 else ''}"
+            return (
+                f"expires in {minutes} minute{'s' if minutes != 1 else ''} "
+                f"{remainder} second{'s' if remainder != 1 else ''}"
+            )
         else:
-            minutes = duration_secs // 60
-            return f"expires in {minutes} minute{'s' if minutes != 1 else ''}"
+            return "expires in under a minute"
     return "no expiry"
+
+
 def _expires_at_from_duration(duration_secs: object) -> str | None:
     """Map a scope request's ``duration_secs`` to a grant expiry timestamp.
 

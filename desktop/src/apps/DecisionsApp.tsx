@@ -653,6 +653,7 @@ function AuthRequestCard({
         requestId={req.id}
         scopes={req.requested_scopes}
         requestedProjectId={req.project_id}
+        humanDuration={req.human_duration}
         onResolved={onResolved}
       />
     </li>
