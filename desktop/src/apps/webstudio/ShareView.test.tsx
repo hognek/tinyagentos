@@ -1,6 +1,11 @@
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { ShareView } from "./ShareView";
+import { copyText } from "@/lib/clipboard";
+
+vi.mock("@/lib/clipboard", () => ({
+  copyText: vi.fn(),
+}));
 
 const SITE = {
   id: "share-site",
@@ -419,5 +424,57 @@ describe("ShareView", () => {
     );
 
     await waitFor(() => expect(screen.getByText(/No security issues found/)).toBeDefined());
+  });
+
+  it("reports 'Copy failed' when copyText resolves false after publish", async () => {
+    vi.mocked(copyText).mockResolvedValue(false);
+    const { fetchMock } = makeFetchMock({
+      accountStatus: 200,
+      accountBody: {
+        user_id: "u1",
+        email: "jay@example.com",
+        taosgo: { status: "active" },
+        subdomains: [{ id: "c1", account_id: "u1", name: "mybiz", status: "active" }],
+      },
+      meshJoined: true,
+    });
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+    render(<ShareView siteId="share-site" provenance="user-uploaded" />);
+    const select = await screen.findByRole("combobox");
+    fireEvent.change(select, { target: { value: "mybiz" } });
+    fireEvent.click(screen.getByRole("button", { name: /Publish/ }));
+
+    await waitFor(() => expect(screen.getByText("Published to mybiz.taos.my")).toBeDefined());
+    fireEvent.click(screen.getByRole("button", { name: /Copy link/ }));
+
+    await waitFor(() => expect(screen.getByText("Copy failed")).toBeDefined());
+    expect(copyText).toHaveBeenCalledWith("https://mybiz.taos.my");
+  });
+
+  it("reports 'Copied!' when copyText resolves true after publish", async () => {
+    vi.mocked(copyText).mockResolvedValue(true);
+    const { fetchMock } = makeFetchMock({
+      accountStatus: 200,
+      accountBody: {
+        user_id: "u1",
+        email: "jay@example.com",
+        taosgo: { status: "active" },
+        subdomains: [{ id: "c1", account_id: "u1", name: "mybiz", status: "active" }],
+      },
+      meshJoined: true,
+    });
+    vi.stubGlobal("fetch", fetchMock as unknown as typeof fetch);
+
+    render(<ShareView siteId="share-site" provenance="user-uploaded" />);
+    const select = await screen.findByRole("combobox");
+    fireEvent.change(select, { target: { value: "mybiz" } });
+    fireEvent.click(screen.getByRole("button", { name: /Publish/ }));
+
+    await waitFor(() => expect(screen.getByText("Published to mybiz.taos.my")).toBeDefined());
+    fireEvent.click(screen.getByRole("button", { name: /Copy link/ }));
+
+    await waitFor(() => expect(screen.getByText("Copied!")).toBeDefined());
+    expect(copyText).toHaveBeenCalledWith("https://mybiz.taos.my");
   });
 });

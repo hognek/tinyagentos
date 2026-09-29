@@ -7,6 +7,7 @@ import { emitAppEvent } from "@/lib/app-event-bus";
 import { fetchAccount, type AccountState, type SubdomainClaim } from "@/lib/account-client";
 import { fetchSitePackage, getSiteRow, publishSite, unpublishSite } from "./web-sites-api";
 import type { SiteRow } from "./web-sites-api";
+import { copyText } from "@/lib/clipboard";
 
 /* ------------------------------------------------------------------ */
 /*  ShareView -- install locally, export a .taosapp package, or publish */
@@ -237,22 +238,8 @@ export function ShareView({ siteId, provenance }: ShareViewProps) {
     setCopyOk(null);
     try {
       const text = `https://${publishResult.fqdn}`;
-      if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
-        await navigator.clipboard.writeText(text);
-        setCopyOk(true);
-      } else if (typeof document !== "undefined" && document.execCommand) {
-        const textarea = document.createElement("textarea");
-        textarea.value = text;
-        textarea.style.position = "fixed";
-        textarea.style.opacity = "0";
-        document.body.appendChild(textarea);
-        textarea.select();
-        const success = document.execCommand("copy");
-        document.body.removeChild(textarea);
-        setCopyOk(success);
-      } else {
-        setCopyOk(false);
-      }
+      const ok = await copyText(text);
+      setCopyOk(ok);
     } catch {
       setCopyOk(false);
     }
