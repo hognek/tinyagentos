@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -51,7 +51,11 @@ VULKAN_ONLY = GpuInfo(type="none", vulkan=True)
 # exists, the CUDA runtime does not.
 UNLOADED_NVIDIA = GpuInfo(type="nvidia", model="NVIDIA Corporation Device 2482")
 
-OLLAMA = {"type": "ollama", "url": "http://127.0.0.1:11434"}
+OLLAMA = {"type": "ollama", "url": "http://127.0.0.1:11434", "status": "ok"}
+# Manifest-synthetic entry: software declared in the worker manifest whose port
+# is not answering (``detect_backends()`` appends these with url=None).
+STOPPED_OLLAMA = {"type": "ollama", "url": None, "status": "stopped", "available_models": []}
+STOPPED_RKLLAMA = {"type": "rkllama", "url": None, "status": "stopped", "available_models": []}
 
 
 def _hw_dict(gpu: GpuInfo) -> dict:
@@ -95,57 +99,90 @@ class TestResourceInventoryContract:
             "npu-rk3588",
         ]
 
+    def test_a_stopped_backend_is_not_evidence(self):
+        # detect_backends() appends manifest-synthetic status="stopped" entries
+        # for declared-but-not-answering software; they must not resurrect an
+        # accelerator class on a host that has the hardware but is not serving.
+        assert _collapse_resources([STOPPED_OLLAMA], _hw_dict(CUDA_DEVICE)) == ["cpu-inference"]
+        assert _collapse_resources([STOPPED_RKLLAMA], _hw_dict(NO_ACCELERATOR)) == ["cpu-inference"]
+
+    def test_a_live_backend_beside_a_stopped_one_still_counts(self):
+        assert _collapse_resources([STOPPED_RKLLAMA, OLLAMA], _hw_dict(CUDA_DEVICE)) == [
+            "cpu-inference",
+            "gpu-cuda-0",
+        ]
+
+    def test_a_backend_without_a_status_key_is_treated_as_live(self):
+        # The type-only shape callers and tests use.
+        assert _collapse_resources([{"type": "ollama"}], _hw_dict(CUDA_DEVICE)) == [
+            "cpu-inference",
+            "gpu-cuda-0",
+        ]
+
     @pytest.mark.parametrize("hardware", [None, {}, {"gpu": None}, {"gpu": "weird"}])
     def test_missing_or_malformed_hardware_is_not_evidence(self, hardware):
         assert _collapse_resources([OLLAMA], hardware) == ["cpu-inference"]
 
 
-class _CapturingClient:
-    """Drop-in ``httpx.AsyncClient`` that records the JSON payload sent."""
+def _capturing_client(captured: dict):
+    """Return an ``httpx.AsyncClient`` stand-in that records the JSON payload.
 
-    captured: dict = {}
+    Built per call so the captured payload lives in the caller's local dict --
+    a shared class attribute would let two concurrent tests overwrite each
+    other's capture.
+    """
 
-    def __init__(self, *args, **kwargs):
-        pass
+    class _Client:
+        def __init__(self, *args, **kwargs):
+            pass
 
-    async def __aenter__(self):
-        return self
+        async def __aenter__(self):
+            return self
 
-    async def __aexit__(self, *args):
-        pass
+        async def __aexit__(self, *args):
+            pass
 
-    async def post(self, url, **kwargs):
-        type(self).captured["url"] = url
-        type(self).captured["body"] = json.loads(kwargs["content"])
-        resp = AsyncMock()
-        resp.status_code = 200
-        resp.json.return_value = {"status": "ok", "generation": 1}
-        resp.raise_for_status = AsyncMock()
-        return resp
+        async def post(self, url, **kwargs):
+            captured["url"] = url
+            captured["body"] = json.loads(kwargs["content"])
+            # httpx's ``Response`` API is synchronous: ``raise_for_status()``
+            # and ``json()`` are plain methods here (agent.py:665,669,814).
+            # Mock them as such -- an AsyncMock hands back un-awaited
+            # coroutines, which silently drops the generation-echo path into
+            # its except branch and hides a real failure if production code
+            # ever started awaiting them.
+            resp = Mock()
+            resp.status_code = 200
+            resp.json.return_value = {"status": "ok", "generation": 1}
+            return resp
+
+    return _Client
 
 
 _KV_SUPPORT = {"legacy": ["fp16"], "k": ["fp16"], "v": ["fp16"], "boundary": False}
 
 
-async def _register(profile: HardwareProfile) -> list[str]:
+async def _register(profile: HardwareProfile, backends: list[dict] | None = None) -> list[str]:
+    captured: dict = {}
     agent = WorkerAgent(controller_url="http://controller:9000", name="test-agent", worker_port=9000)
     with patch("tinyagentos.worker.pairing.load_signing_key", return_value=b"fake-key"):
-        with patch("httpx.AsyncClient", _CapturingClient):
+        with patch("httpx.AsyncClient", _capturing_client(captured)):
             with patch("tinyagentos.hardware.detect_hardware", return_value=profile):
-                with patch.object(agent, "detect_backends", new_callable=AsyncMock, return_value=[OLLAMA]):
+                with patch.object(agent, "detect_backends", new_callable=AsyncMock, return_value=backends or [OLLAMA]):
                     with patch.object(agent, "detect_capabilities", return_value=["llm-chat"]):
                         with patch.object(agent, "detect_kv_quant_support", return_value=_KV_SUPPORT):
                             assert await agent.register() is True
-    return _CapturingClient.captured["body"]["resources"]
+    return captured["body"]["resources"]
 
 
-async def _heartbeat(profile: HardwareProfile) -> list[str]:
+async def _heartbeat(profile: HardwareProfile, backends: list[dict] | None = None) -> list[str]:
+    captured: dict = {}
     agent = WorkerAgent(controller_url="http://controller:9000", name="test-agent", worker_port=9000)
     agent._registered = True
     with patch("tinyagentos.worker.pairing.load_signing_key", return_value=b"fake-key"):
-        with patch("httpx.AsyncClient", _CapturingClient):
+        with patch("httpx.AsyncClient", _capturing_client(captured)):
             with patch("tinyagentos.hardware.detect_hardware", return_value=profile):
-                with patch.object(agent, "detect_backends", new_callable=AsyncMock, return_value=[OLLAMA]):
+                with patch.object(agent, "detect_backends", new_callable=AsyncMock, return_value=backends or [OLLAMA]):
                     with patch.object(agent, "detect_capabilities", return_value=["llm-chat"]):
                         with patch.object(agent, "detect_kv_quant_support", return_value=_KV_SUPPORT):
                             with patch(
@@ -158,7 +195,7 @@ async def _heartbeat(profile: HardwareProfile) -> list[str]:
                                 ):
                                     with patch("tinyagentos.worker.agent.psutil.cpu_percent", return_value=0.0):
                                         assert await agent.heartbeat() == 200
-    return _CapturingClient.captured["body"]["resources"]
+    return captured["body"]["resources"]
 
 
 @pytest.mark.asyncio
@@ -174,6 +211,11 @@ class TestWorkerRegistrationInventory:
             "gpu-cuda-0",
         ]
 
+    async def test_register_ignores_a_stopped_backend_on_a_cuda_host(self):
+        assert await _register(
+            HardwareProfile(ram_mb=16384, gpu=CUDA_DEVICE), backends=[STOPPED_OLLAMA]
+        ) == ["cpu-inference"]
+
 
 @pytest.mark.asyncio
 class TestWorkerHeartbeatInventory:
@@ -187,6 +229,14 @@ class TestWorkerHeartbeatInventory:
             "cpu-inference",
             "gpu-cuda-0",
         ]
+
+    async def test_heartbeat_ignores_a_stopped_backend_on_a_cuda_host(self):
+        # Twin of the register case: the heartbeat rebuilds the inventory on
+        # every tick, so a backend that stops between ticks must drop the class
+        # here too, not just at registration.
+        assert await _heartbeat(
+            HardwareProfile(ram_mb=16384, gpu=CUDA_DEVICE), backends=[STOPPED_OLLAMA]
+        ) == ["cpu-inference"]
 
 
 class _EmptyPath:

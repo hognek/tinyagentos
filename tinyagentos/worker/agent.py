@@ -119,36 +119,59 @@ def _has_cuda_class_evidence(hardware: dict | None) -> bool:
     return bool(gpu.get("cuda") or gpu.get("rocm"))
 
 
+def _is_live_backend(backend: dict) -> bool:
+    """Return True for a backend that is actually serving right now.
+
+    ``WorkerAgent.detect_backends()`` returns two shapes: probed backends that
+    answered a health check (``status: "ok"``) and manifest-synthetic entries
+    for declared-but-stopped software (``status: "stopped"``, ``url: None``) so
+    the controller still sees total capacity.  Only the first kind is evidence
+    that anything is serving.  A backend dict without a ``status`` key (the
+    type-only shape used by callers and tests) is treated as live, matching the
+    pre-existing contract.
+
+    ``"ok"`` is an allow-list on purpose: this gate decides whether the worker
+    claims an accelerator to the controller, so an unrecognised future probe
+    status falls out rather than in.  Adding a new *serving* status is then a
+    deliberate act, not a silent widening of what the worker advertises.
+    """
+    return backend.get("status", "ok") == "ok"
+
+
 def _collect_resources(backends: list[dict], hardware: dict | None) -> list[str]:
     """Return the resource classes this worker advertises to the controller.
 
     ``cpu-inference`` is always advertised.  The accelerator classes are
     evidence-gated:
 
-    * ``npu-rk3588`` -- a live ``rkllama`` backend.
-    * ``gpu-cuda-0``  -- a live GPU-capable backend **and** a detected
+    * ``npu-rk3588`` -- a **live** ``rkllama`` backend.
+    * ``gpu-cuda-0``  -- a **live** GPU-capable backend **and** a detected
       CUDA/ROCm device.
 
-    The backend probe alone is not evidence of a CUDA device: vLLM, Ollama,
-    exo and mlx all serve on hosts with no NVIDIA/ROCm hardware (or with a
-    driver the probe could not see).  Advertising ``gpu-cuda-0`` there sends
-    the controller -- and every A2A lease caller, whose default resource id is
-    ``<worker>:gpu-cuda-0`` (``routes/a2a_gpu_lease.py``) -- to a machine that
-    cannot run a CUDA task.  ``scheduler/discovery.py`` maps a non-CUDA/ROCm
-    GPU to the generic ``gpu`` platform signature while still naming the
-    resource ``gpu-cuda-N``, so the backend-only rule made the worker claim a
-    CUDA *class* the scheduler had already classified as generic.  (The reverse
-    side of that naming mismatch -- the scheduler calling a Metal/ROCm GPU
-    ``gpu-cuda-N`` -- is tracked separately and is not changed here.)
+    Either half alone is not evidence.  The backend probe is not evidence of a
+    CUDA device: vLLM, Ollama, exo and mlx all serve on hosts with no
+    NVIDIA/ROCm hardware (or with a driver the probe could not see), and
+    ``detect_backends()`` also emits manifest-synthetic ``status: "stopped"``
+    entries for declared software that is not answering.  Advertising
+    ``gpu-cuda-0`` there sends the controller -- and every A2A lease caller,
+    whose default resource id is ``<worker>:gpu-cuda-0``
+    (``routes/a2a_gpu_lease.py``) -- to a machine that cannot run a CUDA task.
+    ``scheduler/discovery.py`` maps a non-CUDA/ROCm GPU to the generic ``gpu``
+    platform signature while still naming the resource ``gpu-cuda-N``, so the
+    backend-only rule made the worker claim a CUDA *class* the scheduler had
+    already classified as generic.  (The reverse side of that naming mismatch
+    -- the scheduler calling a Metal/ROCm GPU ``gpu-cuda-N`` -- is tracked
+    separately and is not changed here.)
 
     Args:
         backends: live backend probe results, each carrying a ``type``.
         hardware: ``asdict(detect_hardware())`` for the host, or None.
     """
+    live = [b for b in backends if _is_live_backend(b)]
     resources = ["cpu-inference"]
-    if any(b["type"] == "rkllama" for b in backends):
+    if any(b["type"] == "rkllama" for b in live):
         resources.append("npu-rk3588")
-    if any(b["type"] in _GPU_BACKEND_TYPES for b in backends) and _has_cuda_class_evidence(hardware):
+    if any(b["type"] in _GPU_BACKEND_TYPES for b in live) and _has_cuda_class_evidence(hardware):
         resources.append("gpu-cuda-0")
     return resources
 
