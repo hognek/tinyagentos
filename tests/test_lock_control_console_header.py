@@ -281,9 +281,12 @@ class TestThePageSendsTheHeader:
 
         js = open(auth_routes.__file__, encoding="utf-8").read()
         calls = re.findall(
-            r'fetch\("(/auth/lock-[a-z-]+)",\s*\{(.*?)\}\)', js, flags=re.S
+            r'fetch\("(/auth/lock-[a-z/-]+)",\s*\{(.*?)\}\)', js, flags=re.S
         )
         posts = [(p, opts) for p, opts in calls if 'method: "POST"' in opts]
         assert posts, "no lock-* POSTs found in the page script"
+        # Control: nested lock routes (/auth/lock-call/...) are in scope. With
+        # [a-z-]+ the scan could not see a slash, so those POSTs were skipped.
+        assert any(p.startswith("/auth/lock-call/") for p, _ in posts), posts
         for path, opts in posts:
             assert '"X-taOS-Console"' in opts, path
