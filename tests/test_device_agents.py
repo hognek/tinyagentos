@@ -41,6 +41,11 @@ class _Client:
         self.host = host
 
 
+#: What the lock screen's own send carries (a JSON content type), so the lock
+#: POST gate passes and a test reaches the route's own behaviour.
+PAGE_SEND = {"Content-Type": "application/json"}
+
+
 class _Req:
     #: The request's app.state.data_dir, where the demo-mode switch lives.
     #: None reads as switch OFF (fail closed); `armed` points it at a data dir
@@ -265,7 +270,7 @@ class TestTheThreadIsCapped:
 class TestSendingToABoard:
     def test_an_unplugged_board_is_refused(self, armed):
         """Unplugged between the island being drawn and the send landing."""
-        resp = _call(auth.lock_send("taosusb", _Req({"text": "health check"})))
+        resp = _call(auth.lock_send("taosusb", _Req({"text": "health check"}, PAGE_SEND)))
         assert resp.status_code == 404
 
     def test_a_non_console_request_is_refused(self, armed, monkeypatch):
@@ -278,7 +283,7 @@ class TestSendingToABoard:
         """The sheet must show what was asked. A send that vanishes because
         the board went away reads as the phone having dropped it."""
         _beat(armed)
-        resp = _call(auth.lock_send("taosusb", _Req({"text": "do a health check"})))
+        resp = _call(auth.lock_send("taosusb", _Req({"text": "do a health check"}, PAGE_SEND)))
         # No board is really listening on that URL, so this is the 502 path.
         assert resp.status_code == 502
         thread = auth._DEVICE_THREADS["taosusb"]
@@ -347,7 +352,7 @@ class TestTheRelayAndDedupAreBounded:
         """The board 400s above 2000 chars; a round trip that can only fail is
         worse than a straight answer."""
         _beat(armed)
-        resp = _call(auth.lock_send("taosusb", _Req({"text": "x" * 2001})))
+        resp = _call(auth.lock_send("taosusb", _Req({"text": "x" * 2001}, PAGE_SEND)))
         assert resp.status_code == 400
 
     def test_the_dedup_set_does_not_grow_without_bound(self, armed):

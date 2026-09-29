@@ -10129,9 +10129,16 @@ async def lock_send(slug: str, request: Request):
     the work: `apt update` on a Zero takes 30-90s and an upgrade takes many
     minutes, and a lock screen whose send button hangs for a minute reads as
     broken. The replies come back through /device-agent/message.
+
+    The full lock-POST gate, not just loopback: this relays text to real
+    hardware WITH the pairing token, and a web page open in the phone's own
+    browser is loopback too -- a no-cors text/plain POST would otherwise ride
+    straight through to the board. Checked before anything else, so the
+    refusal is the same whatever the device flag says.
     """
-    if not _request_is_console(request):
-        return JSONResponse({"error": "console only"}, status_code=403)
+    refused = _lock_post_refusal(request)
+    if refused is not None:
+        return refused
     if not _device_agents_enabled(request):
         return JSONResponse({"error": "not found"}, status_code=404)
     if not _DEVICE_SLUG_RE.match(slug or ""):
