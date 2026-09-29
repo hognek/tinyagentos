@@ -3732,6 +3732,28 @@ _LOCK_SCREEN_SCRIPT = r"""
       pollActivity();
     }
 
+    // THE SAFETY NET, as for data-blanked. The pause is lifted by the stream's
+    // screen-on; if that event never arrives -- a dead or reconnecting stream,
+    // a restarted controller -- nothing else would lift it (the kiosk's
+    // visibility does not change with the panel), and the islands would sit
+    // frozen on a lit screen. Real input means someone is looking, so it
+    // resumes the poll; on a running poll resume is a no-op.
+    function armWidgetsInputResume(doc) {
+      ["touchstart", "keydown", "pointerdown"].forEach(function (evt) {
+        doc.addEventListener(evt, function () { resumeWidgetsPoll(); },
+                             { passive: true, capture: true });
+      });
+    }
+
+    // And when the lock stream (re)opens. EventSource reconnects on its own
+    // after a drop, and a screen-on sent while it was down is gone for good;
+    // on a lit screen nobody touches, the input net alone would leave the
+    // islands frozen. A reconnect therefore assumes the screen may be on. If
+    // it is in fact dark, the next screen-off pauses the poll again.
+    function armWidgetsStreamResume(stream) {
+      stream.addEventListener("open", function () { resumeWidgetsPoll(); });
+    }
+
     if (card) {
       pollActivity();
       try {
@@ -3739,6 +3761,7 @@ _LOCK_SCREEN_SCRIPT = r"""
           if (document.visibilityState === "hidden") pauseWidgetsPoll();
           else resumeWidgetsPoll();
         });
+        armWidgetsInputResume(document);
       } catch (err) { /* no document in this harness: keep polling on the timer */ }
     }
 
@@ -5908,6 +5931,7 @@ _LOCK_SCREEN_SCRIPT = r"""
       if (!stream) return;
       stream.addEventListener("screen-off", function () { pauseWidgetsPoll(); });
       stream.addEventListener("screen-on", function () { resumeWidgetsPoll(); });
+      armWidgetsStreamResume(stream);
     })();
 
     (function () {

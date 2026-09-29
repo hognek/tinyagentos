@@ -754,6 +754,8 @@ def _scheduler_source() -> str:
         _function("pollActivity"),
         _function("pauseWidgetsPoll"),
         _function("resumeWidgetsPoll"),
+        _function("armWidgetsInputResume"),
+        _function("armWidgetsStreamResume"),
     ])
 
 
@@ -856,6 +858,56 @@ class TestTheWidgetsPollScheduler:
         assert all(t["cancelled"] for t in out["timers"]), (
             "the scheduled poll survived pauseWidgetsPoll"
         )
+
+    def test_input_resumes_a_poll_whose_screen_on_never_arrived(self):
+        """The pause is lifted by the stream's screen-on. If that event is lost
+        (a dead or reconnecting stream), a touch on the lit screen must still
+        bring the islands back to life rather than leave them frozen."""
+        out = _run_scheduler(
+            "var L = {}; var doc = { addEventListener: function (e, fn) { (L[e] = L[e] || []).push(fn); } };"
+            "armWidgetsInputResume(doc);"
+            "pollActivity(); await flush(); pauseWidgetsPoll();"
+            "L.touchstart.forEach(function (fn) { fn(); }); await flush();",
+            [{"body": {"agents": [], "refresh_in_ms": 9000}}],
+        )
+        assert out["widgetsPaused"] is False
+        assert out["fetchCalls"] == 2, "a touch on a paused lock screen must fetch now"
+
+    def test_input_on_a_running_poll_does_not_fetch_again(self):
+        out = _run_scheduler(
+            "var L = {}; var doc = { addEventListener: function (e, fn) { (L[e] = L[e] || []).push(fn); } };"
+            "armWidgetsInputResume(doc);"
+            "pollActivity(); await flush();"
+            "L.touchstart.forEach(function (fn) { fn(); }); L.keydown.forEach(function (fn) { fn(); }); await flush();",
+            [{"body": {"agents": [], "refresh_in_ms": 9000}}],
+        )
+        assert out["fetchCalls"] == 1
+
+    def test_a_reopened_stream_resumes_a_paused_poll(self):
+        """A reconnect means a screen-on may have been missed while the stream
+        was down; with nobody touching the screen, the reopen itself must bring
+        the islands back."""
+        out = _run_scheduler(
+            "var L = {}; var stream = { addEventListener: function (e, fn) { (L[e] = L[e] || []).push(fn); } };"
+            "armWidgetsStreamResume(stream);"
+            "pollActivity(); await flush(); pauseWidgetsPoll();"
+            "L.open.forEach(function (fn) { fn(); }); await flush();",
+            [{"body": {"agents": [], "refresh_in_ms": 9000}}],
+        )
+        assert out["widgetsPaused"] is False
+        assert out["fetchCalls"] == 2, "a reopened stream must fetch now"
+
+    def test_the_page_arms_the_stream_safety_net(self):
+        from tinyagentos.routes import auth
+        js = auth._LOCK_SCREEN_SCRIPT
+        at = js.index('stream.addEventListener("screen-on", function () { resumeWidgetsPoll(); });')
+        assert "armWidgetsStreamResume(stream);" in js[at:at + 200]
+
+    def test_the_page_arms_the_input_safety_net(self):
+        from tinyagentos.routes import auth
+        js = auth._LOCK_SCREEN_SCRIPT
+        at = js.index('document.addEventListener("visibilitychange"')
+        assert "armWidgetsInputResume(document);" in js[at:at + 400]
 
     def test_resuming_fetches_immediately_rather_than_waiting_out_the_timer(self):
         out = _run_scheduler(
