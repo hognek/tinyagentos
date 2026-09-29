@@ -1,7 +1,6 @@
 ### Fixed
 
-Extended the pre-existing `hailo-ollama` detection in `scripts/install-hailo.sh` to catch installed-but-stopped upstream instances:
-
+- Extended the pre-existing `hailo-ollama` detection in `scripts/install-hailo.sh` to catch installed-but-stopped upstream instances
 - Detect upstream `hailo-ollama.service` units that exist but lack the `OLLAMA_HOST=127.0.0.1:7836` marker
 - Detect upstream `hailo-ollama` binaries on PATH that resolve outside the install directory
 - All detection tests pass, including the critical "our own install" negative test to prevent false positives

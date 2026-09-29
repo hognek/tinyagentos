@@ -30,6 +30,63 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 HAILO_SCRIPT = REPO_ROOT / "scripts" / "install-hailo.sh"
 SERVER_SCRIPT = REPO_ROOT / "scripts" / "install-server.sh"
 WORKER_SCRIPT = REPO_ROOT / "scripts" / "install-worker.sh"
+CALLERS = {
+    "controller": REPO_ROOT / "scripts" / "install-server.sh",
+    "worker": REPO_ROOT / "scripts" / "install-worker.sh",
+}
+
+
+def _extract_function(script: Path, name: str) -> str:
+    """Extract a production shell function from its header to its closing brace."""
+    text = script.read_text()
+    match = re.search(rf"^{re.escape(name)}\(\)\s*\{{", text, re.MULTILINE)
+    assert match, f"{name}() not found in {script}"
+    start = match.start()
+    depth = 0
+    index = match.end() - 1
+    while index < len(text):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+        index += 1
+    raise AssertionError(f"could not find matching closing brace of {name}()")
+
+
+def _run_detection(
+    tmp_path: Path,
+    curl_body: str,
+    after_call: str = "",
+    path: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    function_body = _extract_function(HAILO_SCRIPT, "detect_preexisting_hailoollama")
+    wrapper = tmp_path / "wrapper.sh"
+    wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        "log() { :; }\n"
+        "warn() { printf '%s\\n' \"$*\" >&2; }\n"
+        f"curl() {{\n{curl_body}\n}}\n"
+        "HAILO_OLLAMA_PORT=7836\n"
+        "HAILO_OLLAMA_DIR=\"$HOME/hailo_model_zoo_genai\"\n"
+        + function_body
+        + "\ndetect_preexisting_hailoollama\n"
+        + after_call
+    )
+    wrapper.chmod(0o755)
+    return subprocess.run(
+        ["/usr/bin/env", "bash", str(wrapper)],
+        env={
+            "PATH": f"{path or '/usr/bin:/bin'}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+            "LANG": "C.UTF-8",
+            "HOME": str(tmp_path),
+        },
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
 
 
 def _extract_detect_preexisting_function() -> str:
@@ -38,12 +95,11 @@ def _extract_detect_preexisting_function() -> str:
     We deliberately work on the real script so a regression in the production
     function fails this gate."""
     text = HAILO_SCRIPT.read_text()
-    # Find the function header line and then walk braces to find the close.
     m = re.search(r"^detect_preexisting_hailoollama\(\)\s*\{", text, re.MULTILINE)
     assert m, "detect_preexisting_hailoollama() not found in install-hailo.sh"
     start = m.start()
     depth = 0
-    i = m.end() - 1  # at the '{'
+    i = m.end() - 1
     while i < len(text):
         c = text[i]
         if c == "{":
@@ -75,13 +131,102 @@ def _write_hailo_wrapper(tmp_path: Path, curl_body: str, function_body: str) -> 
     return wrapper
 
 
+def _mock_systemctl_unit_without_marker(tmp_path: Path) -> None:
+    """systemctl that reports hailo-ollama.service exists with a wrong marker."""
+    mock = tmp_path / "systemctl"
+    mock.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$*" == *"list-unit-files"* ]]; then\n'
+        '    echo "hailo-ollama.service"\n'
+        'elif [[ "$*" == *"cat hailo-ollama.service"* ]]; then\n'
+        '    echo "OLLAMA_HOST=0.0.0.0:8000"\n'
+        'fi\n'
+    )
+    mock.chmod(0o755)
+
+
+def _mock_systemctl_unit_with_marker(tmp_path: Path) -> None:
+    """systemctl that reports hailo-ollama.service exists WITH the taOS marker."""
+    mock = tmp_path / "systemctl"
+    mock.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "$*" == *"list-unit-files"* ]]; then\n'
+        '    echo "hailo-ollama.service"\n'
+        'elif [[ "$*" == *"cat hailo-ollama.service"* ]]; then\n'
+        '    echo "OLLAMA_HOST=127.0.0.1:7836"\n'
+        'fi\n'
+    )
+    mock.chmod(0o755)
+
+
+def _mock_hailo_ollama_binary_outside_dir(tmp_path: Path) -> None:
+    """Place a hailo-ollama binary on PATH that resolves outside the install dir."""
+    binary = tmp_path / "hailo-ollama"
+    binary.write_text("#!/usr/bin/env bash\necho running\n")
+    binary.chmod(0o755)
+
+
+def _mock_hailo_ollama_binary_inside_dir(tmp_path: Path) -> None:
+    """Place a hailo-ollama binary inside the install directory."""
+    install_dir = tmp_path / "hailo_model_zoo_genai" / "bin"
+    install_dir.mkdir(parents=True)
+    binary = install_dir / "hailo-ollama"
+    binary.write_text("#!/usr/bin/env bash\necho running\n")
+    binary.chmod(0o755)
+
+
+def _assert_caller_reports_conflict(script: Path, caller: str) -> None:
+    text = script.read_text()
+    branch = re.compile(
+        r"if \(\( rc == 3 \)\); then\s*"
+        r"warn \"[^\"]*pre-existing hailo-ollama on :8000[^\"]*"
+        r"taOS backend not installed on 7836[^\"]*\""
+    )
+    assert branch.search(text), (
+        f"{caller} must branch on exit status 3 and name the :8000 conflict; "
+        "the generic failure warning alone leaves the auto-install silence bug uncovered"
+    )
+    assert 'warn "install-hailo.sh failed - continuing ' in text, (
+        f"{caller} must retain its generic warning for non-3 failures"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
+def test_preexisting_instance_refuses_with_exit_3(tmp_path: Path) -> None:
+    """A live upstream tags endpoint must refuse with the reserved status 3."""
+    result = _run_detection(
+        tmp_path,
+        "    printf '%s' '{\"models\":[]}'\n",
+    )
+
+    assert result.returncode == 3, (
+        "pre-existing hailo-ollama must exit 3, not silently report success; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
+def test_no_instance_on_8000_allows_install_to_proceed(tmp_path: Path) -> None:
+    """An unanswered upstream probe is a clean no-op and must not block setup."""
+    result = _run_detection(
+        tmp_path,
+        "    return 1\n",
+        "printf 'install proceeds\\n'",
+    )
+
+    assert result.returncode == 0, f"unexpected probe failure: {result.stderr}"
+    assert "install proceeds" in result.stdout, (
+        "a clean :8000 probe must allow the installer to continue; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
 def test_preexisting_detected_exits_3_not_0(tmp_path: Path) -> None:
     """When a pre-existing hailo-ollama answers on :8000 with a "models"
     payload, the function must exit 3 (refused), not 0 (success). Exit 0 is
     the bug from PR #3002 that made auto-install callers silent."""
     function_body = _extract_detect_preexisting_function()
-    # Stub curl to return a JSON with "models" key (Ollama /api/tags shape)
     curl_body = '    printf \'{"models":[{"name":"llama3.2:3b"}]}\'\n    return 0\n'
     wrapper = _write_hailo_wrapper(tmp_path, curl_body, function_body)
 
@@ -111,7 +256,6 @@ def test_nothing_on_8000_returns_0_proceeds(tmp_path: Path) -> None:
     """When nothing answers on :8000, the function must return 0 (not exit)
     so the install proceeds normally."""
     function_body = _extract_detect_preexisting_function()
-    # Stub curl to fail (nothing listening)
     curl_body = "    return 1\n"
     wrapper = _write_hailo_wrapper(tmp_path, curl_body, function_body)
 
@@ -130,170 +274,68 @@ def test_nothing_on_8000_returns_0_proceeds(tmp_path: Path) -> None:
     )
 
 
-def _mock_systemctl_for_unit_without_marker(tmp_path: Path) -> None:
-    """Create mock systemctl commands that simulate an upstream unit without marker."""
-    # Create a mock systemctl script that returns specific outputs
-    mock_systemctl = tmp_path / "systemctl"
-    mock_systemctl.write_text("""#!/usr/bin/env bash
-if [[ "$@" == *"list-unit-files"* ]]; then
-    echo "hailo-ollama.service"
-fi
-if [[ "$@" == *"cat hailo-ollama.service"* ]]; then
-    # Return a unit without our OLLAMA_HOST marker
-    cat << EOF
-[Unit]
-Description=upstream hailo-ollama
-EOF
-fi
-""")
-    mock_systemctl.chmod(0o755)
-
-
-def _mock_command_v_for_outside_binary(tmp_path: Path) -> None:
-    """Create mock command -v that returns a path outside install directory."""
-    mock_command_v = tmp_path / "command"
-    mock_command_v.write_text("""#!/usr/bin/env bash
-if [[ "$1" == "hailo-ollama" ]]; then
-    echo "/usr/local/bin/hailo-ollama"
-fi
-""")
-    mock_command_v.chmod(0o755)
-
-
-def _mock_command_v_for_inside_binary(tmp_path: Path) -> None:
-    """Create mock command -v that returns a path inside install directory."""
-    mock_command_v = tmp_path / "command"
-    mock_command_v.write_text("""#!/usr/bin/env bash
-if [[ "$1" == "hailo-ollama" ]]; then
-    echo ""$tmp_path"/hailo-ollama/bin/hailo-ollama"
-fi
-""")
-    mock_command_v.chmod(0o755)
-
-
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
 def test_preexisting_unit_without_marker_refuses(tmp_path: Path) -> None:
-    """An upstream unit present with no taOS marker should refuse with exit 3."""
-    function_body = _extract_detect_preexisting_function()
-    # Stub curl to fail (nothing on 8000)
-    curl_body = "    return 1\n"
-    wrapper = _write_hailo_wrapper(tmp_path, curl_body, function_body)
-    
-    # Create mock systemctl that returns an upstream unit without marker
-    _mock_systemctl_for_unit_without_marker(tmp_path)
-    
-    # Add mock systemctl to PATH
-    env = {**os.environ, "PATH": str(tmp_path) + ":" + os.environ.get("PATH", "")}
-    
-    result = subprocess.run(
-        ["/usr/bin/env", "bash", str(wrapper)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    """An upstream unit with a wrong OLLAMA_HOST marker must refuse with exit 3."""
+    _mock_systemctl_unit_without_marker(tmp_path)
+    result = _run_detection(
+        tmp_path,
+        "    return 1\n",
+        path=str(tmp_path),
     )
-    
-    # The function should exit 3 because it detected an upstream unit without marker
-    # We need to verify this happens when systemctl is properly mocked
-    # For now, we'll just verify the detection logic exists in the script
-    
-    # Check that the script contains the unit detection logic
-    script_text = HAILO_SCRIPT.read_text()
-    assert "if systemctl list-unit-files --full | grep -q '^hailo-ollama.service'" in script_text
-    assert "systemctl cat hailo-ollama.service 2>/dev/null | grep 'OLLAMA_HOST='" in script_text
-    assert "OLLAMA_HOST=127.0.0.1:$HAILO_OLLAMA_PORT" in script_text
-    
-    # The actual test would need proper mocking of systemctl
-    # For now, we'll mark this as not implemented
+    assert result.returncode == 3, (
+        f"unit with wrong marker must refuse with exit 3; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    combined = (result.stdout + result.stderr).lower()
+    assert "upstream" in combined or "marker" in combined, (
+        f"refusal message must mention upstream or marker; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
 def test_preexisting_binary_outside_install_dir_refuses(tmp_path: Path) -> None:
-    """An upstream binary outside our install directory should refuse with exit 3."""
-    function_body = _extract_detect_preexisting_function()
-    # Stub curl to fail (nothing on 8000)
-    curl_body = "    return 1\n"
-    wrapper = _write_hailo_wrapper(tmp_path, curl_body, function_body)
-    
-    # Create mock command -v that returns path outside install directory
-    _mock_command_v_for_outside_binary(tmp_path)
-    
-    # Add mock command to PATH
-    env = {**os.environ, "PATH": str(tmp_path) + ":" + os.environ.get("PATH", "")}
-    
-    result = subprocess.run(
-        ["/usr/bin/env", "bash", str(wrapper)],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
+    """An upstream hailo-ollama binary outside the install directory must refuse."""
+    _mock_hailo_ollama_binary_outside_dir(tmp_path)
+    result = _run_detection(
+        tmp_path,
+        "    return 1\n",
+        path=str(tmp_path),
     )
-    
-    # Check that the script contains the binary detection logic
-    script_text = HAILO_SCRIPT.read_text()
-    assert "local bin_path" in script_text
-    assert "command -v hailo-ollama" in script_text
-    assert "readlink -f" in script_text
-    assert "$HAILO_OLLAMA_DIR" in script_text
-    assert '! [[ "$resolved" == "$HAILO_OLLAMA_DIR"* ]]' in script_text
-    
-    # The actual test would need proper mocking of command -v and readlink -f
-    # For now, we'll mark this as not implemented
+    assert result.returncode == 3, (
+        f"binary outside install dir must refuse with exit 3; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    combined = (result.stdout + result.stderr).lower()
+    assert "upstream" in combined or "binary" in combined, (
+        f"refusal message must mention upstream or binary; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
 def test_our_own_install_without_markers_allowed(tmp_path: Path) -> None:
-    """Our own install (with correct markers) must NOT refuse when nothing on 8000."""
-    function_body = _extract_detect_preexisting_function()
-    # Stub curl to fail (nothing on 8000)
-    curl_body = "    return 1\n"
-    wrapper = _write_hailo_wrapper(tmp_path, curl_body, function_body)
-    
-    # Create mock systemctl that returns a unit WITH our marker
-    # and mock command -v that returns path inside install directory
-    
-    # This test is critical to prevent the detector from unconditionally refusing
-    # all installations. We need to verify that when we have our own installation
-    # (with correct markers and binary in the right place), the detector allows it.
-    
-    # Check that the script properly handles the case of our own installation
-    script_text = HAILO_SCRIPT.read_text()
-    
-    # Extract the function body to analyze the logic
-    function_start = script_text.find("detect_preexisting_hailoollama() {")
-    assert function_start != -1, "Function not found"
-    
-    # Find the closing brace
-    brace_count = 0
-    pos = function_start
-    while pos < len(script_text):
-        if script_text[pos] == '{':
-            brace_count += 1
-        elif script_text[pos] == '}':
-            brace_count -= 1
-            if brace_count == 0:
-                function_body = script_text[function_start:pos + 1]
-                break
-        pos += 1
-    else:
-        raise AssertionError("Could not find closing brace")
-    
-    # The key requirement: if unit exists WITH marker, and binary is inside directory,
-    # the function should NOT refuse (should return 0)
-    
-    # Check that unit detection logic only refuses when marker is absent or different
-    assert "OLLAMA_HOST=127.0.0.1:$HAILO_OLLAMA_PORT" in function_body
-    
-    # Check that binary detection logic only refuses when outside directory
-    assert '$HAILO_OLLAMA_DIR' in function_body
-    assert '! [[ "$resolved" == "$HAILO_OLLAMA_DIR"* ]]' in function_body
-    
-    # This test ensures the detector is precise and doesn't indiscriminately refuse
-    # All three conditions must be satisfied for refusal:
-    # 1. Something on 8000 OR
-    # 2. Unit exists without our marker OR  
-    # 3. Binary exists outside directory
-    # If we have our own install (unit WITH marker, binary inside dir), should NOT refuse
+    """Our own install (unit with correct marker + binary inside dir) must be allowed."""
+    _mock_systemctl_unit_with_marker(tmp_path)
+    _mock_hailo_ollama_binary_inside_dir(tmp_path)
+    result = _run_detection(
+        tmp_path,
+        "    return 1\n",
+        path=str(tmp_path),
+    )
+    assert result.returncode == 0, (
+        f"our own install must be allowed (exit 0); "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+
+def test_install_server_reports_hailo_conflict() -> None:
+    _assert_caller_reports_conflict(CALLERS["controller"], "install-server.sh")
+
+
+def test_install_worker_reports_hailo_conflict() -> None:
+    _assert_caller_reports_conflict(CALLERS["worker"], "install-worker.sh")
 
 
 def test_server_script_branches_on_exit_3_with_conflict_message() -> None:
@@ -301,17 +343,11 @@ def test_server_script_branches_on_exit_3_with_conflict_message() -> None:
     install-hailo.sh whose message names the :8000 conflict (pre-existing
     hailo-ollama on :8000, taOS backend not installed on 7836)."""
     text = SERVER_SCRIPT.read_text()
-    # Find the call to install-hailo.sh and the error handling after it
-    # The pattern should capture the exit code and branch on 3
     assert "install-hailo.sh" in text, "install-hailo.sh not referenced in install-server.sh"
-    # Check for explicit handling of exit code 3
-    # We look for a pattern like: if ! cmd; then rc=$?; ... elif (( rc == 3 )); then ...
-    # or case $? in ... 3) ...
     has_exit3_branch = (
         re.search(r"rc=\$\?|rc=\$?", text) and
         (re.search(r"3\).*", text) or re.search(r"== 3", text) or re.search(r"-eq 3", text))
     ) or "exit 3" in text
-    # More precise: look for a branch that mentions the conflict explicitly
     conflict_mentioned = (
         "8000" in text and
         ("pre-existing" in text.lower() or "conflict" in text.lower())
@@ -332,7 +368,6 @@ def test_worker_script_branches_on_exit_3_with_conflict_message() -> None:
     install-hailo.sh whose message names the :8000 conflict."""
     text = WORKER_SCRIPT.read_text()
     assert "install-hailo.sh" in text, "install-hailo.sh not referenced in install-worker.sh"
-    # Same check as for server script
     has_exit3_branch = (
         re.search(r"rc=\$\?|rc=\$?", text) and
         (re.search(r"3\).*", text) or re.search(r"== 3", text) or re.search(r"-eq 3", text))
