@@ -726,9 +726,11 @@ class ClusterManager:
 
         When a worker is explicitly unregistered (admin action), every
         active lease tied to the worker's resources is released so that
-        those resource slots become available for new claims immediately.
+        those resource slots become available for new claims immediately,
+        and any GPU arbiter task still running on those leases is cancelled
+        so it cannot keep its VRAM reservation alongside a returning worker.
         This mirrors the lease-release logic in ``_monitor_loop`` for the
-        heartbeat-timeout path (taOS #1705).
+        heartbeat-timeout path (taOS #1705, taOS #1992 H2).
         """
         worker = self._workers.get(name)
         if worker is None:
@@ -750,6 +752,21 @@ class ClusterManager:
 
             self._workers.pop(name, None)
         logger.info("Worker '%s' unregistered — %d leases released", name, len(lids))
+        # taOS #1992 (H2): releasing the lease rows is not enough — a task still
+        # running on the arbiter keeps its VRAM reservation and ``_running``
+        # slot, so a returning worker (or a fresh claimant) would execute
+        # concurrently with the orphan on the same physical GPU. Cancel those
+        # tasks, mirroring the heartbeat-timeout/offline branches in
+        # ``_monitor_loop`` and the force-drain path in ``drain_worker``.
+        if lids and self._gpu_arbiter is not None:
+            try:
+                cancelled, already_done = await self._gpu_arbiter.cancel_running_for_leases(set(lids))
+                logger.info(
+                    "Worker '%s' unregistered — arbiter cancelled %d task(s), %d already done",
+                    name, cancelled, already_done,
+                )
+            except Exception:
+                logger.exception("gpu-arbiter: cancel for unregister of '%s' failed", name)
         # taOS #640: remove from persistent store.
         if self._registry_store is not None:
             try:
