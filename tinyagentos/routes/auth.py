@@ -1610,7 +1610,7 @@ body.ls-black { background: #000; }
 @keyframes ls-status-in-fade { from { opacity: 0; } to { opacity: 1; } }
 /* A brief soft highlight on the whole island in the agent's own hue, so a
    task rotation reads as "this one, right now" even from across a room. */
-.ls-island[data-status-pulse="1"] { animation: ls-status-pulse 700ms ease-out; }
+.ls-island[data-status-pulse="1"] { animation: ls-status-pulse 700ms ease-out; } /* keep <= STATUS_PULSE_MS in the script */
 @keyframes ls-status-pulse {
   0%   { box-shadow: 0 6px 18px -6px rgba(0,0,0,0.75), 0 0 0 0 transparent; }
   45%  { box-shadow: 0 6px 18px -6px rgba(0,0,0,0.75), 0 0 22px 3px var(--ls-a, #4c9aff); }
@@ -3346,6 +3346,12 @@ _LOCK_SCREEN_SCRIPT = r"""
     // roughly the halfway point of this same duration, so the two stay in
     // sync by construction rather than by two numbers that can drift apart.
     var STATUS_CHANGE_MS = 380;
+    // How long `data-status-pulse` stays on the island. The pulse keyframes
+    // (`ls-status-pulse`, 700ms in the stylesheet) run longer than the slide,
+    // and removing the attribute cuts the animation off, so this must be at
+    // least that duration. tests/test_lock_demo_task_rotation.py pins the two
+    // together.
+    var STATUS_PULSE_MS = 700;
 
     // Slide the OLD status up and out while the NEW one slides in from below,
     // on the SAME `.ls-status` node -- the island must never be rebuilt for
@@ -3373,8 +3379,14 @@ _LOCK_SCREEN_SCRIPT = r"""
         if (s.__statusChangeSeq !== seq) return; // superseded by a newer change
         s.removeAttribute("data-prev");
         s.className = "ls-status";
-        el.removeAttribute("data-status-pulse");
       }, STATUS_CHANGE_MS);
+      // The pulse outlives the slide, so it has its own timer and its own
+      // supersede check.
+      var pulseSeq = (el.__statusPulseSeq = (el.__statusPulseSeq || 0) + 1);
+      setTimeout(function () {
+        if (el.__statusPulseSeq !== pulseSeq) return;
+        el.removeAttribute("data-status-pulse");
+      }, STATUS_PULSE_MS);
     }
 
     // An island's MUTABLE half: everything a 15s poll can legitimately change.
@@ -11381,6 +11393,14 @@ _POWER_REQUEST = "/run/taos-power/request"
 #: that arrives on a poll is a broken menu.
 _LOCK_EVENT_WAITERS: set = set()
 
+#: The last screen state the device reported ("screen-off" / "screen-on"), or
+#: None when it has not reported one since the controller started. Kept so a
+#: stream that (re)opens can be told the CURRENT state: after a controller
+#: restart the page reconnects while the panel may be dark, and a screen-off
+#: sent before the restart is gone. None means unknown, and unknown sends
+#: nothing rather than guessing.
+_LOCK_SCREEN_STATE: str | None = None
+
 
 def _push_lock_event(kind: str, payload: dict | None = None) -> int:
     """Fan an event out to every open lock-screen stream. Returns the count.
@@ -11415,6 +11435,10 @@ async def lock_events(request: Request):
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=8)
     _LOCK_EVENT_WAITERS.add(queue)
+    # Snapshotted here, in the same synchronous step that registers the queue,
+    # so a screen event landing afterwards reaches this client through the
+    # queue and is never lost or reordered behind a stale snapshot.
+    initial_state = _LOCK_SCREEN_STATE
 
     async def stream():
         try:
@@ -11422,6 +11446,12 @@ async def lock_events(request: Request):
             # connection rather than sitting in CONNECTING until the first real
             # event -- which could be hours.
             yield ": connected\n\n"
+            # The current screen state, to THIS client only (it is written to
+            # this response, not pushed through the fan-out): the page pauses
+            # its widgets poll on screen-off, and a reopen against a dark panel
+            # would otherwise resume it until the next screen-off.
+            if initial_state is not None:
+                yield "event: %s\ndata: {}\n\n" % initial_state
             while True:
                 if await request.is_disconnected():
                     break
@@ -11908,6 +11938,8 @@ async def lock_screen_off(request: Request):
     refusal = _lock_post_refusal(request)
     if refusal is not None:
         return refusal
+    global _LOCK_SCREEN_STATE
+    _LOCK_SCREEN_STATE = "screen-off"
     return JSONResponse({"ok": True, "delivered": _push_lock_event("screen-off")})
 
 
@@ -11923,6 +11955,8 @@ async def lock_screen_on(request: Request):
     refusal = _lock_post_refusal(request)
     if refusal is not None:
         return refusal
+    global _LOCK_SCREEN_STATE
+    _LOCK_SCREEN_STATE = "screen-on"
     return JSONResponse({"ok": True, "delivered": _push_lock_event("screen-on")})
 
 

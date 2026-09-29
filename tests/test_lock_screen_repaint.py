@@ -241,6 +241,7 @@ def _source(*, reconciled: bool = True) -> str:
         _function("initials"),
         _function("islandIdentity"),
         _var("STATUS_CHANGE_MS"),
+        _var("STATUS_PULSE_MS"),
         _function("isDoneStatus"),
         _function("animateStatusChange"),
         _function("applyAgent"),
