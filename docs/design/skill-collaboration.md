@@ -24,8 +24,9 @@ registry — tool schemas, `frameworks` (native/adapter/unsupported), per-agent
 canonical guides. To keep the two apart:
 
 - **guide** — the knowledge artifact. The canonical guides (`docs/agent-manual/`,
-  read-only, compiled, and shipped via `.claude/skills/taos-agent/SKILL.md`) are guides. #898's
-  agent-authored guides are guides.
+  read-only, compiled by `scripts/build-agent-manual.py` into `docs/taos-agent-manual.md`,
+  which `routes/taos_agent.py` loads at import time as the taOS agent's system prompt) are
+  guides. #898's agent-authored guides are guides.
 - **supplement** — one agent's additive note over one guide. This layer stores,
   shares and governs supplements. Call it a *supplement*, never a "skill".
 - **channel** — the bus thread supplements travel on. Recommend `learning`
@@ -40,7 +41,7 @@ canonical guides. To keep the two apart:
 | Bus identity | The taOS send proxy mints `from` from the caller's registry JWT (`agent_token_auth.check_agent_scope`, scope `a2a_send`); the bus verifies `token sub == from` | Free provenance — a supplement's author cannot be spoofed |
 | Read side | `a2a_receive` scope or admin session gates reads | Who may subscribe |
 | Internal per-project a2a (`projects/a2a.py`) | One `kind="a2a"` group channel per project, @mention routing | Out of scope. That is project chat, not learning |
-| Read-only canonical guides (`docs/agent-manual/`) | Compiled to `docs/taos-agent-manual.md` and shipped to agents via `.claude/skills/taos-agent/SKILL.md` (`build_manual()` in `agent_manual.py` is a pure function returning session constants, not this assembly) | The layer supplements sit over, never into |
+| Read-only canonical guides (`docs/agent-manual/`) | Compiled by `scripts/build-agent-manual.py` to `docs/taos-agent-manual.md`, which `routes/taos_agent.py` loads at import time as the taOS agent's system prompt (`SYSTEM_PROMPT: str = _load_manual()`, `:104`/`:117`, handed to the adapter at `:491` when no persona is set). `build_manual()` in `agent_manual.py` is a pure function of session constants and does not read this file; `.claude/skills/taos-agent/SKILL.md` is a hand-authored companion skill consolidating the same content, not the compiled artifact | The layer supplements sit over, never into |
 | Per-agent memory (taosmd/QMD, `memory_mode`) | Existing | Overlaps by design — see §7, build with @taOSmd |
 | Decisions app (`routes/decisions.py`) | Agents create decisions with a registry token; a human answers | The review gate surface in S3 |
 | #896 control plane (`trace_store`, `otel/*`, `scheduler/history_store.py`, Activity UI) | Spec'd/partly built | The evidence and audit surface the review gate links to |
@@ -205,8 +206,8 @@ The canonical guides are read-only (#898). A supplement therefore **never
 edits, overrides or shadows canonical text** — it is a separate layer rendered
 next to it.
 
-- **Rendering.** At guide-render time (the `.claude/skills/taos-agent/SKILL.md` assembly path and any future
-  guide loader), canonical text is emitted byte-identical; adopted supplements are
+- **Rendering.** At guide-render time (the import-time `SYSTEM_PROMPT = _load_manual()`
+  assembly in `routes/taos_agent.py` and any future guide loader), canonical text is emitted byte-identical; adopted supplements are
   appended under a clearly marked block, e.g. `### Local notes (agent-supplied,
   reviewed)`, each stamped with author + id. An agent reading its manual can
   always tell which sentence came from the platform and which came from a peer.
@@ -346,10 +347,11 @@ commands run from the repo root.
   discipline: supplements + generations + tombstones), `tinyagentos/guides/model.py`
   (envelope validation, content-addressed `id`, scope matching),
   `tinyagentos/guides/render.py` (the merge/append/stale rules of §5), wiring into
-  a new supplement-aware guide-injection seam (`build_manual()` is a pure function
-  returning session constants and does not inject the compiled manual, which
-  reaches agents via `.claude/skills/taos-agent/SKILL.md`; S1 declares its own
-  seam), session-only routes
+  a new supplement-aware guide-injection seam that appends to the compiled manual
+  (the existing injection point is the import-time `SYSTEM_PROMPT = _load_manual()`
+  in `routes/taos_agent.py`, which reads `docs/taos-agent-manual.md`; `build_manual()`
+  is a pure function returning session constants and does not inject the compiled
+  manual; S1 declares its own seam alongside that load), session-only routes
   `tinyagentos/routes/guides.py` (`GET/POST /api/guides/supplements`),
   `tests/test_guides_store.py`, `tests/test_guides_render.py`.
 - No bus traffic, no cross-agent effect: an agent can hold and render its *own*
