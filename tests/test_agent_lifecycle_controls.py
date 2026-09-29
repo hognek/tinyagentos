@@ -131,6 +131,31 @@ class TestPauseRoute:
         assert resp.status_code == 500
         assert "error" in resp.json()
 
+    async def test_pause_freeze_failure_leaves_agent_unpaused(
+        self, client, app, monkeypatch, tmp_data_dir,
+    ):
+        """A failed freeze must not leave the agent flagged paused while its
+        container keeps running, including the flag prepare() sets itself."""
+        fake = FakeIncus(fail_verbs=("pause",))
+        monkeypatch.setattr("tinyagentos.containers._run", fake)
+
+        class FakeOrchestrator:
+            async def prepare(self, scope, reason):
+                # Mirrors RestartOrchestrator._prepare_agent, which marks the
+                # agent paused before the freeze is attempted.
+                for a in app.state.config.agents:
+                    if a["name"] in scope:
+                        a["paused"] = True
+                return {}
+
+        monkeypatch.setattr(app.state, "orchestrator", FakeOrchestrator(), raising=False)
+        resp = await client.post("/api/agents/test-agent/pause")
+        assert resp.status_code == 500
+        assert "Could not freeze" in resp.json()["error"]
+        assert resp.json()["paused"] is False
+        assert app.state.config.agents[0].get("paused") is False
+        assert load_config(tmp_data_dir / "config.yaml").agents[0].get("paused") is False
+
     async def test_pause_refuses_stopped_container(self, client, monkeypatch):
         fake = FakeIncus(status="Stopped")
         monkeypatch.setattr("tinyagentos.containers._run", fake)

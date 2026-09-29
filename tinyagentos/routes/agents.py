@@ -1234,19 +1234,24 @@ async def pause_agent(request: Request, name: str, user: CurrentUser = Depends(c
         except Exception:  # noqa: BLE001 - prepare is best-effort; the freeze is the pause
             logger.warning("pause prepare failed for %s", name, exc_info=True)
     result = await pause_container(container_name)
-    # prepare() may already have set the flag; set it here too so the pause is
-    # recorded whether or not an orchestrator ran.
-    agent["paused"] = True
-    await save_config_locked(config, config.config_path)
     if not result.get("success"):
+        # The container is still running, so the agent must not read as
+        # paused. prepare() marks the agent paused before the freeze, so undo
+        # that here too.
+        agent["paused"] = False
+        await save_config_locked(config, config.config_path)
         return JSONResponse(
             {
                 "error": f"Could not freeze agent '{name}': {result.get('output', '').strip()}",
-                "paused": True,
+                "paused": False,
                 "frozen": False,
             },
             status_code=500,
         )
+    # Persist the flag only once the freeze succeeded (prepare() may already
+    # have set it; set it here so it is recorded without an orchestrator too).
+    agent["paused"] = True
+    await save_config_locked(config, config.config_path)
     return {"status": "paused", "name": name, "paused": True, "frozen": True, "report": report}
 
 

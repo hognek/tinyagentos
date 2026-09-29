@@ -172,6 +172,35 @@ describe("AgentsApp lifecycle controls", () => {
     await waitFor(() => expect(posts(fetchMock)).toEqual(["/api/agents/alpha/resume"]));
   });
 
+  it("keeps the row's controls disabled until the refreshed list arrives", async () => {
+    let getCount = 0;
+    let releaseRefresh: () => void = () => {};
+    const refreshGate = new Promise<void>((r) => { releaseRefresh = r; });
+    const fetchMock = vi.fn().mockImplementation((url: string, init?: RequestInit) => {
+      if (init?.method === "POST") return json({ status: "paused" });
+      if (url === "/api/agents") {
+        getCount += 1;
+        // The first load answers at once; the post-action refresh waits.
+        if (getCount === 1) return json([agent("alpha", "running")]);
+        return refreshGate.then(() => json([agent("alpha", "running", true)]));
+      }
+      if (url === "/api/agents/containers") {
+        return json([{ name: "taos-agent-alpha", agent_name: "alpha", status: getCount > 1 ? "Frozen" : "Running" }]);
+      }
+      return json([]);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<AgentsApp windowId="test" />);
+    fireEvent.click(await screen.findByRole("button", { name: "Pause alpha" }));
+    await waitFor(() => expect(posts(fetchMock)).toEqual(["/api/agents/alpha/pause"]));
+    await waitFor(() => expect(getCount).toBe(2));
+    // POST is done but the refresh is still in flight: still disabled.
+    expect(screen.getByRole("button", { name: "Pause alpha" })).toBeDisabled();
+    releaseRefresh();
+    const resume = await screen.findByRole("button", { name: "Resume alpha" });
+    await waitFor(() => expect(resume).toBeEnabled());
+  });
+
   it("shows the server error when an action fails and refreshes the list", async () => {
     const fetchMock = mockFetch(
       [agent("alpha", "running")],

@@ -269,12 +269,14 @@ export function AgentsApp({ windowId: _windowId }: { windowId: string }) {
     } catch (e) {
       fail(e instanceof Error ? e.message : "Network error");
     } finally {
+      // Refresh first so the row's controls come back already reflecting the
+      // new state (fetchAgents handles its own errors).
+      await fetchAgents();
       setBusyAgents((prev) => {
         const next = { ...prev };
         delete next[name];
         return next;
       });
-      fetchAgents();
     }
   }
 
