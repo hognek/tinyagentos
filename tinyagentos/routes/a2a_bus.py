@@ -402,26 +402,35 @@ async def bus_stream(
                     f"{bus}/a2a/stream",
                     params=params,
                 ) as upstream:
+                    it = upstream.aiter_lines().__aiter__()
                     heartbeat = asyncio.create_task(
                         _stream_sleep(_STREAM_HEARTBEAT_SEC)
                     )
+                    next_line = asyncio.ensure_future(it.__anext__())
                     try:
-                        async for line in upstream.aiter_lines():
-                            if await request.is_disconnected():
-                                break
-                            # Drain any pending heartbeat that fired while we were
-                            # forwarding real data: emit it before the next event.
-                            if heartbeat.done():
-                                heartbeat.cancel()
+                        while True:
+                            done, pending = await asyncio.wait(
+                                {next_line, heartbeat},
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if heartbeat in done:
                                 yield ": ping\n\n"
                                 heartbeat = asyncio.create_task(
                                     _stream_sleep(_STREAM_HEARTBEAT_SEC)
                                 )
-                            if line == "":
-                                continue
-                            yield f"{line}\n\n"
+                            if next_line in done:
+                                try:
+                                    line = next_line.result()
+                                except StopAsyncIteration:
+                                    break
+                                if line != "":
+                                    yield f"{line}\n\n"
+                                next_line = asyncio.ensure_future(it.__anext__())
+                            if await request.is_disconnected():
+                                break
                     finally:
                         heartbeat.cancel()
+                        next_line.cancel()
         except Exception as exc:  # noqa: BLE001 (surface a final SSE comment)
             logger.warning("A2A bus stream proxy failed (%s): %s", bus, exc)
             yield f": stream error\n\n"

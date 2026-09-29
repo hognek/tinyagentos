@@ -202,6 +202,18 @@ escalating. When adding a route that reads a JSON body, use the `_json_object()`
 helper rather than parsing inline - it follows the module's existing
 `(value, error_response)` convention.
 
+**`POST /auth/swipe-unlock` mints a session with no credential, so it is
+fenced five ways.** It answers 200 only when the request is the device's own
+console (loopback AND no forwarding header), it is not a simple request (it
+carries `X-taOS-Console` or `Content-Type: application/json`, the gate every
+`/auth/lock-*` POST shares), the browser reports no cross-origin caller, the install has exactly one account, and that account
+chose "swipe" in Settings -> Lock screen (which costs its password, via
+`PUT /api/settings/lock`). Anything else is a 403 with no session; console
+refusals count against the same per-user throttle as `/auth/pin-login`
+(429 + `Retry-After`). An owner whose method is "password" or "swipe" also
+gets a 404 from `/auth/pin-login` even with a correct PIN. Do not drive either
+route from an agent: they exist for the kiosk's own screen.
+
 ## Gate on fresh CI, not stale rollups
 
 - Open the PR against `dev` and let the required checks run: the Python test
@@ -637,10 +649,14 @@ The registry-JWT surface, by scope:
   project binding, and a token bound to a DIFFERENT project gets a 404 rather
   than a 403, so it cannot confirm that another project exists. The note's
   author is taken from the verified token, never from the request body.
-- **canvas_read**: `GET .../canvas/elements`, `.../canvas/watch-projection`,
+- **canvas_read**: `GET .../canvas/elements` (`?include_deleted=true` is the raw
+  JSON backup: soft-deleted rows too, flagged `deleted`), `.../canvas/watch-projection`,
   `.../canvas/snapshot.png|.tldr`, `.../canvas/stream`, `.../canvas/elements/{id}/original`,
   `.../canvas/legacy?include_deleted=1`. **canvas_write**: `POST .../canvas/elements`,
-  `PATCH|DELETE .../canvas/elements/{id}`.
+  `PATCH|DELETE .../canvas/elements/{id}`. A `PATCH` payload replaces the element's
+  payload, except that a `user_shape`'s stored `tldraw_shape` is always kept verbatim
+  (omitting or changing it has no effect, and it counts toward the 64 KiB cap). `DELETE`
+  is a soft delete; the row stays recoverable.
 
 ### Recovering a user's drawing
 
@@ -709,6 +725,21 @@ PIN; see issue #1780). When you change the agent allowlist in
 doc-gate only fires on files ADDED or DELETED, not edits to an existing file,
 so it will NOT catch allowlist drift here on its own; keep this list in sync by
 hand.
+
+Time-boxed grants: a consent request may carry `duration_secs`, a positive
+integer number of seconds up to ten years. On approval each grant it writes
+gets `expires_at = approval time + duration_secs`, and every auth path treats
+the grant as gone once that passes. Omit the field for an unbounded grant.
+A bool, string, float, zero, negative or over-ten-years value is refused with
+**422** at request time. The rule is: a grant with no duration is unbounded,
+and a bound that is set is never silently dropped or lengthened.
+
+Deferred binding (`defer_binding=True`) mints the token and grants UNBOUND
+(project_id=None) with the same `expires_at` from `duration_secs`. When the
+agent is later bound to a project via `POST /api/projects/{id}/members/assign-agent`,
+the project-bound grant **inherits that `expires_at`**. If the deferred grant
+has expired, the binding is refused. When both a deferred grant with expiry and
+a request with expiry exist, the earlier bound is kept (never lengthened).
 
 Multi-project identities (taOS #1862): one agent identity (the registry JWT) may
 belong to several projects at once. The grants table keys a grant on
@@ -926,12 +957,23 @@ a session.
 
 ## Share destinations (device bearer)
 
-`GET /api/share/destinations` lets a paired device DISCOVER share targets. It is
+`GET /api/share/destinations` lets a paired device DISCOVER share destinations. It is
 discovery-only: the response enumerates destinations, but the device scoped
-token itself cannot write to the ingest endpoints behind them (library ingest,
-chat messages, and project-files uploads all require their own session or agent
-auth). Sharing a payload happens through the device share flow, not by the
-device calling those endpoints directly.
+token itself can now WRITE to the ingest endpoints behind them (library ingest,
+chat messages, and project-files uploads all accept device bearer writes with
+per-destination authorization). Sharing a payload happens through the device
+share flow, not by the device calling those endpoints directly.
+
+**New device-bearer write routes.** Device bearers can now write to the three
+endpoints discovered via `GET /api/share/destinations`:
+
+- `POST /api/library/ingest` → into that user's library only
+- `POST /api/projects/{slug}/files/upload` → the user must have WRITE access to that project
+- `POST /api/chat/messages` → the user must be a MEMBER of `channel_id`; the author is the device's user and must not be settable from the request body.
+
+Each route authorizes the device bearer against the SPECIFIC destination, following
+the precedent the decisions routes use for a device caller (read how
+`POST /api/decisions/{id}/answer` resolves and authorises the device's user).
 
 **Auth model.** `require_device` only: the caller sends
 `Authorization: Bearer <scoped_token>` (issued at `POST /api/devices/register`).
@@ -1667,6 +1709,19 @@ session. When you change the allowlist in `tinyagentos/auth_middleware.py`,
 record the change here so the agent-facing surface stays reviewable in one
 place.
 
+The allowlist is the union of:
+
+- Registry feeds (`/api/registry/feeds/*`, scope `registry_feeds_read`).
+- A2A bus read (`/api/a2a/bus/channels`, `/api/a2a/bus/messages`, `/api/a2a/bus/stream`, scope `a2a_receive`).
+- A2A bus write (`/api/a2a/bus/send`, scope `a2a_send`).
+- A2A GPU read (`/api/a2a/gpu/check`, scope `a2a_receive`).
+- A2A GPU write (`/api/a2a/gpu/{claim,release,request,renew}`, scope `a2a_send`).
+- Observatory (`/api/observatory/*`, scope `observatory_control`).
+- Container requests (`/api/containers/requests`, `/api/container-requests`, `/api/containers/requests/{id}/provision`, `/api/containers/requests/{id}/destroy`, `/api/agents/containers/quota`).
+- Agent self-serve (`/api/agents/me/models` GET, `/api/agents/me/model` POST).
+- **Desktop control (system taOS Agent only)**: `POST /api/desktop/command`, `POST /api/desktop/screenshot`, `POST /api/desktop/layout` (native agent's registry JWT sets `user_id` to the owner, so desktop commands are delivered to the owner's desktop).
+- **Skill-exec (system taOS Agent only)**: `POST /api/skill-exec/{skill_id}/call`, `GET /api/skill-exec/tools` (native agent's registry JWT with `SYSTEM_AGENT_API_SCOPES`).
+
 Task checklist items (`/api/projects/{project_id}/tasks/{task_id}/checklist-items`)
 
 Route module `tinyagentos/routes/projects.py`.
@@ -1846,16 +1901,27 @@ which PicoClaw loads as its system prompt. The reply is the text after the
 last lobster (U+1F99E). A controller start into opencode revokes any
 leftover PicoClaw key.
 
-taOS access parity: opencode runs unconfined as the service user and reaches
-the taOS API (desktop control, skill-exec tools, notes, project files) with
-curl and the host local token. PicoClaw is confined to its workspace, so the
-same credential is copied to `workspace/.taos_credential` (0600) and
+taOS access parity: The built-in taOS Agent (both opencode and PicoClaw
+harnesses) reaches the taOS API with a **scoped registry JWT** minted for the
+native agent identity (canonical_id `taos-agent-...`, origin `taos-native`).
+This credential is limited to exactly the endpoints the taOS Agent manual uses:
+desktop control (`/api/desktop/*`), skill-exec (`/api/skill-exec/*`), project
+files, notes, todo, decisions, canvas, and observatory. Admin-only endpoints
+(user management, secrets, settings) return 403. The credential is rotated on
+agent restart (framework switch, model change) and never logged.
+
+PicoClaw receives the credential via `workspace/.taos_credential` (0600) and
 `workspace/bin/taos` (0700) calls `http://127.0.0.1:<server.port>` with it:
-`bin/taos METHOD api/PATH [JSON]` or `bin/taos UPLOAD api/PATH FILE`. The
-path has no leading slash because PicoClaw's exec guard refuses a command
-naming an absolute path. The helper reads the credential from the file
-(never argv) and redacts it from what it prints. The agent's own identity
-token (`.taos_agent_token`) is a2a-only and covers none of these endpoints,
-so it is not narrower-but-sufficient. `AGENTS.md` appends a section mapping
-every manual tool to a `bin/taos` call. Leaving PicoClaw, or any controller
-start into opencode, deletes the credential copy and the helper.
+`bin/taos METHOD api/PATH [JSON]` or `bin/taos UPLOAD api/PATH FILE`. The path
+has no leading slash because PicoClaw's exec guard refuses a command naming an
+absolute path. The helper reads the credential from the file (never argv) and
+redacts it from what it prints.
+
+opencode receives the credential via the `TAOS_API_CREDENTIAL` environment
+variable (and `TAOS_API_BASE_URL` for the controller URL). The opencode server
+process inherits these from the controller at startup.
+
+The agent's own A2A identity token (`.taos_agent_token`) is a2a-only
+(scope `a2a_send` + `a2a_receive`) and covers none of the above endpoints.
+Leaving PicoClaw, or any controller start into opencode, revokes the old
+credential and mints a fresh one.

@@ -449,12 +449,9 @@ class TestTheVolumeKeys:
         a real mic would be the worst possible surprise on a PRE-AUTH screen,
         so the absence is asserted rather than trusted to the comment.
 
-        Scoped to the volume/carousel code rather than the whole script,
-        because the script is NOT mic-free: the pre-existing `#ls-voice` sheet
-        calls navigator.mediaDevices.getUserMedia({audio: true}), and it is
-        reachable from the lock screen. That is worth knowing and is not this
-        feature's doing -- asserting it away here would have quietly taken
-        responsibility for someone else's microphone.
+        Scoped to the volume/carousel code. The `#ls-voice` sheet used to call
+        getUserMedia too; it no longer does, and the whole-script absence is
+        asserted in test_lock_voice_wave.py.
         """
         js = auth._LOCK_SCREEN_SCRIPT
         start = js.index("var volEl = document.getElementById")
@@ -466,15 +463,17 @@ class TestTheVolumeKeys:
                           "new AudioContext(", "navigator.mediaDevices"):
             assert forbidden not in block, forbidden
 
-    def test_the_talking_state_says_demo_on_screen(self):
-        # Sliced to the next function, not a fixed byte count. Adding the
-        # last-used recording inside startTalking pushed "(demo)" past a
-        # 600-char window and reddened this -- the fourth time in this file a
-        # fixed-length slice has broken on code growing inside its window.
+    def test_the_talking_state_shows_no_demo_text(self):
+        """Product owner: "we need to remove any demo text". The walkie-talkie
+        stays a mock -- no microphone, asserted above -- but what the viewer
+        reads is the finished product's wording, in both states."""
         js = auth._LOCK_SCREEN_SCRIPT
         start = js.index("function startTalking(")
-        body = js[start:js.index("function stopTalking(", start)]
-        assert "(demo)" in body, body
+        body = js[start:js.index("function volumeKey(", start)]
+        assert 'setText(carPtt, "Talking…")' in body, body
+        assert 'setText(carPtt, "Sent")' in body, body
+        code = "\n".join(l for l in body.splitlines() if not l.strip().startswith("//"))
+        assert "(demo)" not in code and "demo" not in code.lower(), code
 
     def test_the_volume_surfaces_never_cover_the_passcode(self):
         """A volume nudge must not drop a bezel over the keypad someone is
@@ -1514,3 +1513,65 @@ class TestTheDropBoxDirectoryIsNeverCreatedHere:
         # that gate cannot see: that the three routes share ONE writer.
         src = inspect.getsource(auth)
         assert src.count("_write_power_request(") >= 4  # 1 def + 3 callers
+
+
+class TestTheStreamOpensWithTheCurrentScreenState:
+    """After a controller restart the page's stream reopens while the panel may
+    be dark. The stream therefore leads with the last screen state the device
+    reported, to the connecting client only."""
+
+    @staticmethod
+    async def _first_frames(n):
+        resp = await auth.lock_events(_Req())
+        frames = []
+        async for chunk in resp.body_iterator:
+            frames.append(chunk)
+            if len(frames) >= n:
+                break
+        await resp.body_iterator.aclose()
+        return frames
+
+    @pytest.fixture(autouse=True)
+    def _fresh(self, monkeypatch):
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: True)
+        monkeypatch.setattr(auth, "_LOCK_SCREEN_STATE", None)
+        auth._LOCK_EVENT_WAITERS.clear()
+        yield
+        auth._LOCK_EVENT_WAITERS.clear()
+
+    def test_after_screen_off_a_new_client_is_told_first(self):
+        _call(auth.lock_screen_off(_Req()))
+        frames = asyncio.run(self._first_frames(2))
+        assert frames[0] == ": connected\n\n"
+        assert frames[1].startswith("event: screen-off\n")
+
+    def test_after_screen_on_a_new_client_is_told_first(self):
+        _call(auth.lock_screen_off(_Req()))
+        _call(auth.lock_screen_on(_Req()))
+        frames = asyncio.run(self._first_frames(2))
+        assert frames[1].startswith("event: screen-on\n")
+
+    def test_with_no_state_known_nothing_is_invented(self):
+        # _Req reports a disconnect at once, so the stream ends after whatever
+        # it leads with: with no state known that is the connect byte alone.
+        async def run():
+            resp = await auth.lock_events(_Req())
+            return [c async for c in resp.body_iterator]
+        assert asyncio.run(run()) == [": connected\n\n"]
+
+    def test_it_goes_to_the_new_client_only(self):
+        _call(auth.lock_screen_off(_Req()))
+        other: asyncio.Queue = asyncio.Queue(maxsize=8)
+        auth._LOCK_EVENT_WAITERS.add(other)
+        asyncio.run(self._first_frames(2))
+        assert other.empty(), "the connect-time state must not fan out"
+
+    def test_a_refused_post_does_not_change_the_remembered_state(self, monkeypatch):
+        _call(auth.lock_screen_off(_Req()))
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: False)
+        assert _call(auth.lock_screen_on(_Req())).status_code == 403
+        assert auth._LOCK_SCREEN_STATE == "screen-off"
+
+    def test_the_stream_is_still_console_only(self, monkeypatch):
+        monkeypatch.setattr(auth, "_request_is_console", lambda _r: False)
+        assert _call(auth.lock_events(_Req())).status_code == 403

@@ -42,6 +42,16 @@ ANTHROPIC = {
     "api_key": "sk-ant-nope",
     "priority": 2,
 }
+# A cloud provider the gateway does NOT forward to yet (not OpenAI-compatible,
+# not Ollama, not Anthropic): it must stay a 501, never a network call.
+UNSUPPORTED_PROVIDER = {
+    "name": "router-cloud",
+    "type": "openrouter",
+    "url": "https://openrouter.test/api/v1",
+    "models": [{"id": "router-model"}],
+    "api_key": "sk-or-nope",
+    "priority": 2,
+}
 SECRET_BACKED = {
     "name": "vault-llm",
     "type": "openai-compatible",
@@ -518,11 +528,28 @@ async def test_upstream_200_that_is_not_json_is_502(client):
 @_ASYNC
 @respx.mock
 async def test_non_openai_backend_is_501_naming_the_model(client):
+    # Anthropic is served now (anthropic.py), so the unsupported example is a
+    # provider the gateway still cannot speak to: openrouter.
+    _app(client).state.config.backends = [OPENAI_COMPAT, UNSUPPORTED_PROVIDER]
     route = respx.post(url__regex=r".*")
-    resp = await client.post(BASE + "/chat/completions", json=_chat("claude-x"))
+    resp = await client.post(BASE + "/chat/completions", json=_chat("router-model"))
     err = _assert_openai_error(resp, 501, "backend_not_supported")
-    assert "claude-x" in err["message"]
+    assert "router-model" in err["message"]
+    assert "openrouter" in err["message"]
     assert not route.called
+
+
+@_ASYNC
+@respx.mock
+async def test_anthropic_model_never_reaches_the_real_api(client):
+    """claude-x is served by the Anthropic translator now, so a request for it
+    makes an upstream call. With no route registered, respx's strict default
+    router must refuse that call in-process: this suite cannot reach the real
+    api.anthropic.com."""
+    assert respx.mock._assert_all_mocked is True
+    with pytest.raises(respx.models.AllMockedAssertionError):
+        await client.post(BASE + "/chat/completions", json=_chat("claude-x"))
+    assert respx.mock.calls.call_count == 0 or respx.mock.calls.last.response is None
 
 
 # ---------------------------------------------------------------------------

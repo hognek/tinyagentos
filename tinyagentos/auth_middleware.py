@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import HTMLResponse, RedirectResponse
 
-from tinyagentos.agent_token_auth import check_agent_identity
+from tinyagentos.agent_token_auth import check_agent_identity, _get_keypair, _get_store
 from tinyagentos.auth import AuthStoreCorruptError
 from tinyagentos.device_store import DEVICE_TOKEN_PREFIX
 from tinyagentos.rate_limit import MovingWindowLimiter
@@ -20,9 +20,12 @@ logger = logging.getLogger(__name__)
 # how a session is obtained, so requiring one would be circular. It is NOT
 # unguarded -- the route refuses any request that is not from the device's own
 # console (see auth.is_console_origin) and throttles per user on top of that.
+# /auth/swipe-unlock is exempt on the same argument and guarded harder: console
+# only, single-account only, and only for an owner who chose "swipe" with their
+# password. See routes.auth.swipe_unlock.
 # Note /auth/pin (set/clear a PIN) is deliberately absent from this set: those
 # require a live session and must stay gated here.
-EXEMPT_PATHS = {"/auth/login", "/auth/pin-login", "/auth/osk.js", "/auth/pin-panel.js", "/auth/lock-screen.js", "/auth/lock-widgets", "/auth/lock-weather", "/auth/lock-notifications", "/auth/lock-stats", "/auth/lock-panels", "/auth/lock-events", "/auth/lock-power-menu", "/auth/lock-screen-off", "/auth/lock-screen-on", "/auth/lock-brightness", "/auth/lock-torch", "/auth/lock-volume", "/auth/lock-volume-key", "/auth/lock-radios", "/auth/lock-power-action", "/auth/lock-app", "/auth/setup", "/auth/status", "/auth/me", "/auth/complete", "/auth/lock", "/api/health", "/api/version", "/setup", "/setup/complete", "/redeem", "/api/desktop/browser/push/vapid-public-key", "/api/desktop/browser/proxy-config", "/sw.js", "/desktop", "/desktop/index.html", "/chat-pwa", "/app.html", "/manifest", "/api/agents/registry/pubkey", "/api/share/destinations"}
+EXEMPT_PATHS = {"/auth/login", "/auth/pin-login", "/auth/swipe-unlock", "/auth/osk.js", "/auth/pin-panel.js", "/auth/lock-screen.js", "/auth/lock-widgets", "/auth/lock-weather", "/auth/lock-notifications", "/auth/lock-stats", "/auth/lock-panels", "/auth/lock-events", "/auth/lock-power-menu", "/auth/lock-screen-off", "/auth/lock-screen-on", "/auth/lock-brightness", "/auth/lock-torch", "/auth/lock-volume", "/auth/lock-volume-key", "/auth/lock-charge", "/auth/lock-radios", "/auth/lock-power-action", "/auth/lock-app", "/auth/lock-call", "/auth/lock-call/ring", "/auth/lock-call/reset", "/auth/lock-call/action", "/auth/lock-call/dismiss", "/auth/setup", "/auth/status", "/auth/me", "/auth/complete", "/auth/lock", "/api/health", "/api/version", "/setup", "/setup/complete", "/redeem", "/api/desktop/browser/push/vapid-public-key", "/api/desktop/browser/proxy-config", "/sw.js", "/desktop", "/desktop/index.html", "/chat-pwa", "/app.html", "/manifest", "/api/agents/registry/pubkey", "/api/share/destinations"}
 
 # Registry feed endpoints accept EITHER an admin session OR a registry JWT.
 # When a Bearer token is present for these paths the request bypasses the
@@ -92,6 +95,8 @@ _AGENT_CONTAINER_QUOTA_ROUTE = ("GET", re.compile(r"^/api/agents/containers/quot
 # authenticate any other route (no skeleton key).
 # Agent self-serve routes: /api/agents/me/models (GET) and /api/agents/me/model (POST)
 # accept a LiteLLM/Bearer key for agent self-service.
+# Desktop control endpoints (command, screenshot, layout) for the system taOS Agent.
+# Skill-exec endpoints for the system taOS Agent (scope system_agent_exec).
 _AGENT_TOKEN_PATHS = (
     _REGISTRY_FEED_PATHS
     | _A2A_BUS_READ_PATHS
@@ -100,7 +105,13 @@ _AGENT_TOKEN_PATHS = (
     | _A2A_GPU_WRITE_PATHS
     | _OBSERVATORY_PATHS
     | _CONTAINER_REQUEST_PATHS
-    | frozenset({"/api/agents/me/models", "/api/agents/me/model"})
+    | frozenset({
+        "/api/agents/me/models",
+        "/api/agents/me/model",
+        "/api/desktop/command",
+        "/api/desktop/screenshot",
+        "/api/desktop/layout",
+    })
 )
 
 # Project kanban routes an agent may reach with its own registry JWT (scope
@@ -261,6 +272,9 @@ _DEVICE_BEARER_PATHS = (
     ("GET", re.compile(r"^/api/decisions/[^/]+$")),
     ("GET", re.compile(r"^/api/decisions/[^/]+/history$")),
     ("POST", re.compile(r"^/api/decisions/[^/]+/answer$")),
+    ("POST", re.compile(r"^/api/library/ingest$")),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/files/upload$")),
+    ("POST", re.compile(r"^/api/chat/messages$")),
 )
 
 
@@ -377,6 +391,19 @@ def _is_agent_container_quota_path(method: str, path: str) -> bool:
     """True only for GET /api/agents/containers/quota."""
     m, rx = _AGENT_CONTAINER_QUOTA_ROUTE
     return m == method and rx.match(path)
+
+
+# Skill-exec routes for the system taOS Agent (scope system_agent_exec).
+# These are dynamic paths: /api/skill-exec/{skill_id}/call and /api/skill-exec/tools.
+_AGENT_SKILL_EXEC_ROUTES = (
+    ("GET", re.compile(r"^/api/skill-exec/tools$")),
+    ("POST", re.compile(r"^/api/skill-exec/[^/]+/call$")),
+)
+
+
+def _is_agent_skill_exec_path(method: str, path: str) -> bool:
+    """True only for the skill-exec routes a system_agent_exec token may reach."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_SKILL_EXEC_ROUTES)
 # Bundle assets and the SPA shell HTML must be reachable without auth so:
 #   1. The browser can install and cache the shell for offline / PWA use.
 #   2. After a backend restart the cached shell loads immediately without
@@ -736,9 +763,36 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     or _is_agent_scope_request_path(request.method, path)
                     or _is_container_request_action_path(request.method, path)
                     or _is_agent_container_quota_path(request.method, path)
+                    or _is_agent_skill_exec_path(request.method, path)
                 )
 
                 if is_allowlisted:
+                    # For desktop endpoints and skill-exec, if this is the native
+                    # agent's token, set user_id to the native agent's user_id
+                    # (the owner) so desktop control works. For other agents,
+                    # user_id remains None (they cannot drive the desktop).
+                    if path in ("/api/desktop/command", "/api/desktop/screenshot", "/api/desktop/layout") or _is_agent_skill_exec_path(request.method, path):
+                        # Verify the token and check if it's the native agent.
+                        # We do a lightweight verification here; the route will
+                        # do the full scope check.
+                        try:
+                            from tinyagentos.agent_token_auth import verify_registry_token
+                            from tinyagentos.native_agent_identity import NATIVE_AGENT_ORIGIN
+                            _private_pem, public_pem = _get_keypair(request)
+                            payload = verify_registry_token(presented, public_pem)
+                            canonical_id = payload.get("sub", "")
+                            if canonical_id:
+                                registry = _get_store(request)
+                                record = await registry.get(canonical_id)
+                                if record and record.get("origin") == NATIVE_AGENT_ORIGIN and record.get("status") == "active":
+                                    request.state.user_id = record.get("user_id")
+                                    request.state.is_admin = False
+                                    request.state.via = "registry_jwt_native_agent"
+                                    return await call_next(request)
+                        except Exception:
+                            # Not the native agent or verification failed; fall through
+                            pass
+                    # Default for other agents: no user_id
                     request.state.user_id = None
                     request.state.is_admin = False
                     request.state.via = "registry_jwt_candidate"
@@ -779,6 +833,13 @@ class AuthMiddleware(BaseHTTPMiddleware):
             request.state.user_id = None
             request.state.is_admin = False
             request.state.via = "device_bearer_candidate"
+            device = None
+            try:
+                device = await request.app.state.device_store.get_by_token(auth_header[7:].strip())
+            except Exception:
+                pass
+            if device is not None:
+                request.state._device = device
             return await call_next(request)
 
         # 4) Session cookie
