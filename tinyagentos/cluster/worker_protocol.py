@@ -19,6 +19,13 @@ class WorkerInfo:
     models: list[str] = field(default_factory=list)     # Currently loaded models
     available_models: list[dict] = field(default_factory=list)  # Models this worker CAN load (from local manifest)
     capabilities: list[str] = field(default_factory=list)  # embed, chat, rerank, image-gen, tts, etc
+    # "worker" (a job-running cluster worker) or "device" (a taOSusb board
+    # paired over Bluetooth -- see cluster/ble/pairing.py). A device is
+    # never a placement candidate for any job type, the model mesh
+    # included: see ClusterManager.get_workers_for_capability() and
+    # browser_sessions._capable_workers(), which both filter on this field
+    # rather than trusting `capabilities` to stay empty of job capabilities.
+    kind: str = "worker"
     status: str = "online"            # online | offline | busy
     last_heartbeat: float = 0
     registered_at: float = 0
@@ -72,6 +79,15 @@ class WorkerInfo:
     # free", so those workers are never permanently un-leasable.
     free_vram_mb: int | None = None
     used_vram_mb: int | None = None
+    # Wall-clock timestamp of the most recent heartbeat that carried a VRAM
+    # sample.  Used by claim_lease to age out only leases granted after the
+    # last actual VRAM report, so a vram-less heartbeat does not cause live
+    # leases to drop out of already_held.
+    last_vram_report_at: float = 0.0
+    # Wall-clock timestamp when the sampled VRAM was taken (worker-monotonic).
+    # Used by claim_lease to count leases granted during heartbeat transit.
+    # None = unknown (legacy workers, or receipts without age).
+    vram_sampled_at: float | None = None
 
 
 @dataclass
@@ -96,9 +112,19 @@ class GpuLease:
         required_vram_mb: How many MiB of VRAM the caller declared it
             needs.  Used by the pre-claim check to refuse a claim when
             the worker's ``free_vram_mb`` is too low.
+        granted_at: wall-clock timestamp (``time.time()``) when the lease
+            was granted.  Used to age VRAM accounting against the worker's
+            last heartbeat so already-allocated VRAM is not double-counted.
+        claim_channel: The coordination thread this lease's peer-visible
+            claim was published on (empty for a lease with no bus claim,
+            e.g. one taken by the dispatcher through the cluster API).
+            Kept so a keep-alive refreshes the SAME thread: the channel is
+            an input to the claim, never to its renewal.
     """
     lease_id: str
     resource_id: str
     caller: str = ""
     expires_at: float = 0.0
     required_vram_mb: int = 0
+    granted_at: float = 0.0
+    claim_channel: str = ""

@@ -132,6 +132,17 @@ uv run pytest tests/test_<changed_module>.py tests/<related>/ -v
 uv run pytest tests/ --ignore=tests/e2e -n auto
 ```
 
+### Vendored LLM price table (`tinyagentos/llm_usage/data/`)
+
+`model_prices.json` is GENERATED: a subset of LiteLLM's MIT-licensed
+`model_prices_and_context_window.json`, pinned to the upstream commit recorded in its `_source` key.
+Never hand-edit it and never fetch prices at runtime. Refresh it with
+`python scripts/update_model_prices.py [<sha>]`, keep `data/NOTICE` beside it (the MIT licence
+requires it), and ship both through `[tool.setuptools.package-data]` in `pyproject.toml`. After a
+refresh, run `tests/test_llm_usage.py`: its frozen parity results use synthetic entries, so a data
+refresh cannot break them, but the lookup tests will tell you if a model key taOS relies on moved.
+An unknown price must stay `usd=None`, never `0.0`: the budget code only charges `cost > 0`.
+
 ### Dependency-audit ignore hygiene
 
 `security/pip-audit-ignore.toml` suppresses advisories that have no released
@@ -205,6 +216,22 @@ canonical hook, and a second module-level `def pytest_configure` is last-wins
 rebinding rather than additive registration, so the earlier body never runs and
 its next edit is a silent no-op in CI.
 
+- **`@pytest.mark.guards("module:function", replace=[(correct, defective)])`
+  declares what a guard test protects.** It is inert in a normal run.
+  `scripts/check_non_discriminating.py` (workflow
+  `guard-discrimination-gate.yml`, not a required check) re-runs every declared
+  test against the broken variant, compiled from the function's own source and
+  swapped in via `__code__`; a test that still passes is NON-DISCRIMINATING
+  (exit 1). `must_kill=[ids]` names generated mutants instead (list them with
+  `--list-mutants module:function`); with neither, one generated mutant must
+  kill it. A test that monkeypatches the function it guards can never pass
+  this. Ad-hoc mode (`--guard NODEID --target ... --replace OLD NEW --root DIR`)
+  checks an undecorated test in any repo.
+  **It proves the DECLARED edit, not the card's defect:** a `replace` that
+  raises on entry, or default mode's `return-none`, is killed by any test that
+  merely calls the function. Review the `replace` pair against the real
+  defect; a default-mode OK only proves the test reaches the function. A kill
+  counts only if an unmutated control rerun still passes (else ERROR).
 - **`@pytest.mark.skip_if_no_embed_backend` skips a test that cannot run without
   an embedding backend** — a reachable qmd service, or an installed
   `onnxruntime`. There is no opt-out marker and no `-o` switch: not applying it
@@ -231,7 +258,9 @@ time, so patching the module attribute AFTER `create_app` does nothing.
 - GitHub Actions: `.github/workflows/ci.yml` in upstream repo
 - Uses `uv sync --frozen` and `pytest -n auto`
 - Also required: `spa-build` (npm build + tsc + **vitest** - a desktop type error or failing
-  component test fails CI), a "Verify app starts" `create_app` import smoke, `lint`
+  component test fails CI), `desktop-e2e` (the Playwright suite under `desktop/tests`, run on
+  webkit - see "Desktop SPA build + test" below), a "Verify app starts" `create_app` import
+  smoke, `lint`
   (`compileall`), `docs-build`, and `cla`. `docs-build` is the only job with the mkdocs
   toolchain installed (mkdocs is NOT a project dependency, so `uv sync` does not provide
   it): it runs `tests/test_mkdocs_exclude.py` with `TAOS_DOCS_BUILD_TESTS=1`, which turns
@@ -610,8 +639,13 @@ If your PR trips a rule and there is genuinely nothing to document, add a traile
 ```
 Docs-Reviewed: no user-facing change, internal refactor only
 ```
-The trailer passes **every** rule for that PR, so it is an escape hatch, not a shortcut:
-the gate prints `doc-gate: trailer override used in <sha> by <author>: <why>` in its CI
+The trailer covers **only the commit that carries it**: it waives the rules tripped by the
+files that commit touched, and nothing else. A trailer on an unrelated or empty commit
+waives nothing, and code pushed in a later commit is gated on its own (a doc edit or
+changelog fragment in any commit still satisfies a rule PR-wide). `Docs-Reviewed: [routes]
+<why>` narrows the waiver to the named rules, which is how a squash-merged single commit
+waives one rule and still owes its fragment. The gate prints
+`doc-gate: trailer override used in <sha> by <author>: <why> [covers: <files>]` in its CI
 log for each commit that carries one, and that line is reviewable. A reviewer may ask for
 a real doc instead.
 
@@ -669,7 +703,7 @@ drops each pattern from a copy of the real `.gitignore` and asserts the guard fa
 - Branch naming: `feat/<slug>` or `fix/<slug>`
 - Conventional commits (see table above)
 - No AI tool attribution in commits
-- Python 3.11+ floor (pyproject.toml: `>=3.11,<3.14`). `match`/`case` and `X | None` union syntax
+- Python 3.11+ floor (pyproject.toml: `>=3.11,<3.15`). `match`/`case` and `X | None` union syntax
   are available. Most modules use `from __future__ import annotations`.
 - Code style: match surrounding code, one concern per module
 - Use `uv` for dependency management and test running: `uv sync --extra dev`, `uv run pytest`
@@ -707,8 +741,67 @@ cd desktop
 npm install                # Node.js 22+
 npm run build              # tsc -b && vite build → outputs to static/desktop/
 npm run test               # vitest (unit/component tests)
-npm run test:e2e           # Playwright browser tests (needs running server)
+npm run test:e2e           # Playwright browser tests (starts vite itself)
 ```
+
+`test:e2e` with no `E2E_BASE_URL` starts its own vite server
+(`npm run build && npm run preview` on :5173) and runs the specs against it.
+That is enough for the specs that `page.route()`-mock the API, and NOT enough
+for the rest: `canvas-e2e` and `projects-mobile` POST `/api/projects` for real,
+and `sw-and-reconnect` needs `/sw.js` at the ROOT, which only the backend
+serves (`tinyagentos/routes/desktop.py`) because vite's base is `/desktop/`.
+
+To run the whole suite, start a real backend and point the suite at it:
+
+```bash
+uvicorn --factory tinyagentos.app:create_app --host 127.0.0.1 --port 6969
+cd desktop && npm run build          # the desktop routes serve static/desktop from disk
+E2E_BASE_URL=http://127.0.0.1:6969 npx playwright test
+```
+
+With `E2E_BASE_URL` set, `playwright.config.ts` leaves `webServer` undefined --
+the server is already up and is not the suite's to manage.
+
+A backend with **no account** serves the zero-user setup wizard at `/desktop/`,
+so `App.tsx` never mounts and anything inside the desktop shell is untested.
+The `desktop-e2e` CI job onboards a throwaway first user via `/auth/setup` and
+hands Playwright the session cookie as a storage state (`E2E_STORAGE_STATE`).
+Do the same locally, or expect those specs to fail on a 401.
+
+Seed that session under the **browser's** user-agent, not curl's. `auth.py:1011`
+stores a SHA-256 of the creating user-agent on the session and `:1048` compares
+it on every validation, so a session minted by a plain `curl` is rejected the
+moment WebKit replays the cookie: `/desktop/` 302s to `/auth/login?next=/desktop/`
+and the API answers `401 {"error":"Authentication required"}`. The CI job reads
+the UA out of `require("@playwright/test").devices["iPhone 14"].userAgent` and
+passes it as `curl -A`, so it cannot drift from the config's device.
+
+A `curl` probe **cannot** catch this class of bug on its own. The probe that
+mints the session and the probe that replays it are the same client, so the
+user-agent pair it exercises is self-consistent and passes while the browser's
+pair is refused. A probe proves the pair *it* uses, not the pair the real client
+uses -- give it the real client's identity, or assert the real client directly.
+
+The session cookie alone is not enough for a mutating call: the projects router
+is included with `dependencies=_csrf`, so a cookie-authenticated `POST
+/api/projects` answers `403 {"detail": "CSRF token missing"}` unless the
+`csrf_token` cookie is echoed in an `X-CSRF-Token` header. The job seeds **both**
+cookies into the storage state and proves the pair with a `curl` probe before
+Playwright starts, so a broken seed is one error line instead of three red tests.
+
+The suite also needs the browser binary, and that browser is **webkit**, not
+chromium: the config declares one project, `iphone-14`, built from
+`devices["iPhone 14"]`, whose `defaultBrowserType` is `webkit`. Install it once
+with
+
+```bash
+cd desktop && npx playwright install --with-deps webkit
+```
+
+Installing chromium instead fails every test at launch with
+`browserType.launch: Executable doesn't exist at .../webkit-<rev>/pw_run.sh`.
+The suite runs in CI as the `desktop-e2e` job; it is not schedule-only, so a
+spec broken by a PR fails that PR.
 
 ## Adding an app to the catalog
 
@@ -739,7 +832,7 @@ controls which hardware profiles see the app as recommended.
 - **Secrets have a dedicated store.** `tinyagentos/secrets.py` (routes in
   `tinyagentos/routes/secrets.py`, attached as `app.state.secrets`) is the credential store. Store
   credentials there - never in config or in code.
-- **CONTRIBUTING.md** says Python 3.10+, but `pyproject.toml` requires `>=3.11,<3.14`.
+- **CONTRIBUTING.md** says Python 3.10+, but `pyproject.toml` requires `>=3.11,<3.15`.
   Python 3.11 is the effective floor.
 - **Routes do not import stores directly.** They access them via `request.app.state`.
   This is a common mistake - check existing routes for the pattern.

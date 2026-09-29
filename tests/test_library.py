@@ -89,6 +89,48 @@ class TestKindDetection:
         assert detect_kind() == "file"
 
 
+class TestDetectKindParity:
+    """Parity tests ensuring every extension and content type that origin/dev
+    classified as text still classifies as text after the mimetypes refactor."""
+
+    @pytest.mark.parametrize("ext,expected_kind", [
+        (".txt", "text"),
+        (".md", "text"),
+        (".csv", "text"),
+        (".json", "text"),
+        (".xml", "text"),
+        (".html", "text"),
+        (".pdf", "pdf"),
+        (".png", "image"),
+        (".jpg", "image"),
+        (".jpeg", "image"),
+        (".gif", "image"),
+        (".webp", "image"),
+        (".svg", "image"),
+        (".zip", "archive"),
+        (".gz", "archive"),
+        (".tar", "archive"),
+        (".yaml", "text"),
+        (".yml", "text"),
+        (".toml", "text"),
+        (".log", "text"),
+    ])
+    def test_extension_parity(self, ext: str, expected_kind: str):
+        assert detect_kind(file_path=f"x{ext}") == expected_kind
+
+    @pytest.mark.parametrize("content_type,expected_kind", [
+        ("application/json", "text"),
+        ("application/xml", "text"),
+        ("text/xml", "text"),
+        ("text/markdown", "text"),
+        ("text/csv", "text"),
+        ("text/html", "text"),
+        ("text/plain", "text"),
+    ])
+    def test_content_type_parity(self, content_type: str, expected_kind: str):
+        assert detect_kind(content_type=content_type) == expected_kind
+
+
 # ---------------------------------------------------------------------------
 # LibraryStore
 # ---------------------------------------------------------------------------
@@ -323,6 +365,57 @@ class TestPdfProcessor:
         artifacts = await proc.process(item)
         assert len(artifacts) == 0
 
+    @pytest.mark.asyncio
+    async def test_process_pdf_extracts_text(self, lib_store, storage_dir):
+        """RED-FIRST: PDF with text content must extract text artifact.
+        Currently FAILS because pypdf is not a declared dependency."""
+        fixture_path = Path(__file__).parent / "fixtures" / "test_with_text.pdf"
+        file_path = storage_dir / "test_with_text.pdf"
+        file_path.write_bytes(fixture_path.read_bytes())
+
+        item_id = await lib_store.create_item(
+            kind="pdf", title="test_with_text.pdf", storage_path=str(file_path)
+        )
+        item = await lib_store.get_item(item_id)
+
+        proc = PdfProcessor(lib_store, storage_dir)
+        artifacts = await proc.process(item)
+
+        # Should produce a text artifact with extracted content
+        text_artifacts = [a for a in artifacts if a["kind"] == "text"]
+        assert len(text_artifacts) == 1, (
+            f"Expected 1 text artifact, got {len(text_artifacts)}. "
+            f"Artifacts: {[a['kind'] for a in artifacts]}"
+        )
+        text_path = Path(text_artifacts[0]["path"])
+        assert text_path.exists()
+        content = text_path.read_text()
+        assert "Hello World from test PDF" in content
+        assert "extractable text" in content
+
+    @pytest.mark.asyncio
+    async def test_process_pdf_import_error_fails_item(self, lib_store, storage_dir):
+        """RED-FIRST: When pypdf is missing, PDF processor must fail the item
+        (status=error with message), not mark it ready with empty text."""
+        from unittest.mock import patch
+
+        file_path = storage_dir / "test.pdf"
+        _create_minimal_pdf(file_path)
+
+        item_id = await lib_store.create_item(
+            kind="pdf", title="test.pdf", storage_path=str(file_path)
+        )
+        item = await lib_store.get_item(item_id)
+
+        # Force ImportError by patching the import inside PdfProcessor.process
+        with patch.dict("sys.modules", {"pypdf": None}):
+            proc = PdfProcessor(lib_store, storage_dir)
+            with pytest.raises(ModuleNotFoundError):
+                await proc.process(item)
+
+        # The exception propagates to run_pipeline which marks item as error
+        # This test verifies the processor no longer swallows ImportError
+
 
 class TestImageProcessor:
     @pytest.mark.asyncio
@@ -408,6 +501,54 @@ class TestImageProcessor:
 # ---------------------------------------------------------------------------
 # run_pipeline
 # ---------------------------------------------------------------------------
+
+
+class TestYamlLogExtraction:
+    @pytest.mark.asyncio
+    async def test_yaml_file_extracts_text(self, lib_store, storage_dir):
+        file_path = storage_dir / "config.yaml"
+        file_path.write_text("key: value\nport: 8080\n")
+
+        kind = detect_kind(file_path=str(file_path))
+
+        item_id = await lib_store.create_item(
+            kind=kind, title="config.yaml", storage_path=str(file_path)
+        )
+        await run_pipeline(lib_store, item_id, storage_dir)
+
+        item = await lib_store.get_item(item_id)
+        assert item["status"] == "ready"
+
+        artifacts = await lib_store.get_artifacts(item_id)
+        artifact_kinds = {a["kind"] for a in artifacts}
+        assert "text" in artifact_kinds
+
+        text_artifacts = [a for a in artifacts if a["kind"] == "text"]
+        assert len(text_artifacts) == 1
+        assert "key: value" in Path(text_artifacts[0]["path"]).read_text()
+
+    @pytest.mark.asyncio
+    async def test_log_file_extracts_text(self, lib_store, storage_dir):
+        file_path = storage_dir / "app.log"
+        file_path.write_text("2026-01-01 INFO started\n")
+
+        kind = detect_kind(file_path=str(file_path))
+
+        item_id = await lib_store.create_item(
+            kind=kind, title="app.log", storage_path=str(file_path)
+        )
+        await run_pipeline(lib_store, item_id, storage_dir)
+
+        item = await lib_store.get_item(item_id)
+        assert item["status"] == "ready"
+
+        artifacts = await lib_store.get_artifacts(item_id)
+        artifact_kinds = {a["kind"] for a in artifacts}
+        assert "text" in artifact_kinds
+
+        text_artifacts = [a for a in artifacts if a["kind"] == "text"]
+        assert len(text_artifacts) == 1
+        assert "started" in Path(text_artifacts[0]["path"]).read_text()
 
 
 class TestRunPipeline:

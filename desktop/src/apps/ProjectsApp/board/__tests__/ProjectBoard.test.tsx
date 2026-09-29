@@ -3,10 +3,22 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { ProjectBoard } from "../ProjectBoard";
 import { projectsApi } from "../../../../lib/projects";
 
+const MockEventSourceCtor = vi.fn().mockImplementation(function (this: any) {
+  this.url = "";
+  this.onopen = null;
+  this.onmessage = null;
+  this.onerror = null;
+  this.close = vi.fn();
+  this.readyState = 0;
+});
+Object.assign(MockEventSourceCtor, { CONNECTING: 0, OPEN: 1, CLOSED: 2 });
+
 beforeEach(() => {
   vi.spyOn(projectsApi.tasks, "list").mockResolvedValue([]);
   vi.spyOn(projectsApi.elements, "list").mockResolvedValue([]);
   vi.spyOn(projectsApi, "subscribeEvents").mockReturnValue(() => {});
+  vi.stubGlobal("EventSource", MockEventSourceCtor);
+  MockEventSourceCtor.mockClear();
 });
 
 describe("ProjectBoard", () => {

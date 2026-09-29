@@ -6,7 +6,7 @@ import {
 type Channel = {
   id: string;
   name: string;
-  type: "dm" | "group" | "topic";
+  type: "dm" | "dm-remote" | "group" | "topic";
   topic: string;
   members: string[];
   settings: {

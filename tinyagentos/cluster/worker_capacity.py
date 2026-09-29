@@ -110,10 +110,11 @@ def gpu_vram_snapshot() -> dict | None:
     Best-effort: a missing nvidia-smi or a probe timeout is not an error.
     """
     from tinyagentos.system_stats import read_nvidia_vram
+    import time
 
     pair = read_nvidia_vram()
     if pair is None:
         return None
     used_mb, total_mb = pair
     free_mb = max(0, total_mb - used_mb)
-    return {"free_vram_mb": free_mb, "used_vram_mb": used_mb}
+    return {"free_vram_mb": free_mb, "used_vram_mb": used_mb, "sampled_at": time.time()}

@@ -275,6 +275,12 @@ class HeartbeatBody(BaseModel):
     # rank candidates by actual free memory, not total capacity.
     free_vram_mb: int | None = None
     used_vram_mb: int | None = None
+    # Worker-sampled age of the VRAM report in milliseconds. When present,
+    # the controller uses the sample time (not the receipt time) to avoid
+    # over-admitting during heartbeat transit. If absent, keep the current
+    # receipt-time behavior (old workers, backward compatibility). Must be
+    # non-negative; negative values are rejected with a 422.
+    vram_sampled_age_ms: int | None = Field(default=None, ge=0)
     # Registration-drift refresh (taOS #1538): workers report their live
     # host_lan_ip, url, and hardware on every heartbeat so the cluster
     # manager stays in sync with container reality. Optional so legacy
@@ -329,6 +335,7 @@ async def list_workers(request: Request):
                 "name": d["name"],
                 "status": d["status"],
                 "tier_id": d.get("tier_id", ""),
+                "kind": d.get("kind", "worker"),
             })
             continue
         # Surface the persistent auth state from the pairing store so the
@@ -394,10 +401,21 @@ async def register_worker(request: Request, body: WorkerRegister):
     # Populate signing_key from pairing store so ticket-signing consumers work.
     pairing_store = getattr(request.app.state, "cluster_pairing", None)
     signing_key = b""
+    # The kind is never the caller's to choose. A node whose key was issued
+    # to a device (a taOSusb board paired over BLE), or that the registry
+    # already lists as a device, stays kind="device" however it registers:
+    # the board holds its own node_key, and a self-promotion to "worker"
+    # would put it past every placement guard (chat, embed, browser).
+    kind = "worker"
+    existing = cluster.get_worker(body.name)
+    if existing is not None and getattr(existing, "kind", "worker") == "device":
+        kind = "device"
     if pairing_store is not None:
         key = await pairing_store.get_signing_key(body.name)
         if key is not None:
             signing_key = key
+        if await pairing_store.get_kind(body.name) == "device":
+            kind = "device"
     hw = body.hardware or {}
     # Treat null ram_mb as missing so downstream arithmetic never sees None.
     # Preserve explicit 0 (e.g. ram_mb=0 is valid).
@@ -426,6 +444,7 @@ async def register_worker(request: Request, body: WorkerRegister):
         bytes_deduped_total=body.bytes_deduped_total,
         worker_lxc_image_version=body.worker_lxc_image_version,
         signing_key=signing_key,
+        kind=kind,
     )
     ok, reason = await cluster.register_worker(info, generation=body.generation)
     if not ok:
@@ -597,6 +616,7 @@ async def worker_heartbeat(request: Request, body: HeartbeatBody):
         kv_cache_quant_boundary_layer_protect=body.kv_cache_quant_boundary_layer_protect,
         free_vram_mb=body.free_vram_mb,
         used_vram_mb=body.used_vram_mb,
+        vram_sampled_age_ms=body.vram_sampled_age_ms,
         # LXC storage counters (forwarded from worker heartbeat)
         storage_cap_bytes=body.storage_cap_bytes,
         storage_used_bytes=body.storage_used_bytes,
@@ -621,7 +641,19 @@ async def unregister_worker(request: Request, name: str):
     removed = await cluster.unregister_worker(name)
     if not removed:
         return JSONResponse({"error": "Worker not found"}, status_code=404)
+    _revoke_node_model_keys(request, name)
     return {"status": "removed", "name": name}
+
+
+def _revoke_node_model_keys(request: Request, name: str) -> None:
+    """Cut the node's LLM gateway keys in the same step as the node itself.
+
+    Raises on failure: a node revoke that answered 200 while its model keys
+    stayed live would be a silent half-revocation.
+    """
+    from tinyagentos.llm_gateway.auth import revoke_for_node
+
+    revoke_for_node(name, data_dir=request.app.state.data_dir)
 
 
 @router.post("/api/cluster/workers/{name}/revoke")
@@ -643,6 +675,7 @@ async def revoke_node(request: Request, name: str):
     if state is None:
         return JSONResponse({"error": f"Worker '{name}' not found"}, status_code=404)
     changed = await pairing.revoke(name)
+    _revoke_node_model_keys(request, name)
     # Flag the in-memory worker as offline so the scheduler stops routing tasks
     # to it immediately (rather than waiting for the heartbeat timeout). The
     # worker itself stays in the registry so it remains visible in /api/cluster
@@ -673,6 +706,7 @@ async def block_node(request: Request, name: str):
     if state is None:
         return JSONResponse({"error": f"Worker '{name}' not found"}, status_code=404)
     changed = await pairing.block(name)
+    _revoke_node_model_keys(request, name)
     # Same as revoke: mark in-memory worker offline so no new tasks are routed,
     # but keep it registered so it shows in the UI and can be unblocked.
     cluster = request.app.state.cluster_manager

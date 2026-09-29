@@ -7,6 +7,7 @@ import { BoardLane } from "./BoardLane";
 import { TaskCard } from "./TaskCard";
 import { useBoardData } from "./useBoardData";
 import { useBoardLive } from "./useBoardLive";
+import { useOsEvents } from "@/hooks/use-os-events";
 import { applyFilters } from "./boardFiltering";
 import { groupByAssignee, groupByLabel, groupByParent, groupByPriority } from "./boardGrouping";
 import { dndAction } from "./boardDnd";
@@ -70,7 +71,7 @@ export function ProjectBoard({ projectId, currentUserId, onOpenTask, isLead, ele
     localStorage.setItem(PERSIST_KEY(projectId), JSON.stringify({ viewMode, groupBy }));
   }, [projectId, viewMode, groupBy]);
 
-  const { tasks, elements, applyEvent, setTasks } = useBoardData(projectId);
+  const { tasks, elements, applyEvent, setTasks, refresh } = useBoardData(projectId);
   const { connected } = useBoardLive(projectId, (e) => {
     if (e.kind === "task.claimed") {
       const id = String((e.payload as { id?: string }).id ?? "");
@@ -80,7 +81,26 @@ export function ProjectBoard({ projectId, currentUserId, onOpenTask, isLead, ele
       }
     }
     applyEvent(e);
+    if (e.kind.startsWith("task.")) {
+      void refresh();
+    }
   });
+  const { stale } = useOsEvents(
+    [
+      "task.created",
+      "task.updated",
+      "task.claimed",
+      "task.released",
+      "task.closed",
+      "task.reopened",
+      "task.parked",
+      "task.quarantined",
+      "task.unquarantined",
+    ],
+    () => {
+      void refresh();
+    },
+  );
 
   const filtered = useMemo(() => applyFilters(tasks, filters), [tasks, filters]);
 
@@ -191,6 +211,7 @@ export function ProjectBoard({ projectId, currentUserId, onOpenTask, isLead, ele
           filters={filters}
           elements={elements}
           live={connected}
+          stale={stale}
           onChangeView={setViewMode}
           onChangeGroup={setGroupBy}
           onChangeFilters={setFilters}
@@ -215,6 +236,7 @@ export function ProjectBoard({ projectId, currentUserId, onOpenTask, isLead, ele
         filters={filters}
         elements={elements}
         live={connected}
+        stale={stale}
         onChangeView={setViewMode}
         onChangeGroup={setGroupBy}
         onChangeFilters={setFilters}

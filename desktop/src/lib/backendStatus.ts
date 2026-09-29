@@ -10,7 +10,14 @@
 
 export type BackendStatus = "up" | "reconnecting" | "down";
 
+// A valid version must match the semver-like pattern and start with a digit
+// This rejects the coarsened sentinel "taOS" which has no digit.
 const VERSION_PATTERN = /^[\w.+\-]+$/;
+const IS_VALID_VERSION = (v: string) => VERSION_PATTERN.test(v) && /^[0-9]/.test(v);
+
+// Predicate used by both the health poll (:85) and reportVersion (:119) to reject
+// the coarsened sentinel and leave currentVersion unchanged.
+export const isValidVersion = (v: string): boolean => IS_VALID_VERSION(v);
 const POLL_DELAYS_MS = [2_000, 4_000, 8_000, 16_000, 30_000];
 const LONG_RECONNECTING_MS = 60_000;
 
@@ -82,7 +89,7 @@ export function createBackendStatus(opts: Options): BackendStatusController {
       });
       if (r.ok) {
         const v = r.headers.get("X-Taos-Version");
-        if (v && VERSION_PATTERN.test(v)) {
+        if (v && isValidVersion(v)) {
           if (v !== currentVersion) {
             currentVersion = v;
             notify();
@@ -116,7 +123,7 @@ export function createBackendStatus(opts: Options): BackendStatusController {
     getSecondsReconnecting: () =>
       reconnectingSince === null ? 0 : Math.floor((Date.now() - reconnectingSince) / 1000),
     reportVersion(v: string) {
-      if (!v || !VERSION_PATTERN.test(v)) return;
+      if (!v || !isValidVersion(v)) return;
       if (v !== currentVersion) {
         currentVersion = v;
         notify();

@@ -131,3 +131,82 @@ async def test_answer_source_persistence(store):
     d3 = await store.create("@a", "q3", "approve_deny", user_id="u1")
     upd3 = await store.answer(d3["id"], "approve", "u1")
     assert upd3["answer"]["source"] == "in_app"
+
+
+@pytest.mark.asyncio
+async def test_create_retries_on_id_collision(store, monkeypatch):
+    """new_id collision in a plain BaseStore (non-projects) must be retried."""
+    import tinyagentos.decisions.decision_store as ds_mod
+
+    call_count = 0
+    duplicate_id = "dec-collision"
+    fresh_id = "dec-fresh"
+
+    def fake_new_id(prefix):
+        nonlocal call_count
+        call_count += 1
+        if call_count <= 2:
+            return duplicate_id
+        return fresh_id
+
+    monkeypatch.setattr(ds_mod, "new_id", fake_new_id)
+
+    d1 = await store.create(
+        "@a", "q1", "single_select",
+        options=[{"label": "A", "value": "a"}],
+        user_id="u1",
+    )
+    assert d1["id"] == duplicate_id
+
+    d2 = await store.create(
+        "@a", "q2", "single_select",
+        options=[{"label": "B", "value": "b"}],
+        user_id="u1",
+    )
+    assert d2["id"] == fresh_id
+    assert call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_notes_table_created_on_existing_db(tmp_path):
+    """The decision_notes table is added to an existing database on init,
+    not only on fresh install."""
+    import aiosqlite
+
+    db_path = tmp_path / "existing.db"
+    conn = await aiosqlite.connect(str(db_path))
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS decisions (
+            id TEXT PRIMARY KEY, from_agent TEXT NOT NULL, project_id TEXT,
+            user_id TEXT NOT NULL DEFAULT '', question TEXT NOT NULL,
+            type TEXT NOT NULL, options TEXT NOT NULL DEFAULT '[]',
+            context TEXT NOT NULL DEFAULT '', priority TEXT NOT NULL DEFAULT 'normal',
+            status TEXT NOT NULL DEFAULT 'pending', answer TEXT,
+            created_at REAL NOT NULL, answered_at REAL, deadline REAL,
+            checkpoint_ref TEXT, parent_decision_id TEXT, timeline_id TEXT,
+            metadata TEXT NOT NULL DEFAULT '{}'
+        )
+    """)
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(status, created_at DESC)"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_decisions_project ON decisions(project_id, status)"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_decisions_user ON decisions(user_id, status)"
+    )
+    await conn.commit()
+    await conn.close()
+
+    store = DecisionStore(db_path)
+    await store.init()
+    # list_notes on a missing decision must not crash -- the table must exist.
+    notes = await store.list_notes("dec-nonexistent")
+    assert notes == []
+    # And add_note must work on that upgraded database.
+    d = await store.create("@a", "q", "free_text", user_id="u1")
+    updated = await store.add_note(d["id"], "hello", "u1")
+    assert updated is not None
+    assert len(updated["notes"]) == 1
+    assert updated["notes"][0]["text"] == "hello"

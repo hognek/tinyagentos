@@ -165,6 +165,11 @@ OSK_SCRIPT = r"""
 
   function isTypable(el) {
     if (!el || el.tagName !== "INPUT") return false;
+    // inputmode="none" is the platform way of saying "this field supplies its
+    // own input method, do not open a keyboard". The lock screen's passcode
+    // field sets it because it draws its own keypad -- without this check the
+    // shared keyboard opens a SECOND keypad on top of it.
+    if ((el.getAttribute("inputmode") || "").toLowerCase() === "none") return false;
     return ["text", "password", "email", "number", "tel", "search", "url"]
       .indexOf((el.type || "text").toLowerCase()) !== -1;
   }
@@ -414,7 +419,11 @@ OSK_SCRIPT = r"""
       el.focus();
       if (enabled) show();
     },
-    enable: function () { setEnabled(true, false); }
+    enable: function () { setEnabled(true, false); },
+    // Symmetric with enable(), for a page that supplies its own input method
+    // (the lock screen's passcode keypad) and must keep this one shut. Without
+    // it a caller can open the keyboard but never close it again.
+    disable: function () { setEnabled(false, false); }
   };
 })();
 """

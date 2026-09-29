@@ -101,6 +101,27 @@ describe("backendStatus", () => {
     expect(bs.getCurrentVersion()).toBe("1.0.0-rc.1+build.7"); // unchanged
   });
 
+  it("RED FIRST: coarsened sentinel from health poll does not replace current version", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("{}", {
+        status: 200,
+        headers: new Map([["X-Taos-Version", "taOS"]])
+      }))
+      .mockResolvedValueOnce(new Response("{}", {
+        status: 200,
+        headers: new Map([["X-Taos-Version", "1.0.0-beta.52"]])
+      }));
+    const bs = createBackendStatus({ healthUrl: "/api/health", fetchImpl: fetchMock });
+    bs.start();
+    await vi.advanceTimersByTimeAsync(2000);
+    // After first health poll, currentVersion should remain null (sentinel ignored)
+    expect(bs.getCurrentVersion()).toBeNull();
+    // After second health poll, version should be set
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(bs.getCurrentVersion()).toBe("1.0.0-beta.52");
+    bs.stop();
+  });
+
   it("stop() prevents the next poll from being scheduled even mid-flight", async () => {
     let resolveFetch: (() => void) | null = null;
     const fetchMock = vi.fn().mockImplementation(

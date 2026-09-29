@@ -9,6 +9,8 @@ import {
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { DecisionsApp } from "./DecisionsApp";
 import { useDecisionEventsStore } from "@/stores/decision-events-store";
+import { useOsEvents, resetOsEventsState } from "@/hooks/use-os-events";
+import type { MessageEvent } from "@testing-library/react";
 
 /** ConsentActions reads the server's project-scope vocabulary before it will
  *  enable Allow, so any surface embedding it needs this route answered. It is a
@@ -65,9 +67,26 @@ const singleSelect = {
 };
 
 describe("DecisionsApp", () => {
+  const MockEventSourceCtor = vi.fn().mockImplementation(function (this: any) {
+    this.url = "";
+    this.onopen = null;
+    this.onmessage = null;
+    this.onerror = null;
+    this.close = vi.fn();
+    this.readyState = 0;
+    this._fire = (data: unknown) => {
+      this.onmessage?.({ data: JSON.stringify(data) } as MessageEvent);
+    };
+    lastEs = this;
+  });
+  Object.assign(MockEventSourceCtor, { CONNECTING: 0, OPEN: 1, CLOSED: 2 });
+
   beforeEach(() => {
     vi.restoreAllMocks();
     useDecisionEventsStore.setState({ answeredEpoch: 0, lastAnsweredId: null });
+    vi.stubGlobal("EventSource", MockEventSourceCtor);
+    MockEventSourceCtor.mockClear();
+    lastEs = null;
   });
 
   afterEach(() => {
@@ -619,13 +638,132 @@ describe("DecisionsApp", () => {
     // The pending decision is visible
     await waitFor(() => expect(screen.getByText(/which canvas engine/i)).toBeTruthy());
 
-    // Simulate an SSE decision.answered event for this decision
+    // Simulate an SSE decision.answered event via useOsEvents
     answeredElsewhere = true;
-    useDecisionEventsStore.getState().recordAnswered("dec-1");
+    act(() => {
+      lastEs?._fire({
+        kind: "decision.answered",
+        id: "dec-1",
+        ts: 1234567890.0,
+      });
+    });
 
     // After the silent re-fetch, the pending list is empty
     await waitFor(() => {
       expect(screen.queryByText(/which canvas engine/i)).toBeNull();
     });
+  });
+});
+
+let lastEs: { onmessage: ((e: MessageEvent) => void) | null; _fire: (data: unknown) => void; readyState: number } | null = null;
+
+const MockEventSourceCtor = vi.fn().mockImplementation(function (this: any) {
+  this.url = "";
+  this.onopen = null;
+  this.onmessage = null;
+  this.onerror = null;
+  this.close = vi.fn();
+  this.readyState = 0;
+  this._fire = (data: unknown) => {
+    this.onmessage?.({ data: JSON.stringify(data) } as MessageEvent);
+  };
+  this._fireError = () => {
+    this.onerror?.(new Event("error"));
+  };
+  lastEs = this;
+});
+
+Object.assign(MockEventSourceCtor, { CONNECTING: 0, OPEN: 1, CLOSED: 2 });
+
+describe("DecisionsApp live updates", () => {
+  beforeEach(() => {
+    resetOsEventsState();
+    vi.stubGlobal("EventSource", MockEventSourceCtor);
+    MockEventSourceCtor.mockClear();
+    lastEs = null;
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("refetches decisions on a decision.answered SSE event", async () => {
+    const fetchMock = mockFetch({
+      "GET /api/decisions?status=pending": { ok: true, body: [singleSelect] },
+      "GET /api/decisions?status=answered": { ok: true, body: [] },
+      "GET /api/agents/auth-requests?status=pending": { ok: true, body: { requests: [] } },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<DecisionsApp windowId="w1" />);
+    await flush();
+
+    await waitFor(() =>
+      expect(screen.getByText(/which canvas engine/i)).toBeTruthy(),
+    );
+
+    const initialPendingCalls = fetchMock.mock.calls.filter(
+      (c: unknown[]) => (c[0] as string) === "/api/decisions?status=pending",
+    ).length;
+
+    act(() => {
+      lastEs?._fire({
+        kind: "decision.answered",
+        id: "dec-1",
+        ts: 1234567890.0,
+      });
+    });
+
+    await waitFor(() => {
+      const newPendingCalls = fetchMock.mock.calls.filter(
+        (c: unknown[]) => (c[0] as string) === "/api/decisions?status=pending",
+      ).length;
+      expect(newPendingCalls).toBeGreaterThan(initialPendingCalls);
+    });
+  });
+
+  it("shows the stale indicator when the stream is disconnected", async () => {
+    const fetchMock = mockFetch({
+      "GET /api/decisions?status=pending": { ok: true, body: [singleSelect] },
+      "GET /api/decisions?status=answered": { ok: true, body: [] },
+      "GET /api/agents/auth-requests?status=pending": { ok: true, body: { requests: [] } },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<DecisionsApp windowId="w1" />);
+    await flush();
+
+    await waitFor(() =>
+      expect(screen.getByText(/which canvas engine/i)).toBeTruthy(),
+    );
+
+    // Initial state is disconnected/stale until the EventSource opens
+    expect(screen.getByText("paused")).toBeTruthy();
+  });
+
+  it("hides the stale indicator when connected and fresh", async () => {
+    const fetchMock = mockFetch({
+      "GET /api/decisions?status=pending": { ok: true, body: [singleSelect] },
+      "GET /api/decisions?status=answered": { ok: true, body: [] },
+      "GET /api/agents/auth-requests?status=pending": { ok: true, body: { requests: [] } },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(<DecisionsApp windowId="w1" />);
+    await flush();
+
+    await waitFor(() =>
+      expect(screen.getByText(/which canvas engine/i)).toBeTruthy(),
+    );
+
+    // Initially stale indicator is shown
+    expect(screen.getByText("paused")).toBeTruthy();
+
+    // Simulate a successful connection
+    act(() => {
+      lastEs?.onopen?.();
+    });
+
+    await waitFor(() => expect(screen.queryByText("paused")).toBeNull());
   });
 });

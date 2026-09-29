@@ -23,16 +23,18 @@ Security notes
 
 import asyncio
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, StrictInt
 
 from aiosqlite import IntegrityError
 from tinyagentos.agent_registry_store import agent_slug_or_fallback, mint_registry_token
 from tinyagentos.auth_context import CurrentUser, current_user, require_owner_or_admin
 from tinyagentos.base_store import PendingCapExceeded
+from tinyagentos.routes.projects import _free_suggestions
 
 logger = logging.getLogger(__name__)
 
@@ -47,13 +49,10 @@ _PENDING_CAP = 5
 # Closed vocabulary of grantable scopes — surfaced to the user in the
 # desktop consent actions (desktop/src/components/ConsentActions.tsx).
 VALID_SCOPES = frozenset({
-    "memory_read",
-    "memory_write",
     "a2a_send",
     "a2a_receive",
     "files_read",
     "files_write",
-    "tools_execute",
     "registry_feeds_read",
     # Least-privilege kanban access: task read + lifecycle + comments for the
     # agent's OWN project only (bound by the token's project_id claim). Does NOT
@@ -105,14 +104,31 @@ VALID_SCOPES = frozenset({
 # Request bodies
 # ---------------------------------------------------------------------------
 
+# Upper bound on a requested grant duration: ten years. The create route is
+# unauthenticated, so the agent chooses duration_secs; anything larger is
+# refused at request time (422) rather than stored and then overflowing
+# datetime arithmetic when the request is approved.
+MAX_GRANT_DURATION_SECS = 10 * 365 * 24 * 3600
+
+
 class CreateAuthRequest(BaseModel):
     identity_claim: str
     framework: str
-    requested_scopes: list[str]
+    requested_scopes: list[str] = []
     requested_skills: Optional[list[str]] = None
     reason: str = ""
-    duration_secs: Optional[int] = None
+    # Strict int: JSON true/false and "3600" are refused instead of being
+    # coerced (true used to become a 1-second grant). A bound, when given,
+    # must be a positive number of seconds up to MAX_GRANT_DURATION_SECS;
+    # omit it (None) for an unbounded grant.
+    duration_secs: Optional[StrictInt] = Field(
+        default=None, gt=0, le=MAX_GRANT_DURATION_SECS
+    )
     project_id: Optional[str] = None
+    kind: str = "scope_request"
+    requested_name: Optional[str] = None
+    requested_slug: Optional[str] = None
+    purpose: str = ""
 
 
 class ApproveBody(BaseModel):
@@ -125,6 +141,17 @@ class AssignAgentBody(BaseModel):
     canonical_id: str
     scopes: list[str]
     is_lead: bool = False
+
+
+class RevokeAgentScopesBody(BaseModel):
+    """Body for POST /api/projects/{project_id}/members/revoke-agent.
+
+    ``scopes`` omitted or empty means "every grant this agent holds on this
+    project" — the common "the review is finished, drop it" case.
+    """
+
+    canonical_id: str
+    scopes: list[str] = []
 
 
 class CreateScopeRequest(BaseModel):
@@ -234,6 +261,201 @@ def _get_approve_lock(request: Request, request_id: str) -> asyncio.Lock:
     return locks[request_id]
 
 
+async def _resolve_agent_identity(request: Request, identity_claim: str, *, strict: bool = False) -> str:
+    """Resolve the agent's canonical_id from a Bearer token if present, otherwise
+    look it up in the registry by the slugified identity_claim, falling back to
+    the raw claim only when no matching registry row exists.
+
+    When ``strict`` is True (project_create path), an HTTPException from
+    ``check_agent_identity`` is propagated, and a missing or unresolved identity
+    raises 401 instead of returning the caller-supplied string.
+    """
+    from tinyagentos.agent_token_auth import check_agent_identity
+
+    try:
+        cid = await check_agent_identity(request)
+    except HTTPException:
+        if strict:
+            raise
+        cid = None
+    if cid:
+        if strict and identity_claim:
+            registry = getattr(request.app.state, "agent_registry", None)
+            if registry is not None:
+                record = await registry.get(cid)
+                if record:
+                    expected_handle = agent_slug_or_fallback(
+                        identity_claim.strip().removeprefix("@").strip() or identity_claim
+                    )
+                    token_handle = agent_slug_or_fallback(
+                        record.get("handle", "").strip().removeprefix("@").strip() or record.get("handle", "")
+                    )
+                    if token_handle != expected_handle:
+                        raise HTTPException(status_code=403, detail="identity_claim does not match registry handle")
+        return cid
+
+    if strict:
+        raise HTTPException(
+            status_code=401,
+            detail="unauthenticated: provide a valid registry token or a registered identity_claim",
+        )
+
+    registry = getattr(request.app.state, "agent_registry", None)
+    if registry is not None:
+        handle = agent_slug_or_fallback(
+            identity_claim.strip().removeprefix("@").strip() or identity_claim
+        )
+        existing = await registry.get_by_handle(handle, status=None)
+        if existing is not None:
+            return existing["canonical_id"]
+    return identity_claim
+
+
+async def _handle_project_create_request(
+    request: Request, body: CreateAuthRequest, store
+) -> JSONResponse:
+    """Process a kind=project_create auth request.
+
+    Checks name/slug uniqueness synchronously. A collision returns 409 with
+    suggestions and creates no auth-request row or Decision. A free slug
+    creates an auth-request record and a pending approve/deny Decision.
+    """
+    if not body.requested_slug or not body.requested_name:
+        raise HTTPException(
+            status_code=400,
+            detail="requested_name and requested_slug are required for project_create",
+        )
+
+    pstore = getattr(request.app.state, "project_store", None)
+    if pstore is None:
+        raise HTTPException(status_code=500, detail="project store unavailable")
+
+    # Check slug collision first (the primary identifier).
+    existing_slug = await pstore.get_project_by_slug(body.requested_slug)
+    if existing_slug is not None:
+        suggestions = await _free_suggestions(pstore, "slug", body.requested_slug)
+        return JSONResponse(
+            {
+                "error": f"slug already used: {body.requested_slug}",
+                "field": "slug",
+                "taken": body.requested_slug,
+                "suggestions": suggestions,
+            },
+            status_code=409,
+        )
+
+    # Check name collision.
+    existing_name = await pstore.get_project_by_name(body.requested_name)
+    if existing_name is not None:
+        suggestions = await _free_suggestions(pstore, "name", body.requested_name)
+        return JSONResponse(
+            {
+                "error": f"name already used: {body.requested_name}",
+                "field": "name",
+                "taken": body.requested_name,
+                "suggestions": suggestions,
+            },
+            status_code=409,
+        )
+
+    from_agent = await _resolve_agent_identity(request, body.identity_claim, strict=True)
+
+    admins = [u for u in request.app.state.auth.list_users() if u.get("is_admin")]
+    if not admins:
+        raise HTTPException(status_code=409, detail="no admin to receive the decision")
+    decider = admins[0]["id"]
+
+    decision_store = request.app.state.decision_store
+
+    record = None
+    try:
+        record = await store.create(
+            identity_claim=from_agent,
+            framework="project_create",
+            requested_scopes=[],
+            requested_skills=[],
+            reason=body.purpose or body.reason,
+            duration_secs=None,
+            project_id=None,
+            pending_cap=_PENDING_CAP,
+            kind="project_create",
+            requested_project_name=body.requested_name,
+            requested_project_slug=body.requested_slug,
+            purpose=body.purpose or body.reason,
+            cap_identity=from_agent,
+            cap_framework="project_create",
+        )
+    except PendingCapExceeded as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"too many pending requests from identity {from_agent!r} "
+                f"({exc.pending} pending; resolve existing requests first)"
+            ),
+        ) from None
+
+    try:
+        decision = await decision_store.create(
+            from_agent=from_agent,
+            question=(
+                f"Agent {from_agent} requests to create project "
+                f"'{body.requested_name}' ({body.requested_slug})"
+            ),
+            type="approve_deny",
+            options=[
+                {"label": "Approve", "value": "approve"},
+                {"label": "Deny", "value": "deny"},
+            ],
+            context=body.purpose or body.reason,
+            priority="normal",
+            project_id=None,
+            user_id=decider,
+            metadata={
+                "kind": "project_create",
+                "_server_raised": True,
+                "auth_request_id": record["id"],
+                "requested_name": body.requested_name,
+                "requested_slug": body.requested_slug,
+                "purpose": body.purpose or body.reason,
+                "from_agent": from_agent,
+            },
+        )
+    except Exception:
+        await store._db.execute(
+            "DELETE FROM auth_requests WHERE id = ?",
+            (record["id"],),
+        )
+        await store._db.commit()
+        raise
+
+    notifs = getattr(request.app.state, "notifications", None)
+    if notifs is not None:
+        try:
+            await notifs.add(
+                title="Project creation request",
+                message=(
+                    f"{from_agent} requests to create project "
+                    f"'{body.requested_name}' ({body.requested_slug})"
+                ),
+                level="info",
+                source="auth_requests",
+                data={
+                    "request_id": record["id"],
+                    "identity_claim": from_agent,
+                    "framework": body.framework,
+                    "requested_name": body.requested_name,
+                    "requested_slug": body.requested_slug,
+                    "purpose": body.purpose or body.reason,
+                },
+            )
+        except Exception:
+            pass
+
+    return JSONResponse(
+        {"request_id": record["id"], "status": "pending", "decision_id": decision["id"]}
+    )
+
+
 # ---------------------------------------------------------------------------
 # Routes — scope vocabulary (authenticated)
 # ---------------------------------------------------------------------------
@@ -271,12 +493,33 @@ async def get_scope_vocabulary(_user: CurrentUser = Depends(current_user)):
 async def create_auth_request(request: Request, body: CreateAuthRequest):
     """Submit an access request from an external agent.
 
-    No authentication required — the agent has no credentials yet.
+    No authentication required -- the agent has no credentials yet.
     Returns {request_id, status: 'pending'}.
+
+    For kind='project_create', carries requested_name, requested_slug, and
+    purpose. Slug (and name) uniqueness is checked synchronously against the
+    project store; a collision returns 409 with suggestions and creates no
+    auth-request row or Decision. A free slug creates an auth-request record
+    and a pending approve/deny Decision attributed to the requester.
     """
     store = _get_auth_requests_store(request)
 
-    # Only known scopes may be requested — reject unknown ones up front so
+    if body.kind == "project_create":
+        return await _handle_project_create_request(request, body, store)
+
+    if body.kind != "scope_request":
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown kind: {body.kind!r}; valid: scope_request, project_create",
+        )
+
+    if not body.requested_scopes:
+        raise HTTPException(
+            status_code=400,
+            detail="requested_scopes must not be empty for scope_request",
+        )
+
+    # Only known scopes may be requested -- reject unknown ones up front so
     # the admin is never shown (and can never approve) a scope the system
     # does not actually enforce.
     unknown = sorted(set(body.requested_scopes) - VALID_SCOPES)
@@ -405,6 +648,23 @@ async def approve_auth_request(
                 locks.pop(request_id, None)
 
 
+def _expires_at_from_duration(duration_secs: object) -> str | None:
+    """Map a scope request's ``duration_secs`` to a grant expiry timestamp.
+
+    A positive integer yields ``now + duration_secs`` as a timezone-aware ISO
+    string; anything else (None, zero, negative, a bool, or a non-int) means
+    the grant is unbounded and returns None.
+
+    The create route refuses durations above ``MAX_GRANT_DURATION_SECS``, but a
+    row stored before that check existed can still carry one. Such a value is
+    clamped to the cap: that only shortens the agent's own requested access,
+    never drops the bound, and keeps approval from overflowing into a 500."""
+    if type(duration_secs) is int and duration_secs > 0:
+        secs = min(duration_secs, MAX_GRANT_DURATION_SECS)
+        return (datetime.now(timezone.utc) + timedelta(seconds=secs)).isoformat()
+    return None
+
+
 async def approve_request_record(
     request: Request,
     *,
@@ -485,6 +745,11 @@ async def approve_request_record(
     # regardless of effective_project; project-scoped calls 403 until the agent
     # is bound to a project later via assign-agent.
     binding_project = None if defer_binding else effective_project
+
+    # Compute expires_at from the request's duration_secs so time-boxed grants
+    # actually expire. When duration_secs is None or <= 0, leave it unset so
+    # unbounded grants stay permanent.
+    expires_at = _expires_at_from_duration(record.get("duration_secs"))
 
     registry = _get_registry_store(request)
     private_pem, _public_pem = _get_keypair(request)
@@ -585,6 +850,7 @@ async def approve_request_record(
                 project_id=project_id,
                 granted_scopes=granted_scopes,
                 decided_by=decided_by,
+                expires_at=expires_at,
             )
             result = await auth_store.set_decision(
                 record["id"],
@@ -674,7 +940,9 @@ async def approve_request_record(
     # unbound (project_id=None); assign-agent later writes the project-bound
     # grant that makes project-scoped calls succeed.
     for scope in granted_scopes:
-        await grants_store.add_grant(canonical_id, scope, tier="once", project_id=binding_project)
+        await grants_store.add_grant(
+            canonical_id, scope, tier="once", project_id=binding_project, expires_at=expires_at
+        )
         # Also write a RelationshipManager permission edge so the existing
         # permission-check path (can_communicate etc.) is aware of the agent.
         await rel_mgr.set_permission(canonical_id, "taos-instance", scope)
@@ -756,6 +1024,8 @@ async def add_agent_to_project(
     granted_scopes: list[str],
     decided_by: str,
     is_lead: bool = False,
+    reconcile: bool = False,
+    expires_at: str | None = None,
 ) -> dict:
     """Add an ALREADY-REGISTERED agent to ANOTHER project (taOS #1862).
 
@@ -766,29 +1036,157 @@ async def add_agent_to_project(
     the agent: the identity is reused so one registry JWT spans every project
     the agent holds a grant for.
 
-    Returns ``{"canonical_id": ..., "project_id": ..., "granted_scopes": ...}``.
+    ``reconcile=False`` (the default) is ADDITIVE: grants the agent already
+    holds on the project stay, which is what the consent, invite and
+    scope-request approve paths need (each approves ADDITIONAL scopes and must
+    never drop one already granted). ``reconcile=True`` makes *granted_scopes*
+    the project's exact grant set for this agent: a grant bound to this project
+    that the caller did not name is REVOKED (taOS #2148). Only a caller whose
+    scope list is the operator's complete intent may ask for that — with the
+    additive default a reduced list reports success while the dropped scope
+    stays live.
+
+    ``expires_at`` is written onto every grant this call adds: a
+    timezone-aware ISO timestamp for a time-boxed grant (the consent approve
+    path passes ``now + duration_secs``), or ``None`` for an unbounded grant.
+
+    When adding an agent to a project, this function checks for existing
+    deferred grants (project_id=None) with an expires_at. If found:
+    - It inherits that expires_at for the new project-bound grant
+    - It refuses the binding if the deferred grant has expired (4xx, no grant row written)
+    - Never lengthens: if both a stored bound and a request bound exist, keeps the earlier one
+
+    Returns ``{"canonical_id": ..., "project_id": ..., "granted_scopes": ...}``
+    plus, when reconciling, ``revoked_scopes`` and ``active_scopes`` (read back
+    from the store, so the response cannot claim a revocation that did not
+    land).
     """
     grants_store = _get_grants_store(request)
     rel_mgr = _get_relationships(request)
 
+    # Check for existing deferred grants (project_id=None) with expires_at
+    deferred_grants = await grants_store.list_grants(canonical_id)
+    deferred_grant_with_expiry = None
+    now = datetime.now(timezone.utc).isoformat()
+    
+    for grant in deferred_grants:
+        if grant.get("project_id") is None and grant.get("expires_at"):
+            deferred_grant_with_expiry = grant
+            break
+    
+    # Determine the expires_at to use:
+    # 1. Use the deferred grant's expiry if it exists and is not expired
+    # 2. Otherwise, use the expires_at parameter passed to this function
+    # 3. Never lengthen: if both deferred and request expiry exist, use the earlier one
+    target_expires_at = expires_at
+    
+    if deferred_grant_with_expiry:
+        deferred_expires_at = deferred_grant_with_expiry["expires_at"]
+        # Parse both times for comparison
+        deferred_dt = datetime.fromisoformat(deferred_expires_at)
+        now_dt = datetime.fromisoformat(now)
+        if deferred_dt <= now_dt:
+            # Deferred grant has expired - refuse the binding
+            raise HTTPException(
+                status_code=400,
+                detail=f"cannot bind agent {canonical_id} to project {project_id}: "
+                       f"the agent's deferred grant expired at {deferred_expires_at}",
+            )
+        elif target_expires_at is None:
+            # Only deferred grant has expiry - inherit it
+            target_expires_at = deferred_expires_at
+        elif target_expires_at < deferred_expires_at:
+            # Request expires earlier than deferred - keep the earlier (request) bound
+            pass
+        else:
+            # Request expires later than or at same time as deferred - keep the earlier (deferred) bound
+            # This follows "never lengthen" rule: keep the earlier bound, not the later one
+            target_expires_at = deferred_expires_at
+
+    # Revoke BEFORE adding: the project's grant set becomes exactly
+    # ``granted_scopes``. A grant this call does not name is one the operator
+    # asked to remove, and leaving it live while answering "done" is precisely
+    # the #2148 bug (the response read as a revocation and was not one).
+    revoked_scopes: list[str] = []
+    if reconcile:
+        existing_scopes = {
+            g["scope"]
+            for g in await grants_store.list_grants(canonical_id)
+            if g.get("project_id") == project_id
+        }
+        revoked_scopes = sorted(existing_scopes - set(granted_scopes))
+        for scope in revoked_scopes:
+            await grants_store.revoke_grant(canonical_id, scope, project_id=project_id)
+        if revoked_scopes:
+            # Drop the relationship permission edge too — but only when no
+            # grant for that scope survives on another project (or globally).
+            # The edge is NOT project-scoped, so revoking it unconditionally
+            # would strip a scope the agent still legitimately holds elsewhere.
+            remaining_scopes = {
+                g["scope"] for g in await grants_store.list_grants(canonical_id)
+            }
+            for scope in revoked_scopes:
+                if scope not in remaining_scopes:
+                    await rel_mgr.revoke_permission(
+                        canonical_id, "taos-instance", scope
+                    )
+            try:
+                pstore = getattr(request.app.state, "project_store", None)
+                if pstore is not None:
+                    await pstore.log_activity(
+                        project_id,
+                        decided_by,
+                        "member.grants_revoked",
+                        {"canonical_id": canonical_id, "scopes": revoked_scopes},
+                    )
+            except Exception:  # noqa: BLE001 - the revoke already happened
+                logger.warning(
+                    "add_agent_to_project: could not audit-log the revoke of %s on %s",
+                    revoked_scopes,
+                    project_id,
+                    exc_info=True,
+                )
 
     # Write the grants bound to this project and the relationship edge.
     for scope in granted_scopes:
         await grants_store.add_grant(
-            canonical_id, scope, tier="once", project_id=project_id
+            canonical_id, scope, tier="once", project_id=project_id, expires_at=target_expires_at
         )
         await rel_mgr.set_permission(canonical_id, "taos-instance", scope)
 
-    # If a project-scoped scope was granted, add the agent as a project member
-    # (PK (project_id, member_id) makes this naturally idempotent) and sync the
-    # a2a channel. Best-effort: a membership failure never blocks the grant,
-    # which already authorizes the agent for the project.
+    # Read the project's grant set back and refuse to report a reconcile that did
+    # not land. A success response that leaves the old scope live is the lie
+    # #2148 is about; failing here is the honest alternative.
+    active_scopes = sorted(
+        g["scope"]
+        for g in await grants_store.list_grants(canonical_id)
+        if g.get("project_id") == project_id
+    )
+    if reconcile and set(active_scopes) != set(granted_scopes):
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "scope reconciliation did not take effect: expected "
+                f"{sorted(set(granted_scopes))}, store holds {active_scopes}"
+            ),
+        )
+
     result: dict = {
         "canonical_id": canonical_id,
         "project_id": project_id,
         "granted_scopes": list(granted_scopes),
         "is_lead": bool(is_lead),
     }
+    if reconcile:
+        # ``granted_scopes`` keeps its historical meaning (what this call asked
+        # for); the other two are the store's answer, not the request echoed.
+        result["revoked_scopes"] = revoked_scopes
+        result["active_scopes"] = active_scopes
+
+    # If a project-scoped scope was granted, add the agent as a project member
+    # (PK (project_id, member_id) makes this naturally idempotent) and sync the
+    # a2a channel. Best-effort: a membership failure never blocks the grant,
+    # which already authorizes the agent for the project.
     if set(granted_scopes) & _PROJECT_SCOPES:
         try:
             pstore = getattr(request.app.state, "project_store", None)
@@ -841,6 +1239,30 @@ async def add_agent_to_project(
                 project_id,
                 exc_info=True,
             )
+    elif reconcile:
+        # Reconciled down to a set with no project-scoped grant: the agent holds
+        # no access here any more, so the member row (and the lead pointer with
+        # it) goes too — otherwise the project keeps listing an agent whose
+        # membership claims an access it does not have.
+        try:
+            pstore = getattr(request.app.state, "project_store", None)
+            if pstore is not None:
+                await pstore.remove_member(project_id, canonical_id)
+                from tinyagentos.projects.a2a import ensure_a2a_channel
+
+                await ensure_a2a_channel(
+                    request.app.state.chat_channels,
+                    pstore,
+                    project_id,
+                    config=getattr(request.app.state, "config", None),
+                )
+        except Exception:  # noqa: BLE001 - membership sync is best-effort
+            logger.warning(
+                "add_agent_to_project: could not drop %s membership for project %s",
+                canonical_id,
+                project_id,
+                exc_info=True,
+            )
     return result
 
 
@@ -857,6 +1279,15 @@ async def assign_agent_to_project(
     agent to another project without re-registering it or minting a new token.
     Writes the per-scope grants bound to the project, the idempotent
     project_members row, and ensures a2a channel membership.
+
+    ``body.scopes`` is the agent's COMPLETE scope set for this project, not a
+    delta (taOS #2148): a grant on this project that the body does not name is
+    revoked, so ``scopes: []`` genuinely removes the agent from the project
+    instead of answering ``granted_scopes: []`` while the access stayed live.
+    Grants on the agent's OTHER projects and the identity itself are untouched.
+    The response reports ``revoked_scopes`` and the read-back ``active_scopes``;
+    if the reconciliation does not land the call fails (500) rather than
+    reporting a success it did not perform.
 
     Owner-or-admin gated on the project like the invite mint route.
     """
@@ -893,8 +1324,155 @@ async def assign_agent_to_project(
         granted_scopes=body.scopes,
         decided_by=user.user_id,
         is_lead=body.is_lead,
+        # The operator's scope list is the complete intent for this project
+        # (the UI sends the checked set), so unlisted grants are removed.
+        reconcile=True,
     )
     return result
+
+
+@router.post("/api/projects/{project_id}/members/revoke-agent")
+async def revoke_agent_scopes_from_project(
+    request: Request,
+    project_id: str,
+    body: RevokeAgentScopesBody,
+    user: CurrentUser = Depends(current_user),
+):
+    """Admin route: revoke the scope grants an agent holds on ONE project (taOS #2148).
+
+    The missing half of assign-agent: a grant could be created but never
+    removed, so least privilege was unachievable and the only removal was the
+    nuclear ``agent_registry_store.revoke`` (which kills the entire identity,
+    every scope on every project).
+
+    Revokes the named scopes for *canonical_id* on *project_id* only: the
+    agent's other projects, its other scopes on this project, and the identity
+    itself are untouched. An omitted/empty ``scopes`` list revokes everything
+    the agent holds on this project. When no project-scoped grant survives, the
+    member row (and the lead pointer) go with it, so the project stops listing
+    an agent that holds nothing.
+
+    Deny by default: owner-or-admin gated like assign-agent. Audit-logged as
+    ``member.grants_revoked`` on the project activity feed (the same surface
+    ``member.removed`` uses). The response reports what the store confirms,
+    never what the request asked for.
+    """
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="forbidden")
+
+    pstore = getattr(request.app.state, "project_store", None)
+    if pstore is None:
+        raise HTTPException(status_code=500, detail="project store unavailable")
+    project = await pstore.get_project(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    require_owner_or_admin(user, project["user_id"])
+
+    unknown = sorted(set(body.scopes) - VALID_SCOPES)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown scopes: {unknown}; valid: {sorted(VALID_SCOPES)}",
+        )
+
+    registry = _get_registry_store(request)
+    if await registry.get(body.canonical_id) is None:
+        raise HTTPException(
+            status_code=404, detail="agent canonical_id not found in the registry"
+        )
+
+    grants_store = _get_grants_store(request)
+    rel_mgr = _get_relationships(request)
+
+    held = {
+        g["scope"]
+        for g in await grants_store.list_grants(body.canonical_id)
+        if g.get("project_id") == project_id
+    }
+    # An explicit list revokes exactly what it names; an omitted/empty list means
+    # "everything on this project". Unknown-but-valid scopes simply match
+    # nothing and are reported as not revoked.
+    targets = sorted(held) if not body.scopes else sorted(set(body.scopes) & held)
+
+    revoked: list[str] = []
+    for scope in targets:
+        if await grants_store.revoke_grant(
+            body.canonical_id, scope, project_id=project_id
+        ):
+            revoked.append(scope)
+
+    # Report the store's answer, not the request: a revoke that silently did
+    # nothing must not read as a revocation.
+    active_scopes = sorted(
+        g["scope"]
+        for g in await grants_store.list_grants(body.canonical_id)
+        if g.get("project_id") == project_id
+    )
+    expected = sorted(held - set(revoked))
+    if active_scopes != expected:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "revocation did not take effect: expected "
+                f"{expected}, store holds {active_scopes}"
+            ),
+        )
+
+    # Drop the relationship permission edge for a scope that no longer exists
+    # anywhere for this identity (the edge is not project-scoped, so a scope the
+    # agent still holds on another project keeps its edge).
+    remaining_scopes = {
+        g["scope"] for g in await grants_store.list_grants(body.canonical_id)
+    }
+    for scope in revoked:
+        if scope not in remaining_scopes:
+            await rel_mgr.revoke_permission(body.canonical_id, "taos-instance", scope)
+
+    # No project-scoped grant left: the member row now claims an access the
+    # agent does not have. Drop it (and the lead pointer with it).
+    membership_removed = False
+    if not (set(active_scopes) & _PROJECT_SCOPES):
+        try:
+            await pstore.remove_member(project_id, body.canonical_id)
+            membership_removed = True
+            from tinyagentos.projects.a2a import ensure_a2a_channel
+
+            await ensure_a2a_channel(
+                request.app.state.chat_channels,
+                pstore,
+                project_id,
+                config=getattr(request.app.state, "config", None),
+            )
+        except Exception:  # noqa: BLE001 - membership sync is best-effort
+            logger.warning(
+                "revoke-agent: could not drop %s membership for project %s",
+                body.canonical_id,
+                project_id,
+                exc_info=True,
+            )
+
+    try:
+        await pstore.log_activity(
+            project_id,
+            user.user_id,
+            "member.grants_revoked",
+            {"canonical_id": body.canonical_id, "scopes": revoked},
+        )
+    except Exception:  # noqa: BLE001 - the revoke already happened; never 500 on the audit write
+        logger.warning(
+            "revoke-agent: could not audit-log the revoke of %s on %s",
+            revoked,
+            project_id,
+            exc_info=True,
+        )
+
+    return {
+        "canonical_id": body.canonical_id,
+        "project_id": project_id,
+        "revoked_scopes": revoked,
+        "active_scopes": active_scopes,
+        "membership_removed": membership_removed,
+    }
 
 
 async def _do_approve(request: Request, request_id: str, body: ApproveBody, user):

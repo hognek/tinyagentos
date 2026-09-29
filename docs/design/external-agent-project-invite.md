@@ -526,8 +526,8 @@ Members panel (`desktop/src/apps/ProjectsApp/ProjectMembers.tsx`):
 
 - An "Invite external agent" action beside the existing add-member control.
 - Mint dialog: scope checkboxes (default checked: `project_tasks`,
-  `a2a_send`, `a2a_receive`; unchecked: `memory_read`, `memory_write`;
-  `files_*` and `tools_execute` not offered in v1). `project_tasks` is shown
+  `a2a_send`, `a2a_receive`; unchecked: `files_read`, `files_write`;
+  `memory_read`, `memory_write` were removed from the grantable vocabulary (no route enforces them; agent tokens are refused on `/api/memory/*` and `/api/user-memory/*` by auth_middleware). `project_tasks` is shown
   checked and DISABLED with a "required for project invites" hint, so the
   operator cannot mint a project invite that would not confer membership. The
   harness name is NOT set here: it is declared by the connecting agent at

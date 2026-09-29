@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import time
-
-from typing import TYPE_CHECKING
+from enum import StrEnum
+from typing import TYPE_CHECKING, Literal
 
 from tinyagentos.projects.ids import new_id
 from tinyagentos.projects.strike_store import StrikeStore
@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 # Ancestor-walk depth cap for get_task_context — mirrors the cycle guard in
 # routes/projects.py's parent-chain check.
 _MAX_ANCESTRY_DEPTH = 50
+
+
+class TaskStatus(StrEnum):
+    OPEN = "open"
+    CLAIMED = "claimed"
+    CLOSED = "closed"
 
 TASK_SCHEMA = """
 CREATE TABLE IF NOT EXISTS project_tasks (
@@ -290,18 +296,19 @@ class ProjectTaskStore(ProjectsDBStore):
         parent_task_id: str | None = None,
         element_id: str | None = None,
     ) -> dict:
-        tid = new_id("tsk")
         now = time.time()
         async with self._tx():
-            await self._db.execute(
+            tid = await self._insert_with_retry(
                 """INSERT INTO project_tasks
                    (id, project_id, parent_task_id, title, body, status, priority, labels,
                     assignee_id, element_id, created_by, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, 'open', ?, ?, ?, ?, ?, ?, ?)""",
                 (
-                    tid, project_id, parent_task_id, title, body, priority,
+                    new_id("tsk"), project_id, parent_task_id, title, body, priority,
                     json.dumps(labels or []), assignee_id, element_id, created_by, now, now,
                 ),
+                id_index=0,
+                new_id_fn=lambda: new_id("tsk"),
             )
         new_task = await self.get_task(tid)
         await self._publish(project_id, "task.created", {"id": new_task["id"], "task": new_task})
@@ -320,7 +327,7 @@ class ProjectTaskStore(ProjectsDBStore):
     async def list_tasks(
         self,
         project_id: str,
-        status: str | None = None,
+        status: TaskStatus | None = None,
         parent_task_id: str | None = None,
         element_id: str | None = None,
     ) -> list[dict]:
@@ -356,7 +363,7 @@ class ProjectTaskStore(ProjectsDBStore):
         body: str | None = None,
         priority: int | None = None,
         labels: list[str] | None = None,
-        status: str | None = None,
+        status: TaskStatus | None = None,
         assignee_id: str | None | object = _UNCHANGED,
         parent_task_id: str | None | object = _UNCHANGED,
         element_id: str | None | object = _UNCHANGED,
@@ -430,6 +437,80 @@ class ProjectTaskStore(ProjectsDBStore):
         existing = await self.get_task(task_id)
         if existing is not None:
             await self._publish(existing["project_id"], "task.updated", {"id": task_id, "patch": patch})
+
+    async def assign_if_unassigned(self, task_id: str, assignee: str, actor: str) -> bool:
+        now = time.time()
+        async with self._tx():
+            cursor = await self._db.execute(
+                """UPDATE project_tasks
+                   SET assignee_id = ?, updated_at = ?
+                   WHERE id = ? AND status = 'open'
+                     AND claimed_by IS NULL
+                     AND (assignee_id IS NULL OR lower(trim(assignee_id)) IN ('', '@any', '@all', 'unassigned', 'none'))""",
+                (assignee, now, task_id),
+            )
+            changed = cursor.rowcount == 1
+        if changed:
+            existing = await self.get_task(task_id)
+            if existing is not None:
+                await self._publish(existing["project_id"], "task.updated", {"id": task_id, "patch": {"assignee_id": assignee}})
+            await self._record_audit(
+                task_id, "task.assigned", actor, "open", "open",
+                project_id=existing["project_id"] if existing else "",
+            )
+        return changed
+
+    async def unassign_if(self, task_id: str, expected_assignee: str, actor: str) -> bool:
+        now = time.time()
+        async with self._tx():
+            cursor = await self._db.execute(
+                """UPDATE project_tasks
+                   SET assignee_id = NULL
+                   WHERE id = ? AND assignee_id = ? AND claimed_by IS NULL AND status = 'open'""",
+                (task_id, expected_assignee),
+            )
+            changed = cursor.rowcount == 1
+        if changed:
+            existing = await self.get_task(task_id)
+            if existing is not None:
+                await self._publish(existing["project_id"], "task.updated", {"id": task_id, "patch": {"assignee_id": None}})
+            await self._record_audit(
+                task_id, "task.unassigned", actor, "open", "open",
+                project_id=existing["project_id"] if existing else "",
+            )
+        return changed
+
+    async def count_open_load(self, assignee_ids: list[str]) -> int:
+        if not assignee_ids:
+            return 0
+        placeholders = ",".join("?" for _ in assignee_ids)
+        sql = (
+            f"SELECT COUNT(*) FROM project_tasks "
+            f"WHERE (claimed_by IN ({placeholders}) AND status = 'claimed') "
+            f"OR (assignee_id IN ({placeholders}) AND status = 'open' AND claimed_by IS NULL)"
+        )
+        params = assignee_ids + assignee_ids
+        async with self._read(sql, params) as cur:
+            row = await cur.fetchone()
+        return row[0] if row else 0
+
+    async def count_open_load_by_project(self, assignee_ids: list[str]) -> dict[str, int]:
+        if not assignee_ids:
+            return {}
+        placeholders = ",".join("?" for _ in assignee_ids)
+        sql = (
+            f"SELECT project_id, COUNT(*) FROM project_tasks "
+            f"WHERE (claimed_by IN ({placeholders}) AND status = 'claimed') "
+            f"OR (assignee_id IN ({placeholders}) AND status = 'open' AND claimed_by IS NULL)"
+            f" GROUP BY project_id"
+        )
+        params = assignee_ids + assignee_ids
+        result: dict[str, int] = {}
+        async with self._read(sql, params) as cur:
+            rows = await cur.fetchall()
+            for row in rows:
+                result[row[0]] = row[1]
+        return result
 
     async def held_task(self, claimer_id: str) -> str | None:
         """Return the id of the active ('claimed') task this agent currently
@@ -771,14 +852,15 @@ class ProjectTaskStore(ProjectsDBStore):
             t = await self.get_task(tid)
             if t is None or t["project_id"] != project_id:
                 raise ValueError(f"task not in project: {tid}")
-        rid = new_id("rel")
         now = time.time()
         async with self._tx():
-            await self._db.execute(
+            rid = await self._insert_with_retry(
                 """INSERT INTO task_relationships
                    (id, project_id, from_task_id, to_task_id, kind, created_by, created_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (rid, project_id, from_task_id, to_task_id, kind, created_by, now),
+                (new_id("rel"), project_id, from_task_id, to_task_id, kind, created_by, now),
+                id_index=0,
+                new_id_fn=lambda: new_id("rel"),
             )
         await self._publish(project_id, "relationship.added", {"from": from_task_id, "to": to_task_id, "kind": kind})
         return {
@@ -795,7 +877,7 @@ class ProjectTaskStore(ProjectsDBStore):
     async def list_relationships(
         self,
         task_id: str,
-        direction: str = "from",
+        direction: Literal["from", "to"] = "from",
     ) -> list[dict]:
         if direction not in ("from", "to"):
             raise ValueError(f"invalid direction: {direction}")
@@ -932,14 +1014,15 @@ class ProjectTaskStore(ProjectsDBStore):
                 row = await cur.fetchone()
             if row is None or row[0] != task_id:
                 raise ValueError("replies_to_comment_id not in this task")
-        cid = new_id("cmt")
         now = time.time()
         async with self._tx():
-            await self._db.execute(
+            cid = await self._insert_with_retry(
                 """INSERT INTO task_comments
                    (id, task_id, author_id, body, replies_to_comment_id, created_at)
                    VALUES (?, ?, ?, ?, ?, ?)""",
-                (cid, task_id, author_id, body, replies_to_comment_id, now),
+                (new_id("cmt"), task_id, author_id, body, replies_to_comment_id, now),
+                id_index=0,
+                new_id_fn=lambda: new_id("cmt"),
             )
         new_comment = {
             "id": cid, "task_id": task_id, "author_id": author_id, "body": body,
@@ -977,14 +1060,15 @@ class ProjectTaskStore(ProjectsDBStore):
         task = await self.get_task(task_id)
         if task is None:
             raise ValueError(f"task not found: {task_id}")
-        cid = new_id("cki")
         now = time.time()
         async with self._tx():
-            await self._db.execute(
+            cid = await self._insert_with_retry(
                 """INSERT INTO task_checklist_items
                    (id, task_id, text, done, verified, reported, archived, created_by, created_at, updated_at)
                    VALUES (?, ?, ?, 0, 0, 0, 0, ?, ?, ?)""",
-                (cid, task_id, text, created_by, now, now),
+                (new_id("cki"), task_id, text, created_by, now, now),
+                id_index=0,
+                new_id_fn=lambda: new_id("cki"),
             )
         async with self._read(
             "SELECT * FROM task_checklist_items WHERE id = ?", (cid,)

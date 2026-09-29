@@ -14,12 +14,18 @@ interface DecisionEventsState {
   answeredEpoch: number;
   lastAnsweredId: string | null;
   recordAnswered: (decisionId: string) => void;
+  recordNote: (decisionId: string) => void;
 }
 
 export const useDecisionEventsStore = create<DecisionEventsState>((set, get) => ({
   answeredEpoch: 0,
   lastAnsweredId: null,
   recordAnswered: (decisionId: string) =>
+    set({
+      answeredEpoch: get().answeredEpoch + 1,
+      lastAnsweredId: decisionId,
+    }),
+  recordNote: (decisionId: string) =>
     set({
       answeredEpoch: get().answeredEpoch + 1,
       lastAnsweredId: decisionId,

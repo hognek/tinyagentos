@@ -137,6 +137,17 @@ class PeerOutboxStore(BaseStore):
             row = await cursor.fetchone()
         return row[0] if row else 0
 
+    async def drain_for_contact(self, contact_id: str) -> list[dict]:
+        """Return all due rows for *contact_id* without deleting them.
+
+        Returns the dequeued rows so a caller can attempt delivery.  Rows
+        remain queued until ``mark_sent`` or ``mark_failed`` is called for
+        each row after a delivery attempt.  Called when a peer link becomes
+        active (``last_seen_at`` refresh) so queued envelopes are surfaced
+        for delivery; actual delivery is the caller's responsibility.
+        """
+        return await self.dequeue_due(contact_id, limit=100)
+
 
 # ---------------------------------------------------------------------------
 # helpers

@@ -3,7 +3,7 @@ import { Search, Filter, X, Bell, BellOff, CheckCheck, Trash2, Archive } from "l
 import { useNotificationStore, type Notification } from "@/stores/notification-store";
 import { useProcessStore } from "@/stores/process-store";
 import { getApp } from "@/registry/app-registry";
-import { markServerRead, markAllServerRead, mapRow, type ServerNotificationRow } from "@/lib/server-notifications";
+import { markServerRead, markAllServerRead, mapRow, type ServerNotificationRow, fetchServerNotifications } from "@/lib/server-notifications";
 import {
   getPushState,
   enableNotificationsPush,
@@ -13,6 +13,7 @@ import {
 import { SetupChecklist } from "@/components/SetupChecklist";
 import { ConsentActions, consentPayload } from "@/components/ConsentActions";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui";
+import { useOsEvents } from "@/hooks/use-os-events";
 
 function formatTime(ts: number): string {
   const delta = Date.now() - ts;
@@ -212,6 +213,12 @@ export function NotificationsApp({ windowId: _windowId, section: initialSection 
     [notifications],
   );
 
+  const { stale } = useOsEvents(["notification.added"], () => {
+    void fetchServerNotifications().then((items) => {
+      useNotificationStore.getState().mergeServerNotifications(items);
+    });
+  });
+
   const handleMarkRead = (id: string) => {
     markRead(id);
     void markServerRead(id);
@@ -239,6 +246,9 @@ export function NotificationsApp({ windowId: _windowId, section: initialSection 
         <TabsList className="shrink-0 px-3 pt-2 border-b border-white/5 bg-transparent justify-start gap-1 h-auto pb-0">
           <TabsTrigger value="notifications" className="text-xs pb-1.5">Notifications</TabsTrigger>
           <TabsTrigger value="archive" className="text-xs pb-1.5">Archive</TabsTrigger>
+          {stale && (
+            <span className="text-[11px] text-shell-text-tertiary ml-2" aria-label="live updates paused">paused</span>
+          )}
         </TabsList>
 
         <TabsContent value="notifications" className="flex-1 overflow-hidden mt-0">

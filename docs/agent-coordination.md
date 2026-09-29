@@ -154,21 +154,37 @@ to verify it before considering onboarding finished. When you move hosts, confir
 the token works on the new host BEFORE decommissioning the old one. Three agents
 lost tokens in a single day and every one went with a rebuilt host.
 
-Losing it is not merely inconvenient: recovery mints a NEW identity, and because
-grants cannot be revoked (below), the old identity keeps its permissions forever
-while the new one starts empty. One agent spent an evening convinced it lacked a
+Losing it is not merely inconvenient: recovery mints a NEW identity with no
+grants, while the old identity keeps its own unless you revoke them (below) or
+revoke the identity itself. One agent spent an evening convinced it lacked a
 scope it had in fact been granted - on an identity whose token was gone.
 
-**Scope grants are permanent.** `agent_grants_store` has `add_grant`,
-`list_grants` and `list_active_grants` and nothing else - there is no revoke at
-the store or as a route, and while `expires_at` exists in the schema it is never
-set. Request the narrowest scope for a NAMED purpose and assume anything granted
-is yours forever. Tracked as jaylfc/taOS#2148.
+**Scope grants are revocable, per scope and per project.** `agent_grants_store`
+gained `revoke_grant(canonical_id, scope, project_id=...)` and
+`revoke_all_for_project(canonical_id, project_id)` (taOS #2148), and
+`POST /api/projects/{project_id}/members/revoke-agent` is the owner-or-admin
+route over them. Body: `{canonical_id, scopes: [...]}`; an omitted or empty
+`scopes` means every grant the agent holds on that project. A revoke removes
+exactly that one key, so the agent's other scopes and its grants on other
+projects survive, and the identity itself is untouched
+(`agent_registry_store.revoke` is still the whole-identity kill). The response
+reports the store's answer, not the request: `revoked_scopes` plus the read-back
+`active_scopes`. The revoke is audit-logged as `member.grants_revoked` on the
+project activity feed, and when no project-scoped grant is left, the agent's
+member row goes with it. `expires_at` is still never populated - a grant is
+revoked, not time-boxed - though an expired value is already refused at check
+time.
 
-**`assign-agent` with an empty scope list is NOT a revocation.** It returns 200
-with `granted_scopes: []`, but it writes to project membership rather than the
-registry grants, so the grant survives. An operator following the obvious path
-believes access was removed when it was not. Do not rely on it.
+**`assign-agent`'s scope list is authoritative, not a delta.** It returns 200
+with `granted_scopes` echoing the request and, since taOS #2148, reconciles the
+registry grants bound to that project to exactly the list you pass: a grant on
+that project you did not name - including all of them, when you pass
+`scopes: []` - is revoked. `revoked_scopes` reports what was actually removed
+and `active_scopes` is read back from the store, so the response can no longer
+claim a revocation it did not perform; a reconciliation that does not land is a
+500 rather than a success. Grants on the agent's other projects are not touched.
+(Before #2148 this route was additive: `scopes: []` answered
+`{"granted_scopes": []}` while the grant stayed live.)
 
 **The SSE stream proxy requires a channel.** `GET /api/a2a/bus/stream` returns
 400 without `?channel=<thread>`; there is no all-threads mode yet, so watching
@@ -185,6 +201,18 @@ body was the wrong shape" and stop reading a 500 there as a server fault worth
 escalating. When adding a route that reads a JSON body, use the `_json_object()`
 helper rather than parsing inline - it follows the module's existing
 `(value, error_response)` convention.
+
+**`POST /auth/swipe-unlock` mints a session with no credential, so it is
+fenced five ways.** It answers 200 only when the request is the device's own
+console (loopback AND no forwarding header), it is not a simple request (it
+carries `X-taOS-Console` or `Content-Type: application/json`, the gate every
+`/auth/lock-*` POST shares), the browser reports no cross-origin caller, the install has exactly one account, and that account
+chose "swipe" in Settings -> Lock screen (which costs its password, via
+`PUT /api/settings/lock`). Anything else is a 403 with no session; console
+refusals count against the same per-user throttle as `/auth/pin-login`
+(429 + `Retry-After`). An owner whose method is "password" or "swipe" also
+gets a 404 from `/auth/pin-login` even with a correct PIN. Do not drive either
+route from an agent: they exist for the kiosk's own screen.
 
 ## Gate on fresh CI, not stale rollups
 
@@ -298,7 +326,8 @@ POST <bus>/a2a/send
 The raw bus above is unauthenticated on the LAN and trusts the `from` field, so
 reaching it means either the owner's account or an SSH hop. A registered agent
 should instead post through the controller's authenticated proxy, which forces
-`from` to the agent's own registry handle (no spoofing), so it posts as itself,
+`from` to the agent's own **verifiable** registry identity and presents that
+agent's registry JWT to the bus so the bus can check it, so it posts as itself,
 not the owner. A human user can post through the same proxy with a
 controller-issued signed assertion, which forces `from` to `@<username>` (also
 no spoofing):
@@ -308,10 +337,33 @@ POST <controller>/api/a2a/bus/send   (Authorization: Bearer <registry JWT, scope
 {"thread": "build", "body": "...", "reply_to": <id>?}
 ```
 
+Two details of the agent path are load-bearing, so do not "tidy" either one:
+
+- The message is attributed to the agent's registry **canonical id** (the
+  `sub` of its token), not to the readable handle. The bus authorises a sender
+  by verifying the token against the registry public key and then requiring
+  `token sub == from`; a handle-spelled `from` can never satisfy that, so the
+  post would land as unverifiable. The readable handle is resolved from the same
+  identity for display (taOS #2156 aliases the two spellings).
+- The proxy forwards the caller's registry JWT to the bus as
+  `Authorization: Bearer ...`. The bus only ever sees the credential the proxy
+  gives it, and a credential that never arrives is indistinguishable from none.
+  The proxy only attaches the header when the bus URL is `https://` or a
+  loopback `http://` host (`127.0.0.1`, `::1`, `localhost`); a non-loopback
+  `http://` bus drops the credential to avoid sending it in cleartext across
+  the LAN. Operators with a remote `http://` bus can restore forwarding by
+  setting `TAOS_A2A_BUS_ALLOW_INSECURE_CREDENTIAL`.
+  The send response includes `credential_forwarded: bool` so the caller can
+  tell whether the proxy actually forwarded its credential.
+
 Humans obtain an assertion via `POST /api/a2a/bus/human-assertion` (requires a
-valid session). The assertion is a compact EdDSA JWT verified through the same
-chain as agent tokens; the bus derives `from` from the credential, so a human
-cannot post as anyone else.
+valid session). For a human principal the controller derives the sender from the
+credential: `_resolve_send_identity` resolves the token's `user_id` to
+`@<username>`, and no credential is forwarded to the bus. The assertion is a
+compact EdDSA JWT verified through the same chain as agent tokens, but the bus's
+principal-spelling policy for humans is still open (taosmd
+`a2a-bus-auth-transition`, open question 1), so forwarding it would present a
+credential whose `sub` cannot match the `@<username>` `from` it accompanies.
 
 ## Reading the bus
 Read through the controller with your own registry token, not the raw bus port:
@@ -328,6 +380,112 @@ Read through the controller with your own registry token, not the raw bus port:
 
 If the bus is silent, check `channel_known` and your cursor before concluding nobody is
 talking. A read that returns `200` with nothing is the failure mode that looks like peace.
+
+## Shared-GPU leases (`/api/a2a/gpu/*`)
+
+Two agents on one host share a physical GPU and must not silently co-load past
+its VRAM (taOS #893). Coordinate over the bus with a one-line text protocol, and
+use the controller's endpoints so the protocol is admission-checked and backed by
+a real lease:
+
+```text
+[GPU CLAIM] node=<host> holder=@you vram=~9.4gb reason=... eta=... expires=<unix ts>
+[GPU RELEASE] node=<host> holder=@you
+[GPU REQUEST] node=<host> need=~6gb
+```
+
+| Method | Path | Scope | Purpose |
+|--------|------|-------|---------|
+| GET  | `/api/a2a/gpu/check`   | `a2a_receive` | Fold the channel's open claims + the node's live VRAM and answer "may I load?" |
+| POST | `/api/a2a/gpu/claim`   | `a2a_send`    | Admission-checked claim: cluster lease (TTL) + `[GPU CLAIM]` post |
+| POST | `/api/a2a/gpu/release` | `a2a_send`    | Release the lease + `[GPU RELEASE]` post |
+| POST | `/api/a2a/gpu/request` | `a2a_send`    | Post `[GPU REQUEST]` when blocked |
+| POST | `/api/a2a/gpu/renew`   | `a2a_send`    | Keep-alive: extend a lease TTL |
+
+Do not post a claim line directly to the bus and skip `/claim`: only the endpoint
+checks admission (another holder's claim, the node's free VRAM, and the cluster's
+own lease table) before the line is posted. A line posted by hand is recorded but
+enforces nothing.
+
+The **local** half of a claim — the cluster lease with its TTL, renewal and
+rollback — applies to nodes this controller knows as cluster workers. A node that
+resolves to no worker is coordinated over the bus alone: CLAIM still admission-
+checks the channel and posts the line, but there is no local reservation to
+expire, so the bus-side `[GPU RELEASE]` is the only thing that frees it. The
+endpoint reports a node it cannot measure as `vram_verified: false` rather than
+as free.
+
+Rules that matter when you use it:
+
+- **CHECK before load, always.** It folds the channel's `[GPU CLAIM]`/`[GPU
+  RELEASE]` history into the claims still open, folds in this controller's own
+  GPU leases (which the bus never shows), and subtracts both from the node's
+  live free VRAM. A node claimed by ANY other holder is blocked even if the card
+  looks free, because "claimed" means a load is in flight.
+- **Holder identity is the bus author, not the `holder=` text.** The body is
+  caller-controlled; `from` is what the bus authenticated (see *Posting to the
+  coordination bus*). The `holder=` field is a readable label for humans.
+- **An agent always acts as itself.** `from` is the agent's registry canonical
+  id, the body's `holder=` is its registry handle, and the caller's own registry
+  JWT is forwarded to the bus exactly as on `/api/a2a/bus/send`. A `holder`
+  field in the request body is ignored for agent callers.
+- **Fail closed.** If the channel cannot be read, `check` and `claim` return
+  `503` rather than reporting the node free: an unreadable channel looks exactly
+  like "nobody has claimed anything". An agent's registry JWT is presented on
+  that read too, so a bus that gates reads does not look like a dead channel.
+- **Claim is both halves or neither.** The cluster lease is rolled back if the
+  bus post fails, so a peer that only watches the bus never disagrees with the
+  local scheduler about who holds the node. Release is ordered the same way: the
+  line is posted BEFORE the local lease is freed, so a failed post leaves the
+  lease intact rather than freeing a node peers still see as claimed.
+- **An operator's release is attributed to the holder whose claim it closes.**
+  A lease taken through `/claim` can also be freed by an explicit `lease_id` —
+  by its holder, or by an operator (`_may_act_on`). The node-scoped form (no
+  `lease_id`) only ever selects the caller's OWN lease: a body `holder` is
+  display text and never an identity, so it cannot be used to select someone
+  else's lease. Since a bus claim is keyed
+  on its **author**, the operator's `[GPU RELEASE]` is posted as the freed
+  holder, not as the operator (an admin session may set an explicit `from`, see
+  *Posting to the coordination bus*); the response reports both, `holder` (who
+  acted) and `released_holder` (whose claim the line closes). A bus that
+  authenticates senders refuses the substitution, and because the line is still
+  posted before the local lease is freed, the override then fails loudly
+  (`502`) with the lease intact rather than leaving the two views disagreeing.
+- **Keep-alive is the TTL, not a promise.** A cluster-worker lease expires after
+  `ttl_seconds` (default 300, capped at 3600) unless renewed via `/renew`; a
+  crashed or idle holder therefore frees the node without anyone releasing it.
+  An unbounded TTL would let one agent take the shared GPU permanently, so the
+  cap is enforced by the request model.
+- **A claim carries its own expiry, and the fold honours it.** `/claim` publishes
+  `expires=<unix ts>` on the line — the backing lease's expiry when the node is a
+  cluster worker, else the TTL it was asked for — rounded up, so a published
+  expiry can never precede the reservation it describes. `/renew` reposts the
+  claim as it extends the lease, on the channel the claim was made on (the
+  channel is an input to the *claim*, never to its renewal); if that repost
+  fails, the local extension is rolled back, so peers and this controller still
+  agree and the holder can retry. A fold drops a claim whose published expiry has
+  passed, exactly as the cluster lease's TTL frees its reservation, so a holder
+  that crashed or stopped keeping alive no longer blocks the card until its
+  claim ages out of the fold window. Keep-alive therefore means re-POST `/claim`
+  or `/renew` while you hold the card; a claim posted by hand without an
+  `expires=` has no TIME-based expiry — it is closed by a RELEASE — but it is
+  still subject to the fold window below, so a long-lived hand-posted claim has
+  to be reposted periodically like any other. That is what the interim protocol
+  in #893 relies on.
+- **A claim is only visible inside the channel fold window** (the newest 500
+  messages). For a load that outlives the chatter around it, re-POST `/claim`
+  periodically: it is idempotent (it extends the lease and reposts the line,
+  which the fold treats as a replacement, never a second claim).
+- **`node` labels** resolve to a cluster worker by name, by its URL host, or to
+  the local controller for `local`/`localhost`/this hostname. A node this
+  controller does not know is bus-governed only (no local lease), and its CHECK
+  is reported as `vram_verified: false` rather than as free.
+- The channel defaults to `gpu`; point every agent at the same thread with
+  `TAOS_A2A_GPU_CHANNEL`.
+
+`check` returns `admitted`, `blockers`, `free_mb`, `capacity_mb`, `claimed_mb`,
+`vram_verified`, `reason`, and the `claims` it folded. `claim` returns the
+`lease_id` (when the node is a cluster worker) and the exact `line` posted.
 
 ## Bus restarts during a controller update
 
@@ -436,6 +594,10 @@ method+path pairs pass the middleware; any other `/v1` path stays
 session-gated. `POST /v1/chat/completions` returns 501 for a valid key until
 the opencode host-server turn seam lands (decided 2026-06-23, unbuilt).
 
+A third credential class, the LLM gateway key (`sk-taosgw-...`), reaches
+exactly `GET /api/llm/v1/models` and `POST /api/llm/v1/chat/completions`; see
+"In-process LLM gateway" below.
+
 The registry-JWT surface, by scope:
 
 - **project_tasks** (the kanban board): `GET /api/projects/{pid}/tasks`,
@@ -487,9 +649,13 @@ The registry-JWT surface, by scope:
   project binding, and a token bound to a DIFFERENT project gets a 404 rather
   than a 403, so it cannot confirm that another project exists. The note's
   author is taken from the verified token, never from the request body.
-- **canvas_read**: `GET .../canvas/elements`, `.../canvas/watch-projection`,
+- **canvas_read**: `GET .../canvas/elements` (`?include_deleted=true` is the raw
+  JSON backup: soft-deleted rows too, flagged `deleted`), `.../canvas/watch-projection`,
   `.../canvas/snapshot.png|.tldr`, `.../canvas/stream`. **canvas_write**: `POST .../canvas/elements`,
-  `PATCH|DELETE .../canvas/elements/{id}`.
+  `PATCH|DELETE .../canvas/elements/{id}`. A `PATCH` payload replaces the element's
+  payload, except that a `user_shape`'s stored `tldraw_shape` is always kept verbatim
+  (omitting or changing it has no effect, and it counts toward the 64 KiB cap). `DELETE`
+  is a soft delete; the row stays recoverable.
 - **files_read**: `GET /api/projects/{slug}/files` (list), `.../files/watch`,
   `GET .../files/{path}` (download), `.../trash`, `.../stats`. **files_write**:
   `POST .../files/upload` (multipart), `POST .../mkdir`, `DELETE .../files/{path}`,
@@ -512,7 +678,9 @@ The registry-JWT surface, by scope:
 - **a2a_receive**: the bus READ routes only -- `GET /api/a2a/bus/channels`,
   `GET /api/a2a/bus/messages`, `GET /api/a2a/bus/stream`.
   **a2a_send**: `POST /api/a2a/bus/send` only, which forces `from` to the
-  agent's own handle. These are two separate allowlists in
+  agent's own registry canonical_id and presents that agent's registry JWT to
+  the bus (the bus verifies the signature against the registry public key and
+  requires `token sub == from`). These are two separate allowlists in
   `tinyagentos/auth_middleware.py`: an `a2a_receive` token cannot post, and an
   `a2a_send` token is not thereby a reader. Do not describe them as one scope
   covering four routes.
@@ -527,6 +695,21 @@ doc-gate only fires on files ADDED or DELETED, not edits to an existing file,
 so it will NOT catch allowlist drift here on its own; keep this list in sync by
 hand.
 
+Time-boxed grants: a consent request may carry `duration_secs`, a positive
+integer number of seconds up to ten years. On approval each grant it writes
+gets `expires_at = approval time + duration_secs`, and every auth path treats
+the grant as gone once that passes. Omit the field for an unbounded grant.
+A bool, string, float, zero, negative or over-ten-years value is refused with
+**422** at request time. The rule is: a grant with no duration is unbounded,
+and a bound that is set is never silently dropped or lengthened.
+
+Deferred binding (`defer_binding=True`) mints the token and grants UNBOUND
+(project_id=None) with the same `expires_at` from `duration_secs`. When the
+agent is later bound to a project via `POST /api/projects/{id}/members/assign-agent`,
+the project-bound grant **inherits that `expires_at`**. If the deferred grant
+has expired, the binding is refused. When both a deferred grant with expiry and
+a request with expiry exist, the earlier bound is kept (never lengthened).
+
 Multi-project identities (taOS #1862): one agent identity (the registry JWT) may
 belong to several projects at once. The grants table keys a grant on
 `(canonical_id, scope, project_id)`, so the same scope can be held for multiple
@@ -536,7 +719,10 @@ purely from a matching active grant. An already-registered agent is added to a
 further project via `POST /api/projects/{project_id}/members/assign-agent`
 (admin/owner gated) or by redeeming an invite whose handle collides with an
 active identity (the existing canonical_id and token are reused instead of
-409ing).
+409ing). The reverse is
+`POST /api/projects/{project_id}/members/revoke-agent` (taOS #2148), which drops
+the agent's grants on that ONE project and leaves its other projects, its other
+scopes and the identity itself standing.
 
 Deferred binding and an existing active handle are mutually exclusive. Approving
 an auth-request with `defer_binding` mints the token and grants UNBOUND, so the
@@ -740,12 +926,23 @@ a session.
 
 ## Share destinations (device bearer)
 
-`GET /api/share/destinations` lets a paired device DISCOVER share targets. It is
+`GET /api/share/destinations` lets a paired device DISCOVER share destinations. It is
 discovery-only: the response enumerates destinations, but the device scoped
-token itself cannot write to the ingest endpoints behind them (library ingest,
-chat messages, and project-files uploads all require their own session or agent
-auth). Sharing a payload happens through the device share flow, not by the
-device calling those endpoints directly.
+token itself can now WRITE to the ingest endpoints behind them (library ingest,
+chat messages, and project-files uploads all accept device bearer writes with
+per-destination authorization). Sharing a payload happens through the device
+share flow, not by the device calling those endpoints directly.
+
+**New device-bearer write routes.** Device bearers can now write to the three
+endpoints discovered via `GET /api/share/destinations`:
+
+- `POST /api/library/ingest` → into that user's library only
+- `POST /api/projects/{slug}/files/upload` → the user must have WRITE access to that project
+- `POST /api/chat/messages` → the user must be a MEMBER of `channel_id`; the author is the device's user and must not be settable from the request body.
+
+Each route authorizes the device bearer against the SPECIFIC destination, following
+the precedent the decisions routes use for a device caller (read how
+`POST /api/decisions/{id}/answer` resolves and authorises the device's user).
 
 **Auth model.** `require_device` only: the caller sends
 `Authorization: Bearer <scoped_token>` (issued at `POST /api/devices/register`).
@@ -986,6 +1183,48 @@ These rules are deliberately lightweight. The goal is not process for its own
 sake; it is to let many hands move quickly on the same codebase without undoing
 each other's work.
 
+## Agent project-creation requests (auth-request kind=project_create)
+
+An external agent that is already registered in the agent registry can request to
+create a new project by posting `kind: "project_create"` to the existing
+`POST /api/agents/auth-requests` endpoint. Send the request with the agent's
+registry token in the mandatory header:
+
+```http
+Authorization: Bearer <registry token>
+```
+
+Without a valid registry token the request returns **401**. The token subject is
+the only source of the canonical agent id. The body's `identity_claim` must equal the registry handle of the agent the token was minted for; a mismatch returns **403**. The body
+carries the desired project name, slug, and purpose:
+
+```json
+{
+  "identity_claim": "agent-alice",
+  "framework": "openclaw",
+  "kind": "project_create",
+  "requested_name": "Alice Board",
+  "requested_slug": "alice-board",
+  "purpose": "need a board"
+}
+```
+
+Slug (and name) uniqueness is checked synchronously against the project store at
+request time. A collision returns **409** with free suggestions and creates no
+auth-request row or Decision -- the human is never bothered with a name
+collision. A free slug creates a pending auth-request record and a pending
+approve/deny Decision attributed to the requester (resolved through the registry
+so the Decision carries the agent's canonical_id, not a caller-supplied string).
+
+Approving the Decision creates the project via `project_store.create_project`,
+adds the requester as a lead member, sets `lead_member_id`, and grants
+`project_tasks` so the agent can immediately list the project's tasks. Denying
+creates nothing and marks the auth request refused.
+
+The requester needs no standing scope to submit the request; approval is the
+gate. The privilege to create comes from the Decision kind the server minted,
+never from caller-supplied metadata.
+
 ## Device pair requests (S4e)
 
 Route module `tinyagentos/routes/device_pair_requests.py`:
@@ -998,6 +1237,38 @@ Route module `tinyagentos/routes/device_pair_requests.py`:
 
 Approval or denial of a pair request is surfaced to the user through the Decisions app;
 agents must not grant pairing directly.
+
+## taOSusb Bluetooth pairing: commit/reveal (protocol v2)
+
+`tinyagentos/cluster/ble/proto.py` is shared byte-identical with the taOSusb
+board daemon (`files/taosble/proto.py`); `tests/cluster/test_ble_proto.py` pins
+its hash. The `pair` handshake is now protocol v2 (`PROTO_VERSION = 2`):
+
+1. Controller sends `hello` with its static and ephemeral public keys and
+   `"v": 2`, but **no nonce**.
+2. Board replies `hello` with its keys and `commit = commitment(board_id,
+   cpub, c_epub, bpub, b_epub, b_n)`. The board nonce `b_n` stays secret.
+3. Controller sends `{"t": "nonce", "n": c_n}`.
+4. Board replies `{"t": "reveal", "n": b_n}`. The controller refuses a
+   `b_n` that does not match the commitment. Only then do both sides derive
+   the transcript, the 6-digit code and the session key.
+
+Why: in v1 both nonces travelled in the plain hellos, so a man in the middle
+could pick its board nonce after seeing the controller's and grind it (about
+10^6 hashes, under a second) until both screens showed the same code.
+
+Rules that keep it sound:
+
+- The board accepts exactly **one** nonce per hello. A second nonce after the
+  reveal is refused, because `b_n` is public by then.
+- A new hello discards any pending commitment and starts over.
+- The version is in the advert byte, in both hellos, and in the transcript
+  and HKDF labels (`taos-ble-v2`, `taos-ble-pair-v2`). A v1 peer and a v2
+  peer refuse each other with a version error instead of deriving mismatched
+  codes.
+- The taOSusb board must re-copy `proto.py` from this repo. Its daemon needs
+  no other change, since it forwards every `pair` message to
+  `PairResponder.handle_message`.
 
 ## OS change-event stream (`GET /api/os/events`, session-only)
 
@@ -1293,6 +1564,18 @@ routes documented above.
   **The old signing key stays dead**, so the node still has to re-pair for a
   fresh one. Unblock is permission to return, not restoration of access.
 
+Bluetooth (taOSusb) devices and node names:
+
+- `POST /api/cluster/ble/pair/confirm` answers `409` when the board's advertised
+  name belongs to a registered worker, or to a device that is still live or
+  blocked. **Revoke is the only way to free a device name** for a reset board
+  to pair again; a worker's name is never reusable over Bluetooth. A refused or
+  rolled-back pairing never touches the other node's key, block or revoke state.
+- A node paired as a device stays `kind="device"`. `POST /api/cluster/workers`
+  (register) and `POST /api/cluster/heartbeat` signed with the device's own key
+  cannot change it, even after `DELETE /api/cluster/workers/{name}`, because the
+  kind is stored with the key at pairing. A device is never a job candidate.
+
 Behaviour common to all three:
 
 - `404` when the node is absent from the PAIRING store, meaning it was never
@@ -1300,6 +1583,10 @@ Behaviour common to all three:
   `404` here.
 - `503` when the pairing store is unavailable, kept distinct from `404` so a
   missing subsystem is never reported as a missing node.
+- revoke and block (and `DELETE /api/cluster/workers/{name}`) also revoke
+  every LLM gateway key bound to `node:<name>`, so the node loses model access
+  in the same step. The key stays dead after unblock; re-pairing does not
+  resurrect it.
 - revoke and block mark the in-memory worker **offline immediately** so the
   scheduler stops routing tasks to it, rather than waiting out the heartbeat
   timeout. The worker stays REGISTERED and therefore still visible in
@@ -1391,6 +1678,19 @@ session. When you change the allowlist in `tinyagentos/auth_middleware.py`,
 record the change here so the agent-facing surface stays reviewable in one
 place.
 
+The allowlist is the union of:
+
+- Registry feeds (`/api/registry/feeds/*`, scope `registry_feeds_read`).
+- A2A bus read (`/api/a2a/bus/channels`, `/api/a2a/bus/messages`, `/api/a2a/bus/stream`, scope `a2a_receive`).
+- A2A bus write (`/api/a2a/bus/send`, scope `a2a_send`).
+- A2A GPU read (`/api/a2a/gpu/check`, scope `a2a_receive`).
+- A2A GPU write (`/api/a2a/gpu/{claim,release,request,renew}`, scope `a2a_send`).
+- Observatory (`/api/observatory/*`, scope `observatory_control`).
+- Container requests (`/api/containers/requests`, `/api/container-requests`, `/api/containers/requests/{id}/provision`, `/api/containers/requests/{id}/destroy`, `/api/agents/containers/quota`).
+- Agent self-serve (`/api/agents/me/models` GET, `/api/agents/me/model` POST).
+- **Desktop control (system taOS Agent only)**: `POST /api/desktop/command`, `POST /api/desktop/screenshot`, `POST /api/desktop/layout` (native agent's registry JWT sets `user_id` to the owner, so desktop commands are delivered to the owner's desktop).
+- **Skill-exec (system taOS Agent only)**: `POST /api/skill-exec/{skill_id}/call`, `GET /api/skill-exec/tools` (native agent's registry JWT with `SYSTEM_AGENT_API_SCOPES`).
+
 Task checklist items (`/api/projects/{project_id}/tasks/{task_id}/checklist-items`)
 
 Route module `tinyagentos/routes/projects.py`.
@@ -1429,6 +1729,14 @@ worker lane is therefore refused on `POST` (it lacks the create grant, `403`)
 and authorised on `GET`. `tests/test_routes_task_checklist.py` pins this scope
 split directly, not behind an xfail.
 
+Shared-GPU leases (taOS #893). `GET /api/a2a/gpu/check` (scope `a2a_receive`)
+and `POST /api/a2a/gpu/{claim,release,request,renew}` (scope `a2a_send`). The
+route resolves the acting identity from the token and forces the bus `from` to
+the identity the token proves, so an agent can only claim/release GPU capacity
+for itself. See *Shared-GPU leases (`/api/a2a/gpu/*`)* above for the protocol,
+the admission rules, and why CHECK/CLAIM fail closed when the channel is
+unreadable.
+
 Container provisioning request (P1 + P2, agent-container-provisioning spec):
 
 - `POST /api/containers/requests` and `POST /api/container-requests` -- an active agent submits a container provisioning request with its own registry JWT. The route resolves the canonical_id from the token (never from the request body) and applies the provisioning policy (per-agent quota + threshold). Under quota the request is auto-approved; over quota it lands in `pending-approval`; over threshold it is escalated to a Decisions-app item for Jay. This is an identity-only check (no scope grant required), matching the scope-request create flow's use of `check_agent_identity`.
@@ -1459,3 +1767,130 @@ replace the earlier shared-token binding: each deploy mints a fresh token,
 eliminating the last-deploy-wins collision where two agents bound to the same
 host token would overwrite each other's identity. The shared host token remains
 valid for admin/system callers but is no longer bound to any agent name.
+
+## In-process LLM gateway (`/api/llm/v1`, scoped gateway keys, session or host local token)
+
+`tinyagentos/llm_gateway/` is the in-controller replacement for the LiteLLM
+proxy. It is mounted only when the controller starts with
+`TAOS_LLM_GATEWAY=1`; otherwise `/api/llm/v1/*` does not exist (404 for a
+signed-in caller). LiteLLM keeps running beside it, unchanged.
+
+- `GET /api/llm/v1/models`: OpenAI list shape. Every chat model name in the
+  routing table, plus the alias `taos-default` first.
+- `POST /api/llm/v1/chat/completions`: non-streaming only (`stream: true` is a
+  400 until streaming lands). The body is forwarded verbatim, `tools` /
+  `tool_choice` / `tool_calls` included; only `model` is rewritten to the
+  backend's own id. Only OpenAI-compatible backends (LiteLLM's `openai/`
+  prefix) are served; any other backend type is a 501 naming the model.
+  Upstream failures and timeouts are a 502; the backend's key and URL never
+  appear in a response or a log line.
+
+It is deliberately NOT bare `/v1`: `/v1/models` and `/v1/chat/completions`
+are Agent-as-a-Model (consent-key auth, see `routes/agent_model_api.py`) and
+are unchanged.
+
+Routing: model names resolve through `litellm_config.build_model_list`, the
+same function `generate_litellm_config` wraps, read per request.
+`taos-default` resolves per request to the taOS agent's model preference
+(desktop settings `("user", "taos_agent")["model"]`, set by
+`PATCH /api/taos-agent/settings`), so changing it needs no restart.
+
+Auth: the routes take auth and model permission ONLY from the
+`gateway_caller` dependency (`tinyagentos/llm_gateway/auth.py`). The
+middleware exempts EXACTLY `GET /api/llm/v1/models` and
+`POST /api/llm/v1/chat/completions` (method-sensitive) so a bearer key reaches
+that dependency; every other `/api/llm` path or method stays gated, and its
+401 is OpenAI-shaped (`{"error": {"message", "type", "code": "invalid_api_key"}}`)
+so OpenAI clients surface it as bad credentials. `gateway_caller` accepts:
+
+- a signed-in session, or the host's shared local token: every model;
+- a GATEWAY KEY (`Authorization: Bearer sk-taosgw-...`) bound to one agent id
+  or one node (`node:<id>`), stored only as a SHA-256 hash, compared with
+  `hmac.compare_digest`, optionally expiring. It may use exactly the models it
+  names: an EMPTY list denies every model (LiteLLM read it as allow-all);
+- a legacy per-agent LiteLLM key (`sk-taos-...`, the `agent_keys` table), with
+  its allowlist;
+- the per-install LiteLLM master key, as admin (parity with the LiteLLM hook).
+
+The `taos-default` alias rule: a caller allowed `taos-default` may use
+whatever it CURRENTLY resolves to, without the concrete model in its list.
+Only the owner sets the default, so the grant is "whatever the owner chose",
+and a board keyed to `["taos-default"]` keeps working when the default
+changes. The other direction does not hold: listing the concrete model does
+not grant the alias, and requesting a concrete model directly still needs its
+own entry. `GET /models` for a `["taos-default"]` key lists `taos-default`
+only. The alias is resolved ONCE per request and that one value is both
+checked and forwarded to.
+
+Everything else is 401: a deployer-minted per-agent LOCAL token (that is the
+agent's controller identity, not a model credential), a registry JWT, a device
+bearer and an Agent-as-a-Model consent key. An agent over its LLM budget gets
+the LiteLLM hook's 429 before anything is forwarded. Revoking, blocking or
+deleting a cluster node, and archiving an agent, revoke the keys bound to it
+in the same request.
+
+## The system taOS Agent's harness (opencode, or PicoClaw on a handset)
+
+The built-in taOS Agent runs on opencode (a host `opencode serve`) on every
+host, except a taOSmobile handset, where it runs on PicoClaw (the catalog's
+pinned 0.3.1 binary). `taos_agent_runtime.decide_framework` is the one place
+the choice is made, from two config.yaml keys:
+
+- `device.class`: `auto` (default; `hardware._detect_device_class`, which
+  reads the `taos-kiosk.service` unit), `mobile` or `desktop`;
+- `taos_agent.framework`: `auto` (default; picoclaw on mobile, opencode
+  elsewhere), `opencode` or `picoclaw` (operator overrides).
+
+PicoClaw needs the LLM gateway (`TAOS_LLM_GATEWAY=1`) and a `picoclaw` binary
+(`TAOS_PICOCLAW_BIN`, PATH, `/usr/local/bin`, `/usr/bin`). Without either,
+opencode runs and the reason is logged, e.g. exactly
+`picoclaw preferred, gateway disabled, using opencode`. An unknown config
+value is ignored (treated as `auto`) with a warning.
+
+- `GET /api/taos-agent/config` and the lock screen (`/auth/lock-widgets`)
+  report `framework` = the harness that RUNS the agent (never the
+  preference), plus `framework_preference`, `framework_reason` and
+  `device_class`.
+- `PUT /api/taos-agent/framework` (admin) `{framework?, device_class?}`:
+  unknown values are a 400. Persists to config.yaml and restarts the AGENT,
+  not the controller: leaving PicoClaw revokes its key and deletes its
+  config; entering it stops opencode and mints a fresh key.
+
+PicoClaw's gateway key is bound to `agent:taos-agent`, allowlist = the
+agent's `model` + `permitted_models` + `taos-default`. Changing either
+(`PATCH /api/taos-agent/settings`, `PUT /api/taos-agent/permitted-models`)
+revokes it and mints a new one. The key is written only to
+`<data_dir>/taos-agent-picoclaw/config.json` (0600, directory 0700), never to
+a log, a response, argv or the environment. Every `model_list` entry points
+at `http://127.0.0.1:<server.port>/api/llm/v1`; the default is `taos-default`.
+Each chat turn is one `picoclaw agent --no-color -m <text> -s taos:taos-agent`
+in `<home>/workspace` (`restrict_to_workspace: true`), with a minimal
+environment; the manual or the persona is written to `workspace/AGENTS.md`,
+which PicoClaw loads as its system prompt. The reply is the text after the
+last lobster (U+1F99E). A controller start into opencode revokes any
+leftover PicoClaw key.
+
+taOS access parity: The built-in taOS Agent (both opencode and PicoClaw
+harnesses) reaches the taOS API with a **scoped registry JWT** minted for the
+native agent identity (canonical_id `taos-agent-...`, origin `taos-native`).
+This credential is limited to exactly the endpoints the taOS Agent manual uses:
+desktop control (`/api/desktop/*`), skill-exec (`/api/skill-exec/*`), project
+files, notes, todo, decisions, canvas, and observatory. Admin-only endpoints
+(user management, secrets, settings) return 403. The credential is rotated on
+agent restart (framework switch, model change) and never logged.
+
+PicoClaw receives the credential via `workspace/.taos_credential` (0600) and
+`workspace/bin/taos` (0700) calls `http://127.0.0.1:<server.port>` with it:
+`bin/taos METHOD api/PATH [JSON]` or `bin/taos UPLOAD api/PATH FILE`. The path
+has no leading slash because PicoClaw's exec guard refuses a command naming an
+absolute path. The helper reads the credential from the file (never argv) and
+redacts it from what it prints.
+
+opencode receives the credential via the `TAOS_API_CREDENTIAL` environment
+variable (and `TAOS_API_BASE_URL` for the controller URL). The opencode server
+process inherits these from the controller at startup.
+
+The agent's own A2A identity token (`.taos_agent_token`) is a2a-only
+(scope `a2a_send` + `a2a_receive`) and covers none of the above endpoints.
+Leaving PicoClaw, or any controller start into opencode, revokes the old
+credential and mints a fresh one.

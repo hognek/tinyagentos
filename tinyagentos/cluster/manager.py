@@ -357,10 +357,21 @@ class ClusterManager:
             return (False, "stale_generation")
         self._ever_seen.add(info.name)
 
-        prev_status = self._workers[info.name].status if info.name in self._workers else None
+        prev = self._workers.get(info.name)
+        prev_status = prev.status if prev is not None else None
+        # A device never becomes a worker by re-registering: the stored
+        # kind="device" wins over whatever the new registration carries, so
+        # the device exclusions in get_workers_for_capability and
+        # browser_sessions._capable_workers keep holding (last line of
+        # defence behind routes/cluster.py register_worker).
+        if prev is not None and getattr(prev, "kind", "worker") == "device" and info.kind != "device":
+            logger.warning("Registration for device '%s' asked for kind=%r; kept kind=device", info.name, info.kind)
+            info.kind = "device"
 
         info.registered_at = time.time()
         info.last_heartbeat = time.time()
+        if info.free_vram_mb is not None:
+            info.last_vram_report_at = time.time()
         info.status = "online"
         self._workers[info.name] = info
         logger.info(f"Worker registered: {info.name} ({info.platform}, {len(info.capabilities)} capabilities)")
@@ -503,6 +514,7 @@ class ClusterManager:
         drain_reason: str | None = None,
         generation: int | None = None,
         resources: list[str] | None = None,
+        vram_sampled_age_ms: int | None = None,
     ) -> bool:
         """Accept a worker heartbeat.
 
@@ -601,6 +613,18 @@ class ClusterManager:
             worker.kv_cache_quant_boundary_layer_protect = bool(kv_cache_quant_boundary_layer_protect)
         if free_vram_mb is not None:
             worker.free_vram_mb = int(free_vram_mb)
+            # Use worker-sampled age when available to avoid over-admission during heartbeat transit.
+            # Clamp to 0 to guard against direct callers or misbehaving workers sending a
+            # negative age, which would otherwise set vram_sampled_at in the future and
+            # cause claim_lease to omit every active lease from already_held.
+            safe_age = max(0, vram_sampled_age_ms) if vram_sampled_age_ms is not None else None
+            if safe_age is not None:
+                worker.last_vram_report_at = time.time() - (safe_age / 1000.0)
+                # Store the sample time itself (when the VRAM snapshot was taken)
+                worker.vram_sampled_at = worker.last_vram_report_at
+            else:
+                worker.last_vram_report_at = time.time()
+                worker.vram_sampled_at = None
         if used_vram_mb is not None:
             worker.used_vram_mb = int(used_vram_mb)
         # Registration-drift refresh (taOS #1538): update cached host_lan_ip,
@@ -702,9 +726,11 @@ class ClusterManager:
 
         When a worker is explicitly unregistered (admin action), every
         active lease tied to the worker's resources is released so that
-        those resource slots become available for new claims immediately.
+        those resource slots become available for new claims immediately,
+        and any GPU arbiter task still running on those leases is cancelled
+        so it cannot keep its VRAM reservation alongside a returning worker.
         This mirrors the lease-release logic in ``_monitor_loop`` for the
-        heartbeat-timeout path (taOS #1705).
+        heartbeat-timeout path (taOS #1705, taOS #1992 H2).
         """
         worker = self._workers.get(name)
         if worker is None:
@@ -726,6 +752,21 @@ class ClusterManager:
 
             self._workers.pop(name, None)
         logger.info("Worker '%s' unregistered — %d leases released", name, len(lids))
+        # taOS #1992 (H2): releasing the lease rows is not enough — a task still
+        # running on the arbiter keeps its VRAM reservation and ``_running``
+        # slot, so a returning worker (or a fresh claimant) would execute
+        # concurrently with the orphan on the same physical GPU. Cancel those
+        # tasks, mirroring the heartbeat-timeout/offline branches in
+        # ``_monitor_loop`` and the force-drain path in ``drain_worker``.
+        if lids and self._gpu_arbiter is not None:
+            try:
+                cancelled, already_done = await self._gpu_arbiter.cancel_running_for_leases(set(lids))
+                logger.info(
+                    "Worker '%s' unregistered — arbiter cancelled %d task(s), %d already done",
+                    name, cancelled, already_done,
+                )
+            except Exception:
+                logger.exception("gpu-arbiter: cancel for unregister of '%s' failed", name)
         # taOS #640: remove from persistent store.
         if self._registry_store is not None:
             try:
@@ -806,6 +847,7 @@ class ClusterManager:
         caller: str = "",
         ttl_seconds: float = 30,
         required_vram_mb: int = 0,
+        claim_channel: str = "",
     ) -> GpuLease | None:
         """Attempt to claim a GPU lease on ``resource_id``.
 
@@ -844,13 +886,39 @@ class ClusterManager:
             if (
                 required_vram_mb > 0
                 and worker.free_vram_mb is not None
-                and required_vram_mb > worker.free_vram_mb
             ):
-                logger.debug(
-                    "claim_lease: %s needs %d MiB VRAM but %s has %d MiB free",
-                    caller, required_vram_mb, worker.name, worker.free_vram_mb,
-                )
-                return None
+                # Account for VRAM already held by other active leases on
+                # this worker — two concurrent claims for different resources
+                # must not both pass when their sum exceeds free_vram_mb (H1).
+                #
+                # free_vram_mb is not a pre-allocation figure: it is the
+                # latest heartbeat-reported free VRAM, so once a leased
+                # workload has allocated its VRAM that allocation is already
+                # absent from free_vram_mb.  Only count leases whose grant
+                # post-dates the last actual VRAM report (not the receipt time).
+                # If we have the sample time, compare against that; otherwise
+                # fall back to the receipt time for backward compatibility.
+                already_held = 0
+                now = time.time()
+                sample_time = getattr(worker, "vram_sampled_at", None)
+                if sample_time is None:
+                    sample_time = worker.last_vram_report_at
+                for lid, lease in self._leases.items():
+                    if (parsed := self._parse_resource_id(lease.resource_id)) \
+                            and parsed[0] == worker.name:
+                        if lease.expires_at > now \
+                                and lease.granted_at > sample_time:
+                            already_held += lease.required_vram_mb
+
+                effective_free = worker.free_vram_mb - already_held
+                if required_vram_mb > effective_free:
+                    logger.debug(
+                        "claim_lease: %s needs %d MiB VRAM but %s has %d MiB free, "
+                        "%d MiB held by other active leases",
+                        caller, required_vram_mb, worker.name, worker.free_vram_mb,
+                        already_held,
+                    )
+                    return None
 
             # Enforce lease cap per worker to prevent DoS (S2-24)
             # Count only active (non-expired) leases for this worker
@@ -875,6 +943,8 @@ class ClusterManager:
                 caller=caller,
                 expires_at=time.time() + ttl_seconds,
                 required_vram_mb=required_vram_mb,
+                granted_at=time.time(),
+                claim_channel=claim_channel,
             )
             self._leases[lease_id] = lease
             logger.info(
@@ -894,16 +964,63 @@ class ClusterManager:
 
     async def renew_lease(self, lease_id: str, ttl_seconds: float = 30) -> GpuLease | None:
         """Extend a lease's TTL.  Returns the lease, or None if expired/unknown."""
+        lease, _previous_expiry = await self.renew_lease_with_previous(
+            lease_id, ttl_seconds=ttl_seconds
+        )
+        return lease
+
+    async def renew_lease_with_previous(
+        self, lease_id: str, ttl_seconds: float = 30
+    ) -> tuple[GpuLease | None, float | None]:
+        """Extend a lease's TTL, returning ``(lease, previous_expiry)``.
+
+        ``previous_expiry`` is the expiry this renewal actually REPLACED, read
+        under ``_lease_lock`` in the same critical section that writes the new
+        one. A caller that wants to undo a failed keep-alive needs exactly that
+        value: capturing the expiry before the lock (or from a lease object read
+        outside it) can be stale - another renewal may complete in between - and
+        restoring a stale expiry would clobber a newer renewal that owns the
+        lease (CR on #2988). ``None`` for both when the lease is unknown or
+        already expired, matching :meth:`renew_lease`'s contract.
+        """
         async with self._lease_lock:
             lease = self._leases.get(lease_id)
             if lease is None:
-                return None
+                return None, None
             now = time.time()
             if lease.expires_at <= now:
                 self._leases.pop(lease_id, None)
-                return None
+                return None, None
+            previous_expiry = lease.expires_at
             lease.expires_at = now + ttl_seconds
-            return lease
+            return lease, previous_expiry
+
+    async def restore_lease_expiry(
+        self, lease_id: str, expires_at: float, *, attempted_expiry: float
+    ) -> bool:
+        """Put a lease's expiry back after a keep-alive's other half failed.
+
+        Renewal has two halves: the local reservation and the peer-visible
+        claim published on the bus. When the second cannot be refreshed, the
+        first must not stay extended - peers would then free the card at the
+        expiry they still hold while this controller believes it is reserved.
+        Restoring the previous instant makes the two views agree again, so the
+        caller can retry rather than sit on a renewal nobody else can see.
+
+        Restores only while the lease still carries *attempted_expiry*, the
+        extension this caller made. The bus post happens outside ``_lease_lock``,
+        so a renewal can land in between; that newer expiry owns the lease and
+        must not be clobbered by this rollback. Returns False when the lease is
+        gone or superseded - i.e. when there is nothing of ours to undo.
+        """
+        async with self._lease_lock:
+            lease = self._leases.get(lease_id)
+            if lease is None:
+                return False
+            if lease.expires_at != attempted_expiry:
+                return False
+            lease.expires_at = expires_at
+            return True
 
     def get_leases(self) -> list[GpuLease]:
         """Return a snapshot of active (non-expired) leases."""
@@ -1036,10 +1153,19 @@ class ClusterManager:
     def get_workers_for_capability(self, capability: str) -> list[WorkerInfo]:
         """Get online workers that support a capability, sorted by priority (lowest load first).
 
-        Draining workers are excluded (taOS #890)."""
+        Draining workers are excluded (taOS #890). A ``kind="device"`` node
+        (a taOSusb board paired over Bluetooth) is excluded unconditionally,
+        never by whatever it happens to list in ``capabilities`` -- a
+        capability flag alone reads as fine until someone adds a new job
+        type that a device's capability list was never checked against (see
+        docs/taosusb-pairing-plan.md). This is the model mesh's candidate
+        pool (``TaskRouter.route_request`` -> chat/embed/image-generation),
+        so the guard here is the one that matters most."""
         eligible = [
             w for w in self._workers.values()
-            if w.status in ("online", "update-available") and capability in w.capabilities
+            if w.status in ("online", "update-available")
+            and capability in w.capabilities
+            and getattr(w, "kind", "worker") != "device"
         ]
         return sorted(eligible, key=lambda w: w.load)
 
@@ -1180,6 +1306,7 @@ class ClusterManager:
             "free_vram_mb": worker.free_vram_mb,
             "used_vram_mb": worker.used_vram_mb,
             "resources": json.dumps(worker.resources or []),
+            "kind": worker.kind or "worker",
         }
         await self._registry_store.upsert_worker(info)
 
@@ -1241,6 +1368,7 @@ class ClusterManager:
                     free_vram_mb=row.get("free_vram_mb"),
                     used_vram_mb=row.get("used_vram_mb"),
                     resources=json.loads(row.get("resources", "[]")),
+                    kind=row.get("kind") or "worker",
                 )
                 self._workers[name] = worker
                 self._ever_seen.add(name)

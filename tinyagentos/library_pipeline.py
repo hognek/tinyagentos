@@ -24,14 +24,10 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _MIME_KIND_MAP: dict[str, str] = {
-    "text/plain": "text",
-    "text/markdown": "text",
-    "text/csv": "text",
-    "text/html": "text",
+    "application/pdf": "pdf",
     "application/json": "text",
     "application/xml": "text",
     "text/xml": "text",
-    "application/pdf": "pdf",
     "image/png": "image",
     "image/jpeg": "image",
     "image/gif": "image",
@@ -42,11 +38,21 @@ _MIME_KIND_MAP: dict[str, str] = {
     "application/x-tar": "archive",
 }
 
+_EXT_OVERRIDE_MAP: dict[str, str] = {
+    ".json": "text",
+    ".xml": "text",
+    ".log": "text",
+    ".yaml": "text", ".yml": "text", ".toml": "text",
+    ".pdf": "pdf",
+    ".png": "image", ".jpg": "image", ".jpeg": "image",
+    ".gif": "image", ".webp": "image", ".svg": "image",
+    ".zip": "archive", ".gz": "archive", ".tar": "archive",
+}
+
 
 def detect_kind(source_url: str = "", content_type: str = "",
                 file_path: str = "") -> str:
     """Detect the library item kind from URL, MIME, or file path."""
-    # URL-based detection
     if source_url:
         lower = source_url.lower()
         if any(lower.startswith(p) for p in ("https://www.youtube.com/",
@@ -60,25 +66,24 @@ def detect_kind(source_url: str = "", content_type: str = "",
         if any(lower.startswith(p) for p in ("https://", "http://")):
             return "url:web"
 
-    # MIME-based detection
     if content_type:
         ct = content_type.split(";")[0].strip().lower()
         if ct in _MIME_KIND_MAP:
             return _MIME_KIND_MAP[ct]
+        if ct.startswith("text/"):
+            return "text"
 
-    # File extension fallback
     if file_path:
         ext = Path(file_path).suffix.lower()
-        ext_map = {
-            ".txt": "text", ".md": "text", ".csv": "text",
-            ".json": "text", ".xml": "text", ".html": "text",
-            ".pdf": "pdf",
-            ".png": "image", ".jpg": "image", ".jpeg": "image",
-            ".gif": "image", ".webp": "image", ".svg": "image",
-            ".zip": "archive", ".gz": "archive", ".tar": "archive",
-        }
-        if ext in ext_map:
-            return ext_map[ext]
+        if ext in _EXT_OVERRIDE_MAP:
+            return _EXT_OVERRIDE_MAP[ext]
+        mime_type, _ = mimetypes.guess_type(file_path)
+        if mime_type:
+            if mime_type.startswith("text/"):
+                return "text"
+            kind = _MIME_KIND_MAP.get(mime_type)
+            if kind:
+                return kind
 
     return "file"
 
@@ -218,50 +223,41 @@ class PdfProcessor(Processor):
         if not p.exists():
             return artifacts
 
-        pdf_meta = {"page_count": 0, "has_text": False}
+        from pypdf import PdfReader
+        reader = PdfReader(str(p))
+        pdf_meta = {"page_count": len(reader.pages), "has_text": False}
 
-        # Try extracting text with PyPDF2 / pypdf if available
-        try:
-            from pypdf import PdfReader
-            reader = PdfReader(str(p))
-            pdf_meta["page_count"] = len(reader.pages)
+        # Extract text from all pages
+        pages_text: list[str] = []
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                pages_text.append(page_text)
 
-            # Extract text from all pages
-            pages_text: list[str] = []
-            for page in reader.pages:
-                page_text = page.extract_text()
-                if page_text:
-                    pages_text.append(page_text)
+        if pages_text:
+            text_content = "\n\n".join(pages_text)
+            pdf_meta["has_text"] = True
+            pdf_meta["char_count"] = len(text_content)
 
-            if pages_text:
-                text_content = "\n\n".join(pages_text)
-                pdf_meta["has_text"] = True
-                pdf_meta["char_count"] = len(text_content)
+            text_dir = self.storage_dir / "text"
+            text_dir.mkdir(parents=True, exist_ok=True)
+            text_path = text_dir / f"{item_id}_pdf.txt"
+            text_path.write_text(text_content, encoding="utf-8")
 
-                text_dir = self.storage_dir / "text"
-                text_dir.mkdir(parents=True, exist_ok=True)
-                text_path = text_dir / f"{item_id}_pdf.txt"
-                text_path.write_text(text_content, encoding="utf-8")
+            await self.store.add_artifact(
+                item_id, kind="text", path=str(text_path),
+                meta={"char_count": len(text_content), "pages": len(reader.pages)},
+            )
+            artifacts.append({
+                "kind": "text", "path": str(text_path),
+                "meta": {"char_count": len(text_content), "pages": len(reader.pages)},
+            })
 
-                await self.store.add_artifact(
-                    item_id, kind="text", path=str(text_path),
-                    meta={"char_count": len(text_content), "pages": len(reader.pages)},
-                )
-                artifacts.append({
-                    "kind": "text", "path": str(text_path),
-                    "meta": {"char_count": len(text_content), "pages": len(reader.pages)},
-                })
-
-                # Update item with preview
-                preview = text_content[:200]
-                meta = json.loads(item.get("meta_json", "{}"))
-                meta["preview"] = preview
-                await self.store.update_item(item_id, meta_json=meta)
-        except ImportError:
-            logger.debug("pypdf not installed — PDF text extraction skipped")
-        except Exception:
-            logger.warning("PDF text extraction failed for %s", storage_path,
-                           exc_info=True)
+            # Update item with preview
+            preview = text_content[:200]
+            meta = json.loads(item.get("meta_json", "{}"))
+            meta["preview"] = preview
+            await self.store.update_item(item_id, meta_json=meta)
 
         await self.store.add_artifact(
             item_id, kind="metadata", path="", meta=pdf_meta

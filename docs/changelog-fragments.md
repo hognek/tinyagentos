@@ -9,10 +9,25 @@ Name it `<pr-number>-<short-slug>.md` or, when the change is tracked by a
 task card, `tsk-<cardid>-<short-slug>.md`. Write the bullet exactly as it should
 appear in the changelog. The trailing `(#PR)` is NOT required: the fragment is
 authored inside the commit that does the work, before the pull request number
-exists. Nothing attaches the reference later either — the collator does not
+exists. Nothing attaches the reference later either -- the collator does not
 inject one (see "At release time" below). Add it by hand if you want it and
 you know the number; a `tsk-<cardid>` filename carries the card id instead,
 which is the traceable link for fragments written by a lane.
+
+Every non-blank line in the fragment must be one of:
+
+- a `### Added` / `### Fixed` / `### Changed` / `### Removed` / `### Security` section heading on its own line;
+- a `- ` bullet line;
+- an indented continuation line of the bullet above it.
+
+Fenced code blocks, standalone paragraphs, trailing prose lines, and YAML
+frontmatter are refused. Frontmatter is identified by a leading `---` delimiter
+or a leading `title:` key. These are rejected because `scripts/collate_changelog.py`
+appends every non-blank line verbatim into `CHANGELOG.md`; beta.52 leaked 21
+lines of YAML frontmatter because neither the collator nor the gate caught it.
+The two enforcement points are `scripts/collate_changelog.py` (raises on a
+malformed fragment) and `scripts/check_doc_gate.py invariants` (refuses the
+file before it can merge).
 
     - Projects gain a Notes area: title + markdown notes per project.
 

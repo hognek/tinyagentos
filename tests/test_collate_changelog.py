@@ -230,3 +230,22 @@ def test_rerun_keeps_unfolded_fragment_whose_text_matches_an_older_release(repo:
     # The unfolded fragment survives and the rerun refuses loudly.
     assert (repo / "changelog.d" / "2299-new.md").exists()
     assert rc == 1
+
+
+def test_fragment_with_yaml_frontmatter_is_refused(repo: Path):
+    """RED: a fragment that starts with YAML frontmatter must be refused.
+
+    beta.52 leaked 21 lines of YAML frontmatter from commit 3654ad85b into
+    CHANGELOG.md because neither the collator nor the doc gate caught it.
+    """
+    mod = _load(repo)
+    (repo / "changelog.d" / "3654ad85b.md").write_text(
+        "---\n"
+        'title: "Implement taosgo app-join endpoint with 2FA gate integration"\n'
+        "summary: |\n"
+        "  Adds the taosgo app-join endpoint with 2FA gate integration.\n"
+        "---\n"
+        "- Added taosgo app-join endpoint with 2FA gate integration.\n",
+        encoding="utf-8",
+    )
+    assert mod.main(["1.0.0-beta.52", "--date", "2026-08-05"]) == 1

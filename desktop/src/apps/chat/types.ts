@@ -3,7 +3,7 @@
 export interface Channel {
   id: string;
   name: string;
-  type: "dm" | "topic" | "group";
+  type: "dm" | "dm-remote" | "topic" | "group";
   description?: string;
   topic?: string;
   members?: string[];

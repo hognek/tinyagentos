@@ -276,7 +276,7 @@ ALTER TABLE agent_registry ADD COLUMN sponsor_contact_id TEXT;  -- NULL for all 
   immutable for the grant lifetime; reject null or mismatched `project_id`
   at every project-scoped route, following the existing scope contract in
   `agent_auth_requests.py`. Anything more
-  (`files_read`, `canvas_write`, `memory_*`, `tools_execute`) requires an explicit,
+  (`files_read`, `canvas_write`, `memory_read`, `memory_write` and `tools_execute`) requires an explicit,
   per-scope Decisions approval and is displayed permanently in the Agents app.
   `files_write` and `decisions_write` are **denied to sponsored identities in v1**
   (enforced in grant minting, not just UX).

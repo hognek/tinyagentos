@@ -47,15 +47,18 @@ def _pid_alive(pid: int) -> bool:
 def _pids_listening_on(port: int) -> list[int]:
     """Best-effort lookup of PIDs holding a TCP listen on ``port``.
 
-    Uses ``lsof -ti:<port>`` which is available on macOS, most Linux
+    Uses ``lsof -ti :{port} -sTCP:LISTEN`` which is available on macOS, most Linux
     distros, and the Fedora LXC we ship on the Pi. Returns ``[]`` when
     ``lsof`` is missing, errors, or reports nothing.
     """
     try:
         out = subprocess.check_output(
-            ["lsof", "-ti", f":{port}"], text=True, stderr=subprocess.DEVNULL
+            ["lsof", "-ti", f":{port}", "-sTCP:LISTEN"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
         ).strip()
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
         return []
     pids: list[int] = []
     for line in out.split("\n"):
@@ -442,7 +445,7 @@ class LLMProxy:
             port_in_use = False
 
         if port_in_use:
-            pids = _pids_listening_on(self.port)
+            pids = await asyncio.to_thread(_pids_listening_on, self.port)
             if pids:
                 logger.info(
                     "LiteLLM on port %d owned by foreign PID(s) %r — "

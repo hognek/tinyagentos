@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from unittest.mock import patch
 
@@ -175,8 +176,16 @@ def test_gpu_vram_snapshot_success() -> None:
     """Test gpu_vram_snapshot with successful nvidia-smi output."""
     with patch("tinyagentos.system_stats.read_nvidia_vram") as mock_read:
         mock_read.return_value = (0, 8192)
+        before = time.time()
         result = gpu_vram_snapshot()
-        assert result == {"free_vram_mb": 8192, "used_vram_mb": 0}
+        after = time.time()
+        assert result is not None
+        assert result["free_vram_mb"] == 8192
+        assert result["used_vram_mb"] == 0
+        assert "sampled_at" in result
+        sampled = result["sampled_at"]
+        assert isinstance(sampled, float)
+        assert before <= sampled <= after
 
 
 def test_gpu_vram_snapshot_read_nvidia_vram_none() -> None:

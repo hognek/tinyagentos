@@ -34,6 +34,16 @@ vi.mock("@/components/ConsentActions", () => ({
 
 const SAVED_DOCK = { pinned: ["notification-archive"], iconSize: "medium", position: "bottom" };
 
+const MockEventSourceCtor = vi.fn().mockImplementation(function (this: any) {
+  this.url = "";
+  this.onopen = null;
+  this.onmessage = null;
+  this.onerror = null;
+  this.close = vi.fn();
+  this.readyState = 0;
+});
+Object.assign(MockEventSourceCtor, { CONNECTING: 0, OPEN: 1, CLOSED: 2 });
+
 function mockFetch(dock: Record<string, unknown> = SAVED_DOCK) {
   return vi.spyOn(globalThis, "fetch").mockImplementation((input: RequestInfo | URL) => {
     const url = typeof input === "string" ? input : input.toString();
@@ -64,10 +74,13 @@ beforeEach(() => {
   useDockStore.setState({ pinned: ["messages"], iconSize: "medium", position: "bottom" });
   useProcessStore.setState({ windows: [] });
   useAuthReadyStore.setState({ ready: true });
+  vi.stubGlobal("EventSource", MockEventSourceCtor);
+  MockEventSourceCtor.mockClear();
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
 });
 
 describe("legacy notification-archive dock pin (#2677)", () => {
