@@ -637,14 +637,22 @@ async def worker_heartbeat(request: Request, body: HeartbeatBody):
 
 @router.delete("/api/cluster/workers/{name}", dependencies=_ADMIN)
 async def unregister_worker(request: Request, name: str):
+    # Revoke the pairing key so the deleted node cannot authenticate with its old key.
+    # Must be checked FIRST: if pairing store is unavailable, refuse the DELETE with 503.
+    # Never skip the revoke even if the worker row is deleted from cluster manager.
+    pairing = getattr(request.app.state, "cluster_pairing", None)
+    if pairing is None:
+        return JSONResponse({
+            "error": "pairing store unavailable",
+            "code": "STORE_UNAVAILABLE",
+        }, status_code=503)
+    
     cluster = request.app.state.cluster_manager
     removed = await cluster.unregister_worker(name)
     if not removed:
         return JSONResponse({"error": "Worker not found"}, status_code=404)
-    # Revoke the pairing key so the deleted node cannot authenticate with its old key.
-    pairing = getattr(request.app.state, "cluster_pairing", None)
-    if pairing is not None:
-        await pairing.revoke(name)
+    
+    await pairing.revoke(name)
     _revoke_node_model_keys(request, name)
     return {"status": "removed", "name": name}
 
