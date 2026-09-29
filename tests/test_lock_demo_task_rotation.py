@@ -570,6 +570,7 @@ def _client_source() -> str:
         _var("FRAMEWORKS"),
         _var("RESTING"),
         _var("STATUS_CHANGE_MS"),
+        _var("STATUS_PULSE_MS"),
         _function("hueFor"),
         _function("initials"),
         _function("islandIdentity"),
@@ -617,7 +618,8 @@ var settled = {
   pulse: el.getAttribute("data-status-pulse"),
 };
 process.stdout.write(JSON.stringify({
-  before: before, after: after, settled: settled, timerCount: TIMERS.length
+  before: before, after: after, settled: settled, timerCount: TIMERS.length,
+  timerMs: TIMERS.map(function (t) { return t.ms; })
 }));
 """
 
@@ -690,6 +692,23 @@ class TestTheStatusChangeAnimation:
         assert out["settled"]["cls"] == "ls-status"
         assert out["settled"]["prev"] is None
         assert out["settled"]["pulse"] is None
+
+    def test_the_pulse_attribute_outlives_the_pulse_keyframes(self):
+        """The attribute is what runs the animation: removing it early cuts the
+        pulse off mid-glow. Read both numbers from the shipped page, and check
+        the timer that actually clears the attribute, not just the constant."""
+        import re
+        css = re.search(
+            r'data-status-pulse="1"\]\s*\{\s*animation:\s*ls-status-pulse\s+(\d+)ms',
+            auth._LOCK_SCREEN_STYLE,
+        )
+        assert css, "the pulse rule is gone or reworded"
+        keyframes_ms = int(css.group(1))
+        life_ms = int(re.search(r"var STATUS_PULSE_MS = (\d+);", LOCK_SCRIPT).group(1))
+        assert life_ms >= keyframes_ms
+        out = _run_rotation(_agent(status="Reviewing calendar"),
+                            _agent(status="Booking a table for Friday, 7:30"))
+        assert max(out["timerMs"]) >= keyframes_ms, "no timer holds the pulse for its full run"
 
     def test_a_completion_status_gets_the_done_tint_attribute(self):
         before = _agent(status="Categorising card spend")
