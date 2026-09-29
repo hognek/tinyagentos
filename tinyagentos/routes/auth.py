@@ -11381,6 +11381,14 @@ _POWER_REQUEST = "/run/taos-power/request"
 #: that arrives on a poll is a broken menu.
 _LOCK_EVENT_WAITERS: set = set()
 
+#: The last screen state the device reported ("screen-off" / "screen-on"), or
+#: None when it has not reported one since the controller started. Kept so a
+#: stream that (re)opens can be told the CURRENT state: after a controller
+#: restart the page reconnects while the panel may be dark, and a screen-off
+#: sent before the restart is gone. None means unknown, and unknown sends
+#: nothing rather than guessing.
+_LOCK_SCREEN_STATE: str | None = None
+
 
 def _push_lock_event(kind: str, payload: dict | None = None) -> int:
     """Fan an event out to every open lock-screen stream. Returns the count.
@@ -11415,6 +11423,10 @@ async def lock_events(request: Request):
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=8)
     _LOCK_EVENT_WAITERS.add(queue)
+    # Snapshotted here, in the same synchronous step that registers the queue,
+    # so a screen event landing afterwards reaches this client through the
+    # queue and is never lost or reordered behind a stale snapshot.
+    initial_state = _LOCK_SCREEN_STATE
 
     async def stream():
         try:
@@ -11422,6 +11434,12 @@ async def lock_events(request: Request):
             # connection rather than sitting in CONNECTING until the first real
             # event -- which could be hours.
             yield ": connected\n\n"
+            # The current screen state, to THIS client only (it is written to
+            # this response, not pushed through the fan-out): the page pauses
+            # its widgets poll on screen-off, and a reopen against a dark panel
+            # would otherwise resume it until the next screen-off.
+            if initial_state is not None:
+                yield "event: %s\ndata: {}\n\n" % initial_state
             while True:
                 if await request.is_disconnected():
                     break
@@ -11908,6 +11926,8 @@ async def lock_screen_off(request: Request):
     refusal = _lock_post_refusal(request)
     if refusal is not None:
         return refusal
+    global _LOCK_SCREEN_STATE
+    _LOCK_SCREEN_STATE = "screen-off"
     return JSONResponse({"ok": True, "delivered": _push_lock_event("screen-off")})
 
 
@@ -11923,6 +11943,8 @@ async def lock_screen_on(request: Request):
     refusal = _lock_post_refusal(request)
     if refusal is not None:
         return refusal
+    global _LOCK_SCREEN_STATE
+    _LOCK_SCREEN_STATE = "screen-on"
     return JSONResponse({"ok": True, "delivered": _push_lock_event("screen-on")})
 
 

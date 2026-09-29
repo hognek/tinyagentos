@@ -897,6 +897,22 @@ class TestTheWidgetsPollScheduler:
         assert out["widgetsPaused"] is False
         assert out["fetchCalls"] == 2, "a reopened stream must fetch now"
 
+    def test_a_reopen_followed_at_once_by_screen_off_leaves_the_poll_paused(self):
+        """The server now leads every (re)opened stream with the current screen
+        state. On a dark panel that is open THEN screen-off: the open resumes
+        the poll, the connect-time screen-off must pause it again."""
+        out = _run_scheduler(
+            "var L = {}; var stream = { addEventListener: function (e, fn) { (L[e] = L[e] || []).push(fn); } };"
+            "armWidgetsStreamResume(stream);"
+            "stream.addEventListener('screen-off', function () { pauseWidgetsPoll(); });"
+            "pollActivity(); await flush();"
+            "L.open.forEach(function (fn) { fn(); }); "
+            "L['screen-off'].forEach(function (fn) { fn(); }); await flush();",
+            [{"body": {"agents": [], "refresh_in_ms": 9000}}],
+        )
+        assert out["widgetsPaused"] is True
+        assert all(t["cancelled"] for t in out["timers"]), "no poll may stay armed"
+
     def test_the_page_arms_the_stream_safety_net(self):
         from tinyagentos.routes import auth
         js = auth._LOCK_SCREEN_SCRIPT
