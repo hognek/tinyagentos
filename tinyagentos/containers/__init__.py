@@ -213,7 +213,10 @@ async def list_containers(prefix: str = "taos-agent-") -> list[ContainerInfo]:
             continue
         status = c.get("status", "Unknown")
         ip = None
-        network = c.get("state", {}).get("network", {})
+        # A stopped instance reports "state": {"network": null} (and "state"
+        # itself can be null), so coerce both to {} rather than trusting
+        # dict.get defaults, which only apply when the key is absent.
+        network = (c.get("state") or {}).get("network") or {}
         for iface in network.values():
             for addr in iface.get("addresses", []):
                 if addr.get("family") == "inet" and addr.get("scope") == "global":
