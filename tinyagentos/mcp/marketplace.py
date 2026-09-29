@@ -754,11 +754,8 @@ class MCPMarketplace:
     def categories(self) -> list[str]:
         return self.registry.categories()
 
-    async def installed_ids(self) -> set[str]:
-        """Every server id in the store — whoever installed it."""
-        return {s["id"] for s in await self.store.list_servers()}
-
     async def _installed_rows(self) -> dict[str, dict]:
+        """Every server row in the store, keyed by id — whoever installed it."""
         return {s["id"]: s for s in await self.store.list_servers()}
 
     async def browse(
