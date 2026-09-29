@@ -1,33 +1,21 @@
-"""Anthropic gateway translator for taOS.
+"""OpenAI chat completions <-> Anthropic Messages API, for the taOS gateway.
 
-This module provides OpenAI to Anthropic Messages API translation
-adapted from the aisuite pattern (MIT) but without new dependencies.
+Translates an OpenAI-shaped request into a Messages API request, and the
+Messages API response (or its SSE event stream) back into OpenAI
+``chat.completion`` / ``chat.completion.chunk`` objects. No SDK dependency.
 
-MIT License
+The design follows aisuite (MIT, github.com/andrewyng/aisuite); no aisuite
+code is copied here.
 
-Copyright (c) 2026 taOS Contributors
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+Response and stream shapes are Anthropic's documented ones:
+https://platform.claude.com/docs/en/build-with-claude/streaming
+https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
 """
 from __future__ import annotations
 
 import json
+import logging
+import time
 from typing import Any, AsyncGenerator
 
 import httpx
@@ -38,6 +26,36 @@ from tinyagentos.llm_usage.usage import from_anthropic
 ANTHROPIC_API_BASE = "https://api.anthropic.com"
 ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MAX_TOKENS = 1024
+
+logger = logging.getLogger(__name__)
+
+# Anthropic stop_reason -> OpenAI finish_reason. Clients (PicoClaw among them)
+# decide whether to run tools from finish_reason, so this is load-bearing.
+_FINISH_REASONS = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+    "tool_use": "tool_calls",
+}
+
+
+def _finish_reason(stop_reason: str | None) -> str:
+    """Map an Anthropic stop_reason; anything unmapped is "stop" and logged."""
+    mapped = _FINISH_REASONS.get(stop_reason or "")
+    if mapped is None:
+        logger.warning(
+            "llm_gateway: unmapped Anthropic stop_reason %r, reporting finish_reason 'stop'",
+            stop_reason,
+        )
+        return "stop"
+    return mapped
+
+
+def _arguments(tool_input: Any) -> str:
+    """Anthropic's tool ``input`` is an object; OpenAI's ``arguments`` is a JSON string."""
+    return json.dumps(tool_input if tool_input is not None else {})
+
+
 
 
 def _redact(text: str, *secrets: str | None) -> str:
@@ -150,78 +168,6 @@ async def _call_anthropic(
         raise bad_request(redacted_msg)
 
 
-def _anthropic_to_openai_content_block(block: dict, original_tools: list | None) -> dict | None:
-    """Convert a single Anthropic content block to OpenAI delta format."""
-    block_type = block.get("type")
-    
-    if block_type == "text":
-        return {"type": "content_block_delta", "delta": {"type": "text_delta", "text": block.get("text", "")}}
-    
-    elif block_type == "tool_use":
-        tool_use = block.get("tool_use", {})
-        return {
-            "type": "content_block_delta", 
-            "delta": {
-                "type": "input_json_delta", 
-                "partial_json": json.dumps(tool_use.get("input_json", {}))
-            },
-            "tool_use_id": tool_use.get("id"),
-            "tool_name": tool_use.get("name")
-        }
-    
-    return None
-
-
-def _anthropic_stream_to_openai(sse_data: dict, original_tools: list | None) -> dict | None:
-    """Convert Anthropic stream event to OpenAI stream delta."""
-    event_type = sse_data.get("type")
-    
-    if event_type == "text_delta":
-        return {
-            "type": "content",
-            "delta": {
-                "content": sse_data.get("delta", {}).get("text", "")
-            }
-        }
-    
-    elif event_type == "input_json_delta":
-        # For tool arguments, we need to reconstruct the tool_calls delta
-        partial_json = sse_data.get("delta", {}).get("partial_json", "")
-        try:
-            # Parse partial JSON to extract tool arguments
-            args = json.loads(partial_json) if partial_json else {}
-            return {
-                "type": "tool_calls",
-                "delta": {
-                    "content": partial_json,
-                    "parsed_args": args
-                }
-            }
-        except json.JSONDecodeError:
-            return {
-                "type": "tool_calls", 
-                "delta": {
-                    "content": partial_json,
-                    "parsed_args": {}
-                }
-            }
-    
-    elif event_type == "message_delta":
-        delta = sse_data.get("delta", {})
-        usage = delta.get("usage")
-        if usage:
-            return {
-                "type": "usage",
-                "usage": {
-                    "prompt_tokens": usage.get("input_tokens", 0),
-                    "completion_tokens": usage.get("output_tokens", 0),
-                    "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-                }
-            }
-    
-    return None
-
-
 async def _anthropic_to_openai(response: dict, original_body: dict, api_key: str | None = None) -> dict:
     """Convert Anthropic Messages API response to OpenAI chat.completion format."""
     if "error" in response:
@@ -229,7 +175,7 @@ async def _anthropic_to_openai(response: dict, original_body: dict, api_key: str
         if api_key and api_key in error_msg:
             error_msg = error_msg.replace(api_key, "[redacted]")
         raise upstream_error(f"Anthropic API error: {error_msg}")
-    
+
     # Build OpenAI response
     openai_response = {
         "id": response.get("id", f"chatcmpl-{hash(str(response))}"),
@@ -240,7 +186,7 @@ async def _anthropic_to_openai(response: dict, original_body: dict, api_key: str
         "usage": {},
         "system_fingerprint": None
     }
-    
+
     # Extract usage
     usage = response.get("usage", {})
     openai_response["usage"] = {
@@ -248,52 +194,155 @@ async def _anthropic_to_openai(response: dict, original_body: dict, api_key: str
         "completion_tokens": usage.get("output_tokens", 1),
         "total_tokens": usage.get("input_tokens", 3) + usage.get("output_tokens", 1)
     }
-    
-    # Handle content blocks
-    content = None
-    tool_calls = None
-    stop_reason = response.get("stop_reason", "stop")
-    
-    content_blocks = response.get("content", [])
-    if content_blocks:
-        # Check if this is a tool call response
-        has_tool_use = any(block.get("type") == "tool_use" for block in content_blocks)
-        
-        if has_tool_use:
-            tool_calls = []
-            for block in content_blocks:
-                if block.get("type") == "tool_use":
-                    tool_use = block.get("tool_use", {})
-                    tool_calls.append({
-                        "id": tool_use.get("id", f"call_{len(tool_calls) + 1}"),
-                        "type": "function",
-                        "function": {
-                            "name": tool_use.get("name", ""),
-                            "arguments": json.dumps(tool_use.get("input_json", {}))
-                        }
-                    })
-        else:
-            # Extract text content
-            text_parts = []
-            for block in content_blocks:
-                if block.get("type") == "text":
-                    text_parts.append(block.get("text", ""))
-            content = "".join(text_parts)
-    
+
+    # Content blocks, in one pass: text blocks become ``content`` and FLAT
+    # tool_use blocks ({"type": "tool_use", "id", "name", "input": {...}})
+    # become ``tool_calls``. OpenAI allows both on one message, so text Claude
+    # writes before a call is kept.
+    text_parts: list[str] = []
+    tool_calls: list[dict] = []
+    for block in response.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "text":
+            text_parts.append(block.get("text", ""))
+        elif block.get("type") == "tool_use":
+            tool_calls.append({
+                "id": block.get("id") or f"call_{len(tool_calls) + 1}",
+                "type": "function",
+                "function": {
+                    "name": block.get("name", ""),
+                    "arguments": _arguments(block.get("input")),
+                },
+            })
+    content = "".join(text_parts) if text_parts else None
+
     # Build choices
     choice = {
         "index": 0,
         "message": {
             "role": "assistant",
             "content": content,
-            "tool_calls": tool_calls
+            "tool_calls": tool_calls or None
         },
-        "finish_reason": stop_reason,
+        "finish_reason": _finish_reason(response.get("stop_reason")),
         "logprobs": None
     }
     openai_response["choices"].append(choice)
-    
+
     return openai_response
+
+
+class _StreamTranslator:
+    """Anthropic stream events -> OpenAI ``chat.completion.chunk`` objects.
+
+    Event flow (streaming doc): message_start, then per content block a
+    content_block_start, content_block_delta(s) and content_block_stop, then
+    message_delta (``delta.stop_reason`` and a TOP-LEVEL ``usage``), then
+    message_stop. ping and unknown events are ignored.
+    """
+
+    def __init__(self, model: str):
+        self.model = model
+        self.id = "chatcmpl-anthropic"
+        self.created = int(time.time())
+        self.input_tokens = 0
+        # Anthropic block index -> 0-based OpenAI tool_calls index.
+        self.tool_index: dict[int, int] = {}
+        self.done = False
+
+    def _chunk(self, delta: dict, finish_reason: str | None = None) -> dict:
+        return {
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+
+    def feed(self, event: dict) -> list[dict]:
+        kind = event.get("type")
+        if kind == "message_start":
+            message = event.get("message") or {}
+            if message.get("id"):
+                self.id = message["id"]
+            self.input_tokens = int((message.get("usage") or {}).get("input_tokens") or 0)
+            return [self._chunk({"role": "assistant", "content": ""})]
+
+        if kind == "content_block_start":
+            block = event.get("content_block") or {}
+            if block.get("type") == "text" and block.get("text"):
+                return [self._chunk({"content": block["text"]})]
+            if block.get("type") == "tool_use":
+                idx = len(self.tool_index)
+                self.tool_index[event.get("index", idx)] = idx
+                return [self._chunk({"tool_calls": [{
+                    "index": idx,
+                    "id": block.get("id", ""),
+                    "type": "function",
+                    "function": {"name": block.get("name", ""), "arguments": ""},
+                }]})]
+            return []
+
+        if kind == "content_block_delta":
+            delta = event.get("delta") or {}
+            if delta.get("type") == "text_delta":
+                return [self._chunk({"content": delta.get("text", "")})]
+            if delta.get("type") == "input_json_delta":
+                partial = delta.get("partial_json", "")
+                idx = self.tool_index.get(event.get("index"))
+                if idx is None or not partial:
+                    return []
+                # Raw partial JSON text, passed through as a string piece:
+                # the pieces concatenate to the JSON of the tool's input.
+                return [self._chunk({"tool_calls": [{
+                    "index": idx, "function": {"arguments": partial},
+                }]})]
+            return []
+
+        if kind == "message_delta":
+            out: list[dict] = []
+            stop_reason = (event.get("delta") or {}).get("stop_reason")
+            if stop_reason is not None:
+                out.append(self._chunk({}, _finish_reason(stop_reason)))
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                output_tokens = int(usage.get("output_tokens") or 0)
+                input_tokens = int(usage.get("input_tokens") or self.input_tokens)
+                out.append({
+                    "id": self.id,
+                    "object": "chat.completion.chunk",
+                    "created": self.created,
+                    "model": self.model,
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": input_tokens,
+                        "completion_tokens": output_tokens,
+                        "total_tokens": input_tokens + output_tokens,
+                    },
+                })
+            return out
+
+        if kind == "message_stop":
+            self.done = True
+            return []
+
+        if kind == "error":
+            error = event.get("error") or {}
+            return [{"error": {
+                "message": error.get("message", "Anthropic stream error"),
+                "type": error.get("type", "api_error"),
+            }}]
+
+        return []
+
+
+def _sse_data(frame: str) -> str | None:
+    """The joined ``data:`` payload of one SSE frame (``event:`` lines skipped)."""
+    lines = [
+        line[5:].lstrip(" ") for line in frame.split("\n") if line.startswith("data:")
+    ]
+    return "\n".join(lines) if lines else None
 
 
 async def chat_completion_anthropic(
@@ -305,13 +354,13 @@ async def chat_completion_anthropic(
 ) -> dict:
     """Translate OpenAI request to Anthropic and back (non-streaming)."""
     route = routes[0]
-    
+
     # Build Anthropic request
     anthropic_request = await _openai_to_anthropic(body, principal, state, api_key)
-    
+
     # Make request (respx will intercept this for testing)
     response = await _call_anthropic(anthropic_request, api_key)
-    
+
     # Translate back to OpenAI
     return await _anthropic_to_openai(response, body)
 
@@ -325,11 +374,13 @@ async def chat_completion_stream_anthropic(
 ) -> AsyncGenerator[bytes, None]:
     """Translate OpenAI streaming request to Anthropic and stream back."""
     route = routes[0]
-    
+
     # Build Anthropic request
     anthropic_request = await _openai_to_anthropic(body, principal, state, api_key)
-    
-    # Make request (respx will intercept this for testing)
+    translator = _StreamTranslator(body.get("model", "unknown"))
+
+    # Make request (respx will intercept this for testing). The stream is
+    # read INSIDE the client context so the connection is still open.
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0)) as client:
         req = client.build_request(
             "POST",
@@ -342,39 +393,33 @@ async def chat_completion_stream_anthropic(
             },
         )
         resp = await client.send(req, stream=True)
-    
-    # Process SSE stream
-    _buf = b""
-    async for raw in resp.aiter_raw():
-        if not raw:
-            continue
-        _buf += raw
-        while True:
-            idx = _buf.find(b"\n\n")
-            if idx < 0:
-                break
-            msg = _buf[:idx]
-            _buf = _buf[idx + 2:]
-            msg_str = msg.decode("utf-8", errors="replace").strip()
-            if not msg_str:
-                continue
-            # Parse Anthropic SSE data
-            if msg_str.startswith("data: "):
-                data = msg_str[5:].strip()
-                if data == "[DONE]":
-                    yield (msg_str + "\n\n").encode("utf-8")
+        try:
+            # Anthropic frames are "event: <type>\ndata: {json}\n\n"; the type
+            # is repeated inside the JSON, so only the data line is read.
+            _buf = ""
+            async for raw in resp.aiter_text():
+                if not raw:
                     continue
-                
-                try:
-                    anthropic_chunk = json.loads(data)
-                except ValueError:
-                    yield (msg_str + "\n\n").encode("utf-8")
-                    continue
-                
-                # Convert Anthropic chunk to OpenAI format
-                openai_chunk = _anthropic_stream_to_openai(anthropic_chunk, body.get("tools", []))
-                if openai_chunk:
-                    sse_line = f"data: {json.dumps(openai_chunk)}\n\n"
-                    yield sse_line.encode("utf-8")
-            else:
-                yield (msg_str + "\n\n").encode("utf-8")
+                _buf += raw.replace("\r\n", "\n")
+                while True:
+                    idx = _buf.find("\n\n")
+                    if idx < 0:
+                        break
+                    frame, _buf = _buf[:idx], _buf[idx + 2:]
+                    data = _sse_data(frame)
+                    if not data:
+                        continue
+                    try:
+                        event = json.loads(data)
+                    except ValueError:
+                        logger.debug("llm_gateway: skipped a non-JSON Anthropic SSE frame")
+                        continue
+                    if not isinstance(event, dict):
+                        continue
+                    for chunk in translator.feed(event):
+                        yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                    if translator.done:
+                        yield b"data: [DONE]\n\n"
+                        return
+        finally:
+            await resp.aclose()

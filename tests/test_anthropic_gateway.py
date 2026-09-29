@@ -103,65 +103,155 @@ def _chat_with_tools() -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# Upstream fixtures. Every shape below is copied from Anthropic's published
+# Messages API docs, NOT from the translator under test:
+#   https://platform.claude.com/docs/en/build-with-claude/streaming
+#     ("Full HTTP stream response" / "Streaming request with tool use")
+#   https://platform.claude.com/docs/en/agents-and-tools/tool-use/define-tools
+#     ("Model responses with tools": a FLAT tool_use block, input an object)
+#   https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons
+#     (stop_reason is end_turn | max_tokens | stop_sequence | tool_use | ...)
+# ---------------------------------------------------------------------------
+
+
 def _anthropic_response(
     content_blocks: list[dict] | None = None,
     usage: dict | None = None,
-    stop_reason: str = "stop",
-    **extra
+    stop_reason: str = "end_turn",
 ) -> dict:
-    """Create a mock Anthropic response."""
+    """A Messages API response body as the docs show it."""
     if content_blocks is None:
         content_blocks = [{"type": "text", "text": "hi"}]
-    
     if usage is None:
         usage = {"input_tokens": 3, "output_tokens": 1}
-    
-    response = {
-        "id": "msg_123456",
+    return {
+        "id": "msg_01XFDUDYJgAACzvnptvVoYEL",
         "type": "message",
         "role": "assistant",
-        "content": content_blocks,
-        "usage": usage,
-        "stop_reason": stop_reason,
         "model": "claude-x",
-        "created": 1234567890,
-        "stream": False,
-        **extra,
+        "content": content_blocks,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": usage,
     }
-    return response
 
 
-def _anthropic_stream_chunk(
-    type: str,
-    index: int = 0,
-    text: str | None = None,
-    tool_use: dict | None = None,
-    usage: dict | None = None,
-    stop_reason: str | None = None,
-) -> dict:
-    """Create a mock Anthropic streaming event."""
-    chunk = {"type": type, "index": index}
-    
-    if type == "text_delta":
-        chunk["delta"] = {"type": "text_delta", "text": text or ""}
-    elif type == "input_json_delta":
-        chunk["delta"] = {"type": "input_json_delta", "partial_json": json.dumps(text or {})}
-    elif type == "message_delta":
-        delta = {}
-        if usage:
-            delta["usage"] = usage
-        if stop_reason:
-            delta["stop_reason"] = stop_reason
-        chunk["delta"] = delta
-    elif type == "message_start":
-        chunk["message"] = {"type": "message", "role": "assistant", "content": []}
-    elif type == "content_block_start":
-        content_block = {"type": "text"}
-        if text:
-            content_block["text"] = text
-        chunk["content_block"] = content_block
-    
-    return chunk
+# The tool_use block from "Model responses with tools" (define-tools doc).
+DOC_TOOL_USE_CONTENT = [
+    {
+        "type": "text",
+        "text": "I'll help you check the current weather and time in San Francisco.",
+    },
+    {
+        "type": "tool_use",
+        "id": "toolu_01A09q90qw90lq917835lq9",
+        "name": "get_weather",
+        "input": {"location": "San Francisco, CA"},
+    },
+]
+
+
+def _sse(event: dict) -> str:
+    """One SSE frame as Anthropic sends it: a named ``event:`` line, then ``data:``."""
+    return f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+
+
+# "Streaming request with tool use" from the streaming doc, event for event
+# (text deltas shortened; the input_json_delta pieces are verbatim, including
+# the empty first one). No trailing [DONE]: Anthropic never sends one.
+DOC_TOOL_STREAM = [
+    {"type": "message_start", "message": {"id": "msg_014p7gG3wDgGV9EUtLvnow3U", "type": "message", "role": "assistant", "model": "claude-x", "stop_sequence": None, "usage": {"input_tokens": 472, "output_tokens": 2}, "content": [], "stop_reason": None}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    {"type": "ping"},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Okay"}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": ", let's check"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_01T1x1fJ34qAmk2tNTrN7Up6", "name": "get_weather", "input": {}}},
+    {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": ""}},
+    {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "{\"location\":"}},
+    {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": " \"San"}},
+    {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": " Francisc"}},
+    {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "o,"}},
+    {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": " CA\"}"}},
+    {"type": "content_block_stop", "index": 1},
+    {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None}, "usage": {"output_tokens": 89}},
+    {"type": "message_stop"},
+]
+
+# "Basic streaming request" from the streaming doc.
+DOC_TEXT_STREAM = [
+    {"type": "message_start", "message": {"id": "msg_1nZdL29xx5MUA1yADyHTEsnR8uuvGzszyY", "type": "message", "role": "assistant", "content": [], "model": "claude-x", "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 25, "output_tokens": 1}}},
+    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+    {"type": "ping"},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}},
+    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "!"}},
+    {"type": "content_block_stop", "index": 0},
+    {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 15}},
+    {"type": "message_stop"},
+]
+
+
+def _stream_body(events: list[dict]) -> bytes:
+    return "".join(_sse(e) for e in events).encode("utf-8")
+
+
+def _openai_frames(text: str) -> tuple[list[dict], bool]:
+    """Parse the gateway's SSE output: (JSON chunks, saw a final [DONE])."""
+    chunks: list[dict] = []
+    done = False
+    for frame in text.split("\n\n"):
+        frame = frame.strip()
+        if not frame:
+            continue
+        assert frame.startswith("data: "), f"not an OpenAI SSE frame: {frame!r}"
+        payload = frame[len("data: "):]
+        assert not done, "a frame arrived after data: [DONE]"
+        if payload == "[DONE]":
+            done = True
+            continue
+        chunks.append(json.loads(payload))
+    return chunks, done
+
+
+async def _gateway_app(tmp_path_factory, backends: list[dict] | None = None):
+    """The real app with the gateway on, a logged-in session, and the given backends."""
+    from tinyagentos.llm_gateway.auth import configure_gateway_keystore
+
+    data_dir = tmp_path_factory.mktemp("anthropic_gateway")
+    configure_gateway_keystore(data_dir)
+    _write_test_config(data_dir, backends or [{
+        "name": "claude-cloud",
+        "type": "anthropic",
+        "url": UPSTREAM,
+        "models": [{"id": "claude-x"}],
+        "api_key": ANTHROPIC_KEY,
+        "priority": 2,
+    }])
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("TAOS_LLM_GATEWAY", "1")
+        app = create_app(data_dir=data_dir)
+    state = app.state
+    for store in (state.desktop_settings, state.secrets, state.agent_model_keys):
+        if store._db is not None:
+            await store.close()
+        await store.init()
+    state.auth.setup_user("admin", "Test Admin", "", "testpass")
+    uid = state.auth.find_user("admin")["id"]
+    session = state.auth.create_session(user_id=uid, long_lived=True)
+    state._startup_complete = True
+    return app, session
+
+
+async def _post(app, session, body: dict) -> httpx.Response:
+    from httpx import ASGITransport, AsyncClient
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        cookies={"taos_session": session},
+        event_hooks=csrf_event_hooks(),
+    ) as client:
+        return await client.post(BASE + "/chat/completions", json=body)
 
 
 @pytest.mark.asyncio
@@ -277,27 +367,14 @@ async def test_tool_call_round_trip(tmp_path_factory):
     session = state.auth.create_session(user_id=uid, long_lived=True)
     state._startup_complete = True
     
-    # Mock Anthropic response with tool use
+    # The doc's tool_use response: a text block, then a FLAT tool_use block.
     anthropic_response = _anthropic_response(
-        content_blocks=[
-            {"type": "text", "text": "I'll get the weather for you."},
-            {
-                "type": "tool_use",
-                "tool_use": {
-                    "id": "toolu_123",
-                    "name": "get_weather",
-                    "input_json": {"city": "Paris"}
-                }
-            }
-        ],
-        stop_reason="tool_calls"
+        content_blocks=DOC_TOOL_USE_CONTENT, stop_reason="tool_use",
     )
-    
     respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
         200, json=anthropic_response, headers={"content-type": "application/json"}
     ))
-    
-    # Make the request
+
     from httpx import ASGITransport, AsyncClient
     async with AsyncClient(
         transport=ASGITransport(app=app),
@@ -306,19 +383,22 @@ async def test_tool_call_round_trip(tmp_path_factory):
         event_hooks=csrf_event_hooks(),
     ) as client:
         resp = await client.post(BASE + "/chat/completions", json=_chat_with_tools())
-    
+
     assert resp.status_code == 200, resp.text
-    body = resp.json()
-    
-    # Verify tool_calls in response
-    assert "tool_calls" in body["choices"][0]["message"]
-    assert body["choices"][0]["finish_reason"] == "tool_calls"
-    
-    # Verify tool call details
-    tool_calls = body["choices"][0]["message"]["tool_calls"]
+    choice = resp.json()["choices"][0]
+    message = choice["message"]
+    tool_calls = message["tool_calls"]
     assert len(tool_calls) == 1
     assert tool_calls[0]["function"]["name"] == "get_weather"
-    assert tool_calls[0]["function"]["arguments"] == '{"city": "Paris"}'
+    assert tool_calls[0]["id"] == "toolu_01A09q90qw90lq917835lq9"
+    assert tool_calls[0]["type"] == "function"
+    # OpenAI carries arguments as a JSON STRING; Anthropic's input is an object.
+    arguments = tool_calls[0]["function"]["arguments"]
+    assert isinstance(arguments, str)
+    assert json.loads(arguments) == {"location": "San Francisco, CA"}
+    # The text Claude wrote before the call is kept alongside it.
+    assert message["content"] == DOC_TOOL_USE_CONTENT[0]["text"]
+    assert choice["finish_reason"] == "tool_calls"
 
 
 @pytest.mark.asyncio
@@ -357,30 +437,10 @@ async def test_streaming_with_text_deltas_and_tool_arguments(tmp_path_factory):
     session = state.auth.create_session(user_id=uid, long_lived=True)
     state._startup_complete = True
     
-    # Build streaming response
-    stream_chunks = [
-        _anthropic_stream_chunk("message_start"),
-        _anthropic_stream_chunk("content_block_start", text="Hello"),
-        _anthropic_stream_chunk("text_delta", text="Hello "),
-        _anthropic_stream_chunk("text_delta", text="world!"),
-        _anthropic_stream_chunk("content_block_start", tool_use={"id": "toolu_123", "name": "get_weather"}),
-        _anthropic_stream_chunk("input_json_delta", text='{"city": "'),
-        _anthropic_stream_chunk("input_json_delta", text='Paris"}'),
-        _anthropic_stream_chunk("message_delta", stop_reason="stop", usage={"input_tokens": 3, "output_tokens": 5}),
-        _anthropic_stream_chunk("message_stop"),
-    ]
-    
-    # Convert to SSE format
-    sse_content = ""
-    for chunk in stream_chunks:
-        sse_content += f"data: {json.dumps(chunk)}\n\n"
-    sse_content += "data: [DONE]\n\n"
-    
     respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
-        200, content=sse_content.encode(), headers={"content-type": "text/event-stream"}
+        200, content=_stream_body(DOC_TOOL_STREAM), headers={"content-type": "text/event-stream"}
     ))
-    
-    # Make the request
+
     from httpx import ASGITransport, AsyncClient
     async with AsyncClient(
         transport=ASGITransport(app=app),
@@ -389,20 +449,104 @@ async def test_streaming_with_text_deltas_and_tool_arguments(tmp_path_factory):
         event_hooks=csrf_event_hooks(),
     ) as client:
         resp = await client.post(BASE + "/chat/completions", json=_chat(stream=True))
-    
+
     assert resp.status_code == 200, resp.text
     assert resp.headers["content-type"].startswith("text/event-stream")
-    
-    # Verify the streaming response
-    data = resp.read()
-    text = data.decode("utf-8")
-    
-    # Check that we got the text deltas
-    assert '"content": "Hello "' in text
-    assert '"content": "world!"' in text
-    
-    # Check that we got tool call arguments (this would be in a tool_calls delta)
-    # Note: The exact format depends on the implementation
+    chunks, done = _openai_frames(resp.read().decode("utf-8"))
+    assert done, "the stream must end with data: [DONE]"
+    assert chunks, "no OpenAI chunks were emitted"
+    for chunk in chunks:
+        assert chunk["object"] == "chat.completion.chunk", chunk
+
+    deltas = [c["choices"][0]["delta"] for c in chunks if c.get("choices")]
+    text = "".join(d.get("content") or "" for d in deltas)
+    assert text == "Okay, let's check"
+
+    tool_deltas = [tc for d in deltas for tc in (d.get("tool_calls") or [])]
+    assert tool_deltas, "no tool_calls deltas were emitted"
+    first = tool_deltas[0]
+    assert first["index"] == 0
+    assert first["id"] == "toolu_01T1x1fJ34qAmk2tNTrN7Up6"
+    assert first["type"] == "function"
+    assert first["function"]["name"] == "get_weather"
+    for tc in tool_deltas:
+        assert tc["index"] == 0
+        assert isinstance(tc["function"]["arguments"], str), tc
+    arguments = "".join(tc["function"]["arguments"] for tc in tool_deltas)
+    assert json.loads(arguments) == {"location": "San Francisco, CA"}
+
+    finishes = [c["choices"][0]["finish_reason"] for c in chunks
+                if c.get("choices") and c["choices"][0].get("finish_reason")]
+    assert finishes == ["tool_calls"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_streaming_plain_text_maps_end_turn_and_usage(tmp_path_factory):
+    """The doc's basic text stream: named event frames, a ping, end_turn, and
+    usage split across message_start (input) and message_delta (output)."""
+    app, session = await _gateway_app(tmp_path_factory)
+    respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
+        200, content=_stream_body(DOC_TEXT_STREAM), headers={"content-type": "text/event-stream"}
+    ))
+    resp = await _post(app, session, _chat(stream=True))
+    assert resp.status_code == 200, resp.text
+    chunks, done = _openai_frames(resp.read().decode("utf-8"))
+    assert done
+    for chunk in chunks:
+        assert chunk["object"] == "chat.completion.chunk", chunk
+    deltas = [c["choices"][0]["delta"] for c in chunks if c.get("choices")]
+    assert "".join(d.get("content") or "" for d in deltas) == "Hello!"
+    assert not any(d.get("tool_calls") for d in deltas)
+    finishes = [c["choices"][0]["finish_reason"] for c in chunks
+                if c.get("choices") and c["choices"][0].get("finish_reason")]
+    assert finishes == ["stop"]
+    usages = [c["usage"] for c in chunks if c.get("usage")]
+    assert usages, "no usage chunk was emitted"
+    assert usages[-1] == {"prompt_tokens": 25, "completion_tokens": 15, "total_tokens": 40}
+
+
+@pytest.mark.asyncio
+@respx.mock
+@pytest.mark.parametrize(("stop_reason", "finish_reason", "warns"), [
+    ("end_turn", "stop", False),
+    ("stop_sequence", "stop", False),
+    ("max_tokens", "length", False),
+    ("tool_use", "tool_calls", False),
+    ("some_future_reason", "stop", True),
+])
+async def test_stop_reason_maps_to_openai_finish_reason(
+    tmp_path_factory, caplog, stop_reason, finish_reason, warns,
+):
+    """Every stop_reason the card names maps to its OpenAI finish_reason;
+    anything else becomes "stop" AND is logged."""
+    app, session = await _gateway_app(tmp_path_factory)
+    content = DOC_TOOL_USE_CONTENT if stop_reason == "tool_use" else None
+    respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
+        200, json=_anthropic_response(content_blocks=content, stop_reason=stop_reason),
+    ))
+    with caplog.at_level("WARNING", logger="tinyagentos.llm_gateway.anthropic"):
+        resp = await _post(app, session, _chat())
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["choices"][0]["finish_reason"] == finish_reason
+    logged = [r for r in caplog.records
+              if r.name == "tinyagentos.llm_gateway.anthropic" and stop_reason in r.getMessage()]
+    assert bool(logged) == warns, [r.getMessage() for r in caplog.records]
+
+
+@pytest.mark.asyncio
+async def test_unmocked_upstream_request_is_refused_not_sent(tmp_path_factory):
+    """The suite cannot reach the real api.anthropic.com: under a respx router
+    with assert_all_mocked, a request no route matches is refused inside the
+    test process instead of going to the network."""
+    app, session = await _gateway_app(tmp_path_factory)
+    with respx.mock(assert_all_mocked=True, assert_all_called=False) as router:
+        with pytest.raises(respx.models.AllMockedAssertionError):
+            await _post(app, session, _chat())
+        assert not router.routes
+    # The module-level router every @respx.mock test in the gateway suites
+    # uses is strict in the same way.
+    assert respx.mock._assert_all_mocked is True
 
 
 @pytest.mark.asyncio
