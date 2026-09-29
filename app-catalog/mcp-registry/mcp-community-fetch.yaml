@@ -1,4 +1,4 @@
-id: mcp-fetch
+id: mcp-community-fetch
 name: Fetch
 description: >-
   Fetch a URL and convert the page to markdown for the model. Useful for

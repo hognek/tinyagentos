@@ -27,6 +27,7 @@ from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 
 from tinyagentos.mcp.marketplace import (
+    MARKETPLACE_ID_PREFIX,
     InvalidPermissionSet,
     MCPMarketplace,
     MCPMarketplaceError,
@@ -257,6 +258,44 @@ class TestCuratedRegistry:
             else:
                 assert manifest.server_config()["cmd"] == manifest.launch_argv()
 
+    def test_shipped_entry_ids_do_not_collide_with_the_app_catalog(self):
+        """The curated registry must not reuse an id an app manifest owns.
+
+        ``mcp_servers`` is one namespace shared by every installer: the Store
+        registers a bundled plugin under its app id (with no config), and the
+        marketplace registers a curated entry under its manifest id.  An id both
+        surfaces own means the two install paths overwrite each other's row — a
+        later Store install replaces the marketplace's launch config with the
+        Store's empty one (leaving a server whose command no longer resolves),
+        and a marketplace uninstall deletes a row the Store still reports as
+        installed.  The curated entries therefore live in their own namespace,
+        and this scan is what keeps it that way.
+        """
+        registry = MCPRegistry(default_registry_dir())
+        shipped = {m.id for m in registry.list()}
+        assert shipped, "the shipped registry is empty"
+
+        app_catalog = default_registry_dir().parent
+        app_ids: set[str] = set()
+        for manifest_path in app_catalog.rglob("manifest.yaml"):
+            data = yaml.safe_load(manifest_path.read_text()) or {}
+            if isinstance(data, dict) and data.get("id"):
+                app_ids.add(str(data["id"]))
+        assert app_ids, "the app-catalog scan found no manifests — the path is wrong"
+
+        collisions = sorted(shipped & app_ids)
+        assert collisions == [], (
+            "curated ids collide with app-catalog ids (one mcp_servers "
+            f"namespace, two installers): {collisions}"
+        )
+
+        # …and the namespace is explicit rather than accidentally non-colliding:
+        # a new curated entry is added under the prefix, not next to it.
+        outside = sorted(i for i in shipped if not i.startswith(MARKETPLACE_ID_PREFIX))
+        assert outside == [], (
+            f"curated ids outside the {MARKETPLACE_ID_PREFIX!r} namespace: {outside}"
+        )
+
     def test_search_matches_name_description_and_category(self, registry_dir: Path):
         registry = MCPRegistry(registry_dir)
         assert [m.id for m in registry.list(query="fetch")] == ["mcp-fetch"]
@@ -460,6 +499,55 @@ class TestInstallFlow:
             await marketplace.install("mcp-fetch")
         assert excinfo.value.status_code == 409
 
+    async def test_install_refuses_an_id_owned_by_another_installer(self, registry_dir, store):
+        """A row the marketplace did not write is reported, never replaced.
+
+        ``mcp_servers`` is shared with the app Store, which registers a bundled
+        plugin under its app id with no config.  The install must leave that row
+        exactly as it is and say why, instead of the bare "already installed"
+        (which reads as *this* entry being present).
+        """
+        await store.register_server("mcp-fetch", "0.1.0", "stdio", {})
+        marketplace = MCPMarketplace(
+            registry=MCPRegistry(registry_dir), store=store, runner=RecordingRunner(),
+        )
+        with pytest.raises(MCPMarketplaceError) as excinfo:
+            await marketplace.install("mcp-fetch")
+        assert excinfo.value.status_code == 409
+        assert "outside the marketplace" in str(excinfo.value)
+        server = await store.get_server("mcp-fetch")
+        assert server["version"] == "0.1.0"
+        assert server["config"] == {}
+
+    async def test_uninstall_refuses_a_row_owned_by_another_installer(self, registry_dir, store):
+        """Removing a Store-owned row would desync the Store's installed.json."""
+        await store.register_server("mcp-fetch", "0.1.0", "stdio", {})
+        marketplace = MCPMarketplace(
+            registry=MCPRegistry(registry_dir), store=store, runner=RecordingRunner(),
+        )
+        with pytest.raises(MCPMarketplaceError) as excinfo:
+            await marketplace.uninstall("mcp-fetch")
+        assert excinfo.value.status_code == 409
+        assert await store.get_server("mcp-fetch") is not None
+
+    async def test_browse_and_detail_report_the_install_origin(self, registry_dir, store):
+        marketplace = MCPMarketplace(
+            registry=MCPRegistry(registry_dir), store=store, runner=RecordingRunner(),
+        )
+        await store.register_server("mcp-fetch", "0.1.0", "stdio", {})
+        entries = {e["id"]: e for e in await marketplace.browse()}
+        assert entries["mcp-fetch"]["installed"] is True
+        assert entries["mcp-fetch"]["installed_by_marketplace"] is False
+        detail = await marketplace.detail("mcp-fetch")
+        assert detail["installed"] is True
+        assert detail["installed_by_marketplace"] is False
+
+        await store.delete_server("mcp-fetch")
+        await marketplace.install("mcp-fetch")
+        entries = {e["id"]: e for e in await marketplace.browse()}
+        assert entries["mcp-fetch"]["installed_by_marketplace"] is True
+        assert (await marketplace.detail("mcp-fetch"))["installed_by_marketplace"] is True
+
     async def test_uninstall_removes_the_server(self, registry_dir, store):
         marketplace = MCPMarketplace(
             registry=MCPRegistry(registry_dir), store=store, runner=RecordingRunner(),
@@ -533,16 +621,16 @@ class TestInstallFlow:
             registry=MCPRegistry(default_registry_dir()), store=store,
             workspace_root=workspace_root,
         )
-        result = await marketplace.install("mcp-filesystem", run_install_command=False)
-        expected = str(workspace_root / "mcp-filesystem")
+        result = await marketplace.install("mcp-community-filesystem", run_install_command=False)
+        expected = str(workspace_root / "mcp-community-filesystem")
         assert result["workspace"] == expected
         assert Path(expected).is_dir()
         assert result["config"]["cmd"][-1] == expected
         assert "{workspace}" not in " ".join(result["config"]["cmd"])
 
-        server = await store.get_server("mcp-filesystem")
+        server = await store.get_server("mcp-community-filesystem")
         supervisor = MCPSupervisor(store=store, catalog=None, notif_store=None)
-        cmd = supervisor._resolve_cmd("mcp-filesystem", server)
+        cmd = supervisor._resolve_cmd("mcp-community-filesystem", server)
         assert cmd is not None
         assert cmd[-1] == expected
 
@@ -551,9 +639,9 @@ class TestInstallFlow:
             registry=MCPRegistry(default_registry_dir()), store=store,
         )
         with pytest.raises(MCPMarketplaceError) as excinfo:
-            await marketplace.install("mcp-filesystem", run_install_command=False)
+            await marketplace.install("mcp-community-filesystem", run_install_command=False)
         assert excinfo.value.status_code == 500
-        assert await store.get_server("mcp-filesystem") is None
+        assert await store.get_server("mcp-community-filesystem") is None
 
     async def test_a_failed_install_leaves_no_workspace_behind(self, registry_dir, store, tmp_path):
         """A failed install must leave neither a store row nor a directory."""
@@ -604,7 +692,7 @@ class TestInstallFlow:
             registry=MCPRegistry(default_registry_dir()), store=store,
             workspace_root=None,
         )
-        entry = next(e for e in await marketplace.browse() if e["id"] == "mcp-filesystem")
+        entry = next(e for e in await marketplace.browse() if e["id"] == "mcp-community-filesystem")
         assert entry["uses_workspace"] is True
         assert entry["command"][-1] == "{workspace}"
 

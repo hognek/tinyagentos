@@ -1483,10 +1483,49 @@ described by a manifest in the curated registry.
 | `DELETE /api/mcp/marketplace/servers/{id}` | `require_admin` | uninstall (drops attachments and `mcp:<id>:` secrets) |
 | `POST /api/mcp/marketplace/reload` | `require_admin` | re-read the registry directory |
 
-Install answers `404` for an unknown entry, `409` when it is already
-installed, and `502` when the install command fails — **a failed install leaves
+Install answers `404` for an unknown entry, `409` when it is already installed,
+`409` when the id belongs to a server another installer wrote (see the namespace
+note below), and `502` when the install command fails — **a failed install leaves
 the store untouched**, so a half-installed entry never shows up as launchable.
-Uninstalling is `404` for something that was never installed.
+Uninstalling is `404` for something that was never installed, and `409` for a
+row the marketplace did not write.
+
+### Id namespace: the marketplace shares one table with the Store
+
+`mcp_servers` is a single namespace that every installer on the platform writes
+to. The app Store registers a bundled `app-catalog/plugins/mcp-*` manifest under
+its **app id** with an empty config and relies on `MCPSupervisor._resolve_cmd`'s
+app-catalog fallback; the marketplace registers a curated entry under its
+**manifest id** with an explicit `cmd`. Two installers writing the same id means
+each destroys the other's row:
+
+- a Store install of that app replaces the marketplace's config (`source:
+  marketplace`, `cmd`, `permissions`) with `{}` and drops the version — with the
+  real catalog registered, `_resolve_cmd` then returns `None` and `start()`
+  returns `False`, so the server the marketplace provisioned quietly stops being
+  launchable;
+- a marketplace `DELETE` removes the shared row while the Store's
+  `installed.json` still reports the app installed — the two surfaces disagree
+  about state.
+
+Curated ids therefore live in their own namespace, **`mcp-community-`**
+(`MARKETPLACE_ID_PREFIX`): `mcp-community-filesystem`, `mcp-community-fetch`,
+`mcp-community-git`, `mcp-community-memory`, `mcp-community-time`,
+`mcp-community-github`. `tests/test_mcp_marketplace.py` scans every
+`app-catalog/**/manifest.yaml` and fails if a curated id ever equals an
+app-catalog id again, so the disjointness is enforced rather than remembered.
+
+The runtime does not rely on the convention alone. Rows the marketplace writes
+carry `config["source"] == "marketplace"` (`MARKETPLACE_SOURCE`), which tells a
+marketplace-owned row from one another installer wrote. `install` refuses to
+overwrite a row it did not write (409 with an explicit "already in use by a
+server installed outside the marketplace" message, instead of the bare "already
+installed", which would read as *this* entry being present), and `uninstall`
+refuses to delete one (409) so it cannot desync the Store's own bookkeeping.
+Browse and detail expose both flags: `installed` is true whenever the id is
+occupied in `mcp_servers` (the Store may own it), and
+`installed_by_marketplace` is true only when the stored config is the one this
+marketplace wrote.
 
 A manifest (`app-catalog/mcp-registry/<id>.yaml`, one per entry) declares
 `id`, `name`, `description`, `version`, `author`, `categories`, `transport`,

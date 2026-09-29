@@ -1,4 +1,4 @@
-id: mcp-git
+id: mcp-community-git
 name: Git
 description: >-
   Inspect and operate on a local git repository: status, diff, log, commit and

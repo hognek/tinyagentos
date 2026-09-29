@@ -1,4 +1,4 @@
-id: mcp-time
+id: mcp-community-time
 name: Time
 description: >-
   Current time and timezone conversion. Declares no permissions — it reads

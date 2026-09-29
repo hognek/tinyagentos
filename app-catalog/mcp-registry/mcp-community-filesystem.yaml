@@ -1,4 +1,4 @@
-id: mcp-filesystem
+id: mcp-community-filesystem
 name: Filesystem
 description: >-
   Read, write and search files under one allowed directory. The reference MCP

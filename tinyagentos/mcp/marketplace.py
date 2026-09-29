@@ -102,6 +102,26 @@ SUPPORTED_TRANSPORTS: frozenset[str] = frozenset({"stdio"})
 # creates, so a curated entry can point a server at an empty private directory.
 WORKSPACE_TOKEN = "{workspace}"
 
+# The curated registry's own id namespace.
+#
+# ``mcp_servers`` is ONE namespace shared by every installer on the platform:
+# the app Store registers a bundled ``app-catalog/plugins/mcp-*`` manifest under
+# its app id, and this marketplace registers a curated entry under its manifest
+# id.  An id both surfaces own means the two install paths overwrite each other's
+# row — a later Store install replaces the marketplace's launch config with the
+# Store's empty one, and a marketplace uninstall deletes a row the Store still
+# reports as installed.  Curated entries therefore live under this prefix, so the
+# curated namespace is disjoint from the app catalog's by construction;
+# ``tests/test_mcp_marketplace.py`` scans the app catalog and fails if it stops
+# being true.
+MARKETPLACE_ID_PREFIX = "mcp-community-"
+
+# ``config["source"]`` stamps the rows the install flow writes.  It is what
+# separates a row this marketplace owns from one another installer wrote (a Store
+# plugin row carries no such marker), so the marketplace never overwrites or
+# deletes a row that is not its own.
+MARKETPLACE_SOURCE = "marketplace"
+
 # Upper bound on a single install command.  Generous enough for a real
 # `npm install -g` / `docker pull` on slow hardware, bounded so a hung installer
 # cannot hold an admin's request open indefinitely.
@@ -359,10 +379,12 @@ class MCPRegistryManifest(BaseModel):
         ``MCPSupervisor._resolve_cmd`` reads ``config["cmd"]`` first and falls
         back to the app catalog, so a config carrying ``cmd`` is launchable by
         the loader as-is.  ``permissions`` rides along as a record of what the
-        server declared, and ``env`` supplies non-secret launch defaults.
+        server declared, ``source`` records which installer wrote the row (see
+        :data:`MARKETPLACE_SOURCE`), and ``env`` supplies non-secret launch
+        defaults.
         """
         config: dict[str, Any] = {
-            "source": "marketplace",
+            "source": MARKETPLACE_SOURCE,
             "permissions": list(self.permissions),
             "cmd": self.launch_argv(workspace),
         }
@@ -684,6 +706,20 @@ async def _subprocess_runner(
     )
 
 
+def _is_marketplace_row(server: dict | None) -> bool:
+    """True when *server* is a row this marketplace wrote.
+
+    The origin is recorded in ``config["source"]``.  A row registered by the app
+    Store (or by anything else) carries no such marker and is therefore never
+    treated as this marketplace's own — which is what keeps an install from
+    overwriting it and an uninstall from deleting it.
+    """
+    if not server:
+        return False
+    config = server.get("config")
+    return isinstance(config, dict) and config.get("source") == MARKETPLACE_SOURCE
+
+
 class MCPMarketplace:
     """Browse the registry and install entries into ``MCPServerStore``.
 
@@ -719,19 +755,32 @@ class MCPMarketplace:
         return self.registry.categories()
 
     async def installed_ids(self) -> set[str]:
+        """Every server id in the store — whoever installed it."""
         return {s["id"] for s in await self.store.list_servers()}
+
+    async def _installed_rows(self) -> dict[str, dict]:
+        return {s["id"]: s for s in await self.store.list_servers()}
 
     async def browse(
         self,
         query: str | None = None,
         category: str | None = None,
     ) -> list[dict]:
-        """Registry entries annotated with their install/running state."""
-        installed = await self.installed_ids()
+        """Registry entries annotated with their install/running state.
+
+        ``installed`` is true whenever the id is occupied — the namespace is
+        shared with the app Store, so an entry can be "present" because a
+        bundled plugin owns the id.  ``installed_by_marketplace`` says whether
+        the row is one this marketplace wrote, i.e. whether the entry's own
+        launch config is the one stored.
+        """
+        rows = await self._installed_rows()
         entries: list[dict] = []
         for manifest in self.registry.list(query=query, category=category):
+            row = rows.get(manifest.id)
             entry = manifest.to_dict()
-            entry["installed"] = manifest.id in installed
+            entry["installed"] = row is not None
+            entry["installed_by_marketplace"] = _is_marketplace_row(row)
             entry["running"] = False
             if entry["installed"] and self.supervisor is not None:
                 status = self.supervisor.get_status(manifest.id)
@@ -751,10 +800,12 @@ class MCPMarketplace:
         manifest = self.get_manifest(manifest_id)
         entry = manifest.to_dict()
         entry["installed"] = False
+        entry["installed_by_marketplace"] = False
         entry["running"] = False
         server = await self.store.get_server(manifest_id)
         if server is not None:
             entry["installed"] = True
+            entry["installed_by_marketplace"] = _is_marketplace_row(server)
             entry["installed_version"] = server.get("version", "")
             entry["installed_config"] = server.get("config", {})
             if self.supervisor is not None:
@@ -774,10 +825,13 @@ class MCPMarketplace:
         """Resolve a manifest and register a loadable server config for it.
 
         Raises :class:`MCPMarketplaceError` when the entry is unknown (404),
-        already installed (409), or its install command fails (502).  A failed
-        install leaves the store untouched — the server is registered only
-        after the fetch step succeeded, so a half-installed entry never shows
-        up as launchable.
+        already installed (409), or its install command fails (502).  A row the
+        marketplace did not write (the id belongs to a bundled Store app) is
+        also refused with 409, explicitly and without touching it — see
+        :data:`MARKETPLACE_ID_PREFIX` for why the curated ids avoid that
+        altogether.  A failed install leaves the store untouched — the server is
+        registered only after the fetch step succeeded, so a half-installed
+        entry never shows up as launchable.
 
         The already-installed check is not atomic with the registration that
         follows it: two concurrent installs of the same id would both run the
@@ -790,9 +844,26 @@ class MCPMarketplace:
         """
         manifest = self.get_manifest(manifest_id)
 
-        if await self.store.get_server(manifest.id) is not None:
+        existing = await self.store.get_server(manifest.id)
+        if existing is not None:
+            if _is_marketplace_row(existing):
+                raise MCPMarketplaceError(
+                    f"{manifest.id!r} is already installed", status_code=409
+                )
+            # ``mcp_servers`` is one namespace shared with the app Store, which
+            # registers a bundled plugin under its app id with no config.  A row
+            # this marketplace did not write is reported as what it is: silently
+            # replacing it would destroy the other installer's row (turning a
+            # working server into one whose launch command no longer resolves),
+            # and the bare "already installed" would read as *this* entry being
+            # present when its config is not the one stored.
             raise MCPMarketplaceError(
-                f"{manifest.id!r} is already installed", status_code=409
+                f"server id {manifest.id!r} is already in use by a server "
+                "installed outside the marketplace (for example a bundled app "
+                "from the Store); the marketplace will not overwrite it — "
+                "uninstall it first, or install a registry entry with a "
+                "different id",
+                status_code=409,
             )
 
         if any(WORKSPACE_TOKEN in arg for arg in manifest.install.command):
@@ -882,10 +953,22 @@ class MCPMarketplace:
         Delegates to the supervisor when one is wired (it also drops the
         server's attachments and any ``mcp:<id>:`` secrets — the "no leftover
         state" half of a clean uninstall), and falls back to the store.
+
+        Only a row this marketplace wrote is removed: the id namespace is shared
+        with the app Store, and deleting a Store-owned row here would leave the
+        Store still reporting the app as installed while its server row is gone.
         """
-        if await self.store.get_server(manifest_id) is None:
+        server = await self.store.get_server(manifest_id)
+        if server is None:
             raise MCPMarketplaceError(
                 f"{manifest_id!r} is not installed", status_code=404
+            )
+        if not _is_marketplace_row(server):
+            raise MCPMarketplaceError(
+                f"{manifest_id!r} was not installed from the marketplace (its "
+                "server row was written by another installer, for example the "
+                "app Store); the marketplace will not remove it",
+                status_code=409,
             )
         if self.supervisor is not None:
             result = await self.supervisor.uninstall(manifest_id)
