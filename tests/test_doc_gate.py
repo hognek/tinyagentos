@@ -108,6 +108,26 @@ class TestEvaluateRules:
         assert len(failures) == 1
         assert failures[0].startswith("routes -- ")
 
+    def test_new_file_inside_existing_app_dir_does_not_fire_apps_rule(self):
+        """A new file inside an already-tracked desktop app directory must not
+        trip the apps-added rule -- only a brand-new top-level app directory
+        counts."""
+        changed = [("A", "desktop/src/apps/Foo/components/Bar.tsx")]
+        failures = dg.evaluate_rules(
+            changed, [], APPS_RULE_CONFIG, existing_toplevel_dirs={"Foo"},
+        )
+        assert failures == []
+
+    def test_brand_new_app_directory_does_fire_apps_rule(self):
+        """A new app directory (not in the existing set) must fire the
+        apps-added rule."""
+        changed = [("A", "desktop/src/apps/NewApp/NewApp.tsx")]
+        failures = dg.evaluate_rules(
+            changed, [], APPS_RULE_CONFIG, existing_toplevel_dirs=set(),
+        )
+        assert len(failures) == 1
+        assert failures[0].startswith("apps -- ")
+
 
 class TestGlobMatch:
     def test_single_star_stays_within_segment(self):
