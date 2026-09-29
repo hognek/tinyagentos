@@ -17,6 +17,7 @@ import time
 import pytest
 
 import tinyagentos.routes.auth as auth
+from tinyagentos.demo_mode import write_demo_mode
 from tinyagentos.auth_middleware import EXEMPT_PATHS, EXEMPT_PREFIXES
 
 
@@ -41,6 +42,11 @@ class _Client:
 
 
 class _Req:
+    #: The request's app.state.data_dir, where the demo-mode switch lives.
+    #: None reads as switch OFF (fail closed); `armed` points it at a data dir
+    #: with the switch ON.
+    data_dir = None
+
     def __init__(self, body=None, headers=None, peer="10.0.0.5"):
         self._body = body or {}
         self.headers = _Headers(headers or {})
@@ -48,7 +54,9 @@ class _Req:
         # advertised url to this, so a stub without it would let every test
         # pass against a url no real board could have sent.
         self.client = _Client(peer)
-        self.app = type("App", (), {"state": type("S", (), {})()})()
+        state = type("S", (), {})()
+        state.data_dir = self.data_dir
+        self.app = type("App", (), {"state": state})()
 
     async def json(self):
         return self._body
@@ -79,7 +87,9 @@ def _clean_state():
 
 @pytest.fixture
 def armed(monkeypatch, tmp_path):
-    """Flag on, token file present, console request."""
+    """Flag on, demo switch on, token file present, console request."""
+    write_demo_mode(tmp_path, True)
+    monkeypatch.setattr(_Req, "data_dir", tmp_path)
     token = tmp_path / "pair.token"
     token.write_text("0123456789abcdef", encoding="utf-8")
     monkeypatch.setenv("TAOS_LOCK_DEMO_DEVICE_AGENTS", "1")
@@ -101,8 +111,24 @@ class TestItIsOffUnlessItIsTurnedOn:
         turn a real command path to hardware on as a side effect."""
         monkeypatch.setenv("TAOS_LOCK_DEMO_AGENTS", "Demo")
         monkeypatch.delenv("TAOS_LOCK_DEMO_DEVICE_AGENTS", raising=False)
+        # Switch ON, so the missing flag is the ONLY thing that can refuse.
+        write_demo_mode(tmp_path, True)
+        monkeypatch.setattr(_Req, "data_dir", tmp_path)
         resp = _beat({"Authorization": "Bearer x"})
         assert resp.status_code == 404
+
+    def test_the_demo_switch_off_takes_the_board_down(self, armed, tmp_path):
+        """Flag set, token valid, board live -- then the owner switches demo
+        mode off in Settings. The lock screen must show its real state: no
+        board island, no thread, and the next heartbeat is refused."""
+        assert _beat(armed).status_code == 200
+        assert "device:taosusb" in [
+            a.get("key") for a in _body(_call(auth.lock_widgets(_Req())))["agents"]]
+        write_demo_mode(tmp_path, False)
+        assert _beat(armed).status_code == 404
+        assert "device:taosusb" not in [
+            a.get("key") for a in _body(_call(auth.lock_widgets(_Req())))["agents"]]
+        assert _call(auth.lock_thread("taosusb", _Req())).status_code == 404
 
     def test_a_missing_token_file_refuses_rather_than_opens(
         self, monkeypatch, tmp_path
@@ -112,6 +138,8 @@ class TestItIsOffUnlessItIsTurnedOn:
         appeared on the screen."""
         monkeypatch.setenv("TAOS_LOCK_DEMO_DEVICE_AGENTS", "1")
         monkeypatch.setenv("TAOS_DEVICE_AGENT_TOKEN_FILE", str(tmp_path / "gone"))
+        write_demo_mode(tmp_path, True)
+        monkeypatch.setattr(_Req, "data_dir", tmp_path)
         assert _beat({"Authorization": "Bearer anything"}).status_code == 401
 
     def test_the_wrong_token_is_refused(self, armed):

@@ -156,7 +156,7 @@ taOS ships with a full browser-based desktop environment. Open it at `http://you
 
 ### 43 Bundled Desktop Apps
 
-**Platform apps (29):** Messages (WebSocket chat), Mail (IMAP/SMTP accounts, read and send), Projects (Kanban + A2A), Agents (deploy wizard + logs + skills), Store (109+ apps), Settings (multi-section with Memory capture toggles), Models, Providers (cloud LLM provider management, add/test/remove OpenAI, Anthropic, DeepSeek, and compatible APIs), Memory (User + Agent sections), MCP (plugin manager), Channels, Secrets, Tasks, Import, Images (Image Studio: Create / Library / Edit with tier-aware inpaint + upscale backends), Dashboard (Activity), Cluster (worker management + health), Library (knowledge pipeline, document library with collections and search), Agent Browsers (manage agent browser sessions), Files (real VFS with workspace + shared folders), taOS Agent (Agent-as-a-Model endpoint), Guides, Feedback, Decisions, Notifications, Observatory, Notes, Todo, Hub (taOS hub account and sharing).
+**Platform apps (29):** Messages (WebSocket chat), Mail (IMAP/SMTP accounts, read and send), Projects (Kanban + A2A), Agents (deploy wizard + logs + skills), Store (109+ apps), Settings (multi-section with Memory capture toggles, the lock screen unlock method, and an admin demo-mode switch), Models, Providers (cloud LLM provider management, add/test/remove OpenAI, Anthropic, DeepSeek, and compatible APIs), Memory (User + Agent sections), MCP (plugin manager), Channels, Secrets, Tasks, Import, Images (Image Studio: Create / Library / Edit with tier-aware inpaint + upscale backends), Dashboard (Activity), Cluster (worker management + health), Library (knowledge pipeline, document library with collections and search), Agent Browsers (manage agent browser sessions), Files (real VFS with workspace + shared folders), taOS Agent (Agent-as-a-Model endpoint), Guides, Feedback, Decisions, Notifications, Observatory, Notes, Todo, Hub (taOS hub account and sharing).
 
 **Optional taOS apps (4):** Reddit (subreddit browser with saved threads and memory ingest), YouTube (video library with transcript extraction), GitHub (repository browser with code search), and X (feed monitor with bookmarks and memory capture) ship in the build but are not installed by default; install or remove them from the Store's "taOS Apps" section.
 
@@ -515,6 +515,10 @@ Run `curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/ins
 | Env vars set | `TAOS_SPA_DIR=$INSTALL_DIR/static/desktop` (points the controller at the staged desktop bundle for non-editable `pip install .` users) |
 | OS packages added | python3 + venv + pip, git, curl, ca-certificates, libtorrent-rasterbar (model torrent mesh), Node.js 22 (qmd + SPA build), sqlite3, libsqlcipher (encrypted secrets), vulkan-tools (hardware detection), postgresql (LiteLLM virtual keys) |
 | User accounts created | The distro `postgres` system user is created when PostgreSQL is installed. A `litellm` Postgres role and database are created for virtual-key management. Everything else runs as the user who ran the installer. |
+
+### Hailo-10H install (`scripts/install-hailo.sh`)
+
+Installs `hailo-ollama` (the Hailo-10H LLM runtime) at a pinned ref, listening on port **7836** (port 8000 is the Django slot in taOS port hygiene and is already probed as a llama-cpp/vllm candidate). Before installing, the script checks for a pre-existing upstream hailo-ollama (something answering `GET /api/tags` on `0.0.0.0:8000`, Hailo's own default). If one is found it reports plainly what was detected and exits, leaving the existing instance untouched rather than silently building a second server that would compete for the accelerator and go unseen by taOS.
 
 ### Worker install (`scripts/install-worker.sh`)
 
