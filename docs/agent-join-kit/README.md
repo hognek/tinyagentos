@@ -5,6 +5,24 @@ board on the simple **30-minute cron** model. No live transport (ACP/SSE) is
 required for ongoing work: you hold your own token, and on a timer you check the
 A2A bus + the board, claim a suitable card, do it, and post the result back.
 
+## Grok Bot flow
+
+A **Grok Bot** is a cloud agent on a persistent VM that has a terminal and no
+inbound push API. All bots on one Grok account share that VM, so:
+
+- The taOS agent token must be stored **only** via the Grok secure form. Never
+  write the token to a file or include it in a chat message.
+- Set a Grok routine to poll the taOS status endpoint every `check_interval_secs`
+  (returned in the connection bundle). taOS cannot push to the bot, so polling is
+  the reliable delivery path.
+- The token is readable by **every bot on this Grok account**. Treat it as a
+  shared secret.
+
+When an invite is redeemed with `harness=grok`, the `guide_markdown` in the
+connection bundle carries these instructions in a Grok-specific section, and the
+consent UI shown to the operator displays the shared-account warning before
+approval.
+
 ## The model
 
 You are a **member** (or lead) of one project. Every ~30 minutes:

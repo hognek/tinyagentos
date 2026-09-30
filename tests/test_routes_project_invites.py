@@ -874,13 +874,78 @@ class TestDeriveHandleDedup:
     def test_label_equals_harness(self):
         from tinyagentos.routes.project_invites import _derive_handle
 
-        # proj + claude + claude → proj-claude (label stripped)
+        # proj + claude + claude -> proj-claude (label stripped)
         handle = _derive_handle("myproj", "claude", "claude")
         assert handle == "myproj-claude"
 
     def test_label_without_overlap_unchanged(self):
         from tinyagentos.routes.project_invites import _derive_handle
 
-        # No overlap → label is appended verbatim (slugified).
+        # No overlap -> label is appended verbatim (slugified).
         handle = _derive_handle("taosmobile", "claude", "review-task")
         assert handle == "taosmobile-claude-review-task"
+
+
+class TestGrokGuideMarkdown:
+    """#tsk-c56jag: grok harness must carry secure-form + routine-poll instructions,
+    and non-grok harness text must stay byte-identical."""
+
+    @pytest.mark.asyncio
+    async def test_grok_project_guide_contains_secure_form_and_poll(self, client, app, monkeypatch, tmp_path):
+        await _setup_agent_ecosystem(app, monkeypatch, tmp_path)
+        pid = await _create_project(client, slug="grokproj")
+        iid, pin = await _mint_invite(client, pid, approval_mode="auto", scopes=["a2a_send"])
+
+        resp = await client.post(
+            "/api/projects/invites/redeem",
+            json={"invite_id": iid, "pin": pin, "harness": "grok"},
+        )
+        assert resp.status_code == 200, resp.text
+        guide = resp.json()["bundle"]["guide_markdown"]
+        assert "secure form" in guide
+        assert "poll" in guide
+        assert "every bot on this Grok account" in guide
+        assert "1800" in guide
+
+    @pytest.mark.asyncio
+    async def test_grok_os_guide_contains_secure_form_and_poll(self, client, app, monkeypatch, tmp_path):
+        await _setup_agent_ecosystem(app, monkeypatch, tmp_path)
+        iid, pin = await _mint_os_invite(client, scopes=["a2a_send"], display_name="GrokBot")
+        resp = await client.post(
+            "/api/projects/invites/redeem",
+            json={"invite_id": iid, "pin": pin, "harness": "grok"},
+        )
+        assert resp.status_code == 200, resp.text
+        guide = resp.json()["bundle"]["guide_markdown"]
+        assert "secure form" in guide
+        assert "poll" in guide
+        assert "every bot on this Grok account" in guide
+        assert "1800" in guide
+
+    @pytest.mark.asyncio
+    async def test_claude_project_guide_unchanged(self, client, app, monkeypatch, tmp_path):
+        await _setup_agent_ecosystem(app, monkeypatch, tmp_path)
+        pid = await _create_project(client, slug="claudeproj")
+        iid, pin = await _mint_invite(client, pid, approval_mode="auto", scopes=["a2a_send"])
+
+        resp = await client.post(
+            "/api/projects/invites/redeem",
+            json={"invite_id": iid, "pin": pin, "harness": "claude"},
+        )
+        assert resp.status_code == 200, resp.text
+        guide = resp.json()["bundle"]["guide_markdown"]
+        assert "secure form" not in guide
+        assert "every bot on this Grok account" not in guide
+
+    @pytest.mark.asyncio
+    async def test_claude_os_guide_unchanged(self, client, app, monkeypatch, tmp_path):
+        await _setup_agent_ecosystem(app, monkeypatch, tmp_path)
+        iid, pin = await _mint_os_invite(client, scopes=["a2a_send"], display_name="ClaudeBot")
+        resp = await client.post(
+            "/api/projects/invites/redeem",
+            json={"invite_id": iid, "pin": pin, "harness": "claude"},
+        )
+        assert resp.status_code == 200, resp.text
+        guide = resp.json()["bundle"]["guide_markdown"]
+        assert "secure form" not in guide
+        assert "every bot on this Grok account" not in guide

@@ -1235,6 +1235,8 @@ arrives via the status poll). The bundle has:
   agent manual links, scoped Projects/Canvas summary, the A2A authenticated-proxy
   contract, and explicit instructions to write the identity/project/token-file/bus
   contract into the agent's OWN memory and to poll every `check_interval_secs`).
+  For `harness=grok` the guide includes a Grok-specific section covering secure-form
+  token storage (no file or chat), routine polling, and the shared-account warning.
 
 See `docs/design/external-agent-project-invite.md` (issue #1780) for the full
 design; the bundle advertises canvas routes only when the corresponding scope

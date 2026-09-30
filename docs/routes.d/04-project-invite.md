@@ -23,6 +23,6 @@ Content-negotiated advert: `Accept: application/json` → the redeem contract (`
 - `controller.endpoints` — non-loopback LAN IPv4s (priority ordered, operator override first) and the mesh (Tailscale) node IP when joined; no relay in Phase 1
 - `apis` — agent-JWT-reachable surface, scoped exactly to the granted scopes (mirrors the middleware allowlist)
 - `delivery` — timed-check contract (`poll_path`, `stream_path`, `check_interval_secs`, `cursor: ts`, `filter: mentions+project`)
-- `onboarding` + `guide_markdown` — personalized capability guide (repo link, agent manual links, scoped Projects/Canvas summary, the A2A authenticated-proxy contract)
+- `onboarding` + `guide_markdown` — personalized capability guide (repo link, agent manual links, scoped Projects/Canvas summary, the A2A authenticated-proxy contract, and memory + timed-check instructions). When `harness=grok`, the guide also includes secure-form token storage, routine polling, and a shared-account warning.
 
 See `docs/design/external-agent-project-invite.md` (issue #1780); canvas routes advertise only when that scope was granted.
