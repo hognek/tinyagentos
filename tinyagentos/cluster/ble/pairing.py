@@ -54,6 +54,8 @@ from tinyagentos.cluster.worker_protocol import WorkerInfo
 
 logger = logging.getLogger(__name__)
 
+DEVICE_CAPS_ALLOWED = frozenset({"agent", "orb"})
+
 MAX_SESSIONS = 2
 SESSION_TTL_S = 120.0
 _HELLO_TIMEOUT_S = 10.0
@@ -71,6 +73,23 @@ _MID_NONCE = 2
 # request by the gateway (llm_gateway/resolve.py TAOS_DEFAULT).
 BOARD_LLM_MODELS = ["taos-default"]
 LLM_PATH = "/api/llm/v1"
+
+
+def _device_caps(caps: list[str]) -> list[str]:
+    """Return the device capabilities for a worker registration.
+    
+    Always includes "agent", plus any caps from DEVICE_CAPS_ALLOWED that the board sent.
+    Unknown caps are dropped and logged once at INFO with the board_id.
+    Returns a deduplicated list in stable order ("agent" first)."""
+    result = ["agent"]
+    seen = {"agent"}
+    for cap in caps:
+        if cap in DEVICE_CAPS_ALLOWED and cap not in seen:
+            result.append(cap)
+            seen.add(cap)
+        elif cap not in DEVICE_CAPS_ALLOWED:
+            logger.info("Board with unknown capabilities: dropping '%s' from %s", cap, caps)
+    return result
 
 
 def _platform_from_caps(caps: list[str]) -> str:
@@ -449,7 +468,7 @@ class BlePairingManager:
             url="",
             kind="device",
             platform=platform,
-            capabilities=["agent"],
+            capabilities=_device_caps(sess.caps),
             signing_key=key,
         )
         try:
