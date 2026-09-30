@@ -1929,8 +1929,10 @@ live in e.g. `user-999`) and passing `--project`:
 - gateway on: an agent moves only if the gateway can serve EVERY model its
   key allows (`cutover.models_problem`, read from the same routing table):
   the highest-priority route must be OpenAI-compatible (`openai`,
-  `openrouter`), Anthropic, or Ollama on a backend of type `ollama`.
-  rkllama and hailo-ollama (no `/v1/chat/completions`), deepseek, unknown
+  `openrouter`, `deepseek`), Anthropic, or Ollama-shaped on a backend of
+  type `ollama`, `rkllama` or `hailo-ollama` (all three serve
+  `/v1/chat/completions` at the refs taOS installs; hailo-ollama streams
+  Ollama NDJSON, which the gateway translates to OpenAI SSE). Unknown
   models and an empty allowlist keep the agent on LiteLLM, with the reason
   logged. An agent already on the gateway whose models stop being servable
   goes back. New deploys apply the same check.

@@ -188,6 +188,23 @@ async def test_embeddings_usage_is_recorded_for_the_agent(gw, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_embeddings_notify_lifecycle_keepalive(gw):
+    """LiteLLM's callback reset the backend's keep-alive after embeddings too;
+    the gateway does it in-process, once per successful call."""
+    app, listener, store = gw
+    calls = []
+    app.state.lifecycle_manager = type("L", (), {"notify_task_complete": lambda self, n: calls.append(n)})()
+    key = store.mint("emb-agent", [EMBEDDING_ALIAS])
+    with respx.mock(assert_all_called=False) as router:
+        _mock_backends(router)
+        async with _client(listener) as c:
+            resp = await c.post("/v1/embeddings", json={"model": EMBEDDING_ALIAS, "input": "hello"},
+                                headers={"Authorization": f"Bearer {key}"})
+    assert resp.status_code == 200, resp.text
+    assert calls == ["npu"]
+
+
+@pytest.mark.asyncio
 async def test_embeddings_unknown_model_is_404(gw):
     _app, listener, store = gw
     key = store.mint("emb-agent", ["no-such-embedder"])

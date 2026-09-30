@@ -124,12 +124,17 @@ async def models_problem(state, models: Iterable[str]) -> str | None:
 
     Read from the same routing table the gateway routes with. A model is
     servable when its highest-priority route is Anthropic (translated),
-    OpenAI-compatible (``openai`` / ``openrouter``), or Ollama-shaped on a
-    backend of type ``ollama`` (the only one known to expose
-    ``/v1/chat/completions``; rkllama and hailo-ollama do not). Anything
-    unknown is a problem: an agent is never moved on a guess.
+    OpenAI-compatible (``openai`` / ``openrouter`` / ``deepseek``), or
+    Ollama-shaped on a backend type that exposes ``/v1/chat/completions`` at
+    the ref taOS installs (``forward.OLLAMA_V1_BACKEND_TYPES``: ollama,
+    rkllama, and hailo-ollama, whose NDJSON stream the gateway translates).
+    Anything unknown is a problem: an agent is never moved on a guess.
     """
-    from tinyagentos.llm_gateway.forward import OLLAMA_PROVIDERS, OPENAI_COMPATIBLE_PROVIDERS
+    from tinyagentos.llm_gateway.forward import (
+        OLLAMA_PROVIDERS,
+        OLLAMA_V1_BACKEND_TYPES,
+        OPENAI_COMPATIBLE_PROVIDERS,
+    )
     from tinyagentos.llm_gateway.resolve import (
         TAOS_DEFAULT,
         default_chat_model,
@@ -141,11 +146,6 @@ async def models_problem(state, models: Iterable[str]) -> str | None:
     if not models:
         return "its key allows no models, so there is nothing to serve"
     table = routing_table(state)
-    config = getattr(state, "config", None)
-    backend_types = {
-        b.get("name"): b.get("type")
-        for b in (getattr(config, "backends", None) or []) if isinstance(b, dict)
-    }
     from tinyagentos.litellm_config import EMBEDDING_ALIAS
 
     for requested in models:
@@ -165,10 +165,9 @@ async def models_problem(state, models: Iterable[str]) -> str | None:
         if route.provider == "anthropic" or route.provider in OPENAI_COMPATIBLE_PROVIDERS:
             continue
         if route.provider in OLLAMA_PROVIDERS:
-            btype = backend_types.get(route.backend_name)
-            if btype == "ollama":
+            if route.backend_type in OLLAMA_V1_BACKEND_TYPES:
                 continue
-            return (f"model {requested!r} is served by a {btype or 'unknown'!r} backend "
+            return (f"model {requested!r} is served by a {route.backend_type or 'unknown'!r} backend "
                     "without /v1/chat/completions")
         return (f"model {requested!r} is served by a {route.provider or 'unknown'!r} backend "
                 "the gateway cannot forward yet")

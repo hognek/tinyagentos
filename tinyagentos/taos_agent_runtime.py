@@ -270,12 +270,7 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
         if desktop_settings is not None:
             try:
                 prefs = await desktop_settings.get_preference("user", "taos_agent") or {}
-                stored = prefs.get("permitted_models", [])
-                if stored:
-                    # Always ensure the current model is in the set.
-                    permitted_models = list(stored)
-                    if model not in permitted_models:
-                        permitted_models = [model, *permitted_models]
+                permitted_models = permitted_models_for(model, prefs)
                 stored_key = prefs.get("llm_key") or None
             except Exception:
                 logger.debug("taos_agent_runtime: could not read taos_agent prefs", exc_info=True)
@@ -436,6 +431,32 @@ def _mint_local_taos_agent_key(app_state, models: list[str]) -> str | None:
         return None
 
 
+def permitted_models_for(model: str, prefs: dict | None) -> list[str]:
+    """The taOS agent's permitted model set: the stored one (current model
+    always included, first when added), else just ``model``."""
+    stored = (prefs or {}).get("permitted_models") or []
+    if not stored:
+        return [model]
+    permitted = list(stored)
+    return permitted if model in permitted else [model, *permitted]
+
+
+async def opencode_gateway_problem(app_state, model: str, prefs: dict | None) -> str | None:
+    """Why opencode could NOT reach its model through the in-process gateway
+    (so it would need LiteLLM), or None when ``_llm_base_url`` hands it the
+    gateway. Same inputs and checks as ``_llm_base_url``."""
+    from tinyagentos import llm_gateway
+    from tinyagentos.llm_gateway.cutover import models_problem
+
+    if not llm_gateway.enabled():
+        return "the taOS LLM gateway is turned off (TAOS_LLM_GATEWAY=0)"
+    try:
+        problem = await models_problem(app_state, permitted_models_for(model, prefs))
+    except Exception as exc:  # noqa: BLE001 - unknown routability is a problem
+        problem = f"routability check failed: {type(exc).__name__}"
+    return f"the taOS LLM gateway cannot serve it: {problem}" if problem else None
+
+
 async def _llm_base_url(app_state, llm_proxy, models: list[str]) -> str:
     """Where the taOS agent's opencode sends model calls.
 
@@ -443,7 +464,7 @@ async def _llm_base_url(app_state, llm_proxy, models: list[str]) -> str:
     every permitted model (the same check the cutover applies to container
     agents), so the taOS agent keeps working with LiteLLM stopped. LiteLLM
     otherwise: the gateway switched off (``TAOS_LLM_GATEWAY=0``), or a model
-    only LiteLLM can reach (e.g. an rkllama chat model).
+    the gateway cannot route (e.g. one no longer in the routing table).
     """
     from tinyagentos import llm_gateway
     from tinyagentos.llm_gateway.cutover import models_problem
