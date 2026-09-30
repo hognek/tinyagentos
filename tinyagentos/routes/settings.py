@@ -791,7 +791,7 @@ def _find_uv(project_dir: Path) -> str | None:
 # Optional-dependency extras the updater must install so a `uv sync --frozen`
 # does not prune them out of the venv. Single source of truth for the Python
 # side; `scripts/install-server.sh` installs the same set via
-# `pip install -e ".[proxy]"`, and `test_updater_dep_install.py` asserts the two
+# `pip install -e '.\$(taos_controller_extras)'`, and `test_updater_dep_install.py` asserts the two
 # stay in parity so they cannot silently drift (the bug that stripped litellm).
 # A handset (detected via hardware._detect_device_class() or
 # TAOS_EXTRAS_BLE=1) adds the "ble" extra so Orb scan/pair routes work.

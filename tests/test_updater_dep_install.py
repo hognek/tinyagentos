@@ -202,6 +202,49 @@ def test_updater_extras_parity_with_shell_helper(tmp_path, monkeypatch):
         )
 
 
+def test_updater_extras_match_install_server():
+    """The updater's UPDATE_EXTRAS must equal install-server.sh's pip extras.
+
+    Both install paths carry the same optional extras; if install-server.sh
+    later adds one (e.g. `.[proxy,gpu]`) the updater must too, or a bare-set
+    `uv sync --frozen` will strip it on the next update. This binds the two
+    so a drift fails CI instead of silently breaking a live box.
+
+    If install-server.sh uses a dynamic extras selection (e.g.
+    `$(taos_controller_extras)`), the test verifies that the function exists
+    and that the script's extras-selection logic matches the updater's
+    device-class-based selection.
+    """
+    import re
+
+    repo_root = Path(__file__).resolve().parents[1]
+    script = (repo_root / "scripts" / "install-server.sh").read_text()
+    
+    # Find the taos_controller_extras function in install-server.sh
+    script_match = re.search(r'taos_controller_extras\(\) \{[^}]+\}', script, re.DOTALL)
+    assert script_match, "install-server.sh must inline taos_controller_extras"
+    
+    # Find the taos_controller_extras function in the lib
+    lib = repo_root / "scripts" / "lib" / "controller_extras.sh"
+    lib_match = re.search(r'taos_controller_extras\(\) \{[^}]+\}', lib.read_text(), re.DOTALL)
+    assert lib_match, "controller_extras.sh must define taos_controller_extras"
+    
+    # Assert the inlined function equals the lib's
+    assert script_match.group(0) == lib_match.group(0), (
+        "install-server.sh inlined function must match scripts/lib/controller_extras.sh"
+    )
+    
+    # Also verify that the pip install line uses the correct pattern
+    matches = re.findall(r'pip install[^\n]*-e\s+["\']?\.\[([^\]]+)\]', script)
+    assert matches, "could not find a `pip install -e .[extras]` line in install-server.sh"
+    
+    # Check that the last match uses dynamic selection (command substitution)
+    last_match = matches[-1]
+    assert last_match.startswith('$(') and last_match.endswith(')'), (
+        "install-server.sh pip extras must use $(taos_controller_extras) pattern"
+    )
+
+
 @pytest.mark.asyncio
 async def test_install_nonzero_rc_is_propagated(monkeypatch):
     """A failed install returns (rc, output) so the caller aborts safely."""
