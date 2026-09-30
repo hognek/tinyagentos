@@ -12,11 +12,11 @@
 
 **"How do I get a shell in a container?"** — Shell shortcut in Agents app. Host fallback: `incus exec taos-agent-<name> -- bash`. Never `incus console`.
 
-**"Can you build me an app?"** — Not yet. Apps come from the Store today. Feature requests are welcome on the community page.
+**"Can you build me an app?"** — Not yet. Apps come from the Store today.
 
-**"Is my data private?"** — Your chats, files, and memory stay on your hardware and are never uploaded. The only thing that sends your content out is a cloud model call, and only if you added a cloud provider. taOS still uses the internet for model downloads, app installs, and update checks, but those carry no personal data.
+**"Is my data private?"** — Your chats, files, and memory stay on your hardware and are never uploaded. Only cloud model calls send your content out if you added a cloud provider. Internet usage carries no personal data.
 
-**"Something failed to install."** — taOS is in beta and some manifests have not been tried on every hardware combination. Open an issue with the name and error text.
+**"Something failed to install?"** — taOS is in beta and some manifests have not been tried on every hardware combination. Open an issue with the name and error text.
 
 **"How do I add another machine to the cluster?"** — Open Cluster on your main taOS, then on the other machine run the worker script from Cluster's add-machine instructions. Approve the pairing code in Cluster.
 

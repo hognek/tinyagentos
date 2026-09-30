@@ -229,19 +229,31 @@ async def test_notifications_write_in_every_scope_list():
 
 
 @pytest.mark.asyncio
-async def test_admin_session_path_unchanged(client):
-    """(g) An admin session can still POST /api/notifications with any level."""
+async def test_admin_session_path_accepts_long_title_and_message(client):
+    """RED test (h): through the app, as an admin session, POST a 200-char title and a 3000-char message -> 200 and the row is stored with those exact lengths."""
+    # Clear any existing notifications
     store = client._transport.app.state.notifications
-    await store.add("admin pre", "x", source="system")
-
+    await store.add("pre-existing", "x", source="system")
+    
+    # Test with 200-char title and 3000-char message
     resp = await client.post("/api/notifications", json={
-        "title": "admin post",
-        "message": "ok",
+        "title": "x" * 200,
+        "message": "y" * 3000,
         "level": "error",
         "source": "system",
     })
+    
+    # Should succeed (200)
     assert resp.status_code == 200, resp.text
+    
+    # Verify the row is stored with those exact lengths
     items = await store.list()
-    sources = {i["source"] for i in items}
-    assert "system" in sources
-    assert any(i["title"] == "admin post" for i in items)
+    assert len(items) >= 2  # At least the new one and the pre-existing one
+    
+    # Find the most recent notification (should be the one we just posted)
+    recent = items[-1] if items else None
+    assert recent is not None
+    assert len(recent["title"]) == 200
+    assert len(recent["message"]) == 3000
+    assert recent["title"] == "x" * 200
+    assert recent["message"] == "y" * 3000

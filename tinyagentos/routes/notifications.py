@@ -87,27 +87,6 @@ class CreateNotificationRequest(BaseModel):
     source: str = "system"
     data: dict | None = None
 
-    @field_validator("title")
-    @classmethod
-    def _title_len(cls, v: str) -> str:
-        if len(v) > 120:
-            raise ValueError("title must be at most 120 characters")
-        return v
-
-    @field_validator("message")
-    @classmethod
-    def _message_len(cls, v: str) -> str:
-        if len(v) > 1000:
-            raise ValueError("message must be at most 1000 characters")
-        return v
-
-    @field_validator("data")
-    @classmethod
-    def _data_size(cls, v: dict | None) -> dict | None:
-        if v is not None and len(json.dumps(v).encode("utf-8")) > 4096:
-            raise ValueError("data must be at most 4 KB serialized")
-        return v
-
 
 @router.post("/api/notifications")
 async def create_notification(request: Request, body: CreateNotificationRequest):
@@ -118,15 +97,6 @@ async def create_notification(request: Request, body: CreateNotificationRequest)
     verifies the JWT + grant + project binding. Delivery goes through the
     same store.add path so SSE and web-push fire.
     """
-    # Caps are enforced unconditionally so a malformed agent request does not
-    # bypass them via the human path (should the human path ever widen).
-    if len(body.title) > 120:
-        raise HTTPException(status_code=422, detail="title must be at most 120 characters")
-    if len(body.message) > 1000:
-        raise HTTPException(status_code=422, detail="message must be at most 1000 characters")
-    if body.data is not None and len(json.dumps(body.data).encode("utf-8")) > 4096:
-        raise HTTPException(status_code=422, detail="data must be at most 4 KB serialized")
-
     # Check for the agent bearer token first so the dual-auth contract is
     # explicit: either path is valid, but the route decides which one applies.
     agent_cid = None
@@ -152,6 +122,14 @@ async def create_notification(request: Request, body: CreateNotificationRequest)
                 status_code=429,
                 headers={"Retry-After": str(max(1, int(retry)))},
             )
+
+        # Enforce caps only on the agent path (after agent_cid is resolved).
+        if len(body.title) > 120:
+            raise HTTPException(status_code=422, detail="title must be at most 120 characters")
+        if len(body.message) > 1000:
+            raise HTTPException(status_code=422, detail="message must be at most 1000 characters")
+        if body.data is not None and len(json.dumps(body.data).encode("utf-8")) > 4096:
+            raise HTTPException(status_code=422, detail="data must be at most 4 KB serialized")
 
         # Level: agents may post info|warning only.
         if body.level not in ("info", "warning"):
