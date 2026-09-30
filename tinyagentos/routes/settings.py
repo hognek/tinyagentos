@@ -785,12 +785,51 @@ def _find_uv(project_dir: Path) -> str | None:
     return None
 
 
+from tinyagentos.hardware import _detect_device_class
+
+
 # Optional-dependency extras the updater must install so a `uv sync --frozen`
 # does not prune them out of the venv. Single source of truth for the Python
 # side; `scripts/install-server.sh` installs the same set via
 # `pip install -e ".[proxy]"`, and `test_updater_dep_install.py` asserts the two
 # stay in parity so they cannot silently drift (the bug that stripped litellm).
-UPDATE_EXTRAS: tuple[str, ...] = ("proxy",)
+# A handset (detected via hardware._detect_device_class() or
+# TAOS_EXTRAS_BLE=1) adds the "ble" extra so Orb scan/pair routes work.
+# TAOS_EXTRAS_BLE=0 overrides auto-detection and excludes ble (rare).
+
+def _compute_update_extras() -> tuple[str, ...]:
+    """Compute UPDATE_EXTRAS based on device class and TAOS_EXTRAS_BLE env var.
+
+    Mirrors install-server.sh's logic: ble is added only on a taOSmobile handset
+    (hardware._detect_device_class() == "mobile") unless TAOS_EXTRAS_BLE=1 (force include)
+    or TAOS_EXTRAS_BLE=0 (force exclude). This ensures the scan/pair routes work on
+    a stock install while allowing operators with BLE dongles on non-handset hosts
+    to opt in.
+    """
+    import os
+
+    # Detect handset using the same signal as the controller
+    device_class = _detect_device_class()
+    is_handset = device_class == "mobile"
+
+    # Override via environment variable
+    taos_extras_ble = os.getenv("TAOS_EXTRAS_BLE")
+    if taos_extras_ble is not None:
+        if taos_extras_ble in ("1", "true"):
+            # Force include ble
+            return ("proxy", "ble")
+        elif taos_extras_ble in ("0", "false"):
+            # Force exclude ble
+            return ("proxy",)
+
+    # Default: include ble on handsets only
+    if is_handset:
+        return ("proxy", "ble")
+    else:
+        return ("proxy",)
+
+
+UPDATE_EXTRAS: tuple[str, ...] = _compute_update_extras()
 
 
 async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
@@ -801,11 +840,13 @@ async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
     deps onto a user's box. When uv is not present we fall back to the legacy
     ``pip install -e .`` so installs without uv still update.
 
-    Both paths carry the ``proxy`` extra (litellm + prisma) to match
-    ``install-server.sh``'s ``pip install -e ".[proxy]"``. The LLM proxy is a
-    core dependency, not optional: a bare ``uv sync --frozen`` prunes the venv
-    to the locked default set and silently uninstalls litellm, disabling the
-    proxy on every update and breaking basic agent functionality.
+    Both paths carry the ``proxy`` extra (litellm + prisma) and, on a taOSmobile
+    handset (detected via hardware._detect_device_class()), also carry the ``ble``
+    extra so Orb scan/pair routes work. Use TAOS_EXTRAS_BLE=1 to force include ble
+    on a non-handset, or TAOS_EXTRAS_BLE=0 to exclude it even on a handset.
+    The LLM proxy is a core dependency, not optional: a bare ``uv sync --frozen``
+    prunes the venv to the locked default set and silently uninstalls litellm,
+    disabling the proxy on every update and breaking basic agent functionality.
 
     Capture output and surface failures -- silently swallowing a failed install
     lands users on a grey-screen the next time they restart, because the new
