@@ -1563,6 +1563,33 @@ async def test_hailo_stream_cut_after_first_token_is_not_a_clean_stop(client, ki
 
 @_ASYNC
 @respx.mock
+@pytest.mark.parametrize("kind", ["hailo-ndjson", "rkllama-sse"])
+async def test_stream_frame_without_a_delimiter_is_capped(client, kind):
+    """A backend that keeps streaming bytes and never a line/event delimiter
+    must not grow the gateway's buffer without bound: the read timeout only
+    bounds silence. The gateway gives up once a single frame passes the cap,
+    long before the 10 MiB upstream body is drained."""
+    app = _app(client)
+    backend, url, ctype = (
+        (HAILO_BACKEND, HAILO_CHAT, "application/x-ndjson") if kind == "hailo-ndjson"
+        else (RKLLAMA_BACKEND, RKLLAMA_CHAT, "text/event-stream"))
+    app.state.config.backends = [backend]
+    stream = _PiecewiseStream([b"x" * 65536] * 160)
+    respx.post(url).mock(return_value=httpx.Response(
+        200, stream=stream, headers={"content-type": ctype},
+    ))
+    text = ""
+    try:
+        resp = await client.post(BASE + "/chat/completions", json=_chat("default", stream=True))
+        text = resp.read().decode("utf-8")
+    except Exception:  # noqa: BLE001 - the transport may surface the abort as an error
+        pass
+    assert stream.yielded < len(stream.pieces), "the whole oversized body was buffered"
+    assert "[DONE]" not in text
+
+
+@_ASYNC
+@respx.mock
 async def test_rkllama_stream_passes_sse_through_unchanged(client):
     """rkllama answers /v1/chat/completions with OpenAI SSE: forwarded as-is."""
     app = _app(client)

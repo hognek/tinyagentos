@@ -147,6 +147,14 @@ class LiteLLMKeyStore:
         """
         if conn.execute("PRAGMA user_version").fetchone()[0] >= _EMBED_ALIAS_VERSION:
             return
+        # Take the write lock BEFORE reading the allowlists, so a concurrent
+        # set_models (the other process) cannot land between our read and our
+        # write and be overwritten. Re-check the marker under the lock: another
+        # opener may have finished the grant while we waited.
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("PRAGMA user_version").fetchone()[0] >= _EMBED_ALIAS_VERSION:
+            return
         from tinyagentos.litellm_config import EMBEDDING_ALIAS
 
         def _grant(raw: str) -> str | None:

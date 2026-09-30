@@ -390,7 +390,9 @@ def _event_stream_for_route(
                         while True:
                             idx = _buf.find(b"\n\n")
                             if idx < 0:
+                                _check_frame_size(len(_buf))
                                 break
+                            _check_frame_size(idx)
                             msg = _buf[:idx]
                             _buf = _buf[idx + 2:]
                             msg_str = msg.decode("utf-8", errors="replace").strip()
@@ -444,6 +446,17 @@ def _event_stream_for_route(
 _NDJSON_FINISH = {"stop": "stop", "length": "length"}
 
 
+# Largest single SSE event or NDJSON line a backend stream may send. A read
+# timeout bounds silence, not size: without this a backend that streams bytes
+# and never a delimiter grows the buffer until the controller runs out of RAM.
+_MAX_STREAM_FRAME_BYTES = 4 * 1024 * 1024
+
+
+def _check_frame_size(n: int) -> None:
+    if n > _MAX_STREAM_FRAME_BYTES:
+        raise upstream_error("the backend sent an oversized stream frame")
+
+
 async def _ndjson_to_sse(
     upstream_resp: httpx.Response,
     model: str,
@@ -488,7 +501,9 @@ async def _ndjson_to_sse(
         while finish is None:
             idx = buf.find(b"\n")
             if idx < 0:
+                _check_frame_size(len(buf))
                 break
+            _check_frame_size(idx)
             line, buf = buf[:idx].strip(), buf[idx + 1:]
             if not line:
                 continue

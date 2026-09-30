@@ -29,3 +29,8 @@
   403 `model_not_permitted` for them. It runs once per key store: a later
   deliberate removal of the alias sticks, and deny-all (empty) or revoked
   keys are left alone.
+- A streaming backend that sends more than 4 MiB without a line or event
+  delimiter now fails the stream instead of growing the gateway's buffer
+  until the controller runs out of memory (both the SSE and the hailo NDJSON
+  paths). The one-shot embedding grant takes the key store's write lock
+  before reading, so a concurrent re-scope cannot be overwritten.
