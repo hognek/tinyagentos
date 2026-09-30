@@ -221,7 +221,7 @@ async def test_proxy_key_admin_uses_the_local_store_not_litellm(tmp_path, monkey
     """Even on a Postgres-configured proxy (inhouse_keys off) mint, re-scope,
     usage and delete never call LiteLLM's /key/* admin API with the master key."""
     from tinyagentos.agent_budget_store import AgentBudgetStore, default_budget_path
-    from tinyagentos.llm_proxy import LLMProxy
+    from tinyagentos.llm_proxy import EMBEDDING_ALIAS, LLMProxy
 
     proxy = LLMProxy(port=LITELLM_PORT, data_dir=tmp_path, database_url="postgresql://u:p@db/x",
                      inhouse_keys=False)
@@ -232,7 +232,7 @@ async def test_proxy_key_admin_uses_the_local_store_not_litellm(tmp_path, monkey
             return_value=httpx.Response(200, json={"key": "sk-from-litellm", "info": {}}))
         key = await proxy.create_agent_key("agent-a", models=["gpt-a"], max_budget=2.5)
         assert key and key != "sk-from-litellm"
-        assert store.lookup(key) == {"agent": "agent-a", "allowed_models": ["gpt-a"]}
+        assert store.lookup(key) == {"agent": "agent-a", "allowed_models": ["gpt-a", EMBEDDING_ALIAS]}
         assert AgentBudgetStore(default_budget_path(tmp_path)).get("agent-a")["max_budget_usd"] == 2.5
         assert await proxy.update_agent_key(key, ["gpt-b"]) is True
         assert store.lookup(key)["allowed_models"] == ["gpt-b", "taos-embedding-default"]
@@ -246,13 +246,13 @@ async def test_proxy_key_admin_uses_the_local_store_not_litellm(tmp_path, monkey
 
 @pytest.mark.asyncio
 async def test_key_usage_screen_answers_with_litellm_stopped(tmp_path, monkeypatch):
-    from tinyagentos.llm_proxy import LLMProxy
+    from tinyagentos.llm_proxy import EMBEDDING_ALIAS, LLMProxy
 
     proxy = LLMProxy(port=LITELLM_PORT, data_dir=tmp_path, inhouse_keys=True)
     assert proxy.is_running() is False
     key = await proxy.create_agent_key("agent-a", models=["gpt-a"])
     usage = await proxy.get_key_usage(key)
-    assert usage is not None and usage["info"]["models"] == ["gpt-a"]
+    assert usage is not None and usage["info"]["models"] == ["gpt-a", EMBEDDING_ALIAS]
 
 
 # ---------------------------------------------------------------------------
