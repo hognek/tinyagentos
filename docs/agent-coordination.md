@@ -152,12 +152,30 @@ operator, not from any database. Store it in TWO locations that survive a machin
 migration, both `chmod 600`, outside any git tree, and make one authenticated call
 to verify it before considering onboarding finished. When you move hosts, confirm
 the token works on the new host BEFORE decommissioning the old one. Three agents
-lost tokens in a single day and every one went with a rebuilt host.
+lost tokens in a single day and every one went with a rebuilt host. Every mint
+response now returns that rule alongside the token (the `storage_guidance` field
+on register / mint-internal / auth-request-poll / rotate responses), for the same
+reason the rule matters: the seconds after the handover are the only chance the
+holder gets.
 
-Losing it is not merely inconvenient: recovery mints a NEW identity with no
-grants, while the old identity keeps its own unless you revoke them (below) or
-revoke the identity itself. One agent spent an evening convinced it lacked a
-scope it had in fact been granted - on an identity whose token was gone.
+**Losing it no longer mints a new identity.** `POST
+/api/agents/registry/{canonical_id}/rotate-tokens` rotates the credential ON the
+same canonical identity: it moves the identity's `token_min_iat` cutoff past
+every token already issued and returns one fresh token, minted AT that cutoff, in
+the same call. The superseded token is then rejected with `401 token superseded`
+and the replacement works immediately; the `canonical_id` never changes and the
+identity keeps its grants, so recovery stops scattering grants across orphan
+identities. The replacement carries the identity's `sub` / `user_id` /
+`framework` but not the superseded token's `project_id` claim; that claim has
+been advisory since #1862 (grants, not the claim, decide project-scoped
+authority) and rotation does not touch them, so the replacement's reach is
+unchanged. Owner or admin may rotate any identity they own, and an agent may
+rotate its OWN identity with its own live registry JWT (the route is on the
+middleware allowlist) -- which is the "rotate my credential" action an agent needs
+when it suspects its token is stale or leaked, with no human in the loop. Before
+this the only recovery was "mint a NEW identity": the old row kept its grants
+while the replacement started empty, and one agent spent an evening convinced it
+lacked a scope it had in fact been granted - on an identity whose token was gone.
 
 **Scope grants are revocable, per scope and per project.** `agent_grants_store`
 gained `revoke_grant(canonical_id, scope, project_id=...)` and
@@ -1107,7 +1125,9 @@ All owner-gated registry routes are existence-hiding (#2106): an authenticated
 caller who is not the owner gets the same 404 body as a nonexistent
 `canonical_id`, on the scope-request create/read/approve/deny routes above and
 on registry PATCH, DELETE (revoke), rotate-tokens, and
-`PUT /api/agents/{id}/org`.
+`PUT /api/agents/{id}/org`. `rotate-tokens` additionally authorizes the agent
+itself when it presents its OWN live registry JWT (a self-rotation), so a request
+carrying a valid token for a DIFFERENT identity is still the same 404.
 Agents must not treat a 404 from these routes as proof an id does not exist,
 and must not expect a 403 to distinguish "exists, not yours". Admin-only
 lifecycle routes (approve/reject/suspend/reactivate) still 403 non-admins
@@ -1729,6 +1749,7 @@ The allowlist is the union of:
 - Observatory (`/api/observatory/*`, scope `observatory_control`).
 - Container requests (`/api/containers/requests`, `/api/container-requests`, `/api/containers/requests/{id}/provision`, `/api/containers/requests/{id}/destroy`, `/api/agents/containers/quota`).
 - Agent self-serve (`/api/agents/me/models` GET, `/api/agents/me/model` POST).
+- **Credential rotation** (`POST /api/agents/registry/{id}/rotate-tokens`) -- identity-only, no scope grant: the route requires the JWT's `sub` to equal the path `canonical_id`, so an agent can rotate its own token and nobody else's. Returns the replacement token and the `storage_guidance` string; the superseded token is rejected by the identity's `token_min_iat` cutoff.
 - **Desktop control (system taOS Agent only)**: `POST /api/desktop/command`, `POST /api/desktop/screenshot`, `POST /api/desktop/layout` (native agent's registry JWT sets `user_id` to the owner, so desktop commands are delivered to the owner's desktop).
 - **Skill-exec (system taOS Agent only)**: `POST /api/skill-exec/{skill_id}/call`, `GET /api/skill-exec/tools` (native agent's registry JWT with `SYSTEM_AGENT_API_SCOPES`).
 
