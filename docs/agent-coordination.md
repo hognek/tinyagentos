@@ -1658,6 +1658,53 @@ where `revoked=0 OR blocked=1`, so a blocked device counts against
 `_MAX_DEVICES_PER_USER` until it is unblocked, at which point the row falls out
 and the slot frees. Deliberate: a blocked device is a retained safety valve the
 owner can still see and act on.
+
+## Cluster capability + placement map (`GET /api/cluster/map`, admin-only)
+
+Route module `tinyagentos/routes/cluster_map.py`. **Admin session only**: the
+auth middleware answers `401` to a cookie-less caller (this path is not in the
+middleware's exempt list) and `_require_admin` answers `403` to a signed-in
+non-admin, so no agent scope reaches it. Read-only by construction — it owns no
+state and reads the cluster manager's existing getters (`get_workers()` plus the
+GPU arbiter's `get_leases()`), the same state routing and scheduling consult, so
+it adds no second inventory to keep in sync. The nuance: those are two separate,
+non-atomic reads assembled per request, so the map can reflect slightly
+different state than a routing decision taken a moment later — it is a
+snapshot, not a lock.
+
+- `nodes` -- one entry per REGISTERED node, offline rows included (a node that
+  stopped heartbeating is exactly what the view exists for). Each carries
+  `health` (heartbeat freshness, using the same 60 s / 300 s thresholds the
+  desktop computes), `tier_id`, hardware, VRAM (`free_mb` / `used_mb` /
+  `total_mb`, `null` when the node reports no probe — never coerced to 0),
+  `backends`, `placement` rows and any active GPU `leases`.
+- `placement` -- one row per model: `state` is `loaded` (resident now) or
+  `installed` (declared on the node, not resident). Derived from each worker's
+  `backends[].available_models` (`status` `loaded` / otherwise), which survives
+  a stopped backend, so a node with everything installed and nothing running
+  reports installed-only rows instead of vanishing from the map. A backend with
+  no `available_models` (no manifest, or one that does not cover its software)
+  falls back to its `models` catalog against the `loaded_models` residency set;
+  the absence of a `loaded_models` key is no residency signal, so nothing reads
+  `loaded`. Note the corollary: the non-ollama backends (llama.cpp / vLLM /
+  sd-cpp) publish no in-memory probe — their `loaded_models` is empty by design
+  — so a model they are actively serving still reads `installed`, following the
+  worker's own `available_models[].status`.
+- `capabilities` -- the union of capabilities across the mesh, each split into
+  mutually exclusive buckets: `active_nodes` (serving now), `installed_nodes`
+  (present but not serving) and `potential_nodes` (hardware could run it,
+  nothing installed yet). A node that serves a capability is reported as
+  active and never also as installed or merely capable; the finer detail (a
+  node serving one model while another for the same capability sits installed)
+  lives in that node's own `placement` rows. A `loaded` placement row counts
+  as active. **Only nodes still heartbeating (health `online` or `stale`) count
+  as active**: the manager retains an offline worker with its last-reported
+  capabilities and loaded models, and those are not reachable capacity, so an
+  offline node's retained capabilities land in `installed_nodes` instead.
+  Capability strings are reported as the workers and catalog manifests write
+  them (`chat`, `image-generation`, `llm-chat`, ...); the endpoint does not
+  invent a normalised vocabulary.
+
 ## Controller generation echo (split-brain protection)
 
 Route module `tinyagentos/routes/cluster.py`, manager logic in
