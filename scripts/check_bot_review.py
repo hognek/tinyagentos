@@ -666,6 +666,10 @@ def check_bot_review(
     if _is_fork:
         if head_sha is None:
             _, head_sha = is_fork_pr(owner, repo, pr_number, token)
+        if not head_sha:
+            return EXIT_ERROR, (
+                f"error: fork PR has no head sha (exit {EXIT_ERROR})"
+            )
         labels = collect_pr_labels(owner, repo, pr_number, token)
         if labels is None:
             return EXIT_ERROR, (

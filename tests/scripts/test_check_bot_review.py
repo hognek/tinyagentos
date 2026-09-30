@@ -767,14 +767,19 @@ class TestForkPrGate:
 
     def _mock_api(self, check_mod, pr_data, reviews=None, labels=None, permission=None, issue_comments=None):
         """Build a side_effect for _api_get that handles all URLs check_bot_review touches."""
-        reviews = reviews or []
+        # Special sentinel values to simulate API failures (return None from _api_get)
+        _REVIEWS_API_ERROR = "__REVIEWS_API_ERROR__"
+        _LABELS_API_ERROR = "__LABELS_API_ERROR__"
+        _PERMISSION_API_ERROR = "__PERMISSION_API_ERROR__"
+        
+        reviews_api_error = reviews == _REVIEWS_API_ERROR
+        labels_api_error = labels == _LABELS_API_ERROR
+        permission_api_error = permission == _PERMISSION_API_ERROR
+        
+        reviews_data = [] if reviews is None or reviews_api_error else reviews
         issue_comments = issue_comments or []
         call_count = 0
-        # A special string value signals that the labels call should return
-        # None (simulating an API failure).
-        _LABELS_API_ERROR = "__LABELS_API_ERROR__"
-        labels_data = [] if labels is None else labels
-        label_api_error = labels == _LABELS_API_ERROR
+        labels_data = [] if labels is None or labels_api_error else labels
 
         def side_effect(url, token=None):
             nonlocal call_count
@@ -783,12 +788,16 @@ class TestForkPrGate:
             if "/pulls/" in url and "/reviews" not in url and "/comments" not in url and "/collaborators" not in url:
                 if call_count == 1:
                     return pr_data
-                if label_api_error:
+                if labels_api_error:
                     return None
                 return [{"labels": labels_data}]
             if url.endswith("/reviews"):
-                return reviews
+                if reviews_api_error:
+                    return None
+                return reviews_data
             if "/collaborators/" in url and "/permission" in url:
+                if permission_api_error:
+                    return None
                 if permission is not None:
                     return [{"permission": permission}]
                 return None
@@ -972,6 +981,58 @@ class TestForkPrGate:
         assert exit_code == check_mod.EXIT_ERROR
         assert "error" in message.lower()
         assert "label" in message.lower()
+
+    # 4: permission read returns None -> EXIT_ERROR (fail closed)
+    def test_fork_pr_permission_read_failure_fails_closed(self, check_mod) -> None:
+        with patch.object(check_mod, "_api_get", side_effect=self._mock_api(
+            check_mod, self.FORK_PR_DATA,
+            reviews=[
+                {
+                    "id": 1, "state": "APPROVED",
+                    "commit_id": "head_sha_abc",
+                    "submitted_at": "2026-09-30T00:00:00Z",
+                    "user": {"login": "jaylfc"},
+                }
+            ],
+            permission="__PERMISSION_API_ERROR__",  # Simulate API failure for permission read
+        )):
+            exit_code, message = check_mod.check_bot_review("jaylfc", "taOS", 3015)
+        assert exit_code == check_mod.EXIT_ERROR
+        assert "error" in message.lower()
+        assert "permission" in message.lower()
+
+    # 5: reviews read returns None -> EXIT_ERROR (fail closed)
+    def test_fork_pr_reviews_read_failure_fails_closed(self, check_mod) -> None:
+        with patch.object(check_mod, "_api_get", side_effect=self._mock_api(
+            check_mod, self.FORK_PR_DATA,
+            reviews="__REVIEWS_API_ERROR__",  # Simulate API failure for reviews read
+        )):
+            exit_code, message = check_mod.check_bot_review("jaylfc", "taOS", 3016)
+        assert exit_code == check_mod.EXIT_ERROR
+        assert "error" in message.lower()
+        assert "review" in message.lower()
+
+    # 6: empty head sha -> EXIT_ERROR (null commit_id must never match "")
+    def test_fork_pr_empty_head_sha_fails_closed(self, check_mod) -> None:
+        """A fork PR with no head sha must fail closed. An empty head sha would
+        match a review with commit_id="" (or None), which is a security hole."""
+        empty_head_sha_data = [{"head": {"repo": {"full_name": "external-user/taOS"}, "sha": ""}, "base": {"repo": {"full_name": "jaylfc/taOS"}}}]
+        with patch.object(check_mod, "_api_get", side_effect=self._mock_api(
+            check_mod, empty_head_sha_data,
+            reviews=[
+                {
+                    "id": 1, "state": "APPROVED",
+                    "commit_id": "",
+                    "submitted_at": "2026-09-30T00:00:00Z",
+                    "user": {"login": "jaylfc"},
+                }
+            ],
+            permission="admin",
+        )):
+            exit_code, message = check_mod.check_bot_review("jaylfc", "taOS", 3017)
+        assert exit_code == check_mod.EXIT_ERROR
+        assert "error" in message.lower()
+        assert "head sha" in message.lower()
 
 
 # ---------------------------------------------------------------------------
