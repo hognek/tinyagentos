@@ -1529,6 +1529,38 @@ async def test_hailo_ollama_ndjson_stream_becomes_openai_sse(client, monkeypatch
     assert traces[0][7] == "Hello, world!"
 
 
+def _hailo_truncated(kind: str) -> bytes:
+    """Two tokens, then either an NDJSON error line or EOF with no done=true."""
+    body = _hailo_ndjson(["Hel", "lo"]).rstrip(b"\n").rsplit(b"\n", 1)[0] + b"\n"
+    if kind == "error-line":
+        body += json.dumps({"error": "generation failed"}).encode("utf-8") + b"\n"
+    return body
+
+
+@_ASYNC
+@respx.mock
+@pytest.mark.parametrize("kind", ["error-line", "eof-without-done"])
+async def test_hailo_stream_cut_after_first_token_is_not_a_clean_stop(client, kind):
+    """A hailo stream that fails after tokens went out must not end like a
+    finished answer: no finish_reason "stop" chunk and no [DONE], the same as
+    the SSE path, which re-raises once a byte is sent. A truncated reply that
+    looks complete is worse than a visibly broken one."""
+    app = _app(client)
+    app.state.config.backends = [HAILO_BACKEND]
+    stream = _PiecewiseStream(_awkward_split(_hailo_truncated(kind)))
+    respx.post(HAILO_CHAT).mock(return_value=httpx.Response(
+        200, stream=stream, headers={"content-type": "application/x-ndjson"},
+    ))
+    text = ""
+    try:
+        resp = await client.post(BASE + "/chat/completions", json=_chat("default", stream=True))
+        text = resp.read().decode("utf-8")
+    except Exception:  # noqa: BLE001 - the transport may surface the abort as an error
+        pass
+    assert "[DONE]" not in text
+    assert '"finish_reason": "stop"' not in text
+
+
 @_ASYNC
 @respx.mock
 async def test_rkllama_stream_passes_sse_through_unchanged(client):

@@ -6,7 +6,9 @@
   Ollama NDJSON even on that path; the gateway turns it into OpenAI SSE
   chunks (role on the first delta, `finish_reason` from `done_reason`,
   `data: [DONE]` at the end) and records usage through the estimated path,
-  since hailo reports no prompt token count.
+  since hailo reports no prompt token count. A hailo stream that errors or
+  closes before `done: true` after tokens went out aborts (no finish chunk,
+  no `[DONE]`), as the SSE path does, instead of ending as a clean `stop`.
 - DeepSeek backends are forwarded as OpenAI-compatible (default base
   `https://api.deepseek.com/v1`, the backend's own key) instead of being
   refused as "cannot forward yet".

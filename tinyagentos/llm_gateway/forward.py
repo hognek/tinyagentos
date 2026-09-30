@@ -455,8 +455,8 @@ async def _ndjson_to_sse(
     the last is ``{"done": true, "done_reason": "stop"|"length", ...}``. Lines
     may arrive split across reads, so bytes are buffered to each newline. The
     first chunk's delta carries ``role: assistant``; the last carries the
-    mapped ``finish_reason``; ``data: [DONE]`` ends the stream (also when the
-    upstream closes without ``done: true``). ``model`` is the name the caller
+    mapped ``finish_reason``; ``data: [DONE]`` ends the stream. An error line, or EOF before
+    ``done: true``, raises instead (see the error-line comment below). ``model`` is the name the caller
     asked for, as the Anthropic translator reports it.
 
     No usage chunk is emitted even when the caller asked for
@@ -499,8 +499,11 @@ async def _ndjson_to_sse(
                 continue
             if not isinstance(obj, dict):
                 continue
-            if obj.get("error") is not None and not role_sent:
-                # Nothing sent yet: fail like a 5xx, so failover can run.
+            if obj.get("error") is not None:
+                # Before the first byte this fails over like a 5xx; after it,
+                # _stream_with_retry re-raises and the stream aborts with no
+                # finish chunk and no [DONE], as the SSE path does. Ending it
+                # with "stop" would pass a cut-off answer off as complete.
                 raise upstream_error("the backend failed mid-stream")
             message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
             content = message.get("content")
@@ -511,13 +514,13 @@ async def _ndjson_to_sse(
                     role_sent = True
                 completion_text.append(content)
                 yield frame(delta, None)
-            if obj.get("done") is True or obj.get("error") is not None:
+            if obj.get("done") is True:
                 finish = _NDJSON_FINISH.get(str(obj.get("done_reason") or ""), "stop")
         if finish is not None:
             break
     if finish is None:
-        logger.warning("llm_gateway: NDJSON stream ended without done=true")
-        finish = "stop"
+        # EOF without done=true is a truncated answer, not a finished one.
+        raise upstream_error("the backend closed the stream before it finished")
     yield frame({} if role_sent else {"role": "assistant"}, finish)
     yield b"data: [DONE]\n\n"
 
