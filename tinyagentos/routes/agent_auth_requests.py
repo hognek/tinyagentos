@@ -1132,26 +1132,24 @@ async def add_agent_to_project(
     
     if deferred_grant_with_expiry:
         deferred_expires_at = deferred_grant_with_expiry["expires_at"]
-        # Parse both times for comparison
         deferred_dt = datetime.fromisoformat(deferred_expires_at)
         now_dt = datetime.fromisoformat(now)
         if deferred_dt <= now_dt:
-            # Deferred grant has expired - refuse the binding
             raise HTTPException(
                 status_code=400,
                 detail=f"cannot bind agent {canonical_id} to project {project_id}: "
                        f"the agent's deferred grant expired at {deferred_expires_at}",
             )
-        elif target_expires_at is None:
-            # Only deferred grant has expiry - inherit it
-            target_expires_at = deferred_expires_at
-        elif target_expires_at < deferred_expires_at:
-            # Request expires earlier than deferred - keep the earlier (request) bound
+        elif renew:
             pass
-        else:
-            # Request expires later than or at same time as deferred - keep the earlier (deferred) bound
-            # This follows "never lengthen" rule: keep the earlier bound, not the later one
+        elif target_expires_at is None:
             target_expires_at = deferred_expires_at
+        else:
+            target_dt = datetime.fromisoformat(target_expires_at)
+            if target_dt < deferred_dt:
+                pass
+            else:
+                target_expires_at = deferred_expires_at
 
     # Revoke BEFORE adding: the project's grant set becomes exactly
     # ``granted_scopes``. A grant this call does not name is one the operator

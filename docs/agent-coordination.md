@@ -741,6 +741,10 @@ agent is later bound to a project via `POST /api/projects/{id}/members/assign-ag
 the project-bound grant **inherits that `expires_at`**. If the deferred grant
 has expired, the binding is refused. When both a deferred grant with expiry and
 a request with expiry exist, the earlier bound is kept (never lengthened).
+An expired row is never silently widened to unbounded: if the existing grant
+is already expired and the caller supplies no `expires_at`, the expired row is
+preserved as-is. If the caller supplies a new bounded `expires_at`, that fresh
+bound replaces the dead one.
 
 Multi-project identities (taOS #1862): one agent identity (the registry JWT) may
 belong to several projects at once. The grants table keys a grant on
@@ -1036,7 +1040,8 @@ that SAME canonical_id instead:
   carries an `expires_at`, the earlier of the existing and any new bound is kept
   (never silently dropped or lengthened). Set `renew: true` to explicitly extend
   or replace the bound. The scope request's own `duration_secs` (if present) is
-  also wired through as `expires_at`.
+  also wired through as `expires_at`. An expired existing grant is replaced by a
+  fresh bounded re-approval, or kept as-is if the re-approval is unbounded.
 - `POST /api/agents/registry/{canonical_id}/scope-requests/{req_id}/deny`:
   owner/admin only.
 - `GET /api/agents/registry/{canonical_id}/scope-requests` (optional

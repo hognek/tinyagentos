@@ -178,13 +178,24 @@ class AgentGrantsStore(BaseStore):
                 effective_expires = expires_at
             else:
                 # Keep the earlier bound: if either side is unbounded (None),
-                # keep the other side's bound. If both are bounded, keep min().
+                # keep the other side's bound. If both are bounded, keep the
+                # earlier instant.
                 if existing_expires is None:
                     effective_expires = expires_at
                 elif expires_at is None:
                     effective_expires = existing_expires
                 else:
-                    effective_expires = min(existing_expires, expires_at)
+                    existing_dt = datetime.fromisoformat(existing_expires)
+                    new_dt = datetime.fromisoformat(expires_at)
+                    if existing_dt <= datetime.now(timezone.utc):
+                        # Existing row is already expired: a fresh bounded
+                        # re-approval replaces the dead bound. An unbounded
+                        # call (expires_at is None) is handled above.
+                        effective_expires = expires_at
+                    elif existing_dt <= new_dt:
+                        effective_expires = existing_expires
+                    else:
+                        effective_expires = expires_at
 
             # Remove any existing row for the exact key first (NULL-safe match).
             await self._db.execute(
