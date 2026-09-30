@@ -4,6 +4,7 @@ import asyncio
 import html
 import json
 import logging
+import os
 import socket
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -22,6 +23,7 @@ from tinyagentos.projects.invite_store import (
 )
 from tinyagentos.rate_limit import rate_limited_response
 from tinyagentos.routes.agent_auth_requests import VALID_SCOPES
+from tinyagentos.routes.a2a_bus import _is_url_safe_for_credential
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -242,12 +244,28 @@ def _enumerate_lan_ips() -> list[str]:
 
 async def _build_controller_dict(request: Request) -> dict:
     """Enumerate the controller's reachable endpoints (operator override, LAN,
-    mesh; no relay in Phase 1) and wrap them in the controller descriptor shared
+    mesh, and optional relay) and wrap them in the controller descriptor shared
     by the project and OS-level bundles."""
     endpoints: list[dict] = []
     priority = 1
 
-    # Operator override (TAOS_CONTROLLER_CALLBACK_HOST) becomes priority 1.
+    # Relay endpoint (TAOS_CONTROLLER_RELAY_URL) becomes priority 1 when present.
+    relay_url = os.environ.get("TAOS_CONTROLLER_RELAY_URL", "").strip()
+    if relay_url:
+        if _is_url_safe_for_credential(relay_url, allow_private=True):
+            endpoints.append(
+                {"kind": "relay", "url": relay_url, "priority": priority}
+            )
+            priority += 1
+        else:
+            logger.warning(
+                "TAOS_CONTROLLER_RELAY_URL omitted: %s is not safe for "
+                "credential-bearing bundles (use https or a private address)",
+                relay_url,
+            )
+
+    # Operator override (TAOS_CONTROLLER_CALLBACK_HOST) becomes priority 1
+    # when present and safe.
     override = None
     try:
         from tinyagentos.routes.agent_deploy import controller_callback_host
@@ -256,10 +274,30 @@ async def _build_controller_dict(request: Request) -> dict:
     except Exception:  # noqa: BLE001
         override = None
     if override:
-        endpoints.append(
-            {"kind": "lan", "url": f"http://{override}:{_CONTROLLER_PORT}", "priority": priority}
-        )
-        priority += 1
+        if "://" in override:
+            # Full URL supplied by the operator: use scheme + host as-is.
+            if _is_url_safe_for_credential(override, allow_private=True):
+                endpoints.append(
+                    {"kind": "lan", "url": override, "priority": priority}
+                )
+                priority += 1
+            else:
+                logger.warning(
+                    "TAOS_CONTROLLER_CALLBACK_HOST omitted: %s is not safe for "
+                    "credential-bearing bundles (use https or a private address)",
+                    override,
+                )
+        elif _is_url_safe_for_credential(f"http://{override}", allow_private=True):
+            endpoints.append(
+                {"kind": "lan", "url": f"http://{override}:{_CONTROLLER_PORT}", "priority": priority}
+            )
+            priority += 1
+        else:
+            logger.warning(
+                "TAOS_CONTROLLER_CALLBACK_HOST omitted: %s is a public address "
+                "and cannot be advertised over http in a credential-bearing bundle",
+                override,
+            )
 
     for ip in _enumerate_lan_ips():
         if override and ip == override:
@@ -375,8 +413,8 @@ async def build_connection_bundle(
     """Assemble the JSON connection bundle returned by a successful redeem.
 
     The bundle carries NO token or secret (the token arrives via the status
-    poll). It enumerates the controller's reachable endpoints (LAN, mesh; no
-    relay in Phase 1), the agent-JWT-reachable API surface scoped EXACTLY to
+    poll). It enumerates the controller's reachable endpoints (LAN, mesh, and
+    optional relay), the agent-JWT-reachable API surface scoped EXACTLY to
     the granted scopes (mirroring auth_middleware's canvas allowlist), the
     timed-check delivery contract, and an onboarding kit + guide_markdown.
 

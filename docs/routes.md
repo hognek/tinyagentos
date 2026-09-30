@@ -119,7 +119,7 @@ Content-negotiated advert: `Accept: application/json` → the redeem contract (`
 
 ## Connection bundle
 
-- `controller.endpoints` — non-loopback LAN IPv4s (priority ordered, operator override first) and the mesh (Tailscale) node IP when joined; no relay in Phase 1
+- `controller.endpoints` — non-loopback LAN IPv4s (priority ordered, operator override first) and the mesh (Tailscale) node IP when joined; optional relay endpoint when `TAOS_CONTROLLER_RELAY_URL` is configured with `https://`
 - `apis` — agent-JWT-reachable surface, scoped exactly to the granted scopes (mirrors the middleware allowlist)
 - `delivery` — timed-check contract (`poll_path`, `stream_path`, `check_interval_secs`, `cursor: ts`, `filter: mentions+project`)
 - `onboarding` + `guide_markdown` — personalized capability guide (repo link, agent manual links, scoped Projects/Canvas summary, the A2A authenticated-proxy contract)

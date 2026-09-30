@@ -1,4 +1,5 @@
 import json
+import logging
 import time
 
 import pytest
@@ -884,3 +885,184 @@ class TestDeriveHandleDedup:
         # No overlap → label is appended verbatim (slugified).
         handle = _derive_handle("taosmobile", "claude", "review-task")
         assert handle == "taosmobile-claude-review-task"
+
+
+class TestBuildControllerDict:
+    """_build_controller_dict endpoint bundle contract."""
+
+    @pytest.mark.asyncio
+    async def test_https_relay_url_emitted_at_priority_1(self, monkeypatch):
+        from tinyagentos.routes.project_invites import _build_controller_dict
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        monkeypatch.setenv("TAOS_CONTROLLER_RELAY_URL", "https://relay.example.test")
+        monkeypatch.delenv("TAOS_CONTROLLER_CALLBACK_HOST", raising=False)
+
+        req = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
+        with patch(
+            "tinyagentos.routes.project_invites._enumerate_lan_ips", return_value=[]
+        ), patch(
+            "tinyagentos.taosnet.mesh.mesh_status",
+            return_value={"joined": False},
+        ):
+            result = await _build_controller_dict(req)
+
+        endpoints = result["endpoints"]
+        relay_eps = [ep for ep in endpoints if ep["kind"] == "relay"]
+        assert len(relay_eps) == 1
+        assert relay_eps[0]["url"] == "https://relay.example.test"
+        assert relay_eps[0]["priority"] == 1
+        assert endpoints[0] == relay_eps[0]
+
+    @pytest.mark.asyncio
+    async def test_http_relay_url_omitted_with_warning(self, monkeypatch, caplog):
+        from tinyagentos.routes.project_invites import _build_controller_dict
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        monkeypatch.setenv("TAOS_CONTROLLER_RELAY_URL", "http://relay.example.test")
+        monkeypatch.delenv("TAOS_CONTROLLER_CALLBACK_HOST", raising=False)
+
+        req = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
+        with patch(
+            "tinyagentos.routes.project_invites._enumerate_lan_ips", return_value=[]
+        ), patch(
+            "tinyagentos.taosnet.mesh.mesh_status",
+            return_value={"joined": False},
+        ), patch(
+            "tinyagentos.routes.agent_deploy.controller_callback_host",
+            return_value=None,
+        ):
+            with caplog.at_level(
+                logging.WARNING, logger="tinyagentos.routes.project_invites"
+            ):
+                result = await _build_controller_dict(req)
+
+        endpoints = result["endpoints"]
+        relay_eps = [ep for ep in endpoints if ep["kind"] == "relay"]
+        assert len(relay_eps) == 0
+        assert any(
+            "relay" in r.message.lower() and "not safe" in r.message.lower()
+            for r in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_public_callback_host_omitted_with_warning(self, monkeypatch, caplog):
+        from tinyagentos.routes.project_invites import _build_controller_dict
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        monkeypatch.delenv("TAOS_CONTROLLER_RELAY_URL", raising=False)
+        monkeypatch.setenv("TAOS_CONTROLLER_CALLBACK_HOST", "public.example.com")
+
+        req = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
+        with patch(
+            "tinyagentos.routes.project_invites._enumerate_lan_ips", return_value=[]
+        ), patch(
+            "tinyagentos.taosnet.mesh.mesh_status",
+            return_value={"joined": False},
+        ), patch(
+            "tinyagentos.routes.agent_deploy.controller_callback_host",
+            return_value="public.example.com",
+        ):
+            with caplog.at_level(
+                logging.WARNING, logger="tinyagentos.routes.project_invites"
+            ):
+                result = await _build_controller_dict(req)
+
+        endpoints = result["endpoints"]
+        for ep in endpoints:
+            assert "public.example.com" not in ep.get("url", "")
+        assert any("public.example.com" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_private_callback_host_emitted_as_http(self, monkeypatch):
+        from tinyagentos.routes.project_invites import _build_controller_dict
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        monkeypatch.setenv("TAOS_CONTROLLER_CALLBACK_HOST", "192.168.1.1")
+        monkeypatch.delenv("TAOS_CONTROLLER_RELAY_URL", raising=False)
+
+        req = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
+        with patch(
+            "tinyagentos.routes.project_invites._enumerate_lan_ips", return_value=[]
+        ), patch(
+            "tinyagentos.taosnet.mesh.mesh_status",
+            return_value={"joined": False},
+        ), patch(
+            "tinyagentos.routes.agent_deploy.controller_callback_host",
+            return_value="192.168.1.1",
+        ):
+            result = await _build_controller_dict(req)
+
+        endpoints = result["endpoints"]
+        assert endpoints[0]["kind"] == "lan"
+        assert endpoints[0]["url"] == "http://192.168.1.1:6969"
+        assert endpoints[0]["priority"] == 1
+
+    @pytest.mark.asyncio
+    async def test_lan_only_bundle_unchanged(self, monkeypatch):
+        from tinyagentos.routes.project_invites import _build_controller_dict
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        monkeypatch.delenv("TAOS_CONTROLLER_RELAY_URL", raising=False)
+        monkeypatch.delenv("TAOS_CONTROLLER_CALLBACK_HOST", raising=False)
+
+        req = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
+        with patch(
+            "tinyagentos.routes.project_invites._enumerate_lan_ips",
+            return_value=["192.168.1.1"],
+        ), patch(
+            "tinyagentos.taosnet.mesh.mesh_status",
+            return_value={"joined": False},
+        ), patch(
+            "tinyagentos.routes.agent_deploy.controller_callback_host",
+            return_value=None,
+        ):
+            result = await _build_controller_dict(req)
+
+        endpoints = result["endpoints"]
+        assert len(endpoints) == 1
+        assert endpoints[0] == {
+            "kind": "lan",
+            "url": "http://192.168.1.1:6969",
+            "priority": 1,
+        }
+
+    @pytest.mark.asyncio
+    async def test_mesh_bundle_unchanged(self, monkeypatch):
+        from tinyagentos.routes.project_invites import _build_controller_dict
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        monkeypatch.delenv("TAOS_CONTROLLER_RELAY_URL", raising=False)
+        monkeypatch.delenv("TAOS_CONTROLLER_CALLBACK_HOST", raising=False)
+
+        req = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
+        with patch(
+            "tinyagentos.routes.project_invites._enumerate_lan_ips", return_value=[]
+        ), patch(
+            "tinyagentos.taosnet.mesh.mesh_status",
+            return_value={"joined": True, "node_ip": "100.64.0.7"},
+        ), patch(
+            "tinyagentos.routes.agent_deploy.controller_callback_host",
+            return_value=None,
+        ):
+            result = await _build_controller_dict(req)
+
+        endpoints = result["endpoints"]
+        assert len(endpoints) == 1
+        assert endpoints[0] == {
+            "kind": "mesh",
+            "url": "http://100.64.0.7:6969",
+            "priority": 1,
+        }

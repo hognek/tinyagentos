@@ -67,6 +67,34 @@ def _bus_url() -> str:
     return os.environ.get("TAOS_A2A_BUS_URL", _DEFAULT_BUS_URL).rstrip("/")
 
 
+def _is_url_safe_for_credential(url: str, *, allow_private: bool = False) -> bool:
+    """Return True when *url* is safe to carry a credential.
+
+    Safe = https anywhere, or http on a loopback or (when *allow_private*
+    is True) private / tailnet address. Public http endpoints must never
+    carry a credential in cleartext.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme == "https":
+        return True
+    if parsed.scheme != "http":
+        return False
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return False
+    if hostname == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    if addr.is_loopback:
+        return True
+    if allow_private and addr.is_private:
+        return True
+    return False
+
+
 def _credential_may_cross(bus_url: str) -> bool:
     """Return True when the caller's registry credential may be forwarded to *bus_url*.
 
@@ -87,23 +115,8 @@ def _credential_may_cross(bus_url: str) -> bool:
     The host check uses parsed address resolution, not substring matching:
     ``http://127.0.0.1.evil.test:7900`` does NOT count as loopback.
     """
-    parsed = urlparse(bus_url)
-    if parsed.scheme == "https":
+    if _is_url_safe_for_credential(bus_url, allow_private=False):
         return True
-    if parsed.scheme != "http":
-        return False
-    hostname = (parsed.hostname or "").lower()
-    if not hostname:
-        return False
-    if hostname == "localhost":
-        return True
-    try:
-        addr = ipaddress.ip_address(hostname)
-    except ValueError:
-        pass
-    else:
-        if addr.is_loopback:
-            return True
     return bool(os.environ.get("TAOS_A2A_BUS_ALLOW_INSECURE_CREDENTIAL"))
 
 
