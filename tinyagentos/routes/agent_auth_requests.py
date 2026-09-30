@@ -659,9 +659,9 @@ def _human_duration(duration_secs: object) -> str:
     Returns:
     - "expires N days after approval" for >= 48h
     - "expires N hours after approval" for exact hours >= 1h
-    - "expires N hours M minutes after approval" for >= 1h with a minute remainder
-    - "expires in N minutes" for exact minutes >= 60s
-    - "expires in N minutes M seconds" for >= 60s with a second remainder
+    - "expires N hours M minutes after approval" for >= 1h with a minute remainder (M > 0)
+    - "expires N minutes after approval" for exact minutes >= 60s
+    - "expires N minutes M seconds after approval" for >= 60s with a second remainder
     - "expires in under a minute" for 1 to 59 seconds
     - "no expiry" when duration_secs is None, zero, or invalid
     """
@@ -672,9 +672,9 @@ def _human_duration(duration_secs: object) -> str:
         elif duration_secs >= 3600:
             hours = duration_secs // 3600
             remainder = duration_secs % 3600
-            if remainder == 0:
-                return f"expires {hours} hour{'s' if hours != 1 else ''} after approval"
             minutes = remainder // 60
+            if minutes == 0:
+                return f"expires {hours} hour{'s' if hours != 1 else ''} after approval"
             return (
                 f"expires {hours} hour{'s' if hours != 1 else ''} "
                 f"{minutes} minute{'s' if minutes != 1 else ''} after approval"
@@ -683,10 +683,10 @@ def _human_duration(duration_secs: object) -> str:
             minutes = duration_secs // 60
             remainder = duration_secs % 60
             if remainder == 0:
-                return f"expires in {minutes} minute{'s' if minutes != 1 else ''}"
+                return f"expires {minutes} minute{'s' if minutes != 1 else ''} after approval"
             return (
-                f"expires in {minutes} minute{'s' if minutes != 1 else ''} "
-                f"{remainder} second{'s' if remainder != 1 else ''}"
+                f"expires {minutes} minute{'s' if minutes != 1 else ''} "
+                f"{remainder} second{'s' if remainder != 1 else ''} after approval"
             )
         else:
             return "expires in under a minute"

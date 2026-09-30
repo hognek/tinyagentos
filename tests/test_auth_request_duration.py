@@ -149,7 +149,50 @@ class TestAuthRequestDuration:
         await grants.close()
 
     @pytest.mark.asyncio
+    async def test_backend_human_duration_3601s(self, client, monkeypatch, tmp_path):
+        """3601s = 1 hour 1 second should omit zero minutes: 'expires 1 hour after approval'."""
+        from tinyagentos.agent_registry_store import AgentRegistryStore, load_or_create_signing_keypair
+        from tinyagentos.auth_requests_store import AuthRequestsStore
+        from tinyagentos.agent_grants_store import AgentGrantsStore
+
+        registry = AgentRegistryStore(tmp_path / "reg-3601s.db")
+        await registry.init()
+        auth_store = AuthRequestsStore(tmp_path / "auth-3601s.db")
+        await auth_store.init()
+        grants = AgentGrantsStore(tmp_path / "grants-3601s.db")
+        await grants.init()
+        priv, pub = load_or_create_signing_keypair(tmp_path / "keys-3601s")
+
+        monkeypatch.setattr(client._transport.app.state, "agent_registry", registry)
+        monkeypatch.setattr(client._transport.app.state, "auth_requests", auth_store)
+        monkeypatch.setattr(client._transport.app.state, "agent_grants", grants)
+        monkeypatch.setattr(client._transport.app.state, "agent_registry_keypair", (priv, pub))
+
+        resp = await client.post(
+            "/api/agents/auth-requests",
+            json={
+                "identity_claim": "3601s-bot",
+                "framework": "3601s-cli",
+                "requested_scopes": ["files_read"],
+                "duration_secs": 3601,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        request_id = resp.json()["request_id"]
+
+        resp = await client.get(f"/api/agents/auth-requests/{request_id}")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["human_duration"] == "expires 1 hour after approval", \
+            f"Expected 'expires 1 hour after approval', got: {data['human_duration']}"
+
+        await registry.close()
+        await auth_store.close()
+        await grants.close()
+
+    @pytest.mark.asyncio
     async def test_backend_human_duration_90s(self, client, monkeypatch, tmp_path):
+        """90s = 1 minute 30 seconds should use 'after approval' wording."""
         from tinyagentos.agent_registry_store import AgentRegistryStore, load_or_create_signing_keypair
         from tinyagentos.auth_requests_store import AuthRequestsStore
         from tinyagentos.agent_grants_store import AgentGrantsStore
@@ -182,8 +225,8 @@ class TestAuthRequestDuration:
         resp = await client.get(f"/api/agents/auth-requests/{request_id}")
         assert resp.status_code == 200, resp.text
         data = resp.json()
-        assert data["human_duration"] == "expires in 1 minute 30 seconds", \
-            f"Expected 'expires in 1 minute 30 seconds', got: {data['human_duration']}"
+        assert data["human_duration"] == "expires 1 minute 30 seconds after approval", \
+            f"Expected 'expires 1 minute 30 seconds after approval', got: {data['human_duration']}"
 
         await registry.close()
         await auth_store.close()

@@ -415,7 +415,7 @@ class TestAuthRequestRoutes:
             assert payload["duration_secs"] == 3600
             # Check that human_duration is included and human-readable
             assert "human_duration" in payload
-            assert payload["human_duration"] == "expires in 1 hour"
+            assert payload["human_duration"] == "expires 1 hour after approval"
         finally:
             if notif_store._db is not None:
                 await notif_store.close()
