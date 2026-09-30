@@ -20,7 +20,7 @@ from typing import Any, AsyncGenerator
 
 import httpx
 
-from tinyagentos.llm_gateway.errors import upstream_error, bad_request, rate_limit_error
+from tinyagentos.llm_gateway.errors import GatewayError, upstream_error, bad_request, rate_limit_error
 from tinyagentos.llm_usage.usage import from_anthropic
 
 ANTHROPIC_API_BASE = "https://api.anthropic.com"
@@ -73,7 +73,7 @@ def _convert_openai_tool_to_anthropic(tool: dict) -> dict:
     return {
         "name": fn.get("name", ""),
         "description": fn.get("description", ""),
-        "input_schema": fn.get("parameters", {}),
+        "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
     }
 
 
@@ -86,7 +86,7 @@ def _convert_tool_choice(tool_choice: dict | str | None) -> dict | str | None:
         if tool_choice == "required":
             return {"type": "any"}
         if tool_choice == "none":
-            return "none"
+            return {"type": "none"}
         return tool_choice
     if isinstance(tool_choice, dict):
         if tool_choice.get("type") == "function":
@@ -173,6 +173,51 @@ async def _openai_to_anthropic(
     return request
 
 
+async def _anthropic_status_error(
+    resp: httpx.Response,
+    api_key: str | None,
+    api_key_for_redaction: str | None = None,
+) -> GatewayError | None:
+    """Map an upstream Anthropic response to a GatewayError, or None for 2xx."""
+    status = resp.status_code
+    if 200 <= status < 300:
+        return None
+
+    # Read body for streaming responses
+    try:
+        _ = resp.content
+    except httpx.ResponseNotRead:
+        try:
+            await resp.aread()
+        except Exception:
+            pass
+
+    error_msg = resp.text
+    if resp.headers.get("content-type", "").startswith("application/json"):
+        try:
+            error_data = resp.json()
+            error_msg = error_data.get("error", {}).get("message", resp.text)
+        except Exception:
+            pass
+
+    redacted_msg = _redact(error_msg, api_key, api_key_for_redaction)
+
+    if status == 429:
+        retry_after = resp.headers.get("retry-after")
+        return rate_limit_error(f"the Anthropic API failed (HTTP 429): {redacted_msg}", retry_after)
+
+    if 500 <= status < 600 or status == 529:
+        return upstream_error(f"the Anthropic API failed (HTTP {status}): {redacted_msg}")
+
+    if status in {401, 403}:
+        return upstream_error(f"the Anthropic API failed (HTTP {status}): {redacted_msg}")
+
+    if status in {400, 404}:
+        return bad_request(redacted_msg)
+
+    return upstream_error(f"the Anthropic API failed (HTTP {status}): {redacted_msg}")
+
+
 async def _call_anthropic(
     request: dict, 
     api_key: str | None, 
@@ -187,57 +232,23 @@ async def _call_anthropic(
         "anthropic-version": ANTHROPIC_VERSION,
     }
     
-    what = "the Anthropic API"
-    
     # This will make a real HTTP request, which will be intercepted by respx during testing
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0)) as client:
         resp = await client.post(url, json=request, headers=headers)
     
-    # Handle response based on status code
-    if resp.status_code == 200:
-        try:
-            data = resp.json()
-        except ValueError:
-            data = None
-        
-        if not isinstance(data, dict):
-            raise upstream_error(f"{what} returned a response that is not a JSON object")
-        
-        return data
+    err = await _anthropic_status_error(resp, api_key, api_key_for_redaction)
+    if err is not None:
+        raise err
     
-    # For error responses, extract and redact error message
-    error_msg = resp.text
-    if resp.headers.get("content-type", "").startswith("application/json"):
-        try:
-            error_data = resp.json()
-            error_msg = error_data.get("error", {}).get("message", resp.text)
-        except Exception:
-            pass
+    try:
+        data = resp.json()
+    except ValueError:
+        data = None
     
-    # Redact API key from error message
-    redacted_msg = _redact(error_msg, api_key, api_key_for_redaction)
+    if not isinstance(data, dict):
+        raise upstream_error("the Anthropic API returned a response that is not a JSON object")
     
-    # 429 rate limit -> 429 OpenAI error with Retry-After preserved
-    if resp.status_code == 429:
-        retry_after = resp.headers.get("retry-after")
-        code = "rate_limit_error"
-        message = f"{what} failed (HTTP 429): {redacted_msg}"
-        raise rate_limit_error(message, retry_after)
-    
-    # 5xx and 529 are retryable (upstream errors)
-    if 500 <= resp.status_code < 600 or resp.status_code == 529:
-        raise upstream_error(f"{what} failed (HTTP {resp.status_code}): {redacted_msg}")
-    
-    # 401/403 errors are taOS key/config issues -> upstream error (502)
-    if resp.status_code in {401, 403}:
-        raise upstream_error(f"{what} failed (HTTP {resp.status_code}): {redacted_msg}")
-    
-    # 400, 404 are caller request errors -> passed through (400)
-    if resp.status_code in {400, 404}:
-        raise bad_request(redacted_msg)
-    
-    # Anything else: map to 502 upstream error with the real status in the body
-    raise upstream_error(f"{what} failed (HTTP {resp.status_code}): {redacted_msg}")
+    return data
 
 
 async def _anthropic_to_openai(response: dict, original_body: dict, api_key: str | None = None) -> dict:
@@ -465,18 +476,9 @@ async def chat_completion_stream_anthropic(
             },
         )
         resp = await client.send(req, stream=True)
-        if resp.status_code != 200:
-            try:
-                raw = await resp.aread()
-                error_body = json.loads(raw)
-            except Exception:
-                error_body = {"error": {"message": await resp.aread()}}
-            error_msg = error_body.get("error", {}).get("message", resp.text)
-            if api_key and api_key in error_msg:
-                error_msg = error_msg.replace(api_key, "[redacted]")
-            yield f"data: {json.dumps({'error': {'message': 'the Anthropic API failed (HTTP ' + str(resp.status_code) + '): ' + error_msg, 'type': 'api_error'}})}\n\n".encode("utf-8")
-            yield b"data: [DONE]\n\n"
-            return
+        err = await _anthropic_status_error(resp, api_key)
+        if err is not None:
+            raise err
         try:
             # Anthropic frames are "event: <type>\ndata: {json}\n\n"; the type
             # is repeated inside the JSON, so only the data line is read.

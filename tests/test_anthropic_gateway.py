@@ -867,9 +867,99 @@ async def test_non_openai_backend_no_longer_501(tmp_path_factory):
 
 
 # ---------------------------------------------------------------------------
-# RED-FIRST tests for request-side fixes.
+# RED-FIRST tests for error handling, streaming errors, tool_choice, and input_schema.
 # Each test asserts one missing behavior and MUST FAIL on the unpatched code.
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_retry_after_header(tmp_path_factory):
+    """A 429 upstream returns retry-after header and code rate_limit_exceeded."""
+    app, session = await _gateway_app(tmp_path_factory)
+    respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
+        429,
+        headers={"retry-after": "2", "content-type": "application/json"},
+        json={"error": {"message": "Rate limited"}},
+    ))
+    resp = await _post(app, session, _chat())
+    assert resp.status_code == 429, resp.text
+    assert resp.headers.get("retry-after") == "2"
+    body = resp.json()
+    assert body["error"]["type"] == "rate_limit_error"
+    assert body["error"]["code"] == "rate_limit_exceeded"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_stream_429(tmp_path_factory):
+    """A streaming 429 must be a real 429 response, not HTTP 200."""
+    app, session = await _gateway_app(tmp_path_factory)
+    respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
+        429,
+        headers={"retry-after": "2", "content-type": "application/json"},
+        json={"error": {"message": "Rate limited"}},
+    ))
+    resp = await _post(app, session, _chat(stream=True))
+    assert resp.status_code == 429, resp.text
+    assert resp.headers.get("retry-after") == "2"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_stream_non_json(tmp_path_factory):
+    """A streaming non-JSON error body must not crash; return the real status."""
+    app, session = await _gateway_app(tmp_path_factory)
+    respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
+        502,
+        content=b"<html>Bad Gateway</html>",
+        headers={"content-type": "text/html"},
+    ))
+    resp = await _post(app, session, _chat(stream=True))
+    assert resp.status_code == 502, resp.text
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_tool_choice_none(tmp_path_factory):
+    """tool_choice 'none' maps to {'type': 'none'} and tools are still sent."""
+    app, session = await _gateway_app(tmp_path_factory)
+    anthropic_response = _anthropic_response()
+    respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
+        200, json=anthropic_response, headers={"content-type": "application/json"}
+    ))
+    body = _chat_with_tools()
+    body["tool_choice"] = "none"
+    await _post(app, session, body)
+    data = _upstream_json(respx.calls.last)
+    assert data["tools"]
+    assert data["tool_choice"] == {"type": "none"}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_no_parameters(tmp_path_factory):
+    """A tool with no parameters gets input_schema {'type': 'object', 'properties': {}}."""
+    app, session = await _gateway_app(tmp_path_factory)
+    anthropic_response = _anthropic_response()
+    respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
+        200, json=anthropic_response, headers={"content-type": "application/json"}
+    ))
+    body = {
+        "model": "claude-x",
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Weather for a city",
+            },
+        }],
+    }
+    await _post(app, session, body)
+    data = _upstream_json(respx.calls.last)
+    tool = data["tools"][0]
+    assert tool["input_schema"] == {"type": "object", "properties": {}}
 
 
 def _upstream_json(call):
@@ -998,14 +1088,13 @@ async def test_429_becomes_openai_error_with_retry_after(tmp_path_factory):
 @pytest.mark.asyncio
 @respx.mock
 async def test_streaming_500_becomes_error_not_empty_stream(tmp_path_factory):
-    """A streaming 500 must yield an error event, not an empty stream."""
+    """A streaming 500 must be a real 502 error, not an empty stream."""
     app, session = await _gateway_app(tmp_path_factory)
     respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
         500, json={"error": {"message": "Server error"}},
         headers={"content-type": "application/json"},
     ))
     resp = await _post(app, session, _chat(stream=True))
-    assert resp.status_code == 200, resp.text
-    text = resp.read().decode("utf-8")
-    assert text, "the stream must not be empty"
-    assert '"error"' in text or '"message"' in text
+    assert resp.status_code == 502, resp.text
+    body = resp.json()
+    assert body["error"]["type"] == "api_error"
