@@ -173,10 +173,14 @@ class RestartOrchestrator:
                         paused = True
                         if reason != "pause":
                             paused_by_restart = True
+                        if agent.get("paused", False) and not agent.get("paused_by_restart", False):
+                            paused_by_restart = False
                         stale_note = data_dir / "agent-memory" / name / "resume_note.json"
                         if stale_note.exists():
                             try:
-                                stale_note.unlink()
+                                note = json.loads(stale_note.read_text())
+                                if _is_controller_note(note):
+                                    stale_note.unlink()
                             except Exception:
                                 pass
                     else:

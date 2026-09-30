@@ -8,3 +8,10 @@
   agent, so a later `/resume` POST is not blocked by an old note. Lifecycle
   calls are skipped for agents with no recorded port instead of guessing
   port 8080.
+- A 200 prepare no longer deletes the agent-framework's own `resume_note.json`:
+  controller-side fallback notes are identified by `_is_controller_note` and
+  removed only when they are actually stale. Agents whose frameworks answered
+  `/prepare-for-shutdown` keep their notes through restart.
+- A restart prepare no longer adopts an agent that is already paused by the
+  user (no `paused_by_restart` marker). Such agents stay paused and are
+  excluded from the restart resume pass.

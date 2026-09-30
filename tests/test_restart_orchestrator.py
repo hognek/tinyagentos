@@ -490,6 +490,108 @@ class TestPrepareAgent:
         assert posted.get("called") is True
         assert agent["paused"] is False
 
+    @pytest.mark.asyncio
+    async def test_a_200_prepare_keeps_the_agents_own_note(self, tmp_path, monkeypatch):
+        """A 200 prepare must preserve the agent-framework note, not delete it."""
+        agent = {"name": "keep-note", "host": "10.0.0.1", "port": 8080}
+        state = _app_state(tmp_path, agents=[agent])
+        orch = ro.RestartOrchestrator(state)
+
+        note_path = state.data_dir / "agent-memory" / "keep-note" / "resume_note.json"
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        agent_note = {"reason": "stop", "next_step_hint": "agent handled it"}
+        note_path.write_text(json.dumps(agent_note))
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"note_path": str(note_path)}
+
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_cm = MagicMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        monkeypatch.setattr(orch, "_write_controller_note", AsyncMock())
+        with patch("httpx.AsyncClient", return_value=mock_cm):
+            result = await orch._prepare_agent(agent, "stop", state.data_dir)
+
+        assert note_path.exists()
+        assert json.loads(note_path.read_text()) == agent_note
+        assert agent.get("paused") is True
+        assert agent.get("paused_by_restart") is True
+
+    @pytest.mark.asyncio
+    async def test_a_restart_does_not_adopt_a_user_pause(self, tmp_path, monkeypatch):
+        """A restart prepare must not adopt an agent that is already paused
+        by the user (no paused_by_restart marker)."""
+        agent = {
+            "name": "user-paused",
+            "host": "10.0.0.1",
+            "port": 8080,
+            "paused": True,
+        }
+        state = _app_state(tmp_path, agents=[agent])
+        orch = ro.RestartOrchestrator(state)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"note_path": "/remote/note.json"}
+
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_cm = MagicMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        monkeypatch.setattr(orch, "_write_controller_note", AsyncMock())
+        with patch("httpx.AsyncClient", return_value=mock_cm):
+            result = await orch._prepare_agent(agent, "stop", state.data_dir)
+
+        assert agent.get("paused") is True
+        assert agent.get("paused_by_restart") is not True
+
+        posted = {}
+        async def fake_post(host, port, note):
+            posted["called"] = True
+            return True
+
+        monkeypatch.setattr(ro, "_post_resume", fake_post)
+        await ro.resume_agents_from_notes(state)
+
+        assert "called" not in posted
+        assert agent["paused"] is True
+
+    @pytest.mark.asyncio
+    async def test_200_prepare_removes_stale_controller_note(self, tmp_path, monkeypatch):
+        """Control: a 200 restart prepare still removes a stale controller note."""
+        agent = {"name": "stale-ctrl", "host": "10.0.0.1", "port": 8080}
+        note_path = tmp_path / "data" / "agent-memory" / "stale-ctrl" / "resume_note.json"
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        note_path.write_text(json.dumps({
+            "reason": "stop",
+            "next_step_hint": "controller-side fallback — agent framework did not implement /prepare-for-shutdown"
+        }))
+
+        state = _app_state(tmp_path, agents=[agent])
+        orch = ro.RestartOrchestrator(state)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"note_path": "/remote/note.json"}
+
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_cm = MagicMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        monkeypatch.setattr(orch, "_write_controller_note", AsyncMock())
+        with patch("httpx.AsyncClient", return_value=mock_cm):
+            result = await orch._prepare_agent(agent, "stop", state.data_dir)
+
+        assert not note_path.exists()
+
 
 # ---------------------------------------------------------------------------
 # _write_controller_note
