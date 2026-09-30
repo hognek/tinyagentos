@@ -73,6 +73,13 @@ BOARD_LLM_MODELS = ["taos-default"]
 LLM_PATH = "/api/llm/v1"
 
 
+def _platform_from_caps(caps: list[str]) -> str:
+    """Derive platform from board info caps: 'orb' when 'orb' in caps, else 'taosusb'."""
+    if isinstance(caps, list) and "orb" in caps:
+        return "orb"
+    return "taosusb"
+
+
 class BluetoothError(Exception):
     """bleak or an adapter is missing. Routes map this to 503 bluetooth_unavailable."""
 
@@ -145,6 +152,7 @@ class PairSession:
     initiator: "proto.PairInitiator"
     code: str
     created_at: float
+    caps: list[str] = field(default_factory=list)
     reassembler: "proto.Reassembler" = field(default_factory=proto.Reassembler)
 
 
@@ -326,6 +334,10 @@ class BlePairingManager:
             name = info.get("name")
             state = info.get("state")
             pairable = bool(info.get("pairable", False))
+            caps_raw = info.get("caps")
+            if not isinstance(caps_raw, list):
+                caps_raw = []
+            caps = [c for c in caps_raw if isinstance(c, str)]
             if not isinstance(board_id, str) or not board_id:
                 raise PairError(504, "bad or missing info from board")
             if state != "unpaired" or not pairable:
@@ -364,6 +376,7 @@ class BlePairingManager:
             initiator=initiator,
             code=code,
             created_at=time.time(),
+            caps=caps,
             reassembler=reassembler,
         )
         async with self._lock:
@@ -384,10 +397,13 @@ class BlePairingManager:
         if sess is None:
             raise PairError(404, "unknown or expired pairing session")
 
-        # The board's own advertised name (e.g. "taOSusb-7K3Q") is already the
-        # node's identity -- reuse it as the registry name rather than
-        # re-deriving one, so it matches what the board itself displays.
-        name = sess.board_name or f"taOSusb-{sess.board_id}"
+        platform = _platform_from_caps(sess.caps)
+        if sess.board_name:
+            name = sess.board_name
+        elif platform == "orb":
+            name = f"taOS Orb-{sess.board_id}"
+        else:
+            name = f"taOSusb-{sess.board_id}"
         # That name is the board's claim, not ours: it may not collide with
         # any other node. A registered worker's name is refused outright; a
         # device name is only reusable once an admin has revoked it (a reset
@@ -429,7 +445,7 @@ class BlePairingManager:
             name=name,
             url="",
             kind="device",
-            platform="taosusb",
+            platform=platform,
             capabilities=["agent"],
             signing_key=key,
         )
