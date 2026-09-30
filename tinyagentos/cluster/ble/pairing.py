@@ -242,6 +242,9 @@ class BlePairingManager:
             msg = reassembler.feed(frag)
             if msg is not None:
                 return msg
+            # Log drop reason if present (from Reassembler.last_drop)
+            if reassembler.last_drop is not None:
+                logger.debug("ble pairing: fragment dropped (%s)", reassembler.last_drop)
 
     # -- public API -----------------------------------------------------
 
