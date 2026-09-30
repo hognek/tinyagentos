@@ -10,11 +10,13 @@ Then the happy path end to end.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 import pytest_asyncio
 
 import tinyagentos.cluster.ble.pairing as pairing_mod
+from tinyagentos.cluster.ble import proto
 from tinyagentos.cluster.ble.pairing import BlePairingManager, PairError
 from tinyagentos.cluster.manager import ClusterManager
 from tinyagentos.cluster.pairing_store import ClusterPairingStore
@@ -216,6 +218,78 @@ async def test_cancel_drops_the_session(cluster, store, tmp_path):
     with pytest.raises(PairError) as exc:
         await mgr.confirm(started["session"])
     assert exc.value.status == 404
+
+
+# ---------------------------------------------------------------------------
+# Platform from caps
+# ---------------------------------------------------------------------------
+
+class BoardWithoutCaps:
+    """A fake board that omits the 'caps' field from its info JSON."""
+
+    def __init__(self, *, board_id: str = "TEST", name: str | None = None):
+        self.board_id = board_id
+        self.name = name or f"taOSusb-{board_id}"
+        self.priv, self.pub = proto.x25519_keypair()
+        self.responder = proto.PairResponder(board_id, self.priv)
+
+    def info_bytes(self) -> bytes:
+        frame = {
+            "v": 1,
+            "id": self.board_id,
+            "name": self.name,
+            "state": "unpaired",
+            "pairable": True,
+            "bpub": proto.b64(proto.pub_bytes(self.pub)),
+        }
+        return json.dumps(frame).encode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_orb_caps_register_platform_orb(cluster, store, tmp_path):
+    """Board with caps ["orb"] registers with platform "orb"."""
+    board = FakeBoard(board_id="ORB1", name="taOS Orb-ORB1", caps=["orb"])
+    mgr = make_manager(cluster, store, tmp_path, {"addr1": board})
+    started = await mgr.start("addr1")
+    result = await mgr.confirm(started["session"])
+
+    assert result["name"] == "taOS Orb-ORB1"
+    worker = cluster.get_worker("taOS Orb-ORB1")
+    assert worker is not None
+    assert worker.platform == "orb"
+    assert worker.capabilities == ["agent"]
+
+
+@pytest.mark.asyncio
+async def test_agent_caps_still_register_taosusb(cluster, store, tmp_path):
+    """Board with caps ["agent"] (the default) registers with platform "taosusb"."""
+    board = FakeBoard(board_id="TAOS1", name="taOSusb-TAOS1", caps=["agent"])
+    mgr = make_manager(cluster, store, tmp_path, {"addr1": board})
+    started = await mgr.start("addr1")
+    result = await mgr.confirm(started["session"])
+
+    assert result["name"] == "taOSusb-TAOS1"
+    worker = cluster.get_worker("taOSusb-TAOS1")
+    assert worker is not None
+    assert worker.platform == "taosusb"
+
+
+@pytest.mark.asyncio
+async def test_missing_or_junk_caps_default_to_taosusb(cluster, store, tmp_path):
+    """caps absent, or caps = "orb" as a bare string -> platform == "taosusb"."""
+    board_no_caps = BoardWithoutCaps(board_id="NOCAPS")
+    boards = {"addr1": board_no_caps}
+    transport = FakeTransport(boards)
+    mgr = BlePairingManager(
+        data_dir=tmp_path, cluster_manager=cluster, pairing_store=store,
+        bind_port=6969, transport=transport,
+    )
+    started = await mgr.start("addr1")
+    await mgr.confirm(started["session"])
+
+    worker = cluster.get_worker("taOSusb-NOCAPS")
+    assert worker is not None
+    assert worker.platform == "taosusb"
 
 
 # ---------------------------------------------------------------------------
