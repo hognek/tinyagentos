@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import socket
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -250,9 +251,10 @@ async def _build_controller_dict(request: Request) -> dict:
     priority = 1
 
     # Relay endpoint (TAOS_CONTROLLER_RELAY_URL) becomes priority 1 when present.
+    # Relay MUST be HTTPS — http relays are not safe for credential-bearing bundles.
     relay_url = os.environ.get("TAOS_CONTROLLER_RELAY_URL", "").strip()
     if relay_url:
-        if _is_url_safe_for_credential(relay_url, allow_private=True):
+        if _is_url_safe_for_credential(relay_url, allow_private=False):
             endpoints.append(
                 {"kind": "relay", "url": relay_url, "priority": priority}
             )
@@ -260,7 +262,7 @@ async def _build_controller_dict(request: Request) -> dict:
         else:
             logger.warning(
                 "TAOS_CONTROLLER_RELAY_URL omitted: %s is not safe for "
-                "credential-bearing bundles (use https or a private address)",
+                "credential-bearing bundles (must be https)",
                 relay_url,
             )
 
@@ -299,9 +301,16 @@ async def _build_controller_dict(request: Request) -> dict:
                 override,
             )
 
+    # For LAN deduplication, compare against the override's hostname when it's a full URL.
+    override_host = None
+    if override and "://" in override:
+        override_host = urlparse(override).hostname
+
     for ip in _enumerate_lan_ips():
-        if override and ip == override:
-            continue
+        if override:
+            # Skip if this LAN IP matches the override (either bare hostname/IP or parsed from full URL)
+            if ip == override or (override_host and ip == override_host):
+                continue
         endpoints.append(
             {"kind": "lan", "url": f"http://{ip}:{_CONTROLLER_PORT}", "priority": priority}
         )

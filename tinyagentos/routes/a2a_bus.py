@@ -87,11 +87,33 @@ def _is_url_safe_for_credential(url: str, *, allow_private: bool = False) -> boo
     try:
         addr = ipaddress.ip_address(hostname)
     except ValueError:
+        # Not an IP address — could be a hostname. When allow_private=True,
+        # trust bare hostnames that look like LAN / tailnet names:
+        #   - ends with .local, .lan, .home.arpa, .ts.net
+        #   - single-label (no dot at all)
+        if allow_private:
+            if hostname.endswith((".local", ".lan", ".home.arpa", ".ts.net")):
+                return True
+            if "." not in hostname:
+                return True
         return False
     if addr.is_loopback:
         return True
-    if allow_private and addr.is_private:
-        return True
+    if allow_private:
+        if addr.is_private:
+            return True
+        # Tailscale CGNAT range 100.64.0.0/10 is not flagged as private by
+        # Python's ipaddress, but is a tailnet address and should be trusted.
+        if addr.version == 4:
+            tailscale_net = ipaddress.ip_network("100.64.0.0/10")
+            if addr in tailscale_net:
+                return True
+        # Tailscale ULA fd7a:115c:a1e0::/48 is already is_private (ULA), but
+        # keep the explicit check for clarity / future-proofing.
+        if addr.version == 6:
+            tailscale_ula = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+            if addr in tailscale_ula:
+                return True
     return False
 
 
