@@ -503,13 +503,19 @@ class TestSelfServiceRotation:
         cid, old_token = await _register_and_mint(app, user_id="u")
         # Rotate as the owner/admin, then try to rotate again with the dead token.
         await agent_app.post(f"/api/agents/registry/{cid}/rotate-tokens")
+        cutoff_after_first = (await app.state.agent_registry.get(cid))["token_min_iat"]
+        assert cutoff_after_first > 0
         resp = await agent_app.post(
             f"/api/agents/registry/{cid}/rotate-tokens",
             headers={"Authorization": f"Bearer {old_token}"},
         )
         assert resp.status_code == 404
-        # The cutoff did not move for the failed attempt.
-        assert (await app.state.agent_registry.get(cid))["token_min_iat"] > 0
+        # The cutoff did not move for the failed attempt: it is still the exact
+        # value the first rotation set, not merely some positive number (the
+        # first rotation already made `> 0` true, so that alone proved nothing).
+        assert (
+            await app.state.agent_registry.get(cid)
+        )["token_min_iat"] == cutoff_after_first
 
 
 class TestStorageGuidanceAtMint:

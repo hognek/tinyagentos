@@ -846,6 +846,12 @@ async def rotate_tokens(
 
     Leaves a forensic audit-log entry, actor = the session user, a literal
     ``agent:<canonical_id>`` marker for a self-rotation.
+
+    The replacement carries ``sub``/``user_id``/``framework`` but NOT the
+    original token's ``project_id`` claim.  That claim has been advisory since
+    #1862 -- project-scoped authority comes from the identity's active grants,
+    which rotation does not touch -- so dropping it is not a privilege change;
+    the claim is simply not re-issued.
     """
     store = _get_store(request)
     record = await store.get(canonical_id)

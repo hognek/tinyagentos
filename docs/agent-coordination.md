@@ -165,7 +165,11 @@ every token already issued and returns one fresh token, minted AT that cutoff, i
 the same call. The superseded token is then rejected with `401 token superseded`
 and the replacement works immediately; the `canonical_id` never changes and the
 identity keeps its grants, so recovery stops scattering grants across orphan
-identities. Owner or admin may rotate any identity they own, and an agent may
+identities. The replacement carries the identity's `sub` / `user_id` /
+`framework` but not the superseded token's `project_id` claim; that claim has
+been advisory since #1862 (grants, not the claim, decide project-scoped
+authority) and rotation does not touch them, so the replacement's reach is
+unchanged. Owner or admin may rotate any identity they own, and an agent may
 rotate its OWN identity with its own live registry JWT (the route is on the
 middleware allowlist) -- which is the "rotate my credential" action an agent needs
 when it suspects its token is stale or leaked, with no human in the loop. Before
