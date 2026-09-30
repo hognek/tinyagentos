@@ -208,7 +208,7 @@ function NodeCard({ node, cap }: { node: ClusterMapNode; cap?: ClusterMapCapabil
               <span
                 key={`${node.name}-pot-${c}`}
                 className="text-[9px] px-1.5 py-0.5 rounded-full bg-white/[0.03] border border-white/10 text-shell-text-tertiary"
-                title="Hardware can support this — install a model with this capability to enable it"
+                title="Hardware can support this. Install a model with this capability to enable it."
               >
                 {c}
               </span>
@@ -283,7 +283,7 @@ export function PlacementOverview({ map }: { map: ClusterMap | null }) {
       </div>
       <p className="text-[11px] text-shell-text-tertiary">
         Everything installed or loaded across {nodes.length} node{nodes.length === 1 ? "" : "s"}.
-        Read-only view — nothing here moves anything.
+        Read-only view. Nothing here moves anything.
       </p>
       <div className="space-y-2">
         {nodes.map((node) => (
