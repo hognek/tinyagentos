@@ -31,7 +31,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, StrictInt
 
 from aiosqlite import IntegrityError
-from tinyagentos.agent_registry_store import agent_slug_or_fallback, mint_registry_token
+from tinyagentos.agent_registry_store import (
+    TOKEN_STORAGE_GUIDANCE,
+    agent_slug_or_fallback,
+    mint_registry_token,
+)
 from tinyagentos.auth_context import CurrentUser, current_user, require_owner_or_admin
 from tinyagentos.base_store import PendingCapExceeded
 from tinyagentos.routes.projects import _free_suggestions
@@ -81,6 +85,11 @@ VALID_SCOPES = frozenset({
     # per-project grant authorizes that project only. The route verifies the grant.
     "decisions_read",
     "decisions_write",
+    # Agent notifications: post taOS notifications through the store so SSE
+    # and web-push fire. A global grant authorizes OS-level posts (to admins);
+    # a per-project grant authorizes that project only. The route verifies
+    # the grant.
+    "notifications_write",
     # Doc-review stamps: read/set review state on a project's docs
     # (project-bound like project_tasks). Reconciled from master at beta.45 -
     # the routes shipped on every install while the scope was missing here.
@@ -611,6 +620,10 @@ async def get_auth_request_status(request: Request, request_id: str):
     if record["status"] == "accepted":
         result["canonical_id"] = record["canonical_id"]
         result["token"] = record["token"]
+        # The token is handed over here, so the storage rule travels with it --
+        # this is the last moment the holder can be told, and the token is not
+        # retrievable afterwards.
+        result["storage_guidance"] = TOKEN_STORAGE_GUIDANCE
     return result
 
 
