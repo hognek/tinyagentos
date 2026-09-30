@@ -15,6 +15,7 @@ instance-scoped default, or drops the bus hold, does not keep passing.
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -51,6 +52,21 @@ PREFIX_ISOLATION = (
     "### 3.4 What a subscription means\n"
 )
 
+_FIXED_ISOLATION = (
+    "### 3.2 User (and project) isolation is a precondition, not later hardening\n"
+    "\n"
+    "The bus proxy forwards the channel unfiltered, so the unit this design has\n"
+    "to isolate is the user -- not the instance. An agent belongs to the user who\n"
+    "registered it (`agent_registry.user_id`).\n"
+    "\n"
+    "### 3.3 Who publishes, who subscribes\n"
+    "\n"
+    "- **Subscribers (S1):** default *on* within the same user's fleet, and\n"
+    "  deliberately **not instance-wide**.\n"
+    "\n"
+    "### 3.4 What a subscription means\n"
+)
+
 PREFIX_S2 = (
     "**S2. Publish / subscribe on the `learning` channel.**\n"
     "- Files: `tinyagentos/guides/bus.py`, the instance-isolation setting in\n"
@@ -63,6 +79,11 @@ PREFIX_S2 = (
 def _plain(text: str) -> str:
     """Drop markdown emphasis/backticks so prose guards survive re-formatting."""
     return text.replace("*", "").replace("`", "")
+
+
+def _norm(text: str) -> str:
+    """Case-folded prose: the doc writes "taOS", a reversion may write "taos"."""
+    return _plain(text).lower()
 
 
 def _section(text: str, start: str, end: str) -> str:
@@ -82,13 +103,34 @@ def _s2(text: str) -> str:
 
 def user_is_the_isolation_unit(text: str) -> bool:
     """Guard 1: the isolation unit is the user (or project), not the instance."""
-    body = _plain(_sections(text))
+    body = _norm(_sections(text))
     return (
         "not the instance" in body
         and "agent_registry.user_id" in body
         and "not instance-wide" in body
         and "within the same taos instance" not in body
     )
+
+
+def _envelope_json(text: str) -> str:
+    """The §4 supplement envelope, the one fenced ```json block in the section."""
+    section = _section(
+        text,
+        "## 4. The supplement: data shape",
+        "Rules that make the shape safe",
+    )
+    start = section.index("```json") + len("```json\n")
+    end = section.index("```", start)
+    return section[start:end]
+
+
+def envelope_example_is_valid_json(text: str) -> bool:
+    """Guard 3: an implementer can copy the envelope example and parse it."""
+    try:
+        parsed = json.loads(_envelope_json(text))
+    except json.JSONDecodeError:
+        return False
+    return isinstance(parsed, dict) and parsed.get("kind") == "guide.supplement"
 
 
 def s2_is_blocked_on_the_bus_redesign(text: str) -> bool:
@@ -139,6 +181,13 @@ class TestSkillCollaborationDesignDoc:
             "the 'already exists' framing overstates the transport's readiness"
         )
 
+    def test_envelope_example_is_valid_json(self):
+        text = DOC.read_text(encoding="utf-8")
+        assert envelope_example_is_valid_json(text), (
+            "the §4 supplement envelope no longer parses as JSON, so anyone "
+            "copying the example verbatim hits a parse error"
+        )
+
     def test_cited_code_surfaces_exist(self):
         text = DOC.read_text(encoding="utf-8")
         missing = [
@@ -168,23 +217,20 @@ class TestGuardMutation:
     def test_isolation_guard_rejects_the_instance_scoped_default(self):
         assert not user_is_the_isolation_unit(PREFIX_ISOLATION)
 
-    def test_isolation_guard_accepts_the_fixed_wording(self):
-        fixed = (
-            PREFIX_ISOLATION.replace(
-                "### 3.2 Instance isolation is a precondition, not later hardening",
-                "### 3.2 User (and project) isolation is a precondition, not "
-                "later hardening",
-            )
-            .replace(
-                "Two taOS instances pointed at one bus would therefore see each "
-                "other's\nsupplements.",
-                "The isolation unit is the user, not the instance; an agent "
-                "belongs to\n`agent_registry.user_id`.",
-            )
-            .replace("default *on* within the same taOS instance", "default *on*")
-            .replace("own fleet, which is", "own fleet and not instance-wide, which")
+    def test_isolation_guard_rejects_a_case_mixed_partial_reversion(self):
+        """The negative check must bite on "taOS", not only on "taos".
+
+        A partial reversion that restores the instance-scoped default keeps the
+        mixed-case spelling the doc uses, so a case-sensitive comparison would
+        miss exactly the regression this guard exists for.
+        """
+        fixed = _FIXED_ISOLATION.replace(
+            "default *on*", "default *on* within the same taOS instance"
         )
-        assert user_is_the_isolation_unit(fixed)
+        assert user_is_the_isolation_unit(fixed) is False
+
+    def test_isolation_guard_accepts_the_fixed_wording(self):
+        assert user_is_the_isolation_unit(_FIXED_ISOLATION)
 
     def test_bus_redesign_guard_rejects_the_pre_fix_slice(self):
         assert not s2_is_blocked_on_the_bus_redesign(PREFIX_S2)
@@ -195,6 +241,34 @@ class TestGuardMutation:
             "- BLOCKED on the A2A bus redesign (hold since 2026-08-24).\n- Files:",
         )
         assert s2_is_blocked_on_the_bus_redesign(fixed)
+
+    def test_json_guard_rejects_a_js_style_comment(self):
+        """A `//` note inside the envelope block is what Kilo flagged."""
+        text = (
+            "## 4. The supplement: data shape\n"
+            "\n"
+            "```json\n"
+            "{\n"
+            '  "kind": "guide.supplement",\n'
+            '  "status": "draft|review|fleet",   // retraction is a tombstone\n'
+            "}\n"
+            "```\n"
+            "\n"
+            "Rules that make the shape safe:\n"
+        )
+        assert envelope_example_is_valid_json(text) is False
+
+    def test_json_guard_accepts_the_comment_free_block(self):
+        text = (
+            "## 4. The supplement: data shape\n"
+            "\n"
+            "```json\n"
+            '{\n  "kind": "guide.supplement",\n  "status": "draft|review|fleet"\n}\n'
+            "```\n"
+            "\n"
+            "Rules that make the shape safe:\n"
+        )
+        assert envelope_example_is_valid_json(text) is True
 
 
 if __name__ == "__main__":  # pragma: no cover

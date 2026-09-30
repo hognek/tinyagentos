@@ -207,7 +207,7 @@ One JSON envelope in the bus `body`, and one row in a local store:
   "evidence": [{"run_id": "...", "trace": "<#896 trace id>", "observed": "OOM at step 2, Q4, 1024px"}],
   "provenance": {"created_ts": 0, "source_bus_msg": "...", "prev": null},
   "promotion": {"by": "@<reviewer handle>", "canonical_id": "...", "decision_id": "dec-...", "ts": 0},
-  "status": "draft|review|fleet",   // retraction is a separate guide.tombstone event
+  "status": "draft|review|fleet",
   "supersedes": null
 }
 ```
