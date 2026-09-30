@@ -175,4 +175,64 @@ describe("AgentGrantsPanel", () => {
     const emDash = "\u2014";
     expect(haystack.filter((s) => s.includes(emDash))).toEqual([]);
   });
+
+  it("moves focus into the dialog on open and restores it to the opener on close", async () => {
+    const opener = document.createElement("button");
+    opener.textContent = "Manage grants";
+    document.body.appendChild(opener);
+    opener.focus();
+    expect(document.activeElement).toBe(opener);
+
+    const { unmount } = render(<AgentGrantsPanel target={TARGET} onClose={vi.fn()} />);
+    await waitFor(() => screen.getByText(/no active grants/i));
+
+    const dialog = document.querySelector('[role="dialog"]');
+    expect(dialog).not.toBeNull();
+    expect(dialog!.contains(document.activeElement)).toBe(true);
+
+    unmount();
+    expect(document.activeElement).toBe(opener);
+    opener.remove();
+  });
+
+  it("keeps Tab inside the dialog by wrapping from the last control to the first", async () => {
+    vi.mocked(listAgentGrants).mockResolvedValue([
+      makeGrant({ scope: "project_tasks", project_id: "proj-1" }),
+    ]);
+
+    render(<AgentGrantsPanel target={TARGET} onClose={vi.fn()} />);
+    await waitFor(() => screen.getByText("project_tasks"));
+
+    const dialog = document.querySelector('[role="dialog"]') as HTMLElement;
+    const focusable = Array.from(
+      dialog.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    );
+    expect(focusable.length).toBeGreaterThan(1);
+    const first = focusable[0]!;
+    const last = focusable[focusable.length - 1]!;
+
+    last.focus();
+    await act(async () => {
+      dialog.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true }));
+    });
+
+    expect(document.activeElement).toBe(first);
+  });
+
+  it("still renders grants when the project list fails (labels are cosmetic)", async () => {
+    vi.mocked(listAgentGrants).mockResolvedValue([
+      makeGrant({ scope: "project_tasks", project_id: "proj-1" }),
+    ]);
+    vi.mocked(projectsApi.list).mockRejectedValue(new Error("HTTP 500"));
+
+    render(<AgentGrantsPanel target={TARGET} onClose={vi.fn()} />);
+
+    await waitFor(() => screen.getByText("project_tasks"));
+    // The raw project id stands in for the missing label, and revoke still works.
+    expect(screen.getByText("proj-1")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /revoke project_tasks/i })).toBeTruthy();
+    expect(screen.queryByText(/failed to load grants/i)).toBeNull();
+  });
 });

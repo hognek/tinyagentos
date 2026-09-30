@@ -7,6 +7,7 @@ import {
   type AgentGrant,
 } from "@/lib/agent-grants";
 import { projectsApi, type Project } from "@/lib/projects";
+import { useFocusTrap } from "@/hooks/use-focus-trap";
 
 /**
  * Agents-app revoke surface (taOS #2985).
@@ -62,8 +63,13 @@ export function AgentGrantsPanel({
   const [error, setError] = useState<string | null>(null);
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const loadSeq = useRef(0);
+  const dialogRef = useRef<HTMLDivElement>(null);
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
+
+  // Same modal shell as LicenseAcceptDialog/PermissionConsent: focus moves into
+  // the dialog, Tab wraps inside it, and focus returns to the opener on close.
+  useFocusTrap(dialogRef, true);
 
   // Wrapped so the effect dep is stable (matches RegistryPanel/LogsPanel); the
   // loadSeq guard still drops stale completions when the target changes.
@@ -140,6 +146,7 @@ export function AgentGrantsPanel({
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-label={`Manage grants for ${agentLabel(target)}`}
