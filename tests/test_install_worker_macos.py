@@ -126,7 +126,7 @@ def test_apple_silicon_with_metal_registers_gpu_metal(tmp_path: Path) -> None:
     assert _result(result.stdout, "RESULT_MACOS") == "gpu-metal"
     assert _result(result.stdout, "RESULT_RESOURCES") == "gpu-metal,cpu-inference"
     assert "resource registration: gpu-metal" in result.stdout, result.stdout
-    assert "Apple Silicon (arm64) — Metal available" in result.stdout, result.stdout
+    assert "Apple Silicon (arm64): Metal available" in result.stdout, result.stdout
     assert "MLX runtime detected" in result.stdout, result.stdout
 
 
@@ -141,7 +141,11 @@ def test_apple_silicon_without_mlx_still_registers_gpu_metal(tmp_path: Path) -> 
     assert result.returncode == 0, result.stderr
     assert _result(result.stdout, "RESULT_RESOURCES") == "gpu-metal,cpu-inference"
     assert "MLX runtime not found" in result.stderr, result.stderr
-    assert "pip install mlx" in result.stderr, result.stderr
+    # The hint has to name a package that exists and the interpreter the
+    # service actually runs (#3237 installs mlx-lm into the service venv;
+    # a bare `pip install mlx` with system python does not reach the daemon).
+    assert "pip install mlx-lm" in result.stderr, result.stderr
+    assert f"{tmp_path}/install/.venv/bin/pip install mlx-lm" in result.stderr, result.stderr
 
 
 def test_arm64_without_metal_falls_back_to_cpu(tmp_path: Path) -> None:
@@ -310,15 +314,170 @@ def test_launchd_plist_is_written_to_library_launchagents(tmp_path: Path) -> Non
     assert log.exists() and "load" in log.read_text(), "launchctl load not invoked"
 
 
-def test_install_script_dispatches_macos_branches() -> None:
-    """Static check: the Darwin runtime branch wires detection + launchd."""
+# --- macOS pairing (the launchd agent must not boot unpaired) -------------
+
+
+def _extract_section(script: Path, start_marker: str, end_marker: str) -> str:
+    """Extract the shipped text between two markers (end marker excluded)."""
+    text = script.read_text()
+    assert start_marker in text, (
+        f"{start_marker!r} not found in {script}: the macOS pair step is missing"
+    )
+    start = text.index(start_marker)
+    end = text.index(end_marker, start)
+    return text[start:end]
+
+
+def _write_fake_venv_python(install_dir: Path) -> None:
+    """Stand-in for $INSTALL_DIR/.venv/bin/python that records its argv."""
+    bin_dir = install_dir / ".venv" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    fake = bin_dir / "python"
+    fake.write_text('#!/usr/bin/env bash\nprintf "%s\\n" "$@" >> "$ARGS_LOG"\n')
+    fake.chmod(0o755)
+
+
+def test_pair_step_writes_the_key_where_the_launchd_agent_looks(tmp_path: Path) -> None:
+    """The pair step and the plist must name the SAME state dir.
+
+    pair.py defaults to ~/.local/state/taos-worker while the plist sets
+    TAOS_WORKER_STATE_DIR=$INSTALL_DIR/.taos-worker-state, so a pair run
+    without --state-dir saves the key where the launched daemon never looks
+    and the worker reports "not paired" despite a successful pairing.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    install_dir = home / ".local" / "share" / "tinyagentos-worker"
+    args_log = tmp_path / "pair-args.log"
+    _write_fake_venv_python(install_dir)
+
+    functions = "\n".join(
+        _extract_function(INSTALL_SCRIPT, name)
+        for name in ("pair_worker", "install_macos_launchd")
+    )
+    body = (
+        "log() { printf '%s\\n' \"$*\"; }\n"
+        "warn() { printf '%s\\n' \"$*\" >&2; }\n"
+        'HOME="$(printf %s "$FAKE_HOME")"\n'
+        'INSTALL_DIR="$HOME/.local/share/tinyagentos-worker"\n'
+        "CONTROLLER_URL=http://controller:6969\n"
+        "WORKER_NAME=mac-mini-worker\n"
+        "TAOS_WORKER_RESOURCES=gpu-metal,cpu-inference\n"
+        f'launchctl() {{ printf \'launchctl %s\\n\' "$*" >> "$FAKE_HOME/launchctl.log"; }}\n'
+        + functions
+        + "\npair_worker\ninstall_macos_launchd\n"
+    )
+    result = _run_wrapper(
+        tmp_path, body, env={"FAKE_HOME": str(home), "ARGS_LOG": str(args_log)}
+    )
+    assert result.returncode == 0, result.stderr
+
+    argv = args_log.read_text().splitlines()
+    assert "tinyagentos.worker.pair" in argv, argv
+    assert "--register-after" in argv, argv
+    assert argv[argv.index("--name") + 1] == "mac-mini-worker", argv
+    assert argv[argv.index("--state-dir") + 1] == f"{install_dir}/.taos-worker-state", argv
+    # The Linux path advertises the DNAT'd LXC port; macOS must not.
+    assert "--url" not in argv, f"macOS must let pair.py infer the URL, got {argv}"
+    assert "8443" not in " ".join(argv), argv
+
+    plist = home / "Library" / "LaunchAgents" / "com.tinyagentos.worker.plist"
+    match = re.search(
+        r"<key>TAOS_WORKER_STATE_DIR</key><string>(.*?)</string>", plist.read_text()
+    )
+    assert match, "the plist must set TAOS_WORKER_STATE_DIR"
+    assert argv[argv.index("--state-dir") + 1] == match.group(1), (
+        "pairing wrote the key to a different directory than the service reads"
+    )
+
+
+def test_darwin_pairs_before_installing_the_launchd_agent(tmp_path: Path) -> None:
+    """Wiring: the Darwin service-install path pairs, and pairs first.
+
+    Runs the shipped tail of install-worker.sh (the pairing block plus the
+    service-install dispatch) with both platform functions stubbed, so the
+    call order comes from the script itself, not from a copy of it.
+    """
+    section = _extract_section(
+        INSTALL_SCRIPT, "# --- pairing (macOS) ---", 'log "install complete"'
+    )
+    for os_name, expect_pair in (("Darwin", True), ("Linux", False)):
+        work = tmp_path / os_name
+        work.mkdir()
+        body = (
+            "log() { printf '%s\\n' \"$*\"; }\n"
+            "warn() { printf '%s\\n' \"$*\" >&2; }\n"
+            "INSTALL_DIR=/tmp/install\n"
+            "CONTROLLER_URL=http://controller:6969\n"
+            "WORKER_NAME=w\n"
+            f"os_name={os_name}\n"
+            "SERVICE_MODE=auto\n"
+            "pair_worker() { printf 'PAIR\\n'; }\n"
+            "install_macos_launchd() { printf 'LAUNCHD\\n'; }\n"
+            "install_linux_systemd() { printf 'SYSTEMD\\n'; }\n"
+            + section
+        )
+        result = _run_wrapper(work, body)
+        assert result.returncode == 0, result.stderr
+        lines = result.stdout.splitlines()
+        if expect_pair:
+            assert "PAIR" in lines, f"Darwin never pairs:\n{result.stdout}"
+            assert lines.index("PAIR") < lines.index("LAUNCHD"), (
+                "the plist must be written after pairing, not before"
+            )
+        else:
+            assert "PAIR" not in lines, "Linux pairs inside install_and_enroll_incus"
+            assert "SYSTEMD" in lines, result.stdout
+
+
+def test_pair_failure_stops_the_install(tmp_path: Path) -> None:
+    """A failed pair returns 1 so the caller can skip the service install."""
+    functions = _extract_function(INSTALL_SCRIPT, "pair_worker")
+    body = (
+        "log() { printf '%s\\n' \"$*\"; }\n"
+        "warn() { printf '%s\\n' \"$*\" >&2; }\n"
+        "INSTALL_DIR=/nonexistent-install-dir\n"
+        "CONTROLLER_URL=http://controller:6969\n"
+        "WORKER_NAME=w\n"
+        + functions
+        + "\nif pair_worker; then printf 'PAIR_RC=0\\n'; else printf 'PAIR_RC=1\\n'; fi\n"
+    )
+    result = _run_wrapper(tmp_path, body)
+    assert "PAIR_RC=1" in result.stdout, result.stdout
+
+
+def test_install_script_dispatches_macos_branches(tmp_path: Path) -> None:
+    """Run the shipped OS-deps case block instead of grepping for it.
+
+    The Darwin branch has to call ensure_macos_deps and then
+    detect_macos_accelerator (the probe, which is what sets
+    TAOS_WORKER_RESOURCES and TAOS_MACOS_RESOURCE). The service-install
+    dispatch is exercised behaviourally by
+    test_darwin_pairs_before_installing_the_launchd_agent.
+    """
     text = INSTALL_SCRIPT.read_text()
-    assert re.search(
-        r"Darwin\)\s*ensure_macos_deps;\s*detect_macos_accelerator", text
-    ), "the Darwin deps branch must run detect_macos_accelerator"
-    assert re.search(
-        r"Darwin\)\s*install_macos_launchd", text
-    ), "the service-install case must dispatch LaunchAgents on Darwin"
+    match = re.search(
+        r'(case "\$os_name" in\n    Linux\) ensure_linux_deps ;;\n.*?\nesac)',
+        text,
+        re.DOTALL,
+    )
+    assert match, "the OS deps dispatch block moved; update this test"
+    body = (
+        "log() { printf '%s\\n' \"$*\"; }\n"
+        "warn() { printf '%s\\n' \"$*\" >&2; }\n"
+        "os_name=Darwin\n"
+        "ensure_linux_deps() { printf 'LINUX\\n'; }\n"
+        "ensure_macos_deps() { printf 'MACOS_DEPS\\n'; }\n"
+        "detect_macos_accelerator() { printf 'DETECT\\n'; }\n"
+        "die() { printf 'DIE %s\\n' \"$*\"; exit 1; }\n"
+        + match.group(1)
+    )
+    result = _run_wrapper(tmp_path, body)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert "MACOS_DEPS" in lines, result.stdout
+    assert lines.index("MACOS_DEPS") < lines.index("DETECT"), result.stdout
+    assert "LINUX" not in lines, "the Darwin run must not take the Linux branch"
 
 
 def test_install_script_is_syntactically_valid() -> None:

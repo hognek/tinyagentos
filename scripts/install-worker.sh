@@ -362,6 +362,58 @@ reexec_into_worker_lxc() {
     " </dev/null
 }
 
+# --- controller pairing (shared: Linux incus path + macOS launchd path) ---
+#
+# Acquires the HMAC signing key and, with --register-after, does the first
+# signed POST /api/cluster/workers so the controller knows this worker before
+# the incus-enroll step (that endpoint 404s for unknown workers). Crypto lives
+# in Python (tinyagentos.worker.pair), not shell.
+#
+# Runs on BOTH platforms. The Linux path calls it from
+# install_and_enroll_incus(); macOS has no incus step to carry it, so the
+# Darwin path calls it directly before install_macos_launchd. Without that, a
+# Mac installs and starts a launchd agent whose daemon has no signing key and
+# reports "not paired" forever (issue #37).
+#
+# --state-dir is not optional: the systemd unit and the launchd plist both set
+# TAOS_WORKER_STATE_DIR=$INSTALL_DIR/.taos-worker-state, while pair.py defaults
+# to ~/.local/state/taos-worker. Pairing with the default would write the key
+# where the running service never looks, and the daemon would start "not
+# paired" despite the pairing having succeeded on the console.
+#
+# Args:
+#   $1 (optional) advertised worker URL. The Linux path passes the DNAT'd
+#      bare-host address (https://<LAN_IP>:8443); macOS omits it so pair.py
+#      infers the host's own URL.
+# Returns 1 when pairing fails, so the caller can stop before installing a
+# service that could never register.
+pair_worker() {
+    local worker_url="${1:-}"
+    log "pairing worker '${WORKER_NAME}' with controller at $CONTROLLER_URL"
+    log "  (the pairing code will be printed below: enter it in taOS > Cluster)"
+    local _pair_manual_flag=()
+    if [[ -n "${TAOS_PAIR_MANUAL:-}" ]]; then
+        _pair_manual_flag=(--manual)
+        log "  TAOS_PAIR_MANUAL set: using free-tier manual pairing (enter IP + PIN in Add worker)"
+    fi
+    local _pair_url_flag=()
+    if [[ -n "$worker_url" ]]; then
+        _pair_url_flag=(--url "$worker_url")
+    fi
+    if ! "$INSTALL_DIR/.venv/bin/python" -m tinyagentos.worker.pair \
+            "$CONTROLLER_URL" \
+            --name "$WORKER_NAME" \
+            --state-dir "$INSTALL_DIR/.taos-worker-state" \
+            ${_pair_url_flag[@]+"${_pair_url_flag[@]}"} \
+            ${_pair_manual_flag[@]+"${_pair_manual_flag[@]}"} \
+            --register-after; then
+        warn "pairing requires admin approval in taOS > Cluster."
+        warn "  The code was printed above. Once approved, re-run this installer to resume."
+        warn "  To resume later: run this installer again (it will skip already-done steps)."
+        return 1
+    fi
+}
+
 # --- incus install + controller enrollment --------------------------------
 #
 # Installs incus on Linux workers, configures an HTTPS listener on :8443,
@@ -538,33 +590,11 @@ install_and_enroll_incus() {
     log "LAN IP: $LAN_IP"
 
     # ── 7. Pair + register worker with controller ───────────────────────
-    # Pairing acquires the HMAC signing key; --register-after does the
-    # first signed POST /api/cluster/workers so the controller knows this
-    # worker before the incus-enroll step below (that endpoint 404s for
-    # unknown workers). Crypto lives in Python, not shell.
-    log "pairing worker '${WORKER_NAME}' with controller at $CONTROLLER_URL"
-    log "  (the pairing code will be printed below — enter it in taOS > Cluster)"
-    local _pair_manual_flag=()
-    if [[ -n "${TAOS_PAIR_MANUAL:-}" ]]; then
-        _pair_manual_flag=(--manual)
-        log "  TAOS_PAIR_MANUAL set — using free-tier manual pairing (enter IP + PIN in Add worker)"
-    fi
-    # Save the signing key where the worker daemon reads it. The systemd unit
-    # sets TAOS_WORKER_STATE_DIR=$INSTALL_DIR/.taos-worker-state; pair.py's
-    # default state-dir differs, so pass it explicitly or the daemon starts up
-    # "not paired" despite a successful pairing.
-    if ! "$INSTALL_DIR/.venv/bin/python" -m tinyagentos.worker.pair \
-            "$CONTROLLER_URL" \
-            --name "$WORKER_NAME" \
-            --url "https://${LAN_IP}:8443" \
-            --state-dir "$INSTALL_DIR/.taos-worker-state" \
-            "${_pair_manual_flag[@]}" \
-            --register-after; then
-        warn "pairing requires admin approval in taOS > Cluster."
-        warn "  The code was printed above. Once approved, re-run this installer to resume."
-        warn "  To resume later: run this installer again (it will skip already-done steps)."
-        return 1
-    fi
+    # Shared with the macOS path, which has no incus step to carry it (see
+    # pair_worker above). The advertised URL is the DNAT'd bare-host address:
+    # this code may be running inside the worker LXC, where the only locally
+    # reachable address is the NAT'd incusbr0 IP.
+    pair_worker "https://${LAN_IP}:8443" || return 1
 
     # ── 8. Enrol the worker's incus with the controller ─────────────────
     # The endpoint is HMAC-gated like register/heartbeat, so the request is
@@ -856,9 +886,9 @@ ensure_macos_deps() {
 # docs/design/resource-scheduler.md defines the cross-platform resource
 # classes. For macOS those are:
 #
-#   gpu-metal       Apple Silicon M1-M5 — MLX, llama.cpp Metal, Core ML.
+#   gpu-metal       Apple Silicon M1-M5: MLX, llama.cpp Metal, Core ML.
 #                   Concurrency 1 (unified memory).
-#   cpu-inference   Everything — the Intel Mac fallback.
+#   cpu-inference   Everything: the Intel Mac fallback.
 #
 # The detected class is exported as TAOS_WORKER_RESOURCES so the worker
 # daemon (tinyagentos/worker/agent.py) advertises it at registration and on
@@ -883,7 +913,7 @@ macos_metal_available() {
         # arm64 VM that has none (hw.optional.arm64 only reports the CPU
         # architecture), so refuse to assume: fall back to CPU and let the
         # operator force the branch with TAOS_FORCE_METAL=1.
-        warn "system_profiler not found — cannot verify Metal support"
+        warn "system_profiler not found: cannot verify Metal support"
         return 1
     fi
     system_profiler SPDisplaysDataType 2>/dev/null | grep -qiE 'Metal Support:[[:space:]]+Metal([[:space:]]+[0-9]+)?[[:space:]]*$'
@@ -899,21 +929,21 @@ detect_macos_accelerator() {
     mach="$(uname -m)"
     if [[ "$mach" == "arm64" ]] && macos_metal_available; then
         TAOS_MACOS_RESOURCE="gpu-metal"
-        log "accelerator: Apple Silicon ($mach) — Metal available"
+        log "accelerator: Apple Silicon ($mach): Metal available"
         if macos_mlx_available; then
-            log "  MLX runtime detected — GPU inference via MLX is available"
+            log "  MLX runtime detected: GPU inference via MLX is available"
         else
             warn "MLX runtime not found on this python; install it for GPU inference:"
-            warn "  $INSTALL_DIR/.venv/bin/pip install mlx"
+            warn "  $INSTALL_DIR/.venv/bin/pip install mlx-lm"
             warn "  (llama.cpp Metal and Core ML still work without it)"
         fi
         log "resource registration: gpu-metal (1 concurrent, unified memory) + cpu-inference"
     else
         TAOS_MACOS_RESOURCE="cpu-inference"
         if [[ "$mach" == "arm64" ]]; then
-            warn "accelerator: arm64 without a Metal-capable GPU (VM?) — using the CPU-only fallback"
+            warn "accelerator: arm64 without a Metal-capable GPU (VM?): using the CPU-only fallback"
         else
-            log "accelerator: Intel Mac ($mach) — no Metal GPU in the resource contract"
+            log "accelerator: Intel Mac ($mach): no Metal GPU in the resource contract"
         fi
         log "resource registration: cpu-inference (CPU-only fallback)"
     fi
@@ -921,7 +951,7 @@ detect_macos_accelerator() {
     # not-yet-installed backend does not drop the class from the cluster view.
     # An explicit TAOS_WORKER_RESOURCES wins: it is the documented override.
     if [[ -n "${TAOS_WORKER_RESOURCES:-}" ]]; then
-        log "TAOS_WORKER_RESOURCES set explicitly — keeping: $TAOS_WORKER_RESOURCES"
+        log "TAOS_WORKER_RESOURCES set explicitly, keeping: $TAOS_WORKER_RESOURCES"
     elif [[ "$TAOS_MACOS_RESOURCE" == "cpu-inference" ]]; then
         export TAOS_WORKER_RESOURCES="cpu-inference"
     else
@@ -1598,6 +1628,19 @@ EOF
     log "check: launchctl list | grep tinyagentos"
     log "logs:  tail -f $INSTALL_DIR/worker.log"
 }
+
+# --- pairing (macOS) ------------------------------------------------------
+#
+# On Linux the pair step runs inside install_and_enroll_incus, which the
+# Darwin branch skips outright (incus is Linux-only). A Mac still has to crank
+# its signing key into the state dir install_macos_launchd bakes into the
+# plist, or the launchd worker boots "not paired" and never registers, which
+# is the whole point of #37. Running it here puts it after the venv exists and
+# before the plist is written.
+
+if [[ "$os_name" == "Darwin" && "$SERVICE_MODE" != "skip" ]]; then
+    pair_worker
+fi
 
 if [[ "$SERVICE_MODE" == "skip" ]]; then
     log "TAOS_SERVICE=skip — not installing a service unit"

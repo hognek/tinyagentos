@@ -571,10 +571,12 @@ class WorkerAgent:
         if self._signing_key is None:
             logger.error(
                 "worker not paired: no signing key at %s; "
-                "run `python -m tinyagentos.worker.pair %s --name %s` to pair this worker",
+                "run `python -m tinyagentos.worker.pair %s --name %s "
+                "--state-dir %s` to pair this worker",
                 self._state_dir,
                 self.controller_url,
                 self.name,
+                self._state_dir,
             )
             return False
 
@@ -698,10 +700,12 @@ class WorkerAgent:
         if self._signing_key is None:
             logger.error(
                 "worker not paired: no signing key at %s; "
-                "run `python -m tinyagentos.worker.pair %s --name %s` to pair this worker",
+                "run `python -m tinyagentos.worker.pair %s --name %s "
+                "--state-dir %s` to pair this worker",
                 self._state_dir,
                 self.controller_url,
                 self.name,
+                self._state_dir,
             )
             return 0
 

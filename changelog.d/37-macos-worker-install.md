@@ -10,11 +10,30 @@
   on a bench box whose probe is silent; `TAOS_WORKER_RESOURCES` overrides the
   detected set.
 
+### Fixed
+
+- The macOS install now pairs the worker before it installs the launchd
+  agent. The pair step used to live inside `install_and_enroll_incus()`, which
+  the Darwin branch skips (incus is Linux-only), so a Mac started a launchd
+  agent with no signing key and reported "not paired" forever (#37). The step
+  is now the shared `pair_worker()` function, called from the incus path on
+  Linux and directly before `install_macos_launchd` on macOS, always with
+  `--state-dir $INSTALL_DIR/.taos-worker-state`.
+- The "not paired" hint in `tinyagentos.worker.agent` now includes
+  `--state-dir`, so following it writes the key where the service reads it
+  instead of pairing.py's `~/.local/state/taos-worker` default.
+- The controller validates a worker's advertised `resources` against the
+  scheduler resource-class grammar (`tinyagentos/cluster/worker_protocol.py`)
+  on registration and heartbeat, and answers 400 for an unknown class. The
+  list used to be stored verbatim, and `TAOS_WORKER_RESOURCES` makes it an
+  operator knob. The lease-time fallback grammar in `ClusterManager` now
+  accepts `gpu-metal` too.
+
 ### Changed
 
 - The macOS launchd agent (`~/Library/LaunchAgents/com.tinyagentos.worker.plist`)
-  now carries `EnvironmentVariables` — `PYTHONUNBUFFERED`,
-  `TAOS_WORKER_STATE_DIR`, and the detected `TAOS_WORKER_RESOURCES` — so the
+  now carries `EnvironmentVariables` (`PYTHONUNBUFFERED`,
+  `TAOS_WORKER_STATE_DIR`, and the detected `TAOS_WORKER_RESOURCES`), so the
   resource class survives a re-login instead of depending on the installer's
   process environment.
 - `tinyagentos.worker.agent` advertises Apple Silicon as `gpu-metal` rather
