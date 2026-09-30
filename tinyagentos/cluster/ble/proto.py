@@ -175,11 +175,12 @@ class Reassembler:
         self.max_message = max_message
         self.max_inflight = max_inflight
         self._buf = {}   # mid -> bytearray, insertion order == arrival order of each id's FIRST
-        self.last_drop = None   # documented attribute: drop reason, reset on each feed() that completes
+        self.last_drop = None   # documented attribute: drop reason, reset on EVERY feed()
 
     def feed(self, frag):
         """Feed one wire fragment. Returns the reassembled payload (bytes) when a message
         completes, else None."""
+        self.last_drop = None
         if len(frag) < 2:
             return None   # too short to carry flags+mid; not a real fragment
         flags, mid = frag[0], frag[1]
@@ -252,16 +253,17 @@ def _validate_key_not_weak(key_bytes):
     
     Returns the key if valid, raises ValueError if weak.
     """
+    # All-zero key is caught first for cheapness
+    if key_bytes == b"\x00" * 32:
+        raise ValueError("weak_key")
+    
     try:
         # Attempt a trial exchange with a throwaway key to catch low-order points
-        # All-zero key is caught first for cheapness
-        if key_bytes == b"\x00" * 32:
-            raise ValueError("weak_key")
-        
-        # Create a throwaway private key
+        # and all-zero shared secrets (older cryptography builds return it instead of raising)
         throwaway_priv = X25519PrivateKey.generate()
-        # Try to exchange - will raise ValueError for low-order points
-        throwaway_priv.exchange(X25519PublicKey.from_public_bytes(key_bytes))
+        shared = throwaway_priv.exchange(X25519PublicKey.from_public_bytes(key_bytes))
+        if shared == b"\x00" * 32:
+            raise ValueError("weak_key")
     except ValueError as e:
         if "weak" in str(e) or "low-order" in str(e):
             raise ValueError("weak_key") from e
@@ -454,16 +456,22 @@ class PairResponder:
     def _on_hello(self, msg):
         if msg.get("v") != PROTO_VERSION:
             return _err("unsupported protocol version (board speaks v%d)" % PROTO_VERSION)
+        # Parse keys first - malformed input gets 'bad hello'
         try:
             cpub = unb64(msg["cpub"], 32)
             c_epub = unb64(msg["epub"], 32)
-            # Validate both keys are not weak/low-order before proceeding
-            _validate_key_not_weak(cpub)
-            _validate_key_not_weak(c_epub)
             X25519PublicKey.from_public_bytes(cpub)
             X25519PublicKey.from_public_bytes(c_epub)
         except (KeyError, ValueError, TypeError):
             return _err("bad hello")
+        # Then validate keys are not weak - weak keys get 'weak_key'
+        try:
+            _validate_key_not_weak(cpub)
+            _validate_key_not_weak(c_epub)
+        except ValueError as e:
+            if "weak_key" in str(e):
+                return _err("weak_key")
+            raise
         b_epriv, b_epub = x25519_keypair()
         b_n = os.urandom(16)
         bpub_bytes, b_epub_bytes = pub_bytes(self.static_pub), pub_bytes(b_epub)

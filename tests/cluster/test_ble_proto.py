@@ -24,7 +24,7 @@ import tinyagentos.cluster.ble.proto as proto
 # 2026-09: protocol v2 (commit/reveal nonces, release audit H1) was written
 # here first; taosusb's files/taosble/proto.py must be re-copied FROM this
 # file so the two stay byte-identical.
-EXPECTED_SHA256 = "9284ea2c4ad18d988161b5626560b9c663195cbe31976405d717fdf0ec275195"
+EXPECTED_SHA256 = "a3be058a49367de5b4c8310530b91e868073791e21bd8cc9d9a6e90ddf86593b"
 
 
 def test_proto_is_byte_identical_to_vendored_source():
@@ -177,3 +177,76 @@ def test_drop_reasons_are_named():
     result = reasm.feed(frag4)
     assert result is None
     assert 'inflight' in reasm.last_drop.lower()
+
+
+# --- RED-FIRST: new tests for the fix-forward -------------------------------------------------------
+
+def test_last_drop_resets_on_next_feed():
+    """Reassembler.last_drop is reset at the top of feed(), so a bad-flags
+    feed followed by a valid FIRST-only fragment leaves last_drop as None."""
+    from tinyagentos.cluster.ble.proto import Reassembler, FLAG_FIRST
+    
+    reasm = Reassembler()
+    
+    # First feed: bad flags (0xFF has unknown bits)
+    frag_bad = bytes([0xFF, 1]) + b'x'
+    result = reasm.feed(frag_bad)
+    assert result is None
+    assert reasm.last_drop == "bad_flags"
+    
+    # Second feed: valid FIRST-only fragment (no LAST, so incomplete)
+    frag_good = bytes([FLAG_FIRST, 2]) + b'a'
+    result = reasm.feed(frag_good)
+    assert result is None  # incomplete message
+    # last_drop must be reset to None because this feed didn't cause a drop
+    assert reasm.last_drop is None
+
+
+def test_weak_epub_hello_error_is_named():
+    """PairResponder hello with an all-zero epub gets an error frame whose
+    `why` is exactly 'weak_key'. A 31-byte epub (malformed) still gets 'bad hello'."""
+    from tinyagentos.cluster.ble.proto import PairResponder, x25519_keypair, b64, json
+    
+    board_id, static_priv = "TEST", x25519_keypair()[0]
+    responder = PairResponder(board_id, static_priv)
+    
+    # All-zero epub (32 bytes) -> should get 'weak_key'
+    hello_weak = {"t": "hello", "v": proto.PROTO_VERSION,
+                  "cpub": b64(os.urandom(32)),
+                  "epub": b64(bytes(32))}
+    raw = json.dumps(hello_weak).encode("utf-8")
+    reply = responder.handle_message(raw)
+    reply_dict = json.loads(reply.decode("utf-8"))
+    assert reply_dict["t"] == "error"
+    assert reply_dict["why"] == "weak_key", f"Expected 'weak_key', got {reply_dict['why']!r}"
+    
+    # 31-byte epub (malformed base64 decode length) -> should get 'bad hello'
+    hello_malformed = {"t": "hello", "v": proto.PROTO_VERSION,
+                       "cpub": b64(os.urandom(32)),
+                       "epub": b64(b"x" * 31)}  # 31 bytes, not 32
+    raw = json.dumps(hello_malformed).encode("utf-8")
+    reply = responder.handle_message(raw)
+    reply_dict = json.loads(reply.decode("utf-8"))
+    assert reply_dict["t"] == "error"
+    assert reply_dict["why"] == "bad hello", f"Expected 'bad hello', got {reply_dict['why']!r}"
+
+
+def test_trial_exchange_all_zero_result_refused():
+    """Monkeypatch X25519PrivateKey.generate (as imported in proto) to return
+    a mock whose exchange() returns bytes(32) -> _validate_key_not_weak raises ValueError('weak_key')."""
+    from tinyagentos.cluster.ble.proto import _validate_key_not_weak
+    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from unittest.mock import patch, MagicMock
+    
+    # Valid 32-byte key (not all-zero)
+    good_key = os.urandom(32)
+    while good_key == bytes(32):
+        good_key = os.urandom(32)
+    
+    # Patch generate to return a mock whose exchange returns all-zero
+    mock_priv = MagicMock()
+    mock_priv.exchange.return_value = bytes(32)
+    with patch.object(X25519PrivateKey, 'generate', return_value=mock_priv):
+        with pytest.raises(ValueError) as exc_info:
+            _validate_key_not_weak(good_key)
+        assert "weak_key" in str(exc_info.value)
