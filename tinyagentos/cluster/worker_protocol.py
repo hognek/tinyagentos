@@ -28,6 +28,10 @@ logger = logging.getLogger(__name__)
 #   gpu-mali                 Mali (experimental)
 #   npu-<soc>                NPU, e.g. npu-rk3588
 #   accel-<name>             accelerator boards, e.g. accel-hailo
+#
+# Anchored with \Z rather than $: $ also matches immediately before a trailing
+# newline, so "gpu-cuda-0\n" would validate and then be stored and compared
+# verbatim by the lease path.
 RESOURCE_CLASS_RE = re.compile(
     r"^(?:"
     r"cpu-inference"
@@ -35,7 +39,7 @@ RESOURCE_CLASS_RE = re.compile(
     r"|gpu-(?:metal|mali)"
     r"|npu-[a-z0-9][a-z0-9-]*"
     r"|accel-[a-z0-9][a-z0-9-]*"
-    r")$"
+    r")\Z"
 )
 
 

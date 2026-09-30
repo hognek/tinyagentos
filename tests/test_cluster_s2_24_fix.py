@@ -337,6 +337,8 @@ def test_resource_class_grammar_matches_the_documented_classes():
         "npu-",
         "accel-",
         "gpu-cuda-0 ",
+        "gpu-cuda-0\n",
+        "cpu-inference\n",
         "gpu-cuda-99; rm -rf /",
         "TAOS_WORKER_RESOURCES",
     ):
