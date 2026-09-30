@@ -6,3 +6,7 @@
   stale-summary vs live-context consistency rules, and a three-slice plan (local compression behind
   an idle gate, cross-node dispatch, live-context splice) with per-slice acceptance criteria.
   Design only — no behaviour change in this PR.
+- Follows the #3225 Lead review: the summary row identity is owner-scoped (`user_id` in the store
+  primary key, the vector `metadata_json` and both lookup tiers, since agent names are not unique
+  under per-user namespacing), and the "default on or default off" choice is recorded as an open
+  product question instead of being assumed.

@@ -57,6 +57,12 @@ Relationship to existing pieces:
   (`cluster/worker_protocol.py`), claimed through
   `POST /api/cluster/leases/claim` and tracked in `ClusterManager._leases`, is
   the hard "this node's accelerator is taken" fact that eligibility reads.
+- **Agent ownership is the privacy boundary.** An agent belongs to a user:
+  every row in `agent_registry_store` carries `user_id`, and
+  `auth_context.resolve_agent_owner()` / `require_agent_owner_or_admin()`
+  (`tinyagentos/auth_context.py`) are the house primitives that turn an agent id
+  into its owner, fail-closed for non-admins. A summary is conversation content,
+  so it is owner-scoped the same way — sections 4.3 and 4.4.
 
 ## 2. Architecture
 
@@ -180,6 +186,7 @@ One job type, `summarize_segment`, with a payload of the form:
   "conversation_id": "...",
   "segment_id": "...",
   "agent_name": "...",
+  "user_id": "owner-of-record",
   "source": {"first_message_id": "...", "last_message_id": "...", "sha256": "..."},
   "state_handle": { "kv_summary_location": "...", "vector_shard_ids": [...] },
   "model": "qwen3:4b",
@@ -193,6 +200,16 @@ prompted to emit a compact summary plus structured items (topics, decisions,
 open threads). `sha256` over the canonical raw segment text is carried in the
 payload and stored on the result: it is the staleness key in section 5.
 
+`user_id` is the **owner of record**, resolved by the controller when the job is
+enqueued through the same agent→owner binding the house already uses
+(`auth_context.resolve_agent_owner()`; for tool calls,
+`tools/todo_tools.py::_resolve_owner_user_id()` — registry `get_by_handle`,
+falling back to the authenticated `request.state.user_id`). The controller
+**re-resolves the owner from `agent_name` at commit time** rather than trusting
+what a producer echoes back: ownership is a controller-side authorization fact,
+so a compromised or merely buggy producer must not be able to attribute a summary
+to a different user.
+
 **The controller commits; the producer does not.** A producer node never opens
 the controller's summary store or archive. It returns a result payload and the
 controller writes it. This is what keeps a compromised or merely buggy node from
@@ -205,6 +222,7 @@ One new store following the house SCHEMA/MIGRATIONS discipline
 
 ```
 summaries(
+  user_id          TEXT,   -- owner of record (registry-resolved; see 4.2)
   conversation_id  TEXT,
   segment_id       TEXT,
   agent_name       TEXT,
@@ -215,18 +233,29 @@ summaries(
   model            TEXT,   -- which model produced it (quality attribution)
   produced_on      TEXT,   -- which worker name
   created_at       REAL,   -- UTC
-  PRIMARY KEY (conversation_id, segment_id, source_sha256)
+  PRIMARY KEY (user_id, conversation_id, segment_id, source_sha256)
 )
 ```
+
+`user_id` leads the key because under per-user agent namespacing **neither
+`agent_name` nor `conversation_id` is unique on its own**: two users can each own
+an agent called `assistant`, and nothing in this schema would stop their segments
+from colliding. Making the owner part of the row identity keeps summarisation
+idempotent *for that owner* and stops one user's row from shadowing or
+overwriting another's. It is the same shape as the existing user-scoped store in
+the tree: `knowledge_store.py` carries `user_id TEXT NOT NULL DEFAULT ''`
+(its migration v1 adds the column and `idx_ki_user_id`), and its reads take
+`user_id: str | None = None` so a caller must supply an owner to get owner-scoped
+results. A store that cannot resolve an owner returns nothing, not everything.
 
 The primary key makes summarisation **idempotent by construction — provided
 the insert carries an explicit conflict policy**: SQLite's default on a
 constraint violation is `ABORT`, so the write is
-`INSERT ... ON CONFLICT (conversation_id, segment_id, source_sha256) DO NOTHING`
+`INSERT ... ON CONFLICT (user_id, conversation_id, segment_id, source_sha256) DO NOTHING`
 (the house already uses this form — see the `ON CONFLICT(node_id) DO UPDATE`
 upsert in `cluster/capability_map.py`). With that, re-running an unchanged
-segment is a no-op, and a changed segment gets a new row while the old one stops
-matching `source_sha256` and is ignored.
+segment is a no-op *for that owner*, and a changed segment gets a new row while
+the old one stops matching `source_sha256` and is ignored.
 
 The summary row does **not** cover the vector index write — see the crash-recovery
 row in section 5 for how the two are kept consistent.
@@ -234,9 +263,17 @@ row in section 5 for how the two are kept consistent.
 The embedding goes to the existing vector index (`taosmd/vector_memory.py`
 stores `text` + `embedding` + `metadata_json` in SQLite; the qmd serve index is
 what `routes/memory.py` proxies per agent) with `metadata_json` carrying
-`{conversation_id, segment_id, source_sha256, kind: "summary"}`. Retrieval is
-therefore an ordinary RAG call, which is the whole point of the #155 dependency —
-though the RAG index is not the only lookup (section 4.4).
+`{user_id, conversation_id, segment_id, source_sha256, kind: "summary"}`.
+Retrieval is therefore an ordinary RAG call, which is the whole point of the
+#155 dependency — though the RAG index is not the only lookup (section 4.4).
+
+The owner scopes the *write* as well as the row: the embedding lands in the
+**owner's** memory index. `routes/memory.py::_agent_db_path()` turns the caller's
+`agent` component into `agent_memory_dir/<agent>/index.sqlite` and rejects a
+multi-segment value, so under per-user agent namespacing the component that is
+passed must be the **owner-qualified** agent identity, never the bare
+`agent_name`. A bare name resolves to whatever index that name points at, which
+is exactly how one user's summaries would become retrievable by another.
 
 ### 4.4 Pulling it back
 
@@ -245,13 +282,14 @@ window and, for a reference that falls outside it:
 
 1. resolve the summary with a **two-tier lookup**:
    - **preferred:** an ordinary memory/RAG query (the `routes/memory.py` proxy
-     path, routed by the collection's #155 locality policy) filtered to
-     `kind: "summary"` for that conversation — this is the path that survives a
-     summary-store/node relocation and is what #155 buys us;
+     path, routed by the collection's #155 locality policy) **against the
+     owner's index** and filtered to `kind: "summary"` for that conversation —
+     this is the path that survives a summary-store/node relocation and is what
+     #155 buys us;
    - **fallback:** a direct summary-store read keyed by
-     `(conversation_id, segment_id, source_sha256)` on the controller — the
-     **current** segment's hash, computed by the caller from the raw text, is
-     part of the key. Keying on the hash rather than on
+     `(user_id, conversation_id, segment_id, source_sha256)` on the controller —
+     the **current** segment's hash, computed by the caller from the raw text,
+     is part of the key. Keying on the hash rather than on
      `(conversation_id, segment_id)` alone matters: the store deliberately keeps
      one row per hash, so a segment-level lookup could return a superseded row,
      fail the step-2 check, and hide a perfectly good current summary for the
@@ -277,12 +315,23 @@ lookup is what makes that true rather than merely asserted.
 Step 2 is what stops a stale summary from overruling live context: **the raw
 segment and the hot window always win.**
 
+Both tiers are **owner-scoped**. The owner comes from the live turn's
+authenticated identity (`request.state.user_id`, set by the session or
+local-token auth middleware) or, for an agent caller, from the agent→owner
+binding of section 4.2 — never from a name the caller supplies. `agent_name`
+alone is not a scope: under per-user agent namespacing it is not unique
+(section 4.3), so an unscoped lookup for a colliding name/conversation pair can
+hand back another user's summary. A lookup that cannot resolve an owner resolves
+to **no** summary and takes the section 5 degraded path rather than degrading to
+an unscoped read.
+
 ## 5. Failure and consistency semantics
 
 | Failure | Semantics |
 |---|---|
 | **Stale summary vs live context** | Summaries are keyed on `source_sha256`. A summary whose key no longer matches the current raw segment is *ignored*, never merged. The raw text (hot window, then archive) is authoritative at all times; splices are additive. |
-| **Duplicate / concurrent summarisation of one segment** | The composite primary key plus an explicit `ON CONFLICT ... DO NOTHING` makes the second write a no-op rather than a constraint error. Two producers racing is wasteful, not corrupting. |
+| **Duplicate / concurrent summarisation of one segment** | The composite primary key — owner-scoped, section 4.3 — plus an explicit `ON CONFLICT ... DO NOTHING` makes the second write a no-op rather than a constraint error. Two producers racing is wasteful, not corrupting. |
+| **Cross-user retrieval** | Every row and every lookup carries the registry-resolved owner (`user_id`): the direct tier keys on it, the RAG tier queries the owner's index, and the vector metadata carries it. `agent_name` is never a scope on its own, because under per-user agent namespacing the same name can exist for two users. A lookup that cannot resolve an owner returns **no** summary and takes the degraded path below — it never degrades to an unscoped read. |
 | **Summary row committed, index entry missing** | The vector index is **not** in the summary store's SQLite transaction: it is owned by the qmd serve process and called over HTTP (`tinyagentos/qmd_client.py`, proxied by `routes/memory.py`), so it cannot join a local commit. Committing the summary row and a durable **index-write outbox** row together, drained by a reconciler that retries an idempotent qmd upsert until it succeeds, is the recovery contract — the house already has this pattern in `tinyagentos/chat/peer_outbox.py` (attempt counter, `next_retry_at`, exponential backoff). A summary row whose index entry has not landed yet is still correct and still spliceable through the direct store lookup (section 4.4); it is only vector *discovery* that is delayed. |
 | **Producer node dies mid-job** | The job is a `BACKGROUND` job claimed with an atomic pending→running UPDATE and **no heartbeat or claim TTL** (only GPU leases and BLE pairing carry TTLs today), so a producer that dies mid-job leaves its row `running` until the controller's startup sweep (`JobQueue._sync_init`) marks it `failed` on the next restart and a later pass re-enqueues it from the idempotent source. No partial writes are possible because the producer never writes controller state at all — the controller's only write is the completed-result commit above. A mid-job claim-TTL/reaper (recovery without a restart) is explicitly S2 scope. |
 | **Controller restarts mid-job** | `JobQueue._sync_init()` already marks stale `running` rows as `failed` ("stale: process restarted"). A summarization job lost this way is re-enqueued on the next pass from the same idempotent source, and re-running it cannot double-write. |
@@ -290,7 +339,7 @@ segment and the hot window always win.**
 | **Live inference must not be interrupted** | Eligibility requires no active lease *and* idle, so a job is placed only on a node the cluster believes is free. The live path additionally never blocks on summarisation: enqueue is fire-and-forget and the only synchronous summarisation work is the S3 lookup. |
 | **Raw truth is never lost** | The archive is append-only (`taosmd/archive.py`). Summaries are rebuildable from it, so a bad summarizer costs CPU, never data. |
 | **Runaway CPU cost** | A summary nobody ever reads is wasted work. Cap per agent per hour (`summarization.max_jobs_per_hour`) and stop enqueuing when no segment has crossed the threshold. |
-| **Summarisation must be off-able** | Per-agent `summarization.enabled: false` disables enqueue, splice, and the RAG call entirely — same per-agent config surface as `memory_mode` / `memory_config` in `config.py`. Default is on with a conservative threshold, since the issue lists per-agent disable as the escape hatch rather than the default. |
+| **Summarisation must be off-able** | Per-agent `summarization.enabled: false` disables enqueue, splice, and the RAG call entirely — same per-agent config surface as `memory_mode` / `memory_config` in `config.py`. **What the default should be — on with a conservative threshold, or off until section 7's recall gate has numbers — is a product decision, not a design one: see open question 7.** The switch has to be able to express both; nothing else here depends on which way the decision goes. |
 
 ## 6. Slice plan
 
@@ -314,9 +363,14 @@ Acceptance:
 - [ ] With a `GpuLease` held on any resource of the producing node, the job
       **stays pending** — test injects a lease and asserts no execution.
 - [ ] With `worker.load` above `idle_load_ceiling`, the job stays pending.
-- [ ] A completed job writes one summary row with full provenance
-      (`conversation_id`, `segment_id`, `source_sha256`, message-id range,
-      model, producer node, UTC `created_at`).
+- [ ] A completed job writes one summary row with full provenance (owner
+      `user_id`, `conversation_id`, `segment_id`, `source_sha256`, message-id
+      range, model, producer node, UTC `created_at`), and the embedding's
+      `metadata_json` carries the same owner.
+- [ ] **Cross-user isolation:** with two users, an agent of the same name in
+      each, and a colliding `conversation_id`/segment, user B's lookup returns
+      none of user A's summaries, and B's summarisation of that segment adds its
+      own row instead of colliding with A's.
 - [ ] Re-running the same segment with unchanged content writes **zero** new
       rows; running it after the segment changes writes exactly one new row and
       leaves the old one in place.
@@ -327,8 +381,8 @@ Acceptance:
 - [ ] A metrics surface reports, per agent: segments condensed, compression
       ratio (source tokens ÷ summary tokens), CPU time spent.
 - [ ] Duplicate completion is a no-op, not an error: a second commit of the same
-      `(conversation_id, segment_id, source_sha256)` raises nothing and adds no
-      row (explicit `ON CONFLICT ... DO NOTHING`).
+      `(user_id, conversation_id, segment_id, source_sha256)` raises nothing and
+      adds no row (explicit `ON CONFLICT ... DO NOTHING`).
 - [ ] Crash between the summary commit and the qmd upsert leaves a **pending
       index-write outbox row**; a reconciler drains it and the index entry
       appears. Until then the summary row still exists and is still usable for a
@@ -359,7 +413,12 @@ Acceptance:
       test that a node whose GPU is busy through a **non-leasing** path is not
       selected.
 - [ ] An end-to-end round trip (enqueue → remote produce → controller commits
-      summary row + index entry) passes against a stubbed worker.
+      summary row + index entry) passes against a stubbed worker, and the
+      committed row carries the owner.
+- [ ] The owner is **controller-resolved, not producer-asserted**: a stubbed
+      producer whose result payload names a different `user_id` is committed
+      under the registry-resolved owner, and the row that payload claims is
+      left unchanged.
 - [ ] Worker offline mid-job → job re-queued after TTL, **no partial row**, and
       the retry writes at most one row.
 - [ ] The producer node performs **no** writes to controller stores (asserted:
@@ -388,6 +447,10 @@ Acceptance:
       tiers. The direct tier keys on the current segment's `source_sha256`, so a
       superseded row cannot shadow the current summary — covered by a test with
       two rows for one segment (old hash + current hash, index pending).
+- [ ] Both lookup tiers are **owner-scoped**: a splice performed as user B for a
+      conversation and agent name that collide with user A's resolves nothing
+      (no cross-user splice), and the RAG tier queries B's own index rather than
+      the shared default.
 - [ ] A summary is never spliced for a segment whose messages are still inside
       the hot window (no duplication).
 - [ ] Spliced text is marked and attributable: segment id + time range are
@@ -462,6 +525,13 @@ pre-registered VMAF criteria:
    close that gap (all GPU-capable inference paths claim/renew/release a visible
    lease) or corroborate lease absence with the VRAM/load sample. **Decide this
    alongside open question 1, before S2 is dispatched.**
+7. **Default on, or default off?** A product decision for Jay, not a design
+   constraint. Default-on lowers time-to-value but puts a compression path in
+   front of every conversation before the section 7 recall gate has numbers to
+   justify it; default-off makes the feature invisible until a user opts in per
+   agent. Both are implementable on the same per-agent `summarization.enabled`
+   surface that `memory_mode` already uses, so the design does not block on the
+   answer — but section 5 must not assert a default before it is made.
 
 ## 10. What has to be true for this to be worth building
 
