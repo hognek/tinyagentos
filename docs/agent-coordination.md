@@ -732,7 +732,8 @@ gets `expires_at = approval time + duration_secs`, and every auth path treats
 the grant as gone once that passes. Omit the field for an unbounded grant.
 A bool, string, float, zero, negative or over-ten-years value is refused with
 **422** at request time. The rule is: a grant with no duration is unbounded,
-and a bound that is set is never silently dropped or lengthened.
+and a bound that is set is never silently dropped or lengthened. To explicitly
+renew or extend an existing bound, set `renew: true` on the approve body.
 
 Deferred binding (`defer_binding=True`) mints the token and grants UNBOUND
 (project_id=None) with the same `expires_at` from `duration_secs`. When the
@@ -740,6 +741,10 @@ agent is later bound to a project via `POST /api/projects/{id}/members/assign-ag
 the project-bound grant **inherits that `expires_at`**. If the deferred grant
 has expired, the binding is refused. When both a deferred grant with expiry and
 a request with expiry exist, the earlier bound is kept (never lengthened).
+An expired row is never silently widened to unbounded: if the existing grant
+is already expired and the caller supplies no `expires_at`, the expired row is
+preserved as-is. If the caller supplies a new bounded `expires_at`, that fresh
+bound replaces the dead one.
 
 Multi-project identities (taOS #1862): one agent identity (the registry JWT) may
 belong to several projects at once. The grants table keys a grant on
@@ -1027,11 +1032,16 @@ that SAME canonical_id instead:
   counted by the route first, so a burst of concurrent self-requests cannot
   slip past it and flood the approver's queue.
 - `POST /api/agents/registry/{canonical_id}/scope-requests/{req_id}/approve`
-  `{granted_scopes, project_id?}`: owner/admin only. The admin may narrow but
+  `{granted_scopes, project_id?, renew?}`: owner/admin only. The admin may narrow but
   never widen the requested scopes; each granted scope is added via
   `add_grant(canonical_id, scope, project_id)` (idempotent on the
   `(canonical_id, scope, project_id)` UNIQUE key, so re-approving is a no-op). No
-  new identity is created.
+  new identity is created. `renew` defaults to false: when the scope already
+  carries an `expires_at`, the earlier of the existing and any new bound is kept
+  (never silently dropped or lengthened). Set `renew: true` to explicitly extend
+  or replace the bound. The scope request's own `duration_secs` (if present) is
+  also wired through as `expires_at`. An expired existing grant is replaced by a
+  fresh bounded re-approval, or kept as-is if the re-approval is unbounded.
 - `POST /api/agents/registry/{canonical_id}/scope-requests/{req_id}/deny`:
   owner/admin only.
 - `GET /api/agents/registry/{canonical_id}/scope-requests` (optional
