@@ -6,7 +6,7 @@ gateway (cutover stage 1). It sends the same prompts, as one real agent (its
 own key, read from config.yaml, never printed), to both:
 
   LiteLLM   http://127.0.0.1:<server.litellm_port>/v1         (default 7834)
-  gateway   http://127.0.0.1:<server.llm_gateway_port>/v1     (agent listener, default 7837)
+  gateway   http://127.0.0.1:<server.llm_gateway_port>/v1     (agent listener, default 7838)
 
 and compares, per prompt, non-streamed and streamed:
   status        HTTP status code
@@ -163,7 +163,7 @@ def main() -> int:
     ap.add_argument("--agent", required=True, help="an agent whose LiteLLM key is in the local key store")
     ap.add_argument("--model", help="default: the agent's model from config.yaml")
     ap.add_argument("--litellm-url", help="default: http://127.0.0.1:<server.litellm_port>/v1")
-    ap.add_argument("--gateway-url", help="default: http://127.0.0.1:<server.llm_gateway_port or 7837>/v1")
+    ap.add_argument("--gateway-url", help="default: http://127.0.0.1:<server.llm_gateway_port or 7838>/v1")
     ap.add_argument("--prompt", action="append", help="repeatable; default: three built-in prompts")
     ap.add_argument("--json", action="store_true", help="print the full result as JSON")
     args = ap.parse_args()
@@ -180,7 +180,7 @@ def main() -> int:
     server = cfg.get("server") or {}
     targets = {
         "litellm": args.litellm_url or f"http://127.0.0.1:{server.get('litellm_port', 7834)}/v1",
-        "gateway": args.gateway_url or f"http://127.0.0.1:{server.get('llm_gateway_port') or 7837}/v1",
+        "gateway": args.gateway_url or f"http://127.0.0.1:{server.get('llm_gateway_port') or 7838}/v1",
     }
     prompts = args.prompt or DEFAULT_PROMPTS
 

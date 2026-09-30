@@ -1813,21 +1813,42 @@ How agents reach it. An agent's base URL does not change: it is still
 `http://127.0.0.1:4000`). That address is the incus proxy device
 `taos-proxy-litellm`; its host side (`connect`) used to be LiteLLM's host port
 (`server.litellm_port`, 7834) and is now the gateway's AGENT LISTENER,
-`127.0.0.1:7837` on the host (`server.llm_gateway_port` or
+`127.0.0.1:7838` on the host (`server.llm_gateway_port` or
 `TAOS_LLM_GATEWAY_PORT`; `0` disables the listener and keeps every agent on
-LiteLLM). The listener binds loopback only. It serves `/v1/models` and
+LiteLLM; not 7837, which is the MLX backend's port). The listener binds
+loopback only and serves an allowlist: `/v1/models` and
 `/v1/chat/completions` (and the un-prefixed forms) from the gateway, and
-relays every other path (for example `/v1/embeddings`, which
-`TAOS_EMBEDDING_URL` points at) unchanged to LiteLLM.
+`/v1/embeddings` / `/embeddings` (what `TAOS_EMBEDDING_URL` points at)
+relayed unchanged to LiteLLM. Every other path is a 404, including
+LiteLLM's admin API (`/key/generate`, `/model/new`, `/config/update`,
+`/user/new`) and `/v1/messages` / `/v1/responses`. Paths are normalised first
+(a trailing slash cannot route around the gateway) and request bodies are
+capped at 32 MiB (413). Every response carries `x-taos-llm-listener: <nonce>`,
+a value minted fresh at each controller start.
 
 At every controller start `llm_gateway/cutover.py` reconciles each local
 agent's device, resolving the container's incus project (agent containers
 live in e.g. `user-999`) and passing `--project`:
 
-- gateway on: the agent's gateway key is minted FIRST from its LiteLLM
-  `agent_keys` row (same hash, `key_id` `gk_lit_...`, same allowlist, so the
-  key the agent already holds keeps working), then the device is set to the
-  listener. No restart, no redeploy.
+- The listener must be VERIFIED first: `GET /v1/models` with no key has to
+  answer with this start's nonce in `x-taos-llm-listener` and the gateway's
+  own 401 (`code: invalid_api_key`). Accepting TCP is not enough: a
+  different process holding the port (an unauthenticated model server, say)
+  would otherwise receive every agent's traffic. Unverified: nobody moves,
+  agents already on the listener go back to LiteLLM, and new deploys stay on
+  LiteLLM.
+- gateway on: an agent moves only if the gateway can serve EVERY model its
+  key allows (`cutover.models_problem`, read from the same routing table):
+  the highest-priority route must be OpenAI-compatible (`openai`,
+  `openrouter`), Anthropic, or Ollama on a backend of type `ollama`.
+  rkllama and hailo-ollama (no `/v1/chat/completions`), deepseek, unknown
+  models and an empty allowlist keep the agent on LiteLLM, with the reason
+  logged. An agent already on the gateway whose models stop being servable
+  goes back. New deploys apply the same check.
+- Then the agent's gateway key is minted from its LiteLLM `agent_keys` row
+  (same hash, `key_id` `gk_lit_...`, same allowlist, so the key the agent
+  already holds keeps working), checked to be live, and only then is the
+  device set to the listener. No restart, no redeploy.
 - An agent whose key cannot be read stays on LiteLLM and is logged
   (`llm gateway cutover: <agent> left as is: <reason>`): no key recorded, the
   shared master key, a key the local key store does not hold (for example a
@@ -1835,22 +1856,26 @@ live in e.g. `user-999`) and passing `--project`:
   minted. Remote agents have no device and are skipped.
 - gateway off: every device pointing at the listener is pointed back at
   LiteLLM.
+- A container that errors or hangs (each incus call is capped at 30 s) is
+  logged and skipped; the rest are still reconciled.
 
 Only a device whose current value was read and recognised is changed, so a
 second run changes nothing. New local deploys go straight to the listener
-once it has been seen accepting connections. By hand (the same commands the
+once it has been verified and their models are servable. By hand (the same commands the
 reconcile runs):
 `incus config device get <container> taos-proxy-litellm connect --project <project>`
 and
-`incus config device set <container> taos-proxy-litellm connect=tcp:127.0.0.1:7837 --project <project>`.
+`incus config device set <container> taos-proxy-litellm connect=tcp:127.0.0.1:7838 --project <project>`.
 
 - `GET /api/llm/v1/models`: OpenAI list shape. Every chat model name in the
   routing table, plus the alias `taos-default` first.
 - `POST /api/llm/v1/chat/completions`: streaming and non-streaming. The body
   is forwarded verbatim, `tools` /
   `tool_choice` / `tool_calls` included; only `model` is rewritten to the
-  backend's own id. Only OpenAI-compatible backends (LiteLLM's `openai/`
-  prefix) are served; any other backend type is a 501 naming the model.
+  backend's own id. OpenAI-compatible backends (LiteLLM's `openai/` and
+  `openrouter/` prefixes; OpenRouter defaults to
+  `https://openrouter.ai/api/v1`), Ollama's `/v1` surface and Anthropic
+  (translated) are served; any other backend type is a 501 naming the model.
   Upstream failures and timeouts are a 502; the backend's key and URL never
   appear in a response or a log line.
 

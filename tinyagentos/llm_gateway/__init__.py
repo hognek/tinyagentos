@@ -13,7 +13,7 @@ gateway does not serve (embeddings, for one) to it.
 
 Agents reach the gateway at their own ``127.0.0.1:4000`` exactly as before.
 The incus proxy device behind that address is retargeted from the LiteLLM
-host port to the agent listener (``listener``, host ``127.0.0.1:7837``),
+host port to the agent listener (``listener``, host ``127.0.0.1:7838``),
 which serves ``/v1/models`` and ``/v1/chat/completions`` from this package.
 
 Modules, smallest first:
@@ -36,7 +36,7 @@ _OFF_VALUES = frozenset({"0", "false", "no", "off"})
 # Host port of the agent listener: the target of each agent container's
 # ``taos-proxy-litellm`` device once it is on the gateway. Loopback only.
 AGENT_PORT_ENV = "TAOS_LLM_GATEWAY_PORT"
-DEFAULT_AGENT_PORT = 7837
+DEFAULT_AGENT_PORT = 7838
 
 
 def enabled() -> bool:
@@ -45,9 +45,9 @@ def enabled() -> bool:
 
 
 def agent_port(config=None) -> int:
-    """The agent listener's host port: env > ``server.llm_gateway_port`` > 7837.
+    """The agent listener's host port: env > ``server.llm_gateway_port`` > 7838.
 
-    0 disables the listener (agents then stay on LiteLLM)."""
+    0 disables the listener (agents then stay on LiteLLM). Not 7837: that is the MLX backend."""
     raw = os.environ.get(AGENT_PORT_ENV)
     if raw is not None and raw.strip():
         return int(raw.strip())

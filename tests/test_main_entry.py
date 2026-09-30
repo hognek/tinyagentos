@@ -73,9 +73,9 @@ def _run_main_capturing_serve(monkeypatch, gateway_flag):
 def test_main_serves_the_gateway_agent_listener_by_default(monkeypatch):
     app, served = _run_main_capturing_serve(monkeypatch, None)
     assert "uvicorn_run" not in served
-    assert served["multi"]["gateway_port"] == 7837
+    assert served["multi"]["gateway_port"] == 7838
     assert served["multi"]["proxy_port"] == 0
-    assert app.state.llm_gateway_agent_port == 7837
+    assert app.state.llm_gateway_agent_port == 7838
 
 
 def test_gateway_listener_binds_loopback_only_without_lifespan(monkeypatch):
@@ -96,14 +96,14 @@ def test_gateway_listener_binds_loopback_only_without_lifespan(monkeypatch):
     app = SimpleNamespace(state=SimpleNamespace(llm_proxy=SimpleNamespace(port=7834)))
     with patch("uvicorn.Config", _Cfg), patch("uvicorn.Server.__init__", lambda self, config: None), \
          patch("asyncio.run", fake_asyncio_run):
-        m._serve_dual_port(app, host="0.0.0.0", port=6969, proxy_port=0, gateway_port=7837)
-    gw = [c for c in configs if c.get("port") == 7837]
+        m._serve_dual_port(app, host="0.0.0.0", port=6969, proxy_port=0, gateway_port=7838)
+    gw = [c for c in configs if c.get("port") == 7838]
     assert len(gw) == 1 and gw[0]["host"] == "127.0.0.1" and gw[0]["lifespan"] == "off"
-    assert [c["port"] for c in configs] == [6969, 7837]  # no browser-proxy server
+    assert [c["port"] for c in configs] == [6969, 7838]  # no browser-proxy server
 
 
 def test_main_gateway_off_records_the_port_for_rollback_but_serves_no_listener(monkeypatch):
     app, served = _run_main_capturing_serve(monkeypatch, "0")
     assert "multi" not in served and "uvicorn_run" in served
     # Recorded so the startup reconcile can point agents back at LiteLLM.
-    assert app.state.llm_gateway_agent_port == 7837
+    assert app.state.llm_gateway_agent_port == 7838

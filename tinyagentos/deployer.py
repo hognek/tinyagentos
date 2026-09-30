@@ -560,7 +560,23 @@ async def deploy_agent(req: DeployRequest) -> dict:
             # agent's key is a live gateway key. Otherwise it starts on
             # LiteLLM and the startup reconcile reports it.
             gateway_port = _gateway_port_for(req)
+            route_problem = None
             if gateway_port and llm_key:
+                # The gateway must be able to serve every model this key
+                # allows; unknown (no check supplied) counts as "cannot".
+                check = (req.extra_config or {}).get("llm_gateway_models_problem")
+                if check is None:
+                    route_problem = "routability unknown (no check supplied)"
+                else:
+                    try:
+                        route_problem = await check(
+                            [m for m in [req.model, *(req.fallback_models or [])] if m] or ["default"]
+                        )
+                    except Exception as exc:  # noqa: BLE001 - stay on LiteLLM
+                        route_problem = f"routability check failed: {type(exc).__name__}"
+                if route_problem:
+                    logger.warning("deploy %s: stays on LiteLLM: %s", req.name, route_problem)
+            if gateway_port and llm_key and not route_problem:
                 if _mint_gateway_key_for(req, llm_key):
                     litellm_host_port = gateway_port
                     steps.append("llm: proxy device on the LLM gateway")

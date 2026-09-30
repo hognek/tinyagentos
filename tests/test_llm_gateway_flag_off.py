@@ -44,7 +44,7 @@ async def test_gateway_routes_are_404_when_the_flag_is_off(tmp_data_dir, monkeyp
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("flag", [None, "1", "", "true"], ids=["unset", "1", "empty", "true"])
+@pytest.mark.parametrize("flag", [None, "1", "", "true", "yes"], ids=["unset", "1", "empty", "true", "yes"])
 async def test_flag_on_mounts_the_routes(tmp_data_dir, monkeypatch, flag):
     """Control for the test above: the same probe sees the routes when on,
     and on is the default."""

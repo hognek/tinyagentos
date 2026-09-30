@@ -61,7 +61,12 @@ def main() -> None:
     # point agents back at LiteLLM (rollback).
     gateway_port = _gateway_listener_port(config, taken={port, proxy_port})
     if hasattr(app, "state"):
+        import secrets
+
         app.state.llm_gateway_agent_port = gateway_port
+        # Per-start nonce the listener stamps on every response; the startup
+        # reconcile moves agents only onto a port that answers with it.
+        app.state.llm_gateway_listener_identity = secrets.token_urlsafe(24)
 
     if not proxy_port or proxy_port == port:
         # Single-port fallback: the browser proxy stays on the main origin
@@ -167,7 +172,10 @@ def _serve_dual_port(app, *, host: str, port: int, proxy_port: int, gateway_port
 
         litellm_port = int(getattr(getattr(app.state, "llm_proxy", None), "port", None) or 7834)
         gateway_config = uvicorn.Config(
-            create_agent_listener_app(app, litellm_port=litellm_port),
+            create_agent_listener_app(
+                app, litellm_port=litellm_port,
+                identity=getattr(app.state, "llm_gateway_listener_identity", None),
+            ),
             host="127.0.0.1", port=gateway_port, backlog=128, lifespan="off",
             timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_SECS,
         )
@@ -205,7 +213,8 @@ async def _serve_sidecar(server) -> None:
     Its failure, including uvicorn's ``sys.exit(1)`` on a port already in use,
     is logged and swallowed here, inside the coroutine, so it can never take
     the controller down. Agents then simply stay on LiteLLM: the cutover only
-    repoints once it has seen the listener accept a connection.
+    repoints once the listener has answered with this start's identity nonce, so a
+    different process that holds the port is never mistaken for it.
     """
     import logging
 

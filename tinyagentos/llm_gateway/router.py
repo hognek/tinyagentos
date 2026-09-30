@@ -13,6 +13,7 @@ from tinyagentos.llm_gateway.errors import (
 )
 from tinyagentos.llm_gateway.forward import (
     OLLAMA_PROVIDERS,
+    forwardable,
     chat_completion,
     chat_completion_stream,
     resolve_api_key,
@@ -33,7 +34,7 @@ def mount(app, dependencies=None) -> None:
 
 
 def _forwardable(route) -> bool:
-    return route.provider == OPENAI_PROVIDER or route.provider in OLLAMA_PROVIDERS
+    return forwardable(route)
 
 
 def _model_entry(name: str) -> dict:
