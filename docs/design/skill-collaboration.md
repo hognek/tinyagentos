@@ -1,6 +1,9 @@
 # Skill-collaboration layer: a user's own agents share what they learn
 
-Status: design spike (2026-09-27), doc only — no implementation in this change.
+Status: design spike (2026-09-27), rev. 2026-09-30, doc only — no implementation
+in this change. The revision settles two corrections from the #3222 lead review:
+the isolation unit is the **user** (or a project), not the taOS instance, and S2
+is blocked on the A2A bus redesign (§3.2, §8).
 Design scoped for slices S1–S3; section 7 lists the questions that need a
 decision before S2. Tracking issue: #900. Related: #898 (the artifact this
 layer distributes), #896 (the surface it reviews through), #900's pointer to the
@@ -33,11 +36,11 @@ canonical guides. To keep the two apart:
   (the issue offers "skills (or learning)") so bus channel names never collide
   with the capability registry either.
 
-## 2. Where it sits — every piece already exists, on the bus and in the manual
+## 2. Where it sits — every piece exists except the transport, which is under a hold
 
 | Piece | State | Used here as |
 |---|---|---|
-| taOSmd coordination bus (`routes/a2a_bus.py`, `TAOS_A2A_BUS_URL`, default `http://127.0.0.1:7900`) | Running; separate service | The transport. Channels, threads, `since` cursors, SSE stream |
+| taOSmd coordination bus (`routes/a2a_bus.py`, `TAOS_A2A_BUS_URL`, default `http://127.0.0.1:7900`) | Separate service; **under a maintainer hold since 2026-08-24**, pending a redesign as a real connector | The intended transport — but S2 cannot start on today's proxy (§3.1, §8) |
 | Bus identity | The taOS send proxy mints `from` from the caller's registry JWT (`agent_token_auth.check_agent_scope`, scope `a2a_send`); the bus verifies `token sub == from` | Free provenance — a supplement's author cannot be spoofed |
 | Read side | `a2a_receive` scope or admin session gates reads | Who may subscribe |
 | Internal per-project a2a (`projects/a2a.py`) | One `kind="a2a"` group channel per project, @mention routing | Out of scope. That is project chat, not learning |
@@ -69,25 +72,50 @@ service: identity, ordering, cursors, replay and the offline-degradation path
 are already solved by the bus proxy, and the Messages app gets a readable view
 for free.
 
-### 3.2 Instance isolation is a precondition, not later hardening
+**The transport is under a hold, so this doc must not read as bus-ready.** The
+A2A bus has been on hold since 2026-08-24 pending a redesign as a real connector
+— the direction of #2150 (agent comms move into taOStalk + Projects) and #2147
+(the bus stays a control plane; bytes move through project Files). Nothing here
+assumes the current read-only proxy survives that redesign: the proxy is what
+*shapes* the envelope (§4) and the poller (§3.5), not what S2 is guaranteed to
+ship on. S2 is blocked on the redesign landing, in addition to the isolation
+question in §3.2 — see §8 and open question 7.
+
+### 3.2 User (and project) isolation is a precondition, not later hardening
 
 The bus proxy authorizes reads on the `a2a_receive` grant alone and forwards the
-channel unfiltered, and the default bus URL is a **shared local service**. Two
-taOS instances pointed at one bus would therefore see each other's supplements.
-`author.instance` is self-declared metadata and **must not be used as an
-isolation control** — an author that can lie about its handle is not prevented
-from lying about its instance.
+channel unfiltered, and the default bus URL is a **shared local service**. More
+than one population boundary would therefore see each other's supplements, and
+the unit this design has to isolate is the **user** (or, where a project is the
+fleet boundary, the project), **not the instance**:
 
-S2 must therefore require one of:
+- **user to user on one instance.** taOS is multi-user (`tinyagentos/auth.py`, a
+  multi-user auth manager; owned resources are keyed by `user_id` and gated by
+  `require_owner_or_admin` in `tinyagentos/auth_context.py`), and an agent
+  belongs to the user who registered it (`agent_registry.user_id`,
+  `require_agent_owner_or_admin` in `routes/agents.py`). One box therefore hosts
+  several *unrelated* fleets. "The same taOS instance" is not "the user's own
+  agents": an instance-scoped subscription default would put user A's lessons in
+  front of user B's agents. §3.3 is scoped accordingly.
+- **instance to instance on a shared bus** — the case that made this a
+  precondition in the first place.
+- **`author.instance` and `author.handle` are self-declared metadata and must
+  not be used as an isolation control** — an author that can lie about its handle
+  is not prevented from lying about its instance.
+
+S2 must therefore require all of:
 
 - a **per-instance bus** (the configured `TAOS_A2A_BUS_URL` points at a bus that
-  serves exactly this instance), or
-- an **enforced instance namespace/ACL** applied in the bus path for both send
-  and receive — not a client-side filter over a shared stream.
+  serves exactly this instance) *and* an **enforced user (or project) namespace
+  / ACL applied in the bus path** for both send and receive — not a client-side
+  filter over a shared stream, and not an instance namespace standing in for the
+  user boundary;
+- a **local store keyed by owning user** (or project), so a subscriber can only
+  read its own fleet's supplements even if a foreign row reaches the proxy.
 
-Until one of those is in place, S1–S2 stay inside one instance and the
-cross-instance path stays unbuilt (§9). Which mechanism to standardise on is
-open question 6.
+Until all of that is in place, S1–S2 stay inside one user's fleet on one
+instance; the cross-user and cross-instance paths stay unbuilt (§9). Which
+mechanism to standardise on is open question 6.
 
 **Per-channel scoping is a real dependency, not a nicety.** Today the bus gates
 *send* on any active grant with `a2a_send` and *read* on any active grant with
@@ -101,15 +129,20 @@ the bus does. Wiring stricter bus-side ACLs is a separate card.
 - **Publishers (S1):** an explicit allowlist in config. Publishing is the
   dangerous direction — it is what can put a bad lesson in front of other agents —
   so it starts opt-in per agent, not grant-default.
-- **Subscribers (S1):** default *on* within the same taOS instance (the user's own
-  fleet, which is the whole point: "a user's OWN agents"). Opt-out per agent.
+- **Subscribers (S1):** default *on* within the same **user's** fleet on this
+  instance — the agents that user owns (`agent_registry.user_id`), which is the
+  whole point: "a user's OWN agents". Opt-out per agent. It is deliberately
+  **not instance-wide**: a multi-user instance hosts several users, so an
+  instance-scoped default would subscribe one user's agents to another user's
+  lessons (§3.2). Where a project is the fleet boundary — a shared project with
+  several members — the project is the unit instead.
 - **Cross-user / community (not in S1–S3):** #900's "shareable like apps/themes/
   packages" path needs the hub distribution model plus signing
   (`tinyagentos/hub/identity.py`, the signed-submission pattern in
-  `docs/design/taos-council.md`). S1–S3 stay inside one instance on purpose —
-  the governance gate has to be proven before anything crosses an instance
-  boundary. This is the explicit boundary between "my agents help each other"
-  and "the internet can write my guides".
+  `docs/design/taos-council.md`). S1–S3 stay inside one user's fleet (or one
+  project) on purpose — the governance gate has to be proven before anything
+  crosses a user or an instance boundary. This is the explicit boundary between
+  "my agents help each other" and "the internet can write my guides".
 
 ### 3.4 What a subscription means
 
@@ -143,7 +176,8 @@ re-reading the window) and asks the local proxy for new `learning` rows. It:
    applied only if its authority checks out (§6.3). Applying tombstones before
    anything else means a retraction and a re-publish travelling in the same batch
    cannot leave the withdrawn version live,
-3. drops anything out of scope or from a foreign instance namespace (§3.2),
+3. drops anything out of scope, belonging to another user or project, or from a
+   foreign instance namespace (§3.2),
 4. drops anything whose `status != "fleet"` — `draft` and `review` are seen at
    most — or that duplicates a known supplement id,
 5. **verifies the promotion record** (§6.2): `promotion.by` must resolve to a
@@ -330,10 +364,17 @@ gateway, and the gateway is where redaction belongs — not at the reader).
    names.
 5. **Trusted-reviewer thresholds** for the post-S3 gate (who counts as trusted,
    how many confirm).
-6. **Isolation mechanism** (§3.2): a per-instance bus URL versus an enforced
-   instance namespace/ACL in the bus path. Recommend the namespace, because it
-   also gives per-channel scoping (the same v2 gap that gates `learning` today),
-   but the bus is a separate service so this needs @taOSmd's agreement before S2.
+6. **Isolation mechanism** (§3.2), in two parts: (a) how the **user** (or
+   project) boundary is enforced — a per-user namespace/ACL in the bus path is
+   recommended, because it also gives per-channel scoping (the same v2 gap that
+   gates `learning` today); (b) how the instance boundary is enforced, which a
+   per-instance bus URL covers on its own. Both need @taOSmd's agreement before
+   S2, and both are moot until the bus redesign below lands.
+7. **What the bus redesign makes available** (§3.1, §8 S2). The A2A bus is under
+   a maintainer hold since 2026-08-24, pending a redesign as a real connector
+   (#2150, #2147). Whether S2 publishes over the redesigned connector, receives
+   through project Files, or both, is the same "envelope vs content handle"
+   question as Q2 and cannot be answered before that redesign is settled.
 
 ## 8. Slice plan
 
@@ -363,11 +404,18 @@ commands run from the repo root.
   promoted supplements both render, ranked — neither is dropped.
 - Verify: `uv run pytest tests/test_guides_store.py tests/test_guides_render.py -q`
 
-**S2. Publish / subscribe on the `learning` channel.**
+**S2. Publish / subscribe on the `learning` channel. BLOCKED on the bus redesign.**
+- **Blocked, and not only on the isolation question.** The A2A bus has been on
+  hold since 2026-08-24 pending a redesign as a real connector (#2150 moves agent
+  comms into taOStalk + Projects; #2147 keeps the bus a control plane with bytes
+  in project Files). S2 is the first slice that touches the bus, so it is blocked
+  until that redesign lands *and* the §3.2 user/project isolation is enforceable.
+  Do not start S2 on today's read-only proxy. S1 carries no bus traffic and is
+  not affected.
 - Files: `tinyagentos/guides/bus.py` (publish via the authenticated send proxy,
-  mechanical poller with a `since` cursor, instance-namespace check, promotion
+  mechanical poller with a `since` cursor, user/project namespace check, promotion
   verification, batch ordering, tombstone-first), config allowlist/opt-out and
-  the instance-isolation setting in `config.py`, a startup task in `app.py`,
+  the user/project isolation setting in `config.py`, a startup task in `app.py`,
   `tests/test_guides_bus.py` (mocked bus + mocked proxy, cursor, scope,
   isolation and unattested-promotion cases).
 - Acceptance: (a) a `fleet` supplement published by agent A renders on agent B
@@ -379,9 +427,11 @@ commands run from the repo root.
   allowlist; (g) a `status=fleet` supplement carrying **no verifiable
   `promotion`** — absent, or `by` resolving to a non-reviewer — is stored as seen
   and NOT adopted; (h) a supplement from a foreign instance namespace is not
-  adopted (§3.2); (i) a tombstone from an identity that neither promoted the
+  adopted (§3.2); (i) a supplement published by **another user** on the same
+  instance is not adopted — the subscriber's store is keyed by owning user
+  (§3.2); (j) a tombstone from an identity that neither promoted the
   supplement nor authored it leaves the target and its superseded chain
-  unchanged; (j) a tombstone and a re-publish of the same id in one batch leave
+  unchanged; (k) a tombstone and a re-publish of the same id in one batch leave
   the withdrawn version removed.
 - Verify: `uv run pytest tests/test_guides_bus.py -q`
 
@@ -404,7 +454,8 @@ commands run from the repo root.
 ## 9. Non-goals (v1)
 
 - No editing of the read-only canonical guides — supplements are a layer, always.
-- No cross-instance / community sharing; that needs signing and the hub model.
+- No cross-user or cross-instance / community sharing; that needs the user
+  boundary enforced, plus signing and the hub model.
 - No change to the capability `SkillStore`, `/api/skills`, or tool schemas.
 - No silent conflict resolution, no auto-adoption of cross-user lessons.
 - No new retrieval API: guides render into the manual; supplements are not a
