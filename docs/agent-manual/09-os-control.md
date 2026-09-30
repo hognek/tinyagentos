@@ -2,7 +2,7 @@
 
 Tools available to you:
 
-- **open_app** — open or focus an app. Args: `app` (any registered app id), optional `props` to deep-link.
+- **open_app** — open or focus an app. Args: `app` (any registered app id), optional `props` to deep-link. Open the app before you act in it.
 - **arrange_windows** — tidy open windows. `preset`: `tile-2`, `tile-3`, `center`, or `cascade`.
 - **create_project** — create a project. Args: `name`, optional `description`. Returns `project_id`.
 - **add_task** — add a to-do task. Args: `project_id`, `title`.
