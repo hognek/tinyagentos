@@ -257,6 +257,13 @@ _AGENT_DECISIONS_ROUTES = (
     ("GET", re.compile(r"^/api/decisions/agent$")),
 )
 
+# Notification route an agent may reach with its own registry JWT (scope
+# notifications_write). POST /api/notifications only.  The route verifies
+# the JWT + grant + project binding.  GET and mark-read stay session-only.
+_AGENT_NOTIFICATIONS_ROUTES = (
+    ("POST", re.compile(r"^/api/notifications$")),
+)
+
 # Device-bearer self-service paths (lock-screen push-token rotation plus
 # decision list/get/answer). A scoped device token (Bearer taosdev_...) may
 # pass through the auth gate on exactly these routes; the route dependency
@@ -375,6 +382,13 @@ def _is_agent_decisions_path(method: str, path: str) -> bool:
       - GET  /api/decisions/agent             -> decisions_write (list own)
     The route verifies the JWT + grant + project binding."""
     return any(m == method and rx.match(path) for m, rx in _AGENT_DECISIONS_ROUTES)
+
+
+def _is_agent_notifications_path(method: str, path: str) -> bool:
+    """True only for POST /api/notifications, which a notifications_write token
+    may reach.  GET and mark-read stay session-only.  The route verifies the
+    JWT + grant + project binding."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_NOTIFICATIONS_ROUTES)
 
 
 def _is_agent_files_path(method: str, path: str) -> bool:
@@ -780,6 +794,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     or _is_agent_lists_path(request.method, path)
                     or _is_agent_canvas_path(request.method, path)
                     or _is_agent_decisions_path(request.method, path)
+                    or _is_agent_notifications_path(request.method, path)
                     or _is_agent_files_path(request.method, path)
                     or _is_agent_scope_request_path(request.method, path)
                     or _is_agent_rotate_path(request.method, path)

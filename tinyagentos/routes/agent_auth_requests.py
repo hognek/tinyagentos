@@ -85,6 +85,11 @@ VALID_SCOPES = frozenset({
     # per-project grant authorizes that project only. The route verifies the grant.
     "decisions_read",
     "decisions_write",
+    # Agent notifications: post taOS notifications through the store so SSE
+    # and web-push fire. A global grant authorizes OS-level posts (to admins);
+    # a per-project grant authorizes that project only. The route verifies
+    # the grant.
+    "notifications_write",
     # Doc-review stamps: read/set review state on a project's docs
     # (project-bound like project_tasks). Reconciled from master at beta.45 -
     # the routes shipped on every install while the scope was missing here.
