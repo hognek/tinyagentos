@@ -85,6 +85,74 @@ class TestDeployAgent:
             assert "127.0.0.1" not in env["OPENAI_BASE_URL"]
 
     @pytest.mark.asyncio
+    async def test_deploy_remote_refused_when_inhouse_keys_off(self, tmp_path):
+        """Remote agent with proxy.inhouse_keys=False must be refused because
+        the local key store key it gets is not accepted by LiteLLM when
+        inhouse_keys is off (Postgres-backed). The error must name the
+        .litellm_force_inhouse_keys marker remedy."""
+        mock_proxy = MagicMock()
+        mock_proxy.is_running.return_value = True
+        mock_proxy.url = "http://localhost:4000"
+        mock_proxy.database_url = "postgresql://u:p@h/db"
+        mock_proxy.inhouse_keys = False
+        mock_proxy.create_agent_key = AsyncMock(return_value="sk-local-key")
+
+        req = _req(
+            name="remote-off",
+            data_dir=tmp_path,
+            remote="fedora-worker",
+            taos_host="100.78.225.80",
+            extra_config={"llm_proxy": mock_proxy},
+        )
+
+        async def mock_exec(name, cmd, **kwargs):
+            if "hostname -I" in " ".join(cmd):
+                return (0, "10.228.0.9")
+            return (0, "ok")
+
+        with patch("tinyagentos.deployer.create_container", new_callable=AsyncMock) as mock_create, \
+             patch("tinyagentos.deployer.exec_in_container", side_effect=mock_exec), \
+             patch("tinyagentos.deployer.push_file", new_callable=AsyncMock, return_value=(0, "")), \
+             patch("tinyagentos.deployer.add_proxy_device", new_callable=AsyncMock):
+            mock_create.return_value = {"success": True, "name": "taos-agent-remote-off"}
+            result = await deploy_agent(req)
+            assert result["success"] is False, f"expected refusal, got: {result}"
+            assert ".litellm_force_inhouse_keys" in result["error"]
+            assert "inhouse" in result["error"].lower()
+
+    @pytest.mark.asyncio
+    async def test_deploy_remote_allowed_when_inhouse_keys_on(self, tmp_path):
+        """Control: remote agent with proxy.inhouse_keys=True succeeds (the
+        local key is accepted by the in-house auth hook)."""
+        mock_proxy = MagicMock()
+        mock_proxy.is_running.return_value = True
+        mock_proxy.url = "http://localhost:4000"
+        mock_proxy.database_url = "postgresql://u:p@h/db"
+        mock_proxy.inhouse_keys = True
+        mock_proxy.create_agent_key = AsyncMock(return_value="sk-local-key")
+
+        req = _req(
+            name="remote-on",
+            data_dir=tmp_path,
+            remote="fedora-worker",
+            taos_host="100.78.225.80",
+            extra_config={"llm_proxy": mock_proxy},
+        )
+
+        async def mock_exec(name, cmd, **kwargs):
+            if "hostname -I" in " ".join(cmd):
+                return (0, "10.228.0.9")
+            return (0, "ok")
+
+        with patch("tinyagentos.deployer.create_container", new_callable=AsyncMock) as mock_create, \
+             patch("tinyagentos.deployer.exec_in_container", side_effect=mock_exec), \
+             patch("tinyagentos.deployer.push_file", new_callable=AsyncMock, return_value=(0, "")), \
+             patch("tinyagentos.deployer.add_proxy_device", new_callable=AsyncMock):
+            mock_create.return_value = {"success": True, "name": "taos-agent-remote-on"}
+            result = await deploy_agent(req)
+            assert result["success"] is True, result
+
+    @pytest.mark.asyncio
     async def test_one_trace_bind_mount(self, tmp_path):
         """After deploy, create_container receives exactly one mount: the trace dir."""
         req = _req(data_dir=tmp_path)

@@ -263,17 +263,17 @@ async def deploy_agent(req: DeployRequest) -> dict:
             key_models = [m for m in [req.model, *(req.fallback_models or [])] if m]
             llm_key = await proxy.create_agent_key(req.name, models=key_models or None)
             if llm_key is None:
-                # LiteLLM could not mint (routing-only, no Postgres, or not
-                # running). Two cases:
+                # create_agent_key returned None. Two cases:
                 #
-                # 1. DB configured but mint failed (db_url is set): the proxy
-                #    HAS a key store but /key/generate broke (migration pending,
-                #    DB unreachable). That is a real fault; refuse and name it.
+                # 1. DB configured (database_url is set): the local key store
+                #    is configured but the mint failed (disk full, permission
+                #    denied, database locked, or Postgres unreachable). That is
+                #    a real fault; refuse and name it.
                 #
-                # 2. Otherwise: mint a key scoped to this agent's models in the
-                #    local key store. The gateway accepts it (and mirrors it into
-                #    a gateway key below). The shared LiteLLM master key is never
-                #    handed to an agent any more, so
+                # 2. No DB (routing-only): mint a key scoped to this agent's
+                #    models in the local key store. The gateway accepts it (and
+                #    mirrors it into a gateway key below). The shared LiteLLM
+                #    master key is never handed to an agent any more, so
                 #    TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK no longer changes
                 #    anything.
                 db_url = getattr(proxy, "database_url", None)
@@ -293,21 +293,42 @@ async def deploy_agent(req: DeployRequest) -> dict:
                 llm_key = _mint_local_scoped_key(req, key_models)
                 if llm_key is None:
                     msg = (
-                        "per-agent LLM key could not be minted: LiteLLM issued "
-                        "none and the local key store refused too. An agent is "
-                        "never given the shared LiteLLM master key, so the "
-                        "deploy is refused."
+                        "per-agent LLM key could not be minted: the local key store "
+                        "refused. An agent is never given the shared LiteLLM master "
+                        "key, so the deploy is refused."
                     )
                     logger.error("deploy %s: %s", req.name, msg)
                     return {"success": False, "error": msg, "steps": steps}
                 steps.append("llm-key: scoped key minted in the local key store")
-                if not _gateway_port_for(req) and getattr(proxy, "inhouse_keys", True) is False:
-                    logger.warning(
-                        "deploy %s: its key is a local key-store key; LiteLLM "
-                        "without in-house keys does not accept it, so this agent "
-                        "needs the LLM gateway (it moves there on the next "
-                        "controller start)", req.name,
-                    )
+
+            # If the agent will reach LiteLLM directly (no gateway path) and
+            # inhouse_keys is off, the local key store key is not accepted by
+            # LiteLLM. This affects remote agents (no proxy device) and local
+            # agents when the gateway is off or has a models_problem. Refuse
+            # rather than handing the agent a key LiteLLM will 401.
+            inhouse_keys = getattr(proxy, "inhouse_keys", True)
+            has_gateway_path = _gateway_port_for(req) != 0
+            will_use_litellm_directly = req.remote or not has_gateway_path
+            if will_use_litellm_directly and inhouse_keys is False:
+                msg = (
+                    f"deploy {req.name} refused: this agent would reach LiteLLM "
+                    "directly (remote deploy or no gateway path) but "
+                    "proxy.inhouse_keys is False (Postgres-backed install). "
+                    "Local key-store keys are not accepted by LiteLLM when "
+                    "inhouse_keys is off. Remedy: create the "
+                    ".litellm_force_inhouse_keys marker in the data directory "
+                    "and restart the controller to enable in-house key mode, "
+                    "or deploy this agent locally with the gateway on."
+                )
+                logger.error("deploy %s: %s", req.name, msg)
+                return {"success": False, "error": msg, "steps": steps}
+            if not has_gateway_path and inhouse_keys is True and not req.remote:
+                logger.warning(
+                    "deploy %s: its key is a local key-store key; this agent "
+                    "will use LiteLLM directly since the gateway is off, but "
+                    "will move to the gateway on the next controller start",
+                    req.name,
+                )
             # Primary key for openclaw's litellm provider.
             env["LITELLM_API_KEY"] = llm_key
             # Compat shim — smolagents and other frameworks still expect OPENAI_API_KEY.

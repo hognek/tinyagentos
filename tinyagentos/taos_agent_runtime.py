@@ -298,10 +298,21 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
                 try:
                     rescoped = await llm_proxy.update_agent_key(stored_key, permitted_models)
                     if not rescoped:
+                        # The stored key is not in the local key store (legacy
+                        # Postgres key or another agent's key). Mint a fresh
+                        # local-store key so the gateway (or local LiteLLM with
+                        # inhouse_keys) can accept it.
                         logger.warning(
                             "taos_agent_runtime: re-scoping the taOS agent key returned False "
-                            "(key scope may be stale)"
+                            "(key not in local store); minting a new local-store key"
                         )
+                        litellm_key = _mint_local_taos_agent_key(app_state, permitted_models)
+                        if litellm_key and desktop_settings is not None:
+                            try:
+                                prefs["llm_key"] = litellm_key
+                                await desktop_settings.save_preference("user", "taos_agent", prefs)
+                            except Exception:
+                                logger.debug("taos_agent_runtime: persisting key failed", exc_info=True)
                 except Exception:
                     logger.debug("taos_agent_runtime: re-scoping stored key failed", exc_info=True)
         elif llm_proxy is not None:
@@ -440,12 +451,41 @@ async def _llm_base_url(app_state, llm_proxy, models: list[str]) -> str:
 
     litellm = f"http://127.0.0.1:{llm_proxy.port if llm_proxy is not None else 7834}/v1"
     if not llm_gateway.enabled():
+        # Gateway is off - we'll use LiteLLM directly. If inhouse_keys is
+        # False, local key store keys are not accepted by LiteLLM.
+        inhouse_keys = getattr(llm_proxy, "inhouse_keys", True) if llm_proxy else True
+        if inhouse_keys is False:
+            msg = (
+                "taOS agent would use LiteLLM directly (gateway disabled) but "
+                "proxy.inhouse_keys is False (Postgres-backed install). Local "
+                "key-store keys are not accepted by LiteLLM when inhouse_keys "
+                "is off. Remedy: create the .litellm_force_inhouse_keys marker "
+                "in the data directory and restart the controller to enable "
+                "in-house key mode, or enable the LLM gateway."
+            )
+            logger.error("taos_agent_runtime: %s", msg)
+            raise RuntimeError(msg)
         return litellm
     try:
         problem = await models_problem(app_state, models)
     except Exception as exc:  # noqa: BLE001 - unknown routability: stay on LiteLLM
         problem = f"routability check failed: {type(exc).__name__}"
     if problem:
+        # Gateway has a models_problem - we'll use LiteLLM directly. If
+        # inhouse_keys is False, local key store keys are not accepted.
+        inhouse_keys = getattr(llm_proxy, "inhouse_keys", True) if llm_proxy else True
+        if inhouse_keys is False:
+            msg = (
+                f"taOS agent would use LiteLLM directly (gateway cannot serve "
+                f"all models: {problem}) but proxy.inhouse_keys is False "
+                "(Postgres-backed install). Local key-store keys are not "
+                "accepted by LiteLLM when inhouse_keys is off. Remedy: create "
+                "the .litellm_force_inhouse_keys marker in the data directory "
+                "and restart the controller to enable in-house key mode, or "
+                "configure the gateway to serve all required models."
+            )
+            logger.error("taos_agent_runtime: %s", msg)
+            raise RuntimeError(msg)
         logger.warning("taos_agent_runtime: taOS agent stays on LiteLLM: %s", problem)
         return litellm
     config = getattr(app_state, "config", None)

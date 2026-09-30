@@ -1825,8 +1825,9 @@ discovered embedding models to the Ollama-shaped backend's `/api/embed`, a
 llama.cpp/OpenAI-compatible model to its `/embeddings`), under the same key
 allowlist and usage recording as chat, so nothing an agent calls needs
 LiteLLM running. An agent's key must name the embedding model (e.g.
-`taos-embedding-default`) to use it: deploys scope keys to the chat models
-only, so today that is a re-scope. Chat answers also carry
+`taos-embedding-default`) to use it: `scoped_key_models` adds the
+embedding alias to every mint and re-scope, so the key always allows
+embeddings. Chat answers also carry
 `reasoning_content` (same text) wherever the upstream sent `reasoning`, as
 LiteLLM did. A remote agent has no gateway path (no proxy device, loopback
 listener): the deploy and the cutover name it as such. Every other path is a 404, including

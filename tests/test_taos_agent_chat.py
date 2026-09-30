@@ -519,12 +519,13 @@ async def test_ensure_server_reuses_persisted_key(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ensure_server_rescope_failure_keeps_cached_server(tmp_path, monkeypatch):
-    """When update_agent_key returns False (re-scope no-op), the server is
-    created but NOT marked as born degraded — the proxy is already running
-    so this is a routing-only key-scope no-op, not a degradation. A second
-    ensure call must reuse the cached server, proving no restart churn."""
+async def test_ensure_server_legacy_key_rescope_fails_mints_local(tmp_path, monkeypatch):
+    """When a persisted key is not in the local key store (legacy key),
+    update_agent_key returns False. The runtime must mint a new local-store
+    key, persist it, and use it. The server must NOT be marked as born
+    degraded (proxy is running). A second ensure call reuses the cached server."""
     import tinyagentos.taos_agent_runtime as rt
+    from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
 
     spawned_cfgs: list = []
 
@@ -546,15 +547,25 @@ async def test_ensure_server_rescope_failure_keeps_cached_server(tmp_path, monke
 
     class _FakeSettings:
         async def get_preference(self, user, ns):
-            return {"llm_key": "sk-persisted-9", "permitted_models": ["gpt-4o", "claude"]}
+            # Legacy key that is NOT in the local store
+            return {"llm_key": "sk-legacy-postgres-key", "permitted_models": ["gpt-4o", "claude"]}
         async def save_preference(self, user, ns, prefs):
             pass
 
     mock_proxy = MagicMock()
-    mock_proxy.create_agent_key = AsyncMock(return_value="sk-NEW-should-not-be-used")
-    # Re-scope returns False — routing-only no-op, not a proxy degradation.
-    mock_proxy.update_agent_key = AsyncMock(return_value=False)
     mock_proxy.is_running.return_value = True
+    mock_proxy.port = 7834
+    mock_proxy.inhouse_keys = True
+    mock_proxy.create_agent_key = AsyncMock(return_value="sk-should-not-be-used")
+    # update_agent_key returns False because the key is not in the local store
+    mock_proxy.update_agent_key = AsyncMock(return_value=False)
+
+    # Gateway enabled but model not routable -> falls back to LiteLLM
+    import tinyagentos.llm_gateway as lg
+    monkeypatch.setattr(lg, "enabled", lambda: True)
+    async def mock_models_problem(*a, **kw):
+        return "model 'gpt-4o' is not in the routing table"
+    monkeypatch.setattr("tinyagentos.llm_gateway.cutover.models_problem", mock_models_problem)
 
     state = SimpleNamespace(
         data_dir=tmp_path,
@@ -566,14 +577,22 @@ async def test_ensure_server_rescope_failure_keeps_cached_server(tmp_path, monke
         taos_opencode_session_id=None,
     )
 
-    # First call: must create the server and NOT mark it degraded.
+    # First call: must create the server with a NEW local key, NOT degraded.
     await rt.ensure_taos_opencode_server(state, "gpt-4o")
 
-    assert spawned_cfgs[0].litellm_key == "sk-persisted-9"
-    # Proxy IS running, re-scope no-op → NOT degraded.
+    assert len(spawned_cfgs) == 1
+    key = spawned_cfgs[0].litellm_key
+    # The key must be a NEW local-store key, not the legacy one
+    assert key != "sk-legacy-postgres-key"
+    # The key must exist in the local key store
+    store = LiteLLMKeyStore(default_keystore_path(tmp_path))
+    rec = store.lookup(key)
+    assert rec is not None, f"key {key!r} not found in local store"
+    assert rec["agent"] == "taos-agent"
+    # Proxy IS running, re-scope failed (legacy key) -> minted local key, NOT degraded.
     assert state.taos_opencode_born_degraded["gpt-4o"] is False
     mock_proxy.update_agent_key.assert_awaited()
-    assert len(spawned_cfgs) == 1
+    mock_proxy.create_agent_key.assert_not_called()
 
     # Second call: must reuse the cached server, no restart churn.
     mock_proxy.update_agent_key.reset_mock()
@@ -1159,3 +1178,82 @@ async def test_status_scopes_subagent_fields(client, app):
         assert "error" not in sub
     # The payloads must not leak anywhere in the response body.
     assert "server-side" not in resp.text
+
+
+# ---------------------------------------------------------------------------
+# ensure_taos_opencode_server: legacy key re-scope failure remints locally
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_taos_agent_legacy_key_rescope_fail_remints(tmp_path, monkeypatch):
+    """Stored legacy key (not in local store), update_agent_key returns False,
+    gateway routable -> the key handed to opencode must be a local-store key
+    (store.lookup(key) is not None), not the legacy one."""
+    import tinyagentos.taos_agent_runtime as rt
+    from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
+
+    spawned_cfgs: list = []
+
+    class _FakeServer:
+        def __init__(self, cfg):
+            spawned_cfgs.append(cfg)
+            self._cfg = cfg
+        async def ensure_running(self, **kwargs):
+            pass
+        async def stop(self):
+            pass
+        @property
+        def base_url(self):
+            return f"http://127.0.0.1:{self._cfg.port}"
+        def is_running(self):
+            return True
+
+    monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
+
+    class _FakeSettings:
+        async def get_preference(self, user, ns):
+            # Legacy key that is NOT in the local store
+            return {"llm_key": "sk-legacy-postgres-key", "permitted_models": ["gpt-4o"]}
+        async def save_preference(self, user, ns, prefs):
+            pass
+
+    mock_proxy = MagicMock()
+    mock_proxy.is_running.return_value = True
+    mock_proxy.port = 7834
+    # update_agent_key returns False because the key is not in the local store
+    mock_proxy.update_agent_key = AsyncMock(return_value=False)
+    # create_agent_key should NOT be called - we want to test _mint_local_taos_agent_key
+    mock_proxy.create_agent_key = AsyncMock(return_value="sk-should-not-be-used")
+
+    state = SimpleNamespace(
+        data_dir=tmp_path,
+        llm_proxy=mock_proxy,
+        desktop_settings=_FakeSettings(),
+        taos_opencode_password=None,
+        taos_opencode_server=None,
+        taos_opencode_model=None,
+        taos_opencode_session_id=None,
+    )
+
+    # Gateway is enabled and can serve the model
+    import tinyagentos.llm_gateway as lg
+    monkeypatch.setattr(lg, "enabled", lambda: True)
+    async def mock_models_problem(*a, **kw):
+        return None
+    monkeypatch.setattr("tinyagentos.llm_gateway.cutover.models_problem", mock_models_problem)
+
+    await rt.ensure_taos_opencode_server(state, "gpt-4o")
+
+    assert len(spawned_cfgs) == 1
+    key = spawned_cfgs[0].litellm_key
+    # The key must be a NEW local-store key, not the legacy one
+    assert key != "sk-legacy-postgres-key"
+    # The key must exist in the local key store
+    store = LiteLLMKeyStore(default_keystore_path(tmp_path))
+    rec = store.lookup(key)
+    assert rec is not None, f"key {key!r} not found in local store"
+    assert rec["agent"] == "taos-agent"
+    assert "gpt-4o" in rec["allowed_models"]
+    assert "taos-embedding-default" in rec["allowed_models"]
+    # The legacy key must NOT be in the store
+    assert store.lookup("sk-legacy-postgres-key") is None
