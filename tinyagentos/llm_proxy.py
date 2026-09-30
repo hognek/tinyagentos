@@ -656,9 +656,13 @@ class LLMProxy:
         ``models or ["default"]`` so an agent deployed without an explicit
         model is scoped to the default chat alias (still usable), not minted
         with an empty allowlist that the gateway would deny-all.
+        The embedding alias (``taos-embedding-default``) is always preserved
+        so an agent that embeds does not lose access on model change.
         """
         try:
-            token = self._keystore().mint(agent_name, models or ["default"])
+            base = models or ["default"]
+            allowed = list(dict.fromkeys(base + [EMBEDDING_ALIAS]))
+            token = self._keystore().mint(agent_name, allowed)
         except Exception as e:
             logger.warning("key store mint failed for %s: %s", agent_name, e)
             return None

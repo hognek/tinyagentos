@@ -233,7 +233,7 @@ class TestDeployAgent:
             # back internally to its "default" alias.
             mock_proxy.create_agent_key.assert_called_once_with(
                 "proxy-test",
-                models=["taos-embedding-default"],
+                models=None,
             )
 
     @pytest.mark.asyncio
@@ -265,7 +265,7 @@ class TestDeployAgent:
             from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
             from tinyagentos.litellm_config import EMBEDDING_ALIAS
             rec = LiteLLMKeyStore(default_keystore_path(tmp_path)).lookup(result["llm_key"])
-            assert rec == {"agent": "routing-only", "allowed_models": [EMBEDDING_ALIAS]}
+            assert rec == {"agent": "routing-only", "allowed_models": ["default", EMBEDDING_ALIAS]}
 
     @pytest.mark.asyncio
     async def test_master_key_never_injected_into_container_env(self, tmp_path):
@@ -343,7 +343,7 @@ class TestDeployAgent:
             assert result["success"] is True
             mock_proxy.create_agent_key.assert_called_once_with(
                 "scoped",
-                models=["kilo-auto/free", "kilo-auto/balanced", "kilo-auto/frontier", "taos-embedding-default"],
+                models=["kilo-auto/free", "kilo-auto/balanced", "kilo-auto/frontier"],
             )
 
     @pytest.mark.asyncio
@@ -943,7 +943,7 @@ class TestDeployAgent:
             assert result["success"] is True
             mock_proxy.create_agent_key.assert_called_once_with(
                 "emb-test",
-                models=["kilo-auto/free", EMBEDDING_ALIAS],
+                models=["kilo-auto/free"],
             )
 
     @pytest.mark.asyncio
@@ -1320,6 +1320,38 @@ class TestMasterKeyFallback:
         assert any("local key store" in s for s in result["steps"])
         assert not any("master key" in s for s in result["steps"])
 
+
+    @pytest.mark.asyncio
+    async def test_model_less_deploy_key_allows_default_and_embedding(self, tmp_path, monkeypatch):
+        """RED-FIRST: deploy with no model and no fallbacks (routing-only / no DB path, real local keystore)
+        - the minted key's allowed_models == ["default", EMBEDDING_ALIAS].
+        """
+        monkeypatch.setenv("TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK", "1")
+        mock_proxy = MagicMock()
+        mock_proxy.is_running.return_value = True
+        mock_proxy.url = "http://localhost:4000"
+        mock_proxy.database_url = None
+        mock_proxy.create_agent_key = AsyncMock(return_value=None)
+
+        req = _req(
+            name="model-less",
+            model=None,
+            fallback_models=[],
+            data_dir=tmp_path,
+            extra_config={"llm_proxy": mock_proxy},
+        )
+
+        with patch("tinyagentos.deployer.create_container", new_callable=AsyncMock) as mock_create, \
+             patch("tinyagentos.deployer.exec_in_container", new_callable=AsyncMock, return_value=(0, "")), \
+             patch("tinyagentos.deployer.push_file", new_callable=AsyncMock, return_value=(0, "")), \
+             patch("tinyagentos.deployer.add_proxy_device", new_callable=AsyncMock, return_value={"success": True, "output": ""}):
+            mock_create.return_value = {"success": True, "name": "taos-agent-model-less"}
+            result = await deploy_agent(req)
+            assert result["success"] is True, result
+            from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
+            from tinyagentos.litellm_config import EMBEDDING_ALIAS
+            rec = LiteLLMKeyStore(default_keystore_path(tmp_path)).lookup(result["llm_key"])
+            assert rec == {"agent": "model-less", "allowed_models": ["default", EMBEDDING_ALIAS]}
 
 class TestFrameworkAwareBaseImage:
     """Framework-aware prebuilt base image selection (Hermes fast-path)."""

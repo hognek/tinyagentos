@@ -41,6 +41,7 @@ from tinyagentos.containers import (
     start_container, stop_container, destroy_container,
     add_proxy_device,
 )
+from tinyagentos.llm_proxy import EMBEDDING_ALIAS
 
 logger = logging.getLogger(__name__)
 
@@ -196,10 +197,11 @@ def _gateway_port_for(req: DeployRequest) -> int:
 def _mint_local_scoped_key(req: DeployRequest, models: list[str]) -> str | None:
     """A scoped per-agent key from the local key store (never the master key)."""
     from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
+    from tinyagentos.llm_proxy import EMBEDDING_ALIAS
 
     try:
         return LiteLLMKeyStore(default_keystore_path(req.data_dir)).mint(
-            req.name, models or ["default"]
+            req.name, models or ["default", EMBEDDING_ALIAS]
         )
     except Exception as exc:  # noqa: BLE001 - reported by the caller
         logger.warning("deploy %s: local key store mint failed: %s", req.name, exc)
@@ -255,7 +257,6 @@ async def deploy_agent(req: DeployRequest) -> dict:
     if req.extra_config and req.extra_config.get("llm_proxy"):
         proxy = req.extra_config["llm_proxy"]
         if proxy.is_running() or _gateway_port_for(req):
-            from tinyagentos.llm_proxy import EMBEDDING_ALIAS
             # Scope the virtual key to exactly the models this agent is
             # allowed to call. An empty list is preserved as empty (not
             # ["default"]) when the agent was deployed without a model
@@ -264,11 +265,7 @@ async def deploy_agent(req: DeployRequest) -> dict:
             # TAOS_EMBEDDING_MODEL=taos-embedding-default into every agent
             # that has an LLM proxy, so the key must allow it.
             key_models = [m for m in [req.model, *(req.fallback_models or [])] if m]
-            if key_models:
-                key_models = list(dict.fromkeys(key_models + [EMBEDDING_ALIAS]))
-            else:
-                key_models = [EMBEDDING_ALIAS]
-            llm_key = await proxy.create_agent_key(req.name, models=key_models)
+            llm_key = await proxy.create_agent_key(req.name, models=key_models or None)
             if llm_key is None:
                 # LiteLLM could not mint (routing-only, no Postgres, or not
                 # running). Two cases:

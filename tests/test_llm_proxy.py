@@ -524,7 +524,7 @@ class TestLLMProxyOwnership:
         key = await p.create_agent_key("routing-only")
         assert called is False
         assert LiteLLMKeyStore(default_keystore_path(tmp_path)).lookup(key) == {
-            "agent": "routing-only", "allowed_models": ["default"]}
+            "agent": "routing-only", "allowed_models": ["default", EMBEDDING_ALIAS]}
 
     @pytest.mark.asyncio
     async def test_create_agent_key_returns_none_and_warns_when_the_mint_raises(self, tmp_path, caplog, monkeypatch):
@@ -660,7 +660,7 @@ class TestInhouseKeys:
         proxy = LLMProxy(port=14006, config_dir=tmp_path, data_dir=tmp_path,
                          inhouse_keys=True)
         key = await proxy.create_agent_key("agent-a", None)
-        assert proxy._keystore().lookup(key)["allowed_models"] == ["default"]
+        assert proxy._keystore().lookup(key)["allowed_models"] == ["default", EMBEDDING_ALIAS]
 
     @pytest.mark.asyncio
     async def test_update_and_delete_key_inhouse(self, tmp_path):

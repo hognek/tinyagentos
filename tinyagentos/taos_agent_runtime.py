@@ -284,11 +284,9 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
         # (re-scoping it to the current permitted set), else mint once and persist
         # it. create_agent_key uses a fixed alias, so re-minting would 400 on the
         # alias collision — persisting the value avoids that and keeps it stable.
-        from tinyagentos.llm_proxy import EMBEDDING_ALIAS
         # The deployer injects TAOS_EMBEDDING_MODEL=taos-embedding-default into
         # every agent that has an LLM proxy, so the taOS agent's key must also
-        # allow the embedding alias.
-        permitted_models = list(dict.fromkeys(permitted_models + [EMBEDDING_ALIAS]))
+        # allow the embedding alias. This is now added inside llm_proxy.create_agent_key.
         llm_proxy = getattr(app_state, "llm_proxy", None)
         litellm_key: str | None = None
         born_degraded_now = False
@@ -414,13 +412,21 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
 def _mint_local_taos_agent_key(app_state, models: list[str]) -> str | None:
     """A ``taos-agent`` key scoped to ``models`` from the local key store."""
     from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
+    from tinyagentos.llm_proxy import EMBEDDING_ALIAS
 
     data_dir = getattr(app_state, "data_dir", None)
     if data_dir is None:
         return None
     try:
+        from pathlib import Path
+        # Always include the embedding alias for taOS agent keys
+        key_models = list(models)
+        if key_models:
+            key_models = [EMBEDDING_ALIAS] + key_models
+        else:
+            key_models = ["default", EMBEDDING_ALIAS]
         return LiteLLMKeyStore(default_keystore_path(Path(data_dir))).mint(
-            "taos-agent", list(models) or ["default"])
+            "taos-agent", key_models)
     except Exception:
         logger.warning("taos_agent_runtime: local key store mint failed", exc_info=True)
         return None
