@@ -94,7 +94,32 @@ set -euo pipefail
 # returns 0 on a handset, non-zero otherwise.
 # An explicit TAOS_EXTRAS_BLE=1 overrides auto-detection and forces ble inclusion;
 # TAOS_EXTRAS_BLE=0 forces exclusion (rare, e.g., a desktop with a BLE dongle).
-source "$(dirname "$0")/lib/controller_extras.sh"
+# Inlined here (identical to scripts/lib/controller_extras.sh) so the installer
+# works when piped via `curl | sh` where $0 is not a readable path.
+taos_controller_extras() {
+    local is_handset=0
+    if systemctl cat taos-kiosk.service >/dev/null 2>&1; then
+        is_handset=1
+    fi
+
+    local extras="proxy"
+    case "${TAOS_EXTRAS_BLE:-}" in
+        "1"|"true")
+            extras="proxy,ble"
+            ;;
+        "0"|"false")
+            extras="proxy"
+            ;;
+        *)
+            if [[ $is_handset -eq 1 ]]; then
+                extras="proxy,ble"
+            else
+                extras="proxy"
+            fi
+            ;;
+    esac
+    echo "$extras"
+}
 
 # If taOS is already installed, default to ITS directory so a re-run updates the
 # existing install in place rather than forking a second copy (e.g. a root

@@ -147,21 +147,39 @@ echo "=== Setup complete ==="
 # This ensures that on a fresh handset where taos-kiosk.service doesn't exist yet,
 # the ble extra is still installed when install-server.sh's pip step runs.
 
-# Determine taOS installation directory
-TAOS_DIR=""
-if command -v systemctl >/dev/null 2>&1 && systemctl show tinyagentos -p WorkingDirectory --value 2>/dev/null | grep -q ".*"; then
-    TAOS_DIR=$(systemctl show tinyagentos -p WorkingDirectory --value 2>/dev/null)
-elif [ -d /opt/tinyagentos ]; then
-    TAOS_DIR="/opt/tinyagentos"
-else
-    TAOS_DIR="$HOME/tinyagentos"
+# Determine taOS installation directory (honour TAOS_INSTALL_DIR, then the
+# running service's WorkingDirectory, then /opt, then $HOME).
+TAOS_DIR="${TAOS_INSTALL_DIR:-}"
+if [ -z "$TAOS_DIR" ]; then
+    if command -v systemctl >/dev/null 2>&1; then
+        _wd="$(systemctl show tinyagentos -p WorkingDirectory --value 2>/dev/null || true)"
+        if [ -n "$_wd" ]; then
+            TAOS_DIR="$_wd"
+        fi
+    fi
+fi
+if [ -z "$TAOS_DIR" ]; then
+    if [ -d /opt/tinyagentos ]; then
+        TAOS_DIR="/opt/tinyagentos"
+    else
+        TAOS_DIR="$HOME/tinyagentos"
+    fi
 fi
 
-if [ -f "$TAOS_DIR/.venv/bin/pip" ]; then
-    echo "Installing ble extra into taOS venv at $TAOS_DIR/.venv"
-    "$TAOS_DIR/.venv/bin/pip" install --quiet -e "$TAOS_DIR[proxy,ble]" 2>/dev/null || echo "Warning: Failed to install ble extra into venv (may already be installed)"
+# Install ble extra only when not explicitly disabled via TAOS_EXTRAS_BLE=0/1
+if [ "${TAOS_EXTRAS_BLE:-1}" != "0" ] && [ "${TAOS_EXTRAS_BLE:-1}" != "false" ]; then
+    if [ -f "$TAOS_DIR/.venv/bin/pip" ]; then
+        echo "Installing ble extra into taOS venv at $TAOS_DIR/.venv"
+        if [ -n "$TAOS_USER" ] && [ "$TAOS_USER" != "$(whoami)" ]; then
+            sudo -u "$TAOS_USER" "$TAOS_DIR/.venv/bin/pip" install --quiet -e "$TAOS_DIR[proxy,ble]"
+        else
+            "$TAOS_DIR/.venv/bin/pip" install --quiet -e "$TAOS_DIR[proxy,ble]"
+        fi
+    else
+        echo "Warning: taOS venv not found at $TAOS_DIR/.venv, ble extra not installed"
+    fi
 else
-    echo "Warning: taOS venv not found at $TAOS_DIR/.venv, ble extra not installed"
+    echo "TAOS_EXTRAS_BLE=${TAOS_EXTRAS_BLE:-0} — skipping ble extra install"
 fi
 
 echo ""
