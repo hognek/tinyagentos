@@ -519,7 +519,7 @@ async def test_ensure_server_reuses_persisted_key(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ensure_server_legacy_key_rescope_fails_mints_local(tmp_path, monkeypatch):
+async def test_ensure_server_rescope_failure_keeps_cached_server(tmp_path, monkeypatch):
     """When a persisted key is not in the local key store (legacy key),
     update_agent_key returns False. The runtime must mint a new local-store
     key, persist it, and use it. The server must NOT be marked as born
