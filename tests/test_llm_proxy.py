@@ -1246,3 +1246,23 @@ class TestSystemdUnitPermissions:
     def test_unit_has_no_umask(self):
         text = self._UNIT_PATH.read_text()
         assert re.search(r"(?m)^\s*UMask\s*=", text) is None
+
+
+class TestScopedKeyModels:
+    """scoped_key_models is the single source of truth for a new key's model list."""
+
+    def test_none_returns_default_and_embedding(self):
+        from tinyagentos.llm_proxy import scoped_key_models
+        assert scoped_key_models(None) == ["default", EMBEDDING_ALIAS]
+
+    def test_single_model_returns_model_and_embedding(self):
+        from tinyagentos.llm_proxy import scoped_key_models
+        assert scoped_key_models(["m"]) == ["m", EMBEDDING_ALIAS]
+
+    def test_alias_already_present_no_duplicate(self):
+        from tinyagentos.llm_proxy import scoped_key_models
+        assert scoped_key_models(["m", EMBEDDING_ALIAS]) == ["m", EMBEDDING_ALIAS]
+
+    def test_order_models_first_alias_last(self):
+        from tinyagentos.llm_proxy import scoped_key_models
+        assert scoped_key_models(["a", "b"]) == ["a", "b", EMBEDDING_ALIAS]

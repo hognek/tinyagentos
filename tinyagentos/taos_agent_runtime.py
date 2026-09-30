@@ -412,21 +412,14 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
 def _mint_local_taos_agent_key(app_state, models: list[str]) -> str | None:
     """A ``taos-agent`` key scoped to ``models`` from the local key store."""
     from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
-    from tinyagentos.llm_proxy import EMBEDDING_ALIAS
+    from tinyagentos.llm_proxy import scoped_key_models
 
     data_dir = getattr(app_state, "data_dir", None)
     if data_dir is None:
         return None
     try:
-        from pathlib import Path
-        # Always include the embedding alias for taOS agent keys
-        key_models = list(models)
-        if key_models:
-            key_models = [EMBEDDING_ALIAS] + key_models
-        else:
-            key_models = ["default", EMBEDDING_ALIAS]
         return LiteLLMKeyStore(default_keystore_path(Path(data_dir))).mint(
-            "taos-agent", key_models)
+            "taos-agent", scoped_key_models(models or None))
     except Exception:
         logger.warning("taos_agent_runtime: local key store mint failed", exc_info=True)
         return None

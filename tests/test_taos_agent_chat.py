@@ -461,9 +461,7 @@ async def test_ensure_server_falls_back_to_a_scoped_key_not_the_master_key(tmp_p
     assert key != master_key and state.taos_opencode_key == key
     actual_key_info = LiteLLMKeyStore(default_keystore_path(tmp_path)).lookup(key)
     actual_models = actual_key_info["allowed_models"]
-    expected_models = ["gpt-4o", "taos-embedding-default"]
-    # Check that both lists contain the same elements (order doesn't matter)
-    assert sorted(actual_models) == sorted(expected_models)
+    assert actual_models == ["gpt-4o", "taos-embedding-default"]
 
 
 @pytest.mark.asyncio

@@ -27,9 +27,21 @@ from tinyagentos.litellm_config import (
     get_litellm_master_key,
 )
 
-__all__ = ["EMBEDDING_ALIAS", "CLOUD_BACKEND_TYPES"]
+__all__ = ["EMBEDDING_ALIAS", "CLOUD_BACKEND_TYPES", "scoped_key_models"]
 
 logger = logging.getLogger(__name__)
+
+
+def scoped_key_models(models: list[str] | None) -> list[str]:
+    """Return the model list for a newly-minted agent key.
+
+    ``models or ["default"]`` so an agent deployed without an explicit
+    model is scoped to the default chat alias (still usable), not minted
+    with an empty allowlist that the gateway would deny-all.
+    The embedding alias (``taos-embedding-default``) is always appended
+    so an agent that embeds does not lose access on model change.
+    """
+    return list(dict.fromkeys((models or ["default"]) + [EMBEDDING_ALIAS]))
 
 
 def _pid_alive(pid: int) -> bool:
@@ -651,17 +663,9 @@ class LLMProxy:
 
     async def create_agent_key(self, agent_name: str, models: list[str] | None = None,
                                 max_budget: float | None = None) -> str | None:
-        """Mint a per-agent key in the local key store (no LiteLLM call).
-
-        ``models or ["default"]`` so an agent deployed without an explicit
-        model is scoped to the default chat alias (still usable), not minted
-        with an empty allowlist that the gateway would deny-all.
-        The embedding alias (``taos-embedding-default``) is always preserved
-        so an agent that embeds does not lose access on model change.
-        """
+        """Mint a per-agent key in the local key store (no LiteLLM call)."""
         try:
-            base = models or ["default"]
-            allowed = list(dict.fromkeys(base + [EMBEDDING_ALIAS]))
+            allowed = scoped_key_models(models)
             token = self._keystore().mint(agent_name, allowed)
         except Exception as e:
             logger.warning("key store mint failed for %s: %s", agent_name, e)
@@ -679,14 +683,12 @@ class LLMProxy:
         Keeps the key VALUE unchanged (no container env push / restart needed):
         the framework's ``/v1/models`` with this key then reflects the new
         permitted set. An empty scope is a caller error and is refused.
-        The embedding alias (``taos-embedding-default``) is always preserved
-        so an agent that embeds does not lose access on model change.
         """
         if not key or not models:
             logger.warning("update_agent_key needs key + models; refusing")
             return False
         try:
-            allowed = list(dict.fromkeys(models + [EMBEDDING_ALIAS]))
+            allowed = scoped_key_models(models)
             ok = self._keystore().set_models(key, allowed)
         except Exception as e:
             logger.warning("key re-scope failed: %s", e)

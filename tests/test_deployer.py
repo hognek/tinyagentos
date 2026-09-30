@@ -268,6 +268,38 @@ class TestDeployAgent:
             assert rec == {"agent": "routing-only", "allowed_models": ["default", EMBEDDING_ALIAS]}
 
     @pytest.mark.asyncio
+    async def test_fallback_mint_with_a_model_keeps_the_embedding_alias(self, tmp_path, monkeypatch):
+        """RED-FIRST (g): fallback mint with a model keeps the embedding alias.
+        proxy.create_agent_key returns None, model='kilo-auto/free', no DB,
+        real local keystore -> allowed_models == ['kilo-auto/free', EMBEDDING_ALIAS]."""
+        monkeypatch.setenv("TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK", "1")
+        mock_proxy = MagicMock()
+        mock_proxy.is_running.return_value = True
+        mock_proxy.url = "http://localhost:4000"
+        mock_proxy.database_url = None
+        mock_proxy.create_agent_key = AsyncMock(return_value=None)
+
+        req = _req(
+            name="fallback-emb",
+            model="kilo-auto/free",
+            data_dir=tmp_path,
+            extra_config={"llm_proxy": mock_proxy},
+        )
+
+        with patch("tinyagentos.deployer.create_container", new_callable=AsyncMock) as mock_create, \
+             patch("tinyagentos.deployer.exec_in_container", new_callable=AsyncMock, return_value=(0, "")), \
+             patch("tinyagentos.deployer.push_file", new_callable=AsyncMock, return_value=(0, "")), \
+             patch("tinyagentos.deployer.add_proxy_device", new_callable=AsyncMock, return_value={"success": True, "output": ""}):
+            mock_create.return_value = {"success": True, "name": "taos-agent-fallback-emb"}
+            result = await deploy_agent(req)
+            assert result["success"] is True, result
+            from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
+            from tinyagentos.litellm_config import EMBEDDING_ALIAS
+            rec = LiteLLMKeyStore(default_keystore_path(tmp_path)).lookup(result["llm_key"])
+            assert rec["agent"] == "fallback-emb"
+            assert rec["allowed_models"] == ["kilo-auto/free", EMBEDDING_ALIAS]
+
+    @pytest.mark.asyncio
     async def test_master_key_never_injected_into_container_env(self, tmp_path):
         """The per-install master key must never appear in the container env —
         not as OPENAI_API_KEY, LITELLM_API_KEY, or any other variable.
@@ -913,20 +945,24 @@ class TestDeployAgent:
     @pytest.mark.asyncio
     async def test_deployed_agent_key_allows_the_embedding_alias(self, tmp_path):
         """Deploy an agent with model X; the minted key's allowed models include
-        taos-embedding-default so the agent can embed through the gateway."""
+        taos-embedding-default so the agent can embed through the gateway.
+        Uses a real LLMProxy with a local keystore so the assertion proves the
+        alias was actually granted, not just that create_agent_key was called."""
+        from tinyagentos.llm_proxy import LLMProxy
         from tinyagentos.litellm_config import EMBEDDING_ALIAS
 
-        mock_proxy = MagicMock()
-        mock_proxy.is_running.return_value = True
-        mock_proxy.url = "http://localhost:4000"
-        mock_proxy.database_url = None
-        mock_proxy.create_agent_key = AsyncMock(return_value="sk-test-key-123")
+        proxy = LLMProxy(port=4000, data_dir=tmp_path, inhouse_keys=True)
+
+        class FakeProc:
+            def poll(self):
+                return None
+        proxy._process = FakeProc()
 
         req = _req(
             name="emb-test",
             model="kilo-auto/free",
             data_dir=tmp_path,
-            extra_config={"llm_proxy": mock_proxy},
+            extra_config={"llm_proxy": proxy},
         )
 
         async def mock_exec(name, cmd, **kwargs):
@@ -941,10 +977,11 @@ class TestDeployAgent:
             mock_create.return_value = {"success": True, "name": "taos-agent-emb-test"}
             result = await deploy_agent(req)
             assert result["success"] is True
-            mock_proxy.create_agent_key.assert_called_once_with(
-                "emb-test",
-                models=["kilo-auto/free"],
-            )
+            from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
+            rec = LiteLLMKeyStore(default_keystore_path(tmp_path)).lookup(result["llm_key"])
+            assert rec is not None
+            assert rec["agent"] == "emb-test"
+            assert rec["allowed_models"] == ["kilo-auto/free", EMBEDDING_ALIAS]
 
     @pytest.mark.asyncio
     async def test_bridge_url_injected_into_env(self, tmp_path):
