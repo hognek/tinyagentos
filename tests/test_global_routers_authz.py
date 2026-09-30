@@ -947,3 +947,28 @@ class TestClusterAdminDeleteWithoutPairingStore:
 
         # Worker row should still be present
         assert cluster.get_worker("local-test-worker") is not None
+
+    async def test_delete_with_uninitialised_pairing_store_refuses(self, client, app):
+        """When cluster_pairing exists but its DB was never initialised, admin
+        DELETE -> 503. The worker row must remain present."""
+        store = app.state.cluster_pairing
+        assert store is not None
+        await store.close()
+        store._db = None
+
+        from tinyagentos.cluster.worker_protocol import WorkerInfo
+        cluster = app.state.cluster_manager
+        # Persist the worker so unregister_worker would delete it if called.
+        await cluster._registry_store.init()
+        worker = WorkerInfo(
+            name="uninit-worker",
+            url="http://uninit-worker:9000",
+            capabilities=["chat"],
+            status="online",
+        )
+        cluster._workers["uninit-worker"] = worker
+
+        resp = await client.delete("/api/cluster/workers/uninit-worker")
+        assert resp.status_code == 503, resp.text
+        assert resp.json()["code"] == "STORE_UNAVAILABLE"
+        assert cluster.get_worker("uninit-worker") is not None

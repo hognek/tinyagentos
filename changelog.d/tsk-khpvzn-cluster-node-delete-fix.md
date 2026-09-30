@@ -7,5 +7,4 @@
 
 - **Tests:** Fixed test harness to properly initialize ClusterPairingStore
   - Added `_ensure_cluster_pairing_store` fixture to initialize the store for the test client
-  - Updated `_stub_cluster` function to avoid creating a new ClusterPairingStore without db_path
   - Added `TestClusterAdminDeleteWithoutPairingStore` tests to verify the fix works correctly
