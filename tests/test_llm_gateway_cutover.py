@@ -466,6 +466,173 @@ async def test_listener_never_exposes_other_controller_routes(tmp_data_dir, monk
     assert r1.json() == {"from": "litellm"} and r2.json() == {"from": "litellm"}
 
 
+@pytest.mark.asyncio
+async def test_listener_relays_other_paths_to_litellm_verbatim(monkeypatch):
+    """/v1/embeddings (TAOS_EMBEDDING_URL) still works for a migrated agent:
+    method, path, query, bearer and body reach LiteLLM; status and body come back."""
+    import httpx
+
+    from tinyagentos.llm_gateway import listener as mod
+
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("authorization")
+        seen["body"] = request.content
+
+        class _Wire(httpx.AsyncByteStream):  # a streamed body, like a real socket
+            async def __aiter__(self):
+                yield b'{"object": "list", '
+                yield b'"data": [{"embedding": [0.1]}]}'
+
+        return httpx.Response(201, stream=_Wire(),
+                              headers={"x-litellm": "yes", "content-type": "application/json"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(mod.httpx, "AsyncClient",
+                        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+    main_app = AsyncMock()
+    listener = mod.create_agent_listener_app(main_app, litellm_port=LITELLM_PORT)
+    async with AsyncClient(transport=ASGITransport(app=listener), base_url="http://127.0.0.1:4000") as c:
+        resp = await c.post("/v1/embeddings?x=1", json={"input": "hi", "model": "taos-embed"},
+                            headers={"Authorization": "Bearer sk-taos-agentkey"})
+    assert resp.status_code == 201
+    assert resp.json()["data"][0]["embedding"] == [0.1]
+    assert resp.headers["x-litellm"] == "yes"
+    assert seen["method"] == "POST"
+    assert seen["url"] == f"http://127.0.0.1:{LITELLM_PORT}/v1/embeddings?x=1"
+    assert seen["auth"] == "Bearer sk-taos-agentkey"
+    assert json.loads(seen["body"]) == {"input": "hi", "model": "taos-embed"}
+    main_app.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_listener_answers_502_when_litellm_is_down(monkeypatch):
+    import httpx
+
+    from tinyagentos.llm_gateway import listener as mod
+
+    def handler(request):
+        raise httpx.ConnectError("refused", request=request)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(mod.httpx, "AsyncClient",
+                        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
+    listener = mod.create_agent_listener_app(AsyncMock(), litellm_port=LITELLM_PORT)
+    async with AsyncClient(transport=ASGITransport(app=listener), base_url="http://127.0.0.1:4000") as c:
+        resp = await c.post("/v1/embeddings", json={"input": "hi"})
+    assert resp.status_code == 502
+    assert resp.json()["error"]["code"] == "upstream_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# The live invoker: run_startup_reconcile (what the controller runs at boot)
+# ---------------------------------------------------------------------------
+
+
+def _state(data_dir, agents, **extra):
+    return SimpleNamespace(
+        data_dir=data_dir,
+        config=SimpleNamespace(agents=agents, server={}),
+        llm_proxy=SimpleNamespace(port=LITELLM_PORT),
+        **extra,
+    )
+
+
+@pytest.mark.asyncio
+async def test_startup_reconcile_is_a_noop_without_the_listener_port(tmp_path):
+    from tinyagentos.llm_gateway.cutover import run_startup_reconcile
+
+    agent = _agent_with_key(tmp_path, "naira")
+    fake = FakeIncus({"taos-agent-naira": PROJECT},
+                     {"taos-agent-naira": f"tcp:127.0.0.1:{LITELLM_PORT}"})
+    with patch("tinyagentos.containers._run", side_effect=fake.run):
+        assert await run_startup_reconcile(_state(tmp_path, [agent])) is None
+    assert fake.calls == []
+
+
+@pytest.mark.asyncio
+async def test_startup_reconcile_moves_agents_once_the_listener_answers(tmp_path, monkeypatch):
+    from tinyagentos.llm_gateway import cutover
+
+    monkeypatch.delenv("TAOS_LLM_GATEWAY", raising=False)
+    agent = _agent_with_key(tmp_path, "naira")
+    fake = FakeIncus({"taos-agent-naira": PROJECT},
+                     {"taos-agent-naira": f"tcp:127.0.0.1:{LITELLM_PORT}"})
+    state = _state(tmp_path, [agent], llm_gateway_agent_port=GATEWAY_PORT)
+    probed = []
+
+    async def ready(port, **kw):
+        probed.append(port)
+        return True
+
+    monkeypatch.setattr(cutover, "wait_for_listener", ready)
+    with patch("tinyagentos.containers._run", side_effect=fake.run):
+        report = await cutover.run_startup_reconcile(state)
+    assert probed == [GATEWAY_PORT]
+    assert state.llm_gateway_listener_ready is True
+    assert cutover.llm_gateway_live_port(state) == GATEWAY_PORT
+    assert [r["agent"] for r in report["repointed"]] == ["naira"]
+    assert fake.connect["taos-agent-naira"] == f"tcp:127.0.0.1:{GATEWAY_PORT}"
+
+
+@pytest.mark.asyncio
+async def test_startup_reconcile_with_the_flag_off_rolls_back(tmp_path, monkeypatch):
+    from tinyagentos.llm_gateway import cutover
+
+    monkeypatch.setenv("TAOS_LLM_GATEWAY", "0")
+    agent = _agent_with_key(tmp_path, "naira")
+    fake = FakeIncus({"taos-agent-naira": PROJECT},
+                     {"taos-agent-naira": f"tcp:127.0.0.1:{GATEWAY_PORT}"})
+    state = _state(tmp_path, [agent], llm_gateway_agent_port=GATEWAY_PORT)
+    with patch("tinyagentos.containers._run", side_effect=fake.run):
+        report = await cutover.run_startup_reconcile(state)
+    assert state.llm_gateway_listener_ready is False
+    assert cutover.llm_gateway_live_port(state) == 0
+    assert [r["agent"] for r in report["repointed"]] == ["naira"]
+    assert fake.connect["taos-agent-naira"] == f"tcp:127.0.0.1:{LITELLM_PORT}"
+
+
+@pytest.mark.asyncio
+async def test_startup_reconcile_with_a_dead_listener_moves_nobody(tmp_path, monkeypatch):
+    from tinyagentos.llm_gateway import cutover
+
+    monkeypatch.delenv("TAOS_LLM_GATEWAY", raising=False)
+    agent = _agent_with_key(tmp_path, "naira")
+    fake = FakeIncus({"taos-agent-naira": PROJECT},
+                     {"taos-agent-naira": f"tcp:127.0.0.1:{LITELLM_PORT}"})
+    state = _state(tmp_path, [agent], llm_gateway_agent_port=GATEWAY_PORT)
+
+    async def dead(port, **kw):
+        return False
+
+    monkeypatch.setattr(cutover, "wait_for_listener", dead)
+    with patch("tinyagentos.containers._run", side_effect=fake.run):
+        report = await cutover.run_startup_reconcile(state)
+    assert fake.sets() == []
+    assert cutover.llm_gateway_live_port(state) == 0
+    assert report["skipped"][0]["agent"] == "naira"
+
+
+@pytest.mark.asyncio
+async def test_wait_for_listener_measures_a_real_socket():
+    import asyncio
+
+    from tinyagentos.llm_gateway.cutover import wait_for_listener
+
+    server = await asyncio.start_server(lambda r, w: w.close(), "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        assert await wait_for_listener(port, attempts=2, delay=0.01) is True
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert await wait_for_listener(port, attempts=2, delay=0.01) is False
+    assert await wait_for_listener(0) is False
+
+
 def test_ollama_providers_defined_once():
     import tinyagentos.llm_gateway.forward as forward
     import tinyagentos.llm_gateway.router as router
