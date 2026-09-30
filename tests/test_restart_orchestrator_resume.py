@@ -12,6 +12,7 @@ stranding them:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -44,7 +45,7 @@ class TestResumeAgentsFromNotes:
     async def test_resumes_agent_without_controller_note(self, tmp_path, monkeypatch):
         """A framework that answered /prepare-for-shutdown leaves no
         controller-side note; resume must synthesize one, not skip the agent."""
-        agent = {"name": "naira", "host": "10.0.0.5", "port": 8080, "paused": True}
+        agent = {"name": "naira", "host": "10.0.0.5", "port": 8080, "paused": True, "paused_by_restart": True}
         state = _app_state(tmp_path, [agent])
         posted = {}
 
@@ -61,8 +62,8 @@ class TestResumeAgentsFromNotes:
 
     @pytest.mark.asyncio
     async def test_unpauses_hostless_agent_directly(self, tmp_path):
-        """Hostless agents unpause without a /resume call, and any note on
-        disk is preserved (nothing consumed it)."""
+        """Hostless agents paused by the user (no restart marker) keep their
+        paused flag through restart resume, and any note on disk is preserved."""
         agent = {"name": "wkrlan1", "host": "", "paused": True}
         state = _app_state(tmp_path, [agent])
         note_dir = tmp_path / "agent-memory" / "wkrlan1"
@@ -72,12 +73,12 @@ class TestResumeAgentsFromNotes:
 
         await ro.resume_agents_from_notes(state)
 
-        assert agent["paused"] is False
+        assert agent["paused"] is True
         assert note_file.exists()
 
     @pytest.mark.asyncio
     async def test_uses_existing_note_when_present(self, tmp_path, monkeypatch):
-        agent = {"name": "a1", "host": "10.0.0.6", "port": 8080, "paused": True}
+        agent = {"name": "a1", "host": "10.0.0.6", "port": 8080, "paused": True, "paused_by_restart": True}
         state = _app_state(tmp_path, [agent])
         note_dir = tmp_path / "agent-memory" / "a1"
         note_dir.mkdir(parents=True)
@@ -101,7 +102,7 @@ class TestResumeAgentsFromNotes:
     async def test_unreachable_agent_resumed_by_retry_loop(self, tmp_path, monkeypatch):
         """The agent container boots slower than the controller: the first
         attempt fails, the background retry succeeds and unpauses it."""
-        agent = {"name": "slow", "host": "10.0.0.7", "port": 8080, "paused": True}
+        agent = {"name": "slow", "host": "10.0.0.7", "port": 8080, "paused": True, "paused_by_restart": True}
         state = _app_state(tmp_path, [agent])
         attempts = {"n": 0}
 
@@ -110,8 +111,17 @@ class TestResumeAgentsFromNotes:
             return attempts["n"] >= 2
 
         monkeypatch.setattr(ro, "_post_resume", flaky_post)
-        monkeypatch.setattr(ro, "_RESUME_RETRY_INTERVAL_S", 0.01)
-        monkeypatch.setattr(ro, "_RESUME_RETRY_WINDOW_S", 5)
+
+        fake_time = 0.0
+        def fake_monotonic():
+            return fake_time
+
+        async def fake_sleep(duration):
+            nonlocal fake_time
+            fake_time += duration
+
+        monkeypatch.setattr(ro, "_monotonic", fake_monotonic)
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
         await ro.resume_agents_from_notes(state)
         assert agent["paused"] is True  # first attempt failed
@@ -126,15 +136,24 @@ class TestResumeAgentsFromNotes:
 
     @pytest.mark.asyncio
     async def test_never_returning_agent_leaves_warning(self, tmp_path, monkeypatch):
-        agent = {"name": "gone", "host": "10.0.0.8", "port": 8080, "paused": True}
+        agent = {"name": "gone", "host": "10.0.0.8", "port": 8080, "paused": True, "paused_by_restart": True}
         state = _app_state(tmp_path, [agent])
 
         async def always_fail(host, port, note):
             return False
 
         monkeypatch.setattr(ro, "_post_resume", always_fail)
-        monkeypatch.setattr(ro, "_RESUME_RETRY_INTERVAL_S", 0.01)
-        monkeypatch.setattr(ro, "_RESUME_RETRY_WINDOW_S", 0.05)
+
+        fake_time = 0.0
+        def fake_monotonic():
+            return fake_time
+
+        async def fake_sleep(duration):
+            nonlocal fake_time
+            fake_time += duration
+
+        monkeypatch.setattr(ro, "_monotonic", fake_monotonic)
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
         await ro.resume_agents_from_notes(state)
         for task in list(state._background_tasks):
@@ -341,7 +360,7 @@ class TestResumeRetryLoopCapsSnapshot:
         retry loop re-loads the note from disk and posts it again. The
         context_snapshot must still be capped on every retry, not only on
         the initial attempt."""
-        agent = {"name": "slow", "host": "10.0.0.7", "port": 8080, "paused": True}
+        agent = {"name": "slow", "host": "10.0.0.7", "port": 8080, "paused": True, "paused_by_restart": True}
         state = _app_state(tmp_path, [agent])
         note_dir = tmp_path / "agent-memory" / "slow"
         note_dir.mkdir(parents=True)
@@ -359,8 +378,17 @@ class TestResumeRetryLoopCapsSnapshot:
             return attempts["n"] >= 2
 
         monkeypatch.setattr(ro, "_post_resume", flaky_post)
-        monkeypatch.setattr(ro, "_RESUME_RETRY_INTERVAL_S", 0.01)
-        monkeypatch.setattr(ro, "_RESUME_RETRY_WINDOW_S", 5)
+
+        fake_time = 0.0
+        def fake_monotonic():
+            return fake_time
+
+        async def fake_sleep(duration):
+            nonlocal fake_time
+            fake_time += duration
+
+        monkeypatch.setattr(ro, "_monotonic", fake_monotonic)
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
         await ro.resume_agents_from_notes(state)
 
@@ -381,7 +409,7 @@ class TestResumeBoundsNonDictSnapshot:
         """The on-disk note is written by the agent's own framework, so its
         context_snapshot is not guaranteed to be an object. Whatever shape it
         arrives in, what reaches _post_resume must be within the cap."""
-        agent = {"name": "loud", "host": "10.0.0.11", "port": 8080, "paused": True}
+        agent = {"name": "loud", "host": "10.0.0.11", "port": 8080, "paused": True, "paused_by_restart": True}
         state = _app_state(tmp_path, [agent])
         note_dir = tmp_path / "agent-memory" / "loud"
         note_dir.mkdir(parents=True)

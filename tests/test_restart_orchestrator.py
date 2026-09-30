@@ -383,7 +383,7 @@ class TestPrepareAgent:
         assert agent.get("paused") is not True
 
     @pytest.mark.asyncio
-    async def test_host_connection_failure_does_not_pause(self, tmp_path, monkeypatch):
+    async def test_host_exception_writes_controller_note(self, tmp_path, monkeypatch):
         """An agent whose /prepare-for-shutdown connection fails must not be
         marked paused: the controller never told it to pause."""
         agent = {"name": "remote", "host": "10.0.0.1", "port": 8080}
@@ -440,6 +440,54 @@ class TestPrepareAgent:
         monkeypatch.setattr(ro, "_post_resume", fake_post)
         await ro.resume_agents_from_notes(state)
 
+        assert agent["paused"] is False
+
+    @pytest.mark.asyncio
+    async def test_200_prepare_deletes_stale_controller_note_and_resumes(self, tmp_path, monkeypatch):
+        """A 200 restart prepare deletes any stale controller note and the
+        subsequent restart resume sends /resume."""
+        agent = {
+            "name": "stale-note",
+            "host": "10.0.0.1",
+            "port": 8080,
+        }
+        note_path = tmp_path / "data" / "agent-memory" / "stale-note" / "resume_note.json"
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        note_path.write_text(json.dumps({
+            "reason": "stop",
+            "next_step_hint": "controller-side fallback — agent framework did not implement /prepare-for-shutdown"
+        }))
+
+        state = _app_state(tmp_path, agents=[agent])
+        orch = ro.RestartOrchestrator(state)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"note_path": "/remote/note.json"}
+
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_cm = MagicMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        monkeypatch.setattr(orch, "_write_controller_note", AsyncMock())
+        with patch("httpx.AsyncClient", return_value=mock_cm):
+            result = await orch._prepare_agent(agent, "restart", state.data_dir)
+
+        assert not note_path.exists()
+        assert agent.get("paused") is True
+        assert agent.get("paused_by_restart") is True
+
+        posted = {}
+        async def fake_post(host, port, note):
+            posted["called"] = True
+            return True
+
+        monkeypatch.setattr(ro, "_post_resume", fake_post)
+        await ro.resume_agents_from_notes(state)
+
+        assert posted.get("called") is True
         assert agent["paused"] is False
 
 
@@ -645,17 +693,19 @@ class TestResumeAgentsFromNotes:
 
     @pytest.mark.asyncio
     async def test_hostless_agent_unpaused_without_resume_call(self, tmp_path, monkeypatch):
+        """A hostless agent paused by the user (no restart marker) keeps its
+        paused flag through restart resume."""
         agent = {"name": "hostless", "host": "", "paused": True}
         state = _app_state(tmp_path, agents=[agent])
 
         await ro.resume_agents_from_notes(state)
 
-        assert agent["paused"] is False
-        state.notifications.add.assert_awaited()
+        assert agent["paused"] is True
+        state.notifications.add.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_synthesizes_note_when_missing(self, tmp_path, monkeypatch):
-        agent = {"name": "synth", "host": "10.0.0.1", "port": 8080, "paused": True}
+        agent = {"name": "synth", "host": "10.0.0.1", "port": 8080, "paused": True, "paused_by_restart": True}
         state = _app_state(tmp_path, agents=[agent])
 
         posted = {}
@@ -675,15 +725,24 @@ class TestResumeAgentsFromNotes:
         """An agent that returned 200 to prepare but never answers /resume
         must have its paused flag cleared after the retry window, with a
         single warning notification."""
-        agent = {"name": "gone", "host": "10.0.0.8", "port": 8080, "paused": True}
+        agent = {"name": "gone", "host": "10.0.0.8", "port": 8080, "paused": True, "paused_by_restart": True}
         state = _app_state(tmp_path, agents=[agent])
 
         async def always_fail(host, port, note):
             return False
 
         monkeypatch.setattr(ro, "_post_resume", always_fail)
-        monkeypatch.setattr(ro, "_RESUME_RETRY_INTERVAL_S", 0.01)
-        monkeypatch.setattr(ro, "_RESUME_RETRY_WINDOW_S", 0.05)
+
+        fake_time = 0.0
+        def fake_monotonic():
+            return fake_time
+
+        async def fake_sleep(duration):
+            nonlocal fake_time
+            fake_time += duration
+
+        monkeypatch.setattr(ro, "_monotonic", fake_monotonic)
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
         await ro.resume_agents_from_notes(state)
         for task in list(state._background_tasks):
@@ -695,3 +754,33 @@ class TestResumeAgentsFromNotes:
             if c.kwargs.get("level") == "warning"
         ]
         assert warnings and "Could not tell these agents to resume" in warnings[-1].kwargs["message"]
+
+    @pytest.mark.asyncio
+    async def test_user_pause_not_cleared_by_restart_resume(self, tmp_path, monkeypatch):
+        """A user pause (paused=True without paused_by_restart) must survive
+        a restart resume: no POST is sent and paused stays True."""
+        agent = {
+            "name": "user-paused",
+            "host": "10.0.0.1",
+            "port": 8080,
+            "paused": True,
+        }
+        note_path = tmp_path / "data" / "agent-memory" / "user-paused" / "resume_note.json"
+        note_path.parent.mkdir(parents=True, exist_ok=True)
+        note_path.write_text(json.dumps({
+            "reason": "pause",
+            "next_step_hint": "controller-side fallback — agent framework did not implement /prepare-for-shutdown"
+        }))
+
+        state = _app_state(tmp_path, agents=[agent])
+
+        posted = {}
+        async def fake_post(host, port, note):
+            posted["called"] = True
+            return True
+
+        monkeypatch.setattr(ro, "_post_resume", fake_post)
+        await ro.resume_agents_from_notes(state)
+
+        assert agent["paused"] is True
+        assert "called" not in posted
