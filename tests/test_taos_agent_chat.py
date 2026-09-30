@@ -413,11 +413,14 @@ async def test_ensure_server_uses_agent_key_when_available(tmp_path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_ensure_server_falls_back_to_master_key(tmp_path, monkeypatch):
-    """When create_agent_key returns None, the server falls back to the master key."""
+async def test_ensure_server_falls_back_to_a_scoped_key_not_the_master_key(tmp_path, monkeypatch):
+    """When create_agent_key returns None, the server gets a key scoped to its
+    model from the local key store (LiteLLM removal stage 2a), never the
+    LiteLLM master key."""
     import tinyagentos.taos_agent_runtime as rt
     from tinyagentos.litellm_config import get_litellm_master_key
-    expected_master_key = get_litellm_master_key(tmp_path)
+    from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
+    master_key = get_litellm_master_key(tmp_path)
 
     spawned_cfgs: list = []
 
@@ -454,8 +457,10 @@ async def test_ensure_server_falls_back_to_master_key(tmp_path, monkeypatch):
     await rt.ensure_taos_opencode_server(state, "gpt-4o")
 
     assert len(spawned_cfgs) == 1
-    assert spawned_cfgs[0].litellm_key == expected_master_key
-    assert state.taos_opencode_key == expected_master_key
+    key = spawned_cfgs[0].litellm_key
+    assert key != master_key and state.taos_opencode_key == key
+    assert LiteLLMKeyStore(default_keystore_path(tmp_path)).lookup(key) == {
+        "agent": "taos-agent", "allowed_models": ["gpt-4o"]}
 
 
 @pytest.mark.asyncio

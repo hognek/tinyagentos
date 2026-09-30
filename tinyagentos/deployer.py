@@ -248,11 +248,13 @@ async def deploy_agent(req: DeployRequest) -> dict:
     # Env vars injected at container creation time.
     env: dict[str, str] = {}
 
-    # LLM proxy (LiteLLM).
+    # LLM proxy: the in-process gateway (agent listener) or, until LiteLLM
+    # removal stage 2b, LiteLLM. With the gateway live a deploy no longer
+    # needs LiteLLM running to get its key and LLM env.
     llm_key = None
     if req.extra_config and req.extra_config.get("llm_proxy"):
         proxy = req.extra_config["llm_proxy"]
-        if proxy.is_running():
+        if proxy.is_running() or _gateway_port_for(req):
             # Scope the virtual key to exactly the models this agent is
             # allowed to call. An empty list is preserved as empty (not
             # ["default"]) when the agent was deployed without a model
@@ -260,22 +262,19 @@ async def deploy_agent(req: DeployRequest) -> dict:
             key_models = [m for m in [req.model, *(req.fallback_models or [])] if m]
             llm_key = await proxy.create_agent_key(req.name, models=key_models or None)
             if llm_key is None:
-                # Key mint failed. Two distinct cases, handled differently:
+                # LiteLLM could not mint (routing-only, no Postgres, or not
+                # running). Two cases:
                 #
-                # 1. Routing-only (db_url is None): LiteLLM has no Postgres, so
-                #    virtual keys are simply unavailable (e.g. an ARM box where
-                #    prisma can't start). This is an expected capability gap,
-                #    not a bug. taOS is single-user per instance, so we fall
-                #    back to the shared master key by default and warn loudly;
-                #    a hardened / multi-tenant operator sets
-                #    TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK=1 to refuse instead.
-                #
-                # 2. DB configured but mint failed (db_url is set): the proxy
+                # 1. DB configured but mint failed (db_url is set): the proxy
                 #    HAS a key store but /key/generate broke (migration pending,
-                #    DB unreachable, master-key drift). That is a real bug. The
-                #    master key would mask it AND ship an unscoped agent, so we
-                #    always refuse here regardless of the env var, directing the
-                #    operator at the misbehaving DB.
+                #    DB unreachable). That is a real fault; refuse and name it.
+                #
+                # 2. Otherwise: mint a key scoped to this agent's models in the
+                #    local key store. The gateway accepts it (and mirrors it into
+                #    a gateway key below). The shared LiteLLM master key is never
+                #    handed to an agent any more, so
+                #    TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK no longer changes
+                #    anything.
                 db_url = getattr(proxy, "database_url", None)
                 if db_url is not None:
                     db_host = db_url.split("@")[-1] if "@" in db_url else db_url
@@ -290,53 +289,23 @@ async def deploy_agent(req: DeployRequest) -> dict:
                     logger.error("deploy %s: %s", req.name, msg)
                     return {"success": False, "error": msg, "steps": steps}
 
-                why = (
-                    "LiteLLM is running in routing-only mode (no Postgres "
-                    "DATABASE_URL configured)"
-                )
-                fallback_disabled = os.environ.get(
-                    "TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK", ""
-                ).strip().lower() in ("1", "true", "yes")
-                if _gateway_port_for(req):
-                    # The gateway refuses the master key, so an agent headed
-                    # for it gets a scoped key from the local store instead.
-                    llm_key = _mint_local_scoped_key(req, key_models)
-                    if llm_key is None:
-                        msg = (
-                            f"per-agent LLM key could not be minted: {why}, and "
-                            "the local key store refused too. The LLM gateway "
-                            "does not accept the shared master key, so the "
-                            "deploy is refused."
-                        )
-                        logger.error("deploy %s: %s", req.name, msg)
-                        return {"success": False, "error": msg, "steps": steps}
-                    steps.append("llm-key: scoped key minted in the local key store")
-                elif fallback_disabled:
+                llm_key = _mint_local_scoped_key(req, key_models)
+                if llm_key is None:
                     msg = (
-                        f"per-agent LiteLLM virtual key could not be minted: {why}. "
-                        "The master-key fallback is disabled "
-                        "(TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK is set), so the "
-                        "deploy is refused. Configure a Postgres database for "
-                        "LiteLLM to issue per-agent scoped keys, or unset that "
-                        "variable on a single-user instance."
+                        "per-agent LLM key could not be minted: LiteLLM issued "
+                        "none and the local key store refused too. An agent is "
+                        "never given the shared LiteLLM master key, so the "
+                        "deploy is refused."
                     )
                     logger.error("deploy %s: %s", req.name, msg)
                     return {"success": False, "error": msg, "steps": steps}
-
-                if llm_key is None:
-                    from tinyagentos.llm_proxy import get_litellm_master_key
-                    llm_key = get_litellm_master_key(req.data_dir)
+                steps.append("llm-key: scoped key minted in the local key store")
+                if not _gateway_port_for(req) and getattr(proxy, "inhouse_keys", True) is False:
                     logger.warning(
-                        "deploy %s: %s; falling back to the shared LiteLLM master "
-                        "key. This agent has full LiteLLM admin access. Configure "
-                        "Postgres-backed virtual keys for per-agent isolation, or "
-                        "set TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK=1 to refuse "
-                        "instead.",
-                        req.name, why,
-                    )
-                    steps.append(
-                        "llm-key: per-agent virtual key unavailable, using shared "
-                        "master key (no per-agent isolation)"
+                        "deploy %s: its key is a local key-store key; LiteLLM "
+                        "without in-house keys does not accept it, so this agent "
+                        "needs the LLM gateway (it moves there on the next "
+                        "controller start)", req.name,
                     )
             from tinyagentos.llm_proxy import EMBEDDING_ALIAS
             # Primary key for openclaw's litellm provider.
@@ -348,6 +317,12 @@ async def deploy_agent(req: DeployRequest) -> dict:
             # it reaches the controller's LiteLLM over the network at taos_host
             # (the controller's Tailscale IP) on the host's LiteLLM port.
             if req.remote:
+                from tinyagentos.llm_gateway.cutover import REMOTE_NO_GATEWAY_REASON
+
+                logger.warning("deploy %s: llm_gateway_no_remote_path: %s",
+                               req.name, REMOTE_NO_GATEWAY_REASON)
+                steps.append("llm: remote agent has no LLM gateway path "
+                             "(listener is loopback-only); it uses LiteLLM over the network")
                 _llm_port = getattr(proxy, "port", None) or 7834
                 _llm_base = f"http://{req.taos_host}:{_llm_port}"
             else:

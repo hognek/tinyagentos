@@ -8,13 +8,15 @@ meanings is the trap this prefix avoids.
 ON BY DEFAULT (cutover stage 1). ``TAOS_LLM_GATEWAY=0`` (or ``false`` /
 ``no`` / ``off``) turns it back off: the routes are not mounted and the
 startup reconcile points every agent's proxy device back at LiteLLM. LiteLLM
-still runs beside it in stage 1: the agent listener forwards every path the
-gateway does not serve (embeddings, for one) to it.
+still runs beside it (for that rollback) until removal stage 2b, but since
+stage 2a nothing an agent calls depends on it: the gateway serves models,
+chat completions AND embeddings.
 
 Agents reach the gateway at their own ``127.0.0.1:4000`` exactly as before.
 The incus proxy device behind that address is retargeted from the LiteLLM
 host port to the agent listener (``listener``, host ``127.0.0.1:7838``),
-which serves ``/v1/models`` and ``/v1/chat/completions`` from this package.
+which serves ``/v1/models``, ``/v1/chat/completions`` and ``/v1/embeddings``
+from this package.
 
 Modules, smallest first:
   errors   OpenAI-shaped error envelope + the exception the routes raise
@@ -22,7 +24,8 @@ Modules, smallest first:
   resolve  model name -> backend, from the SAME table the LiteLLM config uses
   forward  one POST to an OpenAI-compatible backend, failures mapped to 502
   anthropic Anthropic Messages API translator for the taOS gateway
-  router   the two routes, and ``mount``
+  embeddings embeddings routing (probe-discovered table) + the backend call
+  router   the three routes, and ``mount``
   listener the agent-facing ASGI app on its own host port (base URL ``/v1``)
   cutover  per-agent key mint + proxy-device repoint / rollback at startup
 """

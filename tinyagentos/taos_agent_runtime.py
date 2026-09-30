@@ -26,7 +26,6 @@ import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
-from tinyagentos.litellm_config import get_litellm_master_key
 from tinyagentos.opencode_runtime import OpenCodeServer, OpenCodeServerConfig
 
 logger = logging.getLogger(__name__)
@@ -314,7 +313,22 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
                 except Exception:
                     logger.debug("taos_agent_runtime: persisting key failed", exc_info=True)
         if not litellm_key:
-            litellm_key = get_litellm_master_key(getattr(app_state, "data_dir", None))
+            # No key from the proxy (LiteLLM stopped, or it could not mint):
+            # a key scoped to the permitted models from the local key store,
+            # which the LLM gateway accepts. Never the LiteLLM master key.
+            litellm_key = _mint_local_taos_agent_key(app_state, permitted_models)
+            if litellm_key and desktop_settings is not None:
+                try:
+                    prefs["llm_key"] = litellm_key
+                    await desktop_settings.save_preference("user", "taos_agent", prefs)
+                except Exception:
+                    logger.debug("taos_agent_runtime: persisting key failed", exc_info=True)
+        if not litellm_key:
+            logger.error(
+                "taos_agent_runtime: no scoped LLM key could be minted for the taOS "
+                "agent; it starts without one (the LiteLLM master key is never used)"
+            )
+            litellm_key = ""
         app_state.taos_opencode_key = litellm_key
 
         # Get the native agent's scoped credential (rotated token) for taOS API access.
@@ -366,7 +380,7 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
             home=home,
             port=TAOS_OPENCODE_PORT,
             server_password=app_state.taos_opencode_password,
-            litellm_base_url=f"http://127.0.0.1:{llm_proxy.port if llm_proxy is not None else 7834}/v1",
+            litellm_base_url=await _llm_base_url(app_state, llm_proxy, permitted_models),
             litellm_key=litellm_key,
             model_ids=permitted_models,
             taos_api_base_url=taos_api_base_url,
@@ -390,6 +404,49 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
     # spuriously time out the very first taOS-agent chat.
     await server.ensure_running(deadline_s=180.0)
     return server
+
+
+def _mint_local_taos_agent_key(app_state, models: list[str]) -> str | None:
+    """A ``taos-agent`` key scoped to ``models`` from the local key store."""
+    from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
+
+    data_dir = getattr(app_state, "data_dir", None)
+    if data_dir is None:
+        return None
+    try:
+        return LiteLLMKeyStore(default_keystore_path(Path(data_dir))).mint(
+            "taos-agent", list(models) or ["default"])
+    except Exception:
+        logger.warning("taos_agent_runtime: local key store mint failed", exc_info=True)
+        return None
+
+
+async def _llm_base_url(app_state, llm_proxy, models: list[str]) -> str:
+    """Where the taOS agent's opencode sends model calls.
+
+    The in-process LLM gateway on this controller when it is on AND can serve
+    every permitted model (the same check the cutover applies to container
+    agents), so the taOS agent keeps working with LiteLLM stopped. LiteLLM
+    otherwise: the gateway switched off (``TAOS_LLM_GATEWAY=0``), or a model
+    only LiteLLM can reach (e.g. an rkllama chat model).
+    """
+    from tinyagentos import llm_gateway
+    from tinyagentos.llm_gateway.cutover import models_problem
+    from tinyagentos.llm_gateway.router import PREFIX
+
+    litellm = f"http://127.0.0.1:{llm_proxy.port if llm_proxy is not None else 7834}/v1"
+    if not llm_gateway.enabled():
+        return litellm
+    try:
+        problem = await models_problem(app_state, models)
+    except Exception as exc:  # noqa: BLE001 - unknown routability: stay on LiteLLM
+        problem = f"routability check failed: {type(exc).__name__}"
+    if problem:
+        logger.warning("taos_agent_runtime: taOS agent stays on LiteLLM: %s", problem)
+        return litellm
+    config = getattr(app_state, "config", None)
+    port = int((getattr(config, "server", None) or {}).get("port", 6969))
+    return f"http://127.0.0.1:{port}{PREFIX}"
 
 
 async def stop_taos_opencode_server(app_state) -> None:

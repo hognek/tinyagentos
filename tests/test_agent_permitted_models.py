@@ -12,19 +12,40 @@ from tinyagentos.cluster.model_resolver import ModelLocation
 # Minimal fakes — mirror the pattern from test_update_agent_key.py
 # ---------------------------------------------------------------------------
 
+class _FakeKeyStore:
+    """Records set_models (the re-scope) the way the old /key/update was recorded."""
+
+    def __init__(self, capture, holds_key=True):
+        self._cap = capture
+        self._holds_key = holds_key
+
+    def set_models(self, key, models):
+        if self._cap is not None:
+            self._cap.setdefault("calls", []).append(
+                {"url": "keystore:set_models", "json": {"key": key, "models": list(models)}})
+        return self._holds_key
+
+
 class _FakeProxy:
-    """Duck-typed LLMProxy that records calls to update_agent_key."""
+    """Duck-typed LLMProxy that records calls to update_agent_key.
+
+    Since LiteLLM removal stage 2a the re-scope is the local key store's
+    ``set_models`` (never LiteLLM's /key/update with the master key)."""
     update_agent_key = LLMProxy.update_agent_key
 
     def __init__(self, running=True, db=True, capture=None):
         self.url = "http://127.0.0.1:4000"
         self.database_url = "postgres://x" if db else None
         self._running = running
-        self._capture = capture  # list to append (models,) tuples
-        self._data_dir = None  # in-memory master key (no disk I/O in tests)
+        self._capture = capture
+        self._data_dir = None
 
     def is_running(self):
         return self._running
+
+    def _keystore(self):
+        # db=False stands for "the store does not hold this key" (re-scope False).
+        return _FakeKeyStore(self._capture, holds_key=self.database_url is not None)
 
 
 class _Resp:
@@ -270,7 +291,7 @@ async def test_put_permitted_rescopes_key(monkeypatch):
     monkeypatch.setattr(M.httpx, "AsyncClient", lambda **k: _Client(200, cap))
     from tinyagentos.routes.agents import set_permitted_models, PermittedModelsUpdate
     agents = [{"name": "alpha", "model": "llama3", "llm_key": "sk-a"}]
-    proxy = _FakeProxy()
+    proxy = _FakeProxy(capture=cap)
     req = _FakeRequest(agents, proxy=proxy)
     body = PermittedModelsUpdate(models=["llama3", "qwen3"])
     resp = await set_permitted_models(req, "alpha", body, user=CurrentUser(is_admin=True, user_id="test-admin"))
@@ -321,7 +342,7 @@ async def test_update_agent_model_scopes_key_to_permitted_set(monkeypatch):
             "permitted_models": ["llama3", "qwen3"],
         }
     ]
-    proxy = _FakeProxy()
+    proxy = _FakeProxy(capture=cap)
     req = _FakeRequest(agents, proxy=proxy)
     body = AgentModelUpdate(model="qwen3")
     resp = await update_agent_model(req, "alpha", body, user=CurrentUser(is_admin=True, user_id="test-admin"))
@@ -330,7 +351,7 @@ async def test_update_agent_model_scopes_key_to_permitted_set(monkeypatch):
     # The key should be scoped to ALL permitted models, not just [qwen3]
     assert set(resp["permitted"]) == {"llama3", "qwen3"}
     calls = cap.get("calls", [])
-    rescope_calls = [c for c in calls if c["url"].endswith("/key/update")]
+    rescope_calls = [c for c in calls if c["url"] == "keystore:set_models"]
     assert rescope_calls, "update_agent_key was not called"
     models_sent = rescope_calls[-1]["json"]["models"]
     assert set(models_sent) == {"llama3", "qwen3"}
@@ -346,14 +367,14 @@ async def test_update_agent_model_adds_new_model_to_permitted(monkeypatch):
     from tinyagentos.routes.agents import update_agent_model, AgentModelUpdate
     # agent has no permitted_models yet
     agents = [{"name": "alpha", "model": "llama3", "llm_key": "sk-a"}]
-    proxy = _FakeProxy()
+    proxy = _FakeProxy(capture=cap)
     req = _FakeRequest(agents, proxy=proxy)
     body = AgentModelUpdate(model="qwen3")
     resp = await update_agent_model(req, "alpha", body, user=CurrentUser(is_admin=True, user_id="test-admin"))
     # Should auto-create permitted set with qwen3 prepended
     assert "qwen3" in resp["permitted"]
     calls = cap.get("calls", [])
-    rescope_calls = [c for c in calls if c["url"].endswith("/key/update")]
+    rescope_calls = [c for c in calls if c["url"] == "keystore:set_models"]
     assert rescope_calls
     models_sent = rescope_calls[-1]["json"]["models"]
     assert "qwen3" in models_sent
@@ -396,7 +417,7 @@ async def test_update_agent_model_discards_stale_key_on_re_scope_failure(monkeyp
 
     monkeypatch.setattr(mod, "save_config_locked", _recording_save)
     _patch_resolver(monkeypatch, {})
-    # routing-only proxy (no database_url) — update_agent_key returns False
+    # a key the local store does not hold -- update_agent_key returns False
     proxy = _FakeProxy(db=False)
     import tinyagentos.llm_proxy as M
     monkeypatch.setattr(M.httpx, "AsyncClient", lambda **k: _Client(200))

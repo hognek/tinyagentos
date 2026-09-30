@@ -471,13 +471,14 @@ _INVITE_INFO_PREFIX = "/i/"
 _AGENT_MODEL_MODELS = "/v1/models"
 _AGENT_MODEL_CHAT = "/v1/chat/completions"
 
-# In-process LLM gateway (tinyagentos/llm_gateway). Exactly two method+path
-# pairs are EXEMPT, like the Agent-as-a-Model pair above: a scoped gateway key
+# In-process LLM gateway (tinyagentos/llm_gateway). Exactly three method+path
+# pairs are EXEMPT (models, chat completions, embeddings), like the Agent-as-a-Model pair above: a scoped gateway key
 # (or the host local token, or a signed-in session) IS the credential and the
 # route's ``gateway_caller`` dependency enforces it, answering an OpenAI-shaped
 # 401 otherwise. Every other /api/llm path or method stays gated here.
 _LLM_GATEWAY_MODELS = "/api/llm/v1/models"
 _LLM_GATEWAY_CHAT = "/api/llm/v1/chat/completions"
+_LLM_GATEWAY_EMBEDDINGS = "/api/llm/v1/embeddings"  # LiteLLM removal stage 2a
 # The gated rest of /api/llm/ still gets an OpenAI-shaped 401: an OpenAI
 # client reads error.message from an object, and the plain
 # {"error": "Authentication required"} string there surfaces as a crash in
@@ -627,6 +628,8 @@ def _is_exempt(method: str, path: str) -> bool:
     if method == "GET" and path == _LLM_GATEWAY_MODELS:
         return True
     if method == "POST" and path == _LLM_GATEWAY_CHAT:
+        return True
+    if method == "POST" and path == _LLM_GATEWAY_EMBEDDINGS:
         return True
     return False
 
