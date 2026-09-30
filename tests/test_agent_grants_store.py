@@ -44,6 +44,52 @@ class TestAgentGrantsStore:
         finally:
             await store.close()
 
+    async def test_add_grant_preserves_existing_expiry_when_new_is_none(self, tmp_path):
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-a", "scope-x", expires_at="2030-01-01T00:00:00+00:00")
+            await store.add_grant("agent-a", "scope-x")
+            grants = await store.list_grants("agent-a")
+            assert len(grants) == 1
+            assert grants[0]["expires_at"] == "2030-01-01T00:00:00+00:00"
+        finally:
+            await store.close()
+
+    async def test_add_grant_uses_earlier_of_two_bounded_expiries(self, tmp_path):
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-a", "scope-x", expires_at="2030-01-01T00:00:00+00:00")
+            await store.add_grant("agent-a", "scope-x", expires_at="2027-01-01T00:00:00+00:00")
+            grants = await store.list_grants("agent-a")
+            assert len(grants) == 1
+            assert grants[0]["expires_at"] == "2027-01-01T00:00:00+00:00"
+        finally:
+            await store.close()
+
+    async def test_add_grant_keeps_earlier_not_later_when_new_is_later(self, tmp_path):
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-a", "scope-x", expires_at="2027-01-01T00:00:00+00:00")
+            await store.add_grant("agent-a", "scope-x", expires_at="2030-01-01T00:00:00+00:00")
+            grants = await store.list_grants("agent-a")
+            assert len(grants) == 1
+            assert grants[0]["expires_at"] == "2027-01-01T00:00:00+00:00"
+        finally:
+            await store.close()
+
+    async def test_add_grant_renew_true_overrides_with_later_expiry(self, tmp_path):
+        store = await self._store(tmp_path)
+        try:
+            await store.add_grant("agent-a", "scope-x", expires_at="2027-01-01T00:00:00+00:00")
+            await store.add_grant(
+                "agent-a", "scope-x", expires_at="2030-01-01T00:00:00+00:00", renew=True
+            )
+            grants = await store.list_grants("agent-a")
+            assert len(grants) == 1
+            assert grants[0]["expires_at"] == "2030-01-01T00:00:00+00:00"
+        finally:
+            await store.close()
+
     async def test_add_grant_idempotent_replace(self, tmp_path):
         store = await self._store(tmp_path)
         try:
