@@ -199,15 +199,21 @@ def _activity_feed(state: Any):
 
 
 def _record_request_start(state: Any, route: Route, principal: str) -> float:
-    """Record ``request.start`` and return a monotonic clock for the finish."""
+    """Record ``request.start`` and return a monotonic clock for the finish.
+
+    ``principal`` is stamped as the event's ``owner``, which is what the
+    /api/activity/models read surface scopes on. The gateway's caller identity
+    for a session is ``user:<id>`` (``llm_gateway/auth.py``), the same spelling
+    the session dependency produces on the read side.
+    """
     feed = _activity_feed(state)
     if feed is not None:
         try:
             feed.record(
                 REQUEST_START,
                 model=route.model_name,
+                owner=principal,
                 backend=route.backend_name,
-                detail={"principal": principal},
             )
         except Exception:  # noqa: BLE001 - telemetry never breaks a request
             logger.warning("llm_gateway: model activity request.start failed", exc_info=True)
@@ -239,13 +245,13 @@ def _record_request_finish(
         feed.record(
             REQUEST_FINISH,
             model=route.model_name,
+            owner=principal,
             backend=route.backend_name,
             duration_ms=duration_ms,
             tokens_in=tokens_in,
             tokens_out=tokens_out,
             token_rate=token_rate,
             reason=reason,
-            detail={"principal": principal},
         )
     except Exception:  # noqa: BLE001 - telemetry never breaks a request
         logger.warning("llm_gateway: model activity request.finish failed", exc_info=True)
@@ -256,8 +262,14 @@ def _record_route_change(
     route: Route,
     previous: Route | None,
     attempt: int,
+    principal: str = "",
 ) -> None:
-    """Record ``model.route`` when failover moves a model to another backend."""
+    """Record ``model.route`` when failover moves a model to another backend.
+
+    ``principal`` is stamped as the event's ``owner`` like the request events,
+    so a session that made the failing request keeps its own failover row
+    instead of losing it to the admin-only controller-level bucket.
+    """
     feed = _activity_feed(state)
     if feed is None or previous is None:
         return
@@ -265,6 +277,7 @@ def _record_route_change(
         feed.record(
             MODEL_ROUTE,
             model=route.model_name,
+            owner=principal or None,
             backend=route.backend_name,
             reason="failover",
             detail={
@@ -668,6 +681,7 @@ async def _call_with_retry(
     routes: list[Route],
     call_one: Callable[[Route], Awaitable[dict]],
     state: Any = None,
+    principal: str = "",
 ) -> dict:
     deadline = time.monotonic() + _DEADLINE_SECONDS
     last_exc: GatewayError | None = None
@@ -683,7 +697,7 @@ async def _call_with_retry(
         if remaining <= 0:
             break
         if attempt > 0:
-            _record_route_change(state, route, ordered[attempt - 1], attempt)
+            _record_route_change(state, route, ordered[attempt - 1], attempt, principal)
         try:
             return await call_one(route)
         except GatewayError as exc:
@@ -704,6 +718,7 @@ async def _stream_with_retry(
     routes: list[Route],
     stream_one: Callable[[Route], AsyncGenerator[bytes, None]],
     state: Any = None,
+    principal: str = "",
 ) -> AsyncGenerator[bytes, None]:
     deadline = time.monotonic() + _DEADLINE_SECONDS
     last_exc: GatewayError | None = None
@@ -720,7 +735,7 @@ async def _stream_with_retry(
             break
 
         if attempt > 0:
-            _record_route_change(state, route, ordered[attempt - 1], attempt)
+            _record_route_change(state, route, ordered[attempt - 1], attempt, principal)
 
         first_byte_sent = False
         try:
@@ -797,7 +812,12 @@ async def chat_completion(routes: list[Route], body: dict, principal: str, state
     cooldown so the next request does not pay the timeout again. Each
     attempt resolves and sends only that backend's own key.
     """
-    return await _call_with_retry(routes, lambda route: _chat_completion_one(route, body, principal, state), state)
+    return await _call_with_retry(
+        routes,
+        lambda route: _chat_completion_one(route, body, principal, state),
+        state,
+        principal,
+    )
 
 
 async def chat_completion_stream(
@@ -813,7 +833,12 @@ async def chat_completion_stream(
     """
     from fastapi.responses import JSONResponse, StreamingResponse
 
-    gen = _stream_with_retry(routes, lambda route: _event_stream_for_route(route, body, principal, state), state)
+    gen = _stream_with_retry(
+        routes,
+        lambda route: _event_stream_for_route(route, body, principal, state),
+        state,
+        principal,
+    )
     try:
         first = await gen.__anext__()
     except StopAsyncIteration:

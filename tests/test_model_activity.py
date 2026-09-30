@@ -29,7 +29,10 @@ from tinyagentos.model_activity import (
     REQUEST_START,
     ModelActivityFeed,
 )
-from tinyagentos.routes.model_activity import model_activity_stream
+from tinyagentos.routes.model_activity import (
+    model_activity_history,
+    model_activity_stream,
+)
 from tinyagentos.scheduler.core_aware_scheduler import CoreAwareModelScheduler
 from tinyagentos.scheduler.loaded_model import LoadedModel, PriorityClass
 from tinyagentos.scheduler.resource_shape import BackendResourceShape
@@ -268,7 +271,8 @@ async def test_gateway_records_request_start_and_finish_with_token_rate():
 
     assert start.model == "qwen3-8b"
     assert start.backend == "test-backend"
-    assert start.detail["principal"] == "agent-a"
+    assert start.owner == "agent-a"
+    assert finish.owner == "agent-a"
 
     assert finish.model == "qwen3-8b"
     assert finish.backend == "test-backend"
@@ -335,6 +339,10 @@ async def test_failover_records_a_route_change():
     assert routes[0].backend == "up-backend"
     assert routes[0].reason == "failover"
     assert routes[0].detail["previous_backend"] == "down-backend"
+    # Owned by the caller whose request failed over, like the request events:
+    # an unowned route change is admin-only, which would hide a member's own
+    # failover row from its own feed.
+    assert routes[0].owner == "agent-a"
 
 
 @respx.mock
@@ -410,8 +418,12 @@ def _sse_request(
     return req
 
 
-#: The stream requires the session dependency; direct handler calls pass it in.
-_USER = {"id": "user-1"}
+#: The stream/history handlers require the session dependency; direct calls pass
+#: it in. This is the admin session, which sees the unfiltered ring.
+_USER = {"id": "user-1", "is_admin": True}
+
+#: A non-admin member session: only the events its own principal owns.
+_MEMBER = {"id": "user-2", "is_admin": False}
 
 
 def _parse_frame(chunk: bytes | str) -> dict:
@@ -426,7 +438,7 @@ async def test_stream_replays_recorded_events_oldest_first():
     feed.record(MODEL_LOAD, model="first")
     feed.record(MODEL_UNLOAD, model="second")
 
-    resp = await model_activity_stream(_sse_request(feed), limit=50, model=None, worker=None, event=None, _user=_USER)
+    resp = await model_activity_stream(_sse_request(feed), limit=50, model=None, worker=None, event=None, user=_USER)
     it = resp.body_iterator
     try:
         first = _parse_frame(await asyncio.wait_for(it.__anext__(), timeout=5))
@@ -441,7 +453,7 @@ async def test_stream_replays_recorded_events_oldest_first():
 async def test_stream_pushes_a_live_event_to_its_subscriber():
     """The card's (b): a recorded event reaches a connected subscriber."""
     feed = ModelActivityFeed()
-    resp = await model_activity_stream(_sse_request(feed), limit=50, model=None, worker=None, event=None, _user=_USER)
+    resp = await model_activity_stream(_sse_request(feed), limit=50, model=None, worker=None, event=None, user=_USER)
     it = resp.body_iterator
 
     async def _emit() -> None:
@@ -466,7 +478,7 @@ async def test_stream_pushes_a_live_event_to_its_subscriber():
 async def test_stream_applies_filters_to_live_events():
     feed = ModelActivityFeed()
     resp = await model_activity_stream(
-        _sse_request(feed), limit=50, model=None, worker="pi-4", event=None, _user=_USER,
+        _sse_request(feed), limit=50, model=None, worker="pi-4", event=None, user=_USER,
     )
     it = resp.body_iterator
 
@@ -502,7 +514,7 @@ async def test_stream_requires_a_session(app, feed):
 async def test_stream_without_a_feed_reports_service_starting():
     req = _sse_request(None)
     req.app.state.model_activity = None
-    resp = await model_activity_stream(req, limit=50, _user=_USER)
+    resp = await model_activity_stream(req, limit=50, user=_USER)
     assert resp.status_code == 503
 
 
@@ -514,7 +526,7 @@ async def test_stream_resumes_from_last_event_id():
 
     resp = await model_activity_stream(
         _sse_request(feed, headers={"last-event-id": "2"}),
-        limit=50, model=None, worker=None, event=None, _user=_USER,
+        limit=50, model=None, worker=None, event=None, user=_USER,
     )
     it = resp.body_iterator
     try:
@@ -534,7 +546,7 @@ async def test_stream_resume_ignores_the_catch_up_limit():
 
     resp = await model_activity_stream(
         _sse_request(feed, headers={"last-event-id": "1"}),
-        limit=0, model=None, worker=None, event=None, _user=_USER,
+        limit=0, model=None, worker=None, event=None, user=_USER,
     )
     it = resp.body_iterator
     try:
@@ -555,7 +567,7 @@ async def test_stream_treats_a_resume_id_ahead_of_the_feed_as_a_new_connection()
 
     resp = await model_activity_stream(
         _sse_request(feed, headers={"last-event-id": "9999"}),
-        limit=50, model=None, worker=None, event=None, _user=_USER,
+        limit=50, model=None, worker=None, event=None, user=_USER,
     )
     it = resp.body_iterator
 
@@ -582,7 +594,7 @@ async def test_stream_treats_a_malformed_last_event_id_as_no_resume():
 
     resp = await model_activity_stream(
         _sse_request(feed, headers={"last-event-id": "not-a-number"}),
-        limit=50, model=None, worker=None, event=None, _user=_USER,
+        limit=50, model=None, worker=None, event=None, user=_USER,
     )
     it = resp.body_iterator
     try:
@@ -658,7 +670,7 @@ async def test_stream_rejects_an_unknown_event_filter():
 
     feed = ModelActivityFeed()
     with pytest.raises(HTTPException) as excinfo:
-        await model_activity_stream(_sse_request(feed), limit=50, event="nope", _user=_USER)
+        await model_activity_stream(_sse_request(feed), limit=50, event="nope", user=_USER)
     assert excinfo.value.status_code == 400
 
 
@@ -679,3 +691,198 @@ async def test_app_lifespan_attaches_the_feed(app):
 
     async with app.router.lifespan_context(app):
         assert isinstance(app.state.model_activity, _Feed)
+
+
+# ---------------------------------------------------------------------------
+# Cross-user visibility and subscriber lifetime (Lead review, 2026-09-29)
+# ---------------------------------------------------------------------------
+
+
+async def test_history_scopes_events_to_the_calling_principal(feed):
+    """A member session must not read another principal's activity.
+
+    Every gateway event is stamped with the principal that made the request
+    (``user:<id>`` for a session, an agent's registry name for an agent), so an
+    unfiltered ring let any signed-in user see which models the other users'
+    agents call, how often, and under which agent names. Only an admin gets the
+    whole ring.
+    """
+    feed.record(REQUEST_START, model="mine", owner="user:user-2")
+    feed.record(REQUEST_START, model="theirs", owner="user:user-1")
+    feed.record(MODEL_LOAD, model="controller-level")  # no owner at all
+    feed.record(REQUEST_START, model="agent-owned", owner="agent-a")
+
+    member = await model_activity_history(
+        _sse_request(feed), limit=100, model=None, worker=None, event=None,
+        user=_MEMBER,
+    )
+    assert [e["model"] for e in member["events"]] == ["mine"]
+
+    admin = await model_activity_history(
+        _sse_request(feed), limit=100, model=None, worker=None, event=None,
+        user=_USER,
+    )
+    assert {e["model"] for e in admin["events"]} == {
+        "mine", "theirs", "controller-level", "agent-owned",
+    }
+
+
+async def test_stream_scopes_replay_and_live_frames_to_the_calling_principal():
+    """The scope applies to the catch-up window AND to the live frames."""
+    feed = ModelActivityFeed()
+    feed.record(REQUEST_START, model="theirs-replayed", owner="user:user-1")
+
+    resp = await model_activity_stream(
+        _sse_request(feed), limit=50, model=None, worker=None, event=None,
+        user=_MEMBER,
+    )
+    it = resp.body_iterator
+
+    async def _emit() -> None:
+        await asyncio.sleep(0)
+        feed.record(REQUEST_START, model="theirs-live", owner="user:user-1")
+        feed.record(REQUEST_START, model="mine-live", owner="user:user-2")
+        await asyncio.sleep(0)
+
+    emitter = asyncio.ensure_future(_emit())
+    try:
+        frame = _parse_frame(await asyncio.wait_for(it.__anext__(), timeout=5))
+    finally:
+        emitter.cancel()
+        await it.aclose()
+
+    assert frame["model"] == "mine-live"
+
+
+async def test_stream_handler_leaves_no_subscriber_behind_before_iteration():
+    """A dropped response must not leak a subscriber.
+
+    Setup lives inside the generator, which never runs when the client goes
+    away between the handler returning and Starlette starting to stream; the
+    feed's subscriber count is therefore untouched. With the subscribe in the
+    handler body (the pre-fix shape) each such disconnect left a queue behind
+    forever, because the ``finally`` that would release it never ran.
+    """
+    feed = ModelActivityFeed()
+    resp = await model_activity_stream(
+        _sse_request(feed), limit=50, model=None, worker=None, event=None,
+        user=_USER,
+    )
+    assert feed.stats()["subscribers"] == 0
+    await resp.body_iterator.aclose()
+    assert feed.stats()["subscribers"] == 0
+
+
+async def test_stream_unsubscribes_when_the_client_goes_away():
+    """The subscriber registered once streaming starts is released again."""
+    feed = ModelActivityFeed()
+    resp = await model_activity_stream(
+        _sse_request(feed), limit=50, model=None, worker=None, event=None,
+        user=_USER,
+    )
+    feed.record(MODEL_LOAD, model="m1")
+    # Nothing is registered until streaming actually starts...
+    assert feed.stats()["subscribers"] == 0
+    it = resp.body_iterator
+    try:
+        first = _parse_frame(await asyncio.wait_for(it.__anext__(), timeout=5))
+        assert first["model"] == "m1"
+        assert feed.stats()["subscribers"] == 1
+    finally:
+        await it.aclose()
+
+    assert feed.stats()["subscribers"] == 0
+
+
+def _add_member_user(app, username: str, password: str) -> str:
+    """Inject a non-admin user into the auth store and return their user_id."""
+    auth = app.state.auth
+    invite_code = auth.add_user_invite(username, invited_by_username="admin")
+    auth.complete_invite(
+        username=username,
+        invite_code=invite_code,
+        full_name="Member User",
+        email=f"{username}@test.local",
+        password=password,
+    )
+    return auth.find_user(username)["id"]
+
+
+async def test_member_session_scopes_through_the_real_dependency(app, feed):
+    """The route-level guard: scoping holds through ``get_current_user``.
+
+    The direct-call tests hand the handlers a session dict, which leaves one
+    seam unproven: that the owner the read path scopes on is the same string
+    the gateway stamps for that session. This test goes through the real
+    session dependency and stamps the events with the owner the *gateway*
+    computes for the same session (``user:<id>``), so the two sides have to
+    agree for the member to see its own event at all.
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    from tinyagentos.llm_gateway.auth import _VIA_SESSION, gateway_caller
+
+    auth = app.state.auth
+    if not auth.is_configured():
+        auth.setup_user("admin", "Test Admin", "", "testpass")
+    member_uid = _add_member_user(app, "member", "memberpass1")
+    other_uid = _add_member_user(app, "other", "otherpass1")
+
+    # The identity the gateway resolves for this member's own calls.
+    gateway_request = MagicMock()
+    gateway_request.state.via = _VIA_SESSION
+    gateway_request.state.user_id = member_uid
+    gateway_request.state.agent_name = None
+    gateway_owner = gateway_caller(gateway_request).caller_id
+    assert gateway_owner == f"user:{member_uid}"
+
+    feed.record(REQUEST_START, model="mine", owner=gateway_owner)
+    feed.record(REQUEST_START, model="theirs", owner=f"user:{other_uid}")
+    feed.record(MODEL_LOAD, model="controller-level")
+
+    app.state._startup_complete = True
+    token = auth.create_session(user_id=member_uid, long_lived=True)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(
+        transport=transport,
+        base_url="http://test",
+        cookies={"taos_session": token},
+    ) as member:
+        resp = await member.get("/api/activity/models")
+
+    assert resp.status_code == 200, resp.text
+    events = resp.json()["events"]
+    assert [e["model"] for e in events] == ["mine"]
+    assert events[0]["owner"] == gateway_owner
+
+
+async def test_routes_reject_the_host_local_token(app, feed):
+    """Session-only, not merely "not anonymous".
+
+    ``AuthMiddleware`` accepts the host local token as a credential and stamps
+    a ``user_id`` for it, so on its own it would let a bearer-holding caller
+    read and stream the feed. The ``get_current_user`` dependency the routes
+    require is what rejects that caller: a local token is not a session. Drop
+    the dependency and both routes answer this request.
+
+    The stream request carries an unknown ``event`` filter on purpose. The
+    dependency is resolved before the handler body, so the correct 401 arrives
+    first, while a route that lost its dependency answers 400 straight away
+    instead of streaming into an ASGI transport that buffers the whole body
+    until the client times out. A guard that hangs the suite is a guard nobody
+    keeps.
+    """
+    from httpx import ASGITransport, AsyncClient
+
+    app.state.auth.local_token_path().write_text("token-under-test")
+
+    transport = ASGITransport(app=app)
+    headers = {"Authorization": "Bearer token-under-test"}
+    async with AsyncClient(transport=transport, base_url="http://test", timeout=30) as bearer:
+        history = await bearer.get("/api/activity/models", headers=headers)
+        stream = await bearer.get(
+            "/api/activity/models/stream", params={"event": "nope"}, headers=headers,
+        )
+
+    assert history.status_code == 401
+    assert stream.status_code == 401

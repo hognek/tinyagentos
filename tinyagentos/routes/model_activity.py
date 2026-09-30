@@ -9,6 +9,15 @@ who is calling them, so both require the ``get_current_user`` session dependency
 token, which the middleware would otherwise let through with a ``user_id``, is
 NOT sufficient here.
 
+Every gateway event carries the principal that made the request as its ``owner``
+(session ``user:<id>``, an agent's registry name, or the gateway master-key
+label), on ``model.route`` as well as on ``request.start`` / ``request.finish``.
+An admin session sees the whole ring; a member session sees only the events its
+own principal owns, and a controller-level event with no owner (a scheduler
+load, unload, evict or shrink) is admin-only. The panel never renders ``owner``;
+the scoping is what keeps one session user from reading another's models, agent
+names and request volume.
+
 Filters (``model`` / ``worker`` / ``event``) apply to the history snapshot and
 to the live SSE frames alike; an unknown ``event`` is a 400 rather than a
 silently empty feed.
@@ -74,13 +83,30 @@ def _resume_seq(request: Request) -> int | None:
         return None
 
 
+def _owner_scope(user: dict) -> str | None:
+    """The ``owner`` filter for this caller; ``None`` means "no filter" (admin).
+
+    Reads the session user the ``get_current_user`` dependency resolved rather
+    than re-deriving admin from middleware state, so the decision travels with
+    the credential the route itself required. Fail-closed: anything that is not
+    an admin session is scoped to its own principal, and a caller that owns
+    nothing simply gets an empty feed.
+    """
+    if user.get("is_admin"):
+        return None
+    return f"user:{user.get('id', '')}"
+
+
 def _matches(
     ev: ModelActivityEvent,
     *,
     model: str | None,
     worker: str | None,
     event: str | None,
+    owner: str | None,
 ) -> bool:
+    if owner is not None and ev.owner != owner:
+        return False
     if model is not None and ev.model != model:
         return False
     if worker is not None and ev.worker != worker:
@@ -101,14 +127,24 @@ async def model_activity_history(
     model: str | None = None,
     worker: str | None = None,
     event: str | None = Query(None, description=f"one of: {', '.join(EVENT_TYPES)}"),
-    _user: dict = Depends(get_current_user),
+    user: dict = Depends(get_current_user),
 ):
-    """Recent model-level events, newest first."""
+    """Recent model-level events, newest first.
+
+    Scoped to the caller: an admin gets the whole ring, anyone else gets only
+    the events their own principal owns.
+    """
     event = _validated_event(event)
     feed = _feed(request)
     if feed is None:
         return {"events": [], "count": 0, "event_types": list(EVENT_TYPES)}
-    events = feed.snapshot(limit=limit, model=model, worker=worker, event=event)
+    events = feed.snapshot(
+        limit=limit,
+        model=model,
+        worker=worker,
+        event=event,
+        owner=_owner_scope(user),
+    )
     return {
         "events": [ev.to_dict() for ev in events],
         "count": len(events),
@@ -123,9 +159,13 @@ async def model_activity_stream(
     model: str | None = None,
     worker: str | None = None,
     event: str | None = None,
-    _user: dict = Depends(get_current_user),
+    user: dict = Depends(get_current_user),
 ):
     """SSE stream of model-level events.
+
+    Scoped like the history endpoint: an admin session subscribes to the whole
+    ring, anyone else only to the events their own principal owns, filtered on
+    the live frames as well as in the catch-up window.
 
     A new subscriber is first sent the current ring-buffer window (oldest of
     that window first) and then every live event matching the filters.
@@ -142,6 +182,7 @@ async def model_activity_stream(
     if feed is None:
         return JSONResponse({"detail": "Service starting"}, status_code=503)
 
+    owner = _owner_scope(user)
     resume_seq = _resume_seq(request)
     # A resume id above anything this feed has issued is from a previous
     # process: the counter restarts at 1 after a controller restart, so
@@ -150,25 +191,33 @@ async def model_activity_stream(
     # new connection instead.
     if resume_seq is not None and resume_seq > feed.last_seq:
         resume_seq = None
-
-    # Subscribe BEFORE snapshotting so no event can slip between the two; the
-    # snapshot's highest seq is the dedupe watermark for the live queue.
-    queue = feed.subscribe()
     # On a resume the whole ring is eligible (the gap may exceed `limit`);
     # otherwise `limit` bounds the initial catch-up window.
-    replay = list(reversed(feed.snapshot(
-        limit=feed.maxlen if resume_seq is not None else limit,
-        model=model,
-        worker=worker,
-        event=event,
-    )))
-    if resume_seq is not None:
-        replay = [ev for ev in replay if ev.seq > resume_seq]
-    # Mutable cell: gen() reassigns it, so a closure-local would read unbound.
-    state = {"watermark": max(resume_seq or 0, replay[-1].seq if replay else 0)}
+    window = feed.maxlen if resume_seq is not None else limit
 
     async def gen():
+        # Subscribe and snapshot INSIDE the generator, not in the handler body.
+        # An async generator that is closed without ever being iterated never
+        # runs its body, so a finally in here can only undo setup that also
+        # happened in here: done in the handler, a client that disconnects
+        # between the handler returning and StreamingResponse starting to
+        # stream leaked one subscriber per occurrence, and every producer kept
+        # fanning events into a queue nobody would ever drain (see the same
+        # trap documented in routes/os_events.py). Subscribing BEFORE the
+        # snapshot keeps a gap from opening between the two; the snapshot's
+        # highest seq is then the dedupe watermark for the live queue.
+        queue = feed.subscribe()
         try:
+            replay = list(reversed(feed.snapshot(
+                limit=window,
+                model=model,
+                worker=worker,
+                event=event,
+                owner=owner,
+            )))
+            if resume_seq is not None:
+                replay = [ev for ev in replay if ev.seq > resume_seq]
+            watermark = max(resume_seq or 0, replay[-1].seq if replay else 0)
             for ev in replay:
                 yield _frame(ev)
             while True:
@@ -179,10 +228,12 @@ async def model_activity_stream(
                 except asyncio.TimeoutError:
                     yield ":keepalive\n\n"
                     continue
-                if ev.seq <= state["watermark"]:
+                if ev.seq <= watermark:
                     continue
-                state["watermark"] = ev.seq
-                if not _matches(ev, model=model, worker=worker, event=event):
+                watermark = ev.seq
+                if not _matches(
+                    ev, model=model, worker=worker, event=event, owner=owner,
+                ):
                     continue
                 yield _frame(ev)
         finally:

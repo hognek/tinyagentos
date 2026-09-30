@@ -23,6 +23,13 @@ strings):
     request.start   the proxy began an inference request against a backend
     request.finish  the proxy finished one (carries duration, tokens, rate)
 
+Visibility: an event may carry an ``owner`` -- the principal the event is
+attributable to (the gateway stamps ``user:<id>``, an agent's registry name, or
+the gateway master-key label; a controller-level event such as a scheduler
+model load has none).  The HTTP surface filters on it: a member session only
+ever sees events its own principal owns, an admin sees the whole ring.  See
+``routes/model_activity.py::_owner_scope``.
+
 The feed is deliberately in-process and non-durable: it is an operational
 window ("what happened just now"), not a system of record.  The existing
 ``SystemEventStore`` remains the durable log.
@@ -70,7 +77,11 @@ class ModelActivityEvent:
 
     ``worker`` is the node the event happened on -- ``"controller"`` for the
     local host, a worker name for cluster-attached workers.  ``token_rate`` is
-    output tokens per second, only meaningful on ``request.finish``.
+    output tokens per second, only meaningful on ``request.finish``.  ``owner``
+    is the principal the event is attributable to (``user:<id>``, an agent's
+    registry name, ...) or ``None`` for a controller-level event that belongs
+    to no caller; the HTTP surface scopes on it so one session user cannot read
+    another principal's activity.
     """
 
     seq: int
@@ -78,6 +89,7 @@ class ModelActivityEvent:
     event: str
     model: str
     worker: str = CONTROLLER_WORKER
+    owner: str | None = None
     backend: str = ""
     duration_ms: int | None = None
     tokens_in: int | None = None
@@ -94,6 +106,7 @@ class ModelActivityEvent:
             "event": self.event,
             "model": self.model,
             "worker": self.worker,
+            "owner": self.owner,
             "backend": self.backend,
             "duration_ms": self.duration_ms,
             "tokens_in": self.tokens_in,
@@ -135,6 +148,7 @@ class ModelActivityFeed:
         *,
         model: str,
         worker: str = CONTROLLER_WORKER,
+        owner: str | None = None,
         backend: str = "",
         duration_ms: int | None = None,
         tokens_in: int | None = None,
@@ -144,7 +158,12 @@ class ModelActivityFeed:
         detail: dict[str, Any] | None = None,
         ts: float | None = None,
     ) -> ModelActivityEvent:
-        """Append one event to the ring and fan it out to subscribers."""
+        """Append one event to the ring and fan it out to subscribers.
+
+        ``owner`` is the principal the event is attributable to; it is the key
+        the read surface scopes on, so a producer that knows the caller must
+        pass it.
+        """
         self._seq += 1
         ev = ModelActivityEvent(
             seq=self._seq,
@@ -152,6 +171,7 @@ class ModelActivityFeed:
             event=event,
             model=model,
             worker=worker,
+            owner=owner,
             backend=backend,
             duration_ms=duration_ms,
             tokens_in=tokens_in,
@@ -189,12 +209,14 @@ class ModelActivityFeed:
         model: str | None = None,
         worker: str | None = None,
         event: str | None = None,
-        since: float | None = None,
+        owner: str | None = None,
     ) -> list[ModelActivityEvent]:
         """Return matching events, newest first, capped at *limit*.
 
-        Filters are exact-match on ``model`` / ``worker`` / ``event``; ``since``
-        is an inclusive lower bound on the event timestamp.
+        Filters are exact-match on ``model`` / ``worker`` / ``event`` /
+        ``owner``; every filter defaults to "no filter", which is what the
+        admin-scoped read path wants. A caller that must not see another
+        principal's events passes its own ``owner``.
         """
         if limit <= 0:
             return []
@@ -206,7 +228,7 @@ class ModelActivityFeed:
                 continue
             if event is not None and ev.event != event:
                 continue
-            if since is not None and ev.ts < since:
+            if owner is not None and ev.owner != owner:
                 continue
             out.append(ev)
             if len(out) >= limit:

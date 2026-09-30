@@ -28,7 +28,9 @@ import {
 // NOTE: this is NOT the AI-stack manager (ActivityApp.aiStack.tsx). That
 // surface lists installed/loaded stack units; this one is an event feed.
 
-/** Ring the panel keeps in memory; matches the server's default ring size. */
+/** Ring the panel keeps in memory. Shorter than the server's 500-record ring on
+ *  purpose: the panel renders a bounded list, and the history fetch plus the
+ *  live frames are merged into it. */
 const MAX_EVENTS = MAX_MODEL_ACTIVITY_EVENTS;
 /** No SSE replay -- the history fetch already delivered that window. */
 const STREAM_REPLAY = 0;

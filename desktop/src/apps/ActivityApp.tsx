@@ -945,7 +945,7 @@ export function ActivityApp({ windowId: _windowId }: { windowId: string }) {
           </Card>
         )}
 
-        {/* Model Activity feed (#208) — its own surface, distinct from the
+        {/* Model Activity feed (#208): its own surface, distinct from the
             AI-stack manager in the header (ActivityApp.aiStack.tsx). */}
         <ModelActivityPanel />
 

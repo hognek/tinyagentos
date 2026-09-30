@@ -106,7 +106,7 @@ export async function fetchModelActivity(
 
 export type ModelIconKind = "brain" | "vector" | "image" | "audio" | "vision" | "code";
 
-/** Pick a model icon from its name — the spec asks for a brain for LLMs and a
+/** Pick a model icon from its name: the spec asks for a brain for LLMs and a
  *  vector for embeddings, extended to the other purposes the catalog uses. */
 export function modelIconKind(model: string): ModelIconKind {
   const name = (model || "").toLowerCase();
@@ -141,7 +141,8 @@ export function formatTokens(ev: ModelActivityEvent): string {
   return `${ev.tokens_out} tok${rate}`;
 }
 
-/** Cap the merged feed — matches the server's default ring size. */
+/** Cap the merged feed. The server's ring holds 500 records by default; the
+ *  panel keeps a shorter window so a long-lived tab cannot grow without bound. */
 export const MAX_MODEL_ACTIVITY_EVENTS = 200;
 
 /** Merge two event lists by `seq` (server-assigned, monotonic), newest first.

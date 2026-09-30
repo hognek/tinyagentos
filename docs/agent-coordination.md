@@ -1464,16 +1464,30 @@ default). Two producers feed it:
 It is an operational window, not a system of record: nothing is persisted, and
 `SystemEventStore` remains the durable log.
 
-Both paths sit behind the session cookie — the paths are NOT in
+Both paths sit behind the session cookie: the paths are NOT in
 `EXEMPT_PATHS`, so `AuthMiddleware` 401s an unauthenticated request before the
-handler runs, and no registry scope reaches them. The stream answers `503`
+handler runs, and no registry scope reaches them. The route's own
+`get_current_user` dependency is what enforces that, not the middleware: a
+local-token bearer is a valid credential for the middleware (it stamps a
+`user_id`), and the routes still answer `401` to it. The stream answers `503`
 while `app.state.model_activity` is still starting.
 
-- `GET /api/activity/models` — newest-first history. `?limit=` (1-500, default
+Reads are owner-scoped. A gateway event carries the principal that made the
+request as its `owner` (`user:<id>` for a session, an agent's registry name for
+an agent, the gateway master-key label for the admin key), on `model.route` as
+well as on `request.start` / `request.finish`; the scheduler hooks have no owner
+because a load is a controller-level fact, not a caller's. An admin session sees
+the whole ring, while a member session sees only the events its own principal
+owns, so one user cannot read which models another user's agents call, how
+often, or under which agent names. Controller-level events and other
+principals' traffic stay admin-only; the AI-stack manager panel remains the
+member-visible view of what is loaded.
+
+- `GET /api/activity/models`: newest-first history. `?limit=` (1-500, default
   100), `?model=`, `?worker=`, `?event=`. Answers
   `{"events": [...], "count": N, "event_types": [...]}`; `event_types` is the
   vocabulary the UI builds its filter list from.
-- `GET /api/activity/models/stream` — SSE. `?limit=` (0-500, default 50) caps
+- `GET /api/activity/models/stream`: SSE. `?limit=` (0-500, default 50) caps
   the ring window a new subscriber is caught up with; `0` means live-only,
   which is the right choice for a caller that already fetched the history and
   is deduplicating by `seq`. Filter parameters are the same three as above and
