@@ -77,8 +77,8 @@ _DEFAULT_CHANNEL = "gpu"
 
 # Resource a lease names when the caller supplies none. It has to match what
 # the target worker advertises: Apple Silicon has no CUDA device and registers
-# `gpu-metal` (tinyagentos/installers/mlx_installer.py, scheduler/discovery.py),
-# so a hardcoded CUDA-indexed default would name a resource no Mac worker has.
+# `gpu-metal` (tinyagentos/hardware.py, scheduler/discovery.py), so a hardcoded
+# CUDA-indexed default would name a resource no Mac worker has.
 _DEFAULT_CUDA_RESOURCE = "gpu-cuda-0"
 
 
@@ -89,7 +89,7 @@ def _default_resource() -> str:
     or a node the cluster does not know; a remote worker's GPU class is its own,
     so callers that know the node use :func:`_default_resource_for`.
     """
-    from tinyagentos.installers.mlx_installer import (
+    from tinyagentos.hardware import (
         METAL_RESOURCE_NAME,
         metal_available,
     )
@@ -464,7 +464,7 @@ class _LeaseBody(BaseModel):
     channel: str | None = None
     # Empty means "the caller named no resource": the default is resolved once
     # the target node is known, from that worker's inventory (see
-    # _default_resource_for) — never from this controller's own hardware.
+    # _default_resource_for), never from this controller's own hardware.
     resource: str = ""
 
 

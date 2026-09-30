@@ -1106,7 +1106,7 @@ class TestDefaultLeaseResource:
     """The resource a lease names when the caller names none (taOS #329).
 
     A defaulted lease has to land on a resource id the TARGET worker actually
-    advertises — Apple Silicon advertises `gpu-metal`, a CUDA box `gpu-cuda-N` —
+    advertises -- Apple Silicon advertises `gpu-metal`, a CUDA box `gpu-cuda-N` --
     so the default comes from that worker's inventory, and only falls back to
     this controller's own GPU probe for a node the cluster does not know.
     """
@@ -1115,18 +1115,18 @@ class TestDefaultLeaseResource:
         from tinyagentos.routes.a2a_gpu_lease import _default_resource
 
         with patch(
-            "tinyagentos.installers.mlx_installer.metal_available", return_value=False
+            "tinyagentos.hardware.metal_available", return_value=False
         ):
             assert _default_resource() == "gpu-cuda-0"
         with patch(
-            "tinyagentos.installers.mlx_installer.metal_available", return_value=True
+            "tinyagentos.hardware.metal_available", return_value=True
         ):
             assert _default_resource() == "gpu-metal"
 
     @pytest.mark.asyncio
     async def test_default_resource_comes_from_the_target_worker_not_the_controller(self):
         """A Linux controller managing a Mac worker must default to the Mac's
-        `gpu-metal`, and vice versa — the controller's own probe is irrelevant
+        `gpu-metal`, and vice versa -- the controller's own probe is irrelevant
         to a remote worker's resource name."""
         from tinyagentos.routes.a2a_gpu_lease import (
             _default_resource,
@@ -1153,7 +1153,7 @@ class TestDefaultLeaseResource:
         self, lease_client, bus, app
     ):
         """A claim body with no `resource` must still create a lease on a Mac
-        worker, whose inventory is `gpu-metal` + `cpu-inference` — resolved from
+        worker, whose inventory is `gpu-metal` + `cpu-inference` -- resolved from
         that worker, not from the (Linux) controller running the test."""
         cm = ClusterManager()
         ok, reason = await cm.register_worker(
@@ -1185,7 +1185,7 @@ class TestDefaultLeaseResource:
         """A worker re-registers with a different GPU class between the claim and
         the release: the release names no resource, so it must find the actor's
         lease on the node rather than the resource id the inventory implies
-        now — otherwise the lease stays alive until TTL while the bus says the
+        now -- otherwise the lease stays alive until TTL while the bus says the
         node is free."""
         cm = ClusterManager()
         ok, reason = await cm.register_worker(

@@ -61,8 +61,8 @@ _HOSTNAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 # loaded by the rk-llama-cpp runtime on demand, same as other backends.
 # hailo-ollama is Ollama-compatible, so it reuses the ollama installer which
 # calls POST /api/pull on the hailo-ollama daemon (port 7836).
-# mlx is the Apple Silicon backend: MLXInstaller installs the mlx-lm runtime
-# and pulls the model into the shared layout (~/models/mlx/...).
+# mlx is the Apple Silicon backend: MLXInstaller provisions the pinned mlx-lm
+# runtime and pulls the model into the shared models tree (<models root>/mlx/...).
 # Future per-backend installers (llama-cpp, vllm, comfyui) can land as
 # follow-ups; download is the safest default in the meantime.
 _BACKEND_TO_METHOD: dict[str, str] = {
