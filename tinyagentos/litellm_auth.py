@@ -6,10 +6,10 @@ LiteLLM authorize per-agent keys against ``LiteLLMKeyStore`` instead of its
 Postgres ``LiteLLM_VerificationToken`` table, so virtual keys work with NO
 ``DATABASE_URL`` and no prisma (the ARM / no-Postgres fix).
 
-The hook reads two env vars exported by ``LLMProxy.start`` into the
-subprocess:
-  - ``LITELLM_MASTER_KEY``   -> admin passthrough
-  - ``TAOS_LITELLM_KEYSTORE`` -> path to the SQLite key store
+The hook reads ``TAOS_LITELLM_KEYSTORE`` (the SQLite key store path), which
+``LLMProxy.start`` exports into the subprocess. The LiteLLM master key is NOT
+an admin passthrough any more (LiteLLM removal stage 2a): no taOS caller
+presents it, so here it is an unknown key like any other and gets a 401.
 
 Per-agent model scoping is enforced HERE (read the requested model from the
 body and reject out-of-scope calls) so correctness does not depend on
@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import logging
 import os
-import secrets
 
 logger = logging.getLogger(__name__)
 
@@ -82,14 +81,10 @@ async def user_api_key_auth(request, api_key: str):
     """Authorize an incoming key against the taOS key store.
 
     Returns a ``UserAPIKeyAuth`` on success; raises ``fastapi.HTTPException``
-    (401/403) otherwise. The master key is admin (full access).
+    (401/403) otherwise. The master key gets no special treatment.
     """
     from fastapi import HTTPException
     from litellm.proxy._types import UserAPIKeyAuth
-
-    master = os.environ.get("LITELLM_MASTER_KEY")
-    if master and secrets.compare_digest(api_key, master):
-        return UserAPIKeyAuth(api_key=api_key)
 
     store = _keystore()
     if store is None:

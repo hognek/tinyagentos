@@ -1,5 +1,6 @@
 """G2 wiring: node/agent revocation cuts gateway access, and the middleware
-exempts exactly the two gateway method+path pairs.
+exempts exactly the three gateway method+path pairs (embeddings joined models
+and chat completions in LiteLLM removal stage 2a).
 
 All through the real app (create_app on a tmp data dir, gateway flag on) and
 the real gateway routes.
@@ -181,7 +182,7 @@ class TestAgentArchiveCutsModelAccess:
 
 
 # ---------------------------------------------------------------------------
-# Middleware exemption: exactly two method+path pairs
+# Middleware exemption: exactly three method+path pairs
 # ---------------------------------------------------------------------------
 
 
@@ -189,6 +190,7 @@ class TestExemptionUnit:
     def test_exact_pairs_exempt(self):
         assert _is_exempt("POST", CHAT)
         assert _is_exempt("GET", MODELS)
+        assert _is_exempt("POST", "/api/llm/v1/embeddings")
 
     @pytest.mark.parametrize("method,path", [
         ("GET", CHAT),
@@ -204,7 +206,8 @@ class TestExemptionUnit:
         ("POST", "/api/llm/v1/chat/completions/"),
         ("POST", "/api/llm/v1/chat/completions/x"),
         ("POST", "/api/llm/v1/completions"),
-        ("POST", "/api/llm/v1/embeddings"),
+        ("GET", "/api/llm/v1/embeddings"),
+        ("POST", "/api/llm/v1/embeddings/"),
         ("GET", "/api/llm/v1"),
         ("GET", "/api/llm/v1/"),
         ("GET", "/api/llm/v1/Models"),
@@ -229,6 +232,8 @@ class TestExemptionThroughRealMiddleware:
         # Reaching the route: a body the route rejects (400), not the gate (401).
         resp = await bare.post(CHAT, json={"model": "gpt-small"}, headers=_h(key))
         assert resp.status_code == 400, resp.text
+        resp = await bare.post("/api/llm/v1/embeddings", json={"model": "gpt-small"}, headers=_h(key))
+        assert resp.status_code == 400, resp.text
 
     async def test_exempt_pairs_without_key_are_401(self, bare):
         for resp in (await bare.get(MODELS), await bare.post(CHAT, json={})):
@@ -242,7 +247,7 @@ class TestExemptionThroughRealMiddleware:
         ("GET", "/api/llm/v2/models"),
         ("POST", "/api/llm/v2/chat/completions"),
         ("GET", "/api/llm/v1/models/x"),
-        ("POST", "/api/llm/v1/embeddings"),
+        ("GET", "/api/llm/v1/embeddings"),
     ])
     async def test_neighbours_stay_gated_with_a_gateway_key(self, bare, app, method, path):
         """A neighbour that got past the middleware would answer 404/405; the

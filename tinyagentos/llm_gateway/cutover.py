@@ -37,6 +37,14 @@ from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path,
 logger = logging.getLogger(__name__)
 
 DEVICE = "taos-proxy-litellm"
+# A remote agent has no proxy device and the agent listener is loopback-only,
+# so it has no path to the gateway: it is named, never silently left on
+# LiteLLM. (No network-facing gateway is built for it; see tsk-ilqzq6.)
+REMOTE_NO_GATEWAY_REASON = (
+    "remote agent: no LLM gateway path (the gateway's agent listener is "
+    "loopback-only and a remote agent has no proxy device); it still reaches "
+    "LiteLLM over the network until LiteLLM is removed"
+)
 # Per incus call; a hung container costs this much, then the next agent runs.
 _INCUS_TIMEOUT = 30
 
@@ -138,7 +146,13 @@ async def models_problem(state, models: Iterable[str]) -> str | None:
         b.get("name"): b.get("type")
         for b in (getattr(config, "backends", None) or []) if isinstance(b, dict)
     }
+    from tinyagentos.litellm_config import EMBEDDING_ALIAS
+
     for requested in models:
+        if requested == EMBEDDING_ALIAS:
+            # Served by the gateway's /embeddings (not a chat route): an
+            # allowlist that grants it must not bounce the agent to LiteLLM.
+            continue
         name = requested
         if requested == TAOS_DEFAULT:
             name = await default_chat_model(state)
@@ -219,7 +233,7 @@ async def _reconcile_one(agent, report, skip, *, projects, store, master, gatewa
                          gw, lite, listener_ready, models_problem) -> None:
     name = agent["name"]
     if agent.get("remote"):
-        skip(name, "remote agent: no proxy device (it reaches LiteLLM over the network)")
+        skip(name, REMOTE_NO_GATEWAY_REASON)
         return
     container = _container_name(agent)
     if projects is None:

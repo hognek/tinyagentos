@@ -411,8 +411,9 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     webhook_notifier = WebhookNotifier(config.to_dict())
     notif_store.set_webhook_notifier(webhook_notifier)
     # Optional Postgres URL for LiteLLM's virtual key store. When this
-    # file is present, LiteLLM can mint per-agent keys via /key/generate;
-    # otherwise the deployer falls back to the shared master key. See
+    # file is present, LiteLLM checks its own Postgres virtual keys. taOS
+    # itself mints per-agent keys in its local key store either way (the
+    # master key is never handed to an agent). See
     # docs/design/framework-agnostic-runtime.md.
     db_url_path = data_dir / ".litellm_db_url"
     db_url = db_url_path.read_text().strip() if db_url_path.exists() else None
@@ -1201,6 +1202,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         # Phase 4: reasoning judge — fire on lifecycle session_end.
         from tinyagentos import llm_gateway as _llm_gateway
         from tinyagentos.otel.judge import ReasoningJudge
+        _judge = None
         if _llm_gateway.enabled():
             # The gateway on this controller, as the host (local token = the
             # admin kind). The LiteLLM master key no longer opens it.
@@ -1209,10 +1211,12 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
                 litellm_api_key=app.state.auth.get_local_token() or "",
             )
         else:
-            from tinyagentos.litellm_config import get_litellm_master_key
-            _judge = ReasoningJudge(
-                litellm_base_url=f"http://localhost:{app.state.llm_proxy.port}/v1",
-                litellm_api_key=get_litellm_master_key(data_dir),
+            # Gateway switched off (TAOS_LLM_GATEWAY=0): its routes are not
+            # mounted, and the judge no longer borrows the LiteLLM master key
+            # (LiteLLM removal stage 2a), so there is no judge.
+            logger.warning(
+                "reasoning judge: disabled because the LLM gateway is off "
+                "(TAOS_LLM_GATEWAY=0); it never uses the LiteLLM master key"
             )
         app.state.trace_registry.set_judge(_judge)
 

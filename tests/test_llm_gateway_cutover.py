@@ -506,9 +506,9 @@ def _listener_with_fakes(identity=None):
     ("POST", "/v1/../key/generate"),
 ])
 async def test_listener_refuses_everything_it_does_not_serve(method, path):
-    """Only /v1/embeddings reaches LiteLLM: its admin API, /v1/messages and
-    /v1/responses (which skip the gateway's keys, allowlists and budgets) and
-    every controller route are a 404 at the listener."""
+    """Nothing reaches LiteLLM (embeddings are the gateway's since stage 2a):
+    its admin API, /v1/messages and /v1/responses (which skip the gateway's
+    keys, allowlists and budgets) and every controller route are a 404."""
     listener, fake_passthrough, seen = _listener_with_fakes()
     with patch("tinyagentos.llm_gateway.listener._passthrough", side_effect=fake_passthrough):
         async with AsyncClient(transport=ASGITransport(app=listener), base_url="http://127.0.0.1:4000") as c:
@@ -523,8 +523,8 @@ async def test_listener_refuses_everything_it_does_not_serve(method, path):
     ("/v1/chat/completions/", "main", "/api/llm/v1/chat/completions"),
     ("/chat/completions//", "main", "/api/llm/v1/chat/completions"),
     ("/v1/models/", "main", "/api/llm/v1/models"),
-    ("/v1/embeddings/", "litellm", "/v1/embeddings"),
-    ("/embeddings", "litellm", "/embeddings"),
+    ("/v1/embeddings/", "main", "/api/llm/v1/embeddings"),
+    ("/embeddings", "main", "/api/llm/v1/embeddings"),
 ])
 async def test_listener_normalises_trailing_slashes(path, where, canonical):
     """A trailing slash must not route around the gateway (and its budgets)."""
@@ -570,64 +570,32 @@ async def test_listener_stamps_its_identity_on_every_response():
 
 
 @pytest.mark.asyncio
-async def test_listener_relays_other_paths_to_litellm_verbatim(monkeypatch):
-    """/v1/embeddings (TAOS_EMBEDDING_URL) still works for a migrated agent:
-    method, path, query, bearer and body reach LiteLLM; status and body come back."""
+@pytest.mark.parametrize("path", ["/v1/embeddings", "/embeddings", "/v1/embeddings/"])
+async def test_listener_never_relays_embeddings_to_litellm(monkeypatch, path):
+    """/v1/embeddings (TAOS_EMBEDDING_URL) is served by the gateway since
+    LiteLLM removal stage 2a: the main app gets it at /api/llm/v1/embeddings
+    and no request reaches the LiteLLM port, even when LiteLLM is down."""
     import httpx
 
     from tinyagentos.llm_gateway import listener as mod
 
-    seen = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["method"] = request.method
-        seen["url"] = str(request.url)
-        seen["auth"] = request.headers.get("authorization")
-        seen["body"] = request.content
-
-        class _Wire(httpx.AsyncByteStream):  # a streamed body, like a real socket
-            async def __aiter__(self):
-                yield b'{"object": "list", '
-                yield b'"data": [{"embedding": [0.1]}]}'
-
-        return httpx.Response(201, stream=_Wire(),
-                              headers={"x-litellm": "yes", "content-type": "application/json"})
-
-    real_client = httpx.AsyncClient
-    monkeypatch.setattr(mod.httpx, "AsyncClient",
-                        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
-    main_app = AsyncMock()
-    listener = mod.create_agent_listener_app(main_app, litellm_port=LITELLM_PORT)
-    async with AsyncClient(transport=ASGITransport(app=listener), base_url="http://127.0.0.1:4000") as c:
-        resp = await c.post("/v1/embeddings?x=1", json={"input": "hi", "model": "taos-embed"},
-                            headers={"Authorization": "Bearer sk-taos-agentkey"})
-    assert resp.status_code == 201
-    assert resp.json()["data"][0]["embedding"] == [0.1]
-    assert resp.headers["x-litellm"] == "yes"
-    assert seen["method"] == "POST"
-    assert seen["url"] == f"http://127.0.0.1:{LITELLM_PORT}/v1/embeddings?x=1"
-    assert seen["auth"] == "Bearer sk-taos-agentkey"
-    assert json.loads(seen["body"]) == {"input": "hi", "model": "taos-embed"}
-    main_app.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_listener_answers_502_when_litellm_is_down(monkeypatch):
-    import httpx
-
-    from tinyagentos.llm_gateway import listener as mod
+    litellm_calls = []
 
     def handler(request):
+        litellm_calls.append(str(request.url))
         raise httpx.ConnectError("refused", request=request)
 
     real_client = httpx.AsyncClient
     monkeypatch.setattr(mod.httpx, "AsyncClient",
                         lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
-    listener = mod.create_agent_listener_app(AsyncMock(), litellm_port=LITELLM_PORT)
+    listener, _fake_passthrough, seen = _listener_with_fakes()
     async with AsyncClient(transport=ASGITransport(app=listener), base_url="http://127.0.0.1:4000") as c:
-        resp = await c.post("/v1/embeddings", json={"input": "hi"})
-    assert resp.status_code == 502
-    assert resp.json()["error"]["code"] == "upstream_unavailable"
+        resp = await c.post(path, json={"input": "hi", "model": "taos-embedding-default"},
+                            headers={"Authorization": "Bearer sk-taos-agentkey"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"from": "gateway"}
+    assert seen == {"main": ["/api/llm/v1/embeddings"], "litellm": []}
+    assert litellm_calls == []
 
 
 # ---------------------------------------------------------------------------
