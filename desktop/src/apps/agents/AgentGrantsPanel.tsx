@@ -13,9 +13,9 @@ import { projectsApi, type Project } from "@/lib/projects";
  *
  * A modal an operator opens for a registered agent. It lists that agent's
  * ACTIVE grants grouped by project, with a per-scope Revoke and a per-project
- * "Revoke all", both backed by the owner/admin-gated
+ * "Revoke all", both backed by the admin-gated
  * `POST /api/projects/{id}/members/revoke-agent` route. Global grants
- * (project_id === null) are shown but not revocable here — there is no
+ * (project_id === null) are shown but not revocable here: there is no
  * project to revoke against, and the identity-level registry Revoke already
  * covers them.
  */
@@ -147,7 +147,7 @@ export function AgentGrantsPanel({
         onClick={(e) => e.stopPropagation()}
       >
         <header className="flex items-center justify-between px-4 py-3 border-b border-white/10 shrink-0">
-          <h2 className="text-sm font-medium">Active grants — {agentLabel(target)}</h2>
+          <h2 className="text-sm font-medium">Active grants for {agentLabel(target)}</h2>
           <button
             type="button"
             aria-label="Close grants"
@@ -199,7 +199,7 @@ export function AgentGrantsPanel({
 
                   {group.isGlobal && (
                     <p className="text-[10px] text-shell-text-tertiary mb-2">
-                      not project-bound — revoke via the registry&apos;s identity Revoke
+                      Global scopes are not project-bound. Revoke via the registry&apos;s identity Revoke.
                     </p>
                   )}
 

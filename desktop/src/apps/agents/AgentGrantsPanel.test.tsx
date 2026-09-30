@@ -150,4 +150,29 @@ describe("AgentGrantsPanel", () => {
 
     expect(screen.queryByRole("button", { name: /revoke a2a_send/i })).toBeNull();
   });
+
+  it("uses no em dashes in the panel's user-facing text or labels", async () => {
+    vi.mocked(listAgentGrants).mockResolvedValue([
+      makeGrant({ scope: "project_tasks", project_id: "proj-1" }),
+      makeGrant({ scope: "a2a_send", project_id: null }),
+    ]);
+
+    render(<AgentGrantsPanel target={TARGET} onClose={vi.fn()} />);
+    await waitFor(() => screen.getByText("project_tasks"));
+    await waitFor(() => screen.getByText("a2a_send"));
+
+    // The panel portals into document.body, so read the live DOM. Scope the
+    // sweep to the dialog itself: visible text plus every attribute, since
+    // aria-label/title strings are read by assistive tech and tooltips.
+    const dialogs = Array.from(document.querySelectorAll('[role="dialog"]'));
+    expect(dialogs.length).toBeGreaterThan(0);
+    const nodes = dialogs.flatMap((d) => [d, ...Array.from(d.querySelectorAll("*"))]);
+    const haystack = nodes.flatMap((el) => [
+      el.textContent ?? "",
+      ...Array.from(el.attributes).map((a) => a.value),
+    ]);
+
+    const emDash = "\u2014";
+    expect(haystack.filter((s) => s.includes(emDash))).toEqual([]);
+  });
 });
