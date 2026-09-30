@@ -265,10 +265,7 @@ def _validate_key_not_weak(key_bytes):
         if shared == b"\x00" * 32:
             raise ValueError("weak_key")
     except ValueError as e:
-        if "weak" in str(e) or "low-order" in str(e):
-            raise ValueError("weak_key") from e
-        # Re-raise other ValueError
-        raise
+        raise ValueError("weak_key") from e
     return key_bytes
 
 
@@ -468,10 +465,8 @@ class PairResponder:
         try:
             _validate_key_not_weak(cpub)
             _validate_key_not_weak(c_epub)
-        except ValueError as e:
-            if "weak_key" in str(e):
-                return _err("weak_key")
-            raise
+        except ValueError:
+            return _err("weak_key")
         b_epriv, b_epub = x25519_keypair()
         b_n = os.urandom(16)
         bpub_bytes, b_epub_bytes = pub_bytes(self.static_pub), pub_bytes(b_epub)

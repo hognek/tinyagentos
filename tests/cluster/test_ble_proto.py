@@ -24,7 +24,7 @@ import tinyagentos.cluster.ble.proto as proto
 # 2026-09: protocol v2 (commit/reveal nonces, release audit H1) was written
 # here first; taosusb's files/taosble/proto.py must be re-copied FROM this
 # file so the two stay byte-identical.
-EXPECTED_SHA256 = "a3be058a49367de5b4c8310530b91e868073791e21bd8cc9d9a6e90ddf86593b"
+EXPECTED_SHA256 = "ad6af4879a0da01bd5689fb0f0acc43ef7a36570d0b00a779fff0a9db7eac7c5"
 
 
 def test_proto_is_byte_identical_to_vendored_source():
@@ -250,3 +250,37 @@ def test_trial_exchange_all_zero_result_refused():
         with pytest.raises(ValueError) as exc_info:
             _validate_key_not_weak(good_key)
         assert "weak_key" in str(exc_info.value)
+
+
+# --- RED-FIRST: low-order key must map to weak_key ---------------------------------------------------
+
+def test_low_order_key_is_weak_key():
+    """_validate_key_not_weak maps ANY ValueError from the trial exchange
+    (including 'Error computing shared key.' from cryptography 50.0.0)
+    to ValueError('weak_key')."""
+    from tinyagentos.cluster.ble.proto import _validate_key_not_weak
+    
+    low_order = bytes([1]) + bytes(31)
+    with pytest.raises(ValueError) as exc_info:
+        _validate_key_not_weak(low_order)
+    assert str(exc_info.value) == "weak_key"
+
+
+def test_responder_low_order_epub_gets_weak_key_frame():
+    """PairResponder hello with a low-order epub returns an error frame
+    whose why is exactly 'weak_key', not an uncaught ValueError."""
+    from tinyagentos.cluster.ble.proto import PairResponder, x25519_keypair, b64, json
+    
+    board_id, static_priv = "TEST", x25519_keypair()[0]
+    responder = PairResponder(board_id, static_priv)
+    
+    low_order = bytes([1]) + bytes(31)
+    hello = {"t": "hello", "v": proto.PROTO_VERSION,
+             "cpub": b64(os.urandom(32)),
+             "epub": b64(low_order)}
+    raw = json.dumps(hello).encode("utf-8")
+    reply = responder.handle_message(raw)
+    
+    reply_dict = json.loads(reply.decode("utf-8"))
+    assert reply_dict["t"] == "error"
+    assert reply_dict["why"] == "weak_key"
