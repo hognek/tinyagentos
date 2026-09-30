@@ -27,9 +27,21 @@ from tinyagentos.litellm_config import (
     get_litellm_master_key,
 )
 
-__all__ = ["EMBEDDING_ALIAS", "CLOUD_BACKEND_TYPES"]
+__all__ = ["EMBEDDING_ALIAS", "CLOUD_BACKEND_TYPES", "scoped_key_models"]
 
 logger = logging.getLogger(__name__)
+
+
+def scoped_key_models(models: list[str] | None) -> list[str]:
+    """Return the model list for a newly-minted agent key.
+
+    ``models or ["default"]`` so an agent deployed without an explicit
+    model is scoped to the default chat alias (still usable), not minted
+    with an empty allowlist that the gateway would deny-all.
+    The embedding alias (``taos-embedding-default``) is always appended
+    so an agent that embeds does not lose access on model change.
+    """
+    return list(dict.fromkeys((models or ["default"]) + [EMBEDDING_ALIAS]))
 
 
 def _pid_alive(pid: int) -> bool:
@@ -92,8 +104,9 @@ class LLMProxy:
     When ``database_url`` is set, it's exported as ``DATABASE_URL`` to
     the LiteLLM subprocess so LiteLLM can connect to Postgres and issue
     per-agent virtual keys via ``/key/generate``. Without it LiteLLM
-    runs in routing-only mode — virtual key endpoints return 5xx and
-    the deployer falls back to the shared master key.
+    runs in routing-only mode. Either way taOS mints, re-scopes and
+    deletes per-agent keys in its own key store (see ``create_agent_key``);
+    the master key is only handed to the LiteLLM subprocess itself.
     """
 
     def __init__(
@@ -640,143 +653,100 @@ class LLMProxy:
         self.stop()
         return await self.start(backends, secrets=secrets)
 
+    # Per-agent key admin (mint / re-scope / delete / usage) lives in taOS's
+    # own key store (``litellm_keystore``) and budget store, whatever the
+    # proxy mode. Before LiteLLM removal stage 2a a Postgres-backed proxy
+    # (``inhouse_keys`` off) called LiteLLM's /key/* admin API with the
+    # LiteLLM master key; nothing does that any more. The LLM gateway reads
+    # the same key store, so every key minted here authenticates there.
+    # A legacy LiteLLM Postgres virtual key is unknown to the store: re-scope
+    # and delete answer False for it (logged), and it keeps working on
+    # LiteLLM until that agent is re-keyed.
+
     async def create_agent_key(self, agent_name: str, models: list[str] | None = None,
                                 max_budget: float | None = None) -> str | None:
-        """Create a per-agent virtual key.
-
-        In-house mode mints a token in the local key store (no DB, works on
-        ARM). Otherwise it calls LiteLLM's Postgres-backed /key/generate.
-        """
-        if getattr(self, "inhouse_keys", False):
-            try:
-                # Mirror the Postgres path's ``models or ["default"]`` so an
-                # agent deployed without an explicit model is scoped to the
-                # default chat alias (still usable), not minted with an empty
-                # allowlist that the auth hook would then deny-all.
-                token = self._keystore().mint(agent_name, models or ["default"])
-            except Exception as e:
-                logger.warning("inhouse key mint failed for %s: %s", agent_name, e)
-                return None
-            if max_budget is not None:
-                try:
-                    self._budget_store().set_budget(agent_name, max_budget)
-                except Exception as e:
-                    logger.warning("inhouse budget set failed for %s: %s", agent_name, e)
-            return token
-        if not self.is_running():
-            return None
-        # LiteLLM virtual keys require a Postgres DB. Without one,
-        # /key/generate returns a 500 "DB not connected" error that looks
-        # alarming in logs even though the deployer's master-key fallback
-        # handles it fine. Skip the round-trip in routing-only mode.
-        if not self.database_url:
-            return None
+        """Mint a per-agent key in the local key store (no LiteLLM call)."""
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                body = {
-                    "key_alias": f"taos-{agent_name}",
-                    "models": models or ["default"],
-                    "metadata": {"agent": agent_name, "managed_by": "tinyagentos"},
-                }
-                if max_budget is not None:
-                    body["max_budget"] = max_budget
-                resp = await client.post(f"{self.url}/key/generate", json=body,
-                                          headers={"Authorization": f"Bearer {get_litellm_master_key(self._data_dir)}"})
-                if resp.status_code == 200:
-                    data = resp.json()
-                    return data.get("key", data.get("token"))
-                logger.warning(
-                    "LiteLLM /key/generate returned %d for agent=%s body=%.200s",
-                    resp.status_code, agent_name, resp.text,
-                )
-                return None
+            allowed = scoped_key_models(models)
+            token = self._keystore().mint(agent_name, allowed)
         except Exception as e:
-            logger.warning(f"Failed to create LiteLLM key for {agent_name}: {e}")
-        return None
+            logger.warning("key store mint failed for %s: %s", agent_name, e)
+            return None
+        if max_budget is not None:
+            try:
+                self._budget_store().set_budget(agent_name, max_budget)
+            except Exception as e:
+                logger.warning("budget set failed for %s: %s", agent_name, e)
+        return token
 
     async def update_agent_key(self, key: str, models: list[str]) -> bool:
-        """Re-scope an existing virtual key's allowed models via /key/update.
+        """Re-scope an existing key's allowed models in the local key store.
 
         Keeps the key VALUE unchanged (no container env push / restart needed):
         the framework's ``/v1/models`` with this key then reflects the new
-        permitted set, so it natively sees exactly what the agent is allowed to
-        use. Returns True on success. No-op (False) in routing-only mode (no DB)
-        — there are no per-agent keys to scope there.
+        permitted set. An empty scope is a caller error and is refused.
         """
-        if getattr(self, "inhouse_keys", False):
-            if not key or not models:
-                logger.warning("update_agent_key (inhouse) needs key + models; refusing")
-                return False
-            try:
-                return self._keystore().set_models(key, models)
-            except Exception as e:
-                logger.warning("inhouse key re-scope failed: %s", e)
-                return False
-        if not self.is_running() or not self.database_url or not key:
-            return False
-        if not models:
-            # An empty scope is a caller error, not a request to allow nothing.
-            # Refuse rather than silently substitute a bogus "default" model
-            # (which would scope the key to a model that does not exist).
-            logger.warning("update_agent_key called with empty models; refusing to re-scope key")
+        if not key or not models:
+            logger.warning("update_agent_key needs key + models; refusing")
             return False
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(
-                    f"{self.url}/key/update",
-                    json={"key": key, "models": models},
-                    headers={"Authorization": f"Bearer {get_litellm_master_key(self._data_dir)}"},
-                )
-                if resp.status_code == 200:
-                    return True
-                logger.warning(
-                    "LiteLLM /key/update returned %d body=%.200s",
-                    resp.status_code, resp.text,
-                )
+            allowed = scoped_key_models(models)
+            ok = self._keystore().set_models(key, allowed)
         except Exception as e:
-            logger.warning("Failed to update LiteLLM key models: %s", e)
-        return False
+            logger.warning("key re-scope failed: %s", e)
+            return False
+        if not ok:
+            logger.warning(
+                "update_agent_key: key is not in the local key store (a legacy "
+                "LiteLLM Postgres key?); not re-scoped"
+            )
+        return ok
 
     async def delete_agent_key(self, key: str) -> bool:
-        """Delete a per-agent virtual key."""
-        if getattr(self, "inhouse_keys", False):
-            if not key:
-                return False
-            try:
-                return self._keystore().delete(key)
-            except Exception as e:
-                logger.warning("inhouse key delete failed: %s", e)
-                return False
-        if not self.is_running():
+        """Delete a per-agent key from the local key store (revoking the
+        gateway key minted from it)."""
+        if not key:
             return False
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.post(f"{self.url}/key/delete", json={"keys": [key]},
-                                          headers={"Authorization": f"Bearer {get_litellm_master_key(self._data_dir)}"})
-                if resp.status_code == 200:
-                    return True
-                logger.warning(
-                    "LiteLLM /key/delete returned %d body=%.200s",
-                    resp.status_code, resp.text,
-                )
-                return False
-        except Exception:
+            ok = self._keystore().delete(key)
+        except Exception as e:
+            logger.warning("key delete failed: %s", e)
             return False
+        if not ok:
+            logger.warning(
+                "delete_agent_key: key is not in the local key store (a legacy "
+                "LiteLLM Postgres key?); nothing deleted"
+            )
+        return ok
 
     async def get_key_usage(self, key: str) -> dict | None:
-        """Get usage stats for an agent's key."""
-        if not self.is_running():
+        """Usage for an agent's key, from the local key and budget stores.
+
+        Shaped like LiteLLM's ``/key/info`` answer (``{"key", "info": {...}}``)
+        so existing readers keep working; ``None`` for an unknown key.
+        """
+        if not key:
             return None
         try:
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(f"{self.url}/key/info", params={"key": key},
-                                         headers={"Authorization": f"Bearer {get_litellm_master_key(self._data_dir)}"})
-                if resp.status_code == 200:
-                    return resp.json()
-                logger.warning(
-                    "LiteLLM /key/info returned %d body=%.200s",
-                    resp.status_code, resp.text,
-                )
-        except Exception:
-            pass
-        return None
+            rec = self._keystore().lookup(key)
+        except Exception as e:
+            logger.warning("key usage lookup failed: %s", e)
+            return None
+        if rec is None:
+            return None
+        agent = rec["agent"]
+        budget = None
+        try:
+            budget = self._budget_store().get(agent)
+        except Exception as e:
+            logger.warning("budget lookup failed for %s: %s", agent, e)
+        return {
+            "key": None,  # never echo a credential
+            "info": {
+                "key_alias": f"taos-{agent}",
+                "models": list(rec.get("allowed_models") or []),
+                "spend": float((budget or {}).get("spend_usd") or 0.0),
+                "max_budget": (budget or {}).get("max_budget_usd"),
+                "metadata": {"agent": agent, "managed_by": "tinyagentos"},
+            },
+        }

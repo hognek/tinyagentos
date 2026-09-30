@@ -709,10 +709,10 @@ class TestParityWithLiteLLMHook:
         wrong = token[:-4] + ("AAAA" if not token.endswith("AAAA") else "BBBB")
         assert await self._both(app, wrong, "gpt-a") == ("deny_auth", "deny_auth")
 
-    async def test_master_key_is_admin_on_litellm_but_refused_by_the_gateway(self, app, parity_env):
-        # Deliberate divergence (cutover stage 1): G2 kept master-key-as-admin
-        # for parity; the gateway now maps the master key to nothing.
-        assert await self._both(app, parity_env["master"], "anything") == ("admin", "deny_auth")
+    async def test_master_key_is_refused_by_the_hook_and_the_gateway(self, app, parity_env):
+        # Cutover stage 1 dropped master-key-as-admin from the gateway; stage
+        # 2a dropped it from the LiteLLM hook too, so both agree again.
+        assert await self._both(app, parity_env["master"], "anything") == ("deny_auth", "deny_auth")
 
     async def test_parity_over_budget(self, app, parity_env):
         token = parity_env["store"].mint("par-broke", ["gpt-a"])

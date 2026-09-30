@@ -257,6 +257,13 @@ _AGENT_DECISIONS_ROUTES = (
     ("GET", re.compile(r"^/api/decisions/agent$")),
 )
 
+# Notification route an agent may reach with its own registry JWT (scope
+# notifications_write). POST /api/notifications only.  The route verifies
+# the JWT + grant + project binding.  GET and mark-read stay session-only.
+_AGENT_NOTIFICATIONS_ROUTES = (
+    ("POST", re.compile(r"^/api/notifications$")),
+)
+
 # Device-bearer self-service paths (lock-screen push-token rotation plus
 # decision list/get/answer). A scoped device token (Bearer taosdev_...) may
 # pass through the auth gate on exactly these routes; the route dependency
@@ -341,6 +348,17 @@ _AGENT_SCOPE_REQUEST_ROUTES = (
     ("GET", re.compile(rf"^/api/agents/registry/{_SEG}/scope-requests/{_SEG}$")),
 )
 
+# Credential rotation an agent may reach with its own registry JWT: an agent
+# that suspects its token is stale or leaked can rotate ITSELF without waiting
+# for a human. The route verifies the JWT identity == the path canonical_id (so
+# an agent may only rotate its own credential) and enforces the same rotation
+# cutoff as every other identity path, so a token that is already superseded
+# cannot use this to outlive its supersession. Owner/admin sessions reach the
+# same route through the normal session gate.
+_AGENT_ROTATE_ROUTES = (
+    ("POST", re.compile(rf"^/api/agents/registry/{_SEG}/rotate-tokens$")),
+)
+
 
 def _is_agent_task_path(method: str, path: str) -> bool:
     """True only for the exact subset of task routes a project_tasks token may
@@ -366,6 +384,13 @@ def _is_agent_decisions_path(method: str, path: str) -> bool:
     return any(m == method and rx.match(path) for m, rx in _AGENT_DECISIONS_ROUTES)
 
 
+def _is_agent_notifications_path(method: str, path: str) -> bool:
+    """True only for POST /api/notifications, which a notifications_write token
+    may reach.  GET and mark-read stay session-only.  The route verifies the
+    JWT + grant + project binding."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_NOTIFICATIONS_ROUTES)
+
+
 def _is_agent_files_path(method: str, path: str) -> bool:
     """True only for the project-files routes a files_read / files_write token
     may reach.  Strict method + anchored-regex match; the route verifies the
@@ -380,6 +405,13 @@ def _is_agent_scope_request_path(method: str, path: str) -> bool:
     routes verify the JWT identity == canonical_id; approve/deny are excluded
     (POST with an extra trailing segment) and stay owner/admin session-only."""
     return any(m == method and rx.match(path) for m, rx in _AGENT_SCOPE_REQUEST_ROUTES)
+
+
+def _is_agent_rotate_path(method: str, path: str) -> bool:
+    """True only for POST /api/agents/registry/{id}/rotate-tokens, which an
+    agent may reach with its own registry JWT to rotate its OWN credential. The
+    route verifies the JWT identity == canonical_id."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_ROTATE_ROUTES)
 
 
 def _is_container_request_action_path(method: str, path: str) -> bool:
@@ -471,13 +503,14 @@ _INVITE_INFO_PREFIX = "/i/"
 _AGENT_MODEL_MODELS = "/v1/models"
 _AGENT_MODEL_CHAT = "/v1/chat/completions"
 
-# In-process LLM gateway (tinyagentos/llm_gateway). Exactly two method+path
-# pairs are EXEMPT, like the Agent-as-a-Model pair above: a scoped gateway key
+# In-process LLM gateway (tinyagentos/llm_gateway). Exactly three method+path
+# pairs are EXEMPT (models, chat completions, embeddings), like the Agent-as-a-Model pair above: a scoped gateway key
 # (or the host local token, or a signed-in session) IS the credential and the
 # route's ``gateway_caller`` dependency enforces it, answering an OpenAI-shaped
 # 401 otherwise. Every other /api/llm path or method stays gated here.
 _LLM_GATEWAY_MODELS = "/api/llm/v1/models"
 _LLM_GATEWAY_CHAT = "/api/llm/v1/chat/completions"
+_LLM_GATEWAY_EMBEDDINGS = "/api/llm/v1/embeddings"  # LiteLLM removal stage 2a
 # The gated rest of /api/llm/ still gets an OpenAI-shaped 401: an OpenAI
 # client reads error.message from an object, and the plain
 # {"error": "Authentication required"} string there surfaces as a crash in
@@ -628,6 +661,8 @@ def _is_exempt(method: str, path: str) -> bool:
         return True
     if method == "POST" and path == _LLM_GATEWAY_CHAT:
         return True
+    if method == "POST" and path == _LLM_GATEWAY_EMBEDDINGS:
+        return True
     return False
 
 
@@ -762,8 +797,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     or _is_agent_lists_path(request.method, path)
                     or _is_agent_canvas_path(request.method, path)
                     or _is_agent_decisions_path(request.method, path)
+                    or _is_agent_notifications_path(request.method, path)
                     or _is_agent_files_path(request.method, path)
                     or _is_agent_scope_request_path(request.method, path)
+                    or _is_agent_rotate_path(request.method, path)
                     or _is_container_request_action_path(request.method, path)
                     or _is_agent_container_quota_path(request.method, path)
                     or _is_agent_skill_exec_path(request.method, path)

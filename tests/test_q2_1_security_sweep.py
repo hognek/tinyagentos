@@ -86,9 +86,13 @@ def _stub_litellm(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_litellm_auth_master_key_uses_compare_digest(monkeypatch):
-    """Master-key comparison must go through secrets.compare_digest."""
+async def test_litellm_auth_master_key_is_not_admitted(monkeypatch):
+    """The master-key admin passthrough (and its compare_digest) is gone since
+    LiteLLM removal stage 2a: the master key is an unknown key, refused 401,
+    and never compared against LITELLM_MASTER_KEY at all."""
     import secrets as secrets_mod
+
+    from fastapi import HTTPException
 
     monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-master-123")
     monkeypatch.delenv("TAOS_LITELLM_KEYSTORE", raising=False)
@@ -106,11 +110,10 @@ async def test_litellm_auth_master_key_uses_compare_digest(monkeypatch):
     import tinyagentos.litellm_auth as auth
     importlib.reload(auth)
 
-    result = await auth.user_api_key_auth(_FakeRequest(), "sk-master-123")
-    assert result is not None
-    assert called, "secrets.compare_digest was not called for master-key check"
-    assert called[0][0] == "sk-master-123"
-    assert called[0][1] == "sk-master-123"
+    with pytest.raises(HTTPException) as exc:
+        await auth.user_api_key_auth(_FakeRequest(), "sk-master-123")
+    assert exc.value.status_code == 401
+    assert not any(b == "sk-master-123" for _a, b in called)
 
 
 # ---------------------------------------------------------------------------
