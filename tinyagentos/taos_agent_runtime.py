@@ -284,6 +284,11 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
         # (re-scoping it to the current permitted set), else mint once and persist
         # it. create_agent_key uses a fixed alias, so re-minting would 400 on the
         # alias collision — persisting the value avoids that and keeps it stable.
+        from tinyagentos.llm_proxy import EMBEDDING_ALIAS
+        # The deployer injects TAOS_EMBEDDING_MODEL=taos-embedding-default into
+        # every agent that has an LLM proxy, so the taOS agent's key must also
+        # allow the embedding alias.
+        permitted_models = list(dict.fromkeys(permitted_models + [EMBEDDING_ALIAS]))
         llm_proxy = getattr(app_state, "llm_proxy", None)
         litellm_key: str | None = None
         born_degraded_now = False

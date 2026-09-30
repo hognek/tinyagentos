@@ -526,6 +526,26 @@ class TestLLMProxyOwnership:
         assert LiteLLMKeyStore(default_keystore_path(tmp_path)).lookup(key) == {
             "agent": "routing-only", "allowed_models": ["default"]}
 
+    @pytest.mark.asyncio
+    async def test_create_agent_key_returns_none_and_warns_when_the_mint_raises(self, tmp_path, caplog, monkeypatch):
+        """When the local key store mint raises, create_agent_key must return
+        None and log a warning (the deployer then refuses the deploy rather
+        than handing the agent the master key)."""
+        import logging
+        import tinyagentos.llm_proxy as mod
+
+        class _FakeStore:
+            def mint(self, *a, **kw):
+                raise OSError("disk full")
+
+        monkeypatch.setattr(mod.LLMProxy, "_keystore", lambda self: _FakeStore())
+
+        proxy = mod.LLMProxy(port=4000, data_dir=tmp_path)
+        with caplog.at_level(logging.WARNING, logger="tinyagentos.llm_proxy"):
+            key = await proxy.create_agent_key("boom")
+        assert key is None
+        assert any("key store mint failed for boom" in r.getMessage() for r in caplog.records)
+
 
 class TestPidsListeningOn:
     def test_listening_pid_only_returns_listener_not_client(self):
@@ -644,11 +664,12 @@ class TestInhouseKeys:
 
     @pytest.mark.asyncio
     async def test_update_and_delete_key_inhouse(self, tmp_path):
+        from tinyagentos.litellm_config import EMBEDDING_ALIAS
         proxy = LLMProxy(port=14005, config_dir=tmp_path, data_dir=tmp_path,
                          inhouse_keys=True)
         key = await proxy.create_agent_key("agent-a", ["a"])
         assert await proxy.update_agent_key(key, ["b", "c"]) is True
-        assert proxy._keystore().lookup(key)["allowed_models"] == ["b", "c"]
+        assert proxy._keystore().lookup(key)["allowed_models"] == ["b", "c", EMBEDDING_ALIAS]
         assert await proxy.delete_agent_key(key) is True
         assert proxy._keystore().lookup(key) is None
 

@@ -255,12 +255,20 @@ async def deploy_agent(req: DeployRequest) -> dict:
     if req.extra_config and req.extra_config.get("llm_proxy"):
         proxy = req.extra_config["llm_proxy"]
         if proxy.is_running() or _gateway_port_for(req):
+            from tinyagentos.llm_proxy import EMBEDDING_ALIAS
             # Scope the virtual key to exactly the models this agent is
             # allowed to call. An empty list is preserved as empty (not
             # ["default"]) when the agent was deployed without a model
             # pick so mint failure isn't masked by an ambient alias.
+            # The embedding alias is always included: the deployer injects
+            # TAOS_EMBEDDING_MODEL=taos-embedding-default into every agent
+            # that has an LLM proxy, so the key must allow it.
             key_models = [m for m in [req.model, *(req.fallback_models or [])] if m]
-            llm_key = await proxy.create_agent_key(req.name, models=key_models or None)
+            if key_models:
+                key_models = list(dict.fromkeys(key_models + [EMBEDDING_ALIAS]))
+            else:
+                key_models = [EMBEDDING_ALIAS]
+            llm_key = await proxy.create_agent_key(req.name, models=key_models)
             if llm_key is None:
                 # LiteLLM could not mint (routing-only, no Postgres, or not
                 # running). Two cases:
@@ -279,12 +287,12 @@ async def deploy_agent(req: DeployRequest) -> dict:
                 if db_url is not None:
                     db_host = db_url.split("@")[-1] if "@" in db_url else db_url
                     msg = (
-                        "per-agent LiteLLM virtual key mint failed despite DB "
-                        f"configured at {db_host}. This is a LiteLLM/DB fault "
-                        "(migration pending, DB unreachable, or master-key "
-                        "drift), not a missing-DB capability gap, so the deploy "
-                        "is refused rather than silently using the shared "
-                        "master key. Fix the LiteLLM Postgres connection."
+                        "per-agent virtual key mint failed despite DB "
+                        f"configured at {db_host}. This is a local key store fault "
+                        "(disk full, permission denied, or database locked), not a "
+                        "missing-DB capability gap, so the deploy is refused rather "
+                        "than silently using the shared master key. Fix the local "
+                        "key store."
                     )
                     logger.error("deploy %s: %s", req.name, msg)
                     return {"success": False, "error": msg, "steps": steps}
@@ -307,7 +315,6 @@ async def deploy_agent(req: DeployRequest) -> dict:
                         "needs the LLM gateway (it moves there on the next "
                         "controller start)", req.name,
                     )
-            from tinyagentos.llm_proxy import EMBEDDING_ALIAS
             # Primary key for openclaw's litellm provider.
             env["LITELLM_API_KEY"] = llm_key
             # Compat shim — smolagents and other frameworks still expect OPENAI_API_KEY.

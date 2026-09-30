@@ -141,6 +141,20 @@ async def test_embeddings_model_not_in_the_agents_allowlist_is_403(gw):
 
 
 @pytest.mark.asyncio
+async def test_default_deployed_agent_can_embed_through_the_listener(gw):
+    """A key minted with a chat model plus taos-embedding-default (the shape the
+    deployer now produces) can call /v1/embeddings and gets 200, not 403."""
+    _app, listener, store = gw
+    key = store.mint("deployed-emb", ["qwen3-8b", EMBEDDING_ALIAS])
+    with respx.mock(assert_all_called=False) as router:
+        ollama_embed, llama_embed, litellm = _mock_backends(router)
+        async with _client(listener) as c:
+            resp = await c.post("/v1/embeddings", json={"model": EMBEDDING_ALIAS, "input": "hello"},
+                                headers={"Authorization": f"Bearer {key}"})
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.asyncio
 async def test_embeddings_without_a_key_is_401_and_reaches_nothing(gw):
     _app, listener, _store = gw
     with respx.mock(assert_all_called=False) as router:

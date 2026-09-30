@@ -460,7 +460,7 @@ async def test_ensure_server_falls_back_to_a_scoped_key_not_the_master_key(tmp_p
     key = spawned_cfgs[0].litellm_key
     assert key != master_key and state.taos_opencode_key == key
     assert LiteLLMKeyStore(default_keystore_path(tmp_path)).lookup(key) == {
-        "agent": "taos-agent", "allowed_models": ["gpt-4o"]}
+        "agent": "taos-agent", "allowed_models": ["gpt-4o", "taos-embedding-default"]}
 
 
 @pytest.mark.asyncio

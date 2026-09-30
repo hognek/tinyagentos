@@ -675,12 +675,15 @@ class LLMProxy:
         Keeps the key VALUE unchanged (no container env push / restart needed):
         the framework's ``/v1/models`` with this key then reflects the new
         permitted set. An empty scope is a caller error and is refused.
+        The embedding alias (``taos-embedding-default``) is always preserved
+        so an agent that embeds does not lose access on model change.
         """
         if not key or not models:
             logger.warning("update_agent_key needs key + models; refusing")
             return False
         try:
-            ok = self._keystore().set_models(key, models)
+            allowed = list(dict.fromkeys(models + [EMBEDDING_ALIAS]))
+            ok = self._keystore().set_models(key, allowed)
         except Exception as e:
             logger.warning("key re-scope failed: %s", e)
             return False

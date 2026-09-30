@@ -83,7 +83,7 @@ async def test_deploy_without_a_scoped_key_mints_a_local_key_never_the_master_ke
     request = SimpleNamespace(state=SimpleNamespace(), headers={"authorization": f"Bearer {key}"},
                               app=SimpleNamespace(state=SimpleNamespace(data_dir=tmp_path)))
     caller = gateway_caller(request)
-    assert caller.caller_id == "fresh" and caller.allowed_models == frozenset({"gpt-a"})
+    assert caller.caller_id == "fresh" and caller.allowed_models == frozenset({"gpt-a", "taos-embedding-default"})
 
 
 @pytest.mark.asyncio
@@ -177,7 +177,7 @@ async def test_taos_agent_falls_back_to_a_scoped_key_not_the_master_key(tmp_path
     key = spawned[0].litellm_key
     assert key and key != master
     rec = LiteLLMKeyStore(default_keystore_path(tmp_path)).lookup(key)
-    assert rec == {"agent": "taos-agent", "allowed_models": ["gpt-4o"]}
+    assert rec == {"agent": "taos-agent", "allowed_models": ["gpt-4o", "taos-embedding-default"]}
 
 
 # ---------------------------------------------------------------------------
@@ -235,9 +235,9 @@ async def test_proxy_key_admin_uses_the_local_store_not_litellm(tmp_path, monkey
         assert store.lookup(key) == {"agent": "agent-a", "allowed_models": ["gpt-a"]}
         assert AgentBudgetStore(default_budget_path(tmp_path)).get("agent-a")["max_budget_usd"] == 2.5
         assert await proxy.update_agent_key(key, ["gpt-b"]) is True
-        assert store.lookup(key)["allowed_models"] == ["gpt-b"]
+        assert store.lookup(key)["allowed_models"] == ["gpt-b", "taos-embedding-default"]
         usage = await proxy.get_key_usage(key)
-        assert usage["info"]["models"] == ["gpt-b"]
+        assert usage["info"]["models"] == ["gpt-b", "taos-embedding-default"]
         assert usage["info"]["max_budget"] == 2.5
         assert await proxy.delete_agent_key(key) is True
         assert store.lookup(key) is None

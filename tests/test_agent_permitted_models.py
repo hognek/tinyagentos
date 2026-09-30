@@ -297,7 +297,10 @@ async def test_put_permitted_rescopes_key(monkeypatch):
     resp = await set_permitted_models(req, "alpha", body, user=CurrentUser(is_admin=True, user_id="test-admin"))
     assert resp["key_rescoped"] is True
     calls = cap.get("calls", [])
-    assert any(c["json"]["models"] == resp["permitted"] for c in calls)
+    rescope_calls = [c for c in calls if c["url"] == "keystore:set_models"]
+    assert rescope_calls, "update_agent_key was not called"
+    models_sent = rescope_calls[-1]["json"]["models"]
+    assert set(models_sent) == {"llama3", "qwen3", "taos-embedding-default"}
 
 
 @pytest.mark.asyncio
@@ -354,7 +357,7 @@ async def test_update_agent_model_scopes_key_to_permitted_set(monkeypatch):
     rescope_calls = [c for c in calls if c["url"] == "keystore:set_models"]
     assert rescope_calls, "update_agent_key was not called"
     models_sent = rescope_calls[-1]["json"]["models"]
-    assert set(models_sent) == {"llama3", "qwen3"}
+    assert set(models_sent) == {"llama3", "qwen3", "taos-embedding-default"}
 
 
 @pytest.mark.asyncio
