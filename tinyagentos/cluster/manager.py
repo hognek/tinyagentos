@@ -2,12 +2,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import secrets
 import time
 from typing import TYPE_CHECKING, Coroutine
 
-from tinyagentos.cluster.worker_protocol import GpuLease, WorkerInfo
+from tinyagentos.cluster.worker_protocol import (
+    RESOURCE_CLASS_RE,
+    GpuLease,
+    WorkerInfo,
+)
 
 if TYPE_CHECKING:
     from tinyagentos.cluster.failure_tracker import FailureTracker
@@ -18,9 +21,12 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_TIMEOUT = 30  # seconds before marking worker offline
 
-# Legacy resource-name grammar for backward compatibility with workers that
-# do not send a `resources` inventory on registration.
-_LEGACY_RESOURCE_RE = re.compile(r'^gpu-cuda-\d+$|^npu-[a-z0-9-]+$|^cpu-inference$')
+# Resource-name grammar for backward compatibility with workers that
+# do not send a `resources` inventory on registration. Aliases the same
+# grammar the register/heartbeat paths validate against, so the two cannot
+# drift: the local copy this replaced predated `gpu-metal` and would have
+# rejected an Apple Silicon worker's lease claim.
+_LEGACY_RESOURCE_RE = RESOURCE_CLASS_RE
 
 # Valid worker-initiated status values that gate drain/update protection.
 # Keep in sync with the notification block below and the heartbeat guard.
