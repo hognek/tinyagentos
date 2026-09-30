@@ -878,11 +878,17 @@ async def test_routes_reject_the_host_local_token(app, feed):
 
     transport = ASGITransport(app=app)
     headers = {"Authorization": "Bearer token-under-test"}
-    async with AsyncClient(transport=transport, base_url="http://test", timeout=30) as bearer:
-        history = await bearer.get("/api/activity/models", headers=headers)
-        stream = await bearer.get(
-            "/api/activity/models/stream", params={"event": "nope"}, headers=headers,
-        )
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test", timeout=30) as bearer:
+            history = await bearer.get("/api/activity/models", headers=headers)
+            stream = await bearer.get(
+                "/api/activity/models/stream", params={"event": "nope"}, headers=headers,
+            )
+    finally:
+        # The app fixture is function-scoped, so this cannot reach another test;
+        # leaving a credential file behind is still a landmine for any future
+        # fixture that reuses the data dir.
+        app.state.auth.local_token_path().unlink(missing_ok=True)
 
     assert history.status_code == 401
     assert stream.status_code == 401
