@@ -17,4 +17,8 @@
 - **Activity**: live feed of everything agents do (tool calls, model calls, errors).
 - **Decisions**: your inbox for agent approvals and questions.
 - **Observatory**: watch the agent fleet; pause or throttle work lanes.
+- **Notifications**: an agent with the `notifications_write` grant can post
+  notifications to the bell. Global grants go to instance admins; per-project
+  grants go to that project's owner only. The agent's canonical_id becomes the
+  source and is never spoofable.
 - Other bundled apps (Library, Channels, Secrets, Routines, Images, MCP, Guides and more); if you do not know one, guess from its name and point to Guides.

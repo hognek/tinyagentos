@@ -102,6 +102,7 @@ _ALLOWED_SCOPES = frozenset({
     "canvas_read", "canvas_write",
     "decisions_read", "decisions_write",
     "observatory_control",
+    "notifications_write",
 })
 
 

@@ -84,6 +84,7 @@ SYSTEM_AGENT_API_SCOPES = (
     "project_doc_review",
     "observatory_control",
     "registry_feeds_read",
+    "notifications_write",
 )
 
 # How much of the install id goes into the canonical_id and the handle.  The
