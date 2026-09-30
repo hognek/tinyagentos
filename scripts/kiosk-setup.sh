@@ -171,7 +171,7 @@ if [ "${TAOS_EXTRAS_BLE:-1}" != "0" ] && [ "${TAOS_EXTRAS_BLE:-1}" != "false" ];
     if [ -f "$TAOS_DIR/.venv/bin/pip" ]; then
         echo "Installing ble extra into taOS venv at $TAOS_DIR/.venv"
         # Get the venv owner (the service user) so pip doesn't hit permission errors
-        local venv_owner=""
+        venv_owner=""
         if command -v systemctl >/dev/null 2>&1; then
             venv_owner="$(systemctl show tinyagentos -p User --value 2>/dev/null || true)"
         fi
@@ -179,16 +179,10 @@ if [ "${TAOS_EXTRAS_BLE:-1}" != "0" ] && [ "${TAOS_EXTRAS_BLE:-1}" != "false" ];
             venv_owner="$(stat -c %U "$TAOS_DIR/.venv" 2>/dev/null)"
         fi
         
-        # If we found a venv owner and TAOS_USER is set, run pip as the venv owner
-        if [[ -n "$venv_owner" ]] && [[ -n "$TAOS_USER" ]]; then
+        if [[ -n "$venv_owner" ]] && [[ "$venv_owner" != "$(whoami)" ]]; then
             sudo -u "$venv_owner" "$TAOS_DIR/.venv/bin/pip" install --quiet -e "$TAOS_DIR[proxy,ble]"
         else
-            # Fallback to current behavior (install as current user or TAOS_USER)
-            if [[ -n "$TAOS_USER" ]] && [[ "$TAOS_USER" != "$(whoami)" ]]; then
-                sudo -u "$TAOS_USER" "$TAOS_DIR/.venv/bin/pip" install --quiet -e "$TAOS_DIR[proxy,ble]"
-            else
-                "$TAOS_DIR/.venv/bin/pip" install --quiet -e "$TAOS_DIR[proxy,ble]"
-            fi
+            "$TAOS_DIR/.venv/bin/pip" install --quiet -e "$TAOS_DIR[proxy,ble]"
         fi
     else
         echo "Warning: taOS venv not found at $TAOS_DIR/.venv, ble extra not installed"
