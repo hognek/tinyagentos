@@ -87,7 +87,12 @@ def _spend(data_dir: Path, agent: str) -> float | None:
 
 
 def _trace_calls(data_dir: Path, agent: str) -> int | None:
-    """``llm_call`` rows across the agent's hourly trace buckets (None: unreadable)."""
+    """``llm_call`` rows across the agent's hourly trace buckets.
+
+    A legacy bucket with no ``trace_events`` table holds no llm_call rows and
+    counts 0. Any other sqlite error (locked, corrupt) makes the whole count
+    None: unknown is not zero.
+    """
     trace_dir = data_dir / "trace" / agent
     if not trace_dir.is_dir():
         return 0
@@ -95,6 +100,11 @@ def _trace_calls(data_dir: Path, agent: str) -> int | None:
     for db in sorted(trace_dir.glob("*.db")):
         try:
             with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5) as conn:
+                has_table = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'trace_events'"
+                ).fetchone()
+                if not has_table:
+                    continue
                 row = conn.execute(
                     "SELECT COUNT(*) FROM trace_events WHERE kind = 'llm_call'"
                 ).fetchone()

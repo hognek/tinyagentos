@@ -16,3 +16,7 @@
 - taOS agent chat on the opencode harness no longer answers 503 "LiteLLM
   proxy is not running" when the gateway can serve its models. With no path
   at all, the 503 now says why the gateway could not carry it.
+- `scripts/llm_gateway_parity.py` no longer reports an agent's trace count
+  as unknown when one of its hourly trace buckets is a legacy file without a
+  `trace_events` table; that bucket counts 0. Other sqlite errors (locked,
+  corrupt) still make the count unknown.
