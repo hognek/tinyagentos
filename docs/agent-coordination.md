@@ -1802,14 +1802,52 @@ valid for admin/system callers but is no longer bound to any agent name.
 ## In-process LLM gateway (`/api/llm/v1`, scoped gateway keys, session or host local token)
 
 `tinyagentos/llm_gateway/` is the in-controller replacement for the LiteLLM
-proxy. It is mounted only when the controller starts with
-`TAOS_LLM_GATEWAY=1`; otherwise `/api/llm/v1/*` does not exist (404 for a
-signed-in caller). LiteLLM keeps running beside it, unchanged.
+proxy, and it is ON BY DEFAULT (cutover stage 1). An operator turns it off
+with `TAOS_LLM_GATEWAY=0` (or `false` / `no` / `off`) in the controller's
+environment; then `/api/llm/v1/*` does not exist (404 for a signed-in caller)
+and agents are moved back to LiteLLM at the next start. LiteLLM still runs
+beside the gateway in stage 1 and is removed in a later stage.
+
+How agents reach it. An agent's base URL does not change: it is still
+`http://127.0.0.1:4000/v1` inside its container (openclaw:
+`http://127.0.0.1:4000`). That address is the incus proxy device
+`taos-proxy-litellm`; its host side (`connect`) used to be LiteLLM's host port
+(`server.litellm_port`, 7834) and is now the gateway's AGENT LISTENER,
+`127.0.0.1:7837` on the host (`server.llm_gateway_port` or
+`TAOS_LLM_GATEWAY_PORT`; `0` disables the listener and keeps every agent on
+LiteLLM). The listener binds loopback only. It serves `/v1/models` and
+`/v1/chat/completions` (and the un-prefixed forms) from the gateway, and
+relays every other path (for example `/v1/embeddings`, which
+`TAOS_EMBEDDING_URL` points at) unchanged to LiteLLM.
+
+At every controller start `llm_gateway/cutover.py` reconciles each local
+agent's device, resolving the container's incus project (agent containers
+live in e.g. `user-999`) and passing `--project`:
+
+- gateway on: the agent's gateway key is minted FIRST from its LiteLLM
+  `agent_keys` row (same hash, `key_id` `gk_lit_...`, same allowlist, so the
+  key the agent already holds keeps working), then the device is set to the
+  listener. No restart, no redeploy.
+- An agent whose key cannot be read stays on LiteLLM and is logged
+  (`llm gateway cutover: <agent> left as is: <reason>`): no key recorded, the
+  shared master key, a key the local key store does not hold (for example a
+  LiteLLM Postgres virtual key) or another agent's key. Nothing unscoped is
+  minted. Remote agents have no device and are skipped.
+- gateway off: every device pointing at the listener is pointed back at
+  LiteLLM.
+
+Only a device whose current value was read and recognised is changed, so a
+second run changes nothing. New local deploys go straight to the listener
+once it has been seen accepting connections. By hand (the same commands the
+reconcile runs):
+`incus config device get <container> taos-proxy-litellm connect --project <project>`
+and
+`incus config device set <container> taos-proxy-litellm connect=tcp:127.0.0.1:7837 --project <project>`.
 
 - `GET /api/llm/v1/models`: OpenAI list shape. Every chat model name in the
   routing table, plus the alias `taos-default` first.
-- `POST /api/llm/v1/chat/completions`: non-streaming only (`stream: true` is a
-  400 until streaming lands). The body is forwarded verbatim, `tools` /
+- `POST /api/llm/v1/chat/completions`: streaming and non-streaming. The body
+  is forwarded verbatim, `tools` /
   `tool_choice` / `tool_calls` included; only `model` is rewritten to the
   backend's own id. Only OpenAI-compatible backends (LiteLLM's `openai/`
   prefix) are served; any other backend type is a 501 naming the model.
@@ -1839,9 +1877,13 @@ so OpenAI clients surface it as bad credentials. `gateway_caller` accepts:
   or one node (`node:<id>`), stored only as a SHA-256 hash, compared with
   `hmac.compare_digest`, optionally expiring. It may use exactly the models it
   names: an EMPTY list denies every model (LiteLLM read it as allow-all);
-- a legacy per-agent LiteLLM key (`sk-taos-...`, the `agent_keys` table), with
-  its allowlist;
-- the per-install LiteLLM master key, as admin (parity with the LiteLLM hook).
+- an agent's LiteLLM key (`sk-taos-...`), with its allowlist: the gateway key
+  minted from it by the cutover once that exists (its revocation is final),
+  otherwise the `agent_keys` row itself.
+
+The per-install LiteLLM master key is NOT accepted (it was admin until cutover
+stage 1): it is a 401 like any unknown key. The host's own callers (the
+reasoning judge, for one) use the host local token.
 
 The `taos-default` alias rule: a caller allowed `taos-default` may use
 whatever it CURRENTLY resolves to, without the concrete model in its list.
@@ -1872,7 +1914,7 @@ the choice is made, from two config.yaml keys:
 - `taos_agent.framework`: `auto` (default; picoclaw on mobile, opencode
   elsewhere), `opencode` or `picoclaw` (operator overrides).
 
-PicoClaw needs the LLM gateway (`TAOS_LLM_GATEWAY=1`) and a `picoclaw` binary
+PicoClaw needs the LLM gateway (on unless `TAOS_LLM_GATEWAY=0`) and a `picoclaw` binary
 (`TAOS_PICOCLAW_BIN`, PATH, `/usr/local/bin`, `/usr/bin`). Without either,
 opencode runs and the reason is logged, e.g. exactly
 `picoclaw preferred, gateway disabled, using opencode`. An unknown config

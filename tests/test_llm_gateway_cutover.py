@@ -1,0 +1,499 @@
+"""LiteLLM -> in-process gateway cutover, stage 1.
+
+The gateway is the default; agents are moved onto it by retargeting the
+incus proxy device behind their own ``127.0.0.1:4000`` (their base URL never
+changes); each agent's gateway key is minted from its LiteLLM ``agent_keys``
+row BEFORE its device moves; the LiteLLM master key no longer opens the
+gateway; and the other HTTP callers of the LiteLLM port point at the gateway.
+
+The incus CLI is faked at ``tinyagentos.containers._run`` with a tiny model of
+the device table, so every command the cutover issues is recorded and its
+effect is visible to the next command (idempotency and rollback are measured,
+not assumed).
+"""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path, token_hash
+
+GATEWAY_PORT = 7837
+LITELLM_PORT = 7834
+DEVICE = "taos-proxy-litellm"
+PROJECT = "user-999"
+
+
+# ---------------------------------------------------------------------------
+# Fake incus: a device table the commands read and write
+# ---------------------------------------------------------------------------
+
+
+class FakeIncus:
+    """Just enough of ``incus`` for the cutover: list, device get, device set."""
+
+    def __init__(self, containers: dict[str, str], connect: dict[str, str]):
+        self.projects = dict(containers)  # container -> project
+        self.connect = dict(connect)  # container -> current connect
+        self.calls: list[list[str]] = []
+        self.fail_get: set[str] = set()
+
+    @staticmethod
+    def _split(cmd):
+        args, project = [], None
+        it = iter(cmd)
+        for a in it:
+            if a == "--project":
+                project = next(it)
+            else:
+                args.append(a)
+        return args, project
+
+    async def run(self, cmd, timeout=120):
+        self.calls.append(list(cmd))
+        args, project = self._split(cmd)
+        if args[:2] == ["incus", "list"]:
+            return 0, json.dumps([{"name": n, "project": p} for n, p in self.projects.items()])
+        if args[:4] == ["incus", "config", "device", "get"]:
+            name, dev, key = args[4], args[5], args[6]
+            if project != self.projects.get(name):
+                return 1, f"Error: Failed to fetch instance {name!r} in project {project!r}: not found"
+            if name in self.fail_get or dev != DEVICE or key != "connect":
+                return 1, "Error: boom"
+            return 0, self.connect[name] + "\n"
+        if args[:4] == ["incus", "config", "device", "set"]:
+            name, dev, kv = args[4], args[5], args[6]
+            if project != self.projects.get(name):
+                return 1, "Error: not found"
+            key, _, value = kv.partition("=")
+            assert dev == DEVICE and key == "connect", cmd
+            self.connect[name] = value
+            return 0, ""
+        return 1, f"unexpected command {cmd}"
+
+    def sets(self):
+        return [c for c in self.calls if c[:4] == ["incus", "config", "device", "set"]]
+
+
+def _agent_with_key(data_dir: Path, name: str, models=("gpt-a",)) -> dict:
+    key = LiteLLMKeyStore(default_keystore_path(data_dir)).mint(name, list(models))
+    return {"name": name, "llm_key": key}
+
+
+def _request(data_dir: Path, bearer: str):
+    return SimpleNamespace(
+        state=SimpleNamespace(),
+        headers={"authorization": f"Bearer {bearer}"},
+        app=SimpleNamespace(state=SimpleNamespace(data_dir=data_dir)),
+    )
+
+
+async def _reconcile(fake, agents, data_dir, *, on=True, ready=True):
+    from tinyagentos.llm_gateway import cutover
+
+    with patch("tinyagentos.containers._run", side_effect=fake.run):
+        return await cutover.reconcile_agents(
+            agents=agents,
+            data_dir=data_dir,
+            gateway_on=on,
+            gateway_port=GATEWAY_PORT,
+            litellm_port=LITELLM_PORT,
+            listener_ready=ready,
+        )
+
+
+# ---------------------------------------------------------------------------
+# RED-FIRST 1: with no config, the gateway routes are mounted and answer
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_gateway_is_mounted_and_answers_with_no_flag_set(tmp_data_dir, monkeypatch):
+    from tinyagentos.app import create_app
+
+    monkeypatch.delenv("TAOS_LLM_GATEWAY", raising=False)
+    app = create_app(data_dir=tmp_data_dir)
+    app.state._startup_complete = True
+    token = app.state.auth.get_local_token()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test",
+                           headers={"Authorization": f"Bearer {token}"}) as c:
+        resp = await c.get("/api/llm/v1/models")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["object"] == "list"
+
+
+# ---------------------------------------------------------------------------
+# RED-FIRST 2: an existing agent's LiteLLM key authenticates after migration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_existing_agent_litellm_key_authenticates_on_the_gateway_after_migration(tmp_path):
+    from tinyagentos.llm_gateway.auth import gateway_caller
+
+    agent = _agent_with_key(tmp_path, "naira", ["gpt-a"])
+    fake = FakeIncus({"taos-agent-naira": PROJECT},
+                     {"taos-agent-naira": f"tcp:127.0.0.1:{LITELLM_PORT}"})
+    report = await _reconcile(fake, [agent], tmp_path)
+
+    assert [r["agent"] for r in report["repointed"]] == ["naira"]
+    caller = gateway_caller(_request(tmp_path, agent["llm_key"]))
+    assert caller.caller_id == "naira"
+    assert caller.kind == "agent"
+    assert caller.allowed_models == frozenset({"gpt-a"})
+    # It is the MINTED gateway key that authenticates, not the legacy row.
+    assert caller.key_id is not None and caller.key_id.startswith("gk_lit_")
+
+
+# ---------------------------------------------------------------------------
+# RED-FIRST 3: the master key alone is refused by the gateway
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_master_key_alone_is_refused_by_the_gateway(tmp_data_dir, monkeypatch):
+    from tinyagentos.app import create_app
+    from tinyagentos.litellm_config import get_litellm_master_key
+
+    monkeypatch.setenv("TAOS_LLM_GATEWAY", "1")
+    app = create_app(data_dir=tmp_data_dir)
+    app.state._startup_complete = True
+    master = get_litellm_master_key(tmp_data_dir)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test",
+                           headers={"Authorization": f"Bearer {master}"}) as c:
+        models = await c.get("/api/llm/v1/models")
+        chat = await c.post("/api/llm/v1/chat/completions",
+                            json={"model": "taos-default",
+                                  "messages": [{"role": "user", "content": "hi"}]})
+    assert models.status_code == 401, models.text
+    assert chat.status_code == 401, chat.text
+    assert models.json()["error"]["code"] == "invalid_api_key"
+
+
+def test_master_key_maps_to_no_caller(tmp_path):
+    from tinyagentos.llm_gateway.auth import gateway_caller
+    from tinyagentos.llm_gateway.errors import GatewayError
+    from tinyagentos.litellm_config import get_litellm_master_key
+
+    master = get_litellm_master_key(tmp_path)
+    with pytest.raises(GatewayError) as exc:
+        gateway_caller(_request(tmp_path, master))
+    assert exc.value.status == 401
+
+
+# ---------------------------------------------------------------------------
+# RED-FIRST 4: a container proxy-device update targets the gateway port
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_migration_repoints_the_proxy_device_at_the_gateway_port_in_the_agents_project(tmp_path):
+    agent = _agent_with_key(tmp_path, "naira")
+    fake = FakeIncus({"taos-agent-naira": PROJECT, "taos-agent-other": "default"},
+                     {"taos-agent-naira": f"tcp:127.0.0.1:{LITELLM_PORT}",
+                      "taos-agent-other": f"tcp:127.0.0.1:{LITELLM_PORT}"})
+    await _reconcile(fake, [agent], tmp_path)
+
+    assert fake.sets() == [[
+        "incus", "config", "device", "set", "taos-agent-naira", DEVICE,
+        f"connect=tcp:127.0.0.1:{GATEWAY_PORT}", "--project", PROJECT,
+    ]]
+    assert fake.connect["taos-agent-naira"] == f"tcp:127.0.0.1:{GATEWAY_PORT}"
+    # Only agents in config are touched.
+    assert fake.connect["taos-agent-other"] == f"tcp:127.0.0.1:{LITELLM_PORT}"
+
+
+@pytest.mark.asyncio
+async def test_new_deploy_attaches_its_proxy_device_to_the_gateway_port(tmp_path, monkeypatch):
+    from tinyagentos.deployer import DeployRequest, deploy_agent
+
+    monkeypatch.delenv("TAOS_LLM_GATEWAY", raising=False)
+    store = LiteLLMKeyStore(default_keystore_path(tmp_path))
+    proxy = MagicMock()
+    proxy.is_running.return_value = True
+    proxy.port = LITELLM_PORT
+    proxy.url = f"http://localhost:{LITELLM_PORT}"
+    proxy.database_url = None
+    proxy.create_agent_key = AsyncMock(side_effect=lambda name, models=None: store.mint(name, models or ["default"]))
+    req = DeployRequest(name="fresh", framework="smolagents", model="gpt-a", data_dir=tmp_path,
+                        extra_config={"llm_proxy": proxy, "llm_gateway_port": GATEWAY_PORT})
+
+    async def mock_exec(name, cmd, **kwargs):
+        return (0, "10.0.0.5") if "hostname -I" in " ".join(cmd) else (0, "ok")
+
+    with patch("tinyagentos.deployer.create_container", new_callable=AsyncMock) as mock_create, \
+         patch("tinyagentos.deployer.exec_in_container", side_effect=mock_exec), \
+         patch("tinyagentos.deployer.push_file", new_callable=AsyncMock, return_value=(0, "")), \
+         patch("tinyagentos.deployer.add_proxy_device", new_callable=AsyncMock) as dev:
+        mock_create.return_value = {"success": True, "name": "taos-agent-fresh"}
+        dev.return_value = {"success": True, "output": ""}
+        result = await deploy_agent(req)
+
+    assert result["success"] is True, result
+    call = next(c for c in dev.call_args_list if c.args[1] == DEVICE)
+    assert call.kwargs["listen"] == "tcp:127.0.0.1:4000"
+    assert call.kwargs["connect"] == f"tcp:127.0.0.1:{GATEWAY_PORT}"
+    # The key it was handed authenticates on the gateway as this agent.
+    from tinyagentos.llm_gateway.auth import gateway_caller
+    caller = gateway_caller(_request(tmp_path, result["llm_key"]))
+    assert caller.caller_id == "fresh" and caller.key_id.startswith("gk_lit_")
+
+
+# ---------------------------------------------------------------------------
+# RED-FIRST 5: otel/judge.py's default base URL points at the gateway
+# ---------------------------------------------------------------------------
+
+
+def test_judge_default_base_url_points_at_the_gateway():
+    from tinyagentos.otel.judge import ReasoningJudge
+
+    judge = ReasoningJudge(litellm_api_key="k")
+    assert judge._base_url == "http://127.0.0.1:6969/api/llm/v1"
+
+
+# ---------------------------------------------------------------------------
+# Migration safety (green-only; each guards a named requirement)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_migration_is_idempotent(tmp_path):
+    agent = _agent_with_key(tmp_path, "naira")
+    fake = FakeIncus({"taos-agent-naira": PROJECT},
+                     {"taos-agent-naira": f"tcp:127.0.0.1:{LITELLM_PORT}"})
+    await _reconcile(fake, [agent], tmp_path)
+    first_sets = len(fake.sets())
+    report = await _reconcile(fake, [agent], tmp_path)
+    assert len(fake.sets()) == first_sets == 1
+    assert report["repointed"] == []
+    assert [r["agent"] for r in report["unchanged"]] == ["naira"]
+
+
+@pytest.mark.asyncio
+async def test_rollback_points_the_device_back_at_litellm_and_is_idempotent(tmp_path):
+    agent = _agent_with_key(tmp_path, "naira")
+    fake = FakeIncus({"taos-agent-naira": PROJECT},
+                     {"taos-agent-naira": f"tcp:127.0.0.1:{LITELLM_PORT}"})
+    await _reconcile(fake, [agent], tmp_path)
+    assert fake.connect["taos-agent-naira"] == f"tcp:127.0.0.1:{GATEWAY_PORT}"
+
+    report = await _reconcile(fake, [agent], tmp_path, on=False, ready=False)
+    assert fake.connect["taos-agent-naira"] == f"tcp:127.0.0.1:{LITELLM_PORT}"
+    assert fake.sets()[-1] == [
+        "incus", "config", "device", "set", "taos-agent-naira", DEVICE,
+        f"connect=tcp:127.0.0.1:{LITELLM_PORT}", "--project", PROJECT,
+    ]
+    assert [r["agent"] for r in report["repointed"]] == ["naira"]
+    n = len(fake.sets())
+    again = await _reconcile(fake, [agent], tmp_path, on=False, ready=False)
+    assert len(fake.sets()) == n
+    assert again["repointed"] == []
+
+
+@pytest.mark.asyncio
+async def test_key_is_minted_before_the_device_moves(tmp_path):
+    agent = _agent_with_key(tmp_path, "naira")
+    fake = FakeIncus({"taos-agent-naira": PROJECT},
+                     {"taos-agent-naira": f"tcp:127.0.0.1:{LITELLM_PORT}"})
+    seen = {}
+    real_run = fake.run
+
+    async def run(cmd, timeout=120):
+        if cmd[:4] == ["incus", "config", "device", "set"]:
+            rec = LiteLLMKeyStore(default_keystore_path(tmp_path)).gateway_key_by_hash(
+                token_hash(agent["llm_key"]))
+            seen["row_at_set"] = rec
+        return await real_run(cmd, timeout)
+
+    fake.run = run
+    await _reconcile(fake, [agent], tmp_path)
+    rec = seen["row_at_set"]
+    assert rec is not None and rec["bound_to"] == "naira" and rec["revoked_ts"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["no_key", "master_key", "unknown_key", "other_agents_key", "remote"])
+async def test_agent_whose_key_cannot_be_read_stays_on_litellm(tmp_path, case):
+    from tinyagentos.litellm_config import get_litellm_master_key
+
+    other = _agent_with_key(tmp_path, "mary")
+    agent = {"name": "naira"}
+    if case == "master_key":
+        agent["llm_key"] = get_litellm_master_key(tmp_path)
+    elif case == "unknown_key":
+        agent["llm_key"] = "sk-" + "x" * 40
+    elif case == "other_agents_key":
+        agent["llm_key"] = other["llm_key"]
+    elif case == "remote":
+        agent = dict(_agent_with_key(tmp_path, "naira"), remote="worker-1")
+    fake = FakeIncus({"taos-agent-naira": PROJECT},
+                     {"taos-agent-naira": f"tcp:127.0.0.1:{LITELLM_PORT}"})
+    before = LiteLLMKeyStore(default_keystore_path(tmp_path))
+    with before._connect() as conn:
+        rows_before = conn.execute("SELECT COUNT(*) FROM gateway_keys").fetchone()[0]
+
+    report = await _reconcile(fake, [agent], tmp_path)
+
+    assert fake.sets() == []
+    assert fake.connect["taos-agent-naira"] == f"tcp:127.0.0.1:{LITELLM_PORT}"
+    assert [r["agent"] for r in report["skipped"]] == ["naira"]
+    assert report["skipped"][0]["reason"]
+    with before._connect() as conn:
+        rows_after = conn.execute("SELECT COUNT(*) FROM gateway_keys").fetchone()[0]
+    assert rows_after == rows_before  # nothing minted, scoped or otherwise
+
+
+@pytest.mark.asyncio
+async def test_unreadable_device_is_left_alone(tmp_path):
+    agent = _agent_with_key(tmp_path, "naira")
+    fake = FakeIncus({"taos-agent-naira": PROJECT},
+                     {"taos-agent-naira": f"tcp:127.0.0.1:{LITELLM_PORT}"})
+    fake.fail_get.add("taos-agent-naira")
+    report = await _reconcile(fake, [agent], tmp_path)
+    assert fake.sets() == []
+    assert report["skipped"][0]["agent"] == "naira"
+
+
+@pytest.mark.asyncio
+async def test_unexpected_connect_target_is_left_alone(tmp_path):
+    agent = _agent_with_key(tmp_path, "naira")
+    fake = FakeIncus({"taos-agent-naira": PROJECT}, {"taos-agent-naira": "tcp:127.0.0.1:9999"})
+    report = await _reconcile(fake, [agent], tmp_path)
+    assert fake.sets() == []
+    assert report["skipped"][0]["agent"] == "naira"
+
+
+@pytest.mark.asyncio
+async def test_listener_not_ready_moves_nobody(tmp_path):
+    agent = _agent_with_key(tmp_path, "naira")
+    fake = FakeIncus({"taos-agent-naira": PROJECT},
+                     {"taos-agent-naira": f"tcp:127.0.0.1:{LITELLM_PORT}"})
+    report = await _reconcile(fake, [agent], tmp_path, ready=False)
+    assert fake.sets() == []
+    assert report["skipped"][0]["agent"] == "naira"
+
+
+@pytest.mark.asyncio
+async def test_missing_container_is_skipped(tmp_path):
+    agent = _agent_with_key(tmp_path, "naira")
+    fake = FakeIncus({}, {})
+    report = await _reconcile(fake, [agent], tmp_path)
+    assert fake.sets() == []
+    assert report["skipped"][0]["agent"] == "naira"
+
+
+# ---------------------------------------------------------------------------
+# Mirror row follows the legacy row
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rescope_and_delete_follow_the_minted_key(tmp_path):
+    from tinyagentos.llm_gateway.auth import gateway_caller
+    from tinyagentos.llm_gateway.errors import GatewayError
+
+    agent = _agent_with_key(tmp_path, "naira", ["gpt-a"])
+    fake = FakeIncus({"taos-agent-naira": PROJECT},
+                     {"taos-agent-naira": f"tcp:127.0.0.1:{LITELLM_PORT}"})
+    await _reconcile(fake, [agent], tmp_path)
+    store = LiteLLMKeyStore(default_keystore_path(tmp_path))
+    assert store.set_models(agent["llm_key"], ["gpt-b"]) is True
+    assert gateway_caller(_request(tmp_path, agent["llm_key"])).allowed_models == frozenset({"gpt-b"})
+    assert store.delete(agent["llm_key"]) is True
+    with pytest.raises(GatewayError):
+        gateway_caller(_request(tmp_path, agent["llm_key"]))
+
+
+# ---------------------------------------------------------------------------
+# The agent-facing listener: /v1 -> gateway, the rest -> LiteLLM
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/v1/models", "/models"])
+async def test_listener_serves_the_gateway_at_the_agents_base_url(tmp_data_dir, monkeypatch, path):
+    from tinyagentos.app import create_app
+    from tinyagentos.llm_gateway.listener import create_agent_listener_app
+
+    monkeypatch.delenv("TAOS_LLM_GATEWAY", raising=False)
+    app = create_app(data_dir=tmp_data_dir)
+    app.state._startup_complete = True
+    agent = _agent_with_key(tmp_data_dir, "naira", ["gpt-a"])
+    fake = FakeIncus({"taos-agent-naira": PROJECT},
+                     {"taos-agent-naira": f"tcp:127.0.0.1:{LITELLM_PORT}"})
+    await _reconcile(fake, [agent], tmp_data_dir)
+    listener = create_agent_listener_app(app, litellm_port=LITELLM_PORT)
+    async with AsyncClient(transport=ASGITransport(app=listener), base_url="http://127.0.0.1:4000") as c:
+        ok = await c.get(path, headers={"Authorization": f"Bearer {agent['llm_key']}"})
+        bad = await c.get(path, headers={"Authorization": "Bearer sk-taos-nope-nope-nope-nope"})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["object"] == "list"
+    assert bad.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_listener_never_exposes_other_controller_routes(tmp_data_dir, monkeypatch):
+    from tinyagentos.app import create_app
+    from tinyagentos.llm_gateway.listener import create_agent_listener_app
+
+    monkeypatch.delenv("TAOS_LLM_GATEWAY", raising=False)
+    app = create_app(data_dir=tmp_data_dir)
+    app.state._startup_complete = True
+    token = app.state.auth.get_local_token()
+    seen = []
+
+    async def fake_passthrough(scope, receive, send, *_):
+        seen.append(scope["path"])
+        from starlette.responses import JSONResponse
+        await JSONResponse({"from": "litellm"}, status_code=200)(scope, receive, send)
+
+    listener = create_agent_listener_app(app, litellm_port=LITELLM_PORT)
+    with patch("tinyagentos.llm_gateway.listener._passthrough", side_effect=fake_passthrough):
+        async with AsyncClient(transport=ASGITransport(app=listener), base_url="http://127.0.0.1:4000",
+                               headers={"Authorization": f"Bearer {token}"}) as c:
+            r1 = await c.get("/api/agents")
+            r2 = await c.post("/api/system/prepare-shutdown")
+            r3 = await c.post("/v1/embeddings", json={"input": "x"})
+    # Controller routes are never reached through the agent listener: those
+    # paths went to LiteLLM, which has no such routes.
+    assert seen == ["/api/agents", "/api/system/prepare-shutdown", "/v1/embeddings"]
+    assert r3.json() == {"from": "litellm"}
+    assert r1.json() == {"from": "litellm"} and r2.json() == {"from": "litellm"}
+
+
+def test_ollama_providers_defined_once():
+    import tinyagentos.llm_gateway.forward as forward
+    import tinyagentos.llm_gateway.router as router
+
+    assert router.OLLAMA_PROVIDERS is forward.OLLAMA_PROVIDERS
+    src = Path(router.__file__).read_text()
+    assert "OLLAMA_PROVIDERS = " not in src
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag,mode,port", [(None, "gateway", GATEWAY_PORT), ("0", "litellm", LITELLM_PORT)])
+async def test_settings_reports_the_gateway_as_the_llm_proxy(tmp_data_dir, monkeypatch, flag, mode, port):
+    from tinyagentos.app import create_app
+
+    if flag is None:
+        monkeypatch.delenv("TAOS_LLM_GATEWAY", raising=False)
+    else:
+        monkeypatch.setenv("TAOS_LLM_GATEWAY", flag)
+    app = create_app(data_dir=tmp_data_dir)
+    app.state._startup_complete = True
+    app.state.llm_gateway_agent_port = GATEWAY_PORT
+    app.state.llm_gateway_listener_ready = True
+    app.state.llm_proxy.port = LITELLM_PORT
+    token = app.state.auth.get_local_token()
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test",
+                           headers={"Authorization": f"Bearer {token}"}) as c:
+        data = (await c.get("/api/settings/llm-proxy")).json()
+    assert data["mode"] == mode
+    assert data["port"] == port
+    if mode == "gateway":
+        assert data["running"] is True and data["url"] == "/api/llm/v1"

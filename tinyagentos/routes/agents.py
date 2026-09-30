@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict
 import taosmd.agents as tm_agents
 
 from tinyagentos.agent_db import find_agent, get_agent_summaries
+from tinyagentos.llm_gateway.cutover import llm_gateway_live_port
 from tinyagentos.config import (
     save_config_locked,
     slugify_agent_name,
@@ -918,6 +919,7 @@ async def deploy_agent_endpoint(request: Request, body: DeployAgentRequest):
                     extra_config={
                         "llm_proxy": llm_proxy,
                         "registry": request.app.state.registry,
+                        "llm_gateway_port": llm_gateway_live_port(request.app.state),
                     },
                     can_read_user_memory=body.can_read_user_memory,
                     secrets_store=secrets_store,

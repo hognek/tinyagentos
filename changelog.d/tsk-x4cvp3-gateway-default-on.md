@@ -1,0 +1,7 @@
+### Changed
+- The in-process LLM gateway (`/api/llm/v1`) is now on by default. Set `TAOS_LLM_GATEWAY=0` (or `false` / `no` / `off`) to turn it off; the next controller start then points agents back at LiteLLM.
+- Agents move to the gateway without a redeploy. Their base URL stays `127.0.0.1:4000`, and at startup the controller points each container's `taos-proxy-litellm` proxy device at a new loopback-only agent listener on host port 7837 (`server.llm_gateway_port` / `TAOS_LLM_GATEWAY_PORT`). Each agent's gateway key is minted from its LiteLLM key row before its device moves, and the move is idempotent and reversible. An agent whose key cannot be read stays on LiteLLM and the controller logs the reason.
+- The agent listener passes every path the gateway does not serve yet, such as `/v1/embeddings`, through to LiteLLM, which keeps running beside the gateway for now.
+- The gateway no longer accepts the LiteLLM master key as admin. With the gateway on, a new deploy that would have fallen back to the master key gets a scoped key instead.
+- The reasoning judge now calls the gateway using the host local token. `GET /api/settings/llm-proxy` reports the gateway (`mode`, listener `port`, `url`), with LiteLLM's status listed alongside it.
+- `scripts/llm_gateway_parity.py` sends the same prompts through LiteLLM and the gateway, as a real agent, and compares status, response shape and recorded usage.

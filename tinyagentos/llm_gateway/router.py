@@ -11,14 +11,18 @@ from tinyagentos.llm_gateway.errors import (
     model_not_found,
     model_not_permitted,
 )
-from tinyagentos.llm_gateway.forward import chat_completion, chat_completion_stream, resolve_api_key
+from tinyagentos.llm_gateway.forward import (
+    OLLAMA_PROVIDERS,
+    chat_completion,
+    chat_completion_stream,
+    resolve_api_key,
+)
 from tinyagentos.llm_gateway.anthropic import chat_completion_anthropic
 from tinyagentos.llm_gateway.resolve import TAOS_DEFAULT, find_routes, model_names, routing_table
 import tinyagentos.llm_gateway.resolve as resolve_mod
 
 PREFIX = "/api/llm/v1"
 OPENAI_PROVIDER = "openai"
-OLLAMA_PROVIDERS = ("ollama", "ollama_chat")
 
 router = APIRouter(prefix=PREFIX)
 
