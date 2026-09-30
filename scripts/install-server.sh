@@ -94,33 +94,7 @@ set -euo pipefail
 # returns 0 on a handset, non-zero otherwise.
 # An explicit TAOS_EXTRAS_BLE=1 overrides auto-detection and forces ble inclusion;
 # TAOS_EXTRAS_BLE=0 forces exclusion (rare, e.g., a desktop with a BLE dongle).
-taos_controller_extras() {
-    local is_handset=0
-    if command -v systemctl >/dev/null 2>&1; then
-        # Use systemctl cat taos-kiosk.service to detect handset (mirrors hardware._detect_device_class())
-        if systemctl cat taos-kiosk.service >/dev/null 2>&1; then
-            is_handset=1
-        fi
-    fi
-
-    local extras="proxy"
-    case "${TAOS_EXTRAS_BLE:-}" in
-        "1"|"true")
-            extras="proxy,ble"
-            ;;
-        "0"|"false")
-            extras="proxy"
-            ;;
-        *)
-            if [[ $is_handset -eq 1 ]]; then
-                extras="proxy,ble"
-            else
-                extras="proxy"
-            fi
-            ;;
-    esac
-    echo "$extras"
-}
+source "$(dirname "$0")/lib/controller_extras.sh"
 
 # If taOS is already installed, default to ITS directory so a re-run updates the
 # existing install in place rather than forking a second copy (e.g. a root
@@ -1649,8 +1623,8 @@ if [[ ! -d .venv ]]; then
 fi
 
 log "installing controller python deps into .venv (pip install -e '.[$(taos_controller_extras)]')"
-    ./.venv/bin/pip install --quiet --upgrade pip
-    ./.venv/bin/pip install --quiet -e ".[$(taos_controller_extras)]"
+./.venv/bin/pip install --quiet --upgrade pip
+./.venv/bin/pip install --quiet -e ".[$(taos_controller_extras)]"
 
 # The proxy extra no longer routes through litellm[proxy], so the proprietary
 # litellm-enterprise wheel is no longer part of the install set. A FRESH install

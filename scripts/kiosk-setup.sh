@@ -142,6 +142,28 @@ chmod +x /usr/local/bin/taos-kiosk
 
 echo ""
 echo "=== Setup complete ==="
+
+# Install ble extra into the existing venv so fresh handset installs get it
+# This ensures that on a fresh handset where taos-kiosk.service doesn't exist yet,
+# the ble extra is still installed when install-server.sh's pip step runs.
+
+# Determine taOS installation directory
+TAOS_DIR=""
+if command -v systemctl >/dev/null 2>&1 && systemctl show tinyagentos -p WorkingDirectory --value 2>/dev/null | grep -q ".*"; then
+    TAOS_DIR=$(systemctl show tinyagentos -p WorkingDirectory --value 2>/dev/null)
+elif [ -d /opt/tinyagentos ]; then
+    TAOS_DIR="/opt/tinyagentos"
+else
+    TAOS_DIR="$HOME/tinyagentos"
+fi
+
+if [ -f "$TAOS_DIR/.venv/bin/pip" ]; then
+    echo "Installing ble extra into taOS venv at $TAOS_DIR/.venv"
+    "$TAOS_DIR/.venv/bin/pip" install --quiet -e "$TAOS_DIR[proxy,ble]" 2>/dev/null || echo "Warning: Failed to install ble extra into venv (may already be installed)"
+else
+    echo "Warning: taOS venv not found at $TAOS_DIR/.venv, ble extra not installed"
+fi
+
 echo ""
 echo "Commands:"
 echo "  taos-kiosk start    — launch kiosk now"

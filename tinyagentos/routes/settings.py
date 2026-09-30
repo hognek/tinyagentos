@@ -19,6 +19,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from tinyagentos.config import AppConfig, save_config_locked, validate_config
+from tinyagentos.hardware import _detect_device_class
 from tinyagentos.auto_update import resolve_tracked_branch, is_valid_branch_name, PREF_NAMESPACE
 from tinyagentos.data_snapshot import snapshot_data_dir
 from tinyagentos.middleware.upload_body_limit import register_upload_cap
@@ -785,7 +786,6 @@ def _find_uv(project_dir: Path) -> str | None:
     return None
 
 
-from tinyagentos.hardware import _detect_device_class
 
 
 # Optional-dependency extras the updater must install so a `uv sync --frozen`
@@ -829,9 +829,6 @@ def _compute_update_extras() -> tuple[str, ...]:
         return ("proxy",)
 
 
-UPDATE_EXTRAS: tuple[str, ...] = _compute_update_extras()
-
-
 async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
     """Install/sync the update's Python deps, preferring a pinned uv sync.
 
@@ -861,7 +858,7 @@ async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
         # HOME=project_dir so uv resolves its data/cache dir correctly under the
         # service user whose HOME is the install dir (the Pi layout).
         env = {**os.environ, "HOME": str(project_dir)}
-        extra_args = [arg for extra in UPDATE_EXTRAS for arg in ("--extra", extra)]
+        extra_args = [arg for extra in _compute_update_extras() for arg in ("--extra", extra)]
         cmd = [uv_cmd, "sync", "--frozen", *extra_args]
         logger.info("Updater dependency install: %s", " ".join(cmd))
         return await _run_capture(cmd, cwd=str(project_dir), env=env)
@@ -871,7 +868,7 @@ async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
         if candidate.exists():
             pip_cmd = str(candidate)
             break
-    pip_target = f".[{','.join(UPDATE_EXTRAS)}]"
+    pip_target = f".[{','.join(_compute_update_extras())}]"
     logger.info("Updater dependency install: uv not found, using %s install -e %s", pip_cmd, pip_target)
     return await _run_capture(
         [pip_cmd, "install", "-e", pip_target],
