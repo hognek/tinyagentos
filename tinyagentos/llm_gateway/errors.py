@@ -50,3 +50,7 @@ def model_not_permitted(model: str) -> GatewayError:
 
 def upstream_error(message: str) -> GatewayError:
     return GatewayError(502, message, type="api_error", code="upstream_error")
+
+
+def rate_limit_error(message: str, retry_after: str | None = None) -> GatewayError:
+    return GatewayError(429, message, type="rate_limit_error", code=retry_after)

@@ -864,3 +864,148 @@ async def test_non_openai_backend_no_longer_501(tmp_path_factory):
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["choices"][0]["message"]["content"] == "hi"
+
+
+# ---------------------------------------------------------------------------
+# RED-FIRST tests for request-side fixes.
+# Each test asserts one missing behavior and MUST FAIL on the unpatched code.
+# ---------------------------------------------------------------------------
+
+
+def _upstream_json(call):
+    return json.loads(call.request.content)
+
+
+def _assert_tool_result_block(content: list | str, tool_use_id: str):
+    """A user message with a single tool_result content block."""
+    if isinstance(content, str):
+        parsed = json.loads(content)
+    else:
+        parsed = content
+    assert isinstance(parsed, list), "tool message should be a list of content blocks"
+    assert len(parsed) == 1, parsed
+    assert parsed[0] == {"type": "tool_result", "tool_use_id": tool_use_id, "content": "42"}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_upstream_request_includes_model(tmp_path_factory):
+    """The upstream Messages API request must carry the route's upstream model id."""
+    app, session = await _gateway_app(tmp_path_factory)
+    respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
+        200, json=_anthropic_response(), headers={"content-type": "application/json"}
+    ))
+    await _post(app, session, _chat())
+    assert _upstream_json(respx.calls.last)["model"] == "claude-x"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_stream_path_sets_stream_true_only(tmp_path_factory):
+    """stream=true only on the streaming path; absent on non-streaming."""
+    app, session = await _gateway_app(tmp_path_factory)
+    respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
+        200, json=_anthropic_response(), headers={"content-type": "application/json"}
+    ))
+    await _post(app, session, _chat(stream=True))
+    assert _upstream_json(respx.calls.last).get("stream") is True
+
+    respx.reset()
+    respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
+        200, json=_anthropic_response(), headers={"content-type": "application/json"}
+    ))
+    await _post(app, session, _chat())
+    assert "stream" not in _upstream_json(respx.calls.last)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_tools_and_tool_choice_converted_to_anthropic_shape(tmp_path_factory):
+    """OpenAI tools and tool_choice are converted to Anthropic format."""
+    app, session = await _gateway_app(tmp_path_factory)
+    anthropic_response = _anthropic_response(
+        content_blocks=DOC_TOOL_USE_CONTENT, stop_reason="tool_use",
+    )
+    respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
+        200, json=anthropic_response, headers={"content-type": "application/json"}
+    ))
+    await _post(app, session, _chat_with_tools())
+    data = _upstream_json(respx.calls.last)
+    assert data["tools"] == [{
+        "name": "get_weather",
+        "description": "Weather for a city",
+        "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+    }]
+    assert data["tool_choice"] == {"type": "tool", "name": "get_weather"}
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_tool_result_round_trip_in_anthropic_shape(tmp_path_factory):
+    """A tool-result message becomes a user message with a tool_result block,
+    and an assistant's tool_calls become tool_use blocks with parsed input."""
+    app, session = await _gateway_app(tmp_path_factory)
+    anthropic_response = _anthropic_response(
+        content_blocks=[{
+            "type": "tool_use",
+            "id": "toolu_abc",
+            "name": "get_weather",
+            "input": {"city": "Paris"},
+        }],
+        stop_reason="tool_use",
+    )
+    respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
+        200, json=anthropic_response, headers={"content-type": "application/json"}
+    ))
+    body = {
+        "model": "claude-x",
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "get_weather", "arguments": '{"city":"Paris"}'},
+            }]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "42"},
+        ],
+    }
+    resp = await _post(app, session, body)
+    assert resp.status_code == 200, resp.text
+    data = _upstream_json(respx.calls.last)
+    msgs = data["messages"]
+    assert msgs[-2]["role"] == "assistant"
+    assert msgs[-2]["content"] == [{"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Paris"}}]
+    assert msgs[-1]["role"] == "user"
+    _assert_tool_result_block(msgs[-1]["content"], "call_1")
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_429_becomes_openai_error_with_retry_after(tmp_path_factory):
+    """A 429 upstream returns a 429 OpenAI error body with Retry-After."""
+    app, session = await _gateway_app(tmp_path_factory)
+    respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
+        429,
+        headers={"retry-after": "2", "content-type": "application/json"},
+        json={"error": {"message": "Rate limited"}},
+    ))
+    resp = await _post(app, session, _chat())
+    assert resp.status_code == 429, resp.text
+    body = resp.json()
+    assert body["error"]["type"] == "rate_limit_error"
+    assert body["error"]["message"] == "the Anthropic API failed (HTTP 429): Rate limited"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_streaming_500_becomes_error_not_empty_stream(tmp_path_factory):
+    """A streaming 500 must yield an error event, not an empty stream."""
+    app, session = await _gateway_app(tmp_path_factory)
+    respx.post(UPSTREAM_CHAT).mock(return_value=httpx.Response(
+        500, json={"error": {"message": "Server error"}},
+        headers={"content-type": "application/json"},
+    ))
+    resp = await _post(app, session, _chat(stream=True))
+    assert resp.status_code == 200, resp.text
+    text = resp.read().decode("utf-8")
+    assert text, "the stream must not be empty"
+    assert '"error"' in text or '"message"' in text
