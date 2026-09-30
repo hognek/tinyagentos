@@ -22,3 +22,10 @@
   as unknown when one of its hourly trace buckets is a legacy file without a
   `trace_events` table; that bucket counts 0. Other sqlite errors (locked,
   corrupt) still make the count unknown.
+- Agents whose keys were minted before the embedding alias was granted
+  (every agent deployed before 2026-09-30) can embed again. Opening the key
+  store grants `taos-embedding-default` to their live agent keys once, in
+  both the legacy and gateway tables, so `/v1/embeddings` no longer answers
+  403 `model_not_permitted` for them. It runs once per key store: a later
+  deliberate removal of the alias sticks, and deny-all (empty) or revoked
+  keys are left alone.
