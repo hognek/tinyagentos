@@ -458,16 +458,36 @@ def _commit_waivers(
     commit_messages: list[str], trailer: str
 ) -> list[set[str] | None | bool]:
     """For each commit message: False when it carries no usable trailer,
-    None for an unscoped trailer, or the set of rule names it is scoped to."""
+    None for an unscoped trailer, or the set of rule names it is scoped to.
+
+    Unscoped trailers (no [scope]) cover every rule. Multiple scoped trailers
+    union their rule names: any [a] followed by [b] waives both a and b.
+    """
     waivers: list[set[str] | None | bool] = []
     for message in commit_messages:
-        scope: set[str] | None | bool = False
+        collected: set[str] | None = None
+        found_unscoped = False
         for line in message.splitlines():
             parsed = _trailer_scope(line, trailer)
-            if parsed is not None:
-                scope = parsed[0]
-                break
-        waivers.append(scope)
+            if parsed is None:
+                # Not a trailer line at all; skip
+                continue
+            names, why = parsed
+            if names is None:
+                # Unscoped trailer: covers all rules
+                found_unscoped = True
+            else:
+                # Scoped trailer: collect rule names
+                if collected is None:
+                    collected = set(names)
+                else:
+                    collected |= set(names)
+        if found_unscoped:
+            waivers.append(None)
+        elif collected is None:
+            waivers.append(False)
+        else:
+            waivers.append(collected)
     return waivers
 
 

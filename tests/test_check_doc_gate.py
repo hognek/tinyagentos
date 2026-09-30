@@ -612,3 +612,54 @@ class TestDiffNameStatusZRequiresBaseRef:
         _git_commit(repo, "README.md", "# hello\n", "init")
         with pytest.raises(ValueError, match="base_ref is required when cached=False"):
             _MOD.diff_name_status_z(repo, base_ref=None, cached=False)
+
+
+def test_two_scoped_trailers_waive_both_rules():
+    """A commit with two scoped Docs-Reviewed trailers waives both rules.
+
+    Regression test for: _commit_waivers broke on the first trailer only,
+    so a commit like:
+        Docs-Reviewed: [changelog] no user-visible change
+        Docs-Reviewed: [agent-manual] internal only
+    would only waive 'changelog' and fail 'agent-manual'.
+    """
+    config = {
+        "gate": {"trailer": "Docs-Reviewed:"},
+        "rules": [
+            {
+                "name": "changelog",
+                "on_modify": True,
+                "when_changed": ["tinyagentos/routes/themes.py"],
+                "require_doc": ["CHANGELOG.md"],
+                "hint": "a route module was modified",
+            },
+            {
+                "name": "agent-manual",
+                "on_modify": True,
+                "when_changed": ["tinyagentos/routes/themes.py"],
+                "require_doc": ["AGENT_MANUAL.md"],
+                "hint": "agent manual updated",
+            },
+        ],
+    }
+    changed = [("M", "tinyagentos/routes/themes.py")]
+    commit_messages = [
+        "Fix themes\n\n"
+        "Docs-Reviewed: [changelog] no user-visible change\n"
+        "Docs-Reviewed: [agent-manual] internal only",
+    ]
+    failures = evaluate_rules(changed, commit_messages, config)
+    assert failures == []
+
+
+def test_unrelated_commit_trailer_waives_nothing():
+    """An unrelated commit's trailer waives nothing.
+
+    Ensures that a trailer on a commit that doesn't touch the relevant paths
+    does not waive the rule.
+    """
+    config = _base_config()
+    changed = [("M", "tinyagentos/routes/themes.py")]
+    commit_messages = ["Fix something else\n\nDocs-Reviewed: [changelog] some reason"]
+    failures = evaluate_rules(changed, commit_messages, config)
+    assert len(failures) == 1
