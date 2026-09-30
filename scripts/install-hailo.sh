@@ -268,7 +268,7 @@ detect_preexisting_hailoollama() {
     if systemctl list-unit-files --full | grep -q '^hailo-ollama.service'; then
         local has_marker
         has_marker="$(systemctl cat hailo-ollama.service 2>/dev/null | grep 'OLLAMA_HOST=' || true)"
-        if [[ -n "$has_marker" && "$has_marker" != *"OLLAMA_HOST=127.0.0.1:$HAILO_OLLAMA_PORT"* ]]; then
+        if [[ -z "$has_marker" || "$has_marker" != *"OLLAMA_HOST=127.0.0.1:$HAILO_OLLAMA_PORT"* ]]; then
             warn "upstream hailo-ollama.service detected without taOS marker (no OLLAMA_HOST=127.0.0.1:$HAILO_OLLAMA_PORT)"
             warn "This installer would have built a second server on port $HAILO_OLLAMA_PORT."
             warn "The existing instance will be left alone (not modified by this script)."
