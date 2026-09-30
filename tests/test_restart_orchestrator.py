@@ -328,7 +328,7 @@ class TestPrepareAgent:
 
         assert result["status"] == "ready"
         assert written["note"] == ("nohost", "stop")
-        assert agent["paused"] is True
+        assert agent.get("paused") is not True
         assert result["note_path"] == str(state.data_dir / "note.json")
 
     @pytest.mark.asyncio
@@ -380,10 +380,12 @@ class TestPrepareAgent:
             result = await orch._prepare_agent(agent, "stop", state.data_dir)
 
         assert result["note_path"] == str(state.data_dir / "note.json")
-        assert agent["paused"] is True
+        assert agent.get("paused") is not True
 
     @pytest.mark.asyncio
-    async def test_host_exception_writes_controller_note(self, tmp_path, monkeypatch):
+    async def test_host_connection_failure_does_not_pause(self, tmp_path, monkeypatch):
+        """An agent whose /prepare-for-shutdown connection fails must not be
+        marked paused: the controller never told it to pause."""
         agent = {"name": "remote", "host": "10.0.0.1", "port": 8080}
         state = _app_state(tmp_path, agents=[agent])
         orch = ro.RestartOrchestrator(state)
@@ -405,7 +407,40 @@ class TestPrepareAgent:
             result = await orch._prepare_agent(agent, "stop", state.data_dir)
 
         assert result["note_path"] == str(state.data_dir / "note.json")
+        assert agent.get("paused") is not True
+
+    @pytest.mark.asyncio
+    async def test_host_200_marks_agent_paused(self, tmp_path, monkeypatch):
+        """Control: an agent that returns 200 to /prepare-for-shutdown is
+        marked paused and can later be resumed."""
+        agent = {"name": "good", "host": "10.0.0.1", "port": 8080}
+        state = _app_state(tmp_path, agents=[agent])
+        orch = ro.RestartOrchestrator(state)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"note_path": "/remote/note.json"}
+
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_cm = MagicMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        monkeypatch.setattr(orch, "_write_controller_note", AsyncMock())
+        with patch("httpx.AsyncClient", return_value=mock_cm):
+            result = await orch._prepare_agent(agent, "stop", state.data_dir)
+
         assert agent["paused"] is True
+        assert result["note_path"] == "/remote/note.json"
+
+        async def fake_post(host, port, note):
+            return True
+
+        monkeypatch.setattr(ro, "_post_resume", fake_post)
+        await ro.resume_agents_from_notes(state)
+
+        assert agent["paused"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -634,3 +669,29 @@ class TestResumeAgentsFromNotes:
 
         assert posted["note"]["reason"] == "restart"
         assert agent["paused"] is False
+
+    @pytest.mark.asyncio
+    async def test_retry_window_expires_clears_paused_and_notifies(self, tmp_path, monkeypatch):
+        """An agent that returned 200 to prepare but never answers /resume
+        must have its paused flag cleared after the retry window, with a
+        single warning notification."""
+        agent = {"name": "gone", "host": "10.0.0.8", "port": 8080, "paused": True}
+        state = _app_state(tmp_path, agents=[agent])
+
+        async def always_fail(host, port, note):
+            return False
+
+        monkeypatch.setattr(ro, "_post_resume", always_fail)
+        monkeypatch.setattr(ro, "_RESUME_RETRY_INTERVAL_S", 0.01)
+        monkeypatch.setattr(ro, "_RESUME_RETRY_WINDOW_S", 0.05)
+
+        await ro.resume_agents_from_notes(state)
+        for task in list(state._background_tasks):
+            await task
+
+        assert agent["paused"] is False
+        warnings = [
+            c for c in state.notifications.add.await_args_list
+            if c.kwargs.get("level") == "warning"
+        ]
+        assert warnings and "Could not tell these agents to resume" in warnings[-1].kwargs["message"]

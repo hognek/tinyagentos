@@ -140,7 +140,7 @@ class TestResumeAgentsFromNotes:
         for task in list(state._background_tasks):
             await task
 
-        assert agent["paused"] is True
+        assert agent["paused"] is False
         warnings = [
             c for c in state.notifications.add.await_args_list
             if c.kwargs.get("level") == "warning"
