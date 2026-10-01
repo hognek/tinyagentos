@@ -512,18 +512,16 @@ async def chat(request: Request, body: ChatRequest):
     else:
         harness = None
 
-    llm_proxy = getattr(request.app.state, "llm_proxy", None)
-    proxy_running = llm_proxy is not None and llm_proxy.is_running()
-    if not use_picoclaw and not proxy_running:
-        # opencode is given the in-process gateway (/api/llm/v1) whenever it
-        # can serve the permitted models, so LiteLLM is needed only when it
-        # cannot. (Stage 2b deletes LiteLLM and this fallback with it.)
+    if not use_picoclaw:
+        # opencode is always given the in-process gateway (/api/llm/v1), the
+        # only LLM path since LiteLLM removal 2b-2a. When it cannot serve the
+        # model, say so up front instead of starting a server that will only
+        # answer model errors.
         gateway_problem = await opencode_gateway_problem(app_state, model, prefs)
         if gateway_problem:
             return JSONResponse(
-                {"error": f"No LLM path for model {model!r}: {gateway_problem}, and the "
-                          "LiteLLM proxy is not running. Check that at least one provider "
-                          "is configured."},
+                {"error": f"No LLM path for model {model!r}: {gateway_problem}. Check that "
+                          "a provider serving it is configured."},
                 status_code=503,
             )
 
