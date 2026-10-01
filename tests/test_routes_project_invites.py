@@ -951,6 +951,35 @@ class TestGrokGuideMarkdown:
         assert "secure form" not in guide
         assert "every bot on this Grok account" not in guide
 
+    @pytest.mark.asyncio
+    async def test_grok_guide_does_not_claim_tasks_on_bus(self, client, app, monkeypatch, tmp_path):
+        """RED-FIRST: Grok guide should clarify polling is for onboarding only, not tasks."""
+        await _setup_agent_ecosystem(app, monkeypatch, tmp_path)
+        pid = await _create_project(client, slug="grokred")
+        iid, pin = await _mint_invite(client, pid, approval_mode="auto", scopes=["a2a_send"])
+
+        resp = await client.post(
+            "/api/projects/invites/redeem",
+            json={"invite_id": iid, "pin": pin, "harness": "grok"},
+        )
+        assert resp.status_code == 200, resp.text
+        guide = resp.json()["bundle"]["guide_markdown"]
+
+        # a) Grok guide does NOT contain 'tasks arrive on the A2A bus'
+        assert "tasks arrive on the A2A bus" not in guide, f"Guide contains wrong text about tasks on bus:\n{guide}"
+        
+        # b) Grok guide DOES mention tasks/ready
+        assert "tasks/ready" in guide, f"Guide does not mention tasks/ready:\n{guide}"
+        
+        # c) NON-Grok guide still contains 'reliable delivery floor' - mint a new invite for this
+        iid2, pin2 = await _mint_invite(client, pid, approval_mode="auto", scopes=["a2a_send"])
+        non_grok_resp = await client.post(
+            "/api/projects/invites/redeem",
+            json={"invite_id": iid2, "pin": pin2, "harness": "claude"},
+        )
+        non_grok_guide = non_grok_resp.json()["bundle"]["guide_markdown"]
+        assert "reliable delivery floor" in non_grok_guide, f"NON-Grok guide does not contain reliable delivery floor:\n{non_grok_guide}"
+
 
 class TestBuildControllerDict:
     """_build_controller_dict endpoint bundle contract."""
