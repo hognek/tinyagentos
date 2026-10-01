@@ -108,20 +108,24 @@ def _release_hashes(pkg: str, version: str, cache: dict) -> list[str]:
 def _download_closure(py: str, abi: str, dest: pathlib.Path) -> list[pathlib.Path]:
     requirements = dest / "mlx_lm_runtime.in"
     requirements.write_text(f"mlx-lm=={MLX_LM_VERSION}\nmlx=={MLX_VERSION}\n")
-    proc = subprocess.run(
-        [
-            sys.executable, "-m", "pip", "download",
-            "--only-binary=:all:",
-            "--platform", PLATFORM,
-            "--python-version", py,
-            "--implementation", "cp",
-            "--abi", abi,
-            "-r", str(requirements),
-            "-d", str(dest),
-        ],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable, "-m", "pip", "download",
+                "--only-binary=:all:",
+                "--platform", PLATFORM,
+                "--python-version", py,
+                "--implementation", "cp",
+                "--abi", abi,
+                "-r", str(requirements),
+                "-d", str(dest),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+    except subprocess.TimeoutExpired:
+        raise SystemExit(f"pip download timed out for py{py} (index stalled?)")
     if proc.returncode != 0:
         print(proc.stdout[-2000:], proc.stderr[-2000:], file=sys.stderr)
         raise SystemExit(f"pip download failed for py{py}")
