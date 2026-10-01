@@ -32,7 +32,6 @@ def test_release_pattern_matches_all_artifacts():
     arches = matrix["arch"]
 
     # ALIAS mapping from workflow env
-    # The ALIAS expression is defined in the workflow env but we parse it manually here
     alias_map = {}
     for base in bases:
         if base == "openclaw":
@@ -47,20 +46,24 @@ def test_release_pattern_matches_all_artifacts():
     # Artifact names are ${ALIAS}-${arch}
     artifact_names = [f"{alias_map[base]}-{arch}" for base in bases for arch in arches]
 
-    # Release job download pattern (multi-line, each line is a pattern)
+    # Release job download pattern: actions/download-artifact@v8 reads this as
+    # ONE glob string (newlines are literal, matching nothing).
     release_steps = wf["jobs"]["release"]["steps"]
     download_step = next(s for s in release_steps if s.get("uses", "").startswith("actions/download-artifact"))
-    pattern_text = download_step["with"]["pattern"]
-    patterns = [p.strip() for p in pattern_text.strip().splitlines() if p.strip()]
+    pattern = download_step["with"]["pattern"]
 
-    # Check each artifact name matches at least one pattern
-    unmatched = []
-    for name in artifact_names:
-        if not any(fnmatch.fnmatch(name, pat) for pat in patterns):
-            unmatched.append(name)
+    assert "\n" not in pattern, (
+        "download-artifact pattern must be a single glob (no newlines), "
+        f"got: {pattern!r}"
+    )
+
+    unmatched = [
+        name for name in artifact_names
+        if not fnmatch.fnmatchcase(name, pattern)
+    ]
 
     assert not unmatched, (
-        f"Release patterns {patterns} do not match artifacts: {unmatched}. "
+        f"Release pattern {pattern!r} does not match artifacts: {unmatched}. "
         f"All artifacts: {artifact_names}"
     )
 

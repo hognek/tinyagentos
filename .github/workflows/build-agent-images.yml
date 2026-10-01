@@ -338,10 +338,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          pattern: |
-            taos-openclaw-base-*
-            taos-base-*
-            taos-hermes-base-*
+          pattern: taos-*base-*
           merge-multiple: true
 
       - name: List downloaded assets
