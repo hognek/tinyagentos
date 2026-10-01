@@ -26,6 +26,7 @@ from tinyagentos.middleware.upload_body_limit import register_upload_cap
 from tinyagentos.safe_archive import ArchiveError, extract_tar_safely
 from tinyagentos.update_runner import switch_to_branch
 from tinyagentos.restart_orchestrator import write_pending_restart
+from tinyagentos.launchd_migration import apply_launchd_migration
 
 logger = logging.getLogger(__name__)
 
@@ -938,6 +939,20 @@ async def _pip_rebuild_restart(project_dir: Path, target_sha: str) -> tuple[int,
     if target_sha:
         write_pending_restart(target_sha)
 
+    # macOS: migrate old bare-uvicorn launchd plist to `python -m tinyagentos`
+    # so the LLM gateway agent listener starts and local agent deploys work.
+    # This runs after deps are synced but before the restart is flagged.
+    # Failure is non-fatal: we log a warning and surface it in the update result.
+    try:
+        launchd_success, launchd_warning = await apply_launchd_migration(str(project_dir))
+        if launchd_warning:
+            logger.warning("Launchd migration: %s", launchd_warning)
+            # Store warning to surface in update result
+            return 0, launchd_warning
+    except Exception as e:
+        logger.warning("Launchd migration failed: %s", e)
+        return 0, f"Launchd migration failed: {e}"
+
     return 0, ""
 
 
@@ -1217,6 +1232,11 @@ async def apply_update(request: Request):
             status_code=500,
         )
 
+    # Capture launchd migration warning from pip_rebuild output
+    launchd_warning = ""
+    if out and "Launchd migration" in out:
+        launchd_warning = out.strip()
+
     # Bring a locally-hosted taOSmd to latest in the SAME action (tsk-jjkukj):
     # two components, one deploy route, one place to look when it fails. A
     # skip (remote taOSmd, hooks unset) is reported, never silent; a failure
@@ -1270,6 +1290,7 @@ async def apply_update(request: Request):
                 if taosmd_report.get("updated")
                 else ""
             )
+            + (f" Launchd migration: {launchd_warning}. " if launchd_warning else "")
             + "Restarting now…"
         ),
     }
