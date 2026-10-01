@@ -8,12 +8,13 @@ a different API.
 
 An ALLOWLIST, nothing else:
 
-- ``/v1/models`` and ``/v1/chat/completions`` (and the un-prefixed forms) are
-  rewritten to ``/api/llm/v1/...`` and handed to the MAIN app object, so the
-  auth middleware exemptions and ``gateway_caller`` (keys, allowlists,
-  budgets) run exactly as for any other gateway call.
-- ``/v1/embeddings`` and ``/embeddings`` go, byte for byte, to the LiteLLM
-  proxy, which still runs in cutover stage 1 (``TAOS_EMBEDDING_URL``).
+- ``/v1/models``, ``/v1/chat/completions`` and ``/v1/embeddings`` (and the
+  un-prefixed forms) are rewritten to ``/api/llm/v1/...`` and handed to the
+  MAIN app object, so the auth middleware exemptions and ``gateway_caller``
+  (keys, allowlists, budgets) run exactly as for any other gateway call.
+  Embeddings (``TAOS_EMBEDDING_URL``) used to be relayed to LiteLLM; since
+  LiteLLM removal stage 2a the gateway serves them itself, so nothing an
+  agent calls depends on LiteLLM running.
 - Everything else is a 404: LiteLLM's admin API (``/key/generate``,
   ``/model/new``, ``/config/update``, ...), ``/v1/messages`` and
   ``/v1/responses`` (which would skip the gateway's checks), and every
@@ -47,8 +48,13 @@ GATEWAY_PATHS = {
     "/models": f"{PREFIX}/models",
     "/v1/chat/completions": f"{PREFIX}/chat/completions",
     "/chat/completions": f"{PREFIX}/chat/completions",
+    "/v1/embeddings": f"{PREFIX}/embeddings",
+    "/embeddings": f"{PREFIX}/embeddings",
 }
-PASSTHROUGH_PATHS = frozenset({"/v1/embeddings", "/embeddings"})
+# Paths relayed to LiteLLM unchanged. EMPTY since LiteLLM removal stage 2a:
+# the gateway serves embeddings itself. ``_passthrough`` below is unused and
+# goes with LiteLLM in stage 2b.
+PASSTHROUGH_PATHS: frozenset[str] = frozenset()
 
 # Generous for chat with inline images, far below anything that hurts an SBC.
 MAX_BODY_BYTES = 32 * 1024 * 1024
@@ -125,7 +131,10 @@ def _replay(body: bytes, receive):
 
 
 async def _passthrough(scope, receive, send, litellm_port: int) -> None:
-    """Relay one request to LiteLLM on ``127.0.0.1:<litellm_port>`` unchanged."""
+    """Relay one request to LiteLLM on ``127.0.0.1:<litellm_port>`` unchanged.
+
+    Unreachable since stage 2a (``PASSTHROUGH_PATHS`` is empty); stage 2b
+    deletes it with LiteLLM."""
     body = await _read_body(scope, receive)
     headers = [(k, v) for k, v in scope.get("headers") or [] if k.lower() not in _HOP_BY_HOP]
     url = f"http://127.0.0.1:{int(litellm_port)}{scope['path']}"
@@ -160,6 +169,7 @@ def create_agent_listener_app(main_app, *, litellm_port: int, identity: str | No
     """ASGI app for the agent listener, wrapping the controller's ``main_app``.
 
     ``identity`` is stamped on every response (``x-taos-llm-listener``).
+    ``litellm_port`` only matters for ``PASSTHROUGH_PATHS`` (empty since 2a).
     """
     stamp = identity.encode("ascii") if identity else None
 

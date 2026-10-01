@@ -496,50 +496,12 @@ class TestLLMProxyOwnership:
         assert (foreign_pid, mod.signal.SIGTERM) in kill_calls
 
     @pytest.mark.asyncio
-    async def test_create_agent_key_logs_on_non_200(self, monkeypatch, caplog):
-        """Non-200 from /key/generate must surface in logs so operators
-        can see master-key mismatches / model-list rejections instead of
-        hunting through null llm_key fields."""
-        import logging
+    @pytest.mark.parametrize("db", [None, "postgres://x:y@h/litellm"], ids=["routing-only", "postgres"])
+    async def test_create_agent_key_mints_locally_without_calling_litellm(self, monkeypatch, tmp_path, db):
+        """LiteLLM removal stage 2a: whatever the proxy mode, a per-agent key is
+        minted in the local key store; /key/generate (master key) is never hit."""
         import tinyagentos.llm_proxy as mod
-
-        class _FakeResp:
-            status_code = 401
-            text = "Invalid master key"
-
-        class _FakeClient:
-            def __init__(self, *a, **kw): pass
-            async def __aenter__(self): return self
-            async def __aexit__(self, *exc): return False
-            async def post(self, url, json=None, headers=None): return _FakeResp()
-
-        monkeypatch.setattr(mod.httpx, "AsyncClient", _FakeClient)
-
-        # database_url required so create_agent_key actually hits the
-        # endpoint — without it the routing-only short-circuit returns
-        # None before any HTTP call.
-        p = mod.LLMProxy(port=4000, database_url="postgres://x:y@h/litellm")
-
-        # Bypass is_running(): pretend we own a live subprocess.
-        class _FakeProc:
-            def poll(self): return None
-        p._process = _FakeProc()
-
-        with caplog.at_level(logging.WARNING, logger="tinyagentos.llm_proxy"):
-            key = await p.create_agent_key("bridgetest")
-
-        assert key is None
-        assert any(
-            "/key/generate" in rec.getMessage() and "401" in rec.getMessage()
-            for rec in caplog.records
-        ), [rec.getMessage() for rec in caplog.records]
-
-    @pytest.mark.asyncio
-    async def test_create_agent_key_skips_call_when_no_database_url(self, monkeypatch):
-        """In routing-only mode (no Postgres), create_agent_key must
-        return None without hitting /key/generate — otherwise LiteLLM
-        emits a confusing 500 'DB not connected' on every deploy."""
-        import tinyagentos.llm_proxy as mod
+        from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
 
         called = False
 
@@ -550,19 +512,39 @@ class TestLLMProxyOwnership:
             async def post(self, *a, **kw):
                 nonlocal called
                 called = True
-                raise AssertionError("/key/generate should not be called when database_url is None")
+                raise AssertionError("/key/generate must not be called")
 
         monkeypatch.setattr(mod.httpx, "AsyncClient", _FakeClient)
-
-        p = mod.LLMProxy(port=4000)  # no database_url
+        p = mod.LLMProxy(port=4000, database_url=db, data_dir=tmp_path)
 
         class _FakeProc:
             def poll(self): return None
         p._process = _FakeProc()
 
         key = await p.create_agent_key("routing-only")
-        assert key is None
         assert called is False
+        assert LiteLLMKeyStore(default_keystore_path(tmp_path)).lookup(key) == {
+            "agent": "routing-only", "allowed_models": ["default", EMBEDDING_ALIAS]}
+
+    @pytest.mark.asyncio
+    async def test_create_agent_key_returns_none_and_warns_when_the_mint_raises(self, tmp_path, caplog, monkeypatch):
+        """When the local key store mint raises, create_agent_key must return
+        None and log a warning (the deployer then refuses the deploy rather
+        than handing the agent the master key)."""
+        import logging
+        import tinyagentos.llm_proxy as mod
+
+        class _FakeStore:
+            def mint(self, *a, **kw):
+                raise OSError("disk full")
+
+        monkeypatch.setattr(mod.LLMProxy, "_keystore", lambda self: _FakeStore())
+
+        proxy = mod.LLMProxy(port=4000, data_dir=tmp_path)
+        with caplog.at_level(logging.WARNING, logger="tinyagentos.llm_proxy"):
+            key = await proxy.create_agent_key("boom")
+        assert key is None
+        assert any("key store mint failed for boom" in r.getMessage() for r in caplog.records)
 
 
 class TestPidsListeningOn:
@@ -678,15 +660,16 @@ class TestInhouseKeys:
         proxy = LLMProxy(port=14006, config_dir=tmp_path, data_dir=tmp_path,
                          inhouse_keys=True)
         key = await proxy.create_agent_key("agent-a", None)
-        assert proxy._keystore().lookup(key)["allowed_models"] == ["default"]
+        assert proxy._keystore().lookup(key)["allowed_models"] == ["default", EMBEDDING_ALIAS]
 
     @pytest.mark.asyncio
     async def test_update_and_delete_key_inhouse(self, tmp_path):
+        from tinyagentos.litellm_config import EMBEDDING_ALIAS
         proxy = LLMProxy(port=14005, config_dir=tmp_path, data_dir=tmp_path,
                          inhouse_keys=True)
         key = await proxy.create_agent_key("agent-a", ["a"])
         assert await proxy.update_agent_key(key, ["b", "c"]) is True
-        assert proxy._keystore().lookup(key)["allowed_models"] == ["b", "c"]
+        assert proxy._keystore().lookup(key)["allowed_models"] == ["b", "c", EMBEDDING_ALIAS]
         assert await proxy.delete_agent_key(key) is True
         assert proxy._keystore().lookup(key) is None
 
@@ -728,6 +711,40 @@ class TestProxySelfHeal:
         assert "proxy" in captured["cmd"]
         assert captured["cwd"] == str(tmp_path)
         assert captured["home"] == str(tmp_path)
+
+    @pytest.mark.asyncio
+    async def test_selfheal_includes_ble_extra_on_handset(self, tmp_path, monkeypatch):
+        """On a taOSmobile handset the self-heal uv sync must include --extra ble."""
+        import sys
+        import tinyagentos.llm_proxy as mod
+        import tinyagentos.routes.settings as settings_mod
+
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "tinyagentos"\n')
+        binp = tmp_path / ".local" / "bin"
+        binp.mkdir(parents=True)
+        (binp / "uv").write_text("x")
+        monkeypatch.setattr(sys, "executable", str(tmp_path / ".venv" / "bin" / "python"))
+        monkeypatch.setattr(settings_mod, "_compute_update_extras", lambda: ("proxy", "ble"))
+
+        captured = {}
+
+        class FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return (b"ok", None)
+
+        async def fake_exec(*cmd, **kw):
+            captured["cmd"] = list(cmd)
+            return FakeProc()
+
+        monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
+
+        ok = await LLMProxy()._selfheal_proxy_extra()
+        assert ok is True
+        assert "--extra" in captured["cmd"]
+        assert "ble" in captured["cmd"]
+        assert "proxy" in captured["cmd"]
 
     @pytest.mark.asyncio
     async def test_selfheal_nonzero_returns_false(self, tmp_path, monkeypatch):
@@ -1263,3 +1280,23 @@ class TestSystemdUnitPermissions:
     def test_unit_has_no_umask(self):
         text = self._UNIT_PATH.read_text()
         assert re.search(r"(?m)^\s*UMask\s*=", text) is None
+
+
+class TestScopedKeyModels:
+    """scoped_key_models is the single source of truth for a new key's model list."""
+
+    def test_none_returns_default_and_embedding(self):
+        from tinyagentos.llm_proxy import scoped_key_models
+        assert scoped_key_models(None) == ["default", EMBEDDING_ALIAS]
+
+    def test_single_model_returns_model_and_embedding(self):
+        from tinyagentos.llm_proxy import scoped_key_models
+        assert scoped_key_models(["m"]) == ["m", EMBEDDING_ALIAS]
+
+    def test_alias_already_present_no_duplicate(self):
+        from tinyagentos.llm_proxy import scoped_key_models
+        assert scoped_key_models(["m", EMBEDDING_ALIAS]) == ["m", EMBEDDING_ALIAS]
+
+    def test_order_models_first_alias_last(self):
+        from tinyagentos.llm_proxy import scoped_key_models
+        assert scoped_key_models(["a", "b"]) == ["a", "b", EMBEDDING_ALIAS]

@@ -189,6 +189,35 @@ async def _record_trace(
         logger.warning("llm_gateway: trace record failed", exc_info=True)
 
 
+def _mirror_reasoning(target) -> bool:  # noqa: ANN001
+    """Add ``reasoning_content`` (same text) beside upstream ``reasoning``.
+
+    LiteLLM answered with ``reasoning_content``; OpenRouter-style upstreams
+    send ``reasoning`` (+ ``reasoning_details``). Clients that read either
+    (hermes, openclaw) are unaffected by the copy; a client that reads only
+    ``reasoning_content`` keeps working after LiteLLM is gone. Upstream's own
+    fields are left as they are and an upstream ``reasoning_content`` is never
+    overwritten. Returns True when ``target`` was changed.
+    """
+    if not isinstance(target, dict) or "reasoning_content" in target:
+        return False
+    reasoning = target.get("reasoning")
+    if not isinstance(reasoning, str) or not reasoning:
+        return False
+    target["reasoning_content"] = reasoning
+    return True
+
+
+def _mirror_choices(body, field: str) -> bool:  # noqa: ANN001
+    """``_mirror_reasoning`` on ``choices[*][field]``; True if any changed."""
+    changed = False
+    if isinstance(body, dict):
+        for choice in body.get("choices") or []:
+            if isinstance(choice, dict) and _mirror_reasoning(choice.get(field)):
+                changed = True
+    return changed
+
+
 def _status_error(resp: httpx.Response, route: Route, api_key: str | None) -> GatewayError | None:
     """The error for a non-2xx upstream answer, or None for a 2xx.
 
@@ -238,6 +267,7 @@ async def _chat_completion_one(
         data = None
     if not isinstance(data, dict):
         raise upstream_error(f"{what} returned a response that is not a JSON object")
+    _mirror_choices(data, "message")
 
     request_text = json.dumps(body)
     response_text = json.dumps(data)
@@ -331,6 +361,10 @@ def _event_stream_for_route(
                             yield (msg_str + "\n\n").encode("utf-8")
                             continue
                         is_usage_only = isinstance(chunk, dict) and isinstance(chunk.get("usage"), dict) and not chunk.get("choices")
+                        if (not is_usage_only and msg_str.startswith("data: ")
+                                and _mirror_choices(chunk, "delta")):
+                            # Re-serialised ONLY when a delta gained reasoning_content.
+                            msg_str = "data: " + json.dumps(chunk)
                         if caller_asked_for_usage or not is_usage_only:
                             yield (msg_str + "\n\n").encode("utf-8")
                         if is_usage_only or caller_asked_for_usage:
