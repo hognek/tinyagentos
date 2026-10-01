@@ -64,12 +64,19 @@ async def _get_verified_gateway_port() -> int:
     try:
         resp = await asyncio.to_thread(TaosClient().get, "/api/settings/llm-proxy")
     except ApiError as exc:
-        print(
-            f"ERROR: local controller rejected the token (HTTP {exc.status}): "
-            "set TAOS_TOKEN or run taosctl login. "
-            f"Detail: {exc.message}",
-            file=sys.stderr,
-        )
+        if exc.status in (401, 403):
+            print(
+                f"ERROR: local controller rejected the token (HTTP {exc.status}): "
+                "set TAOS_TOKEN or run taosctl login. "
+                f"Detail: {exc.message}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"ERROR: local controller returned HTTP {exc.status} for "
+                f"/api/settings/llm-proxy: {exc.message}",
+                file=sys.stderr,
+            )
         return 0
     except Exception as exc:
         print(
@@ -110,7 +117,7 @@ async def _convert_to_lxc(args) -> int:
     try:
         data_dir = resolve_data_dir()
         config = load_config(data_dir / "config.yaml")
-    except ValueError as exc:
+    except (ValueError, OSError) as exc:
         print(f"ERROR: invalid config: {exc}", file=sys.stderr)
         return 1
     llm_proxy = LLMProxy(

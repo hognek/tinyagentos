@@ -551,3 +551,60 @@ async def test_convert_to_lxc_config_failure_exits_before_drain(monkeypatch, tmp
     rc = await _convert_to_lxc(args)
     assert rc != 0
     assert drain_calls == []
+
+
+@pytest.mark.asyncio
+async def test_gateway_port_404_is_not_reported_as_auth(monkeypatch, tmp_path, capsys):
+    """A 404 from the local controller must not print 'rejected the token'.
+
+    Only 401/403 are auth errors. A 404 (older controller without
+    /api/settings/llm-proxy, or any other non-auth failure) should report
+    the HTTP status without telling the user to log in.
+    """
+    import urllib.error
+
+    from tinyagentos.cli.worker import _convert_to_lxc
+
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.list_flat_mode_agents",
+        lambda: [],
+    )
+    fake_run = types.SimpleNamespace(returncode=0)
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: fake_run)
+
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.resolve_data_dir",
+        lambda: tmp_path,
+    )
+    fake_config = types.SimpleNamespace(server={"litellm_port": 7834})
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.load_config",
+        lambda path: fake_config,
+    )
+
+    class FakeResponse:
+        def __init__(self, payload_bytes):
+            self._payload = payload_bytes
+
+        def read(self):
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(req, *a, **k):
+        raise urllib.error.HTTPError(
+            req.full_url, 404, "Not Found", req.headers, None,
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    args = types.SimpleNamespace(controller_url="http://controller:6969", yes=True)
+    rc = await _convert_to_lxc(args)
+    assert rc != 0
+
+    captured = capsys.readouterr()
+    assert "rejected the token" not in captured.err.lower()
