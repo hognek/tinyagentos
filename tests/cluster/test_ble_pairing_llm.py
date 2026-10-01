@@ -208,6 +208,26 @@ async def test_repair_leaves_exactly_one_live_key(tmp_path, store):
     assert _live(tmp_path, new) is not None
 
 
+@pytest.mark.asyncio
+async def test_repair_with_gateway_off_revokes_old_key(tmp_path, store):
+    """A board paired with the gateway on, then re-paired with it off, must
+    leave no orphan model key behind."""
+    first = FakeBoard(board_id="B1")
+    mgr = _mgr(tmp_path, store, {"a": first})
+    await mgr.confirm((await mgr.start("a"))["session"])
+    old = first.responder.provisioned["llm"]["key"]
+    assert _live(tmp_path, old) is not None
+
+    assert await store.revoke("taOSusb-B1")
+
+    second = FakeBoard(board_id="B1")
+    mgr2 = _mgr(tmp_path, store, {"a": second}, llm=False)
+    await mgr2.confirm((await mgr2.start("a"))["session"])
+
+    assert _live(tmp_path, old) is None
+    assert second.responder.provisioned["llm"] is None
+
+
 # -- orb: never mint a model key ----------------------------------------------
 
 @pytest.mark.asyncio

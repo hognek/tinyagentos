@@ -448,13 +448,16 @@ class BlePairingManager:
 
         urls = controller_urls(self._bind_port)
         llm = None
+        # A board re-paired under the same name (reset, not revoked) leaves
+        # its old model key behind; one live key per node. Revocation is a
+        # local store write and does not need the gateway up.
+        from tinyagentos.llm_gateway.auth import revoke_for_node
+
+        revoke_for_node(name, data_dir=self._data_dir)
         if self._llm_enabled and urls:
             try:
-                from tinyagentos.llm_gateway.auth import mint_for_node, revoke_for_node
+                from tinyagentos.llm_gateway.auth import mint_for_node
 
-                # A board re-paired under the same name (reset, not revoked)
-                # leaves its old model key behind; one live key per node.
-                revoke_for_node(name, data_dir=self._data_dir)
                 if platform != "orb":
                     llm_key = mint_for_node(
                         name, BOARD_LLM_MODELS, data_dir=self._data_dir
@@ -544,10 +547,9 @@ class BlePairingManager:
             await self._pairing_store.revoke_if_key(name, key)
         except Exception:
             logger.exception("ble pairing rollback: failed to revoke key for '%s'", name)
-        if self._llm_enabled:
-            try:
-                from tinyagentos.llm_gateway.auth import revoke_for_node
+        try:
+            from tinyagentos.llm_gateway.auth import revoke_for_node
 
-                revoke_for_node(name, data_dir=self._data_dir)
-            except Exception:
-                logger.exception("ble pairing rollback: failed to revoke model keys for '%s'", name)
+            revoke_for_node(name, data_dir=self._data_dir)
+        except Exception:
+            logger.exception("ble pairing rollback: failed to revoke model keys for '%s'", name)
