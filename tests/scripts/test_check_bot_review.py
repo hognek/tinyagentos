@@ -1034,6 +1034,100 @@ class TestForkPrGate:
         assert "error" in message.lower()
         assert "head sha" in message.lower()
 
+    def _mock_api_with_permission_map(self, check_mod, pr_data, reviews=None, labels=None, permission_map=None, issue_comments=None):
+        """Like _mock_api but permission_map is dict of login -> permission value.
+        None means API failure (returns None from _api_get)."""
+        _LABELS_API_ERROR = "__LABELS_API_ERROR__"
+        labels_api_error = labels == _LABELS_API_ERROR
+        reviews_data = [] if reviews is None else reviews
+        issue_comments = issue_comments or []
+        labels_data = [] if labels is None or labels_api_error else labels
+        call_count = 0
+
+        def side_effect(url, token=None):
+            nonlocal call_count
+            call_count += 1
+
+            if "/pulls/" in url and "/reviews" not in url and "/comments" not in url and "/collaborators" not in url:
+                if call_count == 1:
+                    return pr_data
+                if labels_api_error:
+                    return None
+                return [{"labels": labels_data}]
+            if url.endswith("/reviews"):
+                return reviews_data
+            if "/collaborators/" in url and "/permission" in url:
+                login = url.split("/collaborators/")[1].split("/")[0]
+                perm = None
+                if permission_map is not None:
+                    perm = permission_map.get(login)
+                if perm == "__PERMISSION_API_ERROR__":
+                    return None
+                if perm is not None:
+                    return [{"permission": perm}]
+                return None
+            if "/issues/" in url and "/comments" in url:
+                return issue_comments
+            if url.endswith("/comments"):
+                return []
+            return []
+
+        return side_effect
+
+    def test_fork_failed_permission_read_does_not_mask_later_approval(self, check_mod) -> None:
+        """A fork PR has two APPROVED reviews on the head SHA: login A first
+        (permission read -> None) and login B second ('write'). The verdict
+        must be EXIT_OK. On the base head it is EXIT_ERROR."""
+        with patch.object(check_mod, "_api_get", side_effect=self._mock_api_with_permission_map(
+            check_mod, self.FORK_PR_DATA,
+            reviews=[
+                {
+                    "id": 1, "state": "APPROVED",
+                    "commit_id": "head_sha_abc",
+                    "submitted_at": "2026-09-30T00:00:00Z",
+                    "user": {"login": "login_a"},
+                },
+                {
+                    "id": 2, "state": "APPROVED",
+                    "commit_id": "head_sha_abc",
+                    "submitted_at": "2026-09-30T00:01:00Z",
+                    "user": {"login": "login_b"},
+                },
+            ],
+            permission_map={
+                "login_a": None,
+                "login_b": "write",
+            },
+        )):
+            exit_code, message = check_mod.check_bot_review("jaylfc", "taOS", 3018)
+        assert exit_code == check_mod.EXIT_OK
+        assert "fork PR -- lead review present" in message
+        assert "write" in message
+
+    def test_fork_only_failed_permission_read_is_error(self, check_mod) -> None:
+        """The only APPROVED review comes from a login whose permission read
+        returns None. The verdict must be EXIT_ERROR (fail-closed is kept).
+        This must pass both before and after the fix."""
+        with patch.object(check_mod, "_api_get", side_effect=self._mock_api_with_permission_map(
+            check_mod, self.FORK_PR_DATA,
+            reviews=[
+                {
+                    "id": 1, "state": "APPROVED",
+                    "commit_id": "head_sha_abc",
+                    "submitted_at": "2026-09-30T00:00:00Z",
+                    "user": {"login": "login_a"},
+                },
+            ],
+            permission_map={
+                "login_a": None,
+            },
+        )):
+            exit_code, message = check_mod.check_bot_review("jaylfc", "taOS", 3019)
+        assert exit_code == check_mod.EXIT_ERROR
+        assert "error" in message.lower()
+        assert "permission" in message.lower()
+        assert "login_a" in message
+
 
 # ---------------------------------------------------------------------------
 # Workflow YAML regression guard

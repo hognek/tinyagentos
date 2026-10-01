@@ -706,6 +706,7 @@ def check_bot_review(
             if prev is None or submitted_at > (prev.get("submitted_at") or ""):
                 latest_by_login[login] = review
 
+        first_failed_login: str | None = None
         for review in latest_by_login.values():
             state = (review.get("state") or "").upper()
             if state != "APPROVED":
@@ -719,16 +720,19 @@ def check_bot_review(
                 continue
             perm = get_collaborator_permission(owner, repo, login, token)
             if perm is None:
-                return EXIT_ERROR, (
-                    f"error: could not fetch permission for {login} on "
-                    f"{owner}/{repo} (exit {EXIT_ERROR})"
-                )
+                first_failed_login = login
+                continue
             if perm in ("admin", "write"):
                 return EXIT_OK, (
                     f"bot-review-gate: fork PR -- lead review present "
                     f"({login} has {perm} permission) (exit {EXIT_OK})"
                 )
 
+        if first_failed_login is not None:
+            return EXIT_ERROR, (
+                f"error: could not fetch permission for {first_failed_login} on "
+                f"{owner}/{repo} (exit {EXIT_ERROR})"
+            )
         return EXIT_FORK_UNREVIEWED, (
             f"FAIL: fork PR requires lead review "
             f"(no maintainer approval on head sha, no lead-reviewed label) "

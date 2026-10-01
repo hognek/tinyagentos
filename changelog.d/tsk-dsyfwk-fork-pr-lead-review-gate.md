@@ -12,6 +12,4 @@
 
 - Added "Fork PRs" subsection to CONTRIBUTING.md explaining the lead review requirement, the head-sha constraint, and the fail-closed permission read.
 
-### Fixed
-
 - Restored correct `hailo_model_zoo_genai.git` header in `scripts/install-hailo.sh`, undoing a stray revert that had changed it back to `hailo-ollama.git`.

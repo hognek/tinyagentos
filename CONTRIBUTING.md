@@ -61,7 +61,7 @@ Open a GitHub issue describing:
 
 ### Fork PRs
 
-Fork PRs receive no automated review: Gitar is on the free plan (no code review), Qodo is billing-dead, CodeRabbit is intermittent and Kilo is intermittent, and none of them run on fork heads anyway. The ruling is NOT to bolt on a `pull_request_target` reviewer. **Lead review IS the gate for fork PRs.** Make that true in the docs and in the machine gate, so a fork PR can never merge on a vacuous green.
+Fork PRs receive no automated review. **Lead review is the gate for fork PRs:** a maintainer review (an APPROVED review from a collaborator with admin or write permission on the current head sha, or the `lead-reviewed` label) is required before a fork PR can merge.
 
 For a fork PR the CodeRabbit classification is irrelevant: the verdict is EXIT_OK only when a maintainer has approved (APPROVED review by a collaborator with admin or write permission) or the `lead-reviewed` label is present. Otherwise the verdict is EXIT_FORK_UNREVIEWED (3). The `bot-review-allow` label does NOT waive the fork verdict: it waives stub-shaped bot output, and a fork PR has no bot output to be stubbed.
 
