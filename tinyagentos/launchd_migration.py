@@ -12,12 +12,51 @@ deploys are refused.
 from __future__ import annotations
 
 import logging
+import os
 import plistlib
+import shutil
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / "com.tinyagentos.controller.plist"
+HELPER_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / "com.tinyagentos.plist-reload.plist"
+
+
+def _pending_launchd_reload_path() -> Path:
+    return PLIST_PATH.parent / "com.tinyagentos.pending-launchd-reload"
+
+
+def write_pending_launchd_reload() -> None:
+    _pending_launchd_reload_path().write_text("1")
+
+
+def read_pending_launchd_reload() -> bool:
+    return _pending_launchd_reload_path().exists()
+
+
+def clear_pending_launchd_reload() -> None:
+    _pending_launchd_reload_path().unlink(missing_ok=True)
+
+
+def _write_reload_helper(controller_plist: Path) -> None:
+    uid = os.getuid()
+    script = (
+        f"sleep 1; "
+        f"launchctl bootout gui/{uid} com.tinyagentos.controller; "
+        f"launchctl bootstrap gui/{uid} {controller_plist}; "
+        f"rm {HELPER_PLIST_PATH}; "
+        f"launchctl bootout gui/{uid} com.tinyagentos.plist-reload"
+    )
+    helper_plist = {
+        "Label": "com.tinyagentos.plist-reload",
+        "RunAtLoad": True,
+        "KeepAlive": False,
+        "ProgramArguments": ["/bin/sh", "-c", script],
+    }
+    HELPER_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(HELPER_PLIST_PATH, "wb") as f:
+        plistlib.dump(helper_plist, f, fmt=plistlib.FMT_XML)
 
 
 def _is_tinyagentos_controller_plist(plist: dict) -> bool:
@@ -149,7 +188,10 @@ async def apply_launchd_migration(install_dir: str) -> tuple[bool, str | None]:
     """Apply the launchd plist migration on Darwin.
 
     This is the async wrapper that handles file I/O, atomic write, backup,
-    and launchctl reload. Called from the Settings update path.
+    and records that a reload is needed. Called from the Settings update path.
+
+    The actual bootout/bootstrap is performed by a separate one-shot launchd
+    helper job started from _do_restart after the HTTP response is returned.
 
     Parameters
     ----------
@@ -159,8 +201,8 @@ async def apply_launchd_migration(install_dir: str) -> tuple[bool, str | None]:
     Returns
     -------
     tuple[bool, str | None]
-        (success, error_message). success=True means migration applied or not needed.
-        error_message is None on success, or a warning message on failure.
+        (success, warning). success=True means migration applied or not needed.
+        warning is None on success, or a warning message on failure.
     """
     import sys
 
@@ -186,49 +228,25 @@ async def apply_launchd_migration(install_dir: str) -> tuple[bool, str | None]:
         bak_path = plist_path.with_suffix(".plist.bak")
         tmp_path = plist_path.with_suffix(".plist.tmp")
 
-        # Backup current
-        plist_path.replace(bak_path)
-
-        # Write new
+        # Write new plist to temp first (C2: write before backup)
         tmp_path.write_bytes(new_plist_bytes)
-        tmp_path.replace(plist_path)
 
-        # Reload launchd agent
-        import asyncio
+        # Copy current plist to backup (C2: copy, not move)
+        shutil.copy2(plist_path, bak_path)
 
-        proc = await asyncio.create_subprocess_exec(
-            "launchctl", "bootout", f"gui/{Path.home().owner()}", str(plist_path),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+        # Replace live plist with new one
+        os.replace(tmp_path, plist_path)
+
+        # Write the one-shot reload helper (C1: separate job, no bootout here)
+        _write_reload_helper(plist_path)
+
+        # Record that a reload is needed
+        write_pending_launchd_reload()
+
+        logger.info(
+            "launchd migration: migrated com.tinyagentos.controller.plist from bare uvicorn "
+            "to `python -m tinyagentos`"
         )
-        await proc.wait()
-
-        proc = await asyncio.create_subprocess_exec(
-            "launchctl", "bootstrap", f"gui/{Path.home().owner()}", str(plist_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        _, stderr = await proc.communicate()
-
-        if proc.returncode != 0:
-            # Try unload/load as fallback
-            proc = await asyncio.create_subprocess_exec(
-                "launchctl", "unload", str(plist_path),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            await proc.wait()
-            proc = await asyncio.create_subprocess_exec(
-                "launchctl", "load", str(plist_path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            _, stderr = await proc.communicate()
-
-        if proc.returncode != 0:
-            err = stderr.decode() if stderr else "unknown error"
-            logger.warning("launchd migration: reload failed: %s", err)
-            return True, f"plist migrated but launchctl reload failed: {err}"
 
         return True, None
 

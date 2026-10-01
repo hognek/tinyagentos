@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import plistlib
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -272,6 +273,78 @@ class TestDarwinGate:
                 assert len(calls) == 1, f"migration should be called on {platform}"
             else:
                 assert len(calls) == 0, f"migration should NOT be called on {platform}"
+
+
+class TestApplyLaunchdMigrationNoSubprocess:
+    """apply_launchd_migration must not call launchctl from the controller process."""
+
+    def test_apply_launchd_migration_spawns_no_launchctl(self, tmp_path, monkeypatch):
+        """apply_launchd_migration on an old plist must NOT call any launchctl subprocess."""
+        import asyncio
+        from unittest.mock import patch, MagicMock, AsyncMock
+
+        plist_path = tmp_path / "com.tinyagentos.controller.plist"
+        old_plist = _make_old_uvicorn_plist(install_dir="/tmp/test")
+        plist_path.write_bytes(old_plist)
+
+        monkeypatch.setattr(
+            "tinyagentos.launchd_migration.PLIST_PATH",
+            plist_path,
+        )
+        monkeypatch.setattr("sys.platform", "darwin")
+
+        subprocess_calls = []
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            subprocess_calls.append(args)
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.communicate = AsyncMock(return_value=(b"", b""))
+            mock_proc.wait = AsyncMock()
+            return mock_proc
+
+        from tinyagentos.launchd_migration import apply_launchd_migration
+
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_create_subprocess_exec):
+            result = asyncio.run(apply_launchd_migration("/tmp/test"))
+
+        launchctl_calls = [c for c in subprocess_calls if c and c[0] == "launchctl"]
+        assert len(launchctl_calls) == 0, (
+            f"Expected no launchctl calls, got: {launchctl_calls}"
+        )
+
+
+class TestAtomicWrite:
+    """Atomic write must not clobber the live plist on failure."""
+
+    def test_write_failure_leaves_original_plist_in_place(self, tmp_path, monkeypatch):
+        """If the atomic write fails, the original plist must not be touched."""
+        plist_path = tmp_path / "com.tinyagentos.controller.plist"
+        original_plist = _make_old_uvicorn_plist(install_dir="/tmp/test")
+        plist_path.write_bytes(original_plist)
+
+        monkeypatch.setattr(
+            "tinyagentos.launchd_migration.PLIST_PATH",
+            plist_path,
+        )
+        monkeypatch.setattr("sys.platform", "darwin")
+
+        original_write_bytes = Path.write_bytes
+
+        def fake_write_bytes(self, data):
+            if self.suffix == ".tmp":
+                raise OSError("simulated write failure")
+            return original_write_bytes(self, data)
+
+        from tinyagentos.launchd_migration import apply_launchd_migration
+        import asyncio
+
+        with patch.object(Path, "write_bytes", fake_write_bytes):
+            result = asyncio.run(apply_launchd_migration("/tmp/test"))
+
+        assert plist_path.read_bytes() == original_plist, (
+            "Original plist was modified despite write failure"
+        )
 
 
 # Helper to run RED-FIRST: we write a stub that returns None
