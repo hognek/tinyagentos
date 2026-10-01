@@ -210,7 +210,7 @@ export function RequestsPanel() {
               return (
                 <li
                   key={req.id}
-                  className="px-4 py-3 hover:bg-white/[0.02] transition-colors"
+                  className="px-4 py-3 hover:bg-white/3 transition-colors"
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div className="flex-1 min-w-0">

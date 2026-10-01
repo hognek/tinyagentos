@@ -15,8 +15,8 @@ so unauthenticated external agents can reach them.  The opaque UUID request_id a
 capability token for the poll endpoint — only the caller who received the id can poll it.
 
 Security notes
--------------
-* The token field is returned ONLY on status == 'accepted'.
+--------------
+ * The token field is returned ONLY on status == 'accepted'.
 * Admin gate on approve / deny / list — checked via current_user + is_admin flag.
 * Abuse cap: at most _PENDING_CAP pending requests per (identity_claim, framework) pair;
   further submissions receive 429.
