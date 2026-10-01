@@ -172,9 +172,9 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
     The key is scoped to the full ``permitted_models`` set read from the
     ``taos_agent`` desktop_settings namespace (falls back to ``[model]``).
 
-    If the server was created while LiteLLM was not yet ready (born degraded),
-    it is torn down and rebuilt transparently on the next call once the proxy
-    is running so callers never need to know about the race.
+    Its model calls go to the in-process LLM gateway; there is no LiteLLM
+    readiness race any more (LiteLLM removal 2b-2a removed the "born degraded"
+    rebuild).
 
     Returns the running :class:`~tinyagentos.opencode_runtime.OpenCodeServer`.
     """
