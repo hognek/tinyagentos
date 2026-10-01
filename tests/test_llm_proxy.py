@@ -713,6 +713,40 @@ class TestProxySelfHeal:
         assert captured["home"] == str(tmp_path)
 
     @pytest.mark.asyncio
+    async def test_selfheal_includes_ble_extra_on_handset(self, tmp_path, monkeypatch):
+        """On a taOSmobile handset the self-heal uv sync must include --extra ble."""
+        import sys
+        import tinyagentos.llm_proxy as mod
+        import tinyagentos.routes.settings as settings_mod
+
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "tinyagentos"\n')
+        binp = tmp_path / ".local" / "bin"
+        binp.mkdir(parents=True)
+        (binp / "uv").write_text("x")
+        monkeypatch.setattr(sys, "executable", str(tmp_path / ".venv" / "bin" / "python"))
+        monkeypatch.setattr(settings_mod, "_compute_update_extras", lambda: ("proxy", "ble"))
+
+        captured = {}
+
+        class FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return (b"ok", None)
+
+        async def fake_exec(*cmd, **kw):
+            captured["cmd"] = list(cmd)
+            return FakeProc()
+
+        monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
+
+        ok = await LLMProxy()._selfheal_proxy_extra()
+        assert ok is True
+        assert "--extra" in captured["cmd"]
+        assert "ble" in captured["cmd"]
+        assert "proxy" in captured["cmd"]
+
+    @pytest.mark.asyncio
     async def test_selfheal_nonzero_returns_false(self, tmp_path, monkeypatch):
         import sys
         import tinyagentos.llm_proxy as mod
