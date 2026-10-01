@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import plistlib
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock, AsyncMock
 
 import pytest
 
@@ -329,17 +329,19 @@ class TestAtomicWrite:
         )
         monkeypatch.setattr("sys.platform", "darwin")
 
-        original_write_bytes = Path.write_bytes
+        # Import atomic_write_bytes to patch it where it's actually used
+        from tinyagentos.launchd_migration import atomic_write_bytes
 
-        def fake_write_bytes(self, data):
-            if self.suffix == ".tmp":
-                raise OSError("simulated write failure")
-            return original_write_bytes(self, data)
+        original_atomic_write_bytes = atomic_write_bytes
 
-        from tinyagentos.launchd_migration import apply_launchd_migration
-        import asyncio
+        def fake_atomic_write_bytes(path, data, *, mode=None):
+            # Simulate a write failure
+            raise OSError("simulated write failure")
 
-        with patch.object(Path, "write_bytes", fake_write_bytes):
+        with patch("tinyagentos.launchd_migration.atomic_write_bytes", side_effect=fake_atomic_write_bytes):
+            from tinyagentos.launchd_migration import apply_launchd_migration
+            import asyncio
+
             result = asyncio.run(apply_launchd_migration("/tmp/test"))
 
         assert plist_path.read_bytes() == original_plist, (
