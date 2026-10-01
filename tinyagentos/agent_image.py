@@ -187,6 +187,42 @@ async def is_image_present(alias: str = BASE_IMAGE_ALIAS, remote: str | None = N
 
 
 
+async def _sweep_stale_bake_containers() -> None:
+    """Find and force-delete any leftover taos-bake-*-tmp containers.
+
+    Non-fatal: logs every result but never raises. Called before a bake launch
+    and from the startup path to avoid name clashes and permanent orphans.
+    """
+    async def _incus(*args: str, timeout: int = 60) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(
+            "incus", *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise
+        return proc.returncode, (stdout or b"").decode()
+
+    # List containers matching the bake temp pattern
+    code, out = await _incus("list", "--format=csv", "-c", "n", "taos-bake-*-tmp")
+    if code != 0:
+        logger.warning("agent_image: sweep list failed: %s", out[:300])
+        return
+    for line in (out or "").splitlines():
+        name = line.strip()
+        if not name:
+            continue
+        del_code, del_out = await _incus("delete", name, "--force", timeout=30)
+        if del_code != 0:
+            logger.warning("agent_image: sweep delete failed for %s: %s", name, del_out[:300])
+        else:
+            logger.info("agent_image: sweep deleted stale %s", name)
+
+
 async def _bake_scripts_into_image(alias: str) -> None:
     """Launch a temporary container from *alias*, inject taos-framework-update,
     publish the result back over the same alias, then delete the temp container.
@@ -206,8 +242,16 @@ async def _bake_scripts_into_image(alias: str) -> None:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            raise
         return proc.returncode, (stdout or b"").decode()
+
+    # Sweep any stale temp containers before launching to avoid name clashes
+    await _sweep_stale_bake_containers()
 
     try:
         # Launch a temporary container from the just-imported image
@@ -237,9 +281,11 @@ async def _bake_scripts_into_image(alias: str) -> None:
     finally:
         # Always clean up the temp container regardless of outcome
         try:
-            await _incus("delete", tmp_name, "--force", timeout=30)
-        except Exception:
-            pass
+            code, out = await _incus("delete", tmp_name, "--force", timeout=30)
+            if code != 0:
+                logger.warning("agent_image: bake cleanup delete failed for %s: %s", tmp_name, out[:300])
+        except Exception as exc:
+            logger.warning("agent_image: bake cleanup delete error for %s: %s", tmp_name, exc)
 
 async def ensure_image_present(
     alias: str = BASE_IMAGE_ALIAS,
@@ -330,6 +376,8 @@ async def ensure_image_present(
         # On a remote the prefetched base is used as-is (the helper is
         # non-essential and can be baked on the worker separately if needed).
         if not remote:
+            # Sweep stale bake containers on the startup path too
+            await _sweep_stale_bake_containers()
             await _bake_scripts_into_image(alias)
         _prefetch_state["status"] = "done"
         return True
