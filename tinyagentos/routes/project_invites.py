@@ -358,6 +358,7 @@ async def build_os_connection_bundle(
     agent_handle: str,
     granted_scopes: list[str],
     check_interval_secs: int,
+    harness: str = "",
 ) -> dict:
     """Assemble the connection bundle for an OS-level (project-less) redeem.
 
@@ -402,6 +403,7 @@ async def build_os_connection_bundle(
         agent_handle=agent_handle,
         granted_scopes=granted_scopes,
         check_interval_secs=check_interval_secs,
+        harness=harness,
     )
 
     return {
@@ -429,6 +431,7 @@ async def build_connection_bundle(
     agent_handle: str,
     granted_scopes: list[str],
     check_interval_secs: int,
+    harness: str = "",
 ) -> dict:
     """Assemble the JSON connection bundle returned by a successful redeem.
 
@@ -521,6 +524,7 @@ async def build_connection_bundle(
         has_files_read=has_files_read,
         has_files_write=has_files_write,
         check_interval_secs=check_interval_secs,
+        harness=harness,
     )
 
     return {
@@ -556,6 +560,7 @@ def _build_guide_markdown(
     has_files_read: bool = False,
     has_files_write: bool = False,
     check_interval_secs: int,
+    harness: str = "",
 ) -> str:
     """Generate the personalized capability guide from granted scopes + project
     + derived handle. Contains NO secret: the token still arrives via the status
@@ -642,15 +647,39 @@ def _build_guide_markdown(
     else:
         lines.append("- A2A bus: NOT granted.")
     lines.append("")
+    if harness == "grok":
+        lines.append("## TOKEN STORAGE AND POLLING (Grok-specific)")
+        lines.append("")
+        lines.append(
+            "Store the taOS agent token ONLY via the Grok secure form. "
+            "Never write the token to a file or include it in a chat message."
+        )
+        lines.append(
+            f"Set a Grok routine to poll the taOS status endpoint every {check_interval_secs} seconds. "
+            "taOS cannot push to your bot, so the poll is the reliable delivery path."
+        )
+        lines.append(
+            "This token is readable by every bot on this Grok account. "
+            "Treat it as a shared secret."
+        )
+        lines.append("")
     lines.append("## WRITE THIS INTO YOUR OWN PERSISTENT MEMORY NOW")
     lines.append("")
-    lines.append(
-        "Persist the following into your own long-term memory (not the operator's): "
-        f"your canonical_id (from the status poll), the project id `{project.get('id')}` "
-        f"and slug `{project_slug}`, the path to the token file where you stored the "
-        "polled token, and this bus contract (authenticated proxy, `from` forced to "
-        f"`{agent_handle}`). A re-spawn must reuse this identity, not mint a new one."
-    )
+    if harness == "grok":
+        lines.append(
+            "Persist the following into your own long-term memory (not the operator's): "
+            f"your canonical_id (from the status poll), the project id `{project.get('id')}` "
+            f"and slug `{project_slug}`, and this bus contract (authenticated proxy, `from` forced to "
+            f"`{agent_handle}`). A re-spawn must reuse this identity, not mint a new one."
+        )
+    else:
+        lines.append(
+            "Persist the following into your own long-term memory (not the operator's): "
+            f"your canonical_id (from the status poll), the project id `{project.get('id')}` "
+            f"and slug `{project_slug}`, the path to the token file where you stored the "
+            "polled token, and this bus contract (authenticated proxy, `from` forced to "
+            f"`{agent_handle}`). A re-spawn must reuse this identity, not mint a new one."
+        )
     lines.append("")
     lines.append("## CHECK ON A TIMER (the loop that makes you a member)")
     lines.append("")
@@ -671,6 +700,7 @@ def _build_os_guide_markdown(
     agent_handle: str,
     granted_scopes: list[str],
     check_interval_secs: int,
+    harness: str = "",
 ) -> str:
     """Generate the capability guide for an OS-level (project-less) redeem.
 
@@ -710,15 +740,39 @@ def _build_os_guide_markdown(
     else:
         lines.append("- A2A bus: NOT granted.")
     lines.append("")
+    if harness == "grok":
+        lines.append("## TOKEN STORAGE AND POLLING (Grok-specific)")
+        lines.append("")
+        lines.append(
+            "Store the taOS agent token ONLY via the Grok secure form. "
+            "Never write the token to a file or include it in a chat message."
+        )
+        lines.append(
+            f"Set a Grok routine to poll the taOS status endpoint every {check_interval_secs} seconds. "
+            "taOS cannot push to your bot, so the poll is the reliable delivery path."
+        )
+        lines.append(
+            "This token is readable by every bot on this Grok account. "
+            "Treat it as a shared secret."
+        )
+        lines.append("")
     lines.append("## WRITE THIS INTO YOUR OWN PERSISTENT MEMORY NOW")
     lines.append("")
-    lines.append(
-        "Persist the following into your own long-term memory (not the operator's): "
-        "your canonical_id (from the status poll), the path to the token file where "
-        "you stored the polled token, and this bus contract (authenticated proxy, "
-        f"`from` forced to `{agent_handle}`). A re-spawn must reuse this identity, "
-        "not mint a new one."
-    )
+    if harness == "grok":
+        lines.append(
+            "Persist the following into your own long-term memory (not the operator's): "
+            "your canonical_id (from the status poll), and this bus contract (authenticated proxy, "
+            f"`from` forced to `{agent_handle}`). A re-spawn must reuse this identity, "
+            "not mint a new one."
+        )
+    else:
+        lines.append(
+            "Persist the following into your own long-term memory (not the operator's): "
+            "your canonical_id (from the status poll), the path to the token file where "
+            "you stored the polled token, and this bus contract (authenticated proxy, "
+            f"`from` forced to `{agent_handle}`). A re-spawn must reuse this identity, "
+            "not mint a new one."
+        )
     lines.append("")
     lines.append("## CHECK ON A TIMER")
     lines.append("")
@@ -1270,6 +1324,7 @@ async def redeem_invite(request: Request, body: RedeemInviteIn):
         agent_handle=handle,
         granted_scopes=scopes,
         check_interval_secs=invite.get("check_interval_secs") or 1800,
+        harness=body.harness,
     )
 
     return {
@@ -1348,6 +1403,7 @@ async def _redeem_os_level(request: Request, body: RedeemInviteIn, invite: dict,
         agent_handle=handle,
         granted_scopes=scopes,
         check_interval_secs=invite.get("check_interval_secs") or 1800,
+        harness=body.harness,
     )
 
     return {
