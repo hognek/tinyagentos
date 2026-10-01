@@ -189,7 +189,7 @@ async def _embed_one(route: Route, body: dict, requested: str, principal: str, s
             raise upstream_error(f"{what} returned no embeddings")
 
     usage = _usage(data)
-    cost = cost_of(route.backend_name, route.upstream_model, usage) if usage.known else Cost(
+    cost = cost_of(route.backend_type or route.backend_name, route.upstream_model, usage) if usage.known else Cost(
         None, False, "usage not reported by the backend")
     await _forward._record_trace(
         state, principal, route.upstream_model, usage, cost, route.backend_name,
