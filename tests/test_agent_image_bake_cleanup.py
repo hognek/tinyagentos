@@ -26,6 +26,102 @@ class TestBakeCleanup:
     """Tests for _bake_scripts_into_image cleanup behaviour."""
 
     @pytest.mark.asyncio
+    async def test_concurrent_same_alias_imports_only_one_bakes(self):
+        """Two concurrent ensure_image_present calls for the same alias must not
+        race: only one import runs and only one bake temp container is deleted.
+
+        The first bake's launch blocks on an event; the second reaches launch
+        while the first is still mid-bake and fails with a name clash. Without
+        a per-alias lock, both imports run and both finally blocks attempt to
+        force-delete the same temp container.
+        """
+        alias = "taos-hermes-base"
+        tmp_name = f"taos-bake-{alias}-tmp"
+        launch_event = asyncio.Event()
+        launched = []
+        delete_calls = []
+        import_calls = []
+        launch_count = 0
+        is_image_present_calls = 0
+
+        async def _fake_launch(*args, **kwargs):
+            launched.append(args)
+            proc = MagicMock()
+            if args[:3] == ("incus", "image", "list"):
+                nonlocal is_image_present_calls
+                is_image_present_calls += 1
+                # Image is absent initially, present after the first import
+                if is_image_present_calls <= 2:
+                    proc.returncode = 0
+                    proc.communicate = AsyncMock(return_value=(b"", b""))
+                else:
+                    proc.returncode = 0
+                    proc.communicate = AsyncMock(return_value=(b"taos-hermes-base\n", b""))
+            elif args[0] == "curl":
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+            elif args[:3] == ("incus", "image", "import"):
+                import_calls.append(args)
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"imported\n", b""))
+            elif args[:2] == ("incus", "list"):
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+            elif args[:2] == ("incus", "launch"):
+                nonlocal launch_count
+                launch_count += 1
+                if launch_count == 1:
+                    await launch_event.wait()
+                    proc.returncode = 0
+                    proc.communicate = AsyncMock(return_value=(b"", b""))
+                else:
+                    proc.returncode = 1
+                    proc.communicate = AsyncMock(return_value=(b"name clash\n", b""))
+            elif args[:2] == ("incus", "stop"):
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+            elif args[:3] == ("incus", "image", "delete"):
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+            elif args[:2] == ("incus", "publish"):
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+            elif args[:2] == ("incus", "delete") and "--force" in args:
+                delete_calls.append(args)
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+            else:
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+            proc.wait = AsyncMock(return_value=proc.returncode)
+            proc.stdout = MagicMock()
+            proc.stdout.close = MagicMock()
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", new=_fake_launch), \
+             patch("tinyagentos.containers.push_file", new=AsyncMock()), \
+             patch("tinyagentos.containers.exec_in_container", new=AsyncMock()):
+            tasks = [
+                asyncio.create_task(ensure_image_present(alias=alias)),
+                asyncio.create_task(ensure_image_present(alias=alias)),
+            ]
+            await asyncio.sleep(0.1)
+            launch_event.set()
+            results = await asyncio.gather(*tasks)
+
+            # Only one import should have run
+            assert len(import_calls) == 1, (
+                f"Expected exactly 1 import, got {len(import_calls)}: {import_calls}"
+            )
+            # The temp container delete should have been issued exactly once
+            delete_args_list = [c for c in delete_calls if c[2] == tmp_name]
+            assert len(delete_args_list) == 1, (
+                f"Expected exactly 1 delete for {tmp_name}, got {len(delete_args_list)}: {delete_args_list}"
+            )
+            assert delete_args_list[0] == ("incus", "delete", tmp_name, "--force")
+            assert all(r is True for r in results)
+
+    @pytest.mark.asyncio
     async def test_bake_logs_failed_tmp_delete(self, caplog):
         """When the final delete returns rc=1, a WARNING with the tmp name is logged."""
         alias = "taos-hermes-base"
