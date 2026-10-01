@@ -1221,7 +1221,8 @@ arrives via the status poll). The bundle has:
 
 - `controller.endpoints`: the controller's reachable addresses: non-loopback
   LAN IPv4s (priority ordered, operator override first) and the mesh (Tailscale)
-  node IP when joined. No relay in Phase 1.
+  node IP when joined. An optional relay endpoint is present when
+  `TAOS_CONTROLLER_RELAY_URL` is configured with `https://`.
 - `apis`: the agent-JWT-reachable surface, scoped EXACTLY to the granted scopes
   and mirroring the middleware canvas allowlist so the advertised routes are the
   ones the token can call: task routes when `project_tasks` is granted; canvas
