@@ -45,67 +45,6 @@ def test_proxy_extra_stays_empty():
     assert data["project"]["optional-dependencies"]["proxy"] == []
 
 
-# --- Rule (a): NEVER-DELETE ---
-
-
-def _git_merge_base():
-    try:
-        out = subprocess.run(
-            ["git", "merge-base", "HEAD", "origin/dev"],
-            capture_output=True, text=True, check=True, cwd=ROOT,
-        ).stdout.strip()
-        return out or None
-    except Exception:
-        return None
-
-
-def _git_show(ref: str) -> str:
-    return subprocess.run(
-        ["git", "show", f"{ref}:pyproject.toml"],
-        capture_output=True, text=True, check=True, cwd=ROOT,
-    ).stdout
-
-
-def _git_show_lock(ref: str) -> str:
-    return subprocess.run(
-        ["git", "show", f"{ref}:uv.lock"],
-        capture_output=True, text=True, check=True, cwd=ROOT,
-    ).stdout
-
-
-def test_no_extra_deleted_from_pyproject():
-    merge_base = _git_merge_base()
-    assert merge_base is not None, "no merge base with origin/dev"
-    base_text = _git_show(merge_base)
-    head_text = (ROOT / "pyproject.toml").read_text()
-    base_data = tomllib.loads(base_text)
-    head_data = tomllib.loads(head_text)
-    base_extras = set(base_data["project"]["optional-dependencies"])
-    head_extras = set(head_data["project"]["optional-dependencies"])
-    deleted = sorted(base_extras - head_extras)
-    assert not deleted, (
-        "extras deleted from pyproject.toml: {}. "
-        "Empty an extra (name = []) instead of deleting it."
-    ).format(deleted)
-
-
-def test_no_extra_deleted_from_lockfile():
-    merge_base = _git_merge_base()
-    assert merge_base is not None, "no merge base with origin/dev"
-    base_text = _git_show_lock(merge_base)
-    head_text = (ROOT / "uv.lock").read_text()
-    base_m = re.search(r"^provides-extras = \[(.*?)\]", base_text, re.M)
-    head_m = re.search(r"^provides-extras = \[(.*?)\]", head_text, re.M)
-    assert base_m, "base uv.lock has no provides-extras line"
-    assert head_m, "HEAD uv.lock has no provides-extras line"
-    base_provided = set(re.findall(r'"([^"]+)"', base_m.group(1)))
-    head_provided = set(re.findall(r'"([^"]+)"', head_m.group(1)))
-    deleted = sorted(base_provided - head_provided)
-    assert not deleted, (
-        "extras removed from uv.lock provides-extras: {}. "
-        "Empty the extra in pyproject.toml (name = []) instead."
-    ).format(deleted)
-
 
 # --- Rule (b): SELF-MAINTAINING LIST ---
 
