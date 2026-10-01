@@ -33,11 +33,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tinyagentos.app import resolve_data_dir
 from tinyagentos.cluster.convert_to_lxc import (
     drain_and_delete_agents,
     list_flat_mode_agents,
     redeploy_agents,
 )
+from tinyagentos.config import load_config
+from tinyagentos.llm_proxy import LLMProxy
 from tinyagentos.size_units import parse_size_bytes
 
 logger = logging.getLogger(__name__)
@@ -84,9 +87,17 @@ async def _convert_to_lxc(args) -> int:
         print(f"install-worker.sh failed with code {r.returncode}", file=sys.stderr)
         return r.returncode
 
+    # Create LLMProxy for per-agent key minting during redeploy.
+    data_dir = resolve_data_dir()
+    config = load_config(data_dir / "config.yaml")
+    llm_proxy = LLMProxy(
+        port=config.server.get("litellm_port", 7834),
+        data_dir=data_dir,
+    )
+
     print("Redeploying agents into worker LXC...")
     agent_cfgs = _load_agents_json()
-    await redeploy_agents(agent_cfgs)
+    await redeploy_agents(agent_cfgs, llm_proxy=llm_proxy)
 
     print("Convert-to-LXC complete.")
     return 0

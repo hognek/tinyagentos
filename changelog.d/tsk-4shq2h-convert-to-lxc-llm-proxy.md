@@ -1,0 +1,2 @@
+### Fixed
+- `redeploy_agents` in `convert_to_lxc.py` now accepts and passes `llm_proxy` in `DeployRequest.extra_config`, so agents redeployed during flat-to-worker-LXC conversion receive a scoped per-agent LLM key and go through the verified gateway port guard (matching the route callers in `routes/agents.py` and `routes/agent_import.py`).

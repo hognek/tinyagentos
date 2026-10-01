@@ -74,7 +74,7 @@ async def drain_and_delete_agents(agents: list[dict[str, str]]) -> None:
             logger.warning("delete %s failed: %s", agent["name"], r.stderr)
 
 
-async def redeploy_agents(agent_configs: list[dict[str, Any]]) -> None:
+async def redeploy_agents(agent_configs: list[dict[str, Any]], llm_proxy=None) -> None:
     """Redeploy each agent into the new worker LXC's nested incus.
 
     Each entry is the agent's row from agents.json (name, framework, model,
@@ -84,7 +84,10 @@ async def redeploy_agents(agent_configs: list[dict[str, Any]]) -> None:
     from tinyagentos.deployer import deploy_agent, DeployRequest
     for cfg in agent_configs:
         logger.info("redeploying %s", cfg["name"])
-        req = DeployRequest(**cfg)
+        extra_config = dict(cfg.get("extra_config") or {})
+        if llm_proxy is not None:
+            extra_config["llm_proxy"] = llm_proxy
+        req = DeployRequest(**cfg, extra_config=extra_config)
         result = await deploy_agent(req)
         if not result.get("success"):
             logger.error("redeploy %s failed: %s", cfg["name"], result)
