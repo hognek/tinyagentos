@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 # password. See routes.auth.swipe_unlock.
 # Note /auth/pin (set/clear a PIN) is deliberately absent from this set: those
 # require a live session and must stay gated here.
-EXEMPT_PATHS = {"/auth/login", "/auth/pin-login", "/auth/swipe-unlock", "/auth/osk.js", "/auth/pin-panel.js", "/auth/lock-screen.js", "/auth/lock-widgets", "/auth/lock-weather", "/auth/lock-notifications", "/auth/lock-stats", "/auth/lock-panels", "/auth/lock-events", "/auth/lock-power-menu", "/auth/lock-screen-off", "/auth/lock-screen-on", "/auth/lock-brightness", "/auth/lock-torch", "/auth/lock-volume", "/auth/lock-volume-key", "/auth/lock-charge", "/auth/lock-radios", "/auth/lock-power-action", "/auth/lock-app", "/auth/device-agent/heartbeat", "/auth/device-agent/message", "/auth/lock-call", "/auth/lock-call/ring", "/auth/lock-call/reset", "/auth/lock-call/action", "/auth/lock-call/dismiss", "/auth/setup", "/auth/status", "/auth/me", "/auth/complete", "/auth/lock", "/api/health", "/api/version", "/setup", "/setup/complete", "/redeem", "/api/desktop/browser/push/vapid-public-key", "/api/desktop/browser/proxy-config", "/sw.js", "/desktop", "/desktop/index.html", "/chat-pwa", "/app.html", "/manifest", "/api/agents/registry/pubkey", "/api/share/destinations"}
+EXEMPT_PATHS = {"/auth/login", "/auth/pin-login", "/auth/swipe-unlock", "/auth/osk.js", "/auth/pin-panel.js", "/auth/lock-screen.js", "/auth/lock-widgets", "/auth/lock-weather", "/auth/lock-notifications", "/auth/lock-stats", "/auth/lock-panels", "/auth/lock-events", "/auth/lock-power-menu", "/auth/lock-screen-off", "/auth/lock-screen-on", "/auth/lock-brightness", "/auth/lock-torch", "/auth/lock-volume", "/auth/lock-volume-key", "/auth/lock-charge", "/auth/lock-radios", "/auth/lock-usb", "/auth/lock-power-action", "/auth/lock-app", "/auth/device-agent/heartbeat", "/auth/device-agent/message", "/auth/lock-call", "/auth/lock-call/ring", "/auth/lock-call/reset", "/auth/lock-call/action", "/auth/lock-call/dismiss", "/auth/setup", "/auth/status", "/auth/me", "/auth/complete", "/auth/lock", "/api/health", "/api/version", "/setup", "/setup/complete", "/redeem", "/api/desktop/browser/push/vapid-public-key", "/api/desktop/browser/proxy-config", "/sw.js", "/desktop", "/desktop/index.html", "/chat-pwa", "/app.html", "/manifest", "/api/agents/registry/pubkey", "/api/share/destinations"}
 
 # Registry feed endpoints accept EITHER an admin session OR a registry JWT.
 # When a Bearer token is present for these paths the request bypasses the
@@ -503,14 +503,15 @@ _INVITE_INFO_PREFIX = "/i/"
 _AGENT_MODEL_MODELS = "/v1/models"
 _AGENT_MODEL_CHAT = "/v1/chat/completions"
 
-# In-process LLM gateway (tinyagentos/llm_gateway). Exactly three method+path
-# pairs are EXEMPT (models, chat completions, embeddings), like the Agent-as-a-Model pair above: a scoped gateway key
+# In-process LLM gateway (tinyagentos/llm_gateway). Exactly four method+path
+# pairs are EXEMPT (models, chat completions, embeddings, audio transcriptions), like the Agent-as-a-Model pair above: a scoped gateway key
 # (or the host local token, or a signed-in session) IS the credential and the
 # route's ``gateway_caller`` dependency enforces it, answering an OpenAI-shaped
 # 401 otherwise. Every other /api/llm path or method stays gated here.
 _LLM_GATEWAY_MODELS = "/api/llm/v1/models"
 _LLM_GATEWAY_CHAT = "/api/llm/v1/chat/completions"
 _LLM_GATEWAY_EMBEDDINGS = "/api/llm/v1/embeddings"  # LiteLLM removal stage 2a
+_LLM_GATEWAY_TRANSCRIPTIONS = "/api/llm/v1/audio/transcriptions"  # local speech-to-text
 # The gated rest of /api/llm/ still gets an OpenAI-shaped 401: an OpenAI
 # client reads error.message from an object, and the plain
 # {"error": "Authentication required"} string there surfaces as a crash in
@@ -662,6 +663,8 @@ def _is_exempt(method: str, path: str) -> bool:
     if method == "POST" and path == _LLM_GATEWAY_CHAT:
         return True
     if method == "POST" and path == _LLM_GATEWAY_EMBEDDINGS:
+        return True
+    if method == "POST" and path == _LLM_GATEWAY_TRANSCRIPTIONS:
         return True
     return False
 

@@ -28,8 +28,8 @@ _spec.loader.exec_module(check_install_licences)
 # reason, so a future re-add has to argue with the reason rather than the name.
 FORBIDDEN = {
     "litellm-enterprise": (
-        "LicenseRef-Proprietary (BerriAI). Redistributing the taOS venv under "
-        "the commercial licence would redistribute proprietary code."
+        "LicenseRef-Proprietary (BerriAI). Redistributing the taOS venv would "
+        "redistribute proprietary code that the AGPL cannot cover."
     ),
 }
 

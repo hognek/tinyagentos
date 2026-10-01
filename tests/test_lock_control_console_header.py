@@ -42,6 +42,7 @@ CONSOLE_HEADER = {"X-taOS-Console": "1"}
 #: that a refusal can only have come from the gate under test.
 LOCK_POSTS = [
     ("/auth/lock-radios", {"radio": "wifi", "on": False}),
+    ("/auth/lock-usb", {"mode": "ncm"}),
     ("/auth/lock-volume-key", {"key": "up", "action": "press"}),
     ("/auth/lock-volume", {"percent": 40}),
     ("/auth/lock-torch", {"on": True}),
