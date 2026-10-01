@@ -254,6 +254,17 @@ def _resolve_symbol(merge_result_dir: Path, file_path: str, name: str) -> bool:
         for part in name_parts:
             obj = getattr(obj, part)
         return True
+    except SystemExit:
+        # SystemExit is a BaseException that escapes except Exception,
+        # so we need to catch it and fall back to an AST scan.
+        # KeyboardInterrupt must still propagate.
+        print(f"AST fallback used for {file_path}: import-time SystemExit")
+        try:
+            source = abs_file.read_text(encoding="utf-8", errors="ignore")
+            symbols = _extract_symbols(source, file_path)
+            return f"{file_path}:{name}" in symbols
+        except Exception:
+            return False
     except Exception:
         return False
     finally:

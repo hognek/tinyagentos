@@ -307,8 +307,49 @@ class TestResolveSymbolIsolation:
         finally:
             self._purge_package("tinyagentos")
 
+    def test_module_with_import_sys_exit_still_defines_symbol(self, tmp_path: Path):
+        """RED (pre-fix bug): a module that calls sys.exit(2) at import escapes
+        _resolve_symbol's except Exception: return False handler, killing the
+        whole gate process. After fix, the AST fallback detects the symbol and
+        returns True."""
+        merge = self._write_tree(
+            tmp_path,
+            {
+                "tinyagentos/__init__.py": "",
+                "tinyagentos/exit_module.py": "import sys\nsys.exit(2)\n\ndef defined_symbol():\n    pass\n",
+            },
+        )
+        self._purge_package("tinyagentos")
+        
+        try:
+            # On current dev, this will either raise SystemExit (killing the process)
+            # or _resolve_symbol will return False (incorrectly treating defined_symbol as deleted)
+            result = cds._resolve_symbol(merge, "tinyagentos/exit_module.py", "defined_symbol")
+            # If we reach here without SystemExit, the old code incorrectly returns False
+            assert result is True, f"Expected True (AST fallback should detect defined_symbol), got {result}"
+        finally:
+            self._purge_package("tinyagentos")
 
-class TestResolveSymbolSymlinkTypechange:
+    def test_gone_symbol_returns_false(self, tmp_path: Path):
+        """CONTROL: a symbol that really is gone returns False."""
+        merge = self._write_tree(
+            tmp_path,
+            {
+                "tinyagentos/__init__.py": "",
+                "tinyagentos/real_file.py": "def defined_symbol():\n    pass\n",
+            },
+        )
+        self._purge_package("tinyagentos")
+        
+        try:
+            # This module does not have exit_module.py, so defined_symbol should not be found
+            result = cds._resolve_symbol(merge, "tinyagentos/exit_module.py", "defined_symbol")
+            assert result is False, f"Expected False (symbol really missing), got {result}"
+        finally:
+            self._purge_package("tinyagentos")
+
+
+# ---------------------------------------------------------------------------
     """_resolve_symbol must handle a .py -> symlink typechange in the merge
     result: follow an in-tree symlink to its real target, but never follow a
     symlink that escapes the extracted merge tree (the re-entry that loaded the
