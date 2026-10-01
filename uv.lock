@@ -2870,7 +2870,7 @@ requires-dist = [
     { name = "yt-dlp", specifier = ">=2025.1.15" },
     { name = "zeroconf", specifier = ">=0.150.0" },
 ]
-provides-extras = ["worker", "torrent", "ble", "e2e"]
+provides-extras = ["worker", "torrent", "ble", "proxy", "e2e"]
 
 [package.metadata.requires-dev]
 dev = [

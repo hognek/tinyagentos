@@ -97,6 +97,13 @@ torrent = ["libtorrent>=2.0.9"]
 # bluetooth_unavailable when it (or an adapter) is missing, instead of every
 # install failing to boot without it.
 ble = ["bleak>=0.22.0"]
+# DEPRECATED, intentionally empty. The LiteLLM process is gone (#3313), but the
+# updater that RUNS an update is the OLD code already on the box, and before
+# #3313 it called `uv sync --frozen --extra proxy`. uv refuses an undefined
+# extra, so deleting this name stranded every existing install on the release
+# before it. Keep it defined and empty; tests/test_update_extras_compat.py
+# pins every extra a shipped updater has ever requested.
+proxy = []
 e2e = [
     "pytest>=9.1.1",
     "pytest-playwright>=0.5.0",

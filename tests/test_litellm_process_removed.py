@@ -232,10 +232,12 @@ def test_litellm_absent_from_uv_lock_and_extras():
     assert "litellm" not in names
     assert "litellm-proxy-extras" not in names
     project = next(p for p in lock["package"] if p["name"] == "tinyagentos")
-    assert "proxy" not in (project.get("optional-dependencies") or {})
+    # ``proxy`` survives only as an EMPTY extra so pre-#3313 updaters can run
+    # ``uv sync --extra proxy`` (tests/test_update_extras_compat.py); it must pull nothing.
+    assert not (project.get("optional-dependencies") or {}).get("proxy")
     pyproject = tomllib.loads((REPO / "pyproject.toml").read_text())
     extras = pyproject["project"].get("optional-dependencies") or {}
-    assert "proxy" not in extras
+    assert extras.get("proxy", []) == []
     assert not any("litellm" in req for reqs in extras.values() for req in reqs)
     assert not any("litellm" in req for req in pyproject["project"]["dependencies"])
 
