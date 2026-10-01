@@ -12,7 +12,6 @@ from tinyagentos.auth_context import require_admin
 from tinyagentos.backend_adapters import get_adapter
 from tinyagentos.config import save_config_locked, VALID_BACKEND_TYPES
 from tinyagentos.lifecycle_manager import LifecycleManager
-from tinyagentos.litellm_config import get_litellm_master_key
 from tinyagentos.providers import CLOUD_TYPES
 
 logger = logging.getLogger(__name__)
@@ -251,32 +250,33 @@ async def refresh_cloud_backends_if_changed(app_state, config, proxy) -> bool:
     return True
 
 
-async def _fetch_litellm_models(proxy) -> list[dict]:
-    """Fetch ``/v1/models`` from the running LiteLLM proxy using the master
-    key. Returns the raw ``data`` list (list of dicts) or ``[]`` on any
-    failure. LiteLLM's response shape is OpenAI-compatible:
-    ``{"data": [{"id": "...", ...}], "object": "list"}``.
+async def _fetch_litellm_models(proxy, app_state=None) -> list[dict]:
+    """The model catalog, read IN PROCESS from the routing table.
+
+    It used to be LiteLLM's ``/v1/models`` fetched with the LiteLLM master
+    key; since LiteLLM removal stage 2a it is the same table LiteLLM was
+    configured from (``llm_gateway.resolve.routing_table``), so the picker
+    works with LiteLLM stopped and nothing presents the master key. The
+    shape is unchanged: OpenAI-style ``{"id", "object", "created",
+    "owned_by"}`` entries, one per distinct model name, in routing order.
+    The name and the ``proxy`` argument are kept for the callers (and are
+    renamed with LiteLLM in stage 2b). Returns ``[]`` without an app state.
     """
-    if not proxy or not proxy.is_running():
+    if app_state is None:
         return []
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                f"{proxy.url}/v1/models",
-                headers={"Authorization": f"Bearer {get_litellm_master_key(getattr(proxy, '_data_dir', None))}"},
-            )
-        if resp.status_code != 200:
-            logger.warning(
-                "LiteLLM /v1/models returned HTTP %d: %.200s",
-                resp.status_code, resp.text,
-            )
-            return []
-        body = resp.json()
-        data = body.get("data") if isinstance(body, dict) else None
-        return data if isinstance(data, list) else []
-    except Exception as exc:
-        logger.warning("LiteLLM /v1/models fetch failed: %s", exc)
+        from tinyagentos.llm_gateway.resolve import routing_table
+
+        table = routing_table(app_state)
+    except Exception as exc:  # noqa: BLE001 - an empty catalog, never a 500
+        logger.warning("model catalog: routing table unavailable: %s", exc)
         return []
+    seen: dict[str, None] = {}
+    for entry in table:
+        name = entry.get("model_name")
+        if isinstance(name, str) and name:
+            seen.setdefault(name, None)
+    return [{"id": n, "object": "model", "created": 0, "owned_by": "taos"} for n in seen]
 
 
 def seed_cache_from_config(app_state) -> None:
@@ -329,7 +329,7 @@ async def _do_background_refresh(app_state) -> None:
             return
         proxy = getattr(app_state, "llm_proxy", None)
         await _refresh_all_cloud_backends(app_state, config, proxy)
-        data = await _fetch_litellm_models(proxy)
+        data = await _fetch_litellm_models(proxy, app_state)
         if data:
             import time as _time
             import asyncio as _asyncio
@@ -748,7 +748,7 @@ async def get_litellm_models(request: Request, refresh: bool = False):
         proxy = getattr(app_state, "llm_proxy", None)
         config = app_state.config
         await _refresh_all_cloud_backends(app_state, config, proxy)
-        data = await _fetch_litellm_models(proxy)
+        data = await _fetch_litellm_models(proxy, app_state)
         import time as _time
         if data:
             payload: dict = {"data": data, "object": "list"}
@@ -796,7 +796,7 @@ async def force_refresh_models(request: Request):
     cached_payload = getattr(app_state, "litellm_models_cache", None)
 
     await _refresh_all_cloud_backends(app_state, config, proxy)
-    data = await _fetch_litellm_models(proxy)
+    data = await _fetch_litellm_models(proxy, app_state)
 
     if data:
         import time as _time

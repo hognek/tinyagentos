@@ -105,10 +105,13 @@ def _reload_auth(monkeypatch, keystore_path, master="sk-master"):
 
 
 @pytest.mark.asyncio
-async def test_hook_master_key_passthrough(monkeypatch, tmp_path):
+async def test_hook_master_key_is_not_a_passthrough(monkeypatch, tmp_path):
+    """LiteLLM removal stage 2a: the master key is an unknown key to the hook."""
+    from fastapi import HTTPException
     auth = _reload_auth(monkeypatch, tmp_path / "keys.db")
-    result = await auth.user_api_key_auth(_FakeRequest({"model": "x"}), "sk-master")
-    assert result.api_key == "sk-master"
+    with pytest.raises(HTTPException) as exc:
+        await auth.user_api_key_auth(_FakeRequest({"model": "x"}), "sk-master")
+    assert exc.value.status_code == 401
 
 
 @pytest.mark.asyncio

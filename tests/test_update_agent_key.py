@@ -29,25 +29,27 @@ class _FakeProxy:
 
 
 @pytest.mark.asyncio
-async def test_update_agent_key_calls_key_update(monkeypatch):
+async def test_update_agent_key_rescopes_in_the_local_store_not_litellm(monkeypatch, tmp_path):
+    """Since LiteLLM removal stage 2a the re-scope is the local key store,
+    whatever the proxy mode: LiteLLM's /key/update (master key) is never called."""
+    from tinyagentos.litellm_config import EMBEDDING_ALIAS
+    from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
     cap = {}
     import tinyagentos.llm_proxy as M
     monkeypatch.setattr(M.httpx, "AsyncClient", lambda **k: _Client(200, cap))
-    assert await _FakeProxy().update_agent_key("sk-x", ["a", "b"]) is True
-    assert cap["url"].endswith("/key/update")
-    assert cap["json"] == {"key": "sk-x", "models": ["a", "b"]}
+    proxy = LLMProxy(port=4000, data_dir=tmp_path, database_url="postgres://x")
+    key = LiteLLMKeyStore(default_keystore_path(tmp_path)).mint("a", ["m"])
+    assert await proxy.update_agent_key(key, ["a", "b"]) is True
+    assert LiteLLMKeyStore(default_keystore_path(tmp_path)).lookup(key)["allowed_models"] == [
+        "a", "b", EMBEDDING_ALIAS
+    ]
+    assert cap == {}
 
 
 @pytest.mark.asyncio
-async def test_update_agent_key_noop_without_db():
-    assert await _FakeProxy(db=False).update_agent_key("sk-x", ["a"]) is False
-
-
-@pytest.mark.asyncio
-async def test_update_agent_key_false_on_error(monkeypatch):
-    import tinyagentos.llm_proxy as M
-    monkeypatch.setattr(M.httpx, "AsyncClient", lambda **k: _Client(500))
-    assert await _FakeProxy().update_agent_key("sk-x", ["a"]) is False
+async def test_update_agent_key_false_for_a_key_the_store_does_not_hold(tmp_path):
+    proxy = LLMProxy(port=4000, data_dir=tmp_path, database_url="postgres://x")
+    assert await proxy.update_agent_key("sk-legacy-postgres-key", ["a"]) is False
 
 
 @pytest.mark.asyncio
@@ -59,3 +61,20 @@ async def test_update_agent_key_refuses_empty_models(monkeypatch):
     monkeypatch.setattr(M.httpx, "AsyncClient", lambda **k: _Client(200, cap))
     assert await _FakeProxy().update_agent_key("sk-x", []) is False
     assert cap == {}
+
+
+@pytest.mark.asyncio
+async def test_model_change_keeps_the_embedding_alias(monkeypatch, tmp_path):
+    """After update_agent_key re-scopes to [Y], taos-embedding-default is still
+    allowed so the agent does not lose embedding access on model change."""
+    from tinyagentos.litellm_config import EMBEDDING_ALIAS
+    from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
+
+    import tinyagentos.llm_proxy as M
+    monkeypatch.setattr(M.httpx, "AsyncClient", lambda **k: _Client(200, cap := {}))
+    proxy = LLMProxy(port=4000, data_dir=tmp_path, database_url="postgres://x")
+    key = LiteLLMKeyStore(default_keystore_path(tmp_path)).mint("a", ["old-model", EMBEDDING_ALIAS])
+    assert await proxy.update_agent_key(key, ["new-model"]) is True
+    assert LiteLLMKeyStore(default_keystore_path(tmp_path)).lookup(key)["allowed_models"] == [
+        "new-model", EMBEDDING_ALIAS
+    ]
