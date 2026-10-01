@@ -183,6 +183,53 @@ describe("RequestsPanel", () => {
     expect(screen.getByText("Agent Alpha")).toBeInTheDocument();
   });
 
+  it("successful retry clears the previous Action failed error", async () => {
+    let approveAttempt = 0;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation((url: string) => {
+      if (url.startsWith("/api/agents/scope-requests")) {
+        return Promise.resolve({
+          ok: true,
+          headers: { get: () => "application/json" },
+          json: () => Promise.resolve({ requests: MOCK_REQUESTS }),
+        } as unknown as Response);
+      }
+      if (url.includes("/scope-requests/") && url.includes("/approve")) {
+        approveAttempt += 1;
+        if (approveAttempt === 1) {
+          return Promise.resolve({
+            ok: false,
+            status: 400,
+            headers: { get: () => "application/json" },
+            json: () => Promise.resolve({ detail: "transient error" }),
+          } as unknown as Response);
+        }
+        return Promise.resolve({
+          ok: true,
+          headers: { get: () => "application/json" },
+          json: () => Promise.resolve({ status: "accepted" }),
+        } as unknown as Response);
+      }
+      return Promise.resolve({
+        ok: false,
+        headers: { get: () => "application/json" },
+        json: () => Promise.resolve({}),
+      } as unknown as Response);
+    }));
+    render(<RequestsPanel />);
+    await waitFor(() => {
+      expect(screen.getByText("Agent Alpha")).toBeInTheDocument();
+    });
+    const approveButtons = screen.getAllByRole("button", { name: /approve/i });
+    fireEvent.click(approveButtons[0]);
+    await waitFor(() => {
+      expect(screen.getByText(/transient error/i)).toBeInTheDocument();
+    });
+    fireEvent.click(approveButtons[0]);
+    await waitFor(() => {
+      expect(screen.queryByText("Action failed")).not.toBeInTheDocument();
+    });
+  });
+
   it("filter=all with zero rows does not render 'No pending requests'", async () => {
     vi.stubGlobal("fetch", vi.fn().mockImplementation((url: string) => {
       if (url.startsWith("/api/agents/scope-requests")) {
