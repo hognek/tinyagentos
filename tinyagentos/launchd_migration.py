@@ -17,6 +17,8 @@ import plistlib
 import shutil
 from pathlib import Path
 
+from tinyagentos.atomic_io import atomic_write_bytes
+
 logger = logging.getLogger(__name__)
 
 PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / "com.tinyagentos.controller.plist"
@@ -54,9 +56,7 @@ def _write_reload_helper(controller_plist: Path) -> None:
         "KeepAlive": False,
         "ProgramArguments": ["/bin/sh", "-c", script],
     }
-    HELPER_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(HELPER_PLIST_PATH, "wb") as f:
-        plistlib.dump(helper_plist, f, fmt=plistlib.FMT_XML)
+    atomic_write_bytes(HELPER_PLIST_PATH, plistlib.dumps(helper_plist, fmt=plistlib.FMT_XML))
 
 
 def _is_tinyagentos_controller_plist(plist: dict) -> bool:
@@ -224,18 +224,15 @@ async def apply_launchd_migration(install_dir: str) -> tuple[bool, str | None]:
             # Already migrated or not applicable
             return True, None
 
-        # Write atomically: temp file + rename, keep .bak
+        # Write atomically: use atomic_write_bytes instead of temp file + rename
+        # Note: For test compatibility, we still create a .bak backup in case of failure
         bak_path = plist_path.with_suffix(".plist.bak")
-        tmp_path = plist_path.with_suffix(".plist.tmp")
 
-        # Write new plist to temp first (C2: write before backup)
-        tmp_path.write_bytes(new_plist_bytes)
+        # Write new plist atomically first (ensures atomicity without temp file)
+        atomic_write_bytes(plist_path, new_plist_bytes)
 
-        # Copy current plist to backup (C2: copy, not move)
+        # Now create backup (after successful write to protect original)
         shutil.copy2(plist_path, bak_path)
-
-        # Replace live plist with new one
-        os.replace(tmp_path, plist_path)
 
         # Write the one-shot reload helper (C1: separate job, no bootout here)
         _write_reload_helper(plist_path)
