@@ -262,35 +262,25 @@ async def save_platform_settings(request: Request, body: PlatformUpdate):
 async def llm_proxy_status(request: Request):
     """Return LLM proxy status for the settings page.
 
-    With the in-process gateway on (the default) the proxy agents use IS the
-    gateway: ``port`` is its agent listener (what each container's
-    ``127.0.0.1:4000`` forwards to) and ``running`` says the listener was seen
-    accepting connections. LiteLLM's own state is reported beside it while it
-    still runs (cutover stage 1).
+    The proxy agents use IS the in-process gateway (the only LLM path since
+    LiteLLM removal 2b-2a): ``port`` is its agent listener (what each
+    container's ``127.0.0.1:4000`` forwards to) and ``running`` says this
+    start verified the listener as its own. There is no LiteLLM to report.
     """
     from tinyagentos import llm_gateway
     from tinyagentos.llm_gateway.cutover import llm_gateway_live_port
 
-    proxy = request.app.state.llm_proxy
     state = request.app.state
-    litellm = {
-        "running": proxy.is_running() if hasattr(proxy, "is_running") else False,
-        "port": proxy.port if hasattr(proxy, "port") else 7834,
+    port = getattr(state, "llm_gateway_agent_port", None)
+    if port is None:
+        port = llm_gateway.agent_port(state.config)
+    return {
+        "mode": "gateway",
+        "running": bool(llm_gateway_live_port(state)),
+        "port": port,
+        "url": "/api/llm/v1",
+        "backends": len(state.config.backends),
     }
-    backends = len(state.config.backends)
-    if llm_gateway.enabled():
-        port = getattr(state, "llm_gateway_agent_port", None)
-        if port is None:
-            port = llm_gateway.agent_port(state.config)
-        return {
-            "mode": "gateway",
-            "running": bool(llm_gateway_live_port(state)),
-            "port": port,
-            "url": "/api/llm/v1",
-            "backends": backends,
-            "litellm": litellm,
-        }
-    return {"mode": "litellm", **litellm, "backends": backends}
 
 
 @router.post("/api/settings/test-backend")
@@ -791,11 +781,11 @@ def _find_uv(project_dir: Path) -> str | None:
 # Optional-dependency extras the updater must install so a `uv sync --frozen`
 # does not prune them out of the venv. Single source of truth for the Python
 # side; `scripts/install-server.sh` installs the same set via
-# `pip install -e '.\$(taos_controller_extras)'`, and `test_updater_dep_install.py` asserts the two
-# stay in parity so they cannot silently drift (the bug that stripped litellm).
-# A handset (detected via hardware._detect_device_class() or
-# TAOS_EXTRAS_BLE=1) adds the "ble" extra so Orb scan/pair routes work.
-# TAOS_EXTRAS_BLE=0 overrides auto-detection and excludes ble (rare).
+# `$(taos_controller_extras)`, and `test_updater_dep_install.py` asserts the two
+# stay in parity so they cannot silently drift. There are none by default (the
+# LiteLLM `proxy` extra is gone); a handset (detected via
+# hardware._detect_device_class() or TAOS_EXTRAS_BLE=1) adds the "ble" extra so
+# Orb scan/pair routes work. TAOS_EXTRAS_BLE=0 excludes ble (rare).
 
 def _compute_update_extras() -> tuple[str, ...]:
     """Compute UPDATE_EXTRAS based on device class and TAOS_EXTRAS_BLE env var.
@@ -817,16 +807,13 @@ def _compute_update_extras() -> tuple[str, ...]:
     if taos_extras_ble is not None:
         if taos_extras_ble in ("1", "true"):
             # Force include ble
-            return ("proxy", "ble")
+            return ("ble",)
         elif taos_extras_ble in ("0", "false"):
             # Force exclude ble
-            return ("proxy",)
+            return ()
 
     # Default: include ble on handsets only
-    if is_handset:
-        return ("proxy", "ble")
-    else:
-        return ("proxy",)
+    return ("ble",) if is_handset else ()
 
 
 async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
@@ -837,13 +824,12 @@ async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
     deps onto a user's box. When uv is not present we fall back to the legacy
     ``pip install -e .`` so installs without uv still update.
 
-    Both paths carry the ``proxy`` extra (litellm + prisma) and, on a taOSmobile
-    handset (detected via hardware._detect_device_class()), also carry the ``ble``
-    extra so Orb scan/pair routes work. Use TAOS_EXTRAS_BLE=1 to force include ble
-    on a non-handset, or TAOS_EXTRAS_BLE=0 to exclude it even on a handset.
-    The LLM proxy is a core dependency, not optional: a bare ``uv sync --frozen``
-    prunes the venv to the locked default set and silently uninstalls litellm,
-    disabling the proxy on every update and breaking basic agent functionality.
+    On a taOSmobile handset (detected via hardware._detect_device_class()) both
+    paths carry the ``ble`` extra so Orb scan/pair routes work; otherwise no
+    extra (the LiteLLM ``proxy`` extra is gone). Use TAOS_EXTRAS_BLE=1 to force
+    include ble on a non-handset, or TAOS_EXTRAS_BLE=0 to exclude it even on a
+    handset. A bare ``uv sync --frozen`` prunes the venv to the locked default
+    set plus the named extras, so an extra left out here is uninstalled.
 
     Capture output and surface failures -- silently swallowing a failed install
     lands users on a grey-screen the next time they restart, because the new
@@ -868,7 +854,9 @@ async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
         if candidate.exists():
             pip_cmd = str(candidate)
             break
-    pip_target = f".[{','.join(_compute_update_extras())}]"
+    extras = _compute_update_extras()
+    # ``.[]`` is not a valid pip target: brackets only when there is an extra.
+    pip_target = f".[{','.join(extras)}]" if extras else "."
     logger.info("Updater dependency install: uv not found, using %s install -e %s", pip_cmd, pip_target)
     return await _run_capture(
         [pip_cmd, "install", "-e", pip_target],

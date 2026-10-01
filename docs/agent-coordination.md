@@ -1883,11 +1883,9 @@ valid for admin/system callers but is no longer bound to any agent name.
 ## In-process LLM gateway (`/api/llm/v1`, scoped gateway keys, session or host local token)
 
 `tinyagentos/llm_gateway/` is the in-controller replacement for the LiteLLM
-proxy, and it is ON BY DEFAULT (cutover stage 1). An operator turns it off
-with `TAOS_LLM_GATEWAY=0` (or `false` / `no` / `off`) in the controller's
-environment; then `/api/llm/v1/*` does not exist (404 for a signed-in caller)
-and agents are moved back to LiteLLM at the next start. LiteLLM still runs
-beside the gateway in stage 1 and is removed in a later stage.
+proxy, and since LiteLLM removal stage 2b-2a it is the ONLY LLM path: there is
+no LiteLLM process, and `TAOS_LLM_GATEWAY=0` (or `false` / `no` / `off`) is
+ignored (logged once at startup); `/api/llm/v1/*` is always mounted.
 
 How agents reach it. An agent's base URL does not change: it is still
 `http://127.0.0.1:4000/v1` inside its container (openclaw:
@@ -1895,8 +1893,10 @@ How agents reach it. An agent's base URL does not change: it is still
 `taos-proxy-litellm`; its host side (`connect`) used to be LiteLLM's host port
 (`server.litellm_port`, 7834) and is now the gateway's AGENT LISTENER,
 `127.0.0.1:7838` on the host (`server.llm_gateway_port` or
-`TAOS_LLM_GATEWAY_PORT`; `0` disables the listener and keeps every agent on
-LiteLLM; not 7837, which is the MLX backend's port). The listener binds
+`TAOS_LLM_GATEWAY_PORT`; `0` disables the listener, which leaves agents with
+no LLM path; not 7837, which is the MLX backend's port). The device keeps its
+`taos-proxy-litellm` name and its in-container listen side; there is no
+rename migration. The listener binds
 loopback only and serves an allowlist, all from the gateway itself:
 `/v1/models`, `/v1/chat/completions` and `/v1/embeddings` (what
 `TAOS_EMBEDDING_URL` points at), and the un-prefixed forms. Embeddings used to
@@ -1911,7 +1911,9 @@ embedding alias to every mint and re-scope, so the key always allows
 embeddings. Chat answers also carry
 `reasoning_content` (same text) wherever the upstream sent `reasoning`, as
 LiteLLM did. A remote agent has no gateway path (no proxy device, loopback
-listener): the deploy and the cutover name it as such. Every other path is a 404, including
+listener): a remote deploy is REFUSED with "remote agents need the network LLM
+gateway, not built yet" (decision dec-26f4cw), and the cutover skips an
+existing remote agent with the same reason. Every other path is a 404, including
 LiteLLM's admin API (`/key/generate`, `/model/new`, `/config/update`,
 `/user/new`) and `/v1/messages` / `/v1/responses`. Paths are normalised first
 (a trailing slash cannot route around the gateway) and request bodies are
@@ -1926,36 +1928,38 @@ live in e.g. `user-999`) and passing `--project`:
   answer with this start's nonce in `x-taos-llm-listener` and the gateway's
   own 401 (`code: invalid_api_key`). Accepting TCP is not enough: a
   different process holding the port (an unauthenticated model server, say)
-  would otherwise receive every agent's traffic. Unverified: nobody moves,
-  agents already on the listener go back to LiteLLM, and new deploys stay on
-  LiteLLM.
-- gateway on: an agent moves only if the gateway can serve EVERY model its
-  key allows (`cutover.models_problem`, read from the same routing table):
-  the highest-priority route must be OpenAI-compatible (`openai`,
+  would otherwise receive every agent's traffic. Unverified: nobody is moved
+  onto it, agents already on it are left as they are (there is no LiteLLM to
+  send them back to), and new local deploys are refused with the reason.
+- A device whose `connect` is an old LiteLLM host port (4000, 7834, or the
+  configured `server.litellm_port`) is moved to the listener
+  UNCONDITIONALLY: that port is dead. Whether the gateway can serve EVERY
+  model its key allows (`cutover.models_problem`, read from the same routing
+  table) no longer decides the move; a problem is logged on the agent's
+  item. A model is servable when its highest-priority route is
+  OpenAI-compatible (`openai`,
   `openrouter`, `deepseek`), Anthropic, or Ollama-shaped on a backend of
   type `ollama`, `rkllama` or `hailo-ollama` (all three serve
   `/v1/chat/completions` at the refs taOS installs; hailo-ollama streams
-  Ollama NDJSON, which the gateway translates to OpenAI SSE). Unknown
-  models and an empty allowlist keep the agent on LiteLLM, with the reason
-  logged. An agent already on the gateway whose models stop being servable
-  goes back. New deploys apply the same check.
-- Then the agent's gateway key is minted from its LiteLLM `agent_keys` row
-  (same hash, `key_id` `gk_lit_...`, same allowlist, so the key the agent
-  already holds keeps working), checked to be live, and only then is the
-  device set to the listener. No restart, no redeploy.
-- An agent whose key cannot be read stays on LiteLLM and is logged
-  (`llm gateway cutover: <agent> left as is: <reason>`): no key recorded, the
-  shared master key, a key the local key store does not hold (for example a
-  LiteLLM Postgres virtual key) or another agent's key. Nothing unscoped is
-  minted. Remote agents have no device and are skipped.
-- gateway off: every device pointing at the listener is pointed back at
-  LiteLLM.
+  Ollama NDJSON, which the gateway translates to OpenAI SSE). New deploys
+  run the same check and record a warning step instead of failing.
+- When the agent's key is its own `agent_keys` row, its gateway key is
+  minted from it first (same hash, `key_id` `gk_lit_...`, same allowlist, so
+  the key the agent already holds keeps working) and checked to be live,
+  then the device is set to the listener. No restart, no redeploy.
+- An agent whose key cannot be read (no key recorded, the old master key, a
+  key the local key store does not hold such as a LiteLLM Postgres virtual
+  key, or another agent's key) is still moved, nothing is minted for it, and
+  the reason ("re-key or redeploy it") is logged on its item. Remote agents
+  have no device and are skipped.
 - A container that errors or hangs (each incus call is capped at 30 s) is
   logged and skipped; the rest are still reconciled.
 
 Only a device whose current value was read and recognised is changed, so a
 second run changes nothing. New local deploys go straight to the listener
-once it has been verified and their models are servable. By hand (the same commands the
+once it has been verified, with `OPENAI_BASE_URL=http://127.0.0.1:4000/v1`
+and `TAOS_EMBEDDING_URL=http://127.0.0.1:4000/v1/embeddings` (the container's
+own address, never the host's `litellm_port`). By hand (the same commands the
 reconcile runs):
 `incus config device get <container> taos-proxy-litellm connect --project <project>`
 and
@@ -1977,8 +1981,8 @@ It is deliberately NOT bare `/v1`: `/v1/models` and `/v1/chat/completions`
 are Agent-as-a-Model (consent-key auth, see `routes/agent_model_api.py`) and
 are unchanged.
 
-Routing: model names resolve through `litellm_config.build_model_list`, the
-same function `generate_litellm_config` wraps, read per request.
+Routing: model names resolve through `litellm_config.build_model_list`, read
+per request (the LiteLLM config writer that also wrapped it is gone).
 `taos-default` resolves per request to the taOS agent's model preference
 (desktop settings `("user", "taos_agent")["model"]`, set by
 `PATCH /api/taos-agent/settings`), so changing it needs no restart.
@@ -2000,16 +2004,16 @@ so OpenAI clients surface it as bad credentials. `gateway_caller` accepts:
   minted from it by the cutover once that exists (its revocation is final),
   otherwise the `agent_keys` row itself.
 
-The per-install LiteLLM master key is NOT accepted (it was admin until cutover
-stage 1): it is a 401 like any unknown key. The host's own callers (the
-reasoning judge, for one) use the host local token. Since stage 2a nothing in
-taOS presents the master key at all: a deploy LiteLLM cannot mint for gets a
-key scoped to its models from the local key store (never the master key;
-`TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK` no longer does anything), the taOS
+The old per-install LiteLLM master key is NOT accepted (it was admin until
+cutover stage 1): it is a 401 like any unknown key. The host's own callers
+(the reasoning judge, for one) use the host local token. Since stage 2b-2a
+nothing generates or reads the master key at all (an old install may still
+have the `.litellm_master_key` file; nothing uses it): every deploy gets a key
+scoped to its models from the local key store
+(`TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK` no longer does anything), the taOS
 agent's opencode likewise, per-agent key admin (mint / re-scope / delete /
-usage) is the local key store in every proxy mode, the provider model catalog
-is read in process from the routing table, and the LiteLLM auth hook no
-longer admits the master key. Only LiteLLM's own spawn still reads it.
+usage) is the local key store with no process gating it, and the provider
+model catalog is read in process from the routing table.
 
 The `taos-default` alias rule: a caller allowed `taos-default` may use
 whatever it CURRENTLY resolves to, without the concrete model in its list.

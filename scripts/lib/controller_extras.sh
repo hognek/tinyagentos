@@ -9,19 +9,19 @@ taos_controller_extras() {
         is_handset=1
     fi
 
-    local extras="proxy"
+    local extras=""
     case "${TAOS_EXTRAS_BLE:-}" in
         "1"|"true")
-            extras="proxy,ble"
+            extras="ble"
             ;;
         "0"|"false")
-            extras="proxy"
+            extras=""
             ;;
         *)
             if [[ $is_handset -eq 1 ]]; then
-                extras="proxy,ble"
+                extras="ble"
             else
-                extras="proxy"
+                extras=""
             fi
             ;;
     esac

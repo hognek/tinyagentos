@@ -180,9 +180,9 @@ if [ "${TAOS_EXTRAS_BLE:-1}" != "0" ] && [ "${TAOS_EXTRAS_BLE:-1}" != "false" ];
         fi
         
         if [[ -n "$venv_owner" ]] && [[ "$venv_owner" != "$(whoami)" ]]; then
-            sudo -u "$venv_owner" "$TAOS_DIR/.venv/bin/pip" install --quiet -e "$TAOS_DIR[proxy,ble]"
+            sudo -u "$venv_owner" "$TAOS_DIR/.venv/bin/pip" install --quiet -e "$TAOS_DIR[ble]"
         else
-            "$TAOS_DIR/.venv/bin/pip" install --quiet -e "$TAOS_DIR[proxy,ble]"
+            "$TAOS_DIR/.venv/bin/pip" install --quiet -e "$TAOS_DIR[ble]"
         fi
     else
         echo "Warning: taOS venv not found at $TAOS_DIR/.venv, ble extra not installed"
