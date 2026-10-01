@@ -1247,3 +1247,66 @@ class TestBuildControllerDict:
         relay_eps = [ep for ep in endpoints if ep["kind"] == "relay"]
         assert len(relay_eps) == 0
         assert any("relay" in r.message.lower() and "not safe" in r.message.lower() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_ipv6_ula_callback_host_bracketed_and_advertised(self, monkeypatch):
+        """Bare ULA IPv6 override must be bracketed and advertised as a trusted LAN endpoint."""
+        from tinyagentos.routes.project_invites import _build_controller_dict
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        monkeypatch.delenv("TAOS_CONTROLLER_RELAY_URL", raising=False)
+        monkeypatch.setenv("TAOS_CONTROLLER_CALLBACK_HOST", "fd7a:115c:a1e0::1")
+
+        req = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
+        with patch(
+            "tinyagentos.routes.project_invites._enumerate_lan_ips", return_value=[]
+        ), patch(
+            "tinyagentos.taosnet.mesh.mesh_status",
+            return_value={"joined": False},
+        ), patch(
+            "tinyagentos.routes.agent_deploy.controller_callback_host",
+            return_value="fd7a:115c:a1e0::1",
+        ):
+            result = await _build_controller_dict(req)
+
+        endpoints = result["endpoints"]
+        lan_eps = [ep for ep in endpoints if ep["kind"] == "lan"]
+        assert len(lan_eps) == 1
+        assert lan_eps[0]["url"] == "http://[fd7a:115c:a1e0::1]:6969"
+        assert lan_eps[0]["priority"] == 1
+        # No endpoint contains a malformed '::1:' port fragment.
+        for ep in endpoints:
+            assert "::1:" not in ep.get("url", "")
+
+    @pytest.mark.asyncio
+    async def test_ipv6_documentation_callback_host_not_advertised(self, monkeypatch, caplog):
+        """Bare documentation-range IPv6 override must NOT be advertised."""
+        from tinyagentos.routes.project_invites import _build_controller_dict
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        monkeypatch.delenv("TAOS_CONTROLLER_RELAY_URL", raising=False)
+        monkeypatch.setenv("TAOS_CONTROLLER_CALLBACK_HOST", "2001:db8::1")
+
+        req = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
+        with patch(
+            "tinyagentos.routes.project_invites._enumerate_lan_ips", return_value=[]
+        ), patch(
+            "tinyagentos.taosnet.mesh.mesh_status",
+            return_value={"joined": False},
+        ), patch(
+            "tinyagentos.routes.agent_deploy.controller_callback_host",
+            return_value="2001:db8::1",
+        ):
+            with caplog.at_level(
+                logging.WARNING, logger="tinyagentos.routes.project_invites"
+            ):
+                result = await _build_controller_dict(req)
+
+        endpoints = result["endpoints"]
+        for ep in endpoints:
+            assert "2001:db8::1" not in ep.get("url", "")
+        assert any("2001:db8::1" in r.message for r in caplog.records)

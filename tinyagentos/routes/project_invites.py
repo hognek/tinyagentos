@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import ipaddress
 import json
 import logging
 import os
@@ -276,6 +277,16 @@ async def _build_controller_dict(request: Request) -> dict:
     except Exception:  # noqa: BLE001
         override = None
     if override:
+        # Detect bare IPv6 early: bracket it so urlparse sees the real address
+        # in the safety check and the advertised URL.
+        _override_for_check = override
+        try:
+            _addr = ipaddress.ip_address(override)
+            if _addr.version == 6:
+                _override_for_check = f"[{override}]"
+        except ValueError:
+            pass
+
         if "://" in override:
             # Full URL supplied by the operator: use scheme + host as-is.
             if _is_url_safe_for_credential(override, allow_private=True):
@@ -289,9 +300,9 @@ async def _build_controller_dict(request: Request) -> dict:
                     "credential-bearing bundles (use https or a private address)",
                     override,
                 )
-        elif _is_url_safe_for_credential(f"http://{override}", allow_private=True):
+        elif _is_url_safe_for_credential(f"http://{_override_for_check}", allow_private=True):
             endpoints.append(
-                {"kind": "lan", "url": f"http://{override}:{_CONTROLLER_PORT}", "priority": priority}
+                {"kind": "lan", "url": f"http://{_override_for_check}:{_CONTROLLER_PORT}", "priority": priority}
             )
             priority += 1
         else:

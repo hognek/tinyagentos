@@ -466,7 +466,7 @@ Field sourcing:
   remote machine may already be on the same tailnet (Jay's laptop is); a
   non-mesh machine simply fails the probe and moves on.
 - `relay` endpoint: present when `TAOS_CONTROLLER_RELAY_URL` is configured
-  with an `https://` URL (or a private address). The relay is emitted at
+  with an `https://` URL. The relay is emitted at
   priority 1, ahead of LAN and mesh endpoints. An `http://` relay URL or a
   public `TAOS_CONTROLLER_CALLBACK_HOST` is omitted with a logged warning
   rather than advertised in cleartext.

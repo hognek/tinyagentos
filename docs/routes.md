@@ -126,6 +126,27 @@ Content-negotiated advert: `Accept: application/json` → the redeem contract (`
 
 See `docs/design/external-agent-project-invite.md` (issue #1780); canvas routes advertise only when that scope was granted.
 
+## Override addresses advertised over HTTP
+
+The operator can set `TAOS_CONTROLLER_CALLBACK_HOST` to control which address the invite bundle advertises for the controller. The following override values are advertised over **HTTP** in the bundle:
+
+- **Tailscale CGNAT IPs** in `100.64.0.0/10` (e.g. `100.78.225.80`)
+- **Tailscale ULA IPs** in `fd7a:115c:a1e0::/48`
+- **Private LAN IPs** (RFC 1918: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`)
+- **Loopback** (`127.0.0.1`, `::1`, `localhost`)
+- **Hostnames** that end with `.local`, `.lan`, `.home.arpa`, or `.ts.net` (MagicDNS)
+- **Single-label hostnames** with no dot (e.g. `taos`, `controller`)
+
+The following override values are **NOT advertised over HTTP** (omitted with a warning):
+
+- Public IP addresses
+- Public hostnames (e.g. `controller.example.com`, `api.mycompany.com`)
+- Any hostname not matching the trusted suffixes above
+
+When the override is a full URL (e.g. `http://192.168.1.5:6969`), the scheme and port are used as-is, and the LAN IP enumeration deduplicates against the parsed hostname to avoid advertising the same address twice.
+
+**Relay endpoint** (`TAOS_CONTROLLER_RELAY_URL`): Must be `https://` only. HTTP relay URLs are omitted with a warning, even for private addresses.
+
 ---
 
 # OS change-event stream (`GET /api/os/events`, session-only)

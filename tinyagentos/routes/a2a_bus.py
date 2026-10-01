@@ -101,6 +101,14 @@ def _is_url_safe_for_credential(url: str, *, allow_private: bool = False) -> boo
         return True
     if allow_private:
         if addr.is_private:
+            if addr.version == 6:
+                # Exclude documentation range 2001:db8::/32 (RFC 3849) from
+                # the generic is_private bucket: those addresses are not
+                # routable on any real network and must not be advertised in
+                # credential-bearing bundles.
+                doc_net = ipaddress.ip_network("2001:db8::/32")
+                if addr in doc_net:
+                    return False
             return True
         # Tailscale CGNAT range 100.64.0.0/10 is not flagged as private by
         # Python's ipaddress, but is a tailnet address and should be trusted.
