@@ -1694,3 +1694,158 @@ async def test_failed_completion_does_not_notify_lifecycle(client, monkeypatch):
     resp = await client.post(BASE + "/chat/completions", json=_chat())
     _assert_openai_error(resp, 502, "upstream_error")
     assert fake.calls == []
+
+
+# ---------------------------------------------------------------------------
+# Cost recording: backend_type, not backend_name (tsk-3vcvp5)
+# ---------------------------------------------------------------------------
+
+LLAMA_CPP_PI_NPU = {
+    "name": "pi-npu",
+    "type": "llama-cpp",
+    "url": "http://llama.test:8080/v1",
+    "model": "qwen3-4b",
+    "api_key": "sk-llama",
+    "priority": 1,
+}
+
+OPENROUTER_NAMED_OPENAI = {
+    "name": "openai",
+    "type": "openrouter",
+    "url": "https://openrouter.test/api/v1",
+    "models": [{"id": "gpt-4o"}],
+    "api_key": "sk-or-live",
+    "priority": 1,
+}
+
+
+@_ASYNC
+@respx.mock
+async def test_local_backend_with_custom_name_records_zero_cost_chat(client, monkeypatch):
+    """llama-cpp backend named 'pi-npu' records Cost 0.0 known=True reason 'local backend'."""
+    trace_calls = []
+    spend_calls = []
+
+    async def fake_record_trace(*args, **kwargs):
+        trace_calls.append((args, kwargs))
+
+    def fake_record_spend(*args, **kwargs):
+        spend_calls.append((args, kwargs))
+
+    monkeypatch.setattr("tinyagentos.llm_gateway.forward._record_trace", fake_record_trace)
+    monkeypatch.setattr("tinyagentos.llm_gateway.forward._record_spend", fake_record_spend)
+
+    app = _app(client)
+    app.state.config.backends = [LLAMA_CPP_PI_NPU]
+    route = respx.post("http://llama.test:8080/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=_completion("qwen3-4b"))
+    )
+    resp = await client.post(BASE + "/chat/completions", json=_chat("default"))
+    assert resp.status_code == 200, resp.text
+    assert len(trace_calls) == 1
+    args, _ = trace_calls[0]
+    cost = args[4]
+    assert cost.usd == 0.0
+    assert cost.priced is True
+    assert cost.reason == "local backend"
+    assert len(spend_calls) == 0
+
+
+@_ASYNC
+@respx.mock
+async def test_local_backend_with_custom_name_records_zero_cost_stream(client, monkeypatch):
+    """Streaming through a llama-cpp backend named 'pi-npu' records Cost 0.0."""
+    trace_calls = []
+    spend_calls = []
+
+    async def fake_record_trace(*args, **kwargs):
+        trace_calls.append((args, kwargs))
+
+    def fake_record_spend(*args, **kwargs):
+        spend_calls.append((args, kwargs))
+
+    monkeypatch.setattr("tinyagentos.llm_gateway.forward._record_trace", fake_record_trace)
+    monkeypatch.setattr("tinyagentos.llm_gateway.forward._record_spend", fake_record_spend)
+
+    app = _app(client)
+    app.state.config.backends = [LLAMA_CPP_PI_NPU]
+    body = _sse_chunk("hi") + _sse_usage_chunk(10, 5) + _sse_done()
+    route = respx.post("http://llama.test:8080/v1/chat/completions").mock(
+        return_value=httpx.Response(200, content=body, headers={"content-type": "text/event-stream"})
+    )
+    resp = await client.post(BASE + "/chat/completions", json=_chat("default", stream=True))
+    assert resp.status_code == 200, resp.text
+    assert len(trace_calls) == 1
+    args, _ = trace_calls[0]
+    cost = args[4]
+    assert cost.usd == 0.0
+    assert cost.priced is True
+    assert cost.reason == "local backend"
+    assert len(spend_calls) == 0
+
+
+@_ASYNC
+@respx.mock
+async def test_openrouter_named_like_direct_provider_not_priced_from_direct_table(client, monkeypatch):
+    """OpenRouter backend named 'openai' must not be priced from the OpenAI table."""
+    trace_calls = []
+    spend_calls = []
+
+    async def fake_record_trace(*args, **kwargs):
+        trace_calls.append((args, kwargs))
+
+    def fake_record_spend(*args, **kwargs):
+        spend_calls.append((args, kwargs))
+
+    monkeypatch.setattr("tinyagentos.llm_gateway.forward._record_trace", fake_record_trace)
+    monkeypatch.setattr("tinyagentos.llm_gateway.forward._record_spend", fake_record_spend)
+
+    app = _app(client)
+    app.state.config.backends = [OPENROUTER_NAMED_OPENAI]
+    route = respx.post("https://openrouter.test/api/v1/chat/completions").mock(
+        return_value=httpx.Response(200, json=_completion("gpt-4o"))
+    )
+    resp = await client.post(BASE + "/chat/completions", json=_chat("gpt-4o"))
+    assert resp.status_code == 200, resp.text
+    assert len(trace_calls) == 1
+    args, _ = trace_calls[0]
+    cost = args[4]
+    assert cost.usd is None
+    assert cost.priced is False
+
+
+@_ASYNC
+@respx.mock
+async def test_local_backend_with_custom_name_records_zero_cost_embeddings(client, monkeypatch):
+    """llama-cpp backend named 'pi-npu' records Cost 0.0 for embeddings too."""
+    trace_calls = []
+    spend_calls = []
+
+    async def fake_record_trace(*args, **kwargs):
+        trace_calls.append((args, kwargs))
+
+    def fake_record_spend(*args, **kwargs):
+        spend_calls.append((args, kwargs))
+
+    monkeypatch.setattr("tinyagentos.llm_gateway.forward._record_trace", fake_record_trace)
+    monkeypatch.setattr("tinyagentos.llm_gateway.forward._record_spend", fake_record_spend)
+
+    app = _app(client)
+    app.state.config.backends = [LLAMA_CPP_PI_NPU]
+    route = respx.post("http://llama.test:8080/v1/embeddings").mock(
+        return_value=httpx.Response(200, json={
+            "object": "list",
+            "model": "qwen3-4b",
+            "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2, 0.3]}],
+            "usage": {"prompt_tokens": 4, "total_tokens": 4},
+        })
+    )
+    resp = await client.post(BASE + "/embeddings", json={"model": "default", "input": "hello"})
+    assert resp.status_code == 200, resp.text
+    assert len(trace_calls) == 1
+    args, _ = trace_calls[0]
+    cost = args[4]
+    assert cost.usd == 0.0
+    assert cost.priced is True
+    assert cost.reason == "local backend"
+    assert len(spend_calls) == 0
