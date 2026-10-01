@@ -455,13 +455,16 @@ class BlePairingManager:
                 # A board re-paired under the same name (reset, not revoked)
                 # leaves its old model key behind; one live key per node.
                 revoke_for_node(name, data_dir=self._data_dir)
-                llm_key = mint_for_node(name, BOARD_LLM_MODELS, data_dir=self._data_dir)
+                if platform != "orb":
+                    llm_key = mint_for_node(
+                        name, BOARD_LLM_MODELS, data_dir=self._data_dir
+                    )
+                    llm = {"base": urls[0] + LLM_PATH, "key": llm_key}
             except Exception as exc:
                 await self._rollback(name, key, sess)
                 await self._close_session(sess)
                 # type only: never the exception text, which is not ours to vouch for
                 raise PairError(500, f"failed to mint model key: {type(exc).__name__}") from exc
-            llm = {"base": urls[0] + LLM_PATH, "key": llm_key}
 
         worker = WorkerInfo(
             name=name,

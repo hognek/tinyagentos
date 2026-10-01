@@ -1,3 +1,0 @@
-### Fixed
-
-- Fix `scripts/check_deleted_symbols.py:_resolve_symbol` to catch `SystemExit` (but not `KeyboardInterrupt`) when importing modules during deleted-symbols gate checks. When `exec_module` fails with `SystemExit`, the function now falls back to an AST scan of the merge-tree file to determine if a symbol exists, instead of killing the entire gate process. This allows the gate to properly report false deletions while handling modules that call `sys.exit()` at import time.

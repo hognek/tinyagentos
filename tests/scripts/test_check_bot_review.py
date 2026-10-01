@@ -123,6 +123,12 @@ class TestIsRealItem:
         )
         assert not check_mod.is_real_item(item)
 
+    def test_coderabbit_review_in_progress_is_not_real(self, check_mod) -> None:
+        item = check_mod.CRItem(
+            id=1, body=IN_PROGRESS_BODY, is_review=False,
+        )
+        assert not check_mod.is_real_item(item)
+
     def test_coderabbit_acknowledgement_review_is_not_real(self, check_mod) -> None:
         item = check_mod.CRItem(
             id=1, body=ACK_BODY, is_review=True, review_state="COMMENTED",
@@ -422,6 +428,32 @@ class TestClassify:
         assert "stub" in message
         assert "rate-limit stub" not in message
         assert "scaffolding" not in message
+
+    def test_review_in_progress_only_fails(self, check_mod) -> None:
+        """A body carrying the 'review in progress by coderabbit.ai' marker is
+        NOT a real review: the review is still running, so bot-review-gate must
+        stay red (exit 1, FAIL / stub)."""
+        items = [check_mod.CRItem(id=1, body=IN_PROGRESS_BODY, is_review=False)]
+        exit_code, message = check_mod.classify(items)
+        assert exit_code == 1
+        assert "FAIL" in message
+        assert "stub" in message
+
+    def test_review_in_progress_control_real_walkthrough_still_passes(
+        self, check_mod,
+    ) -> None:
+        """Control: a real completed walkthrough (Run ID + Files selected + no
+        actionable phrase) must still PASS after the in-progress fix lands."""
+        body = (
+            "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n"
+            "**Run ID**: abc123-def456\n"
+            "Files selected for processing (3)\n"
+            "No actionable comments were generated in the recent review."
+        )
+        items = [check_mod.CRItem(id=1, body=body, is_review=False)]
+        exit_code, message = check_mod.classify(items)
+        assert exit_code == 0
+        assert "real CodeRabbit review" in message
 
 
 class TestCheckBotReview:
@@ -1499,19 +1531,33 @@ class TestDetectorIsolation:
             ack = check_mod.CRItem(id=1, body=ACK_BODY, is_review=True, review_state="COMMENTED")
             assert not check_mod.is_real_item(ack)  # acknowledgement still caught
 
+    def test_review_in_progress_body_rejected(self, check_mod) -> None:
+        item = check_mod.CRItem(id=1, body=IN_PROGRESS_BODY, is_review=True, review_state="COMMENTED")
+        assert not check_mod.is_real_item(item)
+
+    def test_neutering_review_in_progress_loses_only_its_protection(self, check_mod) -> None:
+        with patch.object(check_mod, "is_coderabbit_review_in_progress", return_value=False):
+            ip = check_mod.CRItem(id=1, body=IN_PROGRESS_BODY, is_review=True, review_state="COMMENTED")
+            assert check_mod.is_real_item(ip) is True  # protection lost
+            ack = check_mod.CRItem(id=2, body=ACK_BODY, is_review=True, review_state="COMMENTED")
+            assert not check_mod.is_real_item(ack)  # acknowledgement still caught
+
     def test_neutering_every_detector_loses_every_protection(self, check_mod) -> None:
         """The trap the audit caught, reproduced: neutering ALL stub detectors
         must let EVERY stub kind through (green), not stay red on one because an
         untested detector was left on. Each stub must flip independently."""
         with patch.object(check_mod, "is_rate_limit_stub", return_value=False), \
              patch.object(check_mod, "is_coderabbit_acknowledgement", return_value=False), \
-             patch.object(check_mod, "is_coderabbit_failure_notice", return_value=False):
+             patch.object(check_mod, "is_coderabbit_failure_notice", return_value=False), \
+             patch.object(check_mod, "is_coderabbit_review_in_progress", return_value=False):
             rl = check_mod.CRItem(id=1, body=self.RL_BODY, is_review=True, review_state="COMMENTED")
             ack = check_mod.CRItem(id=2, body=ACK_BODY, is_review=True, review_state="COMMENTED")
             failure = check_mod.CRItem(id=3, body=self.FAILURE_BODY, is_review=True, review_state="COMMENTED")
+            ip = check_mod.CRItem(id=4, body=IN_PROGRESS_BODY, is_review=True, review_state="COMMENTED")
             assert check_mod.is_real_item(rl) is True
             assert check_mod.is_real_item(ack) is True
             assert check_mod.is_real_item(failure) is True
+            assert check_mod.is_real_item(ip) is True
 
 
 class TestIsCoderabbitZeroFindingReview:
@@ -2171,6 +2217,63 @@ WALKTHROUGH_WITH_QUOTA_BODY = (
 )
 
 FAILURE_NOTICE_BODY = "Review failed by coderabbit.ai"
+
+IN_PROGRESS_BODY = (
+    "<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n"
+    "<!-- review_stack_entry_start -->\n"
+    "\n"
+    '<a href=\"https://app.coderabbit.ai/change-stack/jaylfc/taOS/pull/3322?cs_source=review_comment\"><img src=\"https://storage.googleapis.com/coderabbit_public_assets/review-stack-in-coderabbit-ui-dark.svg?v=2\" alt=\"Review in Change Stack →\" width=\"220\" height=\"32\"></a>\n'
+    "\n"
+    "Navigate logical layers of code changes, visualize relationships, and explore their blast radius.\n"
+    "\n"
+    "<!-- review_stack_entry_end -->\n"
+    "<!-- This is an auto-generated comment: review in progress by coderabbit.ai -->\n"
+    "\n"
+    "> [!NOTE]\n"
+    "> Currently processing new changes in this PR. This may take a few minutes, please wait...\n"
+    "> \n"
+    "> <details>\n"
+    "> <summary>⚙️ Run configuration</summary>\n"
+    "> \n"
+    "> **Configuration used**: Repository: jaylfc/taOS/.coderabbit.yaml\n"
+    "> \n"
+    "> **Review profile**: CHILL\n"
+    "> \n"
+    "> **Plan**: Advanced\n"
+    "> \n"
+    "> **Run ID**: `52507aab-dd7c-4c4b-8f45-c0cf71edfbff`\n"
+    "> \n"
+    "> </details>\n"
+    "> \n"
+    "> <details>\n"
+    "> <summary>📥 Commits</summary>\n"
+    "> \n"
+    "> Reviewing files that changed from the base of the PR and between 9ad82bd5f08c69384a9981952da8483f17f7d500 and 8dc3adf094303d30828550ccdeae5e4ea7c83997.\n"
+    "> \n"
+    "> </details>\n"
+    "> \n"
+    "> <details>\n"
+    "> <summary>📒 Files selected for processing (3)</summary>\n"
+    "> \n"
+    "> * `changelog.d/tsk-b7cabt-fix-flaky-notification-tests.md`\n"
+    "> * `tests/test_notifications.py`\n"
+    "> * `tests/test_notifications_agent_grant.py`\n"
+    "> \n"
+    "> </details>\n"
+    "> \n"
+    "> ```ascii\n"
+    ">  ____________________________________________________________________\n"
+    "> < There is a 100% chance that this message is relevant to your code. >\n"
+    ">  --------------------------------------------------------------------\n"
+    ">   \\\n"
+    ">    \\   \\\n"
+    ">         \\ /\\\n"
+    ">         ( )\n"
+    ">       .( o ).\n"
+    "> ```\n"
+    "\n"
+    "<!-- end of auto-generated comment: review in progress by coderabbit.ai -->\n"
+)
 
 
 class TestWalkthroughPositiveClassification:
