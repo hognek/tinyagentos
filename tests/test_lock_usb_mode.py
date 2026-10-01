@@ -188,3 +188,73 @@ def test_the_closed_map_refuses_even_if_the_reader_offers_the_mode(box, monkeypa
                         lambda: {"mode": "ncm", "available": ["ncm", mode]})
     assert _call(auth.set_lock_usb(_Req({"mode": mode}))).status_code == 400
     assert not box.exists()
+
+
+# --- follow-up to #3328: partial reads and the wall-clock bound -------------
+
+
+def test_a_failing_list_keeps_the_mode_already_read(monkeypatch):
+    """The second helper call raising must not throw away the first's answer."""
+    def run(cmd, **_k):
+        if cmd[-1] == "list":
+            raise subprocess.TimeoutExpired("taos-usb-mode", 4)
+        return _Done(SAMPLE)
+    monkeypatch.setattr(subprocess, "run", run)
+    assert auth._read_usb() == {"mode": "ncm", "saved": "ncm", "available": []}
+
+
+def test_a_slow_helper_cannot_hold_the_switch_past_the_deadline(box, monkeypatch):
+    """Every read costs 3s of clock and the mode never lands. Counting
+    iterations alone would read 24 times (~84s); the deadline stops it at 12s."""
+    now = [0.0]
+    reads = []
+
+    async def tick(s):
+        now[0] += s
+
+    def slow_read():
+        reads.append(now[0])
+        now[0] += 3.0
+        return dict(ALL)
+
+    monkeypatch.setattr(auth, "_usb_clock", lambda: now[0])
+    monkeypatch.setattr(auth.asyncio, "sleep", tick)
+    monkeypatch.setattr(auth, "_read_usb", slow_read)
+    got = _body(_call(auth.set_lock_usb(_Req({"mode": "mtp"}))))
+    assert got["mode"] == "ncm"
+    reads.pop(0)  # the availability check, which ends at t=3
+    assert 1 < len(reads) < 24, reads
+    assert all(t < 3.0 + auth._USB_SETTLE_SECONDS for t in reads), reads
+
+
+def test_a_hung_read_is_abandoned_at_the_deadline(box, monkeypatch):
+    """A read that never returns: the route answers on time with the last
+    read-back it has, instead of waiting out the helper."""
+    import threading
+    import time
+
+    release = threading.Event()
+    calls = []
+
+    def hung_read():
+        calls.append(1)
+        if len(calls) > 1:
+            release.wait(5)
+        return dict(ALL)
+
+    async def timed():
+        # Timed inside the loop: asyncio.run's shutdown joins the abandoned
+        # thread, which a live server's loop never does.
+        start = time.monotonic()
+        try:
+            resp = await auth.set_lock_usb(_Req({"mode": "mtp"}))
+        finally:
+            elapsed = time.monotonic() - start
+            release.set()
+        return resp, elapsed
+
+    monkeypatch.setattr(auth, "_USB_SETTLE_SECONDS", 0.3)
+    monkeypatch.setattr(auth, "_read_usb", hung_read)
+    resp, elapsed = _call(timed())
+    assert elapsed < 2.0, elapsed
+    assert _body(resp)["mode"] == "ncm"
