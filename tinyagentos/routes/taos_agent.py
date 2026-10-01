@@ -49,6 +49,7 @@ from tinyagentos.taos_agent_runtime import (
     apply_framework,
     ensure_taos_opencode_server,
     ensure_taos_picoclaw_harness,
+    opencode_gateway_problem,
     provision_picoclaw,
     system_agent_framework,
 )
@@ -514,10 +515,17 @@ async def chat(request: Request, body: ChatRequest):
     llm_proxy = getattr(request.app.state, "llm_proxy", None)
     proxy_running = llm_proxy is not None and llm_proxy.is_running()
     if not use_picoclaw and not proxy_running:
-        return JSONResponse(
-            {"error": "LiteLLM proxy is not running. Check that at least one provider is configured."},
-            status_code=503,
-        )
+        # opencode is given the in-process gateway (/api/llm/v1) whenever it
+        # can serve the permitted models, so LiteLLM is needed only when it
+        # cannot. (Stage 2b deletes LiteLLM and this fallback with it.)
+        gateway_problem = await opencode_gateway_problem(app_state, model, prefs)
+        if gateway_problem:
+            return JSONResponse(
+                {"error": f"No LLM path for model {model!r}: {gateway_problem}, and the "
+                          "LiteLLM proxy is not running. Check that at least one provider "
+                          "is configured."},
+                status_code=503,
+            )
 
     # Ensure the host opencode server is running.
     try:

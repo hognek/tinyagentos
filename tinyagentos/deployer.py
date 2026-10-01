@@ -337,6 +337,9 @@ async def deploy_agent(req: DeployRequest) -> dict:
             # container's own 127.0.0.1; a remote worker has no proxy device, so
             # it reaches the controller's LiteLLM over the network at taos_host
             # (the controller's Tailscale IP) on the host's LiteLLM port.
+            # LiteLLM removal (stage 2b) takes this path away. What a remote
+            # deploy does then is decision dec-26f4cw (recommended: refuse it
+            # with a named reason in 2b-2); behaviour is unchanged until then.
             if req.remote:
                 from tinyagentos.llm_gateway.cutover import REMOTE_NO_GATEWAY_REASON
 
