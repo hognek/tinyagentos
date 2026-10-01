@@ -158,10 +158,11 @@ async def test_convert_to_lxc_queries_controller_for_gateway_port_and_redeploys(
     monkeypatch, tmp_path
 ):
     """The CLI must obtain the verified agent-listener port from the RUNNING
-    controller and pass it to redeploy_agents so each agent deploys with a
-    minted key. On BASE this FAILS with 'listener is not verified' because
-    llm_gateway_port is never passed and the real deploy_agent refuses.
+    local controller and pass it to redeploy_agents so each agent deploys with
+    a minted key.
     """
+    import urllib.request
+
     from tinyagentos.cli.worker import _convert_to_lxc
 
     # Mock incus enumeration so drain phase is skipped.
@@ -185,25 +186,27 @@ async def test_convert_to_lxc_queries_controller_for_gateway_port_and_redeploys(
         lambda path: fake_config,
     )
 
-    # Controller API returns a verified port.
-    class FakeControllerClient:
-        def __init__(self, *a, **k):
-            pass
+    # Local controller (via taosctl urllib) returns a verified port.
+    captured = []
 
-        async def __aenter__(self):
+    class FakeResponse:
+        def __init__(self, payload_bytes):
+            self._payload = payload_bytes
+
+        def read(self):
+            return self._payload
+
+        def __enter__(self):
             return self
 
-        async def __aexit__(self, *a):
+        def __exit__(self, *exc):
             return False
 
-        async def get(self, url, **kwargs):
-            return types.SimpleNamespace(
-                status_code=200,
-                json=lambda: {"port": 7838, "running": True},
-                raise_for_status=lambda: None,
-            )
+    def fake_urlopen(req, *a, **k):
+        captured.append(req)
+        return FakeResponse(b'{"port": 7838, "running": true}')
 
-    monkeypatch.setattr("httpx.AsyncClient", FakeControllerClient)
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
 
     # Track container creation to verify the deploy actually ran.
     created = []
@@ -229,7 +232,7 @@ async def test_convert_to_lxc_queries_controller_for_gateway_port_and_redeploys(
         fake_add_proxy_device,
     )
 
-    # One agent row (no extra_config here; the controller query is the B1 fix).
+    # One agent row.
     monkeypatch.setattr(
         "tinyagentos.cli.worker._load_agents_json",
         lambda: [
@@ -247,6 +250,10 @@ async def test_convert_to_lxc_queries_controller_for_gateway_port_and_redeploys(
     assert rc == 0
     assert len(created) == 1
     assert created[0] == "taos-agent-test-agent"
+
+    # Port came from the local taosctl client, not args.controller_url.
+    assert len(captured) == 1
+    assert captured[0].full_url.startswith("http://127.0.0.1:6969")
 
 
 @pytest.mark.asyncio
@@ -311,3 +318,143 @@ async def test_convert_to_lxc_exits_nonzero_when_redeploy_fails(monkeypatch, tmp
     args = types.SimpleNamespace(controller_url="http://controller:6969", yes=True)
     rc = await _convert_to_lxc(args)
     assert rc != 0
+
+
+@pytest.mark.asyncio
+async def test_convert_to_lxc_401_exits_nonzero_before_drain(monkeypatch, tmp_path):
+    """C2+C3: A 401 from the LOCAL controller must exit non-zero and must NOT
+    call drain_and_delete_agents.
+
+    On BASE this FAILS because drain_and_delete_agents IS called after the
+    unauthenticated remote query returns 0.
+    """
+    import urllib.request
+
+    from tinyagentos.cli.worker import _convert_to_lxc
+
+    drain_calls = []
+
+    async def fake_drain(agents):
+        drain_calls.append(agents)
+
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.drain_and_delete_agents",
+        fake_drain,
+    )
+
+    # Two agents so we can detect a destructive drain.
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.list_flat_mode_agents",
+        lambda: [
+            {"name": "taos-agent-a", "state": "RUNNING"},
+            {"name": "taos-agent-b", "state": "RUNNING"},
+        ],
+    )
+
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.resolve_data_dir",
+        lambda: tmp_path,
+    )
+    fake_config = types.SimpleNamespace(server={"litellm_port": 7834})
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.load_config",
+        lambda path: fake_config,
+    )
+
+    # install-worker.sh succeeds.
+    fake_run = types.SimpleNamespace(returncode=0)
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: fake_run)
+
+    # Simulate a 401 from the taosctl urllib transport.
+    import urllib.error
+
+    class FakeResponse:
+        def __init__(self, payload_bytes):
+            self._payload = payload_bytes
+
+        def read(self):
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(req, *a, **k):
+        raise urllib.error.HTTPError(
+            req.full_url, 401, "Unauthorized", req.headers, None,
+        )
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    args = types.SimpleNamespace(controller_url="http://192.168.1.10:6969", yes=True)
+    rc = await _convert_to_lxc(args)
+    assert rc != 0
+    assert drain_calls == []
+
+
+@pytest.mark.asyncio
+async def test_convert_to_lxc_uses_local_controller_and_bearer_token(monkeypatch, tmp_path):
+    """C1+C2: The gateway-port request must go to the LOCAL taosctl client
+    (http://127.0.0.1:6969 by default), not args.controller_url, and must
+    carry an Authorization: Bearer header.
+
+    On BASE this FAILS because httpx.AsyncClient is called with the remote
+    controller_url and no auth header.
+    """
+    import urllib.request
+
+    from tinyagentos.cli.worker import _convert_to_lxc
+
+    captured_requests = []
+
+    class FakeResponse:
+        def __init__(self, payload_bytes):
+            self._payload = payload_bytes
+
+        def read(self):
+            return self._payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(req, *a, **k):
+        captured_requests.append(req)
+        return FakeResponse(b'{"port": 7838, "running": true}')
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    # Provide a token via TAOS_TOKEN so the Authorization header is set.
+    monkeypatch.setenv("TAOS_TOKEN", "test-token-123")
+    monkeypatch.delenv("TAOS_URL", raising=False)
+
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.list_flat_mode_agents",
+        lambda: [],
+    )
+    fake_run = types.SimpleNamespace(returncode=0)
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: fake_run)
+
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.resolve_data_dir",
+        lambda: tmp_path,
+    )
+    fake_config = types.SimpleNamespace(server={"litellm_port": 7834})
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.load_config",
+        lambda path: fake_config,
+    )
+
+    args = types.SimpleNamespace(controller_url="http://192.168.1.10:6969", yes=True)
+    rc = await _convert_to_lxc(args)
+    assert rc == 0
+
+    assert len(captured_requests) == 1
+    req = captured_requests[0]
+    assert req.full_url.startswith("http://127.0.0.1:6969")
+    assert req.full_url.endswith("/api/settings/llm-proxy")
+    assert req.get_header("Authorization") == "Bearer test-token-123"
