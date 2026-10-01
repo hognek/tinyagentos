@@ -660,9 +660,22 @@ def test_unrelated_commit_trailer_waives_nothing():
     """
     config = _base_config()
     changed = [("M", "tinyagentos/routes/themes.py")]
-    commit_messages = ["Fix something else\n\nDocs-Reviewed: [changelog] some reason"]
-    failures = evaluate_rules(changed, commit_messages, config)
+    commit_messages = ["Fix something else\n\nDocs-Reviewed: [test_route] some reason"]
+    failures = evaluate_rules(changed, commit_messages, config, commit_paths=[{"other/file.py"}])
     assert len(failures) == 1
+
+
+def test_related_commit_trailer_waives():
+    """A related commit's trailer waives the rule.
+
+    Ensures that a trailer on a commit that does touch the relevant paths
+    does waive the rule.
+    """
+    config = _base_config()
+    changed = [("M", "tinyagentos/routes/themes.py")]
+    commit_messages = ["Fix something else\n\nDocs-Reviewed: [test_route] some reason"]
+    failures = evaluate_rules(changed, commit_messages, config, commit_paths=[{"tinyagentos/routes/themes.py"}])
+    assert failures == []
 
 
 def test_log_trailer_usage_prints_every_trailer(capsys):
@@ -676,7 +689,7 @@ def test_log_trailer_usage_prints_every_trailer(capsys):
             "abcd1234",
             "Alice <alice@example.com>",
             "Fix themes\n\n"
-            "Docs-Reviewed: [changelog] a\n"
+            "Docs-Reviewed: [test_route] a\n"
             "Docs-Reviewed: [agent-manual] b",
         )
     ]
@@ -684,5 +697,5 @@ def test_log_trailer_usage_prints_every_trailer(capsys):
     captured = capsys.readouterr()
     lines = [line for line in captured.out.splitlines() if line.strip()]
     assert len(lines) == 2
-    assert any("[changelog] a" in line for line in lines)
+    assert any("[test_route] a" in line for line in lines)
     assert any("[agent-manual] b" in line for line in lines)
