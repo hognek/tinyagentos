@@ -236,9 +236,11 @@ async def test_admin_session_path_accepts_long_title_and_message(client):
     await store.add("pre-existing", "x", source="system")
     
     # Test with 200-char title and 3000-char message
+    long_title = "x" * 200
+    long_message = "y" * 3000
     resp = await client.post("/api/notifications", json={
-        "title": "x" * 200,
-        "message": "y" * 3000,
+        "title": long_title,
+        "message": long_message,
         "level": "error",
         "source": "system",
     })
@@ -250,10 +252,11 @@ async def test_admin_session_path_accepts_long_title_and_message(client):
     items = await store.list()
     assert len(items) >= 2  # At least the new one and the pre-existing one
     
-    # Find the most recent notification (should be the one we just posted)
-    recent = items[-1] if items else None
-    assert recent is not None
-    assert len(recent["title"]) == 200
-    assert len(recent["message"]) == 3000
-    assert recent["title"] == "x" * 200
-    assert recent["message"] == "y" * 3000
+    # Find the posted notification by its unique title (not by list position;
+    # list() orders by timestamp DESC so items[-1] is the OLDEST row).
+    posted = next((i for i in items if i["title"] == long_title), None)
+    assert posted is not None, "posted notification not found"
+    assert len(posted["title"]) == 200
+    assert len(posted["message"]) == 3000
+    assert posted["title"] == long_title
+    assert posted["message"] == long_message
