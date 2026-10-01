@@ -1,5 +1,6 @@
 """Agent-token path for POST /api/notifications (notifications_write grant gating)."""
-import json
+import time
+from unittest.mock import patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -228,34 +229,34 @@ async def test_notifications_write_in_every_scope_list():
     assert "notifications_write" in _PROJECT_SCOPED, "missing from _PROJECT_SCOPED"
 
 
+TIMESTAMP_KINDS = ["same_second", "pre_existing_1s_earlier"]
+
 @pytest.mark.asyncio
-async def test_admin_session_path_accepts_long_title_and_message(client):
+@pytest.mark.parametrize("timestamp_kind", TIMESTAMP_KINDS)
+async def test_admin_session_path_accepts_long_title_and_message(client, timestamp_kind):
     """RED test (h): through the app, as an admin session, POST a 200-char title and a 3000-char message -> 200 and the row is stored with those exact lengths."""
-    # Clear any existing notifications
     store = client._transport.app.state.notifications
-    await store.add("pre-existing", "x", source="system")
-    
-    # Test with 200-char title and 3000-char message
-    long_title = "x" * 200
-    long_message = "y" * 3000
-    resp = await client.post("/api/notifications", json={
-        "title": long_title,
-        "message": long_message,
-        "level": "error",
-        "source": "system",
-    })
-    
-    # Should succeed (200)
+    base_ts = int(time.time())
+    pre_ts = base_ts - 1 if timestamp_kind == "pre_existing_1s_earlier" else base_ts
+    await store._db.execute(
+        "INSERT INTO notifications (timestamp, level, title, message, source, read, archived, data, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (pre_ts, "info", "pre-existing", "x", "system", 0, 0, None, None),
+    )
+    await store._db.commit()
+    with patch("time.time", return_value=base_ts + 1):
+        long_title = "x" * 200
+        long_message = "y" * 3000
+        resp = await client.post("/api/notifications", json={
+            "title": long_title,
+            "message": long_message,
+            "level": "error",
+            "source": "system",
+        })
     assert resp.status_code == 200, resp.text
-    
-    # Verify the row is stored with those exact lengths
     items = await store.list()
-    assert len(items) >= 2  # At least the new one and the pre-existing one
-    
-    # Find the posted notification by its unique title (not by list position;
-    # list() orders by timestamp DESC so items[-1] is the OLDEST row).
-    posted = next((i for i in items if i["title"] == long_title), None)
-    assert posted is not None, "posted notification not found"
+    matches = [i for i in items if i["title"] == long_title]
+    assert len(matches) == 1, f"Expected exactly 1 row with title {long_title!r}, got {len(matches)}"
+    posted = matches[0]
     assert len(posted["title"]) == 200
     assert len(posted["message"]) == 3000
     assert posted["title"] == long_title
