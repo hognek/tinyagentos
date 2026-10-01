@@ -93,6 +93,18 @@ def _runtime_venv(tmp_path: Path) -> Path:
     return venv
 
 
+def _launchctl_stub() -> str:
+    """A launchctl stand-in that logs its calls and reports the label as NOT
+    loaded for `print` (the real script confirms the bootout with it)."""
+    return (
+        'launchctl() {\n'
+        '    printf "launchctl %s\\n" "$*" >> "$HOME/launchctl.log"\n'
+        '    case "$1" in print) return 1;; esac\n'
+        '    return 0\n'
+        '}\n'
+    )
+
+
 def _stub_host(
     *,
     system_profiler: str | None = 'printf "%s\\n" "      Metal Support: Metal 3"',
@@ -463,15 +475,16 @@ def test_uninstall_stops_and_removes_the_agent_for_its_own_model(tmp_path: Path)
         tmp_path,
         _globals(tmp_path, model=str(model))
         + _functions("uninstall_mlx_agent", "xml_escape", "plist_path", "agent_target")
-        + 'launchctl() { printf "launchctl %s\\n" "$*" >> "$HOME/launchctl.log"; }\n'
+        + _launchctl_stub()
         + 'id() { printf "501\\n"; }\n'
         + "uninstall_mlx_agent\n",
     )
     assert result.returncode == 0, result.stderr
     assert not plist.exists()
-    assert (tmp_path / "home" / "launchctl.log").read_text().strip() == (
-        f"launchctl bootout gui/501/{LABEL}"
-    )
+    calls = (tmp_path / "home" / "launchctl.log").read_text().splitlines()
+    assert calls[0] == f"launchctl bootout gui/501/{LABEL}"
+    # ...and the bootout is confirmed with `print` before the plist is removed.
+    assert calls[1] == f"launchctl print gui/501/{LABEL}"
 
 
 def test_uninstall_leaves_an_agent_pinned_to_another_model(tmp_path: Path) -> None:
@@ -487,7 +500,7 @@ def test_uninstall_leaves_an_agent_pinned_to_another_model(tmp_path: Path) -> No
         tmp_path,
         _globals(tmp_path, model=str(other))
         + _functions("uninstall_mlx_agent", "xml_escape", "plist_path", "agent_target", "xml_escape")
-        + 'launchctl() { printf "launchctl %s\\n" "$*" >> "$HOME/launchctl.log"; }\n'
+        + _launchctl_stub()
         + 'id() { printf "501\\n"; }\n'
         + "uninstall_mlx_agent\n",
     )
@@ -501,7 +514,7 @@ def test_uninstall_without_an_agent_is_a_no_op(tmp_path: Path) -> None:
         tmp_path,
         _globals(tmp_path, model=str(tmp_path / "model"))
         + _functions("uninstall_mlx_agent", "xml_escape", "plist_path", "agent_target", "xml_escape")
-        + 'launchctl() { printf "launchctl %s\\n" "$*" >> "$HOME/launchctl.log"; }\n'
+        + _launchctl_stub()
         + 'id() { printf "501\\n"; }\n'
         + "uninstall_mlx_agent\n",
     )
@@ -560,7 +573,7 @@ def test_uninstall_matches_the_escaped_path_the_plist_pins(tmp_path: Path) -> No
             "xml_escape",
         )
         + _stub_host()
-        + "launchctl() { :; }\n"
+        + _launchctl_stub()
         + 'id() { printf "501\\n"; }\n'
         + "write_launchd_plist\n"
         + "uninstall_mlx_agent\n",
@@ -568,6 +581,77 @@ def test_uninstall_matches_the_escaped_path_the_plist_pins(tmp_path: Path) -> No
     assert result.returncode == 0, result.stdout + result.stderr
     plist = tmp_path / "home" / "Library" / "LaunchAgents" / f"{LABEL}.plist"
     assert not plist.exists(), "the agent pinned to this model was left loaded"
+
+
+def test_uninstall_refuses_to_report_a_still_loaded_agent(tmp_path: Path) -> None:
+    """`launchctl bootout` can fail while the label stays registered, and
+    KeepAlive then keeps restarting the server: say so, keep the plist, and let
+    the caller report a failure instead of "unloaded" (CodeRabbit on #3337)."""
+    model = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model.mkdir(parents=True)
+    plist = _plist_with_model(tmp_path, str(model))
+
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(model))
+        + _functions("uninstall_mlx_agent", "plist_path", "agent_target", "xml_escape")
+        + 'launchctl() { printf "launchctl %s\\n" "$*" >> "$HOME/launchctl.log"; return 0; }\n'
+        + 'id() { printf "501\\n"; }\n'
+        + "uninstall_mlx_agent\n",
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "still loaded" in result.stderr
+    assert plist.exists(), "the plist of a still-loaded agent must not go away"
+
+
+def test_uninstall_reports_a_failed_plist_removal(tmp_path: Path) -> None:
+    """A failing `rm` must not be reported as a successful unload."""
+    model = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model.mkdir(parents=True)
+    plist = _plist_with_model(tmp_path, str(model))
+
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(model))
+        + _functions("uninstall_mlx_agent", "plist_path", "agent_target", "xml_escape")
+        + _launchctl_stub()
+        + 'id() { printf "501\\n"; }\n'
+        + "rm() { return 1; }\n"
+        + "uninstall_mlx_agent\n",
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "failed to remove" in result.stderr
+    assert plist.exists()
+
+
+def test_main_uninstall_propagates_a_failed_unload(tmp_path: Path) -> None:
+    """The regression the review asked for: main --uninstall must exit non-zero,
+    so MLXInstaller cannot record `unloaded` for an agent that is still there."""
+    model = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model.mkdir(parents=True)
+    plist = _plist_with_model(tmp_path, str(model))
+
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(model))
+        + _functions(
+            "main",
+            "parse_args",
+            "resolve_venv",
+            "uninstall_mlx_agent",
+            "plist_path",
+            "agent_target",
+            "xml_escape",
+            "usage",
+        )
+        + _launchctl_stub()
+        + 'id() { printf "501\\n"; }\n'
+        + "rm() { return 1; }\n"
+        + 'main --uninstall --model "$MODEL_DIR" --venv "$VENV_DIR"\n',
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "failed to remove" in result.stderr
+    assert plist.exists()
 
 
 # --- argument handling -------------------------------------------------------

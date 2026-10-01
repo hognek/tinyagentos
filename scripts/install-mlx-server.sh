@@ -216,7 +216,21 @@ uninstall_mlx_agent() {
         return 0
     fi
     launchctl bootout "$(agent_target)/${LABEL}" 2>/dev/null || true
-    rm -f "$plist"
+    # bootout failing is normal when the agent was never loaded, so confirm the
+    # real state instead of trusting its exit code: a label that is still
+    # registered keeps restarting the server (KeepAlive) even after the plist
+    # and the model directory are gone.
+    if launchctl print "$(agent_target)/${LABEL}" >/dev/null 2>&1; then
+        warn "${LABEL} is still loaded after bootout: not reporting it as unloaded"
+        return 1
+    fi
+    # `set -e` is suspended in the caller's `uninstall_mlx_agent || rc=$?` and in
+    # an `if`/`||` context, so a failed removal has to be checked explicitly or
+    # the caller would hear "unloaded" while the plist is still on disk.
+    if ! rm -f "$plist"; then
+        warn "failed to remove $plist"
+        return 1
+    fi
     log "removed $plist"
     return 0
 }
