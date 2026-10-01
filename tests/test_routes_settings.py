@@ -530,3 +530,39 @@ class TestLaunchdMigrationWarning:
         assert count == 1, (
             f"Warning should appear exactly once, got {count} occurrences in: {message!r}"
         )
+
+    @pytest.mark.asyncio
+    async def test_launchd_warning_spacing_before_restarting(self, client, monkeypatch):
+        """A non-None launchd_warning must be followed by a single space, then
+        'Restarting now…' — no double space, no missing space."""
+        import asyncio
+        from unittest.mock import patch, AsyncMock, MagicMock
+
+        warning_text = "launchd warning text"
+
+        async def fake_apply_launchd_migration(install_dir):
+            return True, warning_text
+
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.communicate = AsyncMock(return_value=(b"", b""))
+
+        with (
+            patch("tinyagentos.routes.settings.asyncio.create_subprocess_exec", return_value=fake_proc),
+            patch("tinyagentos.routes.settings._stash_local_source_changes", new_callable=AsyncMock, return_value=False),
+            patch("tinyagentos.routes.settings.apply_launchd_migration", new=fake_apply_launchd_migration),
+            patch("tinyagentos.routes.settings._update_local_taosmd", new_callable=AsyncMock, return_value={}),
+            patch("tinyagentos.routes.system._do_restart"),
+            patch("tinyagentos.restart_orchestrator.write_pending_restart"),
+            patch("tinyagentos.desktop_rebuild.rebuild_desktop_bundle_if_stale", new_callable=AsyncMock, return_value=MagicMock(rebuilt=False, success=True, message="current")),
+        ):
+            resp = await client.post("/api/settings/update")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        message = data.get("message", "")
+
+        expected_suffix = f"{warning_text} Restarting now…"
+        assert message.endswith(expected_suffix), (
+            f"Expected message to end with {expected_suffix!r}, got {message!r}"
+        )

@@ -1285,7 +1285,7 @@ async def apply_update(request: Request):
                 if taosmd_report.get("updated")
                 else ""
             )
-            + (f" {launchd_warning}" if launchd_warning else "")
+            + (f"{launchd_warning} " if launchd_warning else "")
             + "Restarting now…"
         ),
     }
