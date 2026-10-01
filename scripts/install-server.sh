@@ -2450,6 +2450,10 @@ install_macos_launchd() {
     local plist_dir="$HOME/Library/LaunchAgents"
     local plist="$plist_dir/com.tinyagentos.controller.plist"
     mkdir -p "$plist_dir"
+    # `python -m tinyagentos`, not bare uvicorn: only the package entrypoint
+    # starts the LLM gateway's agent listener, which is every agent's only LLM
+    # path since LiteLLM was removed (a bare-uvicorn controller refuses local
+    # agent deploys). It reads TAOS_HOST / TAOS_PORT from the environment.
     cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2460,13 +2464,7 @@ install_macos_launchd() {
     <array>
         <string>$INSTALL_DIR/.venv/bin/python</string>
         <string>-m</string>
-        <string>uvicorn</string>
-        <string>tinyagentos.app:create_app</string>
-        <string>--factory</string>
-        <string>--host</string>
-        <string>0.0.0.0</string>
-        <string>--port</string>
-        <string>$TAOS_PORT</string>
+        <string>tinyagentos</string>
     </array>
     <key>WorkingDirectory</key><string>$INSTALL_DIR</string>
     <key>RunAtLoad</key><true/>
@@ -2476,6 +2474,8 @@ install_macos_launchd() {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PYTHONUNBUFFERED</key><string>1</string>
+        <key>TAOS_HOST</key><string>0.0.0.0</string>
+        <key>TAOS_PORT</key><string>$TAOS_PORT</string>
         <key>TAOS_BROWSER_PROXY_PORT</key><string>$TAOS_BROWSER_PROXY_PORT</string>
         <key>TAOS_SPA_DIR</key><string>$INSTALL_DIR/static/desktop</string>
     </dict>

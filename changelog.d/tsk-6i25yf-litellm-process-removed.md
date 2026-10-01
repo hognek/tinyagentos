@@ -37,6 +37,11 @@
   installs used to inject `http://localhost:7834/v1`, which no container can
   reach. A local deploy is refused, with the reason, when this controller
   start has not verified its gateway listener.
+- The macOS launchd agent the installer writes now runs `python -m tinyagentos`
+  instead of bare uvicorn, so the gateway's agent listener starts there too
+  (it is every agent's only LLM path now). A controller started with bare
+  `uvicorn tinyagentos.app:create_app --factory` has no agent listener and
+  refuses local agent deploys with the reason.
 - `/api/settings/llm-proxy` always reports the gateway (`mode: gateway`) and
   no longer carries a `litellm` block.
 - The taOS agent's opencode harness always uses the in-process gateway; when
