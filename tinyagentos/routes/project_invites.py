@@ -657,7 +657,7 @@ def _build_guide_markdown(
         lines.append(
             f"Set a Grok routine to poll the taOS status endpoint every {check_interval_secs} seconds. "
             "Polling is for onboarding only (to retrieve your token). "
-            "Ongoing messages and tasks arrive on the A2A bus."
+            "Ongoing messages and @mentions arrive on the A2A bus, and ready tasks are found by the timed check of `tasks/ready`."
         )
         lines.append(
             "This token is readable by every bot on this Grok account. "
@@ -688,8 +688,7 @@ def _build_guide_markdown(
         f"Poll every {check_interval_secs} seconds (or hold the SSE stream at "
         "`/api/a2a/bus/stream`) for your ready tasks and any @mentions addressed to "
         f"`{agent_handle}`. On each check: read ready tasks, act on them, comment "
-        "progress, post on the bus, and report status. The A2A bus is your ongoing "
-        "delivery channel for messages and tasks; the timed check is the backstop."
+        "progress, post on the bus, and report status. The timed check is the reliable delivery floor and the stream is an optional optimization."
     )
     lines.append("")
     return "\n".join(lines)
@@ -750,7 +749,7 @@ def _build_os_guide_markdown(
         lines.append(
             f"Set a Grok routine to poll the taOS status endpoint every {check_interval_secs} seconds. "
             "Polling is for onboarding only (to retrieve your token). "
-            "Ongoing messages and tasks arrive on the A2A bus."
+            "Ongoing messages and @mentions arrive on the A2A bus, and ready tasks are found by the timed check of `tasks/ready`."
         )
         lines.append(
             "This token is readable by every bot on this Grok account. "
@@ -781,8 +780,7 @@ def _build_os_guide_markdown(
         f"Poll every {check_interval_secs} seconds (or hold the SSE stream at "
         "`/api/a2a/bus/stream`) for any @mentions addressed to "
         f"`{agent_handle}`. On each check: read your mentions, act on them, and "
-        "report status. The A2A bus is your ongoing delivery channel for messages "
-        "and tasks; the timed check is the backstop."
+        "report status. The timed check is the reliable delivery floor and the stream is an optional optimization."
     )
     lines.append("")
     return "\n".join(lines)

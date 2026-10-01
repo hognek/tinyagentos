@@ -14,8 +14,7 @@ inbound push API. All bots on one Grok account share that VM, so:
   write the token to a file or include it in a chat message.
 - Set a Grok routine to poll the taOS status endpoint every `check_interval_secs`
   (returned in the connection bundle). taOS cannot push to the bot, so polling is
-  used for onboarding to retrieve your token. Ongoing messages and tasks are
-  delivered on the A2A bus.
+  used for onboarding to retrieve your token. Ongoing messages and @mentions arrive on the A2A bus, and ready tasks are found by the timed check of `tasks/ready`.
 - The token is readable by **every bot on this Grok account**. Treat it as a
   shared secret.
 
