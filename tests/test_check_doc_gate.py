@@ -663,3 +663,26 @@ def test_unrelated_commit_trailer_waives_nothing():
     commit_messages = ["Fix something else\n\nDocs-Reviewed: [changelog] some reason"]
     failures = evaluate_rules(changed, commit_messages, config)
     assert len(failures) == 1
+
+
+def test_log_trailer_usage_prints_every_trailer(capsys):
+    """_log_trailer_usage must emit one line per usable scoped trailer.
+
+    A commit whose message carries multiple Docs-Reviewed trailers must
+    produce one log line for each trailer, not just the first one.
+    """
+    commits = [
+        (
+            "abcd1234",
+            "Alice <alice@example.com>",
+            "Fix themes\n\n"
+            "Docs-Reviewed: [changelog] a\n"
+            "Docs-Reviewed: [agent-manual] b",
+        )
+    ]
+    _MOD._log_trailer_usage(commits, "Docs-Reviewed:")
+    captured = capsys.readouterr()
+    lines = [line for line in captured.out.splitlines() if line.strip()]
+    assert len(lines) == 2
+    assert any("[changelog] a" in line for line in lines)
+    assert any("[agent-manual] b" in line for line in lines)

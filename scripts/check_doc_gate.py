@@ -15,7 +15,8 @@ by a doc edit stays PR-wide: a fragment or doc in any commit of the range
 satisfies the rule. An unscoped trailer covers every rule its commit trips;
 `Docs-Reviewed: [rule, rule] <why>` narrows it to the named rules, which is
 the only way a squash-shaped single commit can waive one rule and still be
-held to the others (a name that matches no rule waives nothing).
+held to the others (a name that matches no rule waives nothing). Multiple
+scoped trailers in one commit union their rule names.
 
 Two layers:
   invariants  -- deterministic sanity checks (Layer A). Currently: every
@@ -768,7 +769,6 @@ def _log_trailer_usage(commits: list[tuple], trailer: str) -> None:
                 covers = ", ".join(sorted(paths)) if paths else "no files (inert)"
                 msg += f" [covers: {covers}]"
             print(msg)
-            break
 
 
 def get_trailer(config: dict) -> str:
