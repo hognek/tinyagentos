@@ -33,19 +33,24 @@ import sys
 import time
 from pathlib import Path
 
+# A missing dependency is reported from main(), not at import: importing this
+# module (the deleted-symbols gate loads it from the merge tree with a bare
+# CI python) must not raise SystemExit.
 try:
     import httpx
     import yaml
-except ImportError as exc:  # pragma: no cover - run from the taOS venv
-    print(f"needs the taOS venv (httpx, pyyaml): {exc}", file=sys.stderr)
-    sys.exit(2)
+except ImportError as _exc:  # pragma: no cover - run from the taOS venv
+    httpx = yaml = None
+    _IMPORT_ERROR: ImportError | None = _exc
+else:
+    _IMPORT_ERROR = None
 
 DEFAULT_PROMPTS = [
     "Reply with the single word: pong",
     "List three primary colours as a JSON array of strings, nothing else.",
     "In one sentence, what is an incus proxy device?",
 ]
-TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
+TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0) if httpx else None
 
 
 def _load_agent(data_dir: Path, name: str) -> tuple[dict, dict]:
@@ -269,6 +274,9 @@ def _text_plain(data) -> str:
 
 
 def main() -> int:
+    if _IMPORT_ERROR is not None:
+        print(f"needs the taOS venv (httpx, pyyaml): {_IMPORT_ERROR}", file=sys.stderr)
+        return 2
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", default="/opt/taos/data", type=Path)
     ap.add_argument("--agent", required=True, help="an agent whose key is in the local key store")
