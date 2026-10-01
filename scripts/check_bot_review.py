@@ -92,6 +92,10 @@ CODERABBIT_AUTO_SUMMARY_RE = re.compile(
     r"<!-- This is an auto-generated comment: summarize by coderabbit\.ai -->",
     re.IGNORECASE,
 )
+CODERABBIT_REVIEW_IN_PROGRESS_RE = re.compile(
+    r"review in progress by coderabbit\.ai",
+    re.IGNORECASE,
+)
 CODERABBIT_SCAFFOLDING_RE = re.compile(
     rf"{CODERABBIT_ACKNOWLEDGEMENT_RE.pattern}|{CODERABBIT_FAILURE_RE.pattern}",
     re.IGNORECASE,
@@ -276,6 +280,20 @@ def is_coderabbit_auto_summary(body: str | None) -> bool:
     return bool(CODERABBIT_AUTO_SUMMARY_RE.search(body))
 
 
+def is_coderabbit_review_in_progress(body: str | None) -> bool:
+    """Return True if a body is CodeRabbit's review-in-progress placeholder.
+
+    When CodeRabbit starts processing a new review it edits its existing
+    auto-summary comment to insert a 'review in progress' marker, a Run ID
+    and a Files-processed list before the review actually completes. That
+    placeholder must never read as a real review: the review is still
+    running, so bot-review-gate must stay red until CodeRabbit posts the
+    completed walkthrough."""
+    if not body:
+        return False
+    return bool(CODERABBIT_REVIEW_IN_PROGRESS_RE.search(body))
+
+
 def is_coderabbit_failure_notice(body: str | None) -> bool:
     """Return True if a body is CodeRabbit's failure notice -- posted when a
     review run fails."""
@@ -374,11 +392,12 @@ def is_real_item(item: CRItem) -> bool:
     A rate-limit stub is never real. Review objects with state APPROVED or
     CHANGES_REQUESTED are real regardless of body content (the review state
     itself is the substantive signal). CodeRabbit scaffolding (acknowledgement
-    reply / failure notice) is never real. For issue comments carrying the
-    auto-summary marker, the walkthrough detector applies: a Run ID plus at
-    least one signal (quota-decrement line, no-actionable phrase, or
-    Files-processed list) means a real review ran. Other comments are real
-    when they carry non-empty, non-stub body text.
+    reply / failure notice) is never real. CodeRabbit's review-in-progress
+    placeholder is never real. For issue comments carrying the auto-summary
+    marker, the walkthrough detector applies: a Run ID plus at least one
+    signal (quota-decrement line, no-actionable phrase, or Files-processed
+    list) means a real review ran. Other comments are real when they carry
+    non-empty, non-stub body text.
     """
     if is_rate_limit_stub(item.body):
         return False
@@ -387,6 +406,8 @@ def is_real_item(item: CRItem) -> bool:
         if state in ("APPROVED", "CHANGES_REQUESTED"):
             return True
     if is_coderabbit_scaffolding(item.body):
+        return False
+    if is_coderabbit_review_in_progress(item.body):
         return False
     if not item.is_review and is_coderabbit_auto_summary(item.body):
         return is_coderabbit_walkthrough(item.body)
@@ -600,7 +621,9 @@ def classify(items: list[CRItem]) -> tuple[int, str]:
     # / failure notice), which the gate must treat the same way -- it must not
     # land on the absent/PASS path above.
     has_stubs = any(
-        is_rate_limit_stub(i.body) or is_coderabbit_scaffolding(i.body)
+        is_rate_limit_stub(i.body)
+        or is_coderabbit_scaffolding(i.body)
+        or is_coderabbit_review_in_progress(i.body)
         for i in items
     )
     if has_stubs:
