@@ -2,15 +2,14 @@
 
 - The MLX backend now serves the model it installs. `MLXInstaller.install()`
   pins the model in a per-user launchd agent
-  (`~/Library/LaunchAgents/com.taos.mlx-server.plist`, written by
+  (`~/Library/LaunchAgents/com.taos.mlx-server-<app_id>.plist`, written by
   `scripts/install-mlx-server.sh`) that runs `<mlx-venv>/bin/mlx_lm.server
-  --model <model dir> --host 127.0.0.1 --port 7837`, health-gates on
+  --model <model dir> --host 127.0.0.1 --port <port>`, health-gates on
   `GET /v1/models` and only then reports `endpoint` / `runtime_location` in the
   install result. An install whose server does not come up keeps the downloaded
   weights, reports no endpoint at all, and carries `mlx_serving_error` saying
-  why. `mlx_lm.server` serves one model per process, so the newest MLX install
-  re-points the agent; serving several MLX models at once needs the LLM proxy's
-  per-model spawn and stays a separate slice.
+  why. `mlx_lm.server` serves one model per process, so each installed model
+  gets its own agent and port and several MLX models are served at once.
 - The onboarding checklist's Apple Silicon step is satisfied by either local
   backend: `accel == "metal"` now probes llama.cpp (`/health`) or the MLX
   server (`/v1/models`), so a Mac that installed only an MLX model no longer

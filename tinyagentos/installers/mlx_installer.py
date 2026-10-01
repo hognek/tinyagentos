@@ -46,16 +46,25 @@ not be able to choose what the serving runtime runs, so
 
 Serving is a managed service (taOS #329 review): ``mlx_lm.server`` has no router
 mode -- one process serves exactly ONE model -- so ``install()`` pins the model
-it just downloaded in a user launchd agent (``scripts/install-mlx-server.sh``,
-``~/Library/LaunchAgents/com.taos.mlx-server.plist``), health-gates it on
-``GET /v1/models`` and only then reports ``endpoint`` / ``runtime_location``.
-``mlx_server_is_running()`` is the probe both halves use, so "the install
+it just downloaded in **its own** user launchd agent
+(``scripts/install-mlx-server.sh``,
+``~/Library/LaunchAgents/com.taos.mlx-server-<app_id>.plist``), health-gates it
+on ``GET /v1/models`` and only then reports ``endpoint`` / ``runtime_location``.
+One agent per model is what lets several MLX models be served at once: installing
+a second model neither re-points nor stops the first (each keeps its own label and
+port). ``mlx_server_is_running()`` is the probe both halves use, so "the install
 reported an endpoint" and "the setup checklist sees a backend" cannot disagree.
-Installing another MLX model re-points the agent at the newer one (the last
-install wins); serving several at once needs per-model spawn in the LLM proxy,
-which is a separate slice. Uninstalling the served model unloads the agent with
-it -- launchd's ``KeepAlive`` would otherwise restart a server against a deleted
-model directory forever.
+
+Ports: the first (or only) model keeps the reserved default ``7837``
+(``port_allocator.RESERVED_PORTS``) so the setup checklist's Metal probe, which
+does not know which models are installed, still sees the backend. Every further
+model gets a deterministic, non-reserved free port from
+``port_allocator.allocate_host_port()``; a model whose agent already exists keeps
+the port written in its plist, so a re-install does not move it.
+
+Uninstalling a model unloads the agent that pins it and leaves every other
+model's agent alone -- launchd's ``KeepAlive`` would otherwise restart a server
+against a deleted model directory forever.
 
 Configuration via env vars:
 
@@ -71,6 +80,7 @@ Configuration via env vars:
 from __future__ import annotations
 
 import asyncio
+import http.client
 import logging
 import os
 import platform
@@ -78,6 +88,8 @@ import shutil
 import socket
 import sys
 import urllib.request
+import weakref
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +101,7 @@ from tinyagentos.installers.model_paths import (
     family_from_manifest,
     models_root,
 )
+from tinyagentos.installers.port_allocator import allocate_host_port
 
 logger = logging.getLogger(__name__)
 
@@ -209,8 +222,115 @@ def mlx_server_is_running(timeout: float = 1.0, port: int | None = None) -> bool
         req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/models")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status == 200
-    except Exception:
+    except (
+        OSError,  # refused/reset connection, timeout, urllib.error.URLError + HTTPError
+        http.client.BadStatusLine,  # a half-up server answering garbage
+        http.client.IncompleteRead,
+        ValueError,  # a malformed URL (http.client.InvalidURL is one)
+    ):
+        # Fail closed on anything that means "no valid 200 came back" -- including
+        # a protocol-level failure from a server that is only half up -- but do
+        # not swallow unrelated exceptions, so a real programming error surfaces
+        # instead of reading as "the backend is down".
         return False
+
+
+#: launchd label prefix for the MLX serving agents (taOS #3337). One agent per
+#: model, so the plist is ``<prefix>-<app_id>.plist``; the legacy single-agent
+#: plist (``<prefix>.plist``) is still matched by this prefix so an upgrade from
+#: #3337 is seen rather than doubled.
+_LAUNCH_AGENT_LABEL = "com.taos.mlx-server"
+
+
+def _launch_agents_dir() -> Path:
+    """The user's ``~/Library/LaunchAgents`` directory (faked by ``HOME`` in tests)."""
+    home = os.environ.get("HOME") or str(Path.home())
+    return Path(home) / "Library" / "LaunchAgents"
+
+
+def mlx_agent_plists() -> list[Path]:
+    """Every installed MLX serving agent's plist.
+
+    Includes the legacy single-agent plist from taOS #3337 (same label prefix),
+    so port selection sees it and the install does not collide with it.
+    """
+    agents = _launch_agents_dir()
+    if not agents.is_dir():
+        return []
+    return sorted(agents.glob(f"{_LAUNCH_AGENT_LABEL}*.plist"))
+
+
+def _plist_program_arguments(plist: Path) -> list[str]:
+    """The ``ProgramArguments`` array of a launchd plist, or ``[]`` if unreadable."""
+    try:
+        root = ET.parse(plist).getroot()
+    except (ET.ParseError, OSError):
+        return []
+    node = root.find("dict")
+    if node is None:
+        return []
+    children = list(node)
+    for index, child in enumerate(children):
+        if child.tag == "key" and child.text == "ProgramArguments" and index + 1 < len(children):
+            return [element.text or "" for element in children[index + 1].findall("string")]
+    return []
+
+
+def _plist_arg_value(plist: Path, flag: str) -> str:
+    """The value following *flag* in the agent's ``ProgramArguments``, or ``""``."""
+    argv = _plist_program_arguments(plist)
+    if flag in argv:
+        index = argv.index(flag)
+        if index + 1 < len(argv):
+            return argv[index + 1]
+    return ""
+
+
+def mlx_agent_model_dir(plist: Path) -> str:
+    """The model directory an MLX serving agent pins, or ``""``."""
+    return _plist_arg_value(plist, "--model")
+
+
+def mlx_agent_port(plist: Path) -> int | None:
+    """The port an MLX serving agent serves on, or ``None`` if absent/unparseable."""
+    raw = _plist_arg_value(plist, "--port")
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _pins_model(plist: Path, model_dir: Path) -> bool:
+    """True when *plist* already serves *model_dir* (same directory, normalised)."""
+    pinned = mlx_agent_model_dir(plist)
+    if not pinned:
+        return False
+    return os.path.normpath(pinned) == os.path.normpath(str(model_dir))
+
+
+#: One serving lock per running event loop. ``_serve_port`` chooses a port from
+#: the agents already on disk, and this model's agent only appears once the
+#: shipped script has run -- so two Store installs awaited together would read
+#: the same (empty) set and both pick the default port. The second server cannot
+#: bind a port the first holds, yet its ``GET /v1/models`` probe would still see
+#: the FIRST model answering there, i.e. an endpoint reported for a server that
+#: serves another model. The controller runs a single process
+#: (``uvicorn.run`` with no ``--workers``); the per-loop mapping exists because
+#: tests run each case on its own event loop, and an asyncio primitive is bound
+#: to the loop that first awaits it.
+_serve_locks: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _serve_lock() -> asyncio.Lock:
+    """The MLX serving lock for the running event loop."""
+    loop = asyncio.get_running_loop()
+    lock = _serve_locks.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _serve_locks[loop] = lock
+    return lock
 
 
 def requirements_file(python_version: str) -> Path | None:
@@ -391,49 +511,99 @@ class MLXInstaller(AppInstaller):
             )
         return True, ""
 
-    async def _serve_model(self, model_dir: Path) -> tuple[bool, str]:
-        """Pin *model_dir* in the launchd agent and health-gate it.
+    def _serve_port(self, model_dir: Path) -> int:
+        """The port to serve *model_dir* on.
 
-        Returns ``(serving, error)``. ``serving`` is True only when
-        ``GET /v1/models`` answered on this installer's port, i.e. exactly when
-        ``install()`` may report an endpoint.
+        Rules, in order:
+
+        - an agent that already pins this model wins: a re-install must not move
+          a running server to a different port (which would leave the old agent
+          fighting for its old one). An unreadable port in that agent still means
+          this model is being served, so the configured default is used rather
+          than allocating a fresh port under a live agent;
+        - the first (or only) model keeps the reserved default so the setup
+          checklist's Metal probe, which has no per-model knowledge, still finds
+          the backend;
+        - a model is only pushed off the default when another agent actually
+          claims it, and never onto a port another agent's plist already names
+          (an agent loading a model holds no socket yet, so a free-port probe
+          cannot see it).
+        """
+        agents = mlx_agent_plists()
+        own = next((p for p in agents if _pins_model(p, model_dir)), None)
+        if own is not None:
+            return mlx_agent_port(own) or self.port
+        claimed = {port for port in (mlx_agent_port(p) for p in agents) if port}
+        if self.port not in claimed:
+            return self.port
+        return allocate_host_port(model_dir.name, exclude=claimed)
+
+    async def _serve_model(self, model_dir: Path) -> tuple[bool, str, int]:
+        """Pin *model_dir* in its own launchd agent and health-gate it.
+
+        Returns ``(serving, error, port)``. ``serving`` is True only when
+        ``GET /v1/models`` answered on ``port``, i.e. exactly when ``install()``
+        may report an endpoint. ``port`` is the one the agent was pinned to (see
+        ``_serve_port``), so the reported endpoint names the same server the
+        probe checked.
 
         The shipped script owns the plist and does the loading; it health-gates
         for up to 90 s itself, and this method then re-probes with
         ``mlx_server_is_running()``, the function the setup checklist uses, so
         the endpoint claim rests on the surface the `mlx` backend adapter
         actually talks to.
+
+        Port selection and registration run under ``_serve_lock()``: the port is
+        chosen from the agents already on disk, so two concurrent installs would
+        otherwise both pick the default and only one server could bind it.
         """
         if sys.platform != "darwin":
-            return False, f"MLX serving is macOS-only (this host is {sys.platform})"
+            return False, f"MLX serving is macOS-only (this host is {sys.platform})", self.port
         script = mlx_serving_script()
         if not script.exists():
-            return False, f"the MLX serving script is missing at {script}"
+            return False, f"the MLX serving script is missing at {script}", self.port
 
-        code, output = await run_cmd(
-            [
-                str(script),
-                "--model", str(model_dir),
-                "--venv", str(self._venv()),
-                "--port", str(self.port),
-            ],
-            timeout=self.serve_timeout,
-        )
-        if code != 0:
-            tail = output.strip().splitlines()
-            detail = tail[-1] if tail else "no output"
-            return False, f"starting the MLX server failed (exit {code}): {detail[:400]}"
+        async with _serve_lock():
+            port = self._serve_port(model_dir)
+            try:
+                code, output = await run_cmd(
+                    [
+                        str(script),
+                        "--model", str(model_dir),
+                        "--venv", str(self._venv()),
+                        "--port", str(port),
+                    ],
+                    timeout=self.serve_timeout,
+                )
+            except TimeoutError:
+                # `run_cmd` raises (asyncio.wait_for) instead of returning a code
+                # when the script overruns. That is a serving failure, not an
+                # install failure: the weights are already on disk, so report it
+                # the same way as a non-zero exit.
+                return False, (
+                    f"the MLX serving script did not finish within "
+                    f"{self.serve_timeout}s (a model too large for unified "
+                    "memory is the usual cause)"
+                ), port
+            if code != 0:
+                tail = output.strip().splitlines()
+                detail = tail[-1] if tail else "no output"
+                return (
+                    False,
+                    f"starting the MLX server failed (exit {code}): {detail[:400]}",
+                    port,
+                )
 
-        for _ in range(_SERVE_PROBE_ATTEMPTS):
-            if await asyncio.to_thread(
-                mlx_server_is_running, 1.0, self.port
-            ):
-                return True, ""
-            await asyncio.sleep(_SERVE_PROBE_INTERVAL_S)
-        return False, (
-            f"the MLX server did not answer GET /v1/models on "
-            f"http://127.0.0.1:{self.port} after the launchd agent started"
-        )
+            for _ in range(_SERVE_PROBE_ATTEMPTS):
+                if await asyncio.to_thread(
+                    mlx_server_is_running, 1.0, port
+                ):
+                    return True, "", port
+                await asyncio.sleep(_SERVE_PROBE_INTERVAL_S)
+            return False, (
+                f"the MLX server did not answer GET /v1/models on "
+                f"http://127.0.0.1:{port} after the launchd agent started"
+            ), port
 
     async def _unload_agent(self, model_dir: Path) -> tuple[str, str]:
         """Unload the serving agent when it pins *model_dir*.
@@ -447,15 +617,20 @@ class MLXInstaller(AppInstaller):
         script = mlx_serving_script()
         if not script.exists():
             return "failed", f"the MLX serving script is missing at {script}"
-        code, output = await run_cmd(
-            [
-                str(script),
-                "--uninstall",
-                "--model", str(model_dir),
-                "--venv", str(self._venv()),
-            ],
-            timeout=60,
-        )
+        try:
+            code, output = await run_cmd(
+                [
+                    str(script),
+                    "--uninstall",
+                    "--model", str(model_dir),
+                    "--venv", str(self._venv()),
+                ],
+                timeout=60,
+            )
+        except TimeoutError:
+            # Same shape as a non-zero exit: the model is gone, so the caller
+            # must hear "failed" rather than have uninstall() raise.
+            return "failed", "the MLX serving script timed out while unloading"
         if code == 0:
             return "unloaded", ""
         if code == _AGENT_LEFT_RUNNING_EXIT_CODE:
@@ -580,7 +755,7 @@ class MLXInstaller(AppInstaller):
             )
             return result
 
-        serving, serve_err = await self._serve_model(target)
+        serving, serve_err, port = await self._serve_model(target)
         result["mlx_serving"] = serving
         if not serving:
             # The weights are on disk and reusable; what is NOT true is that
@@ -595,10 +770,10 @@ class MLXInstaller(AppInstaller):
             return result
 
         result["mlx_model_dir"] = str(target)
-        result["endpoint"] = f"http://127.0.0.1:{self.port}/v1"
+        result["endpoint"] = f"http://127.0.0.1:{port}/v1"
         result["runtime_location"] = {
             "host": "127.0.0.1",
-            "port": self.port,
+            "port": port,
             "backend": BACKEND_ID,
         }
         return result

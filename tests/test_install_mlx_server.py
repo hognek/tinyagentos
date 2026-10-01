@@ -34,6 +34,29 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 SERVE_SCRIPT = REPO_ROOT / "scripts" / "install-mlx-server.sh"
 LABEL = "com.taos.mlx-server"
 
+#: Every production function ``main`` reaches on an install. Extracted together
+#: so a whole ``main`` run is exercised against the shipped code.
+_MAIN_FUNCTIONS = (
+    "main",
+    "parse_args",
+    "resolve_venv",
+    "label_for_model",
+    "server_binary",
+    "log_dir",
+    "plist_path",
+    "agent_target",
+    "retire_legacy_agent_for_model",
+    "write_launchd_plist",
+    "load_launchd_agent",
+    "wait_for_mlx_health",
+    "uninstall_mlx_agent",
+    "xml_escape",
+    "require_apple_silicon",
+    "require_server_binary",
+    "macos_metal_available",
+    "usage",
+)
+
 pytestmark = pytest.mark.skipif(
     shutil.which("bash") is None, reason="bash required to exercise the installer"
 )
@@ -78,9 +101,11 @@ def _functions(*names: str) -> str:
     # log/warn/die come along by default: every shipped function logs, and the
     # wrapper would otherwise die with "log: command not found". Trailing
     # newline keeps the last function from running into what the wrapper
-    # appends next (a stub or the call itself).
+    # appends next (a stub or the call itself). LEGACY_LABEL is the script-level
+    # constant label_for_model()/plist_path() read.
     wanted = ["log", "warn", "die"] + [n for n in names if n not in ("log", "warn", "die")]
-    return "\n".join(_extract_function(SERVE_SCRIPT, name) for name in wanted) + "\n"
+    body = "\n".join(_extract_function(SERVE_SCRIPT, name) for name in wanted)
+    return 'LEGACY_LABEL="com.taos.mlx-server"\n' + body + "\n"
 
 
 def _runtime_venv(tmp_path: Path) -> Path:
@@ -145,12 +170,14 @@ def _stub_host(
     return stub
 
 
-def _globals(tmp_path: Path, *, model: str, port: int = 7837, timeout: int = 3) -> str:
+def _globals(
+    tmp_path: Path, *, model: str, port: int = 7837, timeout: int = 3, label: str = LABEL
+) -> str:
     return (
         f'HOME="{tmp_path}/home"\n'
         f'VENV_DIR="{tmp_path}/venv"\n'
         f'MODEL_DIR="{model}"\n'
-        f'LABEL="{LABEL}"\n'
+        f'LABEL="{label}"\n'
         f'HOST="127.0.0.1"\n'
         f'PORT="{port}"\n'
         f'HEALTH_TIMEOUT="{timeout}"\n'
@@ -311,24 +338,7 @@ def test_main_reports_no_endpoint_when_the_health_gate_fails(tmp_path: Path) -> 
     result = _run_wrapper(
         tmp_path,
         _globals(tmp_path, model=str(model), timeout=1)
-        + _functions(
-            "main",
-            "parse_args",
-            "resolve_venv",
-            "server_binary",
-            "log_dir",
-            "plist_path",
-            "agent_target",
-            "write_launchd_plist",
-            "load_launchd_agent",
-            "wait_for_mlx_health",
-            "uninstall_mlx_agent", "xml_escape",
-            "require_apple_silicon",
-            "require_server_binary",
-            "macos_metal_available",
-            "usage",
-            "xml_escape",
-        )
+        + _functions(*_MAIN_FUNCTIONS)
         + _stub_host()
         + "launchctl() { :; }\n"
         + 'id() { printf "501\\n"; }\n'
@@ -350,24 +360,7 @@ def test_main_prints_the_endpoint_once_the_server_answers(tmp_path: Path) -> Non
     result = _run_wrapper(
         tmp_path,
         _globals(tmp_path, model=str(model))
-        + _functions(
-            "main",
-            "parse_args",
-            "resolve_venv",
-            "server_binary",
-            "log_dir",
-            "plist_path",
-            "agent_target",
-            "write_launchd_plist",
-            "load_launchd_agent",
-            "wait_for_mlx_health",
-            "uninstall_mlx_agent", "xml_escape",
-            "require_apple_silicon",
-            "require_server_binary",
-            "macos_metal_available",
-            "usage",
-            "xml_escape",
-        )
+        + _functions(*_MAIN_FUNCTIONS)
         + _stub_host()
         + 'launchctl() { printf "%s\\n" "$*" >> "$HOME/launchctl.log"; }\n'
         + 'id() { printf "501\\n"; }\n'
@@ -720,3 +713,160 @@ def test_unknown_argument_is_rejected() -> None:
     )
     assert result.returncode == 1
     assert "unknown argument" in result.stderr
+
+
+# --- one agent per model (taOS #329 follow-up) -------------------------------
+#
+# mlx_lm.server serves one model per process, so serving N models means N agents.
+# The pre-change script wrote the single legacy plist for whichever model was
+# installed last, so installing a second model silently took the first one down.
+
+
+def _plist_for(tmp_path: Path, *, label: str, model: str, port: int = 7837) -> Path:
+    """A minimal agent plist that pins *model* (and the port) under *label*."""
+    plist = tmp_path / "home" / "Library" / "LaunchAgents" / f"{label}.plist"
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<plist version="1.0"><dict>\n'
+        f"<key>Label</key><string>{label}</string>\n"
+        "<key>ProgramArguments</key><array>"
+        "<string>--model</string>"
+        f"<string>{model}</string>"
+        "<string>--port</string>"
+        f"<string>{port}</string>"
+        "</array>\n</dict></plist>\n"
+    )
+    return plist
+
+
+def _install_model(tmp_path: Path, model: Path, *, port: int = 7837):
+    """Run the shipped ``main`` for *model* with a per-model label (empty LABEL)."""
+    return _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(model), label="", port=port)
+        + _functions(*_MAIN_FUNCTIONS)
+        + _stub_host()
+        + 'launchctl() { printf "launchctl %s\\n" "$*" >> "$HOME/launchctl.log"; }\n'
+        + 'id() { printf "501\\n"; }\n'
+        + "curl() { return 0; }\n"
+        + 'main --model "$MODEL_DIR" --venv "$VENV_DIR"\n',
+    )
+
+
+def test_two_models_get_their_own_agents(tmp_path: Path) -> None:
+    """Two MLX models installed -> two agents, and the second install neither
+    re-points nor stops the first. On the pre-change tree both installs wrote
+    the one legacy plist, so the first model's agent was gone."""
+    model_a = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model_b = tmp_path / "models" / "mlx" / "qwen3" / "qwen3-4b"
+    model_a.mkdir(parents=True)
+    model_b.mkdir(parents=True)
+    _runtime_venv(tmp_path)
+    agents = tmp_path / "home" / "Library" / "LaunchAgents"
+
+    first = _install_model(tmp_path, model_a)
+    assert first.returncode == 0, first.stdout + first.stderr
+    log = tmp_path / "home" / "launchctl.log"
+    calls_after_first = log.read_text().splitlines()
+
+    second = _install_model(tmp_path, model_b, port=30000)
+    assert second.returncode == 0, second.stdout + second.stderr
+
+    plists = sorted(p.name for p in agents.glob("com.taos.mlx-server*.plist"))
+    assert plists == [
+        "com.taos.mlx-server-qwen2.5-3b.plist",
+        "com.taos.mlx-server-qwen3-4b.plist",
+    ], plists
+
+    # Each agent serves exactly its own model on its own port -- the first keeps
+    # the reserved default, the second the free port the installer allocated.
+    assert _plist_argv(agents / "com.taos.mlx-server-qwen2.5-3b.plist") == [
+        str(tmp_path / "venv" / "bin" / "mlx_lm.server"),
+        "--model", str(model_a), "--host", "127.0.0.1", "--port", "7837",
+    ]
+    assert _plist_argv(agents / "com.taos.mlx-server-qwen3-4b.plist") == [
+        str(tmp_path / "venv" / "bin" / "mlx_lm.server"),
+        "--model", str(model_b), "--host", "127.0.0.1", "--port", "30000",
+    ]
+    # ...and the second install never named the first agent's label.
+    new_calls = log.read_text().splitlines()[len(calls_after_first):]
+    assert not any("com.taos.mlx-server-qwen2.5-3b" in call for call in new_calls), new_calls
+
+    # The success summary names each agent's own log, not the legacy shared one
+    # (CodeRabbit on #3351).
+    assert "mlx-server-qwen2.5-3b.log" in first.stdout
+    assert "mlx-server-qwen3-4b.log" in second.stdout
+
+
+def test_uninstalling_one_model_leaves_the_other_agent(tmp_path: Path) -> None:
+    """Per-model uninstall: removing model A must not unload model B's agent."""
+    model_a = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model_b = tmp_path / "models" / "mlx" / "qwen3" / "qwen3-4b"
+    model_a.mkdir(parents=True)
+    model_b.mkdir(parents=True)
+    plist_a = _plist_for(tmp_path, label="com.taos.mlx-server-qwen2.5-3b", model=str(model_a))
+    plist_b = _plist_for(tmp_path, label="com.taos.mlx-server-qwen3-4b", model=str(model_b))
+
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(model_a), label="")
+        + _functions("uninstall_mlx_agent", "xml_escape", "plist_path", "agent_target")
+        + _launchctl_stub()
+        + 'id() { printf "501\\n"; }\n'
+        + "uninstall_mlx_agent\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not plist_a.exists(), "the agent that served the removed model was left loaded"
+    assert plist_b.exists(), "the other model's agent was unloaded too"
+    calls = (tmp_path / "home" / "launchctl.log").read_text().splitlines()
+    assert calls[0] == "launchctl bootout gui/501/com.taos.mlx-server-qwen2.5-3b"
+    assert not any("qwen3-4b" in call for call in calls), calls
+
+
+def test_a_legacy_agent_pinning_the_same_model_is_retired(tmp_path: Path) -> None:
+    """Upgrade from #3337: the single legacy agent is replaced by the per-model
+    one, so the model is not served twice (and 7837 is freed for the new agent)."""
+    model = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model.mkdir(parents=True)
+    _runtime_venv(tmp_path)
+    legacy = _plist_for(tmp_path, label=LABEL, model=str(model), port=7837)
+
+    result = _install_model(tmp_path, model)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    assert not legacy.exists(), "the legacy agent was left serving the same model"
+    assert (tmp_path / "home" / "Library" / "LaunchAgents"
+            / "com.taos.mlx-server-qwen2.5-3b.plist").exists()
+    calls = (tmp_path / "home" / "launchctl.log").read_text().splitlines()
+    assert calls[0] == f"launchctl bootout gui/501/{LABEL}"
+
+
+def test_a_legacy_agent_pinning_another_model_is_left_alone(tmp_path: Path) -> None:
+    """Installing model A must not retire the legacy agent that serves model B."""
+    model_a = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model_b = tmp_path / "models" / "mlx" / "qwen3" / "qwen3-4b"
+    model_a.mkdir(parents=True)
+    model_b.mkdir(parents=True)
+    _runtime_venv(tmp_path)
+    legacy = _plist_for(tmp_path, label=LABEL, model=str(model_b), port=7837)
+
+    result = _install_model(tmp_path, model_a)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    assert legacy.exists(), "another model's legacy agent was removed"
+    assert (tmp_path / "home" / "Library" / "LaunchAgents"
+            / "com.taos.mlx-server-qwen2.5-3b.plist").exists()
+
+
+def test_label_for_model_slugifies_the_app_id(tmp_path: Path) -> None:
+    """launchd labels are [A-Za-z0-9._-]; an app_id with spaces/'&' still yields
+    a valid, unique label rather than a malformed plist filename."""
+    result = _run_wrapper(
+        tmp_path,
+        'MODEL_DIR="/models/mlx/qwen2.5/Qwen2.5-3B & Co"\n'
+        + _functions("label_for_model")
+        + "label_for_model\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "com.taos.mlx-server-Qwen2.5-3B---Co"

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from pathlib import Path
 
@@ -14,6 +15,8 @@ from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 _PREF_NAMESPACE = "setup"
 
@@ -128,8 +131,15 @@ async def _default_backend_running(accel: str) -> bool:
     if accel == "metal":
         # Apple Silicon can satisfy this step with either local backend:
         # llama.cpp (Metal) or MLX. Short-circuit so a host that already has
-        # llama.cpp up never pays for a second socket probe.
-        return await _llamacpp_backend_running() or await _mlx_backend_running()
+        # llama.cpp up never pays for a second socket probe. The probes fail
+        # closed on their own I/O errors, but an import error or an unexpected
+        # exception must not 500 the checklist route — report the step as
+        # unsatisfied instead.
+        try:
+            return await _llamacpp_backend_running() or await _mlx_backend_running()
+        except Exception:  # noqa: BLE001 - a probe must never break /api/setup/status
+            logger.warning("metal backend probe failed", exc_info=True)
+            return False
     if accel in ("cuda", "rocm", "cpu"):
         return await _llamacpp_backend_running()
     return False

@@ -5,6 +5,8 @@ pin the four things that decide whether an MLX install is honest: the
 Apple-Silicon gate, the pinned runtime install (its own venv, vendored
 hash-pinned lock), the delegation of the weight download into the shared models
 tree, and the fact that no endpoint is reported for a service nothing starts.
+``TestMLXMultiModelServing`` then pins the taOS #329 follow-up: one launchd agent
+and one port per model, so installing a second model does not evict the first.
 
 The new symbols are reached through their modules (``hardware_mod``,
 ``mlx_mod``) rather than imported by name, so this file also runs against the
@@ -13,6 +15,7 @@ pass.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,6 +24,7 @@ import pytest
 
 from tinyagentos import hardware as hardware_mod
 from tinyagentos.installers import mlx_installer as mlx_mod
+from tinyagentos.installers import port_allocator as mlx_mod_allocator
 from tinyagentos.installers.mlx_installer import DEFAULT_PORT, MLXInstaller
 
 MLX_VARIANT = {
@@ -28,6 +32,37 @@ MLX_VARIANT = {
     "hf_repo": "mlx-community/Qwen2.5-3B-Instruct-4bit",
     "size_mb": 1900,
 }
+
+
+@pytest.fixture(autouse=True)
+def _isolated_home(monkeypatch, tmp_path):
+    """Keep launchd-agent lookups off the host's real HOME.
+
+    ``_serve_port`` reads ``~/Library/LaunchAgents`` to see which models are
+    already served. On an Apple Silicon dev box that directory really exists and
+    holds agents; CI runs these tests on Linux. Pinning HOME to a throwaway dir
+    makes the port decision identical on both.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+
+def _agent_plist(home: Path, *, label: str, model: str, port: int) -> Path:
+    """Write a launchd plist that looks like the one the shipped script emits."""
+    agents = home / "Library" / "LaunchAgents"
+    agents.mkdir(parents=True, exist_ok=True)
+    path = agents / f"{label}.plist"
+    path.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<plist version="1.0"><dict>\n'
+        f"<key>Label</key><string>{label}</string>\n"
+        "<key>ProgramArguments</key><array>"
+        "<string>/venv/bin/mlx_lm.server</string>"
+        f"<string>--model</string><string>{model}</string>"
+        "<string>--host</string><string>127.0.0.1</string>"
+        f"<string>--port</string><string>{port}</string>"
+        "</array>\n</dict></plist>\n"
+    )
+    return path
 
 
 def _fake_apple(monkeypatch, *, arm64: bool = True, metal: bool = True) -> None:
@@ -145,6 +180,33 @@ class TestAvailabilityProbes:
     def test_server_probe_is_false_when_nothing_listens(self, monkeypatch):
         monkeypatch.setenv("TAOS_MLX_PORT", "1")
         assert mlx_mod.mlx_server_is_running(timeout=0.2) is False
+
+    def test_probe_fails_closed_on_a_malformed_response_but_not_on_a_bug(
+        self, monkeypatch
+    ):
+        """Kilo on #3351: a half-up server (garbage status line, truncated body)
+        must read as "not running", while an unrelated programming error must
+        surface instead of being swallowed as a dead backend."""
+        import contextlib
+        import http.client
+        import urllib.request
+
+        monkeypatch.setattr(
+            mlx_mod.socket, "create_connection", lambda *a, **k: contextlib.nullcontext()
+        )
+        raised: dict[str, BaseException] = {"exc": http.client.BadStatusLine("garbage")}
+
+        def _urlopen(req, timeout=None):
+            raise raised["exc"]
+
+        monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+
+        assert mlx_mod.mlx_server_is_running(timeout=0.1, port=12345) is False
+        raised["exc"] = http.client.IncompleteRead(b"", 10)
+        assert mlx_mod.mlx_server_is_running(timeout=0.1, port=12345) is False
+        raised["exc"] = RuntimeError("boom")
+        with pytest.raises(RuntimeError):
+            mlx_mod.mlx_server_is_running(timeout=0.1, port=12345)
 
     def test_server_probe_follows_the_port_it_is_given(self):
         """A live OpenAI-compatible server counts; the probe is a real GET, and
@@ -344,7 +406,7 @@ class TestMLXInstallerInstall:
         ), patch.object(
             MLXInstaller,
             "_serve_model",
-            AsyncMock(return_value=(False, "no Metal device on this host")),
+            AsyncMock(return_value=(False, "no Metal device on this host", 7837)),
         ):
             result = await MLXInstaller(models_dir=tmp_path, venv_dir=venv).install(
                 "qwen2.5-3b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
@@ -575,7 +637,7 @@ class TestMLXServing:
 
     async def test_serving_is_not_attempted_off_macos(self, monkeypatch, tmp_path):
         monkeypatch.setattr(sys, "platform", "linux")
-        serving, err = await MLXInstaller()._serve_model(tmp_path / "model")
+        serving, err, _port = await MLXInstaller()._serve_model(tmp_path / "model")
         assert serving is False
         assert "macOS-only" in err
 
@@ -589,7 +651,7 @@ class TestMLXServing:
         with patcher, patch.object(
             MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
         ), patch.object(
-            MLXInstaller, "_serve_model", AsyncMock(return_value=(True, ""))
+            MLXInstaller, "_serve_model", AsyncMock(return_value=(True, "", 7837))
         ) as serve:
             result = await MLXInstaller(models_dir=tmp_path).install(
                 "qwen2.5-3b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
@@ -611,7 +673,7 @@ class TestMLXServing:
         with patcher, patch.object(
             MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
         ), patch.object(
-            MLXInstaller, "_serve_model", AsyncMock(return_value=(True, ""))
+            MLXInstaller, "_serve_model", AsyncMock(return_value=(True, "", 7837))
         ) as serve:
             result = await MLXInstaller(models_dir=tmp_path).install(
                 "qwen2.5-3b", install_config={"backend": "mlx"}, variant=variant
@@ -715,6 +777,52 @@ class TestMLXServing:
         assert result["mlx_agent_unloaded"] is False
         assert "mlx_agent_error" not in result
 
+    async def test_a_serving_script_timeout_is_a_serving_failure_not_a_crash(
+        self, monkeypatch, tmp_path
+    ):
+        """CodeRabbit on #3351: ``run_cmd`` raises ``TimeoutError`` when the
+        script overruns, so the install must keep the weights and report why
+        rather than propagate out of ``install()``."""
+        _fake_apple(monkeypatch)
+
+        async def _run_cmd(cmd, cwd=None, timeout=300):
+            raise TimeoutError
+
+        monkeypatch.setattr(mlx_mod, "run_cmd", _run_cmd)
+        patcher, _ = _patch_hf_downloader(target_dir=str(self._model_dir(tmp_path)))
+        with patcher, patch.object(
+            MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
+        ):
+            result = await MLXInstaller(models_dir=tmp_path, serve_timeout=5).install(
+                "qwen2.5-3b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
+            )
+
+        assert result["success"] is True, "the weights are on disk; only serving failed"
+        assert "endpoint" not in result
+        assert result["mlx_serving"] is False
+        assert "did not finish within 5s" in result["mlx_serving_error"]
+
+    async def test_an_unload_timeout_is_reported_as_a_failed_unload(
+        self, monkeypatch, tmp_path
+    ):
+        """The same for uninstall: the model is already gone, so the caller must
+        hear "failed", not get an exception (CodeRabbit on #3351)."""
+        monkeypatch.setattr(sys, "platform", "darwin")
+
+        async def _run_cmd(cmd, cwd=None, timeout=300):
+            raise TimeoutError
+
+        monkeypatch.setattr(mlx_mod, "run_cmd", _run_cmd)
+        target = self._model_dir(tmp_path)
+        target.mkdir(parents=True)
+
+        result = await MLXInstaller(models_dir=tmp_path).uninstall("qwen2.5-3b")
+
+        assert result["success"] is True
+        assert result["mlx_agent_state"] == "failed"
+        assert result["mlx_agent_unloaded"] is False
+        assert "timed out" in result["mlx_agent_error"]
+
     async def test_a_failed_unload_is_reported_as_a_failure(
         self, monkeypatch, tmp_path
     ):
@@ -798,3 +906,299 @@ class TestMLXInstallerUninstall:
         assert uninstall_result["success"] is False
         assert "refusing to remove" in uninstall_result["error"]
         assert (outside / "important.txt").exists()
+
+
+@pytest.mark.asyncio
+class TestMLXMultiModelServing:
+    """taOS #329 follow-up: two MLX models served at once, with no silent eviction.
+
+    ``mlx_lm.server`` serves one model per process, so several models coexist by
+    each having **its own** agent and port. Installing a second model must not
+    re-point (and stop) the first, and each install must report the endpoint of
+    the server it actually health-gated.
+    """
+
+    @staticmethod
+    def _model(root: Path, app_id: str) -> Path:
+        return root / "mlx" / "qwen" / app_id
+
+    @staticmethod
+    def _capture(monkeypatch):
+        calls: list[list[str]] = []
+
+        async def _run_cmd(cmd, cwd=None, timeout=300):
+            calls.append(list(cmd))
+            return 0, ""
+
+        monkeypatch.setattr(mlx_mod, "run_cmd", _run_cmd)
+        monkeypatch.setattr(mlx_mod, "mlx_server_is_running", lambda *a, **k: True)
+        return calls
+
+    async def test_the_first_model_keeps_the_reserved_default_port(
+        self, monkeypatch, tmp_path
+    ):
+        """Nothing else is served, so the setup checklist's Metal probe (which
+        only knows 7837) must still find the backend."""
+        _fake_apple(monkeypatch)
+        target = self._model(tmp_path / "models", "qwen2.5-3b")
+        calls = self._capture(monkeypatch)
+        patcher, _ = _patch_hf_downloader(target_dir=str(target))
+        with patcher, patch.object(
+            MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
+        ):
+            result = await MLXInstaller(models_dir=tmp_path / "models").install(
+                "qwen2.5-3b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
+            )
+
+        assert result["runtime_location"]["port"] == DEFAULT_PORT
+        assert calls[0][calls[0].index("--port") + 1] == str(DEFAULT_PORT)
+
+    async def test_a_second_model_is_served_on_its_own_port(
+        self, monkeypatch, tmp_path
+    ):
+        """The regression this slice fixes: installing model B must not re-point
+        model A's agent *and* must not squat its port. On the pre-change tree both
+        installs passed --port 7837, so the second server could not bind."""
+        _fake_apple(monkeypatch)
+        root = tmp_path / "models"
+        model_a = self._model(root, "qwen2.5-3b")
+        model_b = self._model(root, "qwen3-4b")
+        # Model A is already served by an agent on the reserved default.
+        _agent_plist(
+            tmp_path / "home", label="com.taos.mlx-server-qwen2.5-3b",
+            model=str(model_a), port=DEFAULT_PORT,
+        )
+        calls = self._capture(monkeypatch)
+        patcher, _ = _patch_hf_downloader(target_dir=str(model_b))
+        with patcher, patch.object(
+            MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
+        ):
+            result = await MLXInstaller(models_dir=root).install(
+                "qwen3-4b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
+            )
+
+        port = int(calls[0][calls[0].index("--port") + 1])
+        assert port != DEFAULT_PORT, "model B was pinned to model A's port"
+        # A port no app host-port allocation may squat, so it is genuinely free
+        # for the second server rather than a reserved taOS service port.
+        assert port not in mlx_mod_allocator.RESERVED_PORTS
+        assert result["endpoint"] == f"http://127.0.0.1:{port}/v1"
+        assert result["runtime_location"]["port"] == port
+        # ...and model A's directory is never named: its agent is not touched.
+        assert str(model_a) not in " ".join(calls[0])
+
+    async def test_a_reinstall_keeps_the_port_its_agent_already_uses(
+        self, monkeypatch, tmp_path
+    ):
+        """A re-install must not move a running server to a new port (the old
+        agent would still hold the old one)."""
+        _fake_apple(monkeypatch)
+        root = tmp_path / "models"
+        model_a = self._model(root, "qwen2.5-3b")
+        model_b = self._model(root, "qwen3-4b")
+        _agent_plist(
+            tmp_path / "home", label="com.taos.mlx-server-qwen2.5-3b",
+            model=str(model_a), port=DEFAULT_PORT,
+        )
+        _agent_plist(
+            tmp_path / "home", label="com.taos.mlx-server-qwen3-4b",
+            model=str(model_b), port=34567,
+        )
+        calls = self._capture(monkeypatch)
+        patcher, _ = _patch_hf_downloader(target_dir=str(model_b))
+        with patcher, patch.object(
+            MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
+        ):
+            result = await MLXInstaller(models_dir=root).install(
+                "qwen3-4b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
+            )
+
+        assert result["runtime_location"]["port"] == 34567
+        assert calls[0][calls[0].index("--port") + 1] == "34567"
+
+    async def test_the_legacy_single_agent_is_seen_as_the_same_model(
+        self, monkeypatch, tmp_path
+    ):
+        """An install upgraded from #3337 keeps 7837: the legacy plist pins this
+        model, so it is not "another model" occupying the port."""
+        _fake_apple(monkeypatch)
+        root = tmp_path / "models"
+        model_a = self._model(root, "qwen2.5-3b")
+        _agent_plist(
+            tmp_path / "home", label="com.taos.mlx-server",
+            model=str(model_a), port=DEFAULT_PORT,
+        )
+        self._capture(monkeypatch)
+        patcher, _ = _patch_hf_downloader(target_dir=str(model_a))
+        with patcher, patch.object(
+            MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
+        ):
+            result = await MLXInstaller(models_dir=root).install(
+                "qwen2.5-3b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
+            )
+
+        assert result["runtime_location"]["port"] == DEFAULT_PORT
+
+    async def test_the_default_port_comes_back_when_no_agent_holds_it(
+        self, monkeypatch, tmp_path
+    ):
+        """CodeRabbit on #3351: a model is only pushed off 7837 when another
+        agent actually claims it, so a free default is not wasted."""
+        _fake_apple(monkeypatch)
+        root = tmp_path / "models"
+        model_a = self._model(root, "qwen2.5-3b")
+        model_b = self._model(root, "qwen3-4b")
+        # A is served, but on an allocated port: the reserved default is free.
+        _agent_plist(
+            tmp_path / "home", label="com.taos.mlx-server-qwen2.5-3b",
+            model=str(model_a), port=34567,
+        )
+        self._capture(monkeypatch)
+        patcher, _ = _patch_hf_downloader(target_dir=str(model_b))
+        with patcher, patch.object(
+            MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
+        ):
+            result = await MLXInstaller(models_dir=root).install(
+                "qwen3-4b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
+            )
+
+        assert result["runtime_location"]["port"] == DEFAULT_PORT
+
+    async def test_a_new_model_never_takes_a_port_another_agent_claims(
+        self, monkeypatch, tmp_path
+    ):
+        """CodeRabbit on #3351: an agent's plist names its port even while its
+        server is still loading (no socket bound), so allocation must be told to
+        skip every claimed port, not just the bound ones."""
+        _fake_apple(monkeypatch)
+        root = tmp_path / "models"
+        model_a = self._model(root, "qwen2.5-3b")
+        model_b = self._model(root, "qwen3-4b")
+        model_c = self._model(root, "qwen3-8b")
+        _agent_plist(
+            tmp_path / "home", label="com.taos.mlx-server-qwen2.5-3b",
+            model=str(model_a), port=DEFAULT_PORT,
+        )
+        _agent_plist(
+            tmp_path / "home", label="com.taos.mlx-server-qwen3-4b",
+            model=str(model_b), port=34567,
+        )
+        calls = self._capture(monkeypatch)
+        patcher, _ = _patch_hf_downloader(target_dir=str(model_c))
+        with patcher, patch.object(
+            MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
+        ):
+            result = await MLXInstaller(models_dir=root).install(
+                "qwen3-8b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
+            )
+
+        port = result["runtime_location"]["port"]
+        assert port not in {DEFAULT_PORT, 34567}
+        assert calls[0][calls[0].index("--port") + 1] == str(port)
+
+    async def test_concurrent_installs_do_not_claim_the_same_port(
+        self, monkeypatch, tmp_path
+    ):
+        """CodeRabbit on #3351: two Store installs awaited together must not both
+        pick 7837. Their servers cannot both bind it, and the loser's probe would
+        still see the winner's model answering there -- an endpoint reported for
+        a server that serves another model."""
+        _fake_apple(monkeypatch)
+        root = tmp_path / "models"
+        ports: list[int] = []
+        home = tmp_path / "home"
+
+        async def _run_cmd(cmd, cwd=None, timeout=300):
+            port = int(cmd[cmd.index("--port") + 1])
+            model = Path(cmd[cmd.index("--model") + 1])
+            ports.append(port)
+            # The shipped script writes its plist before health-gating; yield
+            # here so the other install would race past the port choice.
+            await asyncio.sleep(0)
+            _agent_plist(
+                home, label=f"com.taos.mlx-server-{model.name}",
+                model=str(model), port=port,
+            )
+            return 0, ""
+
+        async def _hf_install(app_id, install_config=None, variant=None, **kwargs):
+            return {"success": True, "target_dir": str(self._model(root, app_id))}
+
+        fake_hf = MagicMock()
+        fake_hf.return_value.install = AsyncMock(side_effect=_hf_install)
+        monkeypatch.setattr(mlx_mod, "HFMultiInstaller", fake_hf)
+        monkeypatch.setattr(mlx_mod, "run_cmd", _run_cmd)
+        monkeypatch.setattr(mlx_mod, "mlx_server_is_running", lambda *a, **k: True)
+
+        with patch.object(
+            MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
+        ):
+            await asyncio.gather(
+                MLXInstaller(models_dir=root).install(
+                    "qwen2.5-3b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
+                ),
+                MLXInstaller(models_dir=root).install(
+                    "qwen3-4b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
+                ),
+            )
+
+        assert len(ports) == 2
+        assert len(set(ports)) == 2, f"both installs claimed the same port: {ports}"
+        assert min(ports) == DEFAULT_PORT
+
+    async def test_an_unreadable_port_on_this_models_agent_does_not_move_it(
+        self, monkeypatch, tmp_path
+    ):
+        """Kilo CRITICAL on #3351: this model's own agent wins even when its port
+        cannot be read, so a re-install never allocates a fresh port under a
+        server that is still running."""
+        _fake_apple(monkeypatch)
+        root = tmp_path / "models"
+        model_a = self._model(root, "qwen2.5-3b")
+        model_b = self._model(root, "qwen3-4b")
+        agents = tmp_path / "home" / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True, exist_ok=True)
+        # A's own agent pins A but carries no readable --port.
+        (agents / "com.taos.mlx-server-qwen2.5-3b.plist").write_text(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<plist version="1.0"><dict>\n'
+            "<key>ProgramArguments</key><array>"
+            f"<string>--model</string><string>{model_a}</string>"
+            "</array>\n</dict></plist>\n"
+        )
+        _agent_plist(
+            tmp_path / "home", label="com.taos.mlx-server-qwen3-4b",
+            model=str(model_b), port=34567,
+        )
+        calls = self._capture(monkeypatch)
+        patcher, _ = _patch_hf_downloader(target_dir=str(model_a))
+        with patcher, patch.object(
+            MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
+        ):
+            result = await MLXInstaller(models_dir=root).install(
+                "qwen2.5-3b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
+            )
+
+        assert result["runtime_location"]["port"] == DEFAULT_PORT
+        assert calls[0][calls[0].index("--port") + 1] == str(DEFAULT_PORT)
+
+    async def test_agent_readers_parse_the_shipped_plist_shape(self, tmp_path):
+        """The port decision reads the plists the shipped script writes."""
+        model = tmp_path / "mlx" / "qwen2.5" / "qwen2.5-3b"
+        plist = _agent_plist(
+            tmp_path / "home", label="com.taos.mlx-server-qwen2.5-3b",
+            model=str(model), port=34567,
+        )
+        assert mlx_mod.mlx_agent_model_dir(plist) == str(model)
+        assert mlx_mod.mlx_agent_port(plist) == 34567
+        assert mlx_mod.mlx_agent_plists() == [plist]
+
+    async def test_a_model_without_an_agent_is_not_matched(self, tmp_path):
+        plist = _agent_plist(
+            tmp_path / "home", label="com.taos.mlx-server-other",
+            model=str(tmp_path / "elsewhere"), port=34567,
+        )
+        assert mlx_mod.mlx_agent_model_dir(plist) == str(tmp_path / "elsewhere")
+        assert mlx_mod.mlx_agent_model_dir(plist) != str(
+            tmp_path / "mlx" / "qwen2.5" / "qwen2.5-3b"
+        )
