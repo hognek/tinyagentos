@@ -5240,8 +5240,72 @@ _LOCK_SCREEN_SCRIPT = r"""
     };
     var RADIOS = [["wifi", "Wi‑Fi"], ["bluetooth", "Bluetooth"]];
 
+    // The USB-C port tile, after the radios. It is left out of the list until a
+    // read says this phone offers a mode, so a dev box shows nothing.
+    var USB_LABELS = { ncm: "USB network", charging: "Charge only", mtp: "File transfer" };
+    var USB_GLYPH = '<path d="M12 3v13"/><circle cx="12" cy="19" r="2"/>'
+      + '<path d="M12 9l4-2v3M12 12l-4-2v-2"/>';
+    var usbState = { available: [] };
+    var lastRadios = {};
+
+    function usbTile() {
+      var btn = partOf(togglesEl, "usb", "ls-toggle", "button");
+      if (btn.type !== "button") {
+        btn.type = "button";
+        btn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true">'
+          + USB_GLYPH + "</svg>";
+        btn.appendChild(document.createElement("span"));
+        btn.addEventListener("click", function () { cycleUsb(btn); });
+      }
+      var cur = USB_LABELS[usbState.mode];
+      setText(btn.lastChild, cur || "USB");
+      // Unknown is not a position on the dial: disabled rather than shown in a
+      // mode nobody measured.
+      btn.disabled = !cur;
+      setAttrIfChanged(btn, "aria-pressed", "false");
+      setAttrIfChanged(btn, "data-usb-mode", usbState.mode || "");
+      return btn;
+    }
+
+    function paintUsb(state) {
+      usbState = state || { available: [] };
+      paintRadios(lastRadios);
+    }
+
+    function cycleUsb(btn) {
+      if (btn.getAttribute("data-busy") === "1") return;
+      var avail = usbState.available || [];
+      var next = avail[(avail.indexOf(usbState.mode) + 1) % avail.length];
+      if (!next) return;
+      btn.setAttribute("data-busy", "1");
+      // No optimistic repaint: this can take ~10s, and the answer is the
+      // read-back, which may well not be what was asked for.
+      fetch("/auth/lock-usb", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", "X-taOS-Console": "1" },
+        body: JSON.stringify({ mode: next })
+      }).then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          btn.removeAttribute("data-busy");
+          if (d) paintUsb(d); else loadUsb();
+        })
+        .catch(function () {
+          btn.removeAttribute("data-busy");
+          loadUsb();
+        });
+    }
+
+    function loadUsb() {
+      fetch("/auth/lock-usb", { credentials: "same-origin" })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) { if (d) paintUsb(d); })
+        .catch(function () { /* leave the tile as it is */ });
+    }
+
     function paintRadios(state) {
       if (!togglesEl) return;
+      lastRadios = state;
       var want = [];
       for (var i = 0; i < RADIOS.length; i++) {
         (function (key, label) {
@@ -5273,6 +5337,7 @@ _LOCK_SCREEN_SCRIPT = r"""
           want.push(btn);
         })(RADIOS[i][0], RADIOS[i][1]);
       }
+      if ((usbState.available || []).length) want.push(usbTile());
       placeInOrder(togglesEl, want);
     }
 
@@ -5370,6 +5435,7 @@ _LOCK_SCREEN_SCRIPT = r"""
     function openShade() {
       loadBrightness();
       loadRadios();
+      loadUsb();
       openSheet("shade");
     }
 
@@ -12181,6 +12247,106 @@ async def set_lock_radios(request: Request):
     # radio refuses.
     await asyncio.sleep(1.2)
     return JSONResponse(_read_radios())
+
+
+_USB_BIN = "/usr/local/bin/taos-usb-mode"
+
+#: What the page may ask for, mapped to the verb the root helper accepts. CLOSED.
+_USB_VERBS = {
+    "ncm": "usb-ncm",
+    "charging": "usb-charging",
+    "mtp": "usb-mtp",
+}
+
+
+def _read_usb() -> dict:
+    """USB-C port mode, read as the controller user. Never raises.
+
+    `taos-usb-mode` prints `mode: ...`, `saved: ...` and so on, and
+    `taos-usb-mode list` the modes this phone can do. A missing binary (a dev
+    box) or any failure gives {"available": []}, which the page reads as "hide
+    the tile". A mode outside the closed set reads as "unknown".
+    """
+    import subprocess
+
+    state: dict = {"available": []}
+    try:
+        got = subprocess.run(
+            [_USB_BIN], capture_output=True, text=True, timeout=4,
+        )
+        if got.returncode != 0:
+            return state
+        for line in got.stdout.splitlines():
+            key, sep, value = line.partition(":")
+            if not sep:
+                continue
+            key, value = key.strip().lower(), value.strip().lower()
+            if key in ("mode", "saved"):
+                state[key] = value if value in _USB_VERBS else "unknown"
+        got = subprocess.run(
+            [_USB_BIN, "list"], capture_output=True, text=True, timeout=4,
+        )
+        if got.returncode == 0:
+            state["available"] = [
+                m for m in got.stdout.split() if m in _USB_VERBS
+            ]
+    except Exception:
+        return {"available": []}
+    return state
+
+
+@router.get("/lock-usb")
+async def lock_usb(request: Request):
+    """Current USB-C port mode and the modes this phone offers. Console-only."""
+    if not _request_is_console(request):
+        return JSONResponse({"error": "console only"}, status_code=403)
+    return JSONResponse(await asyncio.to_thread(_read_usb))
+
+
+@router.post("/lock-usb")
+async def set_lock_usb(request: Request):
+    """Switch the USB-C port between network, charge-only and file transfer.
+    Console-only.
+
+    Same drop box as the radios: the root helper runs `taos-usb-mode set MODE`,
+    which also saves the mode across reboots.
+
+    ⚠ Charge-only cuts the USB network link, so together with Wi-Fi off it can
+    strand a headless handset. That is correct for a switch a PERSON flicks,
+    and it is exactly why the mode list is closed and nothing automated writes
+    it.
+
+    A switch can take up to ~8s to land (ncm restarts a systemd helper), so
+    this polls the read-back until it matches, and answers with the READ-BACK
+    even when it never does: the page shows the truth, not the request.
+    """
+    refusal = _lock_post_refusal(request)
+    if refusal is not None:
+        return refusal
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    mode = body.get("mode") if isinstance(body, dict) else None
+    if not isinstance(mode, str) or mode not in _USB_VERBS:
+        return JSONResponse({"error": "mode required"}, status_code=400)
+    current = await asyncio.to_thread(_read_usb)
+    if mode not in current.get("available", []):
+        return JSONResponse({"error": "mode not available"}, status_code=400)
+
+    try:
+        _write_power_request(_USB_VERBS[mode])
+    except OSError as exc:
+        return JSONResponse(
+            {"error": "request failed", "detail": str(exc)}, status_code=503
+        )
+    state = current
+    for _ in range(24):
+        await asyncio.sleep(0.5)
+        state = await asyncio.to_thread(_read_usb)
+        if state.get("mode") == mode:
+            break
+    return JSONResponse(state)
 
 
 @router.post("/lock-volume-key")
