@@ -210,30 +210,7 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
         app_state.taos_opencode_sessions = sessions
 
     existing: OpenCodeServer | None = servers.get(model)
-    born_degraded = getattr(app_state, "taos_opencode_born_degraded", None)
-    if born_degraded is None:
-        born_degraded = {}
-        app_state.taos_opencode_born_degraded = born_degraded
 
-
-    # Self-heal: if the cached server was born before LiteLLM was ready and
-    # LiteLLM is now running, tear down the degraded server and fall through
-    # to a fresh build so the key re-scope and model_ids are applied properly.
-    if existing is not None and born_degraded.get(model, False):
-        llm_proxy_check = getattr(app_state, "llm_proxy", None)
-        if llm_proxy_check is not None and llm_proxy_check.is_running():
-            logger.info(
-                "taos_agent_runtime: LiteLLM now ready; rebuilding taOS opencode server "
-                "for %s that was born degraded", model,
-            )
-            try:
-                await existing.stop()
-            except Exception:
-                logger.debug("taos_agent_runtime: error stopping degraded server", exc_info=True)
-            servers.pop(model, None)
-            sessions.pop(model, None)
-            born_degraded[model] = False
-            existing = None
 
     if existing is None:
         # Stop-on-model-change: all per-model servers share TAOS_OPENCODE_PORT,
@@ -256,7 +233,6 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
                     logger.debug("taos_agent_runtime: error stopping old server", exc_info=True)
                 servers.pop(other_model, None)
                 sessions.pop(other_model, None)
-                born_degraded.pop(other_model, None)
         # Clear the legacy session id so the desktop chat path does not feed
         # a stale session from a now-stopped model to the new server.
         app_state.taos_opencode_session_id = None
@@ -284,9 +260,6 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
         # allow the embedding alias. This is now added inside llm_proxy.create_agent_key.
         llm_proxy = getattr(app_state, "llm_proxy", None)
         litellm_key: str | None = None
-        born_degraded_now = False
-        if llm_proxy is None or not llm_proxy.is_running():
-            born_degraded_now = True
         if stored_key:
             litellm_key = stored_key
             if llm_proxy is not None:
@@ -295,8 +268,7 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
                     if not rescoped:
                         # The stored key is not in the local key store (legacy
                         # Postgres key or another agent's key). Mint a fresh
-                        # local-store key so the gateway (or local LiteLLM with
-                        # inhouse_keys) can accept it.
+                        # local-store key so the gateway can accept it.
                         logger.warning(
                             "taos_agent_runtime: re-scoping the taOS agent key returned False "
                             "(key not in local store); minting a new local-store key"
@@ -322,9 +294,9 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
                 except Exception:
                     logger.debug("taos_agent_runtime: persisting key failed", exc_info=True)
         if not litellm_key:
-            # No key from the proxy (LiteLLM stopped, or it could not mint):
-            # a key scoped to the permitted models from the local key store,
-            # which the LLM gateway accepts. Never the LiteLLM master key.
+            # No key from the key service (none on app.state, or it could
+            # not mint): a key scoped to the permitted models straight from
+            # the local key store, which the LLM gateway accepts.
             litellm_key = _mint_local_taos_agent_key(app_state, permitted_models)
             if litellm_key and desktop_settings is not None:
                 try:
@@ -389,7 +361,7 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
             home=home,
             port=TAOS_OPENCODE_PORT,
             server_password=app_state.taos_opencode_password,
-            litellm_base_url=await _llm_base_url(app_state, llm_proxy, permitted_models),
+            litellm_base_url=await _llm_base_url(app_state, permitted_models),
             litellm_key=litellm_key,
             model_ids=permitted_models,
             taos_api_base_url=taos_api_base_url,
@@ -397,7 +369,6 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
         )
         server = OpenCodeServer(cfg)
         servers[model] = server
-        born_degraded[model] = born_degraded_now
         if model not in sessions:
             sessions[model] = None
 
@@ -442,14 +413,12 @@ def permitted_models_for(model: str, prefs: dict | None) -> list[str]:
 
 
 async def opencode_gateway_problem(app_state, model: str, prefs: dict | None) -> str | None:
-    """Why opencode could NOT reach its model through the in-process gateway
-    (so it would need LiteLLM), or None when ``_llm_base_url`` hands it the
-    gateway. Same inputs and checks as ``_llm_base_url``."""
-    from tinyagentos import llm_gateway
+    """Why the in-process gateway cannot serve opencode's permitted models,
+    or None. Same inputs and checks as the cutover applies to container
+    agents. With LiteLLM gone this no longer picks another path; callers use
+    it to explain a model error up front."""
     from tinyagentos.llm_gateway.cutover import models_problem
 
-    if not llm_gateway.enabled():
-        return "the taOS LLM gateway is turned off (TAOS_LLM_GATEWAY=0)"
     try:
         problem = await models_problem(app_state, permitted_models_for(model, prefs))
     except Exception as exc:  # noqa: BLE001 - unknown routability is a problem
@@ -457,58 +426,21 @@ async def opencode_gateway_problem(app_state, model: str, prefs: dict | None) ->
     return f"the taOS LLM gateway cannot serve it: {problem}" if problem else None
 
 
-async def _llm_base_url(app_state, llm_proxy, models: list[str]) -> str:
-    """Where the taOS agent's opencode sends model calls.
-
-    The in-process LLM gateway on this controller when it is on AND can serve
-    every permitted model (the same check the cutover applies to container
-    agents), so the taOS agent keeps working with LiteLLM stopped. LiteLLM
-    otherwise: the gateway switched off (``TAOS_LLM_GATEWAY=0``), or a model
-    the gateway cannot route (e.g. one no longer in the routing table).
-    """
-    from tinyagentos import llm_gateway
+async def _llm_base_url(app_state, models: list[str]) -> str:
+    """Where the taOS agent's opencode sends model calls: the in-process LLM
+    gateway on this controller. It is the only LLM path since LiteLLM removal
+    2b-2a; a model the gateway cannot route is logged here and answered with a
+    model error at request time."""
     from tinyagentos.llm_gateway.cutover import models_problem
     from tinyagentos.llm_gateway.router import PREFIX
 
-    litellm = f"http://127.0.0.1:{llm_proxy.port if llm_proxy is not None else 7834}/v1"
-    if not llm_gateway.enabled():
-        # Gateway is off - we'll use LiteLLM directly. If inhouse_keys is
-        # False, local key store keys are not accepted by LiteLLM.
-        inhouse_keys = getattr(llm_proxy, "inhouse_keys", True) if llm_proxy else True
-        if inhouse_keys is False:
-            msg = (
-                "taOS agent would use LiteLLM directly (gateway disabled) but "
-                "proxy.inhouse_keys is False (Postgres-backed install). Local "
-                "key-store keys are not accepted by LiteLLM when inhouse_keys "
-                "is off. Remedy: create the .litellm_force_inhouse_keys marker "
-                "in the data directory and restart the controller to enable "
-                "in-house key mode, or enable the LLM gateway."
-            )
-            logger.error("taos_agent_runtime: %s", msg)
-            raise RuntimeError(msg)
-        return litellm
     try:
         problem = await models_problem(app_state, models)
-    except Exception as exc:  # noqa: BLE001 - unknown routability: stay on LiteLLM
+    except Exception as exc:  # noqa: BLE001 - logged, the gateway is still the path
         problem = f"routability check failed: {type(exc).__name__}"
     if problem:
-        # Gateway has a models_problem - we'll use LiteLLM directly. If
-        # inhouse_keys is False, local key store keys are not accepted.
-        inhouse_keys = getattr(llm_proxy, "inhouse_keys", True) if llm_proxy else True
-        if inhouse_keys is False:
-            msg = (
-                f"taOS agent would use LiteLLM directly (gateway cannot serve "
-                f"all models: {problem}) but proxy.inhouse_keys is False "
-                "(Postgres-backed install). Local key-store keys are not "
-                "accepted by LiteLLM when inhouse_keys is off. Remedy: create "
-                "the .litellm_force_inhouse_keys marker in the data directory "
-                "and restart the controller to enable in-house key mode, or "
-                "configure the gateway to serve all required models."
-            )
-            logger.error("taos_agent_runtime: %s", msg)
-            raise RuntimeError(msg)
-        logger.warning("taos_agent_runtime: taOS agent stays on LiteLLM: %s", problem)
-        return litellm
+        logger.warning("taos_agent_runtime: the LLM gateway cannot serve the taOS agent's models: %s",
+                       problem)
     config = getattr(app_state, "config", None)
     port = int((getattr(config, "server", None) or {}).get("port", 6969))
     return f"http://127.0.0.1:{port}{PREFIX}"
@@ -538,7 +470,6 @@ async def stop_taos_opencode_server(app_state) -> None:
             logger.debug("taos_agent_runtime: error during stop", exc_info=True)
     app_state.taos_opencode_servers = {}
     app_state.taos_opencode_sessions = {}
-    app_state.taos_opencode_born_degraded = {}
     app_state.taos_opencode_session_id = None
 
 # ---------------------------------------------------------------------------

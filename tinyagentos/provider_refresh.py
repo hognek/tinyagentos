@@ -1,11 +1,11 @@
 """Periodic cloud-provider catalog refresh.
 
 Cloud providers (kilocode/openrouter/openai/…) gain and lose models upstream
-over time. Without a refresh, taOS's LiteLLM ``model_list`` goes stale — a
-newly published model 404s until someone PATCHes the provider or restarts.
-This service re-probes the cloud providers on an interval and reloads LiteLLM
-ONLY when the catalog actually changed (see
-``providers.refresh_cloud_backends_if_changed``).
+over time. Without a refresh, the gateway's routing table (built from the
+config's backend model lists) goes stale — a newly published model 404s until
+someone PATCHes the provider or restarts. This service re-probes the cloud
+providers on an interval and persists the config ONLY when the catalog
+actually changed (see ``providers.refresh_cloud_backends_if_changed``).
 
 Mirrors AutoUpdateService's lifecycle (start/stop in the app lifespan).
 """
@@ -83,9 +83,8 @@ class CloudProviderRefresher:
         if config is None:
             return
         proxy = getattr(self._state, "llm_proxy", None)
-        reloaded = await refresh_cloud_backends_if_changed(self._state, config, proxy)
-        if reloaded:
-            logger.info("cloud provider refresh: catalog changed, LiteLLM reloaded")
+        if await refresh_cloud_backends_if_changed(self._state, config):
+            logger.info("cloud provider refresh: catalog changed, config persisted")
         # Always update the models cache after a background probe so the
         # picker serves a warm result. The catalog is read in process from
         # the routing table (no LiteLLM round-trip), so this runs whether or

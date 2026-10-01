@@ -6,7 +6,7 @@ from tinyagentos.routes import settings as settings_mod
 
 @pytest.mark.asyncio
 async def test_installer_extras_selection_handset(monkeypatch):
-    """Test that the updater installs .[proxy,ble] on a taOSmobile handset."""
+    """Test that the updater installs .[ble] on a taOSmobile handset."""
     # Patch the _detect_device_class function in the settings module directly
     monkeypatch.setattr('tinyagentos.routes.settings._detect_device_class', lambda: "mobile")
 
@@ -23,16 +23,13 @@ async def test_installer_extras_selection_handset(monkeypatch):
 
     rc, out = await settings_mod._install_dependencies("/srv/taos")
 
-    # Should have both --extra proxy and --extra ble
-    assert "--extra" in captured["cmd"]
-    assert captured["cmd"].count("--extra") == 2
-    assert "proxy" in captured["cmd"]
-    assert "ble" in captured["cmd"]
+    # Only --extra ble (the LiteLLM proxy extra is gone)
+    assert captured["cmd"] == ["/opt/uv", "sync", "--frozen", "--extra", "ble"]
 
 
 @pytest.mark.asyncio
 async def test_installer_extras_selection_non_handset(monkeypatch):
-    """Test that the updater installs .[proxy] on a non-handset host."""
+    """Test that the updater installs no extra on a non-handset host."""
     # Patch the _detect_device_class function in the settings module directly
     monkeypatch.setattr('tinyagentos.routes.settings._detect_device_class', lambda: None)
 
@@ -49,11 +46,8 @@ async def test_installer_extras_selection_non_handset(monkeypatch):
 
     rc, out = await settings_mod._install_dependencies("/srv/taos")
 
-    # Should only have --extra proxy
-    assert "--extra" in captured["cmd"]
-    assert captured["cmd"].count("--extra") == 1
-    assert "proxy" in captured["cmd"]
-    assert "ble" not in captured["cmd"]
+    # No extra at all (the LiteLLM proxy extra is gone)
+    assert captured["cmd"] == ["/opt/uv", "sync", "--frozen"]
 
 
 @pytest.mark.asyncio
@@ -78,11 +72,8 @@ async def test_installer_extras_selection_taos_extras_ble_override(monkeypatch):
 
     rc, out = await settings_mod._install_dependencies("/srv/taos")
 
-    # Should have both --extra proxy and --extra ble
-    assert "--extra" in captured["cmd"]
-    assert captured["cmd"].count("--extra") == 2
-    assert "proxy" in captured["cmd"]
-    assert "ble" in captured["cmd"]
+    # Only --extra ble (the LiteLLM proxy extra is gone)
+    assert captured["cmd"] == ["/opt/uv", "sync", "--frozen", "--extra", "ble"]
 
 
 @pytest.mark.asyncio
@@ -107,8 +98,5 @@ async def test_installer_extras_selection_taos_extras_ble_exclude(monkeypatch):
 
     rc, out = await settings_mod._install_dependencies("/srv/taos")
 
-    # Should only have --extra proxy
-    assert "--extra" in captured["cmd"]
-    assert captured["cmd"].count("--extra") == 1
-    assert "proxy" in captured["cmd"]
-    assert "ble" not in captured["cmd"]
+    # No extra at all (the LiteLLM proxy extra is gone)
+    assert captured["cmd"] == ["/opt/uv", "sync", "--frozen"]

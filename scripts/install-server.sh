@@ -88,7 +88,7 @@ fi
 
 set -euo pipefail
 
-# Determine controller extras (proxy, optionally ble)
+# Determine controller extras (none, or ble on a handset)
 # A taOSmobile handset needs bleak for Orb scan/pair routes.
 # Detection uses the same signal as the controller: systemctl cat taos-kiosk.service
 # returns 0 on a handset, non-zero otherwise.
@@ -102,19 +102,19 @@ taos_controller_extras() {
         is_handset=1
     fi
 
-    local extras="proxy"
+    local extras=""
     case "${TAOS_EXTRAS_BLE:-}" in
         "1"|"true")
-            extras="proxy,ble"
+            extras="ble"
             ;;
         "0"|"false")
-            extras="proxy"
+            extras=""
             ;;
         *)
             if [[ $is_handset -eq 1 ]]; then
-                extras="proxy,ble"
+                extras="ble"
             else
-                extras="proxy"
+                extras=""
             fi
             ;;
     esac
@@ -1647,13 +1647,17 @@ if [[ ! -d .venv ]]; then
     fi
 fi
 
-log "installing controller python deps into .venv (pip install -e '.[$(taos_controller_extras)]')"
+# No extras by default (the LiteLLM `proxy` extra is gone: the in-process LLM
+# gateway replaced it); a handset adds `ble`. `.[]` is not a valid pip target,
+# so the brackets are added only when there is an extra.
+_taos_extras="$(taos_controller_extras)"
+log "installing controller python deps into .venv (pip install -e '.${_taos_extras:+[$_taos_extras]}')"
 ./.venv/bin/pip install --quiet --upgrade pip
-./.venv/bin/pip install --quiet -e ".[$(taos_controller_extras)]"
+./.venv/bin/pip install --quiet -e ".${_taos_extras:+[$_taos_extras]}"
 
-# The proxy extra no longer routes through litellm[proxy], so the proprietary
-# litellm-enterprise wheel is no longer part of the install set. A FRESH install
-# therefore never lands it -- but pip does not prune what an EARLIER install put
+# litellm (and with it the proprietary litellm-enterprise wheel an older
+# litellm[proxy] pulled in) is no longer part of the install set. A FRESH
+# install never lands it -- but pip does not prune what an EARLIER install put
 # in the venv, so upgrading an existing box would silently keep redistributing
 # it. Nothing in taOS imports it (grep -rn litellm_enterprise tinyagentos/ is
 # empty), so removing it is inert; and it is the shipped venv, not the source
@@ -1705,112 +1709,6 @@ if [[ -f data/config.yaml.example && ! -f data/config.yaml ]]; then
     log "copying data/config.yaml.example → data/config.yaml (first-run defaults)"
     cp data/config.yaml.example data/config.yaml
 fi
-
-# --- LiteLLM virtual-key store (Postgres) --------------------------------
-#
-# LiteLLM uses a Postgres-backed key store to mint per-agent virtual keys
-# via /key/generate. Without it, agent deploys log a "DB not connected"
-# error and fall back to a shared master key (functional, but every agent
-# in this controller authenticates as the same identity). We install a
-# small local Postgres and write data/.litellm_db_url so the controller
-# picks it up on next start. Idempotent: re-runs leave the existing URL
-# in place — bumping the password would invalidate any keys already
-# minted against it.
-
-ensure_litellm_postgres() {
-    if [[ -f data/.litellm_db_url && -s data/.litellm_db_url ]]; then
-        log "litellm postgres: data/.litellm_db_url present — skipping setup"
-        return 0
-    fi
-
-    if ! command -v sudo >/dev/null 2>&1 && [[ "$(id -u)" != "0" ]]; then
-        warn "litellm postgres: sudo not available and not running as root — skipping"
-        warn "  per-agent virtual keys will not work; deployer will use the shared master key"
-        return 0
-    fi
-
-    if ! command -v psql >/dev/null 2>&1; then
-        log "installing postgresql for LiteLLM virtual keys"
-        if command -v apt-get >/dev/null 2>&1; then
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql \
-                || { warn "apt install postgresql failed — skipping virtual key setup"; return 0; }
-        elif command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y -q postgresql postgresql-server \
-                || { warn "dnf install postgresql failed — skipping virtual key setup"; return 0; }
-            # Fedora/RHEL ship Postgres uninitialised — set up the data
-            # cluster before systemd can start it.
-            if [[ ! -d /var/lib/pgsql/data/base ]]; then
-                sudo postgresql-setup --initdb >/dev/null 2>&1 || true
-            fi
-        elif command -v pacman >/dev/null 2>&1; then
-            sudo pacman -S --noconfirm postgresql \
-                || { warn "pacman -S postgresql failed — skipping virtual key setup"; return 0; }
-            # Arch ships postgresql binaries without an initialised data
-            # directory; systemd refuses to start until initdb has run.
-            if [[ ! -d /var/lib/postgres/data/base ]]; then
-                sudo mkdir -p /var/lib/postgres/data
-                sudo chown postgres:postgres /var/lib/postgres/data
-                sudo -u postgres initdb --locale=C.UTF-8 --encoding=UTF8 \
-                    -D /var/lib/postgres/data >/dev/null 2>&1 || true
-            fi
-        else
-            warn "litellm postgres: unrecognised package manager — install postgresql manually then re-run"
-            return 0
-        fi
-    fi
-
-    if command -v systemctl >/dev/null 2>&1; then
-        sudo systemctl enable --now postgresql >/dev/null 2>&1 \
-            || { warn "litellm postgres: could not start postgresql service — skipping"; return 0; }
-    fi
-
-    # Wait for Postgres to accept connections (cold start can take a few seconds).
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        sudo -u postgres psql -tAc 'SELECT 1' >/dev/null 2>&1 && break
-        sleep 1
-    done
-
-    local pw
-    pw=$(openssl rand -hex 24 2>/dev/null || head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)
-    if [[ -z "$pw" ]]; then
-        warn "litellm postgres: could not generate password — skipping"
-        return 0
-    fi
-
-    # Pipe the password via stdin instead of -c "...PASSWORD '...'" so it
-    # never appears in /proc/<pid>/cmdline. Quoting nuance: psql's :'var'
-    # interpolation produces a properly-escaped SQL string literal.
-    local role_sql
-    if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='litellm'" 2>/dev/null | grep -q 1; then
-        role_sql="CREATE ROLE litellm WITH LOGIN PASSWORD :'pw';"
-    else
-        role_sql="ALTER ROLE litellm WITH LOGIN PASSWORD :'pw';"
-    fi
-    if ! printf '%s\n' "$role_sql" \
-            | sudo -u postgres psql -v ON_ERROR_STOP=1 -v "pw=${pw}" >/dev/null 2>&1; then
-        warn "litellm postgres: role create/alter failed — skipping"
-        return 0
-    fi
-
-    if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='litellm'" 2>/dev/null | grep -q 1; then
-        printf 'CREATE DATABASE litellm OWNER litellm;\n' \
-            | sudo -u postgres psql -v ON_ERROR_STOP=1 >/dev/null 2>&1 \
-            || { warn "litellm postgres: CREATE DATABASE failed — skipping"; return 0; }
-    fi
-
-    # Subshell scopes umask so we don't leak 077 into the rest of the
-    # install script (the SPA build below relies on the calling shell's
-    # default umask for npm-managed files). chmod is belt-and-braces.
-    ( umask 077 && \
-        printf 'postgresql://litellm:%s@127.0.0.1:5432/litellm\n' "$pw" > data/.litellm_db_url )
-    chmod 600 data/.litellm_db_url
-    log "litellm postgres: data/.litellm_db_url written — virtual keys enabled"
-}
-
-# Postgres backs LiteLLM virtual keys; without it the controller still runs and
-# falls back gracefully. Never let DB setup abort the core install (e.g. WSL
-# without systemd, where the postgres daemon cannot start).
-ensure_litellm_postgres || warn "litellm postgres setup did not complete -- virtual keys disabled, controller still runs; continuing"
 
 # --- desktop SPA bundle --------------------------------------------------
 # The bundle is not committed to git (static/desktop/ is gitignored), so it has
