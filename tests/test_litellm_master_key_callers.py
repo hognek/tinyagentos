@@ -1,11 +1,10 @@
-"""LiteLLM removal stage 2a (tsk-ilqzq6): nothing hands out or presents the
-LiteLLM master key any more.
+"""LiteLLM removal stages 2a/2b-2a: nothing hands out or presents the old
+LiteLLM master key.
 
-Each test measures BEHAVIOUR: which key a deployed agent gets, which key the
-taOS agent's opencode gets, whether a screen still answers with LiteLLM
-stopped, whether any request reaches LiteLLM with the master key. LiteLLM's
-own spawn (config ``master_key`` + ``LITELLM_MASTER_KEY`` env) is the only
-reader left, and stage 2b deletes it.
+Since 2b-2a nothing generates or reads the master key at all; old installs
+still have ``.litellm_master_key`` on disk, so each test plants one and
+measures BEHAVIOUR: which key a deployed agent gets, which key the taOS
+agent's opencode gets, whether a screen answers with no LiteLLM process.
 """
 from __future__ import annotations
 
@@ -18,14 +17,17 @@ import httpx
 import pytest
 import respx
 
-from tinyagentos.litellm_config import get_litellm_master_key
 from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
 
 LITELLM_PORT = 4000
 
 
 def _master(data_dir: Path) -> str:
-    return get_litellm_master_key(data_dir)
+    """A stale on-disk LiteLLM master key, as an old install still has."""
+    path = Path(data_dir) / ".litellm_master_key"
+    if not path.exists():
+        path.write_text("sk-taos-stale-litellm-master-key-0123456789")
+    return path.read_text().strip()
 
 
 # ---------------------------------------------------------------------------
@@ -36,16 +38,12 @@ def _master(data_dir: Path) -> str:
 async def _deploy(tmp_path, *, extra=None, remote=False, create_key=None):
     from tinyagentos.deployer import DeployRequest, deploy_agent
 
-    proxy = MagicMock()
-    proxy.is_running.return_value = True
+    proxy = MagicMock(spec=["port", "create_agent_key"])
     proxy.port = LITELLM_PORT
-    proxy.url = f"http://localhost:{LITELLM_PORT}"
-    proxy.database_url = None  # routing-only: LiteLLM cannot mint
-    proxy._data_dir = tmp_path
     proxy.create_agent_key = create_key or AsyncMock(return_value=None)
     req = DeployRequest(name="fresh", framework="smolagents", model="gpt-a", data_dir=tmp_path,
                         remote=("worker1" if remote else None), taos_host="controller.test",
-                        extra_config={"llm_proxy": proxy, **(extra or {})})
+                        extra_config={"llm_proxy": proxy, "llm_gateway_port": 7838, **(extra or {})})
 
     async def mock_exec(name, cmd, **kwargs):
         return (0, "10.0.0.5") if "hostname -I" in " ".join(cmd) else (0, "ok")
@@ -65,9 +63,9 @@ async def _deploy(tmp_path, *, extra=None, remote=False, create_key=None):
 @pytest.mark.parametrize("fallback_env", [None, "1"], ids=["fallback-env-unset", "fallback-env-set"])
 async def test_deploy_without_a_scoped_key_mints_a_local_key_never_the_master_key(
         tmp_path, monkeypatch, fallback_env):
-    """LiteLLM could not mint (routing-only) and no gateway port was passed:
-    the agent still gets a key scoped to its models, which the gateway
-    accepts. TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK no longer changes anything."""
+    """The key service could not mint: the agent still gets a key scoped to
+    its models straight from the local store, which the gateway accepts.
+    TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK no longer changes anything."""
     from tinyagentos.llm_gateway.auth import gateway_caller
 
     if fallback_env is None:
@@ -93,22 +91,22 @@ async def test_deploy_is_refused_when_no_scoped_key_can_be_minted_at_all(tmp_pat
     with patch("tinyagentos.deployer._mint_local_scoped_key", return_value=None):
         result, env = await _deploy(tmp_path)
     assert result["success"] is False
-    assert "master key" in result["error"]
+    assert "could not be minted" in result["error"]
     assert master not in env.values()
 
 
 @pytest.mark.asyncio
-async def test_remote_agent_is_named_as_having_no_gateway_path(tmp_path, caplog):
+async def test_remote_agent_deploy_is_refused_by_name(tmp_path, caplog):
     """The agent listener is loopback-only: a remote agent has no gateway
-    path. The deploy says so by name instead of silently depending on LiteLLM."""
-    async def mint(name, models=None):
-        return LiteLLMKeyStore(default_keystore_path(tmp_path)).mint(name, models or ["default"])
-
-    with caplog.at_level(logging.WARNING, logger="tinyagentos.deployer"):
-        result, env = await _deploy(tmp_path, remote=True, create_key=AsyncMock(side_effect=mint))
-    assert result["success"] is True, result
-    assert any("llm_gateway_no_remote_path" in r.getMessage() for r in caplog.records)
-    assert any("no LLM gateway path" in s for s in result["steps"])
+    path, and with LiteLLM gone no path at all. The deploy is refused by name
+    (decision dec-26f4cw) and no key is minted for it."""
+    create_key = AsyncMock(return_value="sk-should-not-be-minted")
+    with caplog.at_level(logging.ERROR, logger="tinyagentos.deployer"):
+        result, env = await _deploy(tmp_path, remote=True, create_key=create_key)
+    assert result["success"] is False
+    assert "remote agents need the network LLM gateway, not built yet" in result["error"]
+    create_key.assert_not_awaited()
+    assert env == {}
 
 
 @pytest.mark.asyncio
@@ -117,18 +115,17 @@ async def test_cutover_names_the_remote_agent_as_having_no_gateway_path(tmp_path
 
     report = await cutover.reconcile_agents(
         agents=[{"name": "far", "remote": True, "llm_key": "sk-x"}], data_dir=tmp_path,
-        gateway_on=True, gateway_port=7838, litellm_port=LITELLM_PORT, listener_ready=True,
+        gateway_port=7838, legacy_ports=[LITELLM_PORT], listener_ready=True,
         models_problem=AsyncMock(return_value=None),
     )
     assert report["skipped"][0]["agent"] == "far"
-    assert "no LLM gateway path" in report["skipped"][0]["reason"]
+    assert "remote agents need the network LLM gateway" in report["skipped"][0]["reason"]
 
 
 @pytest.mark.asyncio
-async def test_embedding_alias_in_an_allowlist_does_not_bounce_the_agent_back_to_litellm(tmp_path):
+async def test_embedding_alias_in_an_allowlist_is_not_a_route_problem(tmp_path):
     """models_problem reads chat routes only; the embedding alias is served by
-    the gateway's /embeddings, so it must not count as unroutable (that would
-    move the agent back to LiteLLM on every restart)."""
+    the gateway's /embeddings, so it must not count as unroutable."""
     from tinyagentos.litellm_config import EMBEDDING_ALIAS
     from tinyagentos.llm_gateway.cutover import models_problem
 
@@ -166,9 +163,8 @@ async def test_taos_agent_falls_back_to_a_scoped_key_not_the_master_key(tmp_path
             return True
 
     monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
-    proxy = MagicMock()
+    proxy = MagicMock(spec=["port", "create_agent_key", "update_agent_key"])
     proxy.create_agent_key = AsyncMock(return_value=None)
-    proxy.is_running.return_value = False  # LiteLLM stopped
     proxy.port = LITELLM_PORT
     state = SimpleNamespace(data_dir=tmp_path, llm_proxy=proxy, taos_opencode_password=None,
                             taos_opencode_server=None, taos_opencode_model=None,
@@ -186,18 +182,14 @@ async def test_taos_agent_falls_back_to_a_scoped_key_not_the_master_key(tmp_path
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("litellm_running", [True, False], ids=["litellm-up", "litellm-stopped"])
-async def test_provider_model_catalog_is_read_without_litellm(client, app, litellm_running):
+async def test_provider_model_catalog_is_read_without_litellm(client, app):
     app.state.config.backends = [
         {"name": "local-llama", "type": "openai-compatible", "url": "http://llm.test:8080/v1",
          "models": [{"id": "qwen3-8b"}, {"id": "gpt-small"}], "priority": 1},
     ]
-    proxy = MagicMock()
-    proxy.is_running.return_value = litellm_running
-    proxy.url = f"http://127.0.0.1:{LITELLM_PORT}"
-    proxy.port = LITELLM_PORT
-    proxy._data_dir = app.state.data_dir
-    app.state.llm_proxy = proxy
+    from tinyagentos.llm_proxy import LLMProxy
+
+    app.state.llm_proxy = LLMProxy(port=LITELLM_PORT, data_dir=app.state.data_dir)
     app.state.litellm_models_cache = None
     with respx.mock(assert_all_called=False) as router, \
          patch("tinyagentos.routes.providers._refresh_all_cloud_backends", new=AsyncMock(return_value=0)):
@@ -218,14 +210,12 @@ async def test_provider_model_catalog_is_read_without_litellm(client, app, litel
 
 @pytest.mark.asyncio
 async def test_proxy_key_admin_uses_the_local_store_not_litellm(tmp_path, monkeypatch):
-    """Even on a Postgres-configured proxy (inhouse_keys off) mint, re-scope,
-    usage and delete never call LiteLLM's /key/* admin API with the master key."""
+    """Mint, re-scope, usage and delete never call LiteLLM's /key/* admin API
+    (with the master key or at all); they are local key-store operations."""
     from tinyagentos.agent_budget_store import AgentBudgetStore, default_budget_path
     from tinyagentos.llm_proxy import EMBEDDING_ALIAS, LLMProxy
 
-    proxy = LLMProxy(port=LITELLM_PORT, data_dir=tmp_path, database_url="postgresql://u:p@db/x",
-                     inhouse_keys=False)
-    monkeypatch.setattr(proxy, "is_running", lambda: True)
+    proxy = LLMProxy(port=LITELLM_PORT, data_dir=tmp_path)
     store = LiteLLMKeyStore(default_keystore_path(tmp_path))
     with respx.mock(assert_all_called=False) as router:
         litellm = router.route(host="localhost", port=LITELLM_PORT).mock(
@@ -248,38 +238,10 @@ async def test_proxy_key_admin_uses_the_local_store_not_litellm(tmp_path, monkey
 async def test_key_usage_screen_answers_with_litellm_stopped(tmp_path, monkeypatch):
     from tinyagentos.llm_proxy import EMBEDDING_ALIAS, LLMProxy
 
-    proxy = LLMProxy(port=LITELLM_PORT, data_dir=tmp_path, inhouse_keys=True)
-    assert proxy.is_running() is False
+    proxy = LLMProxy(port=LITELLM_PORT, data_dir=tmp_path)
     key = await proxy.create_agent_key("agent-a", models=["gpt-a"])
     usage = await proxy.get_key_usage(key)
     assert usage is not None and usage["info"]["models"] == ["gpt-a", EMBEDDING_ALIAS]
-
-
-# ---------------------------------------------------------------------------
-# litellm_auth.py: the master key is no longer an admin passthrough
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.asyncio
-async def test_litellm_auth_hook_no_longer_admits_the_master_key(tmp_path, monkeypatch):
-    pytest.importorskip("litellm.proxy._types")
-    from fastapi import HTTPException
-
-    import tinyagentos.litellm_auth as auth_mod
-
-    monkeypatch.setattr(auth_mod, "_store", None)
-    monkeypatch.setattr(auth_mod, "_store_path", None)
-    monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-taos-master-123")
-    monkeypatch.setenv("TAOS_LITELLM_KEYSTORE", str(tmp_path / "keys.db"))
-    monkeypatch.delenv("TAOS_AGENT_BUDGETS", raising=False)
-
-    class _Req:
-        async def json(self):
-            return {"model": "gpt-a"}
-
-    with pytest.raises(HTTPException) as exc:
-        await auth_mod.user_api_key_auth(_Req(), "sk-taos-master-123")
-    assert exc.value.status_code == 401
 
 
 # ---------------------------------------------------------------------------
@@ -288,23 +250,21 @@ async def test_litellm_auth_hook_no_longer_admits_the_master_key(tmp_path, monke
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("flag", [None, "0"], ids=["gateway-on", "gateway-off"])
+@pytest.mark.parametrize("flag", [None, "0"], ids=["flag-unset", "old-off-flag"])
 async def test_reasoning_judge_never_carries_the_master_key(tmp_data_dir, monkeypatch, flag):
+    """The judge always exists now (the gateway is always on) and always uses
+    the host local token, whatever the old off flag says."""
     from tinyagentos.app import create_app
-    from tinyagentos.llm_proxy import LLMProxy
 
     if flag is None:
         monkeypatch.delenv("TAOS_LLM_GATEWAY", raising=False)
     else:
         monkeypatch.setenv("TAOS_LLM_GATEWAY", flag)
-    monkeypatch.setattr(LLMProxy, "start", AsyncMock(return_value=False))
-    app = create_app(data_dir=tmp_data_dir)
     master = _master(tmp_data_dir)
+    app = create_app(data_dir=tmp_data_dir)
     async with app.router.lifespan_context(app):
         judge = getattr(app.state.trace_registry, "_judge", None)
-        if judge is not None:
-            assert judge._api_key != master
-            assert judge._api_key == app.state.auth.get_local_token()
-            assert judge._base_url.endswith("/api/llm/v1")
-        else:
-            assert flag == "0"
+        assert judge is not None
+        assert judge._api_key != master
+        assert judge._api_key == app.state.auth.get_local_token()
+        assert judge._base_url.endswith("/api/llm/v1")

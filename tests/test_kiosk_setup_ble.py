@@ -100,7 +100,7 @@ def _run_ble_block(tmp_path, venv_owner=None, taos_user=None):
 
 
 def test_kiosk_ble_block_default_path(tmp_path):
-    """Default path: TAOS_EXTRAS_BLE unset, venv pip present -> exit 0, pip called with [proxy,ble]."""
+    """Default path: TAOS_EXTRAS_BLE unset, venv pip present -> exit 0, pip called with [ble]."""
     result = _run_ble_block(tmp_path, taos_user="currentuser")
     assert result.returncode == 0, f"stderr: {result.stderr}"
 
@@ -110,7 +110,7 @@ def test_kiosk_ble_block_default_path(tmp_path):
     assert "install" in args
     assert "--quiet" in args
     assert "-e" in args
-    assert any("[proxy,ble]" in arg for arg in args)
+    assert any("[ble]" in arg for arg in args)
 
 
 def test_kiosk_ble_block_sudo_when_venv_owner_differs(tmp_path):
@@ -123,4 +123,4 @@ def test_kiosk_ble_block_sudo_when_venv_owner_differs(tmp_path):
     sudo_args = sudo_args_file.read_text().strip().split("\n")
     assert sudo_args[0] == "-u"
     assert sudo_args[1] == "venvuser"
-    assert any("[proxy,ble]" in arg for arg in sudo_args)
+    assert any("[ble]" in arg for arg in sudo_args)

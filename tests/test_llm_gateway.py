@@ -874,9 +874,8 @@ async def test_models_listing_follows_config_changes_per_request(client):
 
 
 @_ASYNC
-async def test_gateway_reads_the_same_table_as_the_litellm_config(client, monkeypatch):
-    """One source: the gateway's routing table IS build_model_list's output,
-    the same function generate_litellm_config wraps."""
+async def test_gateway_reads_the_one_model_table(client, monkeypatch):
+    """One source: the gateway's routing table IS build_model_list's output."""
     import tinyagentos.litellm_config as lc
 
     calls = []
@@ -893,11 +892,10 @@ async def test_gateway_reads_the_same_table_as_the_litellm_config(client, monkey
 
     from tinyagentos.llm_gateway.resolve import routing_table
     table = routing_table(_app(client).state)
-    config = lc.generate_litellm_config(
-        _app(client).state.config.backends, master_key="k",
+    assert table == real(
+        _app(client).state.config.backends,
         discovered={b["url"]: [] for b in _app(client).state.config.backends},
     )
-    assert table == config["model_list"]
 
 
 # ---------------------------------------------------------------------------

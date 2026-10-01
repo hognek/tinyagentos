@@ -55,19 +55,19 @@ def _run_helper(tmp_path, taos_extras_ble=None, handset=True):
 
 
 def test_installer_extras_selection_handset(tmp_path):
-    assert _run_helper(tmp_path, taos_extras_ble=None, handset=True) == "proxy,ble"
+    assert _run_helper(tmp_path, taos_extras_ble=None, handset=True) == "ble"
 
 
 def test_installer_extras_selection_non_handset(tmp_path):
-    assert _run_helper(tmp_path, taos_extras_ble=None, handset=False) == "proxy"
+    assert _run_helper(tmp_path, taos_extras_ble=None, handset=False) == ""
 
 
 def test_installer_extras_selection_force_include_on_non_handset(tmp_path):
-    assert _run_helper(tmp_path, taos_extras_ble="1", handset=False) == "proxy,ble"
+    assert _run_helper(tmp_path, taos_extras_ble="1", handset=False) == "ble"
 
 
 def test_installer_extras_selection_force_exclude_on_handset(tmp_path):
-    assert _run_helper(tmp_path, taos_extras_ble="0", handset=True) == "proxy"
+    assert _run_helper(tmp_path, taos_extras_ble="0", handset=True) == ""
 
 
 def test_install_server_inline_matches_lib():
