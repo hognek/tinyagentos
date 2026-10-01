@@ -1104,24 +1104,51 @@ class TestRevoke:
         assert updated["status"] == "revoked"
 
     @pytest.mark.asyncio
-    async def test_revoke_nonexistent_returns_none(self, store):
-        result = await store.revoke("no-such-20260101-000000")
-        assert result is None
+    async def test_revoke_nonexistent_raises_key_error(self, store):
+        with pytest.raises(KeyError):
+            await store.revoke("no-such-20260101-000000")
 
     @pytest.mark.asyncio
-    async def test_revoke_idempotent(self, store):
+    async def test_revoke_idempotent_raises_on_second_call(self, store):
         row = await store.register(framework="openclaw", display_name="Idem")
         first = await store.revoke(row["canonical_id"])
-        second = await store.revoke(row["canonical_id"])
-        assert first["revoked_at"] == second["revoked_at"]
+        assert first["revoked_at"] is not None
         assert first["status"] == "revoked"
-        assert second["status"] == "revoked"
+        with pytest.raises(ValueError, match="invalid lifecycle transition"):
+            await store.revoke(row["canonical_id"])
 
     @pytest.mark.asyncio
     async def test_not_initialized_raises(self, tmp_path):
         s = AgentRegistryStore(tmp_path / "not_init.db")
         with pytest.raises(RuntimeError, match="not initialised"):
             await s.revoke("anything")
+
+    @pytest.mark.asyncio
+    async def test_revoke_from_illegal_state_raises_value_error(self, store):
+        """RED-FIRST: revoke from an already-revoked (terminal) state must raise
+        the same ValueError every other illegal transition raises, not silently
+        return the record."""
+        row = await store.register(framework="openclaw", display_name="Terminal")
+        await store.set_status(row["canonical_id"], "revoked")
+        with pytest.raises(ValueError, match="invalid lifecycle transition"):
+            await store.revoke(row["canonical_id"])
+
+
+# --------------------------------------------------------------------------
+# AgentRegistryStore: update handle collision
+# --------------------------------------------------------------------------
+
+
+class TestUpdateHandleCollision:
+    @pytest.mark.asyncio
+    async def test_update_handle_collision_raises_value_error(self, store):
+        """RED-FIRST: updating a handle to one another active agent owns must
+        raise ValueError mentioning the handle, not leak a raw sqlite
+        IntegrityError."""
+        a1 = await store.register(framework="openclaw", display_name="A1", handle="@alpha")
+        await store.register(framework="openclaw", display_name="A2", handle="@beta")
+        with pytest.raises(ValueError, match="already owned"):
+            await store.update(a1["canonical_id"], handle="@beta")
 
 
 # ---------------------------------------------------------------------------
@@ -1693,6 +1720,31 @@ class TestBumpTokenMinIat:
         are valid (migration-safe default)."""
         row = await store.register(framework="test", display_name="test-agent")
         assert row["token_min_iat"] == 0
+
+    @pytest.mark.asyncio
+    async def test_bump_advances_strictly_even_for_a_stale_ts(self, store):
+        """Successive bumps never share a cutoff, whatever ``ts`` is passed.
+
+        The update is a single ``MAX(token_min_iat + 1, ?)``: two rotations that
+        read the same stored cutoff and both computed a target from it (or a
+        caller passing a stale/smaller ts) must still land on DIFFERENT values.
+        A shared cutoff is the dangerous case -- a rotation's replacement would
+        be born already superseded (``iat == token_min_iat`` is accepted, so the
+        previous token survives too).
+        """
+        row = await store.register(framework="test", display_name="test-agent")
+        cid = row["canonical_id"]
+
+        first = await store.bump_token_min_iat(cid, 1000)
+        assert first["token_min_iat"] == 1000
+
+        # A smaller/stale ts still advances by one rather than rewriting 1000.
+        second = await store.bump_token_min_iat(cid, 500)
+        assert second["token_min_iat"] == 1001
+
+        # And a ts equal to the stored value advances too.
+        third = await store.bump_token_min_iat(cid, 1001)
+        assert third["token_min_iat"] == 1002
 
     @pytest.mark.asyncio
     async def test_bump_nonexistent_returns_none(self, store):

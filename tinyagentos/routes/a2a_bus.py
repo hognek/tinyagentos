@@ -67,6 +67,64 @@ def _bus_url() -> str:
     return os.environ.get("TAOS_A2A_BUS_URL", _DEFAULT_BUS_URL).rstrip("/")
 
 
+def _is_url_safe_for_credential(url: str, *, allow_private: bool = False) -> bool:
+    """Return True when *url* is safe to carry a credential.
+
+    Safe = https anywhere, or http on a loopback or (when *allow_private*
+    is True) private / tailnet address. Public http endpoints must never
+    carry a credential in cleartext.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme == "https":
+        return True
+    if parsed.scheme != "http":
+        return False
+    hostname = (parsed.hostname or "").lower()
+    if not hostname:
+        return False
+    if hostname == "localhost":
+        return True
+    try:
+        addr = ipaddress.ip_address(hostname)
+    except ValueError:
+        # Not an IP address — could be a hostname. When allow_private=True,
+        # trust bare hostnames that look like LAN / tailnet names:
+        #   - ends with .local, .lan, .home.arpa, .ts.net
+        #   - single-label (no dot at all)
+        if allow_private:
+            if hostname.endswith((".local", ".lan", ".home.arpa", ".ts.net")):
+                return True
+            if "." not in hostname:
+                return True
+        return False
+    if addr.is_loopback:
+        return True
+    if allow_private:
+        if addr.is_private:
+            if addr.version == 6:
+                # Exclude documentation range 2001:db8::/32 (RFC 3849) from
+                # the generic is_private bucket: those addresses are not
+                # routable on any real network and must not be advertised in
+                # credential-bearing bundles.
+                doc_net = ipaddress.ip_network("2001:db8::/32")
+                if addr in doc_net:
+                    return False
+            return True
+        # Tailscale CGNAT range 100.64.0.0/10 is not flagged as private by
+        # Python's ipaddress, but is a tailnet address and should be trusted.
+        if addr.version == 4:
+            tailscale_net = ipaddress.ip_network("100.64.0.0/10")
+            if addr in tailscale_net:
+                return True
+        # Tailscale ULA fd7a:115c:a1e0::/48 is already is_private (ULA), but
+        # keep the explicit check for clarity / future-proofing.
+        if addr.version == 6:
+            tailscale_ula = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+            if addr in tailscale_ula:
+                return True
+    return False
+
+
 def _credential_may_cross(bus_url: str) -> bool:
     """Return True when the caller's registry credential may be forwarded to *bus_url*.
 
@@ -87,22 +145,19 @@ def _credential_may_cross(bus_url: str) -> bool:
     The host check uses parsed address resolution, not substring matching:
     ``http://127.0.0.1.evil.test:7900`` does NOT count as loopback.
     """
-    parsed = urlparse(bus_url)
-    if parsed.scheme != "http":
+    if _is_url_safe_for_credential(bus_url, allow_private=False):
         return True
-    hostname = (parsed.hostname or "").lower()
-    if not hostname:
-        return False
-    if hostname == "localhost":
-        return True
-    try:
-        addr = ipaddress.ip_address(hostname)
-    except ValueError:
-        pass
-    else:
-        if addr.is_loopback:
-            return True
     return bool(os.environ.get("TAOS_A2A_BUS_ALLOW_INSECURE_CREDENTIAL"))
+
+
+def _sanitise_handle(handle: str) -> str:
+    """Strip non-printable characters and cap at 64 characters.
+
+    Shared by the admin and human branches of ``_resolve_send_identity`` so
+    the two paths cannot drift apart: a handle carrying a newline or control
+    character cannot inject into bus records or log lines.
+    """
+    return "".join(c for c in handle if c.isprintable())[:64].strip()
 
 
 async def _authorize_bus_read(request: Request) -> None:
@@ -390,26 +445,35 @@ async def bus_stream(
                     f"{bus}/a2a/stream",
                     params=params,
                 ) as upstream:
+                    it = upstream.aiter_lines().__aiter__()
                     heartbeat = asyncio.create_task(
                         _stream_sleep(_STREAM_HEARTBEAT_SEC)
                     )
+                    next_line = asyncio.ensure_future(it.__anext__())
                     try:
-                        async for line in upstream.aiter_lines():
-                            if await request.is_disconnected():
-                                break
-                            # Drain any pending heartbeat that fired while we were
-                            # forwarding real data: emit it before the next event.
-                            if heartbeat.done():
-                                heartbeat.cancel()
+                        while True:
+                            done, pending = await asyncio.wait(
+                                {next_line, heartbeat},
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            if heartbeat in done:
                                 yield ": ping\n\n"
                                 heartbeat = asyncio.create_task(
                                     _stream_sleep(_STREAM_HEARTBEAT_SEC)
                                 )
-                            if line == "":
-                                continue
-                            yield f"{line}\n\n"
+                            if next_line in done:
+                                try:
+                                    line = next_line.result()
+                                except StopAsyncIteration:
+                                    break
+                                if line != "":
+                                    yield f"{line}\n\n"
+                                next_line = asyncio.ensure_future(it.__anext__())
+                            if await request.is_disconnected():
+                                break
                     finally:
                         heartbeat.cancel()
+                        next_line.cancel()
         except Exception as exc:  # noqa: BLE001 (surface a final SSE comment)
             logger.warning("A2A bus stream proxy failed (%s): %s", bus, exc)
             yield f": stream error\n\n"
@@ -497,8 +561,7 @@ async def _resolve_send_identity(
       rejected here as 403 (fail closed).
     """
     if getattr(request.state, "is_admin", False):
-        handle = (body_from or "").strip()
-        handle = "".join(c for c in handle if c.isprintable())[:64].strip()
+        handle = _sanitise_handle(body_from or "")
         return _BusIdentity(handle or "@operator")
 
     caller = await check_agent_scope(request, "a2a_send")
@@ -533,7 +596,8 @@ async def _resolve_send_identity(
         # principal-spelling policy for humans is not settled yet (taosmd
         # a2a-bus-auth-transition, open question 1). Forwarding it today would
         # present a credential whose sub cannot match the from it accompanies.
-        return _BusIdentity(f"@{username}")
+        handle = _sanitise_handle(f"@{username}")
+        return _BusIdentity(handle or f"@{human_id}")
 
     raise HTTPException(status_code=403, detail="forbidden")
 
@@ -581,10 +645,12 @@ async def bus_send(request: Request, body: BusSendBody):
         payload["reply_to"] = body.reply_to
 
     headers: dict[str, str] = {}
+    credential_forwarded = False
     if identity.credential:
         bus = _bus_url()
         if _credential_may_cross(bus):
             headers["Authorization"] = f"Bearer {identity.credential}"
+            credential_forwarded = True
         else:
             logger.warning(
                 "A2A bus credential withheld for non-loopback http destination %s",
@@ -603,7 +669,7 @@ async def bus_send(request: Request, body: BusSendBody):
         logger.warning("A2A bus send failed (%s): %s", bus, exc)
         raise HTTPException(status_code=502, detail="a2a bus unavailable")
 
-    return {"ok": True, "from": identity.from_handle, "message": data}
+    return {"ok": True, "from": identity.from_handle, "message": data, "credential_forwarded": credential_forwarded}
 
 
 @router.post("/api/a2a/bus/human-assertion")

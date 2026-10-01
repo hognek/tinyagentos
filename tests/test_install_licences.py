@@ -8,9 +8,7 @@ distribution, not import. The evidence lives in ``uv.lock`` and in
 from __future__ import annotations
 
 import importlib.util
-import re
 import sys
-import tomllib
 from pathlib import Path
 
 import pytest
@@ -42,7 +40,7 @@ def _install_set() -> dict[str, str]:
 
 @pytest.mark.parametrize("forbidden,reason", sorted(FORBIDDEN.items()))
 def test_server_install_set_excludes_forbidden_package(forbidden, reason):
-    """`pip install -e .[proxy]` must not land a non-redistributable package."""
+    """`pip install -e .` must not land a non-redistributable package."""
     resolved = {check_install_licences.canonical(n): v for n, v in _install_set().items()}
     assert forbidden not in resolved, (
         f"{forbidden} {resolved.get(forbidden)} is in the server install set: {reason}"
@@ -61,51 +59,6 @@ def test_installer_installs_nothing_pyproject_does_not_declare():
         "install-server.sh pip-installs packages absent from pyproject.toml: "
         f"{undeclared}"
     )
-
-
-def test_proxy_extra_pins_litellm_to_the_minor_it_mirrors():
-    """The inlined proxy subset mirrors one litellm minor, so cap litellm to it.
-
-    ``pip install -e .[proxy]`` resolves fresh — it does not read uv.lock — so an
-    uncapped ``litellm>=…`` lets the installer pull a newer minor whose proxy
-    extra has grown requirements this list does not carry. That is not
-    hypothetical: litellm 1.99.0 added ``hiredis`` and made ``expression`` an
-    eager import, and a venv built from the 1.94 subset dies at startup with
-    ``ModuleNotFoundError: No module named 'expression'``.
-    """
-    with open(REPO_ROOT / "pyproject.toml", "rb") as fh:
-        doc = tomllib.load(fh)
-    proxy = doc["project"]["optional-dependencies"]["proxy"]
-    litellm_req = next(
-        (r for r in proxy if check_install_licences.canonical(re.split(r"[<>=!~\[;\s]", r.strip(), maxsplit=1)[0]) == "litellm"),
-        None,
-    )
-    assert litellm_req is not None, "the proxy extra must depend on litellm"
-    assert "<" in litellm_req, (
-        "litellm must carry an upper bound so the installer's fresh pip resolve "
-        f"cannot outrun the inlined proxy subset (got {litellm_req!r})"
-    )
-    assert "[proxy]" not in litellm_req, (
-        "litellm[proxy] pulls litellm-enterprise; the subset is inlined below it "
-        f"instead (got {litellm_req!r})"
-    )
-    assert check_install_licences.litellm_cap_pins_mirrored_minor(litellm_req), (
-        "litellm's specifier must pin exactly the mirrored minor (>=1.94.2,<1.95), "
-        f"not merely carry *some* upper bound (got {litellm_req!r})"
-    )
-
-
-def test_litellm_cap_helper_rejects_a_ceiling_wider_than_the_mirrored_minor():
-    """A loose ceiling like ``<2`` must not satisfy the cap check.
-
-    ``"<" in litellm_req`` (the original assertion) is true for ``litellm>=1.94.2,<2``
-    just as it is for the correct ``litellm>=1.94.2,<1.95`` — it cannot tell a real
-    cap from a decoy one, so a fresh pip resolve could still outrun the inlined
-    proxy subset while this test stayed green.
-    """
-    assert not check_install_licences.litellm_cap_pins_mirrored_minor(
-        "litellm>=1.94.2,<2"
-    ), "a <2 ceiling is far wider than the <1.95 the inlined subset mirrors"
 
 
 def test_unreadable_licence_is_its_own_failing_finding():

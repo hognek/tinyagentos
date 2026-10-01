@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import html
+import ipaddress
 import json
 import logging
+import os
 import socket
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -22,6 +25,7 @@ from tinyagentos.projects.invite_store import (
 )
 from tinyagentos.rate_limit import rate_limited_response
 from tinyagentos.routes.agent_auth_requests import VALID_SCOPES
+from tinyagentos.routes.a2a_bus import _is_url_safe_for_credential
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -85,7 +89,7 @@ class RedeemInviteIn(BaseModel):
 # (project-less) invite has no project to bind them to, so they are stripped
 # before minting rather than granted verbatim: an OS invite must never hand out
 # project-scoped authority that resolves to no project.
-_PROJECT_SCOPED = {"project_tasks", "project_tasks_create", "project_tasks_update", "canvas_read", "canvas_write"}
+_PROJECT_SCOPED = {"project_tasks", "project_tasks_create", "project_tasks_update", "canvas_read", "canvas_write", "notifications_write"}
 
 
 def _derive_handle(project_slug: str, harness: str, label: str | None) -> str:
@@ -242,12 +246,29 @@ def _enumerate_lan_ips() -> list[str]:
 
 async def _build_controller_dict(request: Request) -> dict:
     """Enumerate the controller's reachable endpoints (operator override, LAN,
-    mesh; no relay in Phase 1) and wrap them in the controller descriptor shared
+    mesh, and optional relay) and wrap them in the controller descriptor shared
     by the project and OS-level bundles."""
     endpoints: list[dict] = []
     priority = 1
 
-    # Operator override (TAOS_CONTROLLER_CALLBACK_HOST) becomes priority 1.
+    # Relay endpoint (TAOS_CONTROLLER_RELAY_URL) becomes priority 1 when present.
+    # Relay MUST be HTTPS — http relays are not safe for credential-bearing bundles.
+    relay_url = os.environ.get("TAOS_CONTROLLER_RELAY_URL", "").strip()
+    if relay_url:
+        if _is_url_safe_for_credential(relay_url, allow_private=False):
+            endpoints.append(
+                {"kind": "relay", "url": relay_url, "priority": priority}
+            )
+            priority += 1
+        else:
+            logger.warning(
+                "TAOS_CONTROLLER_RELAY_URL omitted: %s is not safe for "
+                "credential-bearing bundles (must be https)",
+                relay_url,
+            )
+
+    # Operator override (TAOS_CONTROLLER_CALLBACK_HOST) becomes priority 1
+    # when present and safe.
     override = None
     try:
         from tinyagentos.routes.agent_deploy import controller_callback_host
@@ -256,14 +277,51 @@ async def _build_controller_dict(request: Request) -> dict:
     except Exception:  # noqa: BLE001
         override = None
     if override:
-        endpoints.append(
-            {"kind": "lan", "url": f"http://{override}:{_CONTROLLER_PORT}", "priority": priority}
-        )
-        priority += 1
+        # Detect bare IPv6 early: bracket it so urlparse sees the real address
+        # in the safety check and the advertised URL.
+        _override_for_check = override
+        try:
+            _addr = ipaddress.ip_address(override)
+            if _addr.version == 6:
+                _override_for_check = f"[{override}]"
+        except ValueError:
+            pass
+
+        if "://" in override:
+            # Full URL supplied by the operator: use scheme + host as-is.
+            if _is_url_safe_for_credential(override, allow_private=True):
+                endpoints.append(
+                    {"kind": "lan", "url": override, "priority": priority}
+                )
+                priority += 1
+            else:
+                logger.warning(
+                    "TAOS_CONTROLLER_CALLBACK_HOST omitted: %s is not safe for "
+                    "credential-bearing bundles (use https or a private address)",
+                    override,
+                )
+        elif _is_url_safe_for_credential(f"http://{_override_for_check}", allow_private=True):
+            endpoints.append(
+                {"kind": "lan", "url": f"http://{_override_for_check}:{_CONTROLLER_PORT}", "priority": priority}
+            )
+            priority += 1
+        else:
+            logger.warning(
+                "TAOS_CONTROLLER_CALLBACK_HOST omitted: %s is a public address "
+                "and cannot be advertised over http in a credential-bearing bundle",
+                override,
+            )
+
+    # For LAN deduplication, compare against the override's hostname when it's a full URL.
+    override_host = None
+    if override and "://" in override:
+        override_host = urlparse(override).hostname
 
     for ip in _enumerate_lan_ips():
-        if override and ip == override:
-            continue
+        if override:
+            # Skip if this LAN IP matches the override (either bare hostname/IP or parsed from full URL)
+            if ip == override or (override_host and ip == override_host):
+                continue
         endpoints.append(
             {"kind": "lan", "url": f"http://{ip}:{_CONTROLLER_PORT}", "priority": priority}
         )
@@ -375,8 +433,8 @@ async def build_connection_bundle(
     """Assemble the JSON connection bundle returned by a successful redeem.
 
     The bundle carries NO token or secret (the token arrives via the status
-    poll). It enumerates the controller's reachable endpoints (LAN, mesh; no
-    relay in Phase 1), the agent-JWT-reachable API surface scoped EXACTLY to
+    poll). It enumerates the controller's reachable endpoints (LAN, mesh, and
+    optional relay), the agent-JWT-reachable API surface scoped EXACTLY to
     the granted scopes (mirroring auth_middleware's canvas allowlist), the
     timed-check delivery contract, and an onboarding kit + guide_markdown.
 
@@ -407,6 +465,8 @@ async def build_connection_bundle(
     if has_canvas_read:
         apis["canvas_elements"] = f"/api/projects/{pid}/canvas/elements"
         apis["canvas_snapshot"] = f"/api/projects/{pid}/canvas/snapshot.png"
+        apis["canvas_original"] = f"/api/projects/{pid}/canvas/elements/{{eid}}/original"
+        apis["canvas_legacy"] = f"/api/projects/{pid}/canvas/legacy"
     if has_canvas_write:
         apis["canvas_element"] = f"/api/projects/{pid}/canvas/elements/{{eid}}"
     # Files routes key on the project SLUG (not the id) in the path.

@@ -21,6 +21,17 @@ That is the only channel for driving the user's desktop -- never bypass it.
 This skill consolidates the OS-operation content of the in-repo agent manual
 (`docs/agent-manual/`).
 
+## Which harness runs you
+
+On most hosts you run on opencode. On a taOSmobile handset you may run on
+PicoClaw instead (the config endpoint's `framework` says which). Under
+PicoClaw your tools are `exec`, `read_file`, `write_file`, `edit_file`,
+`append_file`, `list_dir` and `web_fetch`, confined to your workspace, and
+you reach the control API below through `bin/taos METHOD api/PATH [JSON]`
+from `exec` (no leading slash on the path); each reply arrives whole at the
+end of the turn, and image attachments are not supported yet. Your models are whatever the taOS Agent settings permit,
+reached through `taos-default` on the controller's LLM gateway.
+
 ## HARD RULE: Drive the OS only via the control API
 
 Every desktop and window action must go through the control API. There is one channel:
@@ -79,7 +90,7 @@ mDNS).
 | Browser proxy port | 6970 |
 | qmd model service | port 7832 |
 | rkllama (NPU models) | port 7833 on new installs; 8080 on installs from before June 2026 |
-| LiteLLM (model routing) | port 7834 on new installs; 4000 on installs from before June 2026 |
+| LLM gateway (model routing) | in the controller at `/api/llm/v1`; agents reach it at their own `127.0.0.1:4000`, forwarded to the host's 7838 |
 | Agent frameworks | OpenClaw (default), Hermes, SmolAgents, Langroid, PocketFlow, OpenAI Agents SDK |
 | Memory system | taOSmd, long-term memory shared by all agents |
 | Community | github.com/jaylfc/tinyagentos/discussions |
