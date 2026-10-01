@@ -160,7 +160,9 @@ def test_plist_is_written_under_the_fake_home_and_pins_the_model(tmp_path: Path)
     result = _run_wrapper(
         tmp_path,
         _globals(tmp_path, model=str(model))
-        + _functions("write_launchd_plist", "server_binary", "log_dir", "plist_path")
+        + _functions(
+            "write_launchd_plist", "server_binary", "log_dir", "plist_path", "xml_escape"
+        )
         + _stub_host()
         + "write_launchd_plist\n",
     )
@@ -195,7 +197,9 @@ def test_plist_honours_the_configured_port(tmp_path: Path) -> None:
     result = _run_wrapper(
         tmp_path,
         _globals(tmp_path, model=str(model), port=7899)
-        + _functions("write_launchd_plist", "server_binary", "log_dir", "plist_path")
+        + _functions(
+            "write_launchd_plist", "server_binary", "log_dir", "plist_path", "xml_escape"
+        )
         + _stub_host()
         + "write_launchd_plist\n",
     )
@@ -286,11 +290,12 @@ def test_main_reports_no_endpoint_when_the_health_gate_fails(tmp_path: Path) -> 
             "write_launchd_plist",
             "load_launchd_agent",
             "wait_for_mlx_health",
-            "uninstall_mlx_agent",
+            "uninstall_mlx_agent", "xml_escape",
             "require_apple_silicon",
             "require_server_binary",
             "macos_metal_available",
             "usage",
+            "xml_escape",
         )
         + _stub_host()
         + "launchctl() { :; }\n"
@@ -324,11 +329,12 @@ def test_main_prints_the_endpoint_once_the_server_answers(tmp_path: Path) -> Non
             "write_launchd_plist",
             "load_launchd_agent",
             "wait_for_mlx_health",
-            "uninstall_mlx_agent",
+            "uninstall_mlx_agent", "xml_escape",
             "require_apple_silicon",
             "require_server_binary",
             "macos_metal_available",
             "usage",
+            "xml_escape",
         )
         + _stub_host()
         + 'launchctl() { printf "%s\\n" "$*" >> "$HOME/launchctl.log"; }\n'
@@ -456,7 +462,7 @@ def test_uninstall_stops_and_removes_the_agent_for_its_own_model(tmp_path: Path)
     result = _run_wrapper(
         tmp_path,
         _globals(tmp_path, model=str(model))
-        + _functions("uninstall_mlx_agent", "plist_path", "agent_target")
+        + _functions("uninstall_mlx_agent", "xml_escape", "plist_path", "agent_target")
         + 'launchctl() { printf "launchctl %s\\n" "$*" >> "$HOME/launchctl.log"; }\n'
         + 'id() { printf "501\\n"; }\n'
         + "uninstall_mlx_agent\n",
@@ -469,7 +475,8 @@ def test_uninstall_stops_and_removes_the_agent_for_its_own_model(tmp_path: Path)
 
 
 def test_uninstall_leaves_an_agent_pinned_to_another_model(tmp_path: Path) -> None:
-    """Removing model A must not take model B's server down."""
+    """Removing model A must not take model B's server down, and the caller
+    must be able to tell that apart from "unloaded" (exit 3, not 0)."""
     served = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
     served.mkdir(parents=True)
     other = tmp_path / "models" / "mlx" / "qwen3" / "qwen3-4b"
@@ -479,12 +486,12 @@ def test_uninstall_leaves_an_agent_pinned_to_another_model(tmp_path: Path) -> No
     result = _run_wrapper(
         tmp_path,
         _globals(tmp_path, model=str(other))
-        + _functions("uninstall_mlx_agent", "plist_path", "agent_target")
+        + _functions("uninstall_mlx_agent", "xml_escape", "plist_path", "agent_target", "xml_escape")
         + 'launchctl() { printf "launchctl %s\\n" "$*" >> "$HOME/launchctl.log"; }\n'
         + 'id() { printf "501\\n"; }\n'
         + "uninstall_mlx_agent\n",
     )
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 3, result.stdout + result.stderr
     assert plist.exists(), "the agent serving another model was removed"
     assert not (tmp_path / "home" / "launchctl.log").exists(), "launchctl was called anyway"
 
@@ -493,13 +500,74 @@ def test_uninstall_without_an_agent_is_a_no_op(tmp_path: Path) -> None:
     result = _run_wrapper(
         tmp_path,
         _globals(tmp_path, model=str(tmp_path / "model"))
-        + _functions("uninstall_mlx_agent", "plist_path", "agent_target")
+        + _functions("uninstall_mlx_agent", "xml_escape", "plist_path", "agent_target", "xml_escape")
         + 'launchctl() { printf "launchctl %s\\n" "$*" >> "$HOME/launchctl.log"; }\n'
         + 'id() { printf "501\\n"; }\n'
         + "uninstall_mlx_agent\n",
     )
     assert result.returncode == 0, result.stderr
     assert "no com.taos.mlx-server agent installed" in result.stdout
+
+
+# --- XML escaping at the plist boundary --------------------------------------
+
+
+def test_plist_escapes_xml_in_the_paths(tmp_path: Path) -> None:
+    """A model directory is arbitrary user data: "Models & Data" must still
+    produce a plist launchd can parse (CodeRabbit on #3337)."""
+    model = tmp_path / "Models & Data" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model.mkdir(parents=True)
+    _runtime_venv(tmp_path)
+
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(model))
+        + _functions(
+            "write_launchd_plist", "server_binary", "log_dir", "plist_path", "xml_escape"
+        )
+        + _stub_host()
+        + "write_launchd_plist\n",
+    )
+    assert result.returncode == 0, result.stderr
+
+    plist = tmp_path / "home" / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+    body = plist.read_text()
+    assert "Models & Data" not in body, "raw ampersand in the XML"
+    assert "Models &amp; Data" in body
+    # ...and the *decoded* value is the path that was asked for, so mlx_lm.server
+    # is pointed at the real directory rather than an entity-mangled one.
+    argv = _plist_argv(plist)
+    assert argv[argv.index("--model") + 1] == str(model)
+
+
+def test_uninstall_matches_the_escaped_path_the_plist_pins(tmp_path: Path) -> None:
+    """Escaping is only useful if --uninstall compares the same way: write the
+    agent for an "&" path, then unload it by that path."""
+    model = tmp_path / "Models & Data" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model.mkdir(parents=True)
+    _runtime_venv(tmp_path)
+
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(model))
+        + _functions(
+            "write_launchd_plist",
+            "uninstall_mlx_agent", "xml_escape",
+            "server_binary",
+            "log_dir",
+            "plist_path",
+            "agent_target",
+            "xml_escape",
+        )
+        + _stub_host()
+        + "launchctl() { :; }\n"
+        + 'id() { printf "501\\n"; }\n'
+        + "write_launchd_plist\n"
+        + "uninstall_mlx_agent\n",
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    plist = tmp_path / "home" / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+    assert not plist.exists(), "the agent pinned to this model was left loaded"
 
 
 # --- argument handling -------------------------------------------------------

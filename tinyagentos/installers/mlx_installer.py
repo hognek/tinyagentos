@@ -129,6 +129,11 @@ _SERVE_PROBE_ATTEMPTS = 5
 _SERVE_PROBE_INTERVAL_S = 1.0
 _DEFAULT_SERVE_TIMEOUT_S = 180
 
+#: Exit code ``scripts/install-mlx-server.sh --uninstall`` uses when it left an
+#: agent loaded on purpose, because that agent pins a different model. Anything
+#: else non-zero is a failure.
+_AGENT_LEFT_RUNNING_EXIT_CODE = 3
+
 
 def _default_port() -> int:
     """Resolve the MLX server port from TAOS_MLX_PORT or DEFAULT_PORT."""
@@ -430,15 +435,18 @@ class MLXInstaller(AppInstaller):
             f"http://127.0.0.1:{self.port} after the launchd agent started"
         )
 
-    async def _unload_agent(self, model_dir: Path) -> tuple[bool, str]:
-        """Best-effort unload of the serving agent when it pins *model_dir*.
+    async def _unload_agent(self, model_dir: Path) -> tuple[str, str]:
+        """Unload the serving agent when it pins *model_dir*.
 
-        The script decides: an agent pinned to a different model is left alone,
-        so removing one model cannot take another one's server down.
+        Returns ``(state, error)`` with ``state`` one of ``"unloaded"`` (the
+        plist is gone, so nothing serves this model any more), ``"left-running"``
+        (the agent pins a different model and is deliberately left alone) or
+        ``"failed"``. The script owns that decision and reports it in its exit
+        code (see the script's `--uninstall` contract).
         """
         script = mlx_serving_script()
         if not script.exists():
-            return False, f"the MLX serving script is missing at {script}"
+            return "failed", f"the MLX serving script is missing at {script}"
         code, output = await run_cmd(
             [
                 str(script),
@@ -448,9 +456,11 @@ class MLXInstaller(AppInstaller):
             ],
             timeout=60,
         )
-        if code != 0:
-            return False, (output.strip() or f"exited {code}")[-400:]
-        return True, ""
+        if code == 0:
+            return "unloaded", ""
+        if code == _AGENT_LEFT_RUNNING_EXIT_CODE:
+            return "left-running", ""
+        return "failed", (output.strip() or f"exited {code}")[-400:]
 
     async def install(
         self,
@@ -627,9 +637,12 @@ class MLXInstaller(AppInstaller):
             # The launchd agent KeepAlive-restarts whatever model its plist
             # pins, so removing the served model without unloading it would
             # restart a server against a directory that no longer exists.
-            unloaded, unload_err = await self._unload_agent(target)
-            result["mlx_agent_unloaded"] = unloaded
-            if not unloaded:
+            state, unload_err = await self._unload_agent(target)
+            result["mlx_agent_state"] = state
+            # True only when this model's agent is actually gone: an agent left
+            # running on purpose (it pins a different model) is not "unloaded".
+            result["mlx_agent_unloaded"] = state == "unloaded"
+            if state == "failed":
                 result["mlx_agent_error"] = unload_err
                 logger.warning(
                     "MLX model %s removed but its serving agent was not unloaded: %s",

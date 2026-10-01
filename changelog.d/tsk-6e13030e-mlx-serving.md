@@ -26,3 +26,11 @@
   `TAOS_MLX_PORT`, else 7837) so the installer probes the port it pinned the
   agent to, and its docstring records that `mlx_lm.server` 0.31.3 also answers
   `/health` while the probe deliberately checks the OpenAI surface taOS calls.
+- The MLX agent's plist values are XML-escaped, so a model directory such as
+  `Models & Data` produces a plist launchd can load, and `--uninstall` compares
+  against the same escaped directory; the model path pinned in the agent is the
+  resolved one uninstall later matches.
+- `MLXInstaller.uninstall()` reports `mlx_agent_state`
+  (`unloaded` / `left-running` / `failed`) and only sets `mlx_agent_unloaded`
+  when the agent really was unloaded, so an agent deliberately left serving a
+  different model is not reported as stopped.

@@ -30,6 +30,9 @@
 # Exit 0 means the agent is loaded AND `GET /v1/models` answered on the port.
 # Anything else exits non-zero and says why, so a model install that cannot get
 # the server up reports no endpoint at all, never an endpoint nothing serves.
+# `--uninstall` uses the same idea for its three outcomes: 0 when nothing serves
+# that model any more (unloaded, or there was no agent), 3 when the agent was
+# left running because it pins a different model, 1 on error.
 set -euo pipefail
 
 LABEL="com.taos.mlx-server"
@@ -44,6 +47,14 @@ UNINSTALL=0
 log()  { printf '\033[1;34m[mlx-server]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[mlx-server]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[mlx-server]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# The plist is XML, so any value interpolated into it has to be escaped: a
+# perfectly legal model directory like "Models & Data" would otherwise produce
+# malformed XML and launchctl would refuse to bootstrap the agent. The same
+# escaping is applied when matching a path against an existing plist below.
+xml_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
 
 usage() {
     cat <<'EOF'
@@ -145,10 +156,10 @@ write_launchd_plist() {
     <key>Label</key><string>${LABEL}</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$(server_binary)</string>
-        <string>--model</string><string>${MODEL_DIR}</string>
-        <string>--host</string><string>${HOST}</string>
-        <string>--port</string><string>${PORT}</string>
+        <string>$(xml_escape "$(server_binary)")</string>
+        <string>--model</string><string>$(xml_escape "$MODEL_DIR")</string>
+        <string>--host</string><string>$(xml_escape "$HOST")</string>
+        <string>--port</string><string>$(xml_escape "$PORT")</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -156,8 +167,8 @@ write_launchd_plist() {
     </dict>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>$(log_dir)/mlx-server.log</string>
-    <key>StandardErrorPath</key><string>$(log_dir)/mlx-server.err.log</string>
+    <key>StandardOutPath</key><string>$(xml_escape "$(log_dir)/mlx-server.log")</string>
+    <key>StandardErrorPath</key><string>$(xml_escape "$(log_dir)/mlx-server.err.log")</string>
 </dict>
 </plist>
 EOF
@@ -193,10 +204,12 @@ uninstall_mlx_agent() {
     plist="$(plist_path)"
     # Called from a model uninstall with --model: only stop an agent that was
     # serving THAT model. One pinning another model is left running (otherwise
-    # removing one model would silently take the other one's server down).
-    if [[ -n "$MODEL_DIR" && -f "$plist" ]] && ! grep -qF -- "<string>${MODEL_DIR}</string>" "$plist"; then
+    # removing one model would silently take the other one's server down), and
+    # that outcome is reported as exit 3 so the caller can tell it apart from
+    # "nothing serves this model any more" (exit 0).
+    if [[ -n "$MODEL_DIR" && -f "$plist" ]] && ! grep -qF -- "<string>$(xml_escape "$MODEL_DIR")</string>" "$plist"; then
         log "$plist pins another model; leaving the agent running"
-        return 0
+        return 3
     fi
     if [[ ! -f "$plist" ]]; then
         log "no ${LABEL} agent installed"
@@ -205,6 +218,7 @@ uninstall_mlx_agent() {
     launchctl bootout "$(agent_target)/${LABEL}" 2>/dev/null || true
     rm -f "$plist"
     log "removed $plist"
+    return 0
 }
 
 main() {
@@ -212,8 +226,9 @@ main() {
     resolve_venv
 
     if [[ "$UNINSTALL" == "1" ]]; then
-        uninstall_mlx_agent
-        return 0
+        local rc=0
+        uninstall_mlx_agent || rc=$?
+        return "$rc"
     fi
 
     require_apple_silicon

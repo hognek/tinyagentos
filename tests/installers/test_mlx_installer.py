@@ -682,7 +682,9 @@ class TestMLXServing:
         result = await MLXInstaller(models_dir=tmp_path).uninstall("qwen2.5-3b")
 
         assert result["success"] is True and result["deleted"] == 1
+        assert result["mlx_agent_state"] == "unloaded"
         assert result["mlx_agent_unloaded"] is True
+        assert "mlx_agent_error" not in result
         assert calls[0][0].endswith("scripts/install-mlx-server.sh")
         assert calls[0][1:] == [
             "--uninstall",
@@ -691,6 +693,44 @@ class TestMLXServing:
             "--venv",
             str(mlx_mod.mlx_runtime_venv()),
         ]
+
+    async def test_uninstall_does_not_claim_to_have_unloaded_a_left_running_agent(
+        self, monkeypatch, tmp_path
+    ):
+        """The script exits 3 when it deliberately leaves an agent that serves a
+        different model alone; that is not "unloaded" (Kilo on #3337)."""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(
+            mlx_mod,
+            "run_cmd",
+            AsyncMock(return_value=(3, "... pins another model; leaving the agent running\n")),
+        )
+        target = self._model_dir(tmp_path)
+        target.mkdir(parents=True)
+
+        result = await MLXInstaller(models_dir=tmp_path).uninstall("qwen2.5-3b")
+
+        assert result["success"] is True
+        assert result["mlx_agent_state"] == "left-running"
+        assert result["mlx_agent_unloaded"] is False
+        assert "mlx_agent_error" not in result
+
+    async def test_a_failed_unload_is_reported_as_a_failure(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setattr(
+            mlx_mod, "run_cmd", AsyncMock(return_value=(1, "launchctl: no such label\n"))
+        )
+        target = self._model_dir(tmp_path)
+        target.mkdir(parents=True)
+
+        result = await MLXInstaller(models_dir=tmp_path).uninstall("qwen2.5-3b")
+
+        assert result["success"] is True, "the model itself was removed"
+        assert result["mlx_agent_state"] == "failed"
+        assert result["mlx_agent_unloaded"] is False
+        assert "no such label" in result["mlx_agent_error"]
 
     async def test_uninstall_off_macos_does_not_touch_the_agent(
         self, monkeypatch, tmp_path
