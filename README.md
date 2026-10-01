@@ -722,7 +722,6 @@ uv run exo
 - [docs/design/framework-agnostic-runtime.md](docs/design/framework-agnostic-runtime.md). containers hold code, hosts hold state (load-bearing architectural rule)
 - [docs/superpowers/specs/2026-04-11-taos-framework-integration-bridge-design.md](docs/superpowers/specs/2026-04-11-taos-framework-integration-bridge-design.md). TAOS Framework Integration Bridge design (OpenClaw → Hermes → OpenClaw round-trip, not yet implemented)
 - [docs/mirror-policy.md](docs/mirror-policy.md). binary mirror governance: what is mirrored, SHA256 verification, self-hosting guide
-- [docs/deploy/platform.md](docs/deploy/platform.md). Runbook for the tinyagentos.com platform LXC, covering landing page, docs site, and bittorrent tracker. Uses `scripts/install-platform-lxc.sh` on the Proxmox host to provision. Infrastructure for the project's public web presence, not part of the taOS product itself.
 
 ## Development
 
@@ -859,4 +858,4 @@ taOS is open source under the [GNU Affero General Public License v3.0 or later](
 
 You may use, modify, and self-host taOS freely under the AGPL, including for your own organisation's internal business purposes. The AGPL's one condition for network use is that if you run a modified taOS as a service for others, you make your modified source available to those users, also under the AGPL.
 
-A separate **commercial license** is available from jaylfc for anyone who wants to use taOS on terms the AGPL does not grant them -- for example embedding it in a proprietary product, or offering it as a hosted or managed service without releasing modifications under the AGPL. See [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) or contact info@taos.my.
+There is no separate commercial license: AGPL-3.0-or-later is the only license taOS is offered under, and contributions are accepted under the same terms.

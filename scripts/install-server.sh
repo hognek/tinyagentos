@@ -1661,7 +1661,7 @@ log "installing controller python deps into .venv (pip install -e '.${_taos_extr
 # in the venv, so upgrading an existing box would silently keep redistributing
 # it. Nothing in taOS imports it (grep -rn litellm_enterprise tinyagentos/ is
 # empty), so removing it is inert; and it is the shipped venv, not the source
-# tree, that a commercial licensee redistributes.
+# tree, that every install redistributes.
 #
 # Probed with importlib.metadata.distribution(), not importlib.util.find_spec():
 # that is exactly what `pip uninstall` itself consults, so the probe and the
