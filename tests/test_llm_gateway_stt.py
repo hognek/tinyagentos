@@ -509,6 +509,20 @@ async def test_transcribes_by_alias_and_by_manifest_model_name(gw, daemon, model
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mime", ["Multipart/Form-Data", "MULTIPART/FORM-DATA"])
+async def test_the_media_type_is_case_insensitive(gw, daemon, mime):
+    """RFC 9110: media types are case-insensitive, and python-multipart's
+    parse_options_header hands the type back as sent."""
+    c, data_dir, _ = gw
+    write_manifest(data_dir, daemon.port)
+    body, ctype = multipart([("file", make_wav(), "a.wav"), ("model", MODEL.encode(), None)])
+    ctype = ctype.replace("multipart/form-data", mime)
+    resp = await c.post(URL, content=body, headers={"content-type": ctype})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"text": "hello world"}
+
+
+@pytest.mark.asyncio
 async def test_response_format_text_is_plain_text(gw, daemon):
     c, data_dir, _ = gw
     write_manifest(data_dir, daemon.port)

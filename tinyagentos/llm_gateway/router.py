@@ -218,7 +218,7 @@ def _parse_multipart(content_type: str, body: bytes) -> dict[str, bytes]:
 
     mime, params = parse_options_header(content_type.encode("latin-1", "replace"))
     boundary = params.get(b"boundary")
-    if mime != b"multipart/form-data" or not boundary:
+    if mime.lower() != b"multipart/form-data" or not boundary:  # RFC 9110: case-insensitive
         raise bad_request("expected a multipart/form-data body with 'file' and 'model' fields")
     fields: dict[str, bytearray] = {}
     state: dict = {"hname": b"", "hvalue": b"", "headers": {}, "name": None, "ended": False}
