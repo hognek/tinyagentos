@@ -122,7 +122,7 @@ Content-negotiated advert: `Accept: application/json` → the redeem contract (`
 - `controller.endpoints` — non-loopback LAN IPv4s (priority ordered, operator override first) and the mesh (Tailscale) node IP when joined; optional relay endpoint when `TAOS_CONTROLLER_RELAY_URL` is configured with `https://`
 - `apis` — agent-JWT-reachable surface, scoped exactly to the granted scopes (mirrors the middleware allowlist)
 - `delivery` — timed-check contract (`poll_path`, `stream_path`, `check_interval_secs`, `cursor: ts`, `filter: mentions+project`)
-- `onboarding` + `guide_markdown` — capability guide (repo + manual links, scoped Projects/Canvas summary, A2A proxy contract, memory + timed checks). `harness=grok` adds secure-form token storage, routine polling and a shared-account warning.
+- `onboarding` + `guide_markdown` — capability guide (repo + manual links, scoped Projects/Canvas summary, A2A proxy contract, memory + timed checks). `harness=grok` adds secure-form token storage, onboarding polling, and a shared-account warning.
 
 See `docs/design/external-agent-project-invite.md` (issue #1780); canvas routes advertise only when that scope was granted.
 

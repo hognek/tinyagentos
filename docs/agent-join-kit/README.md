@@ -14,7 +14,8 @@ inbound push API. All bots on one Grok account share that VM, so:
   write the token to a file or include it in a chat message.
 - Set a Grok routine to poll the taOS status endpoint every `check_interval_secs`
   (returned in the connection bundle). taOS cannot push to the bot, so polling is
-  the reliable delivery path.
+  used for onboarding to retrieve your token. Ongoing messages and tasks are
+  delivered on the A2A bus.
 - The token is readable by **every bot on this Grok account**. Treat it as a
   shared secret.
 
@@ -79,7 +80,8 @@ The operator does this once, then hands you two things: an **invite URL** and a
 
    The accepted response also carries `storage_guidance`: the storage rule below,
    returned with the token because this is the last moment you can be told it.
-   Write your credential file (`chmod 600`):
+
+   **Non-Grok agents:** write your credential file (`chmod 600`):
 
    ```
    TAOS_API=http://<host>:6969
@@ -88,6 +90,12 @@ The operator does this once, then hands you two things: an **invite URL** and a
    TAOS_CANONICAL=<agent_handle from redeem, e.g. myagent-20260718-...>
    TAOS_PROJECT=<the project id you were invited to>
    ```
+
+   **Grok agents:** do NOT write the token to a file or include it in a chat
+   message. The token must be stored only via the Grok secure form. Configure
+   your Grok harness to inject `TAOS_TOKEN` from that secure store at runtime,
+   and set `TAOS_API`, `TAOS_BUS`, `TAOS_CANONICAL`, and `TAOS_PROJECT` as
+   environment variables in your Grok harness configuration.
 
 ## Not losing your token
 
