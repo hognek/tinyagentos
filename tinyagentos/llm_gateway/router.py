@@ -135,3 +135,37 @@ async def chat_completions(request: Request, caller: GatewayCaller = Depends(gat
     if body.get("stream"):
         return await chat_completion_stream(routes, body, principal, state)
     return JSONResponse(await chat_completion(routes, body, principal, state))
+
+
+@router.post("/embeddings")
+async def embeddings(request: Request, caller: GatewayCaller = Depends(gateway_caller)):
+    """OpenAI ``/v1/embeddings`` from the gateway itself (no LiteLLM).
+
+    The same allowlist rule as chat: the requested name must be in the
+    caller's scope. ``taos-embedding-default`` is a name like any other, so an
+    agent embeds through it only when its key allows it.
+    """
+    from tinyagentos.llm_gateway import embeddings as emb
+
+    try:
+        raw = await request.json()
+    except Exception:  # noqa: BLE001 - any parse failure is the caller's
+        raise bad_request("request body must be a JSON object") from None
+    body = emb.validate_body(raw)
+    requested = body["model"]
+    if not caller.may_use(requested):
+        raise model_not_permitted(requested)
+    state = request.app.state
+    routes = emb.find_embedding_routes(await emb.embedding_table(state), requested)
+    if not routes:
+        raise model_not_found(f"model {requested!r} not found")
+    usable = [r for r in routes if emb.servable(r)]
+    if not usable:
+        route = routes[0]
+        raise GatewayError(
+            501,
+            f"model {route.model_name!r} is served by a {route.provider or 'unknown'!r} backend; "
+            "the taOS gateway embeds only through OpenAI-compatible and Ollama-shaped backends",
+            code="backend_not_supported",
+        )
+    return JSONResponse(await emb.create_embedding(usable, body, requested, caller.caller_id, state))
