@@ -453,7 +453,14 @@ class BlePairingManager:
         # local store write and does not need the gateway up.
         from tinyagentos.llm_gateway.auth import revoke_for_node
 
-        revoke_for_node(name, data_dir=self._data_dir)
+        try:
+            revoke_for_node(name, data_dir=self._data_dir)
+        except Exception as exc:
+            await self._rollback(name, key, sess)
+            await self._close_session(sess)
+            # type only: never the exception text, which is not ours to vouch for
+            raise PairError(500, f"failed to revoke model keys: {type(exc).__name__}") from exc
+
         if self._llm_enabled and urls:
             try:
                 from tinyagentos.llm_gateway.auth import mint_for_node

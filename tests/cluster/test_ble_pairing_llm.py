@@ -283,3 +283,27 @@ async def test_taosusb_with_llm_enabled_still_gets_llm_block(tmp_path, store):
     assert llm is not None
     assert llm["base"] == URL + "/api/llm/v1"
     assert _live(tmp_path, llm["key"]) is not None
+
+
+# -- revoke rollback ------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_revoke_failure_rolls_back_node_credential(tmp_path, store, monkeypatch):
+    """If revoke_for_node raises (keystore write error), the node credential
+    must be rolled back and PairError raised, not a raw exception."""
+    board = FakeBoard(board_id="REV1")
+    mgr = _mgr(tmp_path, store, {"a": board})
+    started = await mgr.start("a")
+
+    def _boom(name, data_dir):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(gw, "revoke_for_node", _boom)
+
+    with pytest.raises(PairError) as exc:
+        await mgr.confirm(started["session"])
+    assert exc.value.status == 500
+    assert "failed to revoke model keys" in str(exc.value)
+
+    # The node credential must be rolled back (no orphan key)
+    assert await store.get_signing_key("taOSusb-REV1") is None
