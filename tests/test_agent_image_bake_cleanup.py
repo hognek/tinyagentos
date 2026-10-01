@@ -1,11 +1,25 @@
 """Tests for bake cleanup: failed tmp delete logging and stale tmp sweep."""
 import asyncio
 import logging
+import re
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from tinyagentos.agent_image import _bake_scripts_into_image, ensure_image_present
+from tinyagentos.agent_image import _bake_scripts_into_image, ensure_image_present, _sweep_stale_bake_containers
+
+
+def _incus_list_semantics(names, filter_arg=None):
+    """Simulate incus list --format=csv -c n filtering semantics.
+
+    - No filter arg: return all names
+    - Bare filter arg: return names matching re.fullmatch(filter, name) or re.match(filter, name)
+    """
+    if filter_arg is None:
+        return "\n".join(names) + "\n"
+    pattern = filter_arg
+    matched = [n for n in names if re.fullmatch(pattern, n) or re.match(pattern, n)]
+    return "\n".join(matched) + ("\n" if matched else "")
 
 
 class TestBakeCleanup:
@@ -206,3 +220,127 @@ class TestBakeCleanup:
             f"Sweep delete from ensure_image_present should run before bake launch; "
             f"sweep indices: {sweep_delete_indices}, bake launch: {bake_launch_idx}"
         )
+
+
+class TestSweepStaleBakeContainers:
+    """Tests for _sweep_stale_bake_containers with incus REAL filter semantics."""
+
+    @pytest.mark.asyncio
+    async def test_sweep_deletes_real_bake_tmp_name(self, caplog):
+        """Sweep deletes taos-bake-taos-hermes-base-tmp and does NOT delete naira/mary."""
+        names = ["taos-bake-taos-hermes-base-tmp", "naira", "mary", "taos-bake-openclaw-base-tmp"]
+        launched = []
+
+        async def _fake_launch(*args, **kwargs):
+            launched.append(args)
+            proc = MagicMock()
+            if args[:2] == ("incus", "list"):
+                # No filter arg -> return all names (incus real semantics)
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(_incus_list_semantics(names).encode(), b""))
+            elif args[:2] == ("incus", "delete") and "--force" in args:
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+            else:
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+            proc.wait = AsyncMock(return_value=proc.returncode)
+            proc.stdout = MagicMock()
+            proc.stdout.close = MagicMock()
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", new=_fake_launch), \
+             caplog.at_level(logging.INFO):
+            await _sweep_stale_bake_containers()
+
+        # Should have called incus list with NO filter (all names)
+        list_calls = [c for c in launched if c[:2] == ("incus", "list")]
+        assert len(list_calls) == 1
+        # The filter arg should NOT be present (no "taos-bake-*-tmp" arg)
+        assert len(list_calls[0]) == 5  # incus, list, --format=csv, -c, n
+
+        # Should have deleted only the bake tmp containers
+        delete_calls = [c for c in launched if c[:2] == ("incus", "delete") and "--force" in c]
+        deleted_names = [c[2] for c in delete_calls]
+        assert "taos-bake-taos-hermes-base-tmp" in deleted_names
+        assert "taos-bake-openclaw-base-tmp" in deleted_names
+        assert "naira" not in deleted_names
+        assert "mary" not in deleted_names
+
+        # Verify INFO logs for deleted containers
+        info_logs = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+        assert any("taos-bake-taos-hermes-base-tmp" in msg for msg in info_logs)
+        assert any("taos-bake-openclaw-base-tmp" in msg for msg in info_logs)
+
+    @pytest.mark.asyncio
+    async def test_startup_sweep_runs_when_image_present(self, caplog):
+        """ensure_image_present with is_image_present=True still runs the sweep once (local, no remote)."""
+        alias = "taos-hermes-base"
+        tmp_name = f"taos-bake-{alias}-tmp"
+        names = [tmp_name, "other-container"]
+        launched = []
+
+        async def _fake_launch(*args, **kwargs):
+            launched.append(args)
+            proc = MagicMock()
+            # is_image_present: image IS present (early return path)
+            if args[:3] == ("incus", "image", "list"):
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"taos-hermes-base\n", b""))
+            # sweep: incus list shows stale tmp (no filter -> all names)
+            elif args[:2] == ("incus", "list"):
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(_incus_list_semantics(names).encode(), b""))
+            # sweep delete
+            elif args[:2] == ("incus", "delete") and "--force" in args:
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+            else:
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+            proc.wait = AsyncMock(return_value=proc.returncode)
+            proc.stdout = MagicMock()
+            proc.stdout.close = MagicMock()
+            return proc
+
+        with patch("asyncio.create_subprocess_exec", new=_fake_launch), \
+             caplog.at_level(logging.INFO):
+            result = await ensure_image_present(alias=alias)
+
+        assert result is True  # image was present, returned early but sweep still ran
+
+        # Sweep should have run: list called without filter
+        list_calls = [c for c in launched if c[:2] == ("incus", "list")]
+        assert len(list_calls) == 1
+        assert len(list_calls[0]) == 5  # no filter arg
+
+        # Sweep delete should have been called for the tmp container
+        delete_calls = [c for c in launched if c[:2] == ("incus", "delete") and "--force" in c]
+        deleted_names = [c[2] for c in delete_calls]
+        assert tmp_name in deleted_names
+
+        # Should NOT have run curl or image import (early return)
+        curl_calls = [c for c in launched if c[0] == "curl"]
+        assert len(curl_calls) == 0
+        import_calls = [c for c in launched if c[:3] == ("incus", "image", "import")]
+        assert len(import_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_sweep_is_non_fatal_without_incus(self, caplog):
+        """Sweep with create_subprocess_exec raising FileNotFoundError returns None and logs a warning."""
+        launched = []
+
+        async def _fake_launch(*args, **kwargs):
+            launched.append(args)
+            raise FileNotFoundError("incus not found")
+
+        with patch("asyncio.create_subprocess_exec", new=_fake_launch), \
+             caplog.at_level(logging.WARNING):
+            result = await _sweep_stale_bake_containers()
+
+        assert result is None
+
+        # Should log a warning about the failure
+        warning_logs = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("sweep" in msg.lower() for msg in warning_logs)
+        assert any("incus" in msg.lower() or "file" in msg.lower() or "not found" in msg.lower() for msg in warning_logs)
