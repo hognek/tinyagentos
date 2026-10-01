@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 async def _incus(*args: str, timeout: int = 60) -> tuple[int, str]:
     """Run an incus subcommand with timeout and kill on timeout.
 
-    Returns (returncode, stdout). Never raises on timeout -- kills the
-    process and re-raises TimeoutError. Other exceptions propagate.
+    Returns (returncode, stdout). Kills the process on timeout and re-raises
+    TimeoutError. Other exceptions propagate.
     """
     proc = await asyncio.create_subprocess_exec(
         "incus", *args,
@@ -50,6 +50,11 @@ async def _incus(*args: str, timeout: int = 60) -> tuple[int, str]:
 # show download progress. Keys: status (idle|downloading|importing|done|failed),
 # started_at (ISO timestamp), url (str).
 _prefetch_state: dict = {"status": "idle"}
+
+# Bake containers currently mid-flight. Set while _bake_scripts_into_image
+# is between launch and publish so concurrent ensure_image_present calls
+# do not sweep-delete the in-flight temp container.
+_INFLIGHT_BAKES: set[str] = set()
 
 _FRAMEWORK_UPDATE_SCRIPT_SRC = Path(__file__).parent / "scripts" / "taos-framework-update.sh"
 
@@ -220,6 +225,9 @@ async def _sweep_stale_bake_containers() -> None:
             if not name:
                 continue
             if name.startswith("taos-bake-") and name.endswith("-tmp"):
+                if name in _INFLIGHT_BAKES:
+                    logger.debug("agent_image: sweep skipping in-flight %s", name)
+                    continue
                 del_code, del_out = await _incus("delete", name, "--force", timeout=30)
                 if del_code != 0:
                     logger.warning("agent_image: sweep delete failed for %s: %s", name, del_out[:300])
@@ -245,6 +253,7 @@ async def _bake_scripts_into_image(alias: str) -> None:
     # Sweep any stale temp containers before launching to avoid name clashes
     await _sweep_stale_bake_containers()
 
+    _INFLIGHT_BAKES.add(tmp_name)
     try:
         # Launch a temporary container from the just-imported image
         code, out = await _incus("launch", alias, tmp_name, timeout=120)
@@ -271,6 +280,7 @@ async def _bake_scripts_into_image(alias: str) -> None:
     except Exception as exc:
         logger.warning("agent_image: bake scripts failed for %s: %s", alias, exc)
     finally:
+        _INFLIGHT_BAKES.discard(tmp_name)
         # Always clean up the temp container regardless of outcome
         try:
             code, out = await _incus("delete", tmp_name, "--force", timeout=30)

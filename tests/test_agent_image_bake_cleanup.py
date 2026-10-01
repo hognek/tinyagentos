@@ -326,6 +326,55 @@ class TestSweepStaleBakeContainers:
         assert len(import_calls) == 0
 
     @pytest.mark.asyncio
+    async def test_sweep_skips_inflight_bake_container(self, caplog):
+        """Sweep skips a container that is currently in-flight (mid-bake)."""
+        alias = "taos-hermes-base"
+        in_flight_name = f"taos-bake-{alias}-tmp"
+        other_name = "taos-bake-other-tmp"
+        names = [in_flight_name, other_name]
+        launched = []
+
+        async def _fake_launch(*args, **kwargs):
+            launched.append(args)
+            proc = MagicMock()
+            if args[:3] == ("incus", "image", "list"):
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"fingerprint-abc\n", b""))
+            elif args[:2] == ("incus", "list"):
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(_incus_list_semantics(names).encode(), b""))
+            elif args[:2] == ("incus", "delete") and "--force" in args:
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+            else:
+                proc.returncode = 0
+                proc.communicate = AsyncMock(return_value=(b"", b""))
+            proc.wait = AsyncMock(return_value=proc.returncode)
+            proc.stdout = MagicMock()
+            proc.stdout.close = MagicMock()
+            return proc
+
+        from tinyagentos import agent_image as ai
+        ai._INFLIGHT_BAKES.add(in_flight_name)
+        try:
+            with patch("asyncio.create_subprocess_exec", new=_fake_launch), \
+                 caplog.at_level(logging.INFO):
+                result = await ensure_image_present(alias=alias)
+        finally:
+            ai._INFLIGHT_BAKES.discard(in_flight_name)
+
+        assert result is True
+
+        delete_calls = [c for c in launched if c[:2] == ("incus", "delete") and "--force" in c]
+        deleted_names = [c[2] for c in delete_calls]
+        assert in_flight_name not in deleted_names, (
+            f"In-flight bake {in_flight_name} should not be deleted"
+        )
+        assert other_name in deleted_names, (
+            f"Non-in-flight bake {other_name} should still be deleted"
+        )
+
+    @pytest.mark.asyncio
     async def test_sweep_is_non_fatal_without_incus(self, caplog):
         """Sweep with create_subprocess_exec raising FileNotFoundError returns None and logs a warning."""
         launched = []
