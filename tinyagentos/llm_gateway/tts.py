@@ -43,8 +43,9 @@ from operator import mul
 from pathlib import Path
 
 import anyio
-import anyio.lowlevel
+import anyio.to_thread
 import httpx
+from starlette.responses import StreamingResponse
 
 from tinyagentos.llm_gateway.errors import GatewayError, upstream_error
 
@@ -61,7 +62,7 @@ _LOOPBACK = "127.0.0.1"
 # Synthesis starts streaming at once, but the first chunk of a long input can
 # take a moment on an SBC CPU: allow it, but fail a dead socket fast. Reads
 # between chunks use the same bound.
-# Bytes of PCM filtered between two visits to the event loop (~25 ms of work).
+# Bytes of PCM filtered per worker-thread hop (~25 ms of work).
 _SLICE = 8192
 _TIMEOUT = httpx.Timeout(60.0, connect=2.0)
 
@@ -236,6 +237,7 @@ class Speech:
         self._client = client
         self._response = response
         self.sample_rate = sample_rate
+        self.closed = False
 
     def chunks(self):
         return self._response.aiter_raw()
@@ -243,6 +245,7 @@ class Speech:
     async def aclose(self) -> None:
         # Shielded: this runs from a cancelled stream (client disconnect) and
         # must still release the upstream connection promptly.
+        self.closed = True
         with anyio.CancelScope(shield=True):
             try:
                 await self._response.aclose()
@@ -302,6 +305,27 @@ async def open_speech(text: str, manifest: dict) -> Speech:
     return Speech(client, response, manifest["sample_rate"])
 
 
+class SpeechResponse(StreamingResponse):
+    """A ``StreamingResponse`` that always closes its ``Speech``.
+
+    Under ASGI spec < 2.4 a client that disconnects before the first chunk is
+    pulled cancels the response before ``stream_pcm`` ever starts, so that
+    generator's ``finally`` never runs. This is the backstop; ``stream_pcm``
+    is the normal path and marks the ``Speech`` closed first.
+    """
+
+    def __init__(self, speech: Speech, rate: int, **kwargs):
+        super().__init__(stream_pcm(speech, rate), **kwargs)
+        self._speech = speech
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if not self._speech.closed:
+                await self._speech.aclose()
+
+
 async def stream_pcm(speech: Speech, rate: int):
     """The PCM to send at ``rate``, closing the upstream however the stream ends."""
     resampler = None if rate == speech.sample_rate else PcmResampler(speech.sample_rate, rate)
@@ -311,17 +335,22 @@ async def stream_pcm(speech: Speech, rate: int):
                 if chunk:
                     yield chunk
                 continue
-            # Pure-Python filtering holds the event loop: do a big chunk in
-            # slices and yield to the loop between them.
+            # Pure-Python filtering is CPU work: do it off the event loop, a
+            # slice at a time so a cancel lands between slices.
             for i in range(0, len(chunk), _SLICE):
-                out = resampler.feed(chunk[i:i + _SLICE])
+                out = await anyio.to_thread.run_sync(resampler.feed, chunk[i:i + _SLICE])
                 if out:
                     yield out
-                await anyio.lowlevel.checkpoint()
         if resampler is not None:
-            tail = resampler.finish()
+            tail = await anyio.to_thread.run_sync(resampler.finish)
             if tail:
                 yield tail
+    except httpx.HTTPError:
+        # The daemon died or stalled mid-audio (read timeout, dropped
+        # connection): the headers are long gone, so end the audio cleanly
+        # rather than reset the client. Fixed string: no text, no exception.
+        logger.warning("tts: the daemon failed mid-stream; audio ended early")
+        return
     except (anyio.get_cancelled_exc_class(), GeneratorExit):
         # The client went away mid-stream (499 semantics): nothing to answer,
         # only the upstream to release. Fixed string: no text, no audio.

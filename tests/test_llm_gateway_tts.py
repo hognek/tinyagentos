@@ -707,3 +707,92 @@ async def test_client_disconnect_mid_stream_closes_the_upstream(gw, daemon, spec
     assert 3 <= len(sent_body) < 100  # it stopped; the daemon would have gone on forever
     assert closes == [1], "the route must close the upstream stream itself, once"
     assert await asyncio.to_thread(daemon.closed.wait, 5), "upstream connection was leaked"
+
+
+@pytest.mark.asyncio
+async def test_disconnect_before_the_first_chunk_still_closes_the_upstream(gw, daemon, monkeypatch):
+    """ASGI <= 2.3: StreamingResponse can be cancelled before it ever iterates
+    the body generator, so the generator's own ``finally`` never runs. The
+    route's response is driven directly: through the app, the startup-guard
+    middleware pulls the body itself and hides the race."""
+    from starlette.requests import Request
+
+    from tinyagentos.llm_gateway import router as gw_router
+
+    _, data_dir, app, _ = gw
+    write_manifest(data_dir, daemon.port)
+    daemon.endless = True
+    closes = []
+    real_aclose = tts.Speech.aclose
+
+    async def spy(self):
+        closes.append(1)
+        await real_aclose(self)
+
+    async def alive(self):
+        return False
+
+    class Caller:
+        def may_use(self, name):
+            return True
+
+    monkeypatch.setattr(tts.Speech, "aclose", spy)
+    monkeypatch.setattr(Request, "is_disconnected", alive)
+    body = json.dumps({"model": MODEL, "input": "never heard"}).encode()
+
+    async def request_receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+             "http_version": "1.1", "method": "POST", "scheme": "http", "path": URL,
+             "raw_path": URL.encode(), "query_string": b"", "root_path": "",
+             "headers": [(b"content-type", b"application/json")], "app": app}
+    response = await gw_router.audio_speech(Request(scope, request_receive), Caller())
+
+    async def receive():
+        return {"type": "http.disconnect"}  # gone before the first chunk is pulled
+
+    async def send(message):
+        # A real server's send takes a moment on the headers; the disconnect
+        # lands in that gap, before the body generator is first iterated.
+        await asyncio.sleep(0.05)
+
+    await asyncio.wait_for(response(scope, receive, send), timeout=10)
+    assert closes, "the route must close the upstream even if the body never started"
+    assert await asyncio.to_thread(daemon.closed.wait, 5), "upstream connection was leaked"
+
+
+# --- the daemon failing mid-stream ------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exc", [httpx.ReadTimeout("SECRET-UTTERANCE-9f2"),
+                                 httpx.RemoteProtocolError("SECRET-UTTERANCE-9f2")])
+@pytest.mark.parametrize("rate", [None, 16000])
+async def test_daemon_failing_mid_stream_ends_the_audio_cleanly(gw, daemon, monkeypatch, caplog,
+                                                                exc, rate):
+    c, data_dir, _, _ = gw
+    write_manifest(data_dir, daemon.port)
+    first = pcm_of(sine(1000, NATIVE, 0.2))
+    closes = []
+    real_aclose = tts.Speech.aclose
+
+    async def spy(self):
+        closes.append(1)
+        await real_aclose(self)
+
+    async def broken(self):
+        yield first
+        raise exc
+
+    monkeypatch.setattr(tts.Speech, "aclose", spy)
+    monkeypatch.setattr(tts.Speech, "chunks", broken)
+    extra = {} if rate is None else {"sample_rate": rate}
+    with caplog.at_level(0):
+        resp = await post(c, **extra)
+    assert resp.status_code == 200
+    assert resp.content  # the audio before the failure arrived
+    if rate is None:
+        assert resp.content == first
+    assert closes == [1]
+    assert "SECRET-UTTERANCE-9f2" not in caplog.text

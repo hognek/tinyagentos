@@ -382,8 +382,8 @@ async def audio_speech(request: Request, caller: GatewayCaller = Depends(gateway
         # The client is gone: do not spend the daemon on speech nobody awaits.
         return Response(status_code=499)
     speech = await tts.open_speech(text, manifest)
-    return StreamingResponse(
-        tts.stream_pcm(speech, rate),
+    return tts.SpeechResponse(
+        speech, rate,
         media_type="audio/pcm",
         headers={"X-Sample-Rate": str(rate), "X-Channels": "1"},
     )
