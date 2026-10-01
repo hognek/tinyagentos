@@ -46,7 +46,8 @@ def fast_timeouts(monkeypatch):
     monkeypatch.setattr(pairing_mod, "_CONNECT_TIMEOUT_S", 0.3)
 
 
-def make_manager(cluster, store, tmp_path, boards, **conn_kwargs) -> BlePairingManager:
+def make_manager(cluster, store, tmp_path, boards, llm_gateway_enabled=None,
+                 **conn_kwargs) -> BlePairingManager:
     transport = FakeTransport(boards, **conn_kwargs)
     return BlePairingManager(
         data_dir=tmp_path,
@@ -54,6 +55,7 @@ def make_manager(cluster, store, tmp_path, boards, **conn_kwargs) -> BlePairingM
         pairing_store=store,
         bind_port=6969,
         transport=transport,
+        llm_gateway_enabled=llm_gateway_enabled,
     )
 
 
@@ -298,11 +300,11 @@ async def test_missing_or_junk_caps_default_to_taosusb(cluster, store, tmp_path)
 
 @pytest.mark.asyncio
 async def test_scan_start_confirm_happy_path(cluster, store, tmp_path, monkeypatch):
-    # S1 scope, with the LLM gateway pinned OFF: the gateway is on by default
-    # now, and the default-on provision is covered by the sibling below.
-    monkeypatch.setenv("TAOS_LLM_GATEWAY", "0")
+    # S1 scope, with the LLM provision pinned OFF through the manager's own
+    # switch (the gateway is always on since LiteLLM removal 2b-2a; the
+    # default-on provision is covered by the sibling below).
     board = FakeBoard(board_id="HAPP", name="taOSusb-HAPP")
-    mgr = make_manager(cluster, store, tmp_path, {"addr1": board})
+    mgr = make_manager(cluster, store, tmp_path, {"addr1": board}, llm_gateway_enabled=False)
 
     devices = await mgr.scan(2)
     assert len(devices) == 1

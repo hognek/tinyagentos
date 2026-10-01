@@ -307,9 +307,6 @@ async def test_chat_opencode_with_gateway_and_no_litellm_is_not_a_litellm_503(cl
 
     monkeypatch.setenv("TAOS_LLM_GATEWAY", "1")
     await client.patch("/api/taos-agent/settings", json={"model": "default"})
-    mock_proxy = MagicMock()
-    mock_proxy.is_running.return_value = False
-    app.state.llm_proxy = mock_proxy
     reached = []
 
     async def fake_ensure(app_state, model):
@@ -327,19 +324,15 @@ async def test_chat_opencode_with_gateway_and_no_litellm_is_not_a_litellm_503(cl
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("gateway,needle", [("0", "turned off"), ("1", "cannot serve")])
-async def test_chat_opencode_no_gateway_path_and_no_litellm_503_names_the_gateway(
-    client, app, monkeypatch, gateway, needle,
-):
+@pytest.mark.parametrize("gateway", ["0", "1"], ids=["old-off-flag", "flag-on"])
+async def test_chat_opencode_no_gateway_path_503_names_the_gateway(client, app, monkeypatch, gateway):
+    """The gateway is the only LLM path: a model it cannot serve is a 503 that
+    names why, whatever the old off flag says (it is ignored)."""
     import tinyagentos.routes.taos_agent as ta_module
 
     monkeypatch.setenv("TAOS_LLM_GATEWAY", gateway)
     # Not in the routing table: the gateway cannot serve it.
-    await client.patch("/api/taos-agent/settings",
-                       json={"model": "default" if gateway == "0" else "gone-model"})
-    mock_proxy = MagicMock()
-    mock_proxy.is_running.return_value = False
-    app.state.llm_proxy = mock_proxy
+    await client.patch("/api/taos-agent/settings", json={"model": "gone-model"})
 
     async def must_not_start(app_state, model):
         raise AssertionError("opencode must not start without an LLM path")
@@ -351,5 +344,5 @@ async def test_chat_opencode_no_gateway_path_and_no_litellm_503_names_the_gatewa
     )
     assert resp.status_code == 503
     error = resp.json()["error"]
-    assert "gateway" in error and needle in error
-    assert "LiteLLM proxy is not running" in error
+    assert "gateway" in error and "cannot serve" in error
+    assert "LiteLLM" not in error

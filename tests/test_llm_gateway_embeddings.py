@@ -52,7 +52,7 @@ def gw(tmp_data_dir, monkeypatch):
     cfg_path.write_text(yaml.dump(cfg))
     app = create_app(data_dir=tmp_data_dir)
     app.state._startup_complete = True
-    listener = create_agent_listener_app(app, litellm_port=LITELLM_PORT)
+    listener = create_agent_listener_app(app)
     store = LiteLLMKeyStore(default_keystore_path(tmp_data_dir))
     return app, listener, store
 

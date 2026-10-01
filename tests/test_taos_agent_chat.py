@@ -81,9 +81,23 @@ def _fake_server(base_url: str = "http://127.0.0.1:4188"):
 
 
 def _make_mock_proxy(running: bool = True):
-    proxy = MagicMock()
-    proxy.is_running.return_value = running
-    return proxy
+    """A key-service stand-in. ``running`` used to mean "LiteLLM is up"; with
+    LiteLLM gone the only LLM path is the gateway, so the chat route's
+    gateway check is what these tests steer instead (see the autouse
+    ``_gateway_can_serve`` fixture and ``test_chat_no_gateway_path_returns_503``)."""
+    return MagicMock(spec=["port", "create_agent_key", "update_agent_key"])
+
+
+@pytest.fixture(autouse=True)
+def _gateway_can_serve(monkeypatch):
+    """The chat route refuses (503) a model the gateway cannot route; these
+    tests are about the opencode turn, not routing, so the gateway can serve."""
+    import tinyagentos.routes.taos_agent as ta_module
+
+    async def no_problem(app_state, model, prefs):
+        return None
+
+    monkeypatch.setattr(ta_module, "opencode_gateway_problem", no_problem)
 
 
 def _parse_ndjson(text: str) -> list[dict]:
@@ -113,10 +127,15 @@ async def test_chat_no_model_returns_400(client):
 
 
 @pytest.mark.asyncio
-async def test_chat_proxy_not_running_returns_503(client, app):
-    """POST /api/taos-agent/chat when proxy not running → 503."""
+async def test_chat_no_gateway_path_returns_503(client, app, monkeypatch):
+    """POST /api/taos-agent/chat when the gateway cannot serve the model → 503."""
+    import tinyagentos.routes.taos_agent as ta_module
+
+    async def problem(app_state, model, prefs):
+        return "the taOS LLM gateway cannot serve it: model 'gpt-4o' is not in the routing table"
+
+    monkeypatch.setattr(ta_module, "opencode_gateway_problem", problem)
     await client.patch("/api/taos-agent/settings", json={"model": "gpt-4o"})
-    app.state.llm_proxy = _make_mock_proxy(running=False)
 
     resp = await client.post(
         "/api/taos-agent/chat",
@@ -394,7 +413,6 @@ async def test_ensure_server_uses_agent_key_when_available(tmp_path, monkeypatch
 
     mock_proxy = MagicMock()
     mock_proxy.create_agent_key = AsyncMock(return_value="sk-agent-key-123")
-    mock_proxy.is_running.return_value = True
 
     state = SimpleNamespace(
         data_dir=tmp_path,
@@ -418,9 +436,9 @@ async def test_ensure_server_falls_back_to_a_scoped_key_not_the_master_key(tmp_p
     model from the local key store (LiteLLM removal stage 2a), never the
     LiteLLM master key."""
     import tinyagentos.taos_agent_runtime as rt
-    from tinyagentos.litellm_config import get_litellm_master_key
     from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
-    master_key = get_litellm_master_key(tmp_path)
+    master_key = "sk-taos-stale-litellm-master-key-0123456789"
+    (tmp_path / ".litellm_master_key").write_text(master_key)
 
     spawned_cfgs: list = []
 
@@ -443,7 +461,6 @@ async def test_ensure_server_falls_back_to_a_scoped_key_not_the_master_key(tmp_p
 
     mock_proxy = MagicMock()
     mock_proxy.create_agent_key = AsyncMock(return_value=None)
-    mock_proxy.is_running.return_value = True
 
     state = SimpleNamespace(
         data_dir=tmp_path,
@@ -497,7 +514,6 @@ async def test_ensure_server_reuses_persisted_key(tmp_path, monkeypatch):
     mock_proxy = MagicMock()
     mock_proxy.create_agent_key = AsyncMock(return_value="sk-NEW-should-not-be-used")
     mock_proxy.update_agent_key = AsyncMock(return_value=True)
-    mock_proxy.is_running.return_value = True
 
     state = SimpleNamespace(
         data_dir=tmp_path,
@@ -553,7 +569,6 @@ async def test_ensure_server_rescope_failure_keeps_cached_server(tmp_path, monke
             pass
 
     mock_proxy = MagicMock()
-    mock_proxy.is_running.return_value = True
     mock_proxy.port = 7834
     mock_proxy.inhouse_keys = True
     mock_proxy.create_agent_key = AsyncMock(return_value="sk-should-not-be-used")
@@ -590,7 +605,6 @@ async def test_ensure_server_rescope_failure_keeps_cached_server(tmp_path, monke
     assert rec is not None, f"key {key!r} not found in local store"
     assert rec["agent"] == "taos-agent"
     # Proxy IS running, re-scope failed (legacy key) -> minted local key, NOT degraded.
-    assert state.taos_opencode_born_degraded["gpt-4o"] is False
     mock_proxy.update_agent_key.assert_awaited()
     mock_proxy.create_agent_key.assert_not_called()
 
@@ -638,7 +652,6 @@ async def test_ensure_server_serializes_concurrent_different_models(tmp_path, mo
 
     mock_proxy = MagicMock()
     mock_proxy.create_agent_key = _mint_key
-    mock_proxy.is_running.return_value = True
 
     state = SimpleNamespace(data_dir=tmp_path, llm_proxy=mock_proxy)
 
@@ -656,105 +669,6 @@ async def test_ensure_server_serializes_concurrent_different_models(tmp_path, mo
 # ---------------------------------------------------------------------------
 # Degraded-birth detection and self-heal
 # ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_ensure_server_born_degraded_when_proxy_not_running(tmp_path, monkeypatch):
-    """Server built while proxy not running sets the born_degraded flag."""
-    import tinyagentos.taos_agent_runtime as rt
-
-    class _FakeServer:
-        def __init__(self, cfg):
-            self._cfg = cfg
-
-        async def ensure_running(self, **kwargs):
-            pass
-
-        async def stop(self):
-            pass
-
-        @property
-        def base_url(self):
-            return f"http://127.0.0.1:{self._cfg.port}"
-
-        def is_running(self):
-            return False
-
-    monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
-
-    mock_proxy = MagicMock()
-    mock_proxy.is_running.return_value = False
-    mock_proxy.create_agent_key = AsyncMock(return_value=None)
-
-    state = SimpleNamespace(
-        data_dir=tmp_path,
-        llm_proxy=mock_proxy,
-        taos_opencode_password=None,
-        taos_opencode_server=None,
-        taos_opencode_model=None,
-        taos_opencode_session_id=None,
-    )
-
-    await rt.ensure_taos_opencode_server(state, "gpt-4o")
-
-    assert state.taos_opencode_born_degraded["gpt-4o"] is True
-
-
-@pytest.mark.asyncio
-async def test_ensure_server_self_heals_when_proxy_becomes_ready(tmp_path, monkeypatch):
-    """Second ensure call with proxy now running rebuilds: old server stopped, new one created, flag cleared."""
-    import tinyagentos.taos_agent_runtime as rt
-
-    stop_calls: list[str] = []
-    spawned_cfgs: list = []
-
-    class _FakeServer:
-        def __init__(self, cfg):
-            spawned_cfgs.append(cfg)
-            self._cfg = cfg
-
-        async def ensure_running(self, **kwargs):
-            pass
-
-        async def stop(self):
-            stop_calls.append("stopped")
-
-        @property
-        def base_url(self):
-            return f"http://127.0.0.1:{self._cfg.port}"
-
-        def is_running(self):
-            return True
-
-    monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
-
-    mock_proxy = MagicMock()
-    mock_proxy.is_running.return_value = False
-    mock_proxy.create_agent_key = AsyncMock(return_value="sk-key-1")
-
-    state = SimpleNamespace(
-        data_dir=tmp_path,
-        llm_proxy=mock_proxy,
-        taos_opencode_password=None,
-        taos_opencode_server=None,
-        taos_opencode_model=None,
-        taos_opencode_session_id=None,
-    )
-
-    # First call: proxy not ready, server born degraded.
-    await rt.ensure_taos_opencode_server(state, "gpt-4o")
-    assert state.taos_opencode_born_degraded["gpt-4o"] is True
-    assert len(spawned_cfgs) == 1
-
-    # Proxy comes up.
-    mock_proxy.is_running.return_value = True
-
-    # Second call: proxy is ready now, so should tear down and rebuild.
-    await rt.ensure_taos_opencode_server(state, "gpt-4o")
-
-    assert len(stop_calls) == 1, "old server must have been stopped"
-    assert len(spawned_cfgs) == 2, "a new server must have been created"
-    assert state.taos_opencode_born_degraded["gpt-4o"] is False
-
 
 @pytest.mark.asyncio
 async def test_ensure_server_model_switch_clears_legacy_session_id(tmp_path, monkeypatch):
@@ -787,7 +701,6 @@ async def test_ensure_server_model_switch_clears_legacy_session_id(tmp_path, mon
     monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
 
     mock_proxy = MagicMock()
-    mock_proxy.is_running.return_value = True
     mock_proxy.create_agent_key = AsyncMock(return_value="sk-key-1")
 
     state = SimpleNamespace(
@@ -854,7 +767,6 @@ async def test_ensure_server_model_switch_preserves_home_directory(tmp_path, mon
     monkeypatch.setattr(rt, "OpenCodeServer", _FakeServer)
 
     mock_proxy = MagicMock()
-    mock_proxy.is_running.return_value = True
     mock_proxy.create_agent_key = AsyncMock(return_value="sk-key-1")
 
     state = SimpleNamespace(
@@ -1218,7 +1130,6 @@ async def test_taos_agent_legacy_key_rescope_fail_remints(tmp_path, monkeypatch)
             pass
 
     mock_proxy = MagicMock()
-    mock_proxy.is_running.return_value = True
     mock_proxy.port = 7834
     # update_agent_key returns False because the key is not in the local store
     mock_proxy.update_agent_key = AsyncMock(return_value=False)

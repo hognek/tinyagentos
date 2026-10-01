@@ -150,14 +150,15 @@ async def test_gateway_off_sends_llm_null_and_mints_nothing(tmp_path, store):
 
 
 def test_gateway_flag_is_read_from_the_same_switch_that_mounts_it(tmp_path, monkeypatch):
-    # The gateway is on by default (unset); "0" is the operator's off switch.
+    # The gateway is always mounted since LiteLLM removal 2b-2a, so the old
+    # "0" off switch no longer turns the board's LLM provision off either.
     monkeypatch.setenv("TAOS_LLM_GATEWAY", "0")
-    off = BlePairingManager(data_dir=tmp_path, cluster_manager=ClusterManager(),
-                            pairing_store=None, bind_port=1)
+    old_off = BlePairingManager(data_dir=tmp_path, cluster_manager=ClusterManager(),
+                                pairing_store=None, bind_port=1)
     monkeypatch.delenv("TAOS_LLM_GATEWAY", raising=False)
     on = BlePairingManager(data_dir=tmp_path, cluster_manager=ClusterManager(),
                            pairing_store=None, bind_port=1)
-    assert (off._llm_enabled, on._llm_enabled) == (False, True)
+    assert (old_off._llm_enabled, on._llm_enabled) == (True, True)
 
 
 # -- happy path ---------------------------------------------------------------
