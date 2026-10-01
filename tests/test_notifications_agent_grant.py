@@ -243,7 +243,7 @@ async def test_admin_session_path_accepts_long_title_and_message(client, timesta
         (pre_ts, "info", "pre-existing", "x", "system", 0, 0, None, None),
     )
     await store._db.commit()
-    with patch("time.time", return_value=base_ts + 1):
+    with patch("time.time", return_value=base_ts):
         long_title = "x" * 200
         long_message = "y" * 3000
         resp = await client.post("/api/notifications", json={
@@ -261,3 +261,11 @@ async def test_admin_session_path_accepts_long_title_and_message(client, timesta
     assert len(posted["message"]) == 3000
     assert posted["title"] == long_title
     assert posted["message"] == long_message
+    # Guard: verify timestamp ordering matches the case.
+    pre_existing = [i for i in items if i["title"] == "pre-existing"][0]
+    if timestamp_kind == "same_second":
+        assert posted["timestamp"] == pre_existing["timestamp"], \
+            f"same_second: expected equal timestamps, got {posted['timestamp']} vs {pre_existing['timestamp']}"
+    else:  # pre_existing_1s_earlier
+        assert posted["timestamp"] - pre_existing["timestamp"] == 1, \
+            f"pre_existing_1s_earlier: expected 1s gap, got {posted['timestamp'] - pre_existing['timestamp']}s"
