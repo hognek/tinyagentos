@@ -314,7 +314,7 @@ async def _chat_completion_one(
         if estimate > 0:
             _record_spend(state, principal, estimate)
     else:
-        cost = cost_of(route.backend_name, route.upstream_model, usage)
+        cost = cost_of(route.backend_type or route.backend_name, route.upstream_model, usage)
         await _record_trace(state, principal, route.upstream_model, usage, cost, route.backend_name, request_text, response_text, 0, "success", estimated=False)
         if cost and cost.usd and cost.usd > 0:
             _record_spend(state, principal, cost.usd)
@@ -434,7 +434,7 @@ def _event_stream_for_route(
             if estimate > 0:
                 _record_spend(state, principal, estimate)
         else:
-            cost = cost_of(route.backend_name, route.upstream_model, usage)
+            cost = cost_of(route.backend_type or route.backend_name, route.upstream_model, usage)
             await _record_trace(state, principal, route.upstream_model, usage, cost, route.backend_name, request_text, response_text, 0, "success", estimated=False)
             if cost and cost.usd and cost.usd > 0:
                 _record_spend(state, principal, cost.usd)
