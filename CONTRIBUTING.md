@@ -6,11 +6,9 @@ Welcome - and thanks for your interest in contributing. taOS is a self-hosted AI
 
 ---
 
-## License & Contributor License Agreement
+## License
 
-taOS is open source under the **GNU Affero General Public License v3.0 or later** (AGPL-3.0-or-later; see [`LICENSE`](LICENSE)). A separate commercial license is available from jaylfc for uses the AGPL does not grant, for example embedding taOS in a proprietary product or offering it as a hosted service without releasing your modifications under the AGPL (see [`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md)).
-
-To keep this sustainable, **all contributors must agree to the Contributor License Agreement ([`CLA.md`](CLA.md))** before their contributions are merged. The CLA grants jaylfc the right to include and **relicense** your contributions under the project's licenses; **you keep ownership of your work**. You sign once - on your first pull request, comment **"I have read the CLA Document and I hereby sign the CLA"** and the CLA check turns green; it then covers all your future contributions.
+taOS is open source under the **GNU Affero General Public License v3.0 or later** (AGPL-3.0-or-later; see [`LICENSE`](LICENSE)). There is no separate commercial license and no Contributor License Agreement: your contributions are accepted under the same AGPL-3.0-or-later terms as the rest of the project, and you keep the copyright in your work.
 
 ---
 
