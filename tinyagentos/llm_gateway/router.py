@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
+
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse, PlainTextResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 from tinyagentos.llm_gateway.auth import GatewayCaller, gateway_caller
 from tinyagentos.llm_gateway.errors import (
@@ -19,7 +21,7 @@ from tinyagentos.llm_gateway.forward import (
     resolve_api_key,
 )
 from tinyagentos.llm_gateway.anthropic import chat_completion_anthropic
-from tinyagentos.llm_gateway import stt
+from tinyagentos.llm_gateway import stt, tts
 from tinyagentos.llm_gateway.resolve import TAOS_DEFAULT, find_routes, model_names, routing_table
 import tinyagentos.llm_gateway.resolve as resolve_mod
 
@@ -319,3 +321,69 @@ async def audio_transcriptions(request: Request, caller: GatewayCaller = Depends
     if response_format == "text":
         return PlainTextResponse(text)
     return JSONResponse({"text": text})
+
+
+# A JSON body of up to MAX_INPUT_CHARS characters, even all \uXXXX escapes (6 bytes
+# each), plus the small fields around it.
+_TTS_BODY_CAP = tts.MAX_INPUT_CHARS * 12 + 16 * 1024
+
+
+@router.post("/audio/speech")
+async def audio_speech(request: Request, caller: GatewayCaller = Depends(gateway_caller)):
+    """OpenAI ``/v1/audio/speech``, answered by the on-device daemon.
+
+    JSON ``model``, ``input`` (the text), optional ``voice`` (``cori``),
+    ``response_format`` (``pcm``, the default and only one) and ``sample_rate``
+    (the voice's native rate, the default, or 16000, resampled here). The reply
+    streams raw PCM16 mono and always says its rate in ``X-Sample-Rate``.
+    Local only: nothing here can reach a cloud backend, and the input text is
+    never logged, traced or kept. See ``tts`` for the rules.
+    """
+    raw = await _read_capped(request, _TTS_BODY_CAP)
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        raise bad_request("request body must be a JSON object") from None
+    if not isinstance(body, dict):
+        raise bad_request("request body must be a JSON object")
+    requested = body.get("model")
+    if not isinstance(requested, str) or not requested.strip():
+        raise bad_request("'model' must be a non-empty string")
+    requested = requested.strip()
+    text = body.get("input")
+    if not isinstance(text, str) or not text.strip():
+        raise bad_request("'input' must be a non-empty string")
+    if len(text) > tts.MAX_INPUT_CHARS:
+        raise GatewayError(413, f"'input' is over {tts.MAX_INPUT_CHARS} characters",
+                           code="input_too_long")
+    if "voice" in body and body["voice"] != tts.TTS_VOICE:
+        raise bad_request(f"'voice' must be {tts.TTS_VOICE!r} or omitted")
+    if "response_format" in body and body["response_format"] != "pcm":
+        raise bad_request("'response_format' must be 'pcm' or omitted")
+    sample_rate = body.get("sample_rate")
+    if "sample_rate" in body and (
+            sample_rate is None or isinstance(sample_rate, bool) or not isinstance(sample_rate, int)
+            or sample_rate <= 0):
+        raise bad_request("'sample_rate' must be a positive integer or omitted")
+    if not caller.may_use(requested):
+        raise model_not_permitted(requested)
+    data_dir = request.app.state.data_dir
+    try:
+        manifest = tts.load_manifest(data_dir)
+    except GatewayError as exc:
+        # Not installed: no name can match, so an unknown name is a 404, not a 409.
+        if exc.code == "tts_not_installed" and requested != tts.TTS_ALIAS:
+            raise model_not_found(f"model {requested!r} not found") from None
+        raise
+    if requested not in (tts.TTS_ALIAS, manifest["model"]):
+        raise model_not_found(f"model {requested!r} not found")
+    rate = tts.check_sample_rate(sample_rate, manifest["sample_rate"])
+    if await request.is_disconnected():
+        # The client is gone: do not spend the daemon on speech nobody awaits.
+        return Response(status_code=499)
+    speech = await tts.open_speech(text, manifest)
+    return StreamingResponse(
+        tts.stream_pcm(speech, rate),
+        media_type="audio/pcm",
+        headers={"X-Sample-Rate": str(rate), "X-Channels": "1"},
+    )
