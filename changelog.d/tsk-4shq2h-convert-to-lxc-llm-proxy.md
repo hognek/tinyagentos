@@ -1,2 +1,5 @@
 ### Fixed
 - `redeploy_agents` in `convert_to_lxc.py` now accepts and passes `llm_proxy` in `DeployRequest.extra_config`, so agents redeployed during flat-to-worker-LXC conversion receive a scoped per-agent LLM key and go through the verified gateway port guard (matching the route callers in `routes/agents.py` and `routes/agent_import.py`).
+- `redeploy_agents` no longer raises `TypeError` when an `agents.json` row already carries `extra_config`; kwargs are built without the duplicate key before merging.
+- `_convert_to_lxc` in `cli/worker.py` now queries the running controller's `/api/settings/llm-proxy` endpoint for the verified agent-listener port instead of assuming the host `litellm_port`.
+- `_convert_to_lxc` returns non-zero when any redeploy fails, instead of silently printing `Convert-to-LXC complete.`

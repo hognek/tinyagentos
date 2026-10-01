@@ -1,4 +1,5 @@
 """T9: Tests for convert_to_lxc — flat-mode to worker-LXC migration."""
+import types
 from unittest.mock import AsyncMock, patch
 import pytest
 
@@ -118,3 +119,195 @@ async def test_redeploy_agents_passes_llm_proxy_in_extra_config(monkeypatch):
     )
 
     assert captured_req["extra_config"]["llm_proxy"] is mock_proxy
+
+
+@pytest.mark.asyncio
+async def test_redeploy_agents_handles_extra_config_in_row_without_typeerror(monkeypatch, tmp_path):
+    """An agents.json row that carries extra_config must not raise TypeError.
+
+    Build the DeployRequest kwargs from cfg WITHOUT extra_config, then pass
+    the merged extra_config. On BASE this FAILS with TypeError because
+    DeployRequest(**cfg, extra_config=extra_config) sees extra_config twice.
+    """
+    from tinyagentos.deployer import DeployRequest, deploy_agent
+
+    captured_req = {}
+
+    async def fake_deploy(req):
+        captured_req["extra_config"] = req.extra_config
+        return {"success": True}
+
+    monkeypatch.setattr("tinyagentos.deployer.deploy_agent", fake_deploy)
+
+    # Row carrying extra_config (the agents.json shape).
+    await redeploy_agents([
+        {
+            "name": "agent-a",
+            "framework": "openclaw",
+            "model": "gpt-4o",
+            "data_dir": tmp_path,
+            "extra_config": {"llm_gateway_port": 7838},
+        }
+    ])
+
+    assert captured_req["extra_config"]["llm_gateway_port"] == 7838
+
+
+@pytest.mark.asyncio
+async def test_convert_to_lxc_queries_controller_for_gateway_port_and_redeploys(
+    monkeypatch, tmp_path
+):
+    """The CLI must obtain the verified agent-listener port from the RUNNING
+    controller and pass it to redeploy_agents so each agent deploys with a
+    minted key. On BASE this FAILS with 'listener is not verified' because
+    llm_gateway_port is never passed and the real deploy_agent refuses.
+    """
+    from tinyagentos.cli.worker import _convert_to_lxc
+
+    # Mock incus enumeration so drain phase is skipped.
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.list_flat_mode_agents",
+        lambda: [],
+    )
+
+    # install-worker.sh succeeds.
+    fake_run = types.SimpleNamespace(returncode=0)
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: fake_run)
+
+    # Data dir and config.
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.resolve_data_dir",
+        lambda: tmp_path,
+    )
+    fake_config = types.SimpleNamespace(server={"litellm_port": 7834})
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.load_config",
+        lambda path: fake_config,
+    )
+
+    # Controller API returns a verified port.
+    class FakeControllerClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kwargs):
+            return types.SimpleNamespace(
+                status_code=200,
+                json=lambda: {"port": 7838, "running": True},
+                raise_for_status=lambda: None,
+            )
+
+    monkeypatch.setattr("httpx.AsyncClient", FakeControllerClient)
+
+    # Track container creation to verify the deploy actually ran.
+    created = []
+
+    async def fake_create_container(name, **kwargs):
+        created.append(name)
+        return {"success": True, "name": name}
+
+    async def fake_exec(name, cmd, **kwargs):
+        cmd_str = " ".join(cmd)
+        if "hostname" in cmd_str and "-I" in cmd_str:
+            return (0, "10.0.0.5")
+        return (0, "ok")
+
+    async def fake_add_proxy_device(*a, **k):
+        return {"success": True, "output": ""}
+
+    monkeypatch.setattr("tinyagentos.deployer.create_container", fake_create_container)
+    monkeypatch.setattr("tinyagentos.deployer.exec_in_container", fake_exec)
+    monkeypatch.setattr("tinyagentos.deployer.push_file", lambda *a, **k: (0, ""))
+    monkeypatch.setattr(
+        "tinyagentos.deployer.add_proxy_device",
+        fake_add_proxy_device,
+    )
+
+    # One agent row (no extra_config here; the controller query is the B1 fix).
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker._load_agents_json",
+        lambda: [
+            {
+                "name": "test-agent",
+                "framework": "openclaw",
+                "model": "gpt-4o",
+                "data_dir": tmp_path,
+            }
+        ],
+    )
+
+    args = types.SimpleNamespace(controller_url="http://controller:6969", yes=True)
+    rc = await _convert_to_lxc(args)
+    assert rc == 0
+    assert len(created) == 1
+    assert created[0] == "taos-agent-test-agent"
+
+
+@pytest.mark.asyncio
+async def test_convert_to_lxc_exits_nonzero_when_redeploy_fails(monkeypatch, tmp_path):
+    """_convert_to_lxc must return non-zero when any redeploy fails.
+
+    On BASE it returns 0 and prints 'Convert-to-LXC complete.' regardless.
+    """
+    from tinyagentos.cli.worker import _convert_to_lxc
+
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.list_flat_mode_agents",
+        lambda: [],
+    )
+    fake_run = types.SimpleNamespace(returncode=0)
+    monkeypatch.setattr("subprocess.run", lambda *a, **k: fake_run)
+
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.resolve_data_dir",
+        lambda: tmp_path,
+    )
+    fake_config = types.SimpleNamespace(server={"litellm_port": 7834})
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.load_config",
+        lambda path: fake_config,
+    )
+
+    # Controller returns a verified port.
+    class FakeControllerClient:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, **kwargs):
+            return types.SimpleNamespace(
+                status_code=200,
+                json=lambda: {"port": 7838, "running": True},
+                raise_for_status=lambda: None,
+            )
+
+    monkeypatch.setattr("httpx.AsyncClient", FakeControllerClient)
+
+    # redeploy_agents reports one failed agent.
+    async def fake_redeploy(*args, **kwargs):
+        return ["test-agent"]
+
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker.redeploy_agents",
+        fake_redeploy,
+    )
+
+    monkeypatch.setattr(
+        "tinyagentos.cli.worker._load_agents_json",
+        lambda: [{"name": "test-agent", "framework": "openclaw", "model": "gpt-4o", "data_dir": tmp_path}],
+    )
+
+    args = types.SimpleNamespace(controller_url="http://controller:6969", yes=True)
+    rc = await _convert_to_lxc(args)
+    assert rc != 0

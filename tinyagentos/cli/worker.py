@@ -33,6 +33,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import httpx
+
 from tinyagentos.app import resolve_data_dir
 from tinyagentos.cluster.convert_to_lxc import (
     drain_and_delete_agents,
@@ -51,6 +53,23 @@ def _load_agents_json(path: Path = Path("data/agents.json")) -> list[dict]:
     if not path.exists():
         return []
     return json.loads(path.read_text())
+
+
+async def _get_verified_gateway_port(controller_url: str) -> int:
+    """Query the running controller for the verified LLM gateway agent-listener port.
+
+    Returns 0 if the controller cannot be reached or the gateway is not verified.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{controller_url}/api/settings/llm-proxy", timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("running") and data.get("port"):
+                return int(data["port"])
+    except Exception as exc:
+        logger.warning("failed to query controller for gateway port: %s", exc)
+    return 0
 
 
 async def _convert_to_lxc(args) -> int:
@@ -97,7 +116,11 @@ async def _convert_to_lxc(args) -> int:
 
     print("Redeploying agents into worker LXC...")
     agent_cfgs = _load_agents_json()
-    await redeploy_agents(agent_cfgs, llm_proxy=llm_proxy)
+    gateway_port = await _get_verified_gateway_port(args.controller_url)
+    failed = await redeploy_agents(agent_cfgs, llm_proxy=llm_proxy, gateway_port=gateway_port)
+    if failed:
+        print(f"Redeploy failed for: {', '.join(failed)}", file=sys.stderr)
+        return 1
 
     print("Convert-to-LXC complete.")
     return 0
