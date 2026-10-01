@@ -188,8 +188,6 @@ async def test_put_permitted_sets_field(monkeypatch):
     from tinyagentos.routes.agents import set_permitted_models, PermittedModelsUpdate
     agents = [{"name": "alpha", "model": "llama3", "llm_key": "sk-a"}]
     cap = {}
-    import tinyagentos.llm_proxy as M
-    monkeypatch.setattr(M.httpx, "AsyncClient", lambda **k: _Client(200, cap))
     proxy = _FakeProxy()
     req = _FakeRequest(agents, proxy=proxy)
     body = PermittedModelsUpdate(models=["llama3", "qwen3"])
@@ -266,8 +264,6 @@ async def test_put_permitted_unreachable_current_returns_409(monkeypatch):
 async def test_put_permitted_prepends_current_if_omitted(monkeypatch):
     _patch_save(monkeypatch)
     _patch_resolver(monkeypatch, {})
-    import tinyagentos.llm_proxy as M
-    monkeypatch.setattr(M.httpx, "AsyncClient", lambda **k: _Client(200, {}))
     from tinyagentos.routes.agents import set_permitted_models, PermittedModelsUpdate
     agents = [{"name": "alpha", "model": "llama3", "llm_key": "sk-a"}]
     proxy = _FakeProxy()
@@ -287,8 +283,6 @@ async def test_put_permitted_rescopes_key(monkeypatch):
     _patch_save(monkeypatch)
     _patch_resolver(monkeypatch, {})
     cap = {}
-    import tinyagentos.llm_proxy as M
-    monkeypatch.setattr(M.httpx, "AsyncClient", lambda **k: _Client(200, cap))
     from tinyagentos.routes.agents import set_permitted_models, PermittedModelsUpdate
     agents = [{"name": "alpha", "model": "llama3", "llm_key": "sk-a"}]
     proxy = _FakeProxy(capture=cap)
@@ -334,8 +328,6 @@ async def test_update_agent_model_scopes_key_to_permitted_set(monkeypatch):
     _patch_save(monkeypatch)
     _patch_resolver(monkeypatch, {})
     cap = {}
-    import tinyagentos.llm_proxy as M
-    monkeypatch.setattr(M.httpx, "AsyncClient", lambda **k: _Client(200, cap))
     from tinyagentos.routes.agents import update_agent_model, AgentModelUpdate
     agents = [
         {
@@ -365,8 +357,6 @@ async def test_update_agent_model_adds_new_model_to_permitted(monkeypatch):
     _patch_save(monkeypatch)
     _patch_resolver(monkeypatch, {})
     cap = {}
-    import tinyagentos.llm_proxy as M
-    monkeypatch.setattr(M.httpx, "AsyncClient", lambda **k: _Client(200, cap))
     from tinyagentos.routes.agents import update_agent_model, AgentModelUpdate
     # agent has no permitted_models yet
     agents = [{"name": "alpha", "model": "llama3", "llm_key": "sk-a"}]
@@ -422,8 +412,6 @@ async def test_update_agent_model_discards_stale_key_on_re_scope_failure(monkeyp
     _patch_resolver(monkeypatch, {})
     # a key the local store does not hold -- update_agent_key returns False
     proxy = _FakeProxy(db=False)
-    import tinyagentos.llm_proxy as M
-    monkeypatch.setattr(M.httpx, "AsyncClient", lambda **k: _Client(200))
     from tinyagentos.routes.agents import update_agent_model, AgentModelUpdate
     agents = [
         {
@@ -544,8 +532,6 @@ async def test_agent_set_own_model_no_rescope_on_same_permitted_set(monkeypatch)
     """Switching active model within the permitted set must NOT call update_agent_key."""
     _patch_save(monkeypatch)
     cap = {}
-    import tinyagentos.llm_proxy as M
-    monkeypatch.setattr(M.httpx, "AsyncClient", lambda **k: _Client(200, cap))
     from tinyagentos.routes.agents import agent_set_own_model, AgentSelfModelUpdate
     agents = [
         {"name": "alpha", "model": "llama3", "llm_key": "sk-abc", "permitted_models": ["llama3", "qwen3"]},

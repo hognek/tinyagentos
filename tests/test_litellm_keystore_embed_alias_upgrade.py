@@ -102,7 +102,7 @@ def _boot(tmp_data_dir):
     cfg_path.write_text(yaml.dump(cfg))
     app = create_app(data_dir=tmp_data_dir)
     app.state._startup_complete = True
-    return create_agent_listener_app(app, litellm_port=4000)
+    return create_agent_listener_app(app)
 
 
 async def _embed(listener, token: str) -> httpx.Response:

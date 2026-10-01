@@ -6,8 +6,8 @@ Settings "Install Update" flow:
   * `_find_uv` resolves uv robustly (uv is not always on PATH; on the Pi it
     lives at <install_dir>/.local/bin/uv).
   * `_install_dependencies` prefers a lockfile-pinned `uv sync --frozen
-    --extra proxy` and falls back to `pip install -e .[proxy]` only when uv is
-    absent. The proxy extra (litellm + prisma) is a core dep, so both paths
+    --extra ...` with the device's extras (none by default; ``ble`` on a
+    handset) and falls back to `pip install -e .` only when uv is absent. Both paths
     carry it to match install-server.sh.
   * a non-zero install return code aborts the update WITHOUT writing the
     pending-restart marker (the crash-loop safety net stays intact).
@@ -60,7 +60,7 @@ def test_find_uv_not_found_returns_none(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_install_uses_uv_sync_frozen(monkeypatch):
-    """uv found -> runs `uv sync --frozen --extra proxy` with cwd + HOME=project_dir."""
+    """uv found -> runs `uv sync --frozen` (no extra off a handset) with cwd + HOME=project_dir."""
     monkeypatch.setattr(settings_mod, "_detect_device_class", lambda: None)
     monkeypatch.setattr(settings_mod, "_find_uv", lambda pd: "/opt/uv")
 
@@ -78,14 +78,14 @@ async def test_install_uses_uv_sync_frozen(monkeypatch):
 
     assert rc == 0
     assert out == "synced"
-    assert captured["cmd"] == ["/opt/uv", "sync", "--frozen", "--extra", "proxy"]
+    assert captured["cmd"] == ["/opt/uv", "sync", "--frozen"]
     assert captured["cwd"] == "/srv/taos"
     assert captured["env"]["HOME"] == "/srv/taos"
 
 
 @pytest.mark.asyncio
 async def test_install_falls_back_to_pip(monkeypatch):
-    """uv absent -> runs `pip install -e .[proxy]` (legacy path)."""
+    """uv absent -> runs `pip install -e .` (legacy path; `.[]` is not a pip target)."""
     monkeypatch.setattr(settings_mod, "_detect_device_class", lambda: None)
     monkeypatch.setattr(settings_mod, "_find_uv", lambda pd: None)
     monkeypatch.setattr(Path, "exists", lambda self: False)
@@ -103,7 +103,7 @@ async def test_install_falls_back_to_pip(monkeypatch):
     rc, out = await settings_mod._install_dependencies(Path("/srv/taos"))
 
     assert rc == 0
-    assert captured["cmd"] == ["pip", "install", "-e", ".[proxy]"]
+    assert captured["cmd"] == ["pip", "install", "-e", "."]
     assert captured["cwd"] == "/srv/taos"
     assert captured["env"] is None
 
@@ -127,7 +127,7 @@ async def test_install_uses_venv_pip_when_present(monkeypatch):
     monkeypatch.setattr(settings_mod, "_run_capture", fake_run)
 
     await settings_mod._install_dependencies(project)
-    assert captured["cmd"] == [str(venv_pip), "install", "-e", ".[proxy]"]
+    assert captured["cmd"] == [str(venv_pip), "install", "-e", "."]
 
 
 # --- parity: Python selection must match shell helper ---------------------
@@ -181,10 +181,10 @@ def _shell_extras(tmp_path, taos_extras_ble=None, handset=True):
 def test_updater_extras_parity_with_shell_helper(tmp_path, monkeypatch):
     """Python _compute_update_extras matches the shell helper for identical inputs."""
     cases = [
-        ("mobile", None, "proxy,ble"),
-        (None, None, "proxy"),
-        (None, "1", "proxy,ble"),
-        ("mobile", "0", "proxy"),
+        ("mobile", None, "ble"),
+        (None, None, ""),
+        (None, "1", "ble"),
+        ("mobile", "0", ""),
     ]
 
     for device_class, taos_ble, expected in cases:
@@ -196,7 +196,7 @@ def test_updater_extras_parity_with_shell_helper(tmp_path, monkeypatch):
 
         python_extras = settings_mod._compute_update_extras()
         shell_extras = _shell_extras(tmp_path, taos_extras_ble=taos_ble, handset=(device_class == "mobile"))
-        assert tuple(python_extras) == tuple(shell_extras.split(",")), (
+        assert tuple(python_extras) == tuple(e for e in shell_extras.split(",") if e), (
             f"mismatch for device_class={device_class!r} TAOS_EXTRAS_BLE={taos_ble!r}: "
             f"python={python_extras} shell={shell_extras}"
         )
@@ -234,15 +234,14 @@ def test_updater_extras_match_install_server():
         "install-server.sh inlined function must match scripts/lib/controller_extras.sh"
     )
     
-    # Also verify that the pip install line uses the correct pattern
-    matches = re.findall(r'pip install[^\n]*-e\s+["\']?\.\[([^\]]+)\]', script)
-    assert matches, "could not find a `pip install -e .[extras]` line in install-server.sh"
-    
-    # Check that the last match uses dynamic selection (command substitution)
-    last_match = matches[-1]
-    assert last_match.startswith('$(') and last_match.endswith(')'), (
-        "install-server.sh pip extras must use $(taos_controller_extras) pattern"
+    # The installer's final pip line must take its extras from the function,
+    # bracketed only when non-empty (`.[]` is not a valid pip target).
+    assert '_taos_extras="$(taos_controller_extras)"' in script, (
+        "install-server.sh must take its extras from $(taos_controller_extras)"
     )
+    pip_lines = re.findall(r'^\./\.venv/bin/pip install[^\n]*-e[^\n]*$', script, re.MULTILINE)
+    assert pip_lines, "could not find the editable `pip install -e` line in install-server.sh"
+    assert pip_lines[-1].endswith('-e ".${_taos_extras:+[$_taos_extras]}"'), pip_lines[-1]
 
 
 @pytest.mark.asyncio
