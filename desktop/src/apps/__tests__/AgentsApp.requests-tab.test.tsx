@@ -100,4 +100,94 @@ describe("AgentsApp — requests tab gating", () => {
     const requestsTab = screen.queryByRole("tab", { name: /requests/i });
     expect(requestsTab).not.toBeInTheDocument();
   });
+
+  it("non-admin who owns no agents does not see Requests tab when other users have agents", async () => {
+    (global.fetch as any).mockImplementation((url: string) => {
+      if (url === "/api/agents") {
+        return Promise.resolve({
+          ok: true,
+          headers: { get: () => "application/json" },
+          json: () => Promise.resolve([{ name: "other-user-agent" }]),
+        } as unknown as Response);
+      }
+      if (url === "/api/agents/registry") {
+        return Promise.resolve({
+          ok: true,
+          headers: { get: () => "application/json" },
+          json: () => Promise.resolve([]),
+        } as unknown as Response);
+      }
+      if (url === "/api/agents/archived") {
+        return Promise.resolve({
+          ok: true,
+          headers: { get: () => "application/json" },
+          json: () => Promise.resolve([{ id: "arch-1", name: "old-agent" }]),
+        } as unknown as Response);
+      }
+      if (url === "/auth/status") {
+        return Promise.resolve({
+          ok: true,
+          headers: { get: () => "application/json" },
+          json: () => Promise.resolve({ user: { is_admin: false, id: "user-1" } }),
+        } as unknown as Response);
+      }
+      return Promise.resolve({
+        ok: false,
+        headers: { get: () => "application/json" },
+        json: () => Promise.resolve({}),
+      } as unknown as Response);
+    });
+
+    render(<AgentsApp windowId="test" />);
+    await waitFor(() => {
+      expect(screen.getByText(/taos agent/i)).toBeInTheDocument();
+    });
+    const requestsTab = screen.queryByRole("tab", { name: /requests/i });
+    expect(requestsTab).not.toBeInTheDocument();
+  });
+
+  it("non-admin who owns an agent sees Requests tab", async () => {
+    (global.fetch as any).mockImplementation((url: string) => {
+      if (url === "/api/agents") {
+        return Promise.resolve({
+          ok: true,
+          headers: { get: () => "application/json" },
+          json: () => Promise.resolve([{ name: "other-user-agent" }]),
+        } as unknown as Response);
+      }
+      if (url === "/api/agents/registry") {
+        return Promise.resolve({
+          ok: true,
+          headers: { get: () => "application/json" },
+          json: () => Promise.resolve([{ name: "my-agent" }]),
+        } as unknown as Response);
+      }
+      if (url === "/api/agents/archived") {
+        return Promise.resolve({
+          ok: true,
+          headers: { get: () => "application/json" },
+          json: () => Promise.resolve([{ id: "arch-1", name: "old-agent" }]),
+        } as unknown as Response);
+      }
+      if (url === "/auth/status") {
+        return Promise.resolve({
+          ok: true,
+          headers: { get: () => "application/json" },
+          json: () => Promise.resolve({ user: { is_admin: false, id: "user-1" } }),
+        } as unknown as Response);
+      }
+      return Promise.resolve({
+        ok: false,
+        headers: { get: () => "application/json" },
+        json: () => Promise.resolve({}),
+      } as unknown as Response);
+    });
+
+    render(<AgentsApp windowId="test" />);
+    await waitFor(() => {
+      expect(screen.getByText(/taos agent/i)).toBeInTheDocument();
+    });
+    const requestsTab = screen.queryByRole("tab", { name: /requests/i });
+    expect(requestsTab).toBeInTheDocument();
+  });
 });
