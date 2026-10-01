@@ -139,6 +139,9 @@ class TestSpaShellCspCompatibility:
             "/desktop/boot.js in the build. Found scripts: "
             f"{srcs!r}"
         )
+        # The rewrite itself is pinned on the emitted shell by
+        # desktop/src/__tests__/built-shell.test.ts (a real `vite build`); this
+        # guard only covers the hand-written source.
         boot = _DESKTOP_DIR / "public" / "boot.js"
         assert boot.is_file(), "desktop/public/boot.js must exist (copied to the build root)"
         # Assert the behaviour, not just that the file mentions `data-perf`: a
