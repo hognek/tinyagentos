@@ -165,6 +165,19 @@ jobs:
         run: |
           # Extract version from: npm install -g --unsafe-perm openclaw@0.2.0
           VERSION=$(grep -E 'npm install.*openclaw@' app-catalog/agents/openclaw/scripts/install.sh | sed -E 's/.*openclaw@([0-9.]+).*/\1/')
+          
+          # Validate extracted version
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: Failed to extract openclaw version from install.sh" >&2
+            exit 1
+          fi
+          
+          # Check if version matches pattern (at least major.minor.patch)
+          if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+            echo "ERROR: Invalid openclaw version format: '$VERSION' (expected format: X.Y.Z where X, Y, Z are numbers)" >&2
+            exit 1
+          fi
+          
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Extracted openclaw version: $VERSION"
 
@@ -236,7 +249,7 @@ jobs:
         env:
           OPENCLAW_VERSION: ${{ steps.extract_openclaw_version.outputs.version }}
         run: |
-          sudo incus exec build-base -- bash -eux <<'BASH'
+          sudo incus exec build-base --env OPENCLAW_VERSION="$OPENCLAW_VERSION" -- bash -eux <<'BASH'
           export DEBIAN_FRONTEND=noninteractive
           # Upstream OpenClaw from npm — pinned to the same version the
           # deploy-time install.sh uses (single source of truth).
