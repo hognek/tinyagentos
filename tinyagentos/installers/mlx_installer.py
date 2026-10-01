@@ -554,8 +554,13 @@ class MLXInstaller(AppInstaller):
             )
             return result
 
-        target = Path(str(result.get("target_dir") or ""))
-        if self._contained(target) is None:
+        reported = Path(str(result.get("target_dir") or ""))
+        # Keep the resolved path, not just the verdict: the serving agent must
+        # be pinned to the same directory string uninstall later greps for in
+        # the plist, and a symlinked models root (macOS /var -> /private/var, or
+        # a symlinked TAOS_MODELS_ROOT) makes the two differ.
+        target = self._contained(reported)
+        if target is None:
             # Same boundary rule as the download and the delete below: a
             # server must not be pointed outside the mlx backend root.
             result["mlx_serving"] = False

@@ -622,6 +622,47 @@ class TestMLXServing:
         assert "serves an MLX model directory" in result["mlx_serving_note"]
         assert "endpoint" not in result
 
+    async def test_the_pinned_path_is_the_path_uninstall_matches(
+        self, monkeypatch, tmp_path
+    ):
+        """Both halves must name the same (resolved) model directory: the
+        script's --uninstall greps the plist for the path it is given, so a
+        symlinked models root would otherwise leave the agent loaded."""
+        _fake_apple(monkeypatch)
+        monkeypatch.setattr(sys, "platform", "darwin")
+        real = tmp_path / "real-models"
+        real.mkdir()
+        link = tmp_path / "models"
+        link.symlink_to(real, target_is_directory=True)
+        unresolved = link / "mlx" / "qwen2.5" / "qwen2.5-3b"
+        unresolved.mkdir(parents=True)
+        resolved = real / "mlx" / "qwen2.5" / "qwen2.5-3b"
+
+        calls: list[list[str]] = []
+
+        async def _run_cmd(cmd, cwd=None, timeout=300):
+            calls.append(list(cmd))
+            return 0, ""
+
+        monkeypatch.setattr(mlx_mod, "run_cmd", _run_cmd)
+        monkeypatch.setattr(mlx_mod, "mlx_server_is_running", lambda *a, **k: True)
+        patcher, _ = _patch_hf_downloader(target_dir=str(unresolved))
+        installer = MLXInstaller(models_dir=link, venv_dir=tmp_path / "rt")
+        with patcher, patch.object(
+            MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
+        ):
+            result = await installer.install(
+                "qwen2.5-3b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
+            )
+        assert result["mlx_model_dir"] == str(resolved)
+        pinned = calls[0][calls[0].index("--model") + 1]
+        assert pinned == str(resolved), "the plist must pin the resolved model dir"
+
+        uninstall = await installer.uninstall("qwen2.5-3b")
+        assert uninstall["mlx_agent_unloaded"] is True
+        matched = calls[-1][calls[-1].index("--model") + 1]
+        assert matched == pinned, "uninstall must name the directory the plist pins"
+
     async def test_uninstall_unloads_the_agent_that_served_this_model(
         self, monkeypatch, tmp_path
     ):
