@@ -44,12 +44,20 @@ def clear_pending_launchd_reload() -> None:
 
 def _write_reload_helper(controller_plist: Path) -> None:
     uid = os.getuid()
+    controller_plist_q = shlex.quote(str(controller_plist))
+    helper_plist_q = shlex.quote(str(HELPER_PLIST_PATH))
     script = (
         f"sleep 1; "
         f"launchctl bootout gui/{uid} com.tinyagentos.controller; "
-        f"launchctl bootstrap gui/{uid} {shlex.quote(str(controller_plist))}; "
-        f"rm {shlex.quote(str(HELPER_PLIST_PATH))}; "
-        f"launchctl bootout gui/{uid} com.tinyagentos.plist-reload"
+        f"for i in 1 2 3 4 5; do "
+        f"  launchctl bootstrap gui/{uid} {controller_plist_q} && "
+        f"  launchctl print gui/{uid}/com.tinyagentos.controller >/dev/null 2>&1 && break; "
+        f"  sleep 2; "
+        f"done; "
+        f"if launchctl print gui/{uid}/com.tinyagentos.controller >/dev/null 2>&1; then "
+        f"  rm {helper_plist_q}; "
+        f"  launchctl bootout gui/{uid} com.tinyagentos.plist-reload; "
+        f"fi"
     )
     helper_plist = {
         "Label": "com.tinyagentos.plist-reload",

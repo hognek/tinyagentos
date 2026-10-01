@@ -1387,7 +1387,7 @@ async def set_update_channel(request: Request, body: UpdateChannel):
     prefs["tracked_branch"] = branch
     await store.save_preference("user", PREF_NAMESPACE, prefs)
 
-    rc, out, _launchd_warning = await _pip_rebuild_restart(project_dir, result.new_sha)
+    rc, out, launchd_warning = await _pip_rebuild_restart(project_dir, result.new_sha)
     if rc != 0:
         return JSONResponse(
             {"error": f"Switched to {branch} but rebuild failed: {out[:300]}",
@@ -1407,7 +1407,7 @@ async def set_update_channel(request: Request, body: UpdateChannel):
         "branch": branch,
         "snapshot": str(snapshot_path) if snapshot_path else None,
         "recovery_tag": result.recovery_tag,
-        "message": result.message,
+        "message": result.message + (f" {launchd_warning}" if launchd_warning else ""),
     }
 
 

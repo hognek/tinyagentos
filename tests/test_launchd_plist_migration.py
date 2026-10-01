@@ -287,9 +287,14 @@ class TestApplyLaunchdMigrationNoSubprocess:
         old_plist = _make_old_uvicorn_plist(install_dir="/tmp/test")
         plist_path.write_bytes(old_plist)
 
+        helper_path = tmp_path / "com.tinyagentos.plist-reload.plist"
         monkeypatch.setattr(
             "tinyagentos.launchd_migration.PLIST_PATH",
             plist_path,
+        )
+        monkeypatch.setattr(
+            "tinyagentos.launchd_migration.HELPER_PLIST_PATH",
+            helper_path,
         )
         monkeypatch.setattr("sys.platform", "darwin")
 
@@ -323,9 +328,14 @@ class TestAtomicWrite:
         original_plist = _make_old_uvicorn_plist(install_dir="/tmp/test")
         plist_path.write_bytes(original_plist)
 
+        helper_path = tmp_path / "com.tinyagentos.plist-reload.plist"
         monkeypatch.setattr(
             "tinyagentos.launchd_migration.PLIST_PATH",
             plist_path,
+        )
+        monkeypatch.setattr(
+            "tinyagentos.launchd_migration.HELPER_PLIST_PATH",
+            helper_path,
         )
         monkeypatch.setattr("sys.platform", "darwin")
 
@@ -369,9 +379,14 @@ class TestApplyLaunchdMigrationRedFirst:
         old_plist = _make_old_uvicorn_plist(install_dir="/tmp/test")
         plist_path.write_bytes(old_plist)
 
+        helper_path = tmp_path / "com.tinyagentos.plist-reload.plist"
         monkeypatch.setattr(
             "tinyagentos.launchd_migration.PLIST_PATH",
             plist_path,
+        )
+        monkeypatch.setattr(
+            "tinyagentos.launchd_migration.HELPER_PLIST_PATH",
+            helper_path,
         )
         monkeypatch.setattr("sys.platform", "darwin")
 
@@ -415,4 +430,82 @@ class TestApplyLaunchdMigrationRedFirst:
         assert len(matching) == 1, (
             f"controller plist path must be a single token in shlex.split output, "
             f"tokens: {tokens}"
+        )
+
+
+class TestHelperRetryLogic:
+    """RED-FIRST tests for B1: helper script retries bootstrap and only deletes itself on success."""
+
+    def test_helper_script_retries_bootstrap_and_preserves_plist_on_failure(
+        self, tmp_path, monkeypatch
+    ):
+        """Helper script must retry bootstrap up to 5 times and only delete helper plist on success.
+
+        If bootstrap fails all retries, the helper plist must remain so RunAtLoad re-runs it.
+        """
+        import asyncio
+        import shlex
+        import subprocess
+        import os
+        import stat
+
+        # Create a fake launchctl that fails on 'bootstrap' but succeeds on other commands
+        fake_launchctl = tmp_path / "launchctl"
+        fake_launchctl.write_text(
+            """#!/bin/sh
+# Fake launchctl for testing
+# Fails on 'bootstrap' command, succeeds on others
+if [ "$1" = "bootstrap" ]; then
+    echo "fake launchctl: bootstrap failed" >&2
+    exit 1
+fi
+if [ "$1" = "print" ]; then
+    # Simulate service not found on print (controller not loaded)
+    echo "fake launchctl: print failed - service not found" >&2
+    exit 1
+fi
+if [ "$1" = "bootout" ]; then
+    # bootout succeeds
+    exit 0
+fi
+# Unknown command
+exit 0
+"""
+        )
+        fake_launchctl.chmod(fake_launchctl.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+        # Put fake launchctl first on PATH
+        monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+
+        controller_plist = tmp_path / "controller.plist"
+        controller_plist.write_bytes(b"dummy")
+
+        helper_path = tmp_path / "com.tinyagentos.plist-reload.plist"
+        monkeypatch.setattr(
+            "tinyagentos.launchd_migration.HELPER_PLIST_PATH",
+            helper_path,
+        )
+        monkeypatch.setattr("sys.platform", "darwin")
+
+        from tinyagentos.launchd_migration import _write_reload_helper
+
+        _write_reload_helper(controller_plist)
+
+        assert helper_path.exists(), "helper plist was not written"
+        helper_plist = plistlib.loads(helper_path.read_bytes())
+        script = helper_plist["ProgramArguments"][2]
+
+        # Run the helper script with our fake launchctl
+        # The script should retry bootstrap 5 times, then leave the helper plist in place
+        result = subprocess.run(
+            ["/bin/sh", "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        # The helper plist should STILL EXIST because bootstrap failed
+        assert helper_path.exists(), (
+            f"Helper plist was deleted despite bootstrap failure! "
+            f"Script stdout: {result.stdout}, stderr: {result.stderr}, returncode: {result.returncode}"
         )
