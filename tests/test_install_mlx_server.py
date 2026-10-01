@@ -93,15 +93,35 @@ def _runtime_venv(tmp_path: Path) -> Path:
     return venv
 
 
-def _launchctl_stub() -> str:
-    """A launchctl stand-in that logs its calls and reports the label as NOT
-    loaded for `print` (the real script confirms the bootout with it)."""
+def _launchctl_stub(*, print_result: str = "absent") -> str:
+    """A launchctl stand-in that logs its calls.
+
+    ``print`` answers with the platform's unknown-service message by default
+    (what a successful bootout leaves behind). Pass ``"loaded"`` for an agent
+    launchd still has registered, or ``"error"`` for an inspection that fails
+    for some other reason (permissions, session) - the two cases the script must
+    not confuse.
+    """
+    if print_result == "loaded":
+        print_body = '        print) printf "%s\\n" "com.taos.mlx-server = { ... }"; return 0 ;;\n'
+    elif print_result == "error":
+        print_body = (
+            '        print) printf "%s\\n" "launchctl print: Operation not permitted" >&2;'
+            " return 1 ;;\n"
+        )
+    else:
+        print_body = (
+            "        print) printf '%s\\n' 'Could not find service \"com.taos.mlx-server\""
+            " in domain for user gui: 501' >&2; return 1 ;;\n"
+        )
     return (
         'launchctl() {\n'
         '    printf "launchctl %s\\n" "$*" >> "$HOME/launchctl.log"\n'
-        '    case "$1" in print) return 1;; esac\n'
-        '    return 0\n'
-        '}\n'
+        '    case "$1" in\n'
+        + print_body
+        + "    esac\n"
+        "    return 0\n"
+        "}\n"
     )
 
 
@@ -595,13 +615,35 @@ def test_uninstall_refuses_to_report_a_still_loaded_agent(tmp_path: Path) -> Non
         tmp_path,
         _globals(tmp_path, model=str(model))
         + _functions("uninstall_mlx_agent", "plist_path", "agent_target", "xml_escape")
-        + 'launchctl() { printf "launchctl %s\\n" "$*" >> "$HOME/launchctl.log"; return 0; }\n'
+        + _launchctl_stub(print_result="loaded")
         + 'id() { printf "501\\n"; }\n'
         + "uninstall_mlx_agent\n",
     )
     assert result.returncode == 1, result.stdout + result.stderr
     assert "still loaded" in result.stderr
     assert plist.exists(), "the plist of a still-loaded agent must not go away"
+
+
+def test_uninstall_refuses_to_guess_when_launchctl_cannot_answer(
+    tmp_path: Path,
+) -> None:
+    """`launchctl print` failing for a permission/session reason is NOT proof
+    the agent is gone: only its unknown-service answer is (CodeRabbit #3337)."""
+    model = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model.mkdir(parents=True)
+    plist = _plist_with_model(tmp_path, str(model))
+
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(model))
+        + _functions("uninstall_mlx_agent", "plist_path", "agent_target", "xml_escape")
+        + _launchctl_stub(print_result="error")
+        + 'id() { printf "501\\n"; }\n'
+        + "uninstall_mlx_agent\n",
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "cannot confirm" in result.stderr
+    assert plist.exists(), "an unconfirmed unload must not delete the plist"
 
 
 def test_uninstall_reports_a_failed_plist_removal(tmp_path: Path) -> None:

@@ -34,6 +34,7 @@
   (`unloaded` / `left-running` / `failed`) and only sets `mlx_agent_unloaded`
   when the agent really was unloaded, so an agent deliberately left serving a
   different model is not reported as stopped. `install-mlx-server.sh
-  --uninstall` confirms the bootout with `launchctl print` and checks the plist
-  removal, so an agent that is still registered (or a plist that could not be
-  removed) is a failure rather than a success.
+  --uninstall` confirms the bootout with `launchctl print` (only launchctl's
+  unknown-service answer counts as absence) and checks the plist removal, so a
+  still-registered agent, an inspection that cannot answer, or a plist that
+  could not be removed is a failure rather than a success.

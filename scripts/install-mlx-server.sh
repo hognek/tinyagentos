@@ -220,8 +220,18 @@ uninstall_mlx_agent() {
     # real state instead of trusting its exit code: a label that is still
     # registered keeps restarting the server (KeepAlive) even after the plist
     # and the model directory are gone.
-    if launchctl print "$(agent_target)/${LABEL}" >/dev/null 2>&1; then
+    local probe
+    if probe="$(launchctl print "$(agent_target)/${LABEL}" 2>&1)"; then
         warn "${LABEL} is still loaded after bootout: not reporting it as unloaded"
+        return 1
+    fi
+    # A failing `print` only means the agent is gone when launchctl says the
+    # service is unknown (macOS: `Could not find service "..." in domain ...`).
+    # Any other failure (a permission or session error) leaves the unload
+    # unconfirmed, so it is an uninstall error rather than a silent plist
+    # removal under an agent that may still be registered.
+    if ! printf '%s' "$probe" | grep -qiE 'could not find service|service not found|no such process'; then
+        warn "cannot confirm ${LABEL} is unloaded (launchctl print: ${probe}); leaving $plist in place"
         return 1
     fi
     # `set -e` is suspended in the caller's `uninstall_mlx_agent || rc=$?` and in
