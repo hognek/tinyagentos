@@ -51,7 +51,7 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
   primary key, the vector `metadata_json` and both lookup tiers, since agent names are not unique
   under per-user namespacing), and the "default on or default off" choice is recorded as an open
   product question instead of being assumed.
-- Invite bundle `relay` endpoint kind: when `TAOS_CONTROLLER_RELAY_URL` is set to an `https://` URL (or a private address), it is emitted at priority 1 ahead of LAN and mesh endpoints. Public `http://` relay or callback-host endpoints are omitted with a logged warning rather than downgraded to cleartext.
+- Invite bundle `relay` endpoint kind: when `TAOS_CONTROLLER_RELAY_URL` is set to an `https://` URL or an `http://` loopback URL, it is emitted at priority 1 ahead of LAN and mesh endpoints. Non-loopback `http://` relay and public `http://` callback-host endpoints are omitted with a logged warning rather than downgraded to cleartext.
 - Design doc for the skill-collaboration layer (`docs/design/skill-collaboration.md`): the `learning` A2A channel and its subscription/scoping model, the guide-supplement envelope (immutable content-addressed id, attested promotion record, authorized tombstones) and how it merges over the read-only canonical guides without overriding them, per-user (or per-project) isolation and a review-before-spread governance gate built on the Decisions app and the #896 control plane, with a three-slice build plan (#tsk-8801c4b2).
 - `GET /api/cluster/map` (admin-only, `tinyagentos/routes/cluster_map.py`) — the
   read-only capability map and live placement view for the Cluster app. It
@@ -128,15 +128,14 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
 - Nothing in taOS presents the LiteLLM master key any more: a deploy LiteLLM cannot mint for gets a key scoped to its models from the local key store (`TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK` is now a no-op), the taOS agent likewise (and it uses the gateway when the gateway can serve its models), per-agent key admin and the workspace usage view read the local key and budget stores, the provider model catalog is read from the routing table, the reasoning judge is off when the gateway is off, and the LiteLLM auth hook no longer admits the master key.
 - A remote agent is named as having no LLM gateway path (the agent listener is loopback-only) in deploy steps, logs and the cutover report.
 - `scripts/llm_gateway_parity.py --gateway-only` checks the gateway alone: status, shape, `reasoning_content`, usage, trace rows and embeddings.
-- The in-process LLM gateway (`/api/llm/v1`) is now on by default. Set `TAOS_LLM_GATEWAY=0` (or `false` / `no` / `off`) to turn it off; the next controller start then points agents back at LiteLLM.
+- The in-process LLM gateway (`/api/llm/v1`) is always on (see the `TAOS_LLM_GATEWAY` entry above: the flag is now a logged no-op).
 - Agents move to the gateway without a redeploy. Their base URL stays `127.0.0.1:4000`, and at startup the controller points each container's `taos-proxy-litellm` proxy device at a new loopback-only agent listener on host port 7838 (`server.llm_gateway_port` / `TAOS_LLM_GATEWAY_PORT`; 7837 stays with the MLX backend).
-- An agent only moves after three checks pass: the listener has proved it is this controller's (it must answer with a nonce minted fresh at each start, so another process holding the port is never trusted), the gateway can serve every model the agent's key allows, and the agent's gateway key has been minted from its LiteLLM key row. Otherwise the agent stays on LiteLLM and the controller logs the reason. The move is idempotent and reversible, and one container that errors or hangs does not stop the others.
+- An agent only moves after three checks pass: the listener has proved it is this controller's (it must answer with a nonce minted fresh at each start, so another process holding the port is never trusted), the gateway can serve every model the agent's key allows, and the agent's gateway key has been minted from its LiteLLM key row. Otherwise the agent is not moved and the controller logs the reason. The move is idempotent, and one container that errors or hangs does not stop the others.
 - The gateway now forwards OpenRouter models, which are OpenAI-compatible (default base `https://openrouter.ai/api/v1`).
-- The agent listener serves only the gateway's models and chat paths, plus `/v1/embeddings`, which it relays to LiteLLM. Every other path is a 404, including LiteLLM's admin API, `/v1/messages` and `/v1/responses`. Paths are normalised and request bodies are capped at 32 MiB.
-- The gateway no longer accepts the LiteLLM master key as admin. Agents that still hold it stay on LiteLLM and are not re-keyed. With the gateway on, a new deploy that would have fallen back to the master key gets a scoped key instead.
+- The agent listener serves only the gateway's models and chat paths, plus `/v1/embeddings`, which the gateway serves itself. Every other path is a 404, including LiteLLM's admin API, `/v1/messages` and `/v1/responses`. Paths are normalised and request bodies are capped at 32 MiB.
+- The gateway no longer accepts the LiteLLM master key as admin. Agents that still hold it are not re-keyed. With the gateway on, a new deploy that would have fallen back to the master key gets a scoped key instead.
 - Turning the gateway on by default also enables the LLM key and gateway URLs that BLE pairing provisions to boards, and lets a handset choose PicoClaw as the system agent's harness.
 - The reasoning judge now calls the gateway using the host local token. `GET /api/settings/llm-proxy` reports the gateway (`mode`, listener `port`, `url`), with LiteLLM's status listed alongside it.
-- `scripts/llm_gateway_parity.py` sends the same prompts through LiteLLM and the gateway, as a real agent, and compares status, response shape and recorded usage.
 
 ### Fixed
 
@@ -360,10 +359,9 @@ Versions follow semver beta: `1.0.0-beta.N`, bumped on each dev->master promotio
 
 ### Caveat
 
-- On Postgres-mode installs (`inhouse_keys` off), LiteLLM has no `custom_auth`
-  and rejects keystore-minted keys. Setting `TAOS_LLM_GATEWAY=0` (rollback to
-  LiteLLM) breaks every agent deployed after this PR because its key is accepted
-  only by the gateway. Stage 2b deletes the LiteLLM rollback path entirely.
+- There is no LiteLLM rollback path in this release: the gateway is the only
+  LLM path, and `TAOS_LLM_GATEWAY=0` is ignored (logged once) rather than
+  breaking agents.
 
 ## [1.0.0-beta.54] - 2026-09-29
 
