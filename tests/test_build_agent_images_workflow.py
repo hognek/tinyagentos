@@ -1,7 +1,10 @@
 """Tests for .github/workflows/build-agent-images.yml"""
 
 import fnmatch
+import os
 import re
+import subprocess
+import tempfile
 from pathlib import Path
 
 import yaml
@@ -109,16 +112,16 @@ def test_release_runs_when_detect_succeeded_not_cancelled():
     release_job = wf["jobs"]["release"]
     needs = release_job["needs"]
 
-    # Should only need detect, not build (or use a condition)
-    # The fix should make release run when detect succeeded and not cancelled
-    assert "build" not in needs, (
-        "Release job should not hard-depend on 'build' succeeding entirely. "
-        "It should run when detect succeeded and publish whatever artifacts exist."
+    assert "build" in needs, (
+        "Release job should depend on 'build' so it waits for all build legs. "
+        f"Got needs: {needs}"
     )
-    # The actual fix will use a condition like: if: needs.detect.result == 'success' && !cancelled()
-    # For now just check the structure allows this
 
-    assert isinstance(needs, str), "needs should be a string referencing the detect job"
+    if_cond = release_job.get("if", "")
+    assert "!cancelled()" in if_cond, (
+        "Release job if condition should include !cancelled() so partial "
+        f"success still publishes. Got: {if_cond}"
+    )
 
 
 def test_release_publishes_existing_artifacts():
@@ -184,6 +187,57 @@ def test_version_extract_step_fails_on_empty():
     assert "exit 1" in run_content, (
         "Extract version step should exit with error code 1 when version is invalid. "
         f"Run content: {run_content}"
+    )
+
+
+def test_extract_step_runs_against_real_install_sh():
+    """The extract step must succeed against the actual install.sh and emit exactly one version."""
+    wf = load_workflow()
+    build_steps = wf["jobs"]["build"]["steps"]
+    extract_step = next(s for s in build_steps if s.get("name") == "Extract openclaw version from install.sh")
+    run_script = extract_step["run"]
+
+    install_sh = load_install_sh()
+    match = re.search(r"npm install -g --unsafe-perm openclaw@([\d.]+)", install_sh)
+    assert match, "Could not find pinned openclaw version in install.sh"
+    expected_version = match.group(1)
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as tmp:
+        tmp_path = tmp.name
+    try:
+        env = os.environ.copy()
+        env["GITHUB_OUTPUT"] = tmp_path
+        result = subprocess.run(
+            ["bash", "-c", run_script],
+            cwd=Path(".").resolve(),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"Extract step failed (rc={result.returncode}): {result.stderr}"
+        )
+        output = Path(tmp_path).read_text()
+        assert f"version={expected_version}" in output, (
+            f"Expected 'version={expected_version}' in GITHUB_OUTPUT, got: {output}"
+        )
+    finally:
+        os.unlink(tmp_path)
+
+
+def test_release_waits_for_build():
+    """Release must wait for the build matrix and still publish partial success."""
+    wf = load_workflow()
+    release_job = wf["jobs"]["release"]
+
+    needs = release_job["needs"]
+    assert isinstance(needs, list), f"needs should be a list, got: {needs!r}"
+    assert "build" in needs, f"'build' should be in needs, got: {needs}"
+    assert "detect" in needs, f"'detect' should be in needs, got: {needs}"
+
+    if_cond = release_job.get("if", "")
+    assert "!cancelled()" in if_cond, (
+        f"Release if condition should include !cancelled(), got: {if_cond}"
     )
 
 

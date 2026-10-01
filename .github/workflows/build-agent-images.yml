@@ -163,21 +163,31 @@ jobs:
         if: matrix.base == 'openclaw'
         id: extract_openclaw_version
         run: |
-          # Extract version from: npm install -g --unsafe-perm openclaw@0.2.0
-          VERSION=$(grep -E 'npm install.*openclaw@' app-catalog/agents/openclaw/scripts/install.sh | sed -E 's/.*openclaw@([0-9.]+).*/\1/')
-          
-          # Validate extracted version
+          set -euo pipefail
+          # Collect DISTINCT versions so a matching echo/error line does not
+          # pollute the result (grep -oE anchors on the version token, then
+          # sort -u collapses duplicates).
+          VERSIONS=$(grep -oE 'openclaw@[0-9]+(\.[0-9]+)+' app-catalog/agents/openclaw/scripts/install.sh | sed 's/openclaw@//' | sort -u)
+
+          COUNT=$(printf '%s\n' "$VERSIONS" | wc -l)
+          if [ "$COUNT" -ne 1 ]; then
+            echo "ERROR: Expected exactly one distinct openclaw version in install.sh, found $COUNT" >&2
+            printf '%s\n' "$VERSIONS" >&2
+            exit 1
+          fi
+
+          VERSION=$(printf '%s\n' "$VERSIONS" | head -n1)
+
           if [ -z "$VERSION" ]; then
             echo "ERROR: Failed to extract openclaw version from install.sh" >&2
             exit 1
           fi
-          
-          # Check if version matches pattern (at least major.minor.patch)
+
           if ! [[ "$VERSION" =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
             echo "ERROR: Invalid openclaw version format: '$VERSION' (expected format: X.Y.Z where X, Y, Z are numbers)" >&2
             exit 1
           fi
-          
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Extracted openclaw version: $VERSION"
 
@@ -320,8 +330,8 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: detect
-    if: needs.detect.result == 'success' && !cancelled()
+    needs: [detect, build]
+    if: ${{ !cancelled() && needs.detect.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
