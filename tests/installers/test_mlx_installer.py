@@ -44,11 +44,11 @@ def _fake_apple(monkeypatch, *, arm64: bool = True, metal: bool = True) -> None:
     )
 
 
-def _patch_hf_downloader():
+def _patch_hf_downloader(target_dir: str = "/models/mlx/qwen2.5/qwen2.5-3b"):
     """Patch the HF multi-file downloader used for repo-backed variants."""
     fake_cls = MagicMock()
     fake_cls.return_value.install = AsyncMock(
-        return_value={"success": True, "target_dir": "/models/mlx/qwen2.5/qwen2.5-3b"}
+        return_value={"success": True, "target_dir": target_dir}
     )
     return patch("tinyagentos.installers.mlx_installer.HFMultiInstaller", fake_cls), fake_cls
 
@@ -145,6 +145,36 @@ class TestAvailabilityProbes:
     def test_server_probe_is_false_when_nothing_listens(self, monkeypatch):
         monkeypatch.setenv("TAOS_MLX_PORT", "1")
         assert mlx_mod.mlx_server_is_running(timeout=0.2) is False
+
+    def test_server_probe_follows_the_port_it_is_given(self):
+        """A live OpenAI-compatible server counts; the probe is a real GET, and
+        the port argument overrides TAOS_MLX_PORT (the installer pins a port)."""
+        import http.server
+        import threading
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
+                if self.path == "/v1/models":
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"{}")
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, *args):  # keep the test output clean
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            assert mlx_mod.mlx_server_is_running(timeout=2.0, port=port) is True
+        finally:
+            server.shutdown()
+            server.server_close()
+        assert mlx_mod.mlx_server_is_running(timeout=0.2, port=port) is False
 
 
 class TestVendoredRuntimeLocks:
@@ -300,13 +330,21 @@ class TestMLXInstallerInstall:
     async def test_result_claims_no_endpoint_and_names_the_runtime_interpreter(
         self, monkeypatch, tmp_path
     ):
-        """The installer must not advertise a service nothing starts (taOS #329):
-        mlx_lm.server is not launched by a model install."""
+        """The installer must not advertise a service that is not up (taOS #329):
+        when the launchd agent cannot be started, ``endpoint`` stays out of the
+        result while the runtime interpreter that holds the pinned `mlx-lm` is
+        still reported."""
         _fake_apple(monkeypatch)
         venv = tmp_path / "rt"
-        patcher, _ = _patch_hf_downloader()
+        patcher, _ = _patch_hf_downloader(
+            target_dir=str(tmp_path / "mlx" / "qwen2.5" / "qwen2.5-3b")
+        )
         with patcher, patch.object(
             MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
+        ), patch.object(
+            MLXInstaller,
+            "_serve_model",
+            AsyncMock(return_value=(False, "no Metal device on this host")),
         ):
             result = await MLXInstaller(models_dir=tmp_path, venv_dir=venv).install(
                 "qwen2.5-3b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
@@ -314,6 +352,8 @@ class TestMLXInstallerInstall:
         assert result["success"] is True
         assert "endpoint" not in result
         assert "runtime_location" not in result
+        assert result["mlx_serving"] is False
+        assert "no Metal device" in result["mlx_serving_error"]
         # What is true instead: the interpreter that holds the pinned runtime.
         assert result["mlx_python"] == str(venv / "bin" / "python")
         assert result["mlx_lm_version"] == mlx_mod.MLX_LM_VERSION
@@ -427,6 +467,206 @@ class TestMLXInstallerRuntime:
 
 def test_default_port_is_the_reserved_one():
     assert DEFAULT_PORT == 7837
+
+
+@pytest.mark.asyncio
+class TestMLXServing:
+    """The serving half of taOS #329: the installed model is pinned in the
+    launchd agent, and ``endpoint`` is reported only once the probe answers."""
+
+    @staticmethod
+    def _model_dir(tmp_path: Path) -> Path:
+        return tmp_path / "mlx" / "qwen2.5" / "qwen2.5-3b"
+
+    async def test_serving_step_runs_the_shipped_script_for_the_installed_model(
+        self, monkeypatch, tmp_path
+    ):
+        _fake_apple(monkeypatch)
+        target = self._model_dir(tmp_path)
+        calls: list[list[str]] = []
+
+        async def _run_cmd(cmd, cwd=None, timeout=300):
+            calls.append(list(cmd))
+            return 0, ""
+
+        monkeypatch.setattr(mlx_mod, "run_cmd", _run_cmd)
+        monkeypatch.setattr(mlx_mod, "mlx_server_is_running", lambda *a, **k: True)
+        patcher, _ = _patch_hf_downloader(target_dir=str(target))
+        with patcher, patch.object(
+            MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
+        ):
+            result = await MLXInstaller(
+                models_dir=tmp_path, venv_dir=tmp_path / "rt", port=7899
+            ).install(
+                "qwen2.5-3b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
+            )
+
+        assert result["success"] is True
+        assert len(calls) == 1, calls
+        assert calls[0][0].endswith("scripts/install-mlx-server.sh")
+        assert calls[0][1:] == [
+            "--model",
+            str(target),
+            "--venv",
+            str(tmp_path / "rt"),
+            "--port",
+            "7899",
+        ]
+        assert result["mlx_serving"] is True
+        assert result["mlx_model_dir"] == str(target)
+        assert result["endpoint"] == "http://127.0.0.1:7899/v1"
+        assert result["runtime_location"] == {
+            "host": "127.0.0.1",
+            "port": 7899,
+            "backend": "mlx",
+        }
+
+    async def test_no_endpoint_while_the_probe_never_answers(
+        self, monkeypatch, tmp_path
+    ):
+        """The script can load the agent and the server still never come up:
+        the endpoint claim waits for the same probe the checklist uses."""
+        _fake_apple(monkeypatch)
+        monkeypatch.setattr(mlx_mod, "run_cmd", AsyncMock(return_value=(0, "")))
+        monkeypatch.setattr(mlx_mod, "_SERVE_PROBE_INTERVAL_S", 0)
+        probes = {"count": 0}
+
+        def _probe(*args, **kwargs):
+            probes["count"] += 1
+            return False
+
+        monkeypatch.setattr(mlx_mod, "mlx_server_is_running", _probe)
+        patcher, _ = _patch_hf_downloader(target_dir=str(self._model_dir(tmp_path)))
+        with patcher, patch.object(
+            MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
+        ):
+            result = await MLXInstaller(models_dir=tmp_path, port=7899).install(
+                "qwen2.5-3b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
+            )
+
+        assert result["success"] is True, "the weights did land; only serving failed"
+        assert "endpoint" not in result
+        assert result["mlx_serving"] is False
+        assert "did not answer" in result["mlx_serving_error"]
+        assert probes["count"] == mlx_mod._SERVE_PROBE_ATTEMPTS
+
+    async def test_script_failure_reports_why_and_keeps_the_model(
+        self, monkeypatch, tmp_path
+    ):
+        _fake_apple(monkeypatch)
+        monkeypatch.setattr(
+            mlx_mod,
+            "run_cmd",
+            AsyncMock(return_value=(1, "no Metal device on this host: MLX cannot load\n")),
+        )
+        patcher, _ = _patch_hf_downloader(target_dir=str(self._model_dir(tmp_path)))
+        with patcher, patch.object(
+            MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
+        ):
+            result = await MLXInstaller(models_dir=tmp_path).install(
+                "qwen2.5-3b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
+            )
+
+        assert result["success"] is True
+        assert "endpoint" not in result
+        assert result["mlx_serving"] is False
+        assert "starting the MLX server failed" in result["mlx_serving_error"]
+        assert "no Metal device" in result["mlx_serving_error"]
+
+    async def test_serving_is_not_attempted_off_macos(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(sys, "platform", "linux")
+        serving, err = await MLXInstaller()._serve_model(tmp_path / "model")
+        assert serving is False
+        assert "macOS-only" in err
+
+    async def test_a_target_outside_the_mlx_root_is_never_served(
+        self, monkeypatch, tmp_path
+    ):
+        """A server must not be pointed outside the mlx backend root, whatever
+        the downloader reports."""
+        _fake_apple(monkeypatch)
+        patcher, _ = _patch_hf_downloader(target_dir="/models/mlx/somewhere-else")
+        with patcher, patch.object(
+            MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
+        ), patch.object(
+            MLXInstaller, "_serve_model", AsyncMock(return_value=(True, ""))
+        ) as serve:
+            result = await MLXInstaller(models_dir=tmp_path).install(
+                "qwen2.5-3b", install_config={"backend": "mlx"}, variant=MLX_VARIANT
+            )
+        serve.assert_not_awaited()
+        assert result["success"] is True
+        assert result["mlx_serving"] is False
+        assert "not inside the mlx backend root" in result["mlx_serving_error"]
+        assert "endpoint" not in result
+
+    async def test_single_file_variant_has_nothing_to_serve(
+        self, monkeypatch, tmp_path
+    ):
+        """`mlx_lm.server --model <dir>` loads a directory; the single-file
+        fallback is not servable, so no endpoint is claimed for it."""
+        _fake_apple(monkeypatch)
+        patcher, _ = _patch_download_downloader()
+        variant = {"id": "gguf", "download_url": "https://example/q4.gguf"}
+        with patcher, patch.object(
+            MLXInstaller, "_ensure_mlx_lm", AsyncMock(return_value=(True, ""))
+        ), patch.object(
+            MLXInstaller, "_serve_model", AsyncMock(return_value=(True, ""))
+        ) as serve:
+            result = await MLXInstaller(models_dir=tmp_path).install(
+                "qwen2.5-3b", install_config={"backend": "mlx"}, variant=variant
+            )
+        serve.assert_not_awaited()
+        assert result["success"] is True
+        assert result["mlx_serving"] is False
+        assert "serves an MLX model directory" in result["mlx_serving_note"]
+        assert "endpoint" not in result
+
+    async def test_uninstall_unloads_the_agent_that_served_this_model(
+        self, monkeypatch, tmp_path
+    ):
+        """launchd KeepAlive would restart a server against the deleted model
+        directory forever, so removing the served model unloads its agent."""
+        monkeypatch.setattr(sys, "platform", "darwin")
+        calls: list[list[str]] = []
+
+        async def _run_cmd(cmd, cwd=None, timeout=300):
+            calls.append(list(cmd))
+            return 0, ""
+
+        monkeypatch.setattr(mlx_mod, "run_cmd", _run_cmd)
+        target = self._model_dir(tmp_path)
+        target.mkdir(parents=True)
+
+        result = await MLXInstaller(models_dir=tmp_path).uninstall("qwen2.5-3b")
+
+        assert result["success"] is True and result["deleted"] == 1
+        assert result["mlx_agent_unloaded"] is True
+        assert calls[0][0].endswith("scripts/install-mlx-server.sh")
+        assert calls[0][1:] == [
+            "--uninstall",
+            "--model",
+            str(target.resolve()),
+            "--venv",
+            str(mlx_mod.mlx_runtime_venv()),
+        ]
+
+    async def test_uninstall_off_macos_does_not_touch_the_agent(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(sys, "platform", "linux")
+
+        async def _boom(*args, **kwargs):
+            raise AssertionError("the serving script must not run off macOS")
+
+        monkeypatch.setattr(mlx_mod, "run_cmd", _boom)
+        target = self._model_dir(tmp_path)
+        target.mkdir(parents=True)
+
+        result = await MLXInstaller(models_dir=tmp_path).uninstall("qwen2.5-3b")
+
+        assert result["success"] is True
+        assert "mlx_agent_unloaded" not in result
 
 
 @pytest.mark.asyncio

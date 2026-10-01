@@ -1,0 +1,528 @@
+"""``scripts/install-mlx-server.sh``: the launchd agent that serves an MLX model.
+
+Gates the serving half of taOS #329 (PR #3237 deliberately shipped no endpoint
+because nothing started ``mlx_lm.server``):
+
+  * the plist lands in ``~/Library/LaunchAgents`` pinned to ONE model, with the
+    runtime venv's ``mlx_lm.server`` and the reserved port;
+  * the agent is bootstrapped/kickstarted with ``launchctl`` (and unloaded
+    first, so a re-install replaces rather than doubles it);
+  * the health gate polls ``GET /v1/models`` and fails loudly, which is what
+    stops a model install from reporting an endpoint nothing serves;
+  * Apple Silicon + Metal is verified before any of that, on the device (an
+    arm64 VM with no Metal GPU must not get a server that cannot load a model);
+  * unloading a model's agent leaves an agent pinned to a *different* model
+    alone.
+
+Like ``tests/test_install_worker_macos.py`` this runs the production shell
+functions in a simulated environment: the functions are extracted from the
+shipped script (never copied), the host commands are shell-function stubs, and
+``$HOME`` is a throwaway directory. Nothing here needs macOS.
+"""
+
+from __future__ import annotations
+
+import re
+import shutil
+import subprocess
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+SERVE_SCRIPT = REPO_ROOT / "scripts" / "install-mlx-server.sh"
+LABEL = "com.taos.mlx-server"
+
+pytestmark = pytest.mark.skipif(
+    shutil.which("bash") is None, reason="bash required to exercise the installer"
+)
+
+
+def _extract_function(script: Path, name: str) -> str:
+    """Extract a production shell function from its header to its closing brace."""
+    text = script.read_text()
+    match = re.search(rf"^{re.escape(name)}\(\)\s*\{{", text, re.MULTILINE)
+    assert match, f"{name}() not found in {script}"
+    start = match.start()
+    depth = 0
+    index = match.end() - 1
+    while index < len(text):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+        index += 1
+    raise AssertionError(f"could not find matching closing brace of {name}()")
+
+
+def _run_wrapper(tmp_path: Path, body: str, env: dict[str, str] | None = None):
+    wrapper = tmp_path / "wrapper.sh"
+    wrapper.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body)
+    wrapper.chmod(0o755)
+    child_env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}
+    if env:
+        child_env.update(env)
+    return subprocess.run(
+        ["/usr/bin/env", "bash", str(wrapper)],
+        env=child_env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+
+def _functions(*names: str) -> str:
+    # log/warn/die come along by default: every shipped function logs, and the
+    # wrapper would otherwise die with "log: command not found". Trailing
+    # newline keeps the last function from running into what the wrapper
+    # appends next (a stub or the call itself).
+    wanted = ["log", "warn", "die"] + [n for n in names if n not in ("log", "warn", "die")]
+    return "\n".join(_extract_function(SERVE_SCRIPT, name) for name in wanted) + "\n"
+
+
+def _runtime_venv(tmp_path: Path) -> Path:
+    """A venv-looking tree with an executable ``bin/mlx_lm.server`` in it."""
+    venv = tmp_path / "venv"
+    (venv / "bin").mkdir(parents=True, exist_ok=True)
+    binary = venv / "bin" / "mlx_lm.server"
+    binary.write_text("#!/usr/bin/env bash\n")
+    binary.chmod(0o755)
+    return venv
+
+
+def _stub_host(
+    *,
+    system_profiler: str | None = 'printf "%s\\n" "      Metal Support: Metal 3"',
+    shell: str = "Darwin",
+    machine: str = "arm64",
+) -> str:
+    """Shell-function stubs for the macOS host commands the script probes.
+
+    Omitting *system_profiler* makes ``command -v system_profiler`` fail, which
+    is what a trimmed image looks like (the child runs with PATH=/usr/bin:/bin).
+    """
+    stub = (
+        f'uname() {{ case "${{1:-}}" in -s) printf "%s\\n" "{shell}";;'
+        f' -m) printf "%s\\n" "{machine}";; *) printf "%s\\n" "{shell}";; esac; }}\n'
+    )
+    if system_profiler is not None:
+        stub += f"system_profiler() {{ {system_profiler}; }}\n"
+    return stub
+
+
+def _globals(tmp_path: Path, *, model: str, port: int = 7837, timeout: int = 3) -> str:
+    return (
+        f'HOME="{tmp_path}/home"\n'
+        f'VENV_DIR="{tmp_path}/venv"\n'
+        f'MODEL_DIR="{model}"\n'
+        f'LABEL="{LABEL}"\n'
+        f'HOST="127.0.0.1"\n'
+        f'PORT="{port}"\n'
+        f'HEALTH_TIMEOUT="{timeout}"\n'
+        f'UNINSTALL="0"\n'
+        'mkdir -p "$HOME" "${VENV_DIR}/bin"\n'
+    )
+
+
+def _plist_dict(path: Path) -> dict:
+    """The plist's top-level dict as a plain Python dict (plutil is macOS-only)."""
+    root = ET.parse(path).getroot()
+    node = root.find("dict")
+    assert node is not None, "plist has no <dict>"
+    children = list(node)
+    out: dict = {}
+    index = 0
+    while index < len(children):
+        key = children[index]
+        assert key.tag == "key", key.tag
+        value = children[index + 1]
+        out[key.text] = value
+        index += 2
+    return out
+
+
+def _plist_argv(path: Path) -> list[str]:
+    node = _plist_dict(path)["ProgramArguments"]
+    return [child.text for child in node.findall("string")]
+
+
+# --- the plist ---------------------------------------------------------------
+
+
+def test_plist_is_written_under_the_fake_home_and_pins_the_model(tmp_path: Path) -> None:
+    model = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model.mkdir(parents=True)
+    _runtime_venv(tmp_path)
+
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(model))
+        + _functions("write_launchd_plist", "server_binary", "log_dir", "plist_path")
+        + _stub_host()
+        + "write_launchd_plist\n",
+    )
+    assert result.returncode == 0, result.stderr
+
+    plist = tmp_path / "home" / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+    assert plist.exists(), f"plist not written; stdout={result.stdout!r}"
+    argv = _plist_argv(plist)
+    assert argv == [
+        str(tmp_path / "venv" / "bin" / "mlx_lm.server"),
+        "--model",
+        str(model),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "7837",
+    ], argv
+    body = _plist_dict(plist)
+    assert body["Label"].text == LABEL
+    assert body["RunAtLoad"].tag == "true"
+    assert body["KeepAlive"].tag == "true"
+    # Logs sit next to the runtime venv, not inside the model tree, so the
+    # Models app can clean models without taking the service log with it.
+    assert body["StandardErrorPath"].text == str(tmp_path / "mlx-server.err.log")
+
+
+def test_plist_honours_the_configured_port(tmp_path: Path) -> None:
+    model = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model.mkdir(parents=True)
+    _runtime_venv(tmp_path)
+
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(model), port=7899)
+        + _functions("write_launchd_plist", "server_binary", "log_dir", "plist_path")
+        + _stub_host()
+        + "write_launchd_plist\n",
+    )
+    assert result.returncode == 0, result.stderr
+    plist = tmp_path / "home" / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+    argv = _plist_argv(plist)
+    assert argv[argv.index("--port") + 1] == "7899"
+
+
+# --- loading the agent -------------------------------------------------------
+
+
+def test_agent_is_booted_out_then_bootstrapped_and_started(tmp_path: Path) -> None:
+    model = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model.mkdir(parents=True)
+
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(model))
+        + _functions("load_launchd_agent", "plist_path", "agent_target")
+        + _stub_host()
+        + 'launchctl() { printf "launchctl %s\\n" "$*" >> "$HOME/launchctl.log"; }\n'
+        + 'id() { printf "501\\n"; }\n'
+        + "load_launchd_agent\n",
+    )
+    assert result.returncode == 0, result.stderr
+
+    calls = (tmp_path / "home" / "launchctl.log").read_text().splitlines()
+    # A stale agent from an earlier model path must be dropped first: bootstrap
+    # on an already-loaded label fails and would leave the old model serving.
+    assert calls[0] == f"launchctl bootout gui/501/{LABEL}"
+    assert f"launchctl bootstrap gui/501 {tmp_path}/home/Library/LaunchAgents/{LABEL}.plist" in calls
+    assert f"launchctl kickstart -k gui/501/{LABEL}" in calls
+
+
+# --- the health gate ---------------------------------------------------------
+
+
+def test_health_gate_polls_the_openai_surface(tmp_path: Path) -> None:
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(tmp_path / "model"))
+        + _functions("wait_for_mlx_health")
+        + 'curl() { printf "curl %s\\n" "$*" >> "$HOME/curl.log"; return 0; }\n'
+        + "wait_for_mlx_health\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "home" / "curl.log").read_text().strip() == (
+        "curl -fsS http://127.0.0.1:7837/v1/models"
+    )
+
+
+def test_health_gate_fails_when_the_server_never_answers(tmp_path: Path) -> None:
+    """The failure path is the contract: no answer, no endpoint report."""
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(tmp_path / "model"), timeout=2)
+        + _functions("wait_for_mlx_health")
+        + "curl() { return 7; }\n"
+        + 'sleep() { printf "slept\\n" >> "$HOME/sleep.log"; }\n'
+        + "if wait_for_mlx_health; then exit 9; fi\n"
+        + 'printf "GATE_FAILED\\n"\n'
+        + 'wc -l < "$HOME/sleep.log"\n',
+    )
+    assert result.returncode == 0, result.stderr
+    assert "GATE_FAILED" in result.stdout
+    # It retried instead of giving up on the first refused connection.
+    assert result.stdout.strip().endswith("2")
+
+
+def test_main_reports_no_endpoint_when_the_health_gate_fails(tmp_path: Path) -> None:
+    """End-to-end: the script exits non-zero, so install() cannot claim an endpoint."""
+    model = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model.mkdir(parents=True)
+    _runtime_venv(tmp_path)
+
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(model), timeout=1)
+        + _functions(
+            "main",
+            "parse_args",
+            "resolve_venv",
+            "server_binary",
+            "log_dir",
+            "plist_path",
+            "agent_target",
+            "write_launchd_plist",
+            "load_launchd_agent",
+            "wait_for_mlx_health",
+            "uninstall_mlx_agent",
+            "require_apple_silicon",
+            "require_server_binary",
+            "macos_metal_available",
+            "usage",
+        )
+        + _stub_host()
+        + "launchctl() { :; }\n"
+        + 'id() { printf "501\\n"; }\n'
+        + 'curl() { return 7; }\n'
+        + "sleep() { :; }\n"
+        + 'main --model "$MODEL_DIR" --venv "$VENV_DIR" --health-timeout 1\n',
+    )
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "did not answer http://127.0.0.1:7837/v1/models" in result.stderr
+    # The endpoint only ever appears in the success summary below.
+    assert "HTTP endpoint:" not in result.stdout
+
+
+def test_main_prints_the_endpoint_once_the_server_answers(tmp_path: Path) -> None:
+    model = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model.mkdir(parents=True)
+    _runtime_venv(tmp_path)
+
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(model))
+        + _functions(
+            "main",
+            "parse_args",
+            "resolve_venv",
+            "server_binary",
+            "log_dir",
+            "plist_path",
+            "agent_target",
+            "write_launchd_plist",
+            "load_launchd_agent",
+            "wait_for_mlx_health",
+            "uninstall_mlx_agent",
+            "require_apple_silicon",
+            "require_server_binary",
+            "macos_metal_available",
+            "usage",
+        )
+        + _stub_host()
+        + 'launchctl() { printf "%s\\n" "$*" >> "$HOME/launchctl.log"; }\n'
+        + 'id() { printf "501\\n"; }\n'
+        + "curl() { return 0; }\n"
+        + 'main --model "$MODEL_DIR" --venv "$VENV_DIR"\n',
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "HTTP endpoint: http://127.0.0.1:7837/v1" in result.stdout
+    assert (tmp_path / "home" / "Library" / "LaunchAgents" / f"{LABEL}.plist").exists()
+
+
+# --- host gates --------------------------------------------------------------
+
+
+def test_refuses_a_mac_without_a_metal_device(tmp_path: Path) -> None:
+    """arm64 alone is not enough: Metal is the device, not the architecture."""
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(tmp_path / "model"))
+        + _functions("require_apple_silicon", "macos_metal_available")
+        + _stub_host(system_profiler='printf "%s\\n" "      Metal Support: Unsupported"')
+        + "require_apple_silicon\n",
+    )
+    assert result.returncode == 1
+    assert "no Metal device" in result.stderr
+
+
+def test_refuses_a_host_that_cannot_report_metal_support(tmp_path: Path) -> None:
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(tmp_path / "model"))
+        + _functions("require_apple_silicon", "macos_metal_available")
+        + _stub_host(system_profiler=None)
+        + "require_apple_silicon\n",
+    )
+    assert result.returncode == 1
+    assert "cannot verify Metal support" in result.stderr
+
+
+def test_refuses_a_linux_host_and_an_intel_mac(tmp_path: Path) -> None:
+    linux = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(tmp_path / "model"))
+        + _functions("require_apple_silicon", "macos_metal_available")
+        + _stub_host(shell="Linux", machine="x86_64")
+        + "require_apple_silicon\n",
+    )
+    assert linux.returncode == 1
+    assert "macOS-only" in linux.stderr
+
+    intel = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(tmp_path / "model"))
+        + _functions("require_apple_silicon", "macos_metal_available")
+        + _stub_host(machine="x86_64")
+        + "require_apple_silicon\n",
+    )
+    assert intel.returncode == 1
+    assert "Apple Silicon" in intel.stderr
+
+
+def test_force_metal_short_circuits_the_probe(tmp_path: Path) -> None:
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(tmp_path / "model"))
+        + "TAOS_FORCE_METAL=1\n"
+        + _functions("require_apple_silicon", "macos_metal_available")
+        + _stub_host(system_profiler=None)
+        + 'printf "ALLOWED\\n"\n'
+        + "require_apple_silicon\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ALLOWED" in result.stdout
+
+
+def test_requires_the_pinned_runtime_before_touching_launchd(tmp_path: Path) -> None:
+    """No runtime venv (no model installed yet) is an error, not an empty agent."""
+    model = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model.mkdir(parents=True)
+    # Deliberately no `_runtime_venv`: the venv only exists once a model has
+    # been installed on the mlx backend.
+
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(model))
+        + _functions("require_server_binary", "server_binary")
+        + "require_server_binary\n",
+    )
+    assert result.returncode == 1
+    assert "no MLX server at" in result.stderr
+
+
+def test_missing_model_directory_is_an_error(tmp_path: Path) -> None:
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(tmp_path / "gone"))
+        + _functions("require_server_binary", "server_binary")
+        + "require_server_binary\n",
+    )
+    assert result.returncode == 1
+    assert "does not exist" in result.stderr
+
+
+# --- uninstall ---------------------------------------------------------------
+
+
+def _plist_with_model(tmp_path: Path, model: str) -> Path:
+    plist = tmp_path / "home" / "Library" / "LaunchAgents" / f"{LABEL}.plist"
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_text(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        "<plist version=\"1.0\"><dict>\n"
+        f"<key>ProgramArguments</key><array><string>--model</string><string>{model}</string></array>\n"
+        "</dict></plist>\n"
+    )
+    return plist
+
+
+def test_uninstall_stops_and_removes_the_agent_for_its_own_model(tmp_path: Path) -> None:
+    model = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    model.mkdir(parents=True)
+    plist = _plist_with_model(tmp_path, str(model))
+
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(model))
+        + _functions("uninstall_mlx_agent", "plist_path", "agent_target")
+        + 'launchctl() { printf "launchctl %s\\n" "$*" >> "$HOME/launchctl.log"; }\n'
+        + 'id() { printf "501\\n"; }\n'
+        + "uninstall_mlx_agent\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert not plist.exists()
+    assert (tmp_path / "home" / "launchctl.log").read_text().strip() == (
+        f"launchctl bootout gui/501/{LABEL}"
+    )
+
+
+def test_uninstall_leaves_an_agent_pinned_to_another_model(tmp_path: Path) -> None:
+    """Removing model A must not take model B's server down."""
+    served = tmp_path / "models" / "mlx" / "qwen2.5" / "qwen2.5-3b"
+    served.mkdir(parents=True)
+    other = tmp_path / "models" / "mlx" / "qwen3" / "qwen3-4b"
+    other.mkdir(parents=True)
+    plist = _plist_with_model(tmp_path, str(served))
+
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(other))
+        + _functions("uninstall_mlx_agent", "plist_path", "agent_target")
+        + 'launchctl() { printf "launchctl %s\\n" "$*" >> "$HOME/launchctl.log"; }\n'
+        + 'id() { printf "501\\n"; }\n'
+        + "uninstall_mlx_agent\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert plist.exists(), "the agent serving another model was removed"
+    assert not (tmp_path / "home" / "launchctl.log").exists(), "launchctl was called anyway"
+
+
+def test_uninstall_without_an_agent_is_a_no_op(tmp_path: Path) -> None:
+    result = _run_wrapper(
+        tmp_path,
+        _globals(tmp_path, model=str(tmp_path / "model"))
+        + _functions("uninstall_mlx_agent", "plist_path", "agent_target")
+        + 'launchctl() { printf "launchctl %s\\n" "$*" >> "$HOME/launchctl.log"; }\n'
+        + 'id() { printf "501\\n"; }\n'
+        + "uninstall_mlx_agent\n",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "no com.taos.mlx-server agent installed" in result.stdout
+
+
+# --- argument handling -------------------------------------------------------
+
+
+def test_help_lists_the_flags() -> None:
+    result = subprocess.run(
+        ["/usr/bin/env", "bash", str(SERVE_SCRIPT), "--help"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    for flag in ("--model", "--venv", "--port", "--uninstall"):
+        assert flag in result.stdout
+
+
+def test_unknown_argument_is_rejected() -> None:
+    result = subprocess.run(
+        ["/usr/bin/env", "bash", str(SERVE_SCRIPT), "--nope"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 1
+    assert "unknown argument" in result.stderr
