@@ -50,14 +50,73 @@ afterAll(() => {
   if (outDir) rmSync(outDir, { recursive: true, force: true });
 });
 
+interface ScriptTag {
+  /** Lower-cased attribute names → values (empty string for bare attributes). */
+  attrs: Record<string, string>;
+  /** Offset of the `<script` in the source string. */
+  start: number;
+  /** The raw tag text, `<script` through its closing `>`. */
+  raw: string;
+}
+
+/**
+ * Parse every `<script>` start tag with a quote-aware scanner.
+ *
+ * A regex such as `<script\b[^>]*>` stops at the first `>` even inside a
+ * quoted attribute value (e.g. `<script data-x="a>b">`), which mis-splits the
+ * tag; the Python guard in tests/test_security_headers.py switched to a real
+ * parser for exactly this reason, and HTMLParser is not available in a node
+ * vitest environment, so this does the equivalent scan by hand. Comments and
+ * script bodies are the caller's concern (the emitted shell has none).
+ */
+function scriptStartTags(html: string): ScriptTag[] {
+  const isSpace = (c: string) => c === " " || c === "\t" || c === "\n" || c === "\r" || c === "\f";
+  const tags: ScriptTag[] = [];
+  const opener = /<script\b/gi;
+  let match: RegExpExecArray | null;
+  while ((match = opener.exec(html))) {
+    const start = match.index;
+    let i = opener.lastIndex;
+    const attrs: Record<string, string> = {};
+    while (i < html.length) {
+      while (i < html.length && isSpace(html[i])) i++;
+      if (html[i] === ">") {
+        i++;
+        break;
+      }
+      if (html[i] === "/" && html[i + 1] === ">") {
+        i += 2;
+        break;
+      }
+      let name = "";
+      while (i < html.length && !isSpace(html[i]) && !"=/>".includes(html[i])) name += html[i++];
+      while (i < html.length && isSpace(html[i])) i++;
+      let value = "";
+      if (html[i] === "=") {
+        i++;
+        while (i < html.length && isSpace(html[i])) i++;
+        const quote = html[i];
+        if (quote === '"' || quote === "'") {
+          i++;
+          while (i < html.length && html[i] !== quote) value += html[i++];
+          i++; // closing quote
+        } else {
+          while (i < html.length && !isSpace(html[i]) && html[i] !== ">") value += html[i++];
+        }
+      }
+      if (name) attrs[name.toLowerCase()] = value;
+    }
+    opener.lastIndex = i;
+    tags.push({ attrs, start, raw: html.slice(start, i) });
+  }
+  return tags;
+}
+
 /** The `src` of every real <script> start tag (a `data-src` does not count). */
 function scriptSrcs(html: string): string[] {
-  const srcs: string[] = [];
-  for (const [, attrs] of html.matchAll(/<script\b([^>]*)>/gi)) {
-    const src = /(?:^|\s)src\s*=\s*("([^"]*)"|'([^']*)')/i.exec(attrs);
-    if (src) srcs.push(src[2] ?? src[3] ?? "");
-  }
-  return srcs;
+  return scriptStartTags(html)
+    .map((tag) => tag.attrs.src)
+    .filter((src): src is string => src !== undefined);
 }
 
 describe("built SPA shell keeps the pre-paint script working", () => {
@@ -79,9 +138,14 @@ describe("built SPA shell keeps the pre-paint script working", () => {
   });
 
   it("emits the pre-paint script as a blocking tag in <head>", () => {
-    const head = shell.slice(0, shell.search(/<\/head>/i));
-    expect(head).toMatch(/<script\b[^>]*\bsrc\s*=\s*"\/desktop\/boot\.js"[^>]*>/i);
-    expect(head).not.toMatch(/<script\b[^>]*\b(?:defer|async)\b/i);
+    const headEnd = shell.toLowerCase().indexOf("</head>");
+    expect(headEnd, "the built shell has no </head>").toBeGreaterThan(-1);
+    const boot = scriptStartTags(shell).find(
+      (tag) => tag.attrs.src === "/desktop/boot.js",
+    );
+    expect(boot, "no <script src=/desktop/boot.js> in the built shell").toBeDefined();
+    expect(boot!.start).toBeLessThan(headEnd);
+    expect(boot!.raw).not.toMatch(/\b(?:defer|async)\b/i);
   });
 
   it("keeps every emitted script external (CSP script-src 'self')", () => {
@@ -89,8 +153,10 @@ describe("built SPA shell keeps the pre-paint script working", () => {
     // a src on every <script>. Comments are stripped first: the shell's own
     // explanation of the change mentions script markup in prose.
     const withoutComments = shell.replace(/<!--[\s\S]*?-->/g, "");
-    const tags = withoutComments.match(/<script\b/gi)?.length ?? 0;
-    expect(tags).toBeGreaterThan(0);
-    expect(scriptSrcs(withoutComments)).toHaveLength(tags);
+    const tags = scriptStartTags(withoutComments);
+    expect(tags.length).toBeGreaterThan(0);
+    for (const tag of tags) {
+      expect(tag.attrs.src, `inline <script> in the built shell: ${tag.raw}`).toBeTruthy();
+    }
   });
 });
