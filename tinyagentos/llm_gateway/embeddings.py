@@ -32,7 +32,7 @@ import httpx
 from tinyagentos import litellm_config
 from tinyagentos.llm_gateway import forward as _forward
 from tinyagentos.llm_gateway.errors import GatewayError, bad_request, upstream_error
-from tinyagentos.llm_gateway.resolve import Route
+from tinyagentos.llm_gateway.resolve import Route, route_from_entry
 from tinyagentos.llm_usage.pricing import Cost, cost_of
 from tinyagentos.llm_usage.usage import UNKNOWN, Usage
 
@@ -79,18 +79,7 @@ async def embedding_table(state) -> list[dict]:
 
 
 def _route(entry: dict, name: str) -> Route:
-    params = entry.get("litellm_params") or {}
-    provider, sep, upstream = str(params.get("model", "")).partition("/")
-    if not sep:
-        provider, upstream = "", provider
-    return Route(
-        model_name=name,
-        provider=provider,
-        upstream_model=upstream,
-        api_base=params.get("api_base") or None,
-        api_key_ref=params.get("api_key") or None,
-        backend_name=str((entry.get("metadata") or {}).get("backend_name", "")),
-    )
+    return route_from_entry(entry, name)
 
 
 def find_embedding_routes(table: list[dict], name: str) -> list[Route]:
@@ -209,6 +198,7 @@ async def _embed_one(route: Route, body: dict, requested: str, principal: str, s
     )
     if cost and cost.usd and cost.usd > 0:
         _forward._record_spend(state, principal, cost.usd)
+    _forward._notify_lifecycle(state, route.backend_name)
     return data
 
 

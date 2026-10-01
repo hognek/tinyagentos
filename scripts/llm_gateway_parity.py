@@ -1,31 +1,15 @@
 #!/usr/bin/env python3
-"""Side-by-side parity check: LiteLLM proxy vs the in-process LLM gateway.
+"""Gateway check: the in-process LLM gateway, as one real agent.
 
-NOT a test. Run it on a live controller while LiteLLM still runs beside the
-gateway (cutover stage 1). It sends the same prompts, as one real agent (its
-own key, read from config.yaml, never printed), to both:
+NOT a test. Run it on a live controller. It sends prompts, as one real agent
+(its own key, read from config.yaml, never printed), to the gateway's agent
+listener ``http://127.0.0.1:<server.llm_gateway_port>/v1`` (default 7838).
 
-  LiteLLM   http://127.0.0.1:<server.litellm_port>/v1         (default 7834)
-  gateway   http://127.0.0.1:<server.llm_gateway_port>/v1     (agent listener, default 7838)
+The side-by-side LiteLLM comparison it used to run is gone with LiteLLM
+(removal stage 2b-2a); what was ``--gateway-only`` is now the only mode
+(the flag is still accepted, as a no-op).
 
-and compares, per prompt, non-streamed and streamed:
-  status        HTTP status code
-  shape         the OpenAI response skeleton (keys, message keys, finish_reason,
-                content type; for streams: chunk object, [DONE], usage chunk)
-  usage         prompt/completion/total tokens as the client saw them
-  recorded      the agent's spend delta in <data-dir>/.agent_budgets.db
-                (both proxies record into the same store)
-
-Exit 0 when status and shape match everywhere and the gateway reported usage
-wherever LiteLLM did; 1 otherwise; 2 when it could not run at all. Token
-counts and cost are REPORTED, not gated: two cost tables legitimately differ.
-
-  sudo -u taos /opt/taos/venv/bin/python scripts/llm_gateway_parity.py \\
-      --data-dir /opt/taos/data --agent naira
-
-GATEWAY-ONLY MODE (``--gateway-only``): no LiteLLM needed (it keeps working
-after LiteLLM is removed). Against the gateway alone, per prompt,
-non-streamed and streamed, it asserts:
+Per prompt, non-streamed and streamed, it asserts:
   status        200
   shape         a chat completion (or chunks + [DONE]); wherever the answer
                 carries ``reasoning`` it also carries ``reasoning_content``
@@ -38,7 +22,7 @@ and then one embeddings call (``--embedding-model``, default
 embedding model is told so plainly and fails).
 
   sudo -u taos /opt/taos/venv/bin/python scripts/llm_gateway_parity.py \\
-      --data-dir /opt/taos/data --agent naira --gateway-only
+      --data-dir /opt/taos/data --agent naira
 """
 from __future__ import annotations
 
@@ -49,19 +33,24 @@ import sys
 import time
 from pathlib import Path
 
+# A missing dependency is reported from main(), not at import: importing this
+# module (the deleted-symbols gate loads it from the merge tree with a bare
+# CI python) must not raise SystemExit.
 try:
     import httpx
     import yaml
-except ImportError as exc:  # pragma: no cover - run from the taOS venv
-    print(f"needs the taOS venv (httpx, pyyaml): {exc}", file=sys.stderr)
-    sys.exit(2)
+except ImportError as _exc:  # pragma: no cover - run from the taOS venv
+    httpx = yaml = None
+    _IMPORT_ERROR: ImportError | None = _exc
+else:
+    _IMPORT_ERROR = None
 
 DEFAULT_PROMPTS = [
     "Reply with the single word: pong",
     "List three primary colours as a JSON array of strings, nothing else.",
     "In one sentence, what is an incus proxy device?",
 ]
-TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
+TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0) if httpx else None
 
 
 def _load_agent(data_dir: Path, name: str) -> tuple[dict, dict]:
@@ -72,22 +61,13 @@ def _load_agent(data_dir: Path, name: str) -> tuple[dict, dict]:
     raise SystemExit(f"agent {name!r} not found in {data_dir / 'config.yaml'}")
 
 
-def _spend(data_dir: Path, agent: str) -> float | None:
-    path = data_dir / ".agent_budgets.db"
-    if not path.exists():
-        return None
-    try:
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5) as conn:
-            row = conn.execute(
-                "SELECT spend_usd FROM agent_budgets WHERE agent = ?", (agent,)
-            ).fetchone()
-    except sqlite3.Error:
-        return None
-    return float(row[0]) if row else 0.0
-
-
 def _trace_calls(data_dir: Path, agent: str) -> int | None:
-    """``llm_call`` rows across the agent's hourly trace buckets (None: unreadable)."""
+    """``llm_call`` rows across the agent's hourly trace buckets.
+
+    A legacy bucket with no ``trace_events`` table holds no llm_call rows and
+    counts 0. Any other sqlite error (locked, corrupt) makes the whole count
+    None: unknown is not zero.
+    """
     trace_dir = data_dir / "trace" / agent
     if not trace_dir.is_dir():
         return 0
@@ -95,6 +75,11 @@ def _trace_calls(data_dir: Path, agent: str) -> int | None:
     for db in sorted(trace_dir.glob("*.db")):
         try:
             with sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5) as conn:
+                has_table = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'trace_events'"
+                ).fetchone()
+                if not has_table:
+                    continue
                 row = conn.execute(
                     "SELECT COUNT(*) FROM trace_events WHERE kind = 'llm_call'"
                 ).fetchone()
@@ -289,21 +274,22 @@ def _text_plain(data) -> str:
 
 
 def main() -> int:
+    if _IMPORT_ERROR is not None:
+        print(f"needs the taOS venv (httpx, pyyaml): {_IMPORT_ERROR}", file=sys.stderr)
+        return 2
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data-dir", default="/opt/taos/data", type=Path)
     ap.add_argument("--agent", required=True, help="an agent whose key is in the local key store")
     ap.add_argument("--model", help="default: the agent's model from config.yaml")
-    ap.add_argument("--litellm-url", help="default: http://127.0.0.1:<server.litellm_port>/v1")
     ap.add_argument("--gateway-url", help="default: http://127.0.0.1:<server.llm_gateway_port or 7838>/v1")
     ap.add_argument("--prompt", action="append", help="repeatable; default: three built-in prompts")
     ap.add_argument("--json", action="store_true", help="print the full result as JSON")
     ap.add_argument("--gateway-only", action="store_true",
-                    help="check the gateway alone (no LiteLLM): status, shape, reasoning_content, "
-                         "usage, trace rows and embeddings")
+                    help="accepted for old command lines; the gateway check is the only mode")
     ap.add_argument("--embedding-model", default="taos-embedding-default",
-                    help="model for the --gateway-only embeddings check")
+                    help="model for the embeddings check")
     ap.add_argument("--skip-embeddings", action="store_true",
-                    help="--gateway-only without the embeddings check")
+                    help="leave out the embeddings check")
     args = ap.parse_args()
 
     cfg, agent = _load_agent(args.data_dir, args.agent)
@@ -316,55 +302,8 @@ def main() -> int:
         print("no --model given and the agent has none", file=sys.stderr)
         return 2
     server = cfg.get("server") or {}
-    targets = {
-        "litellm": args.litellm_url or f"http://127.0.0.1:{server.get('litellm_port', 7834)}/v1",
-        "gateway": args.gateway_url or f"http://127.0.0.1:{server.get('llm_gateway_port') or 7838}/v1",
-    }
-    prompts = args.prompt or DEFAULT_PROMPTS
-    if args.gateway_only:
-        return _gateway_only(args, key, model, targets["gateway"], prompts)
-
-    rows, ok = [], True
-    for prompt in prompts:
-        for stream in (False, True):
-            row = {"prompt": prompt[:40], "stream": stream}
-            for side, url in targets.items():
-                before = _spend(args.data_dir, args.agent)
-                res = _call(url, key, model, prompt, stream)
-                time.sleep(1.0)  # LiteLLM records spend from an async callback
-                after = _spend(args.data_dir, args.agent)
-                res["recorded_usd"] = (
-                    round(after - before, 8) if before is not None and after is not None else None
-                )
-                if not args.json:
-                    res.pop("text", None)
-                row[side] = res
-            lite, gw = row["litellm"], row["gateway"]
-            row["status_match"] = lite["status"] == gw["status"]
-            row["shape_match"] = lite["shape"] == gw["shape"]
-            row["usage_ok"] = not (lite["usage"] and not gw["usage"])
-            ok = ok and row["status_match"] and row["shape_match"] and row["usage_ok"]
-            rows.append(row)
-
-    print(f"model={model} agent={args.agent} litellm={targets['litellm']} gateway={targets['gateway']}")
-    print(f"{'prompt':42} {'strm':5} {'status L/G':11} {'shape':6} {'tokens L':>16} {'tokens G':>16} {'usd L':>10} {'usd G':>10}")
-    for r in rows:
-        lu, gu = r["litellm"]["usage"] or {}, r["gateway"]["usage"] or {}
-        print(
-            f"{r['prompt']:42} {str(r['stream']):5} "
-            f"{str(r['litellm']['status']) + '/' + str(r['gateway']['status']):11} "
-            f"{'same' if r['shape_match'] else 'DIFF':6} "
-            f"{str(lu.get('prompt_tokens')) + '+' + str(lu.get('completion_tokens')):>16} "
-            f"{str(gu.get('prompt_tokens')) + '+' + str(gu.get('completion_tokens')):>16} "
-            f"{str(r['litellm']['recorded_usd']):>10} {str(r['gateway']['recorded_usd']):>10}"
-        )
-        if not r["shape_match"]:
-            print(f"    litellm shape: {r['litellm']['shape']}")
-            print(f"    gateway shape: {r['gateway']['shape']}")
-    if args.json:
-        print(json.dumps(rows, indent=2))
-    print("PARITY OK" if ok else "PARITY FAILED")
-    return 0 if ok else 1
+    url = args.gateway_url or f"http://127.0.0.1:{server.get('llm_gateway_port') or 7838}/v1"
+    return _gateway_only(args, key, model, url, args.prompt or DEFAULT_PROMPTS)
 
 
 if __name__ == "__main__":
