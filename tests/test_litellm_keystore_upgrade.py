@@ -22,6 +22,7 @@ import pytest
 
 import tinyagentos.litellm_auth as hook_mod
 import tinyagentos.llm_gateway.auth as gw
+from tinyagentos.litellm_config import EMBEDDING_ALIAS
 from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
 
 # dev's agent_keys schema before this change, verbatim.
@@ -188,7 +189,9 @@ async def test_old_key_authenticates_through_the_gateway(tmp_path):
     tokens = _old_db(default_keystore_path(data_dir))
     caller = _gateway(data_dir, tokens["agent-a"])
     assert (caller.caller_id, caller.kind) == ("agent-a", "agent")
-    assert caller.allowed_models == frozenset({"gpt-small", "default"})
+    # Its own scope, plus the embedding alias the one-shot grant adds to
+    # pre-alias agent keys (test_litellm_keystore_embed_alias_upgrade.py).
+    assert caller.allowed_models == frozenset({"gpt-small", "default", EMBEDDING_ALIAS})
 
 
 @pytest.mark.asyncio

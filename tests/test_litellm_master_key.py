@@ -165,17 +165,12 @@ class TestProxyConsistency:
         assert env_key.startswith("sk-taos-")
 
     @pytest.mark.asyncio
-    async def test_create_agent_key_header_matches_env_key(self, tmp_path, monkeypatch):
-        """Bearer token in /key/generate request must equal the generated master key."""
+    async def test_create_agent_key_never_sends_the_master_key(self, tmp_path, monkeypatch):
+        """LiteLLM removal stage 2a: minting is the local key store, so no
+        request carries the master key (or reaches /key/generate at all)."""
         import tinyagentos.llm_proxy as mod
 
-        expected_key = get_litellm_master_key(tmp_path)
-        captured_headers: list[dict] = []
-
-        class _FakeResp:
-            status_code = 200
-            def json(self):
-                return {"key": "sk-virtual-abc"}
+        captured: list = []
 
         class _FakeClient:
             def __init__(self, *a, **kw):
@@ -185,11 +180,10 @@ class TestProxyConsistency:
             async def __aexit__(self, *exc):
                 return False
             async def post(self, url, json=None, headers=None):
-                captured_headers.append(headers or {})
-                return _FakeResp()
+                captured.append((url, headers))
+                raise AssertionError("no LiteLLM admin call expected")
 
         monkeypatch.setattr(mod.httpx, "AsyncClient", _FakeClient)
-
         proxy = mod.LLMProxy(port=14098, database_url="postgres://x:y@h/db", data_dir=tmp_path)
 
         class _FakeProc:
@@ -197,8 +191,6 @@ class TestProxyConsistency:
                 return None
         proxy._process = _FakeProc()
 
-        await proxy.create_agent_key("test-agent")
-
-        assert captured_headers, "No HTTP call was made"
-        auth = captured_headers[0].get("Authorization", "")
-        assert auth == f"Bearer {expected_key}"
+        key = await proxy.create_agent_key("test-agent")
+        assert key and key != get_litellm_master_key(tmp_path)
+        assert captured == []

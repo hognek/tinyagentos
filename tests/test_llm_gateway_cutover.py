@@ -275,7 +275,7 @@ async def test_new_deploy_attaches_its_proxy_device_to_the_gateway_port(tmp_path
 @pytest.mark.parametrize("check", ["unroutable", "missing"])
 async def test_new_deploy_on_an_unforwardable_model_stays_on_litellm(tmp_path, monkeypatch, check):
     async def unroutable(models):
-        return "model 'gpt-a' is served by a 'rkllama' backend without /v1/chat/completions"
+        return "model 'gpt-a' is not in the routing table"
 
     extra = {"llm_gateway_port": GATEWAY_PORT}
     if check == "unroutable":
@@ -506,9 +506,9 @@ def _listener_with_fakes(identity=None):
     ("POST", "/v1/../key/generate"),
 ])
 async def test_listener_refuses_everything_it_does_not_serve(method, path):
-    """Only /v1/embeddings reaches LiteLLM: its admin API, /v1/messages and
-    /v1/responses (which skip the gateway's keys, allowlists and budgets) and
-    every controller route are a 404 at the listener."""
+    """Nothing reaches LiteLLM (embeddings are the gateway's since stage 2a):
+    its admin API, /v1/messages and /v1/responses (which skip the gateway's
+    keys, allowlists and budgets) and every controller route are a 404."""
     listener, fake_passthrough, seen = _listener_with_fakes()
     with patch("tinyagentos.llm_gateway.listener._passthrough", side_effect=fake_passthrough):
         async with AsyncClient(transport=ASGITransport(app=listener), base_url="http://127.0.0.1:4000") as c:
@@ -523,8 +523,8 @@ async def test_listener_refuses_everything_it_does_not_serve(method, path):
     ("/v1/chat/completions/", "main", "/api/llm/v1/chat/completions"),
     ("/chat/completions//", "main", "/api/llm/v1/chat/completions"),
     ("/v1/models/", "main", "/api/llm/v1/models"),
-    ("/v1/embeddings/", "litellm", "/v1/embeddings"),
-    ("/embeddings", "litellm", "/embeddings"),
+    ("/v1/embeddings/", "main", "/api/llm/v1/embeddings"),
+    ("/embeddings", "main", "/api/llm/v1/embeddings"),
 ])
 async def test_listener_normalises_trailing_slashes(path, where, canonical):
     """A trailing slash must not route around the gateway (and its budgets)."""
@@ -570,64 +570,32 @@ async def test_listener_stamps_its_identity_on_every_response():
 
 
 @pytest.mark.asyncio
-async def test_listener_relays_other_paths_to_litellm_verbatim(monkeypatch):
-    """/v1/embeddings (TAOS_EMBEDDING_URL) still works for a migrated agent:
-    method, path, query, bearer and body reach LiteLLM; status and body come back."""
+@pytest.mark.parametrize("path", ["/v1/embeddings", "/embeddings", "/v1/embeddings/"])
+async def test_listener_never_relays_embeddings_to_litellm(monkeypatch, path):
+    """/v1/embeddings (TAOS_EMBEDDING_URL) is served by the gateway since
+    LiteLLM removal stage 2a: the main app gets it at /api/llm/v1/embeddings
+    and no request reaches the LiteLLM port, even when LiteLLM is down."""
     import httpx
 
     from tinyagentos.llm_gateway import listener as mod
 
-    seen = {}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen["method"] = request.method
-        seen["url"] = str(request.url)
-        seen["auth"] = request.headers.get("authorization")
-        seen["body"] = request.content
-
-        class _Wire(httpx.AsyncByteStream):  # a streamed body, like a real socket
-            async def __aiter__(self):
-                yield b'{"object": "list", '
-                yield b'"data": [{"embedding": [0.1]}]}'
-
-        return httpx.Response(201, stream=_Wire(),
-                              headers={"x-litellm": "yes", "content-type": "application/json"})
-
-    real_client = httpx.AsyncClient
-    monkeypatch.setattr(mod.httpx, "AsyncClient",
-                        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
-    main_app = AsyncMock()
-    listener = mod.create_agent_listener_app(main_app, litellm_port=LITELLM_PORT)
-    async with AsyncClient(transport=ASGITransport(app=listener), base_url="http://127.0.0.1:4000") as c:
-        resp = await c.post("/v1/embeddings?x=1", json={"input": "hi", "model": "taos-embed"},
-                            headers={"Authorization": "Bearer sk-taos-agentkey"})
-    assert resp.status_code == 201
-    assert resp.json()["data"][0]["embedding"] == [0.1]
-    assert resp.headers["x-litellm"] == "yes"
-    assert seen["method"] == "POST"
-    assert seen["url"] == f"http://127.0.0.1:{LITELLM_PORT}/v1/embeddings?x=1"
-    assert seen["auth"] == "Bearer sk-taos-agentkey"
-    assert json.loads(seen["body"]) == {"input": "hi", "model": "taos-embed"}
-    main_app.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_listener_answers_502_when_litellm_is_down(monkeypatch):
-    import httpx
-
-    from tinyagentos.llm_gateway import listener as mod
+    litellm_calls = []
 
     def handler(request):
+        litellm_calls.append(str(request.url))
         raise httpx.ConnectError("refused", request=request)
 
     real_client = httpx.AsyncClient
     monkeypatch.setattr(mod.httpx, "AsyncClient",
                         lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw))
-    listener = mod.create_agent_listener_app(AsyncMock(), litellm_port=LITELLM_PORT)
+    listener, _fake_passthrough, seen = _listener_with_fakes()
     async with AsyncClient(transport=ASGITransport(app=listener), base_url="http://127.0.0.1:4000") as c:
-        resp = await c.post("/v1/embeddings", json={"input": "hi"})
-    assert resp.status_code == 502
-    assert resp.json()["error"]["code"] == "upstream_unavailable"
+        resp = await c.post(path, json={"input": "hi", "model": "taos-embedding-default"},
+                            headers={"Authorization": "Bearer sk-taos-agentkey"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"from": "gateway"}
+    assert seen == {"main": ["/api/llm/v1/embeddings"], "litellm": []}
+    assert litellm_calls == []
 
 
 # ---------------------------------------------------------------------------
@@ -636,8 +604,9 @@ async def test_listener_answers_502_when_litellm_is_down(monkeypatch):
 
 
 # The Orange Pi's two live agents run OpenRouter models; an NPU box runs
-# rkllama (Ollama-shaped, no /v1/chat/completions); deepseek is a LiteLLM
-# native provider the gateway does not speak.
+# rkllama (Ollama-shaped, serves /v1/chat/completions at the pinned ref);
+# deepseek is OpenAI-compatible. Every configured chat provider is servable,
+# so the unservable case is a model no backend serves any more.
 BACKENDS = [
     {"name": "or-cloud", "type": "openrouter", "url": "https://openrouter.ai/api/v1",
      "models": [{"id": "tencent/hy3:free"}, {"id": "nvidia/nemotron-3-ultra-550b-a55b:free"}],
@@ -892,9 +861,10 @@ async def test_wait_for_listener_recognises_our_listener_and_nothing_else(tmp_da
     (["tencent/hy3:free"], True),
     (["tencent/hy3:free", "nvidia/nemotron-3-ultra-550b-a55b:free"], True),
     (["gpt-a"], True),
-    (["default"], False),                            # highest priority: rkllama (no /v1 chat)
-    (["deepseek-chat"], False),                      # a provider the gateway does not speak
-    (["tencent/hy3:free", "deepseek-chat"], False),  # EVERY model must be servable
+    (["default"], True),                             # highest priority: rkllama (/v1 chat)
+    (["deepseek-chat"], True),                       # OpenAI-compatible
+    (["tencent/hy3:free", "deepseek-chat"], True),
+    (["tencent/hy3:free", "no-such-model"], False),  # EVERY model must be servable
     (["no-such-model"], False),
     ([], False),
     (["taos-default"], False),                       # nothing behind it
@@ -913,22 +883,22 @@ async def test_models_problem_follows_taos_default(tmp_path):
     state = _state(tmp_path, [])
     state.desktop_settings = _Prefs("tencent/hy3:free")
     assert await models_problem(state, ["taos-default"]) is None
-    state.desktop_settings = _Prefs("deepseek-chat")
+    state.desktop_settings = _Prefs("gone-model")
     assert await models_problem(state, ["taos-default"]) is not None
 
 
 @pytest.mark.asyncio
 async def test_agent_on_an_unforwardable_model_stays_on_litellm(tmp_path, monkeypatch):
-    """naira on OpenRouter moves; an agent on rkllama (Ollama-shaped, no /v1
-    chat) and one on deepseek stay, each with a logged reason."""
+    """naira on OpenRouter moves; agents on models no backend serves any more
+    stay, each with a logged reason."""
     from tinyagentos.llm_gateway import cutover
 
     monkeypatch.delenv("TAOS_LLM_GATEWAY", raising=False)
     monkeypatch.setattr(cutover, "wait_for_listener", _ready)
     agents = [
         _agent_with_key(tmp_path, "naira", ["tencent/hy3:free"]),
-        _agent_with_key(tmp_path, "npu", ["default"]),
-        _agent_with_key(tmp_path, "ds", ["deepseek-chat"]),
+        _agent_with_key(tmp_path, "npu", ["gone-npu-model"]),
+        _agent_with_key(tmp_path, "ds", ["gone-ds-model"]),
     ]
     names = {f"taos-agent-{a['name']}": PROJECT for a in agents}
     fake = FakeIncus(names, {n: f"tcp:127.0.0.1:{LITELLM_PORT}" for n in names})
@@ -939,7 +909,7 @@ async def test_agent_on_an_unforwardable_model_stays_on_litellm(tmp_path, monkey
     assert [r["agent"] for r in report["repointed"]] == ["naira"]
     skipped = {r["agent"]: r["reason"] for r in report["skipped"]}
     assert set(skipped) == {"npu", "ds"}
-    assert "rkllama" in skipped["npu"] and "deepseek" in skipped["ds"]
+    assert "gone-npu-model" in skipped["npu"] and "gone-ds-model" in skipped["ds"]
     assert fake.connect["taos-agent-npu"] == f"tcp:127.0.0.1:{LITELLM_PORT}"
     assert fake.connect["taos-agent-ds"] == f"tcp:127.0.0.1:{LITELLM_PORT}"
     # Nothing is minted for an agent that is not moving.
@@ -953,7 +923,7 @@ async def test_agent_on_the_gateway_whose_model_became_unforwardable_goes_back(t
 
     monkeypatch.delenv("TAOS_LLM_GATEWAY", raising=False)
     monkeypatch.setattr(cutover, "wait_for_listener", _ready)
-    agent = _agent_with_key(tmp_path, "npu", ["default"])
+    agent = _agent_with_key(tmp_path, "npu", ["gone-npu-model"])
     fake = FakeIncus({"taos-agent-npu": PROJECT}, {"taos-agent-npu": f"tcp:127.0.0.1:{GATEWAY_PORT}"})
     state = _state(tmp_path, [agent], llm_gateway_agent_port=GATEWAY_PORT,
                    llm_gateway_listener_identity="n")
@@ -1046,3 +1016,28 @@ async def test_settings_reports_the_gateway_as_the_llm_proxy(tmp_data_dir, monke
     assert data["port"] == port
     if mode == "gateway":
         assert data["running"] is True and data["url"] == "/api/llm/v1"
+
+
+# ---------------------------------------------------------------------------
+# Backend parity: rkllama and hailo-ollama both expose /v1/chat/completions
+# at their pinned refs (rkllama dadea413 measured live; hailo-ollama 1a3ba6be
+# read from source: non-stream OpenAI JSON, stream NDJSON the gateway
+# translates), and deepseek is OpenAI-compatible.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend,model", [
+    ({"name": "npu", "type": "rkllama", "url": "http://localhost:8080", "priority": 1}, "default"),
+    ({"name": "hailo", "type": "hailo-ollama", "url": "http://localhost:8000", "priority": 1}, "default"),
+    ({"name": "ds", "type": "deepseek", "url": "https://api.deepseek.com",
+      "models": [{"id": "deepseek-chat"}], "api_key": "sk-ds", "priority": 1}, "deepseek-chat"),
+    ({"name": "ds", "type": "deepseek", "url": "",
+      "models": [{"id": "deepseek-chat"}], "api_key": "sk-ds", "priority": 1}, "deepseek-chat"),
+], ids=["rkllama", "hailo-ollama", "deepseek", "deepseek-default-base"])
+async def test_models_problem_serves_npu_and_deepseek_backends(tmp_path, backend, model):
+    from tinyagentos.llm_gateway.cutover import models_problem
+
+    state = _state(tmp_path, [])
+    state.config.backends = [backend]
+    assert await models_problem(state, [model]) is None

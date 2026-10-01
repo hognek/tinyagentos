@@ -310,6 +310,7 @@ def build_model_list(
                     "metadata": {
                         "priority": backend.get("priority", 99),
                         "backend_name": backend.get("name", ""),
+                        "backend_type": backend_type,
                     },
                 })
 
@@ -319,6 +320,7 @@ def build_model_list(
             "metadata": {
                 "priority": backend.get("priority", 99),
                 "backend_name": backend.get("name", ""),
+                "backend_type": backend_type,
             },
         })
 
@@ -357,6 +359,7 @@ def build_model_list(
                     "metadata": {
                         "priority": backend.get("priority", 99),
                         "backend_name": backend_name,
+                        "backend_type": backend_type,
                         "source": "local-installed",
                     },
                 })
@@ -384,6 +387,7 @@ def build_model_list(
                     "metadata": {
                         "priority": backend.get("priority", 99),
                         "backend_name": backend.get("name", ""),
+                        "backend_type": backend_type,
                     },
                 })
                 if not aliased_embedding_claimed:
@@ -394,6 +398,7 @@ def build_model_list(
                         "metadata": {
                             "priority": backend.get("priority", 99),
                             "backend_name": backend.get("name", ""),
+                            "backend_type": backend_type,
                             "aliases": discovered_name,
                         },
                     })

@@ -46,21 +46,15 @@ def _reset_module_caches(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_master_key_bypasses_budget_check(tmp_path, monkeypatch):
-    """The master-key admin passthrough must never consult the budget store."""
+async def test_master_key_is_an_unknown_key(tmp_path, monkeypatch):
+    """LiteLLM removal stage 2a: the master key is no admin passthrough; the
+    hook looks it up like any key and refuses it (401)."""
+    from fastapi import HTTPException
     monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-taos-master-123")
-    # Point at a budget store that would reject any real agent lookup — the
-    # master key must never even open it.
-    budgets = AgentBudgetStore(tmp_path / "budgets.db")
-    budgets.set_budget("some-agent", 0.0)
-    budgets.add_spend("some-agent", 1.0)
-    monkeypatch.setenv("TAOS_AGENT_BUDGETS", str(tmp_path / "budgets.db"))
-
-    # Reaching this assertion at all proves the bypass: an over-budget agent
-    # would have raised HTTPException(429) before returning. We assert a valid
-    # auth object rather than the exact api_key, which litellm hashes.
-    result = await _auth(_FakeRequest(), "sk-taos-master-123")
-    assert result is not None
+    monkeypatch.setenv("TAOS_LITELLM_KEYSTORE", str(tmp_path / "keys.db"))
+    with pytest.raises(HTTPException) as exc_info:
+        await _auth(_FakeRequest(), "sk-taos-master-123")
+    assert exc_info.value.status_code == 401
 
 
 @pytest.mark.asyncio

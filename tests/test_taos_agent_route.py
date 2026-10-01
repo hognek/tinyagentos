@@ -287,3 +287,69 @@ async def test_upload_50mb_cap_enforced(client):
     big = b"A" * (50 * 1024 * 1024 + 1)
     resp = await _upload(client, "big.bin", big)
     assert resp.status_code == 413
+
+
+# ---------------------------------------------------------------------------
+# opencode harness without LiteLLM: the gateway serves the model
+# ---------------------------------------------------------------------------
+
+
+class _SentinelStart(Exception):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_chat_opencode_with_gateway_and_no_litellm_is_not_a_litellm_503(client, app, monkeypatch):
+    """opencode's base URL is the gateway's /api/llm/v1 when the gateway can
+    serve the model, so a stopped LiteLLM must not block the chat. The
+    fixture routes ``default`` to an rkllama backend."""
+    import tinyagentos.routes.taos_agent as ta_module
+
+    monkeypatch.setenv("TAOS_LLM_GATEWAY", "1")
+    await client.patch("/api/taos-agent/settings", json={"model": "default"})
+    mock_proxy = MagicMock()
+    mock_proxy.is_running.return_value = False
+    app.state.llm_proxy = mock_proxy
+    reached = []
+
+    async def fake_ensure(app_state, model):
+        reached.append(model)
+        raise _SentinelStart("sentinel-opencode-start")
+
+    monkeypatch.setattr(ta_module, "ensure_taos_opencode_server", fake_ensure)
+    resp = await client.post(
+        "/api/taos-agent/chat",
+        json={"messages": [{"role": "user", "content": "Hello"}]},
+    )
+    assert reached == ["default"], resp.text
+    assert "sentinel-opencode-start" in resp.json()["error"]
+    assert "LiteLLM" not in resp.json()["error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("gateway,needle", [("0", "turned off"), ("1", "cannot serve")])
+async def test_chat_opencode_no_gateway_path_and_no_litellm_503_names_the_gateway(
+    client, app, monkeypatch, gateway, needle,
+):
+    import tinyagentos.routes.taos_agent as ta_module
+
+    monkeypatch.setenv("TAOS_LLM_GATEWAY", gateway)
+    # Not in the routing table: the gateway cannot serve it.
+    await client.patch("/api/taos-agent/settings",
+                       json={"model": "default" if gateway == "0" else "gone-model"})
+    mock_proxy = MagicMock()
+    mock_proxy.is_running.return_value = False
+    app.state.llm_proxy = mock_proxy
+
+    async def must_not_start(app_state, model):
+        raise AssertionError("opencode must not start without an LLM path")
+
+    monkeypatch.setattr(ta_module, "ensure_taos_opencode_server", must_not_start)
+    resp = await client.post(
+        "/api/taos-agent/chat",
+        json={"messages": [{"role": "user", "content": "Hello"}]},
+    )
+    assert resp.status_code == 503
+    error = resp.json()["error"]
+    assert "gateway" in error and needle in error
+    assert "LiteLLM proxy is not running" in error
