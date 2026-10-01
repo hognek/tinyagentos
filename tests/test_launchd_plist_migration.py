@@ -355,3 +355,64 @@ class TestAtomicWrite:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+class TestApplyLaunchdMigrationRedFirst:
+    """RED-FIRST tests for B1 (backup order) and B2 (quoted paths in reload helper)."""
+
+    def test_bak_holds_original_bytes_before_overwrite(self, tmp_path, monkeypatch):
+        """The .bak must contain the ORIGINAL plist bytes, not the migrated ones."""
+        import asyncio
+        import shutil
+
+        plist_path = tmp_path / "com.tinyagentos.controller.plist"
+        old_plist = _make_old_uvicorn_plist(install_dir="/tmp/test")
+        plist_path.write_bytes(old_plist)
+
+        monkeypatch.setattr(
+            "tinyagentos.launchd_migration.PLIST_PATH",
+            plist_path,
+        )
+        monkeypatch.setattr("sys.platform", "darwin")
+
+        from tinyagentos.launchd_migration import apply_launchd_migration
+
+        result = asyncio.run(apply_launchd_migration("/tmp/test"))
+        assert result[0] is True, f"migration should succeed: {result}"
+
+        bak_path = plist_path.with_suffix(".plist.bak")
+        assert bak_path.exists(), ".bak file was not created"
+        assert bak_path.read_bytes() == old_plist, (
+            ".bak must contain original bytes, not the migrated plist"
+        )
+
+    def test_write_reload_helper_quotes_paths_with_spaces(self, tmp_path, monkeypatch):
+        """Paths with spaces in _write_reload_helper must be shlex.quoted."""
+        import shlex
+        from tinyagentos.launchd_migration import HELPER_PLIST_PATH as REAL_HELPER_PATH
+
+        controller_plist = tmp_path / "path with spaces" / "controller.plist"
+        controller_plist.parent.mkdir(parents=True)
+        controller_plist.write_bytes(b"dummy")
+
+        helper_path = tmp_path / "helper.plist"
+        monkeypatch.setattr(
+            "tinyagentos.launchd_migration.HELPER_PLIST_PATH",
+            helper_path,
+        )
+
+        from tinyagentos.launchd_migration import _write_reload_helper
+
+        _write_reload_helper(controller_plist)
+
+        assert helper_path.exists(), "helper plist was not written"
+        helper_plist = plistlib.loads(helper_path.read_bytes())
+        script = helper_plist["ProgramArguments"][2]
+
+        # shlex.split must preserve the full quoted path as a single token
+        tokens = shlex.split(script)
+        matching = [t for t in tokens if t.startswith(str(controller_plist))]
+        assert len(matching) == 1, (
+            f"controller plist path must be a single token in shlex.split output, "
+            f"tokens: {tokens}"
+        )

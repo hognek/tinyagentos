@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import os
 import plistlib
+import shlex
 import shutil
 from pathlib import Path
 
@@ -46,8 +47,8 @@ def _write_reload_helper(controller_plist: Path) -> None:
     script = (
         f"sleep 1; "
         f"launchctl bootout gui/{uid} com.tinyagentos.controller; "
-        f"launchctl bootstrap gui/{uid} {controller_plist}; "
-        f"rm {HELPER_PLIST_PATH}; "
+        f"launchctl bootstrap gui/{uid} {shlex.quote(str(controller_plist))}; "
+        f"rm {shlex.quote(str(HELPER_PLIST_PATH))}; "
         f"launchctl bootout gui/{uid} com.tinyagentos.plist-reload"
     )
     helper_plist = {
@@ -225,14 +226,11 @@ async def apply_launchd_migration(install_dir: str) -> tuple[bool, str | None]:
             return True, None
 
         # Write atomically: use atomic_write_bytes instead of temp file + rename
-        # Note: For test compatibility, we still create a .bak backup in case of failure
         bak_path = plist_path.with_suffix(".plist.bak")
 
-        # Write new plist atomically first (ensures atomicity without temp file)
-        atomic_write_bytes(plist_path, new_plist_bytes)
+        atomic_write_bytes(bak_path, plist_bytes)
 
-        # Now create backup (after successful write to protect original)
-        shutil.copy2(plist_path, bak_path)
+        atomic_write_bytes(plist_path, new_plist_bytes)
 
         # Write the one-shot reload helper (C1: separate job, no bootout here)
         _write_reload_helper(plist_path)
