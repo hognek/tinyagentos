@@ -520,6 +520,7 @@ async def _unpause(app_state, agent: dict, note_path: Path | None) -> None:
     # resumed over /resume, so the in-memory flag flips even if persistence
     # fails; the failure is surfaced and the recovery note is kept.
     agent["paused"] = False
+    agent["paused_by_restart"] = False
     from tinyagentos.config import save_config_locked
 
     config = app_state.config
@@ -691,20 +692,30 @@ async def _resume_retry_loop(app_state, names: list[str]) -> None:
                 agent["paused_by_restart"] = False
         from tinyagentos.config import save_config_locked
 
+        save_ok = True
         try:
             await save_config_locked(config, config.config_path)
         except Exception:
             logger.exception("persisting agent unpauses after retry window failed")
+            save_ok = False
 
         # The whole point of this warning is to make the failure visible; a
         # notification-store error must not silently swallow it.
         try:
-            await notif.add(
-                title="Some agents could not be resumed",
-                message=(
+            if save_ok:
+                message = (
                     f"Could not tell these agents to resume after the restart: "
                     f"{', '.join(sorted(remaining))}. Their paused flags have been cleared."
-                ),
+                )
+            else:
+                message = (
+                    f"Could not tell these agents to resume after the restart: "
+                    f"{', '.join(sorted(remaining))}. Config write failed; paused flags "
+                    f"cleared in memory but may reappear after the next restart."
+                )
+            await notif.add(
+                title="Some agents could not be resumed",
+                message=message,
                 level="warning",
                 source="system.lifecycle",
             )

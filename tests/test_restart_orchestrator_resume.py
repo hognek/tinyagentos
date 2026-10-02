@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -428,3 +428,160 @@ class TestResumeBoundsNonDictSnapshot:
 
         encoded = json.dumps(posted["note"]["context_snapshot"], separators=(",", ":"))
         assert len(encoded) <= ro._MAX_CONTEXT_SNAPSHOT_BYTES
+
+
+class TestRetryResumeClearsRestartMarker:
+    """Tests for the fix: retry-window resume must clear paused_by_restart."""
+
+    @pytest.mark.asyncio
+    async def test_a_retry_resume_clears_the_restart_marker(self, tmp_path, monkeypatch):
+        """An agent paused_by_restart whose first /resume fails and whose
+        retry-loop /resume succeeds ends with paused=False AND
+        paused_by_restart=False in the saved config."""
+        agent = {"name": "retry-marker", "host": "10.0.0.20", "port": 8080, "paused": True, "paused_by_restart": True}
+        state = _app_state(tmp_path, [agent])
+        attempts = {"n": 0}
+
+        async def flaky_post(host, port, note):
+            attempts["n"] += 1
+            return attempts["n"] >= 2
+
+        monkeypatch.setattr(ro, "_post_resume", flaky_post)
+
+        fake_time = 0.0
+        def fake_monotonic():
+            return fake_time
+
+        async def fake_sleep(duration):
+            nonlocal fake_time
+            fake_time += duration
+
+        monkeypatch.setattr(ro, "_monotonic", fake_monotonic)
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+        await ro.resume_agents_from_notes(state)
+        for task in list(state._background_tasks):
+            await task
+
+        assert agent["paused"] is False
+        assert agent["paused_by_restart"] is False
+
+
+class TestUserPauseAfterRetryResumeSurvivesRestart:
+    """Tests for the fix: a later user pause must not be adopted by the next restart."""
+
+    @pytest.mark.asyncio
+    async def test_a_user_pause_after_a_retry_resume_survives_the_next_restart(self, tmp_path, monkeypatch):
+        """Continue from retry-resume, pause the agent through the Agents app
+        pause route helper, then run a restart prepare answering 200 plus a
+        restart resume: no /resume POST is sent and paused stays True."""
+        agent = {"name": "user-after-retry", "host": "10.0.0.21", "port": 8080, "paused": True, "paused_by_restart": True}
+        state = _app_state(tmp_path, [agent])
+        attempts = {"n": 0}
+
+        async def flaky_post(host, port, note):
+            attempts["n"] += 1
+            return attempts["n"] >= 2
+
+        monkeypatch.setattr(ro, "_post_resume", flaky_post)
+
+        fake_time = 0.0
+        def fake_monotonic():
+            return fake_time
+
+        async def fake_sleep(duration):
+            nonlocal fake_time
+            fake_time += duration
+
+        monkeypatch.setattr(ro, "_monotonic", fake_monotonic)
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+        await ro.resume_agents_from_notes(state)
+        for task in list(state._background_tasks):
+            await task
+
+        assert agent["paused"] is False
+        assert agent["paused_by_restart"] is False
+
+        # Now simulate a user pause via the Agents app pause route logic:
+        # the route sets paused=True and paused_by_restart=False
+        agent["paused"] = True
+        agent["paused_by_restart"] = False
+
+        # Now run a restart prepare (200) + restart resume
+        # Use the RestartOrchestrator.prepare for "restart" reason
+        orch = ro.RestartOrchestrator(state)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"note_path": "/remote/note.json"}
+
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_cm = MagicMock()
+        mock_cm.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_cm.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("httpx.AsyncClient", return_value=mock_cm):
+            await orch._prepare_agent(agent, "restart", state.data_dir)
+
+        # The user pause should NOT be adopted by the restart
+        assert agent["paused"] is True
+        assert agent["paused_by_restart"] is False
+
+        # Now run resume_agents_from_notes - should NOT send /resume for user-paused agent
+        posted = {}
+        async def fake_post(host, port, note):
+            posted["called"] = True
+            return True
+
+        monkeypatch.setattr(ro, "_post_resume", fake_post)
+        await ro.resume_agents_from_notes(state)
+
+        assert agent["paused"] is True
+        assert "called" not in posted
+
+
+class TestNonRestartPauseSettersClearRestartMarker:
+    """Tests that non-restart pause setters clear paused_by_restart."""
+
+    @pytest.mark.asyncio
+    async def test_disk_quota_pause_clears_restart_marker(self, tmp_path, monkeypatch):
+        """disk_quota.py pause must set paused_by_restart=False."""
+        from tinyagentos.disk_quota import DiskQuotaMonitor
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock, MagicMock
+
+        config = SimpleNamespace(agents=[{"name": "quota-agent", "paused": False, "paused_by_restart": True, "disk_quota_gib": 10}])
+        backend = MagicMock()
+        notifications = SimpleNamespace(emit_event=AsyncMock())
+        monitor = DiskQuotaMonitor(config, backend, notifications)
+
+        agent = config.agents[0]
+        # Call the internal _scan_one method with a simulated "hard" state
+        # Mock _sample_usage to return a value that triggers hard threshold
+        async def mock_sample_usage(container_name):
+            return 15.0  # 150% of 10 GiB quota = hard
+
+        monkeypatch.setattr(monitor, "_sample_usage", mock_sample_usage)
+        await monitor._scan_one("quota-agent", "taos-agent-quota-agent")
+
+        assert agent["paused"] is True
+        assert agent["paused_by_restart"] is False
+
+    def test_failure_handler_pause_clears_restart_marker(self, tmp_path):
+        """scheduler/failure_handler.py pause must set paused_by_restart=False."""
+        from tinyagentos.scheduler.failure_handler import _pause_and_notify
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+
+        config = SimpleNamespace(agents=[{"name": "failure-agent", "paused": False, "paused_by_restart": True}])
+        notif_store = SimpleNamespace(add=AsyncMock())
+
+        # Call the internal helper directly
+        import asyncio
+        asyncio.run(_pause_and_notify("failure-agent", "worker1", config, notif_store))
+
+        agent = config.agents[0]
+        assert agent["paused"] is True
+        assert agent["paused_by_restart"] is False
