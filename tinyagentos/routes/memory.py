@@ -30,6 +30,7 @@ from fastapi import APIRouter, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from tinyagentos.agent_token_auth import check_agent_scope
 from tinyagentos.otel.trace_context import build_trace_context_headers
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,18 @@ async def memory_browse(
     conversation_id: str | None = None,
 ):
     """Browse memory chunks via qmd serve GET /browse."""
+    # Check if this is a registry-JWT agent request (not a human session)
+    agent_canonical_id = await check_agent_scope(request, "memory_read")
+    
+    # For registry-JWT agents, restrict to own namespace
+    if agent_canonical_id is not None:
+        # If an agent name was provided in the query, ensure it matches the calling agent's own
+        if agent is not None and agent != agent_canonical_id:
+            raise HTTPException(status_code=403, detail="Agent can only browse its own memory")
+        # Use the canonical_id for the agent namespace, not the query parameter
+        # The _agent_db_path will use canonical_id when agent is set
+        agent = agent_canonical_id
+    
     http_client = request.app.state.http_client
     params: dict = {"limit": limit, "offset": offset}
     if collection:
@@ -174,6 +187,17 @@ async def memory_search(request: Request, body: SearchRequest):
     Aggregating across agents is a separate concern that belongs in a
     future ``/api/memory/all`` endpoint, gated by user permission.
     """
+    # Check if this is a registry-JWT agent request (not a human session)
+    agent_canonical_id = await check_agent_scope(request, "memory_read")
+    
+    # For registry-JWT agents, restrict to own namespace
+    if agent_canonical_id is not None:
+        # If an agent name was provided in the body, ensure it matches the calling agent's own
+        if body.agent is not None and body.agent != agent_canonical_id:
+            raise HTTPException(status_code=403, detail="Agent can only search its own memory")
+        # Use the canonical_id for the agent namespace, not the query parameter
+        body.agent = agent_canonical_id
+    
     db_path = _agent_db_path(request, body.agent)
     search_fn = _qmd_vsearch if body.mode == "semantic" else _qmd_search
 
@@ -197,6 +221,16 @@ async def memory_collections(
     request: Request, agent_name: str, conversation_id: str | None = None,
 ):
     """List memory collections for an agent via qmd serve GET /collections."""
+    # Check if this is a registry-JWT agent request (not a human session)
+    agent_canonical_id = await check_agent_scope(request, "memory_read")
+    
+    # For registry-JWT agents, restrict to own namespace
+    if agent_canonical_id is not None:
+        # Ensure the agent is requesting collections for itself only
+        if agent_name != agent_canonical_id:
+            raise HTTPException(status_code=403, detail="Agent can only access its own collections")
+        # agent_name is already the canonical_id for registry-JWT agents
+    
     http_client = request.app.state.http_client
     params: dict = {"dbPath": _agent_db_path(request, agent_name)}
     headers = build_trace_context_headers(conversation_id=conversation_id)
@@ -219,6 +253,20 @@ async def memory_delete_chunk(
     Routes to the per-agent index when ``agent`` is set, otherwise to
     the default user index.
     """
+    # For registry-JWT agents, DELETE is not allowed even with memory_read
+    # This route remains human-only as per the spec
+    try:
+        await check_agent_scope(request, "memory_read")
+        # If check_agent_scope returns without raising, the agent has some scope
+        # but not memory_read, so we should return 403
+        raise HTTPException(status_code=403, detail="Memory deletion is human-only")
+    except HTTPException as e:
+        # If it's 401 or 403 from check_agent_scope, that means:
+        # - 401: no valid Authorization header (or human token) - human can proceed
+        # - 403: valid token but missing required scope - human can proceed (agent can't access)
+        # Re-raise the same exception to stop processing
+        raise e
+    
     http_client = request.app.state.http_client
     payload: dict = {"hash": content_hash, "dbPath": _agent_db_path(request, agent)}
     headers = build_trace_context_headers(conversation_id=conversation_id)

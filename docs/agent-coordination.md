@@ -733,6 +733,12 @@ different project, and 403 when the agent lacks the `canvas_read` scope or the
   `tinyagentos/auth_middleware.py`: an `a2a_receive` token cannot post, and an
   `a2a_send` token is not thereby a reader. Do not describe them as one scope
   covering four routes.
+- **memory_read**: read an agent's own memory index via qmd serve.
+  `GET /api/memory/browse`, `POST /api/memory/search`, `GET /api/memory/collections/{agent_name}`.
+  These routes restrict results to the calling agent's OWN memory namespace (its own
+  agent name / canonical_id) — an agent must never read another agent's memory.
+  The DELETE `/api/memory/chunk/{content_hash}` route stays human-only and is not
+  reachable by agent tokens, even with memory_read.
 
 Access is per-project: a token is authorized for a project only when the agent
 holds an active grant + membership there; a request for a project it has no
