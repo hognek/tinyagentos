@@ -74,7 +74,7 @@ async def device_tts(request: Request, _device: dict = Depends(device_scope(VOIC
             return Response(status_code=499)
         speech = await tts.open_speech(text, manifest)
     except GatewayError as exc:
-        raise _device_error(exc) from None
+        raise _device_error(exc, too_large_code="input_too_long") from None
     return tts.SpeechResponse(
         speech, rate,
         media_type="audio/pcm",

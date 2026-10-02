@@ -288,6 +288,9 @@ async def test_tts_oversize_body_is_413_before_parsing(vapp, tmp_data_dir, daemo
         r = await c.post(TTS_URL, headers={**_bearer(tok), "content-type": "application/json"},
                          content=b'{"text": "' + b"a" * 300000 + b'"}')
     assert r.status_code == 413
+    # The device contract has ONE 413 for speech: the gateway's generic
+    # request_too_large must not leak through.
+    assert err(r) == "input_too_long"
     assert daemon.requests == []
 
 
