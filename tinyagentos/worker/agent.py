@@ -176,6 +176,11 @@ _PROBEABLE_TYPES = frozenset(
     {"rkllama", "ollama", "hailo-ollama", "llama-cpp", "vllm", "exo", "mlx", "sd-cpp"}
 )
 _MAX_EXTRA_BACKENDS = 16
+# Total time one candidate may take. httpx timeouts are per read, so a server
+# trickling bytes could otherwise hold the probe (and the heartbeat, which the
+# controller marks offline after 30 s) indefinitely. Up to three sequential
+# requests at a 3 s timeout each fit inside it.
+_PROBE_DEADLINE_S = 10.0
 
 # Each candidate is an outbound request on every heartbeat, so it is held to
 # loopback or a private LAN. Explicit ranges, not ipaddress.is_private (which
@@ -264,7 +269,12 @@ def _manifest_entry_url(m: dict) -> str | None:
     if isinstance(health_url, str) and health_url.strip():
         try:
             parts = urlsplit(health_url.strip())
-            return _normalize_probe_url(f"{parts.scheme}://{parts.netloc}", loopback_only=True)
+            origin = _normalize_probe_url(f"{parts.scheme}://{parts.netloc}", loopback_only=True)
+            # The entry is reported under its declared port, so a health_url
+            # on another port would split it across two backends.
+            if port not in (None, 0) and urlsplit(origin).port != port:
+                raise ValueError(f"its port does not match the declared port {port!r}")
+            return origin
         except ValueError as exc:
             _warn_probe_entry_once(
                 f"worker manifest: ignoring health_url of {m.get('model_id')!r}: {exc}"
@@ -400,11 +410,23 @@ class WorkerAgent:
         # Probed concurrently so dead candidates cost one timeout in total,
         # not one each (the heartbeat must beat the controller's 30 s
         # offline cutoff). LAN candidates get a short connect timeout.
+        async def probe_by_deadline(client: httpx.AsyncClient, backend_type: str, base_url: str):
+            try:
+                return await asyncio.wait_for(probe(client, backend_type, base_url),
+                                              _PROBE_DEADLINE_S)
+            except asyncio.TimeoutError:
+                _warn_probe_entry_once(
+                    f"probe of {backend_type} at {base_url} took over "
+                    f"{_PROBE_DEADLINE_S:g} s; treating it as down"
+                )
+                return None
+
         async with httpx.AsyncClient(timeout=3) as local_client, \
                 httpx.AsyncClient(timeout=httpx.Timeout(3.0, connect=1.0)) as lan_client:
             results = await asyncio.gather(*(
-                probe(local_client if _candidate_key(bt, url)[2] == "loopback" else lan_client,
-                      bt, url)
+                probe_by_deadline(
+                    local_client if _candidate_key(bt, url)[2] == "loopback" else lan_client,
+                    bt, url)
                 for bt, url in candidates
             ))
         backends = [b for b in results if b is not None]
@@ -658,6 +680,24 @@ class WorkerAgent:
             caps.add("app-streaming")
         return sorted(caps)
 
+    def _advertised_url(self, backends: list[dict]) -> str:
+        """The URL the controller reaches this worker on: the pinned
+        advertise_url, else TAOS_ADVERTISE_IP (+ worker_port), else the first
+        live loopback backend (the legacy fallback the task router relies on
+        for a co-located worker), else get_worker_url(). Never a LAN backend
+        from TAOS_EXTRA_BACKENDS: that is another machine, and worker-control
+        traffic (with its bearer token) would go there."""
+        if self.advertise_url:
+            return self.advertise_url
+        adv_ip = os.environ.get("TAOS_ADVERTISE_IP", "").strip()
+        if adv_ip:
+            return f"http://{adv_ip}:{self.worker_port}" if self.worker_port else f"http://{adv_ip}"
+        for b in backends:
+            url = b.get("url")
+            if url and _candidate_key(b.get("type", ""), url)[2] == "loopback":
+                return url
+        return self.get_worker_url()
+
     def get_worker_url(self) -> str:
         """Get this worker's reachable URL."""
         # Try to get LAN IP
@@ -717,16 +757,7 @@ class WorkerAgent:
         # (DNAT'd to the LXC), so honour it for both the advertised URL and the
         # host_lan_ip used to match the incus remote to this worker.
         adv_ip = os.environ.get("TAOS_ADVERTISE_IP", "").strip()
-        # Mirror get_worker_url's port handling: include the worker_port when set
-        # so the controller stores a reachable host:port (not a bare host).
-        adv_url = None
-        if adv_ip:
-            adv_url = f"http://{adv_ip}:{self.worker_port}" if self.worker_port else f"http://{adv_ip}"
-        worker_url = (
-            self.advertise_url
-            or adv_url
-            or next((b["url"] for b in backends if b.get("url")), self.get_worker_url())
-        )
+        worker_url = self._advertised_url(backends)
 
         payload = {
             "name": self.name,
@@ -865,13 +896,7 @@ class WorkerAgent:
                 vram = None
                 vram_sampled_age_ms = None
             adv_ip = os.environ.get("TAOS_ADVERTISE_IP", "").strip()
-            live_url = (
-                self.advertise_url
-                or (f"http://{adv_ip}:{self.worker_port}" if adv_ip and self.worker_port
-                    else f"http://{adv_ip}" if adv_ip
-                    else None)
-                or (backends[0]["url"] if backends else self.get_worker_url())
-            )
+            live_url = self._advertised_url(backends)
             live_host_lan_ip = adv_ip or _detect_lan_ip(self.controller_url)
             path = "/api/cluster/heartbeat"
             payload = {
