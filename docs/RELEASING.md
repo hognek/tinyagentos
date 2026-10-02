@@ -64,26 +64,43 @@ Do not skip this: a `.gitignore` conflict resolution can quietly drop a
 key-material rule while every test stays green. The gate is the verification, not
 an assumption.
 
-### 5. Tag and create a GitHub Release
+### 5. Tag (the tag push publishes the GitHub Release)
 
 On `master`, after the merge commit:
 
 ```bash
-git tag v1.0.0-beta.N
+git tag -a v1.0.0-beta.N -m "v1.0.0-beta.N"
 git push origin v1.0.0-beta.N
 ```
 
-Create a GitHub Release for that tag. Paste the matching CHANGELOG section as the release body:
+Pushing the tag runs `.github/workflows/release.yml`, which:
+
+1. refuses to publish if the tagged commit's `pyproject.toml` version is not the tag,
+2. takes the release body from the `## [1.0.0-beta.N]` section of `CHANGELOG.md`
+   (`scripts/changelog_section.py`; it fails rather than publish empty or wrong notes),
+3. publishes the release with `--latest` and attaches the prebuilt desktop bundle,
+4. fails unless `/releases/latest` now names the new tag.
+
+**The release is not done until that workflow run is green.** Check it, then confirm:
 
 ```bash
-gh release create v1.0.0-beta.N --title "v1.0.0-beta.N" --notes-file <notes> --latest
+gh api repos/jaylfc/taOS/releases/latest --jq .tag_name   # must print v1.0.0-beta.N
 ```
 
-Do NOT pass `--prerelease`: betas are our normal releases here, and the in-app
-update check (`tinyagentos/github_releases.py`) reads `/releases/latest`, which
-skips prereleases. A release created as a prerelease leaves both the GitHub
-"Latest" badge and the update check stuck on the previous version.
-The taos.my changelog page pulls from GitHub Releases, so this is the canonical public record.
+This step exists because beta.54 and beta.55 were tagged without a GitHub Release
+(2026-09-30 to 2026-10-02): the in-app update check (`tinyagentos/github_releases.py`)
+reads `/releases/latest`, which skips tags without a release, so installed hosts kept
+seeing beta.53. The taos.my changelog page also pulls from GitHub Releases.
+
+Do NOT create the release as a prerelease: `/releases/latest` skips prereleases.
+
+**Fallback** if the workflow cannot run (Actions outage), publish by hand from the same
+notes; ci.yml's `release: published` trigger then attaches the bundle:
+
+```bash
+python3 scripts/changelog_section.py v1.0.0-beta.N > notes.md
+gh release create v1.0.0-beta.N --verify-tag --title "v1.0.0-beta.N" --notes-file notes.md --latest
+```
 
 ## Notes
 

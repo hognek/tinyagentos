@@ -1,0 +1,82 @@
+name: Release
+
+# Pushing a version tag IS the release. beta.54 and beta.55 were tagged on
+# master but the separate `gh release create` step was skipped, so GitHub showed
+# no release for 16 days and the in-app update check (which reads
+# /releases/latest, tinyagentos/github_releases.py) kept offering beta.53.
+# This workflow removes that manual step: the tag push publishes the release
+# with the CHANGELOG section as its body and attaches the prebuilt desktop
+# bundle.
+#
+# A release created with GITHUB_TOKEN does NOT fire `release: published`
+# events, so ci.yml's per-version bundle attach never runs for it. The bundle
+# is therefore built and attached here, from the tagged commit.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the tag matches the release commit's version
+        run: |
+          version=$(python3 -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "v${version}" != "${TAG}" ]; then
+            echo "::error::tag ${TAG} is on a commit whose pyproject version is ${version}; refusing to publish"
+            exit 1
+          fi
+
+      - name: Extract release notes from CHANGELOG.md
+        run: python3 scripts/changelog_section.py "${TAG}" CHANGELOG.md > release-notes.md
+
+      - name: Set up Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Build desktop bundle
+        run: |
+          cd desktop
+          npm ci --silent
+          npm run build
+          cd ..
+          tar -C static -czf desktop-bundle.tar.gz desktop
+          git rev-parse HEAD:desktop > desktop-tree.txt
+          sha256sum desktop-bundle.tar.gz | awk '{print $1}' > desktop-bundle.sha256
+
+      - name: Publish the GitHub Release
+        run: |
+          # Betas are our normal releases: never --prerelease, or /releases/latest
+          # (the in-app update check) skips it.
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "release ${TAG} already exists; refreshing its bundle only"
+          else
+            gh release create "${TAG}" --verify-tag --title "${TAG}" \
+              --notes-file release-notes.md --latest
+          fi
+          gh release upload "${TAG}" desktop-bundle.tar.gz desktop-tree.txt desktop-bundle.sha256 --clobber
+
+      - name: Verify /releases/latest now names this tag
+        run: |
+          latest=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)
+          if [ "${latest}" != "${TAG}" ]; then
+            echo "::error::/releases/latest is ${latest}, expected ${TAG}; the in-app update check will not offer this release"
+            exit 1
+          fi
+          echo "releases/latest = ${latest}"
