@@ -11,6 +11,10 @@ from starlette.responses import HTMLResponse, RedirectResponse
 
 from tinyagentos.agent_token_auth import check_agent_identity, _get_keypair, _get_store
 from tinyagentos.auth import AuthStoreCorruptError
+from tinyagentos.device_scopes import (
+    AGENTS_READ, CHAT_SEND, DECISIONS_ANSWER, FILES_UPLOAD, LIBRARY_INGEST,
+    PUSH_REGISTER, VOICE_STT, VOICE_TTS,
+)
 from tinyagentos.device_store import DEVICE_TOKEN_PREFIX
 from tinyagentos.rate_limit import MovingWindowLimiter
 
@@ -20,9 +24,12 @@ logger = logging.getLogger(__name__)
 # how a session is obtained, so requiring one would be circular. It is NOT
 # unguarded -- the route refuses any request that is not from the device's own
 # console (see auth.is_console_origin) and throttles per user on top of that.
+# /auth/swipe-unlock is exempt on the same argument and guarded harder: console
+# only, single-account only, and only for an owner who chose "swipe" with their
+# password. See routes.auth.swipe_unlock.
 # Note /auth/pin (set/clear a PIN) is deliberately absent from this set: those
 # require a live session and must stay gated here.
-EXEMPT_PATHS = {"/auth/login", "/auth/pin-login", "/auth/osk.js", "/auth/pin-panel.js", "/auth/lock-screen.js", "/auth/lock-widgets", "/auth/lock-weather", "/auth/lock-notifications", "/auth/lock-stats", "/auth/lock-panels", "/auth/lock-events", "/auth/lock-power-menu", "/auth/lock-screen-off", "/auth/lock-screen-on", "/auth/lock-brightness", "/auth/lock-torch", "/auth/lock-volume", "/auth/lock-volume-key", "/auth/lock-radios", "/auth/lock-power-action", "/auth/lock-app", "/auth/setup", "/auth/status", "/auth/me", "/auth/complete", "/auth/lock", "/api/health", "/api/version", "/setup", "/setup/complete", "/redeem", "/api/desktop/browser/push/vapid-public-key", "/api/desktop/browser/proxy-config", "/sw.js", "/desktop", "/desktop/index.html", "/chat-pwa", "/app.html", "/manifest", "/api/agents/registry/pubkey", "/api/share/destinations"}
+EXEMPT_PATHS = {"/auth/login", "/auth/pin-login", "/auth/swipe-unlock", "/auth/osk.js", "/auth/pin-panel.js", "/auth/lock-screen.js", "/auth/lock-widgets", "/auth/lock-weather", "/auth/lock-notifications", "/auth/lock-stats", "/auth/lock-panels", "/auth/lock-events", "/auth/lock-power-menu", "/auth/lock-screen-off", "/auth/lock-screen-on", "/auth/lock-brightness", "/auth/lock-torch", "/auth/lock-volume", "/auth/lock-volume-key", "/auth/lock-charge", "/auth/lock-radios", "/auth/lock-usb", "/auth/lock-power-action", "/auth/lock-app", "/auth/device-agent/heartbeat", "/auth/device-agent/message", "/auth/lock-call", "/auth/lock-call/ring", "/auth/lock-call/reset", "/auth/lock-call/action", "/auth/lock-call/dismiss", "/auth/setup", "/auth/status", "/auth/me", "/auth/complete", "/auth/lock", "/api/health", "/api/version", "/setup", "/setup/complete", "/redeem", "/api/desktop/browser/push/vapid-public-key", "/api/desktop/browser/proxy-config", "/sw.js", "/desktop", "/desktop/index.html", "/chat-pwa", "/app.html", "/manifest", "/api/agents/registry/pubkey", "/api/share/destinations"}
 
 # Registry feed endpoints accept EITHER an admin session OR a registry JWT.
 # When a Bearer token is present for these paths the request bypasses the
@@ -236,10 +243,12 @@ _AGENT_CANVAS_ROUTES = (
     ("POST", re.compile(rf"^/api/projects/{_SEG}/canvas/elements$")),
     ("PATCH", re.compile(rf"^/api/projects/{_SEG}/canvas/elements/{_SEG}$")),
     ("DELETE", re.compile(rf"^/api/projects/{_SEG}/canvas/elements/{_SEG}$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/elements/{_SEG}/original$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/snapshot\.png$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/snapshot\.tldr$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/stream$")),
     ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/watch-projection$")),
+    ("GET", re.compile(rf"^/api/projects/{_SEG}/canvas/legacy$")),
 )
 
 # Decisions route an agent may reach with its own registry JWT (scope
@@ -252,6 +261,13 @@ _AGENT_DECISIONS_ROUTES = (
     ("GET", re.compile(r"^/api/decisions/agent$")),
 )
 
+# Notification route an agent may reach with its own registry JWT (scope
+# notifications_write). POST /api/notifications only.  The route verifies
+# the JWT + grant + project binding.  GET and mark-read stay session-only.
+_AGENT_NOTIFICATIONS_ROUTES = (
+    ("POST", re.compile(r"^/api/notifications$")),
+)
+
 # Device-bearer self-service paths (lock-screen push-token rotation plus
 # decision list/get/answer). A scoped device token (Bearer taosdev_...) may
 # pass through the auth gate on exactly these routes; the route dependency
@@ -262,21 +278,46 @@ _AGENT_DECISIONS_ROUTES = (
 # calls still work: the session-cookie check runs when no Bearer header is
 # present, so GET/POST without a Bearer reach the guard normally.
 _DEVICE_BEARER_PATHS = (
-    ("PATCH", re.compile(r"^/api/devices/[^/]+/push-token$")),
-    ("GET", re.compile(r"^/api/decisions$")),
-    ("GET", re.compile(r"^/api/decisions/[^/]+$")),
-    ("GET", re.compile(r"^/api/decisions/[^/]+/history$")),
-    ("POST", re.compile(r"^/api/decisions/[^/]+/answer$")),
-    ("POST", re.compile(r"^/api/library/ingest$")),
-    ("POST", re.compile(rf"^/api/projects/{_SEG}/files/upload$")),
-    ("POST", re.compile(r"^/api/chat/messages$")),
+    ("PATCH", re.compile(r"^/api/devices/[^/]+/push-token$"), PUSH_REGISTER),
+    ("GET", re.compile(r"^/api/decisions$"), AGENTS_READ),
+    ("GET", re.compile(r"^/api/decisions/[^/]+$"), AGENTS_READ),
+    ("GET", re.compile(r"^/api/decisions/[^/]+/history$"), AGENTS_READ),
+    ("POST", re.compile(r"^/api/decisions/[^/]+/answer$"), DECISIONS_ANSWER),
+    ("POST", re.compile(r"^/api/library/ingest$"), LIBRARY_INGEST),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/files/upload$"), FILES_UPLOAD),
+    ("POST", re.compile(r"^/api/chat/messages$"), CHAT_SEND),
+    # S6 / S6b: device voice. Device-bearer only; the routes name their own
+    # scope via device_scope(), this entry is what lets the Bearer past the gate.
+    ("POST", re.compile(r"^/api/device/v1/voice$"), VOICE_STT),
+    ("POST", re.compile(r"^/api/device/v1/voice/tts$"), VOICE_TTS),
+)
+
+# Device-bearer routes that are NOT in _DEVICE_BEARER_PATHS because they sit in
+# EXEMPT_PATHS (the auth gate must not change for them) but still authenticate
+# the device themselves via require_device. Kept in a separate table so the
+# gate behaviour is untouched; device_scope_for consults both.
+# Classification of share destinations is provisional: it lists the library and
+# the owner's project/DM write targets, so it is gated on the same scope as the
+# library ingest it feeds. Fail closed: a device without library:ingest (e.g.
+# embedded) is refused rather than shown the destinations.
+_DEVICE_EXEMPT_SCOPED_PATHS = (
+    ("GET", re.compile(r"^/api/share/destinations$"), LIBRARY_INGEST),
 )
 
 
 def _is_device_bearer_path(method: str, path: str) -> bool:
     """True only for the exact device-bearer self-service routes. Strict
     method + anchored-regex match; everything else stays session-only."""
-    return any(m == method and rx.match(path) for m, rx in _DEVICE_BEARER_PATHS)
+    return any(m == method and rx.match(path) for m, rx, _scope in _DEVICE_BEARER_PATHS)
+
+
+def device_scope_for(method: str, path: str) -> str | None:
+    """The scope a device bearer needs for this method + path, or None when
+    the path is unclassified (callers must treat None as a refusal)."""
+    for m, rx, scope in _DEVICE_BEARER_PATHS + _DEVICE_EXEMPT_SCOPED_PATHS:
+        if m == method and rx.match(path):
+            return scope
+    return None
 
 
 def _any_route_matches(method: str, path: str, routes, *, match_method: bool = True) -> bool:
@@ -336,6 +377,17 @@ _AGENT_SCOPE_REQUEST_ROUTES = (
     ("GET", re.compile(rf"^/api/agents/registry/{_SEG}/scope-requests/{_SEG}$")),
 )
 
+# Credential rotation an agent may reach with its own registry JWT: an agent
+# that suspects its token is stale or leaked can rotate ITSELF without waiting
+# for a human. The route verifies the JWT identity == the path canonical_id (so
+# an agent may only rotate its own credential) and enforces the same rotation
+# cutoff as every other identity path, so a token that is already superseded
+# cannot use this to outlive its supersession. Owner/admin sessions reach the
+# same route through the normal session gate.
+_AGENT_ROTATE_ROUTES = (
+    ("POST", re.compile(rf"^/api/agents/registry/{_SEG}/rotate-tokens$")),
+)
+
 
 def _is_agent_task_path(method: str, path: str) -> bool:
     """True only for the exact subset of task routes a project_tasks token may
@@ -361,6 +413,13 @@ def _is_agent_decisions_path(method: str, path: str) -> bool:
     return any(m == method and rx.match(path) for m, rx in _AGENT_DECISIONS_ROUTES)
 
 
+def _is_agent_notifications_path(method: str, path: str) -> bool:
+    """True only for POST /api/notifications, which a notifications_write token
+    may reach.  GET and mark-read stay session-only.  The route verifies the
+    JWT + grant + project binding."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_NOTIFICATIONS_ROUTES)
+
+
 def _is_agent_files_path(method: str, path: str) -> bool:
     """True only for the project-files routes a files_read / files_write token
     may reach.  Strict method + anchored-regex match; the route verifies the
@@ -375,6 +434,13 @@ def _is_agent_scope_request_path(method: str, path: str) -> bool:
     routes verify the JWT identity == canonical_id; approve/deny are excluded
     (POST with an extra trailing segment) and stay owner/admin session-only."""
     return any(m == method and rx.match(path) for m, rx in _AGENT_SCOPE_REQUEST_ROUTES)
+
+
+def _is_agent_rotate_path(method: str, path: str) -> bool:
+    """True only for POST /api/agents/registry/{id}/rotate-tokens, which an
+    agent may reach with its own registry JWT to rotate its OWN credential. The
+    route verifies the JWT identity == canonical_id."""
+    return any(m == method and rx.match(path) for m, rx in _AGENT_ROTATE_ROUTES)
 
 
 def _is_container_request_action_path(method: str, path: str) -> bool:
@@ -419,11 +485,14 @@ def _is_agent_skill_exec_path(method: str, path: str) -> bool:
 # check is the authoritative guard for all WebSocket endpoints.
 # The lock screen renders BEFORE sign-in, so every URL it fetches has to be
 # reachable without a session or the screen half-loads with no visible error.
-# The two /auth/lock-* prefixes are its per-agent reads (portrait, conversation);
-# both are console-gated in the route itself, which is where that check belongs.
+# The /auth/lock-* prefixes are the lock screen's per-agent paths: two reads
+# (portrait, conversation) and ONE WRITE -- lock-send, which relays what was
+# typed to a physical device agent. All three are console-gated in the route
+# itself, which is where that check belongs, and lock-send additionally
+# refuses unless its own demo flag is on and the board is currently live.
 EXEMPT_PREFIXES = (
     "/static/", "/desktop/", "/chat-pwa/", "/ws/", "/shortcut/", "/api/peer/",
-    "/auth/lock-avatar/", "/auth/lock-thread/",
+    "/auth/lock-avatar/", "/auth/lock-thread/", "/auth/lock-send/",
 )
 
 # Consent-loop status-poll paths are unauthenticated (the opaque request_id is
@@ -463,13 +532,16 @@ _INVITE_INFO_PREFIX = "/i/"
 _AGENT_MODEL_MODELS = "/v1/models"
 _AGENT_MODEL_CHAT = "/v1/chat/completions"
 
-# In-process LLM gateway (tinyagentos/llm_gateway). Exactly two method+path
-# pairs are EXEMPT, like the Agent-as-a-Model pair above: a scoped gateway key
+# In-process LLM gateway (tinyagentos/llm_gateway). Exactly five method+path
+# pairs are EXEMPT (models, chat completions, embeddings, audio transcriptions, audio speech), like the Agent-as-a-Model pair above: a scoped gateway key
 # (or the host local token, or a signed-in session) IS the credential and the
 # route's ``gateway_caller`` dependency enforces it, answering an OpenAI-shaped
 # 401 otherwise. Every other /api/llm path or method stays gated here.
 _LLM_GATEWAY_MODELS = "/api/llm/v1/models"
 _LLM_GATEWAY_CHAT = "/api/llm/v1/chat/completions"
+_LLM_GATEWAY_EMBEDDINGS = "/api/llm/v1/embeddings"  # LiteLLM removal stage 2a
+_LLM_GATEWAY_TRANSCRIPTIONS = "/api/llm/v1/audio/transcriptions"  # local speech-to-text
+_LLM_GATEWAY_SPEECH = "/api/llm/v1/audio/speech"  # local text-to-speech
 # The gated rest of /api/llm/ still gets an OpenAI-shaped 401: an OpenAI
 # client reads error.message from an object, and the plain
 # {"error": "Authentication required"} string there surfaces as a crash in
@@ -620,6 +692,12 @@ def _is_exempt(method: str, path: str) -> bool:
         return True
     if method == "POST" and path == _LLM_GATEWAY_CHAT:
         return True
+    if method == "POST" and path == _LLM_GATEWAY_EMBEDDINGS:
+        return True
+    if method == "POST" and path == _LLM_GATEWAY_TRANSCRIPTIONS:
+        return True
+    if method == "POST" and path == _LLM_GATEWAY_SPEECH:
+        return True
     return False
 
 
@@ -754,8 +832,10 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     or _is_agent_lists_path(request.method, path)
                     or _is_agent_canvas_path(request.method, path)
                     or _is_agent_decisions_path(request.method, path)
+                    or _is_agent_notifications_path(request.method, path)
                     or _is_agent_files_path(request.method, path)
                     or _is_agent_scope_request_path(request.method, path)
+                    or _is_agent_rotate_path(request.method, path)
                     or _is_container_request_action_path(request.method, path)
                     or _is_agent_container_quota_path(request.method, path)
                     or _is_agent_skill_exec_path(request.method, path)

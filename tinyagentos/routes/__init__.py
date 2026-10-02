@@ -66,6 +66,11 @@ def register_all_routers(app):
     from tinyagentos.routes.settings import router as settings_router
     app.include_router(settings_router, dependencies=_csrf)
 
+    # Settings -> Lock screen. NOT on the settings router: that one is admin-
+    # only, and every signed-in user owns their own unlock method.
+    from tinyagentos.routes.lock_settings import router as lock_settings_router
+    app.include_router(lock_settings_router, dependencies=_csrf)
+
     from tinyagentos.routes.share import router as share_router
     app.include_router(share_router, dependencies=_csrf)
 
@@ -95,6 +100,11 @@ def register_all_routers(app):
     # pair_request_id is the capability); CSRF is a cookie-auth defence.
     from tinyagentos.routes.device_pair_requests import router as device_pair_requests_router
     app.include_router(device_pair_requests_router)
+
+    # Device voice (S6/S6b): device-bearer only, so CSRF-exempt like the pair
+    # routes (the bearer is not an ambient cookie credential).
+    from tinyagentos.routes.device_voice import router as device_voice_router
+    app.include_router(device_voice_router)
 
     from tinyagentos.routes.observatory import router as observatory_router
     app.include_router(observatory_router, dependencies=_csrf)
@@ -170,6 +180,9 @@ def register_all_routers(app):
 
     from tinyagentos.routes.cluster_capability import router as cluster_capability_router
     app.include_router(cluster_capability_router, dependencies=_csrf)
+
+    from tinyagentos.routes.cluster_map import router as cluster_map_router
+    app.include_router(cluster_map_router, dependencies=_csrf)
 
     from tinyagentos.routes.cluster_ble import router as cluster_ble_router
     app.include_router(cluster_ble_router, dependencies=_csrf)
@@ -430,12 +443,13 @@ def register_all_routers(app):
     from tinyagentos.routes.agent_model_api import router as agent_model_api_router
     app.include_router(agent_model_api_router, dependencies=_csrf)
 
-    # In-process LLM gateway (/api/llm/v1), the LiteLLM replacement. Off by
-    # default: not mounted at all unless TAOS_LLM_GATEWAY=1, so off is a 404.
+    # In-process LLM gateway (/api/llm/v1), the LiteLLM replacement. Always
+    # mounted: since LiteLLM removal 2b-2a it is the only LLM path, and
+    # TAOS_LLM_GATEWAY=0 is a logged no-op (see llm_gateway.enabled).
     from tinyagentos import llm_gateway
-    if llm_gateway.enabled():
-        from tinyagentos.llm_gateway.router import mount as mount_llm_gateway
-        mount_llm_gateway(app, dependencies=_csrf)
+    llm_gateway.enabled()  # logs once if the old off switch is still set
+    from tinyagentos.llm_gateway.router import mount as mount_llm_gateway
+    mount_llm_gateway(app, dependencies=_csrf)
 
     from tinyagentos.routes.agent_model_keys import router as agent_model_keys_router
     app.include_router(agent_model_keys_router, dependencies=_csrf)

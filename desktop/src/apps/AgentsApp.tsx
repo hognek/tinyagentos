@@ -18,7 +18,56 @@ import { ImportWizard } from "./agents/ImportWizard";
 import { ArchivedAgentsPanel } from "./agents/ArchivedAgents";
 import { RegistryPanel } from "./agents/RegistryPanel";
 import { BaseImagesPanel } from "./agents/BaseImagesPanel";
+import { RequestsPanel } from "./agents/RequestsPanel";
 import { fetchTaosAgentConfig } from "@/lib/taos-agent-api";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
+
+/** Lifecycle actions, each a POST /api/agents/{name}/{action}. */
+type LifecycleAction = "start" | "stop" | "restart" | "pause" | "resume";
+
+const LIFECYCLE_LABEL: Record<LifecycleAction, string> = {
+  start: "Start",
+  stop: "Stop",
+  restart: "Restart",
+  pause: "Pause",
+  resume: "Resume",
+};
+
+/** Fetch live container state keyed by agent name. Returns an empty map on any
+ *  failure so the list falls back to each agent's stored status. */
+async function fetchLiveContainerStates(): Promise<Record<string, string>> {
+  try {
+    const res = await fetch("/api/agents/containers");
+    if (!res.ok) return {};
+    const data = await res.json();
+    if (!Array.isArray(data)) return {};
+    const out: Record<string, string> = {};
+    for (const c of data as Array<Record<string, unknown>>) {
+      if (c && typeof c.agent_name === "string" && typeof c.status === "string") {
+        out[c.agent_name] = c.status;
+      }
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
+
+/** Overlay an incus container status onto an agent's stored status. */
+function applyLiveState(agent: Agent, live: string | undefined): Agent {
+  switch (live) {
+    case "Running":
+      return { ...agent, status: "running", frozen: false };
+    case "Frozen":
+      return { ...agent, status: "running", frozen: true };
+    case "Stopped":
+      return { ...agent, status: "stopped", frozen: false };
+    case "Error":
+      return { ...agent, status: "error", frozen: false };
+    default:
+      return agent;
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /*  AgentsApp (main)                                                   */
@@ -72,12 +121,19 @@ export function AgentsApp({ windowId: _windowId }: { windowId: string }) {
   // panel fetches its own config on open). Shown as the model indicator line on
   // the system agent's card; failures are silently ignored.
   const [taosModel, setTaosModel] = useState<string | undefined>(undefined);
+  const [contentTab, setContentTab] = useState<"registry" | "requests">("registry");
+  const [pendingRequestCount, setPendingRequestCount] = useState(0);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [ownsAgent, setOwnsAgent] = useState(false);
   const isMobile = useIsMobile();
   const openWindow = useProcessStore((s) => s.openWindow);
 
   const fetchAgents = useCallback(async () => {
     try {
-      const res = await fetch("/api/agents");
+      const [res, live] = await Promise.all([
+        fetch("/api/agents"),
+        fetchLiveContainerStates(),
+      ]);
       if (res.ok) {
         const ct = res.headers.get("content-type") ?? "";
         if (ct.includes("application/json")) {
@@ -102,7 +158,7 @@ export function AgentsApp({ windowId: _windowId }: { windowId: string }) {
                 kv_cache_quant_boundary_layers: typeof a.kv_cache_quant_boundary_layers === "number" ? a.kv_cache_quant_boundary_layers : 0,
                 framework_version_sha: a.framework_version_sha != null ? String(a.framework_version_sha) : null,
                 migrated_to_v2_personas: Boolean(a.migrated_to_v2_personas),
-              }))
+              })).map((agent: Agent) => applyLiveState(agent, live[agent.name]))
             );
             setLoading(false);
             return;
@@ -134,6 +190,35 @@ export function AgentsApp({ windowId: _windowId }: { windowId: string }) {
       // Surface the failure in DevTools so a silent empty-archived list
       // isn't mistaken for "no archived agents". UI keeps prior state.
       console.warn("fetchArchived: network/parse error", err);
+    }
+  }, []);
+
+  const fetchAuthStatus = useCallback(async () => {
+    try {
+      const res = await fetch("/auth/status", { credentials: "include" });
+      if (res.ok) {
+        const data = await res.json();
+        setIsAdmin(!!data?.user?.is_admin);
+      }
+    } catch { /* ignore */ }
+  }, []);
+
+  const fetchRegistry = useCallback(async () => {
+    try {
+      const res = await fetch("/api/agents/registry");
+      if (!res.ok) {
+        setOwnsAgent(false);
+        return;
+      }
+      const ct = res.headers.get("content-type") ?? "";
+      if (!ct.includes("application/json")) {
+        setOwnsAgent(false);
+        return;
+      }
+      const data = await res.json();
+      setOwnsAgent(Array.isArray(data) ? data.length > 0 : false);
+    } catch {
+      setOwnsAgent(false);
     }
   }, []);
 
@@ -182,30 +267,55 @@ export function AgentsApp({ windowId: _windowId }: { windowId: string }) {
     fetchTaosAgentConfig().then((cfg) => setTaosModel(cfg.model ?? undefined)).catch(() => {});
   }, []);
 
-  async function handleResume(name: string) {
+  // Agents with a lifecycle request in flight (their controls are disabled).
+  const [busyAgents, setBusyAgents] = useState<Record<string, boolean>>({});
+  // Stop and Restart ask first.
+  const [pendingConfirm, setPendingConfirm] = useState<
+    { name: string; action: "stop" | "restart" } | null
+  >(null);
+
+  async function runLifecycle(name: string, action: LifecycleAction) {
+    const label = LIFECYCLE_LABEL[action];
+    const fail = (body: string) =>
+      useNotificationStore.getState().addNotification({
+        source: name, title: `${label} failed`, body, level: "error",
+      });
+    setBusyAgents((prev) => ({ ...prev, [name]: true }));
     try {
-      const res = await fetch(`/api/agents/${encodeURIComponent(name)}/resume`, {
+      const res = await fetch(`/api/agents/${encodeURIComponent(name)}/${action}`, {
         method: "POST",
         headers: { Accept: "application/json" },
       });
+      let data: Record<string, unknown> | null = null;
+      try {
+        data = await res.json();
+      } catch { /* non-JSON body */ }
       if (!res.ok) {
-        let msg = `Resume failed (${res.status})`;
-        try {
-          const err = await res.json();
-          if (err?.error) msg = String(err.error);
-        } catch { /* ignore */ }
-        useNotificationStore.getState().addNotification({
-          source: name, title: "Resume failed", body: msg, level: "error",
-        });
+        fail(data?.error ? String(data.error) : `${label} failed (${res.status})`);
         return;
       }
-      fetchAgents();
+      // Stop answers 200 with the incus result; a failed stop that the
+      // force-kill did not rescue is still a failure.
+      const stopResult = data?.stop_result as { success?: boolean; output?: string } | undefined;
+      if (action === "stop" && stopResult && stopResult.success === false && !data?.force_killed) {
+        fail(stopResult.output ? String(stopResult.output) : "The container did not stop.");
+      }
     } catch (e) {
-      useNotificationStore.getState().addNotification({
-        source: name, title: "Resume failed",
-        body: e instanceof Error ? e.message : "Network error", level: "error",
+      fail(e instanceof Error ? e.message : "Network error");
+    } finally {
+      // Refresh first so the row's controls come back already reflecting the
+      // new state (fetchAgents handles its own errors).
+      await fetchAgents();
+      setBusyAgents((prev) => {
+        const next = { ...prev };
+        delete next[name];
+        return next;
       });
     }
+  }
+
+  function handleResume(name: string) {
+    void runLifecycle(name, "resume");
   }
 
   // Fetch disk states whenever agent list changes
@@ -218,9 +328,26 @@ export function AgentsApp({ windowId: _windowId }: { windowId: string }) {
   useEffect(() => {
     fetchAgents();
     fetchArchived();
-  }, [fetchAgents, fetchArchived]);
+    fetchAuthStatus();
+    fetchRegistry();
+  }, [fetchAgents, fetchArchived, fetchAuthStatus, fetchRegistry]);
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent<{ count: number }>).detail;
+      if (detail?.count != null) setPendingRequestCount(detail.count);
+    };
+    window.addEventListener("taos:scope-requests-count", handler);
+    return () => window.removeEventListener("taos:scope-requests-count", handler);
+  }, []);
 
   useRefreshOnFocus(fetchAgents);
+
+  useEffect(() => {
+    if (contentTab === "requests" && !isAdmin && !ownsAgent) {
+      setContentTab("registry");
+    }
+  }, [contentTab, isAdmin, ownsAgent]);
 
   async function handleDelete(name: string) {
     if (!window.confirm(`Archive "${name}"? It can be restored later from the Archived section.`)) return;
@@ -576,8 +703,64 @@ export function AgentsApp({ windowId: _windowId }: { windowId: string }) {
               onRestore={handleRestore}
               onPurge={handlePurge}
             />
-            <RegistryPanel />
-            <BaseImagesPanel />
+            <nav
+              className="flex items-center gap-1 border-b border-white/5"
+              aria-label="Content tabs"
+              role="tablist"
+            >
+              <button
+                type="button"
+                id="registry-tab-0"
+                role="tab"
+                aria-selected={contentTab === "registry"}
+                aria-controls="registry-panel-0"
+                onClick={() => setContentTab("registry")}
+                className={`text-xs font-medium px-3 py-2 transition-colors ${
+                  contentTab === "registry"
+                    ? "text-shell-text border-b-2 border-accent"
+                    : "text-shell-text-secondary hover:text-shell-text"
+                }`}
+              >
+                Registry
+              </button>
+              {(isAdmin || ownsAgent) && (
+                <button
+                  type="button"
+                  id="requests-tab-0"
+                  role="tab"
+                  aria-selected={contentTab === "requests"}
+                  aria-controls="requests-panel-0"
+                  onClick={() => setContentTab("requests")}
+                  className={`text-xs font-medium px-3 py-2 transition-colors relative ${
+                    contentTab === "requests"
+                      ? "text-shell-text border-b-2 border-accent"
+                      : "text-shell-text-secondary hover:text-shell-text"
+                  }`}
+                >
+                  Requests
+                  {pendingRequestCount > 0 && (
+                    <span className="ml-1.5 inline-flex items-center justify-center rounded-full bg-amber-500/20 text-amber-300 text-[10px] px-1.5 py-0.5 min-w-[18px]">
+                      {pendingRequestCount}
+                    </span>
+                  )}
+                </button>
+              )}
+            </nav>
+            {contentTab === "registry" ? (
+              <div id="registry-panel-0" role="tabpanel" aria-labelledby="registry-tab-0">
+                <RegistryPanel />
+                <BaseImagesPanel />
+              </div>
+            ) : (
+              <div
+                id="requests-panel-0"
+                role="tabpanel"
+                aria-labelledby="requests-tab-0"
+                className="mt-3 rounded-lg border border-white/5 bg-white/[0.02] min-h-[200px]"
+              >
+                <RequestsPanel />
+              </div>
+            )}
           </div>
         ) : (
           <div className="p-4">
@@ -656,6 +839,11 @@ export function AgentsApp({ windowId: _windowId }: { windowId: string }) {
                   onViewMessages={(name) => setDetail({ name, tab: "messages" })}
                   onDelete={handleDelete}
                   onResume={handleResume}
+                  onStart={(name) => void runLifecycle(name, "start")}
+                  onPause={(name) => void runLifecycle(name, "pause")}
+                  onStop={(name) => setPendingConfirm({ name, action: "stop" })}
+                  onRestart={(name) => setPendingConfirm({ name, action: "restart" })}
+                  busy={Boolean(busyAgents[agent.name])}
                 />
               ))}
             </div>
@@ -664,11 +852,89 @@ export function AgentsApp({ windowId: _windowId }: { windowId: string }) {
               onRestore={handleRestore}
               onPurge={handlePurge}
             />
-            <RegistryPanel />
-            <BaseImagesPanel />
+            <nav
+              className="flex items-center gap-1 border-b border-white/5"
+              aria-label="Content tabs"
+              role="tablist"
+            >
+              <button
+                type="button"
+                id="registry-tab-1"
+                role="tab"
+                aria-selected={contentTab === "registry"}
+                aria-controls="registry-panel-1"
+                onClick={() => setContentTab("registry")}
+                className={`text-xs font-medium px-3 py-2 transition-colors ${
+                  contentTab === "registry"
+                    ? "text-shell-text border-b-2 border-accent"
+                    : "text-shell-text-secondary hover:text-shell-text"
+                }`}
+              >
+                Registry
+              </button>
+              {(isAdmin || ownsAgent) && (
+                <button
+                  type="button"
+                  id="requests-tab-1"
+                  role="tab"
+                  aria-selected={contentTab === "requests"}
+                  aria-controls="requests-panel-1"
+                  onClick={() => setContentTab("requests")}
+                  className={`text-xs font-medium px-3 py-2 transition-colors relative ${
+                    contentTab === "requests"
+                      ? "text-shell-text border-b-2 border-accent"
+                      : "text-shell-text-secondary hover:text-shell-text"
+                  }`}
+                >
+                  Requests
+                  {pendingRequestCount > 0 && (
+                    <span className="ml-1.5 inline-flex items-center justify-center rounded-full bg-amber-500/20 text-amber-300 text-[10px] px-1.5 py-0.5 min-w-[18px]">
+                      {pendingRequestCount}
+                    </span>
+                  )}
+                </button>
+              )}
+            </nav>
+            {contentTab === "registry" ? (
+              <div id="registry-panel-1" role="tabpanel" aria-labelledby="registry-tab-1">
+                <RegistryPanel />
+                <BaseImagesPanel />
+              </div>
+            ) : (
+              <div
+                id="requests-panel-1"
+                role="tabpanel"
+                aria-labelledby="requests-tab-1"
+                className="mt-3 rounded-lg border border-white/5 bg-white/[0.02] min-h-[200px]"
+              >
+                <RequestsPanel />
+              </div>
+            )}
           </div>
         )}
       </div>
+
+      <ConfirmDialog
+        open={pendingConfirm !== null}
+        title={
+          pendingConfirm
+            ? `${LIFECYCLE_LABEL[pendingConfirm.action]} ${pendingConfirm.name}?`
+            : ""
+        }
+        message={
+          pendingConfirm?.action === "stop"
+            ? "The agent's container shuts down and the agent stops answering until you start it again."
+            : "The agent's container restarts. Work in progress may be interrupted."
+        }
+        confirmLabel={pendingConfirm ? LIFECYCLE_LABEL[pendingConfirm.action] : "Confirm"}
+        danger={pendingConfirm?.action === "stop"}
+        onConfirm={() => {
+          const pending = pendingConfirm;
+          setPendingConfirm(null);
+          if (pending) void runLifecycle(pending.name, pending.action);
+        }}
+        onCancel={() => setPendingConfirm(null)}
+      />
 
       {/* Deploy wizard overlay */}
       <DeployWizard open={wizardOpen} onClose={handleWizardClose} />
