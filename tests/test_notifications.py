@@ -8,6 +8,9 @@ import pytest_asyncio
 from tinyagentos.notifications import NotificationStore
 
 
+TIMESTAMP_KINDS = ["same_second", "pre_existing_1s_earlier"]
+
+
 @pytest_asyncio.fixture
 async def notif_store(tmp_path):
     store = NotificationStore(tmp_path / "notifications.db")
@@ -18,6 +21,17 @@ async def notif_store(tmp_path):
 
 @pytest.mark.asyncio
 class TestNotificationStore:
+    @staticmethod
+    async def _add_with_timestamp(store, title, message, *, timestamp=None):
+        if timestamp is None:
+            await store.add(title, message)
+        else:
+            await store._db.execute(
+                "INSERT INTO notifications (timestamp, level, title, message, source, read, archived, data, user_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (timestamp, "info", title, message, "system", 0, 0, None, None),
+            )
+            await store._db.commit()
+
     async def test_add_and_list(self, notif_store):
         await notif_store.add("Test title", "Test message", level="info", source="test")
         items = await notif_store.list()
@@ -34,19 +48,23 @@ class TestNotificationStore:
         await notif_store.add("B", "b")
         assert await notif_store.unread_count() == 2
 
-    async def test_mark_read(self, notif_store):
-        await notif_store.add("A", "a")
-        await notif_store.add("B", "b")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timestamp_kind", TIMESTAMP_KINDS)
+    async def test_mark_read(self, notif_store, timestamp_kind):
+        ts = int(time.time())
+        pre_ts = ts - 1 if timestamp_kind == "pre_existing_1s_earlier" else ts
+        await self._add_with_timestamp(notif_store, "A", "a", timestamp=ts if timestamp_kind == "same_second" else None)
+        await self._add_with_timestamp(notif_store, "B", "b", timestamp=pre_ts if timestamp_kind == "pre_existing_1s_earlier" else None)
         items = await notif_store.list()
-        # Select the most recent by title (list() orders by timestamp DESC;
-        # if timestamps tie the order is not guaranteed).
-        notif_id = next(i["id"] for i in items if i["title"] == "B")
+        matches = [i for i in items if i["title"] == "B"]
+        assert len(matches) == 1, f"Expected exactly 1 row with title 'B', got {len(matches)}"
+        notif_id = matches[0]["id"]
         await notif_store.mark_read(notif_id)
         assert await notif_store.unread_count() == 1
         items = await notif_store.list()
-        # The "B" notification should now be read
-        b_item = next(i for i in items if i["title"] == "B")
-        assert b_item["read"] is True
+        b_matches = [i for i in items if i["title"] == "B"]
+        assert len(b_matches) == 1
+        assert b_matches[0]["read"] is True
 
     async def test_mark_all_read(self, notif_store):
         await notif_store.add("A", "a")
@@ -86,23 +104,33 @@ class TestNotificationStore:
         history = await notif_store.list_archived()
         assert [h["title"] for h in history] == ["OldDismissed"]
 
-    async def test_list_unread_only(self, notif_store):
-        await notif_store.add("A", "a")
-        await notif_store.add("B", "b")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timestamp_kind", TIMESTAMP_KINDS)
+    async def test_list_unread_only(self, notif_store, timestamp_kind):
+        ts = int(time.time())
+        pre_ts = ts - 1 if timestamp_kind == "pre_existing_1s_earlier" else ts
+        await self._add_with_timestamp(notif_store, "A", "a", timestamp=ts if timestamp_kind == "same_second" else None)
+        await self._add_with_timestamp(notif_store, "B", "b", timestamp=pre_ts if timestamp_kind == "pre_existing_1s_earlier" else None)
         items = await notif_store.list()
-        # Mark the most recent ("B") as read
-        b_id = next(i["id"] for i in items if i["title"] == "B")
+        b_matches = [i for i in items if i["title"] == "B"]
+        assert len(b_matches) == 1
+        b_id = b_matches[0]["id"]
         await notif_store.mark_read(b_id)
         unread = await notif_store.list(unread_only=True)
         assert len(unread) == 1
         assert unread[0]["title"] == "A"
 
-    async def test_archive_hides_from_active_list(self, notif_store):
-        await notif_store.add("A", "a")
-        await notif_store.add("B", "b")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timestamp_kind", TIMESTAMP_KINDS)
+    async def test_archive_hides_from_active_list(self, notif_store, timestamp_kind):
+        ts = int(time.time())
+        pre_ts = ts - 1 if timestamp_kind == "pre_existing_1s_earlier" else ts
+        await self._add_with_timestamp(notif_store, "A", "a", timestamp=ts if timestamp_kind == "same_second" else None)
+        await self._add_with_timestamp(notif_store, "B", "b", timestamp=pre_ts if timestamp_kind == "pre_existing_1s_earlier" else None)
         items = await notif_store.list()
-        # Archive the most recent ("B")
-        b_id = next(i["id"] for i in items if i["title"] == "B")
+        b_matches = [i for i in items if i["title"] == "B"]
+        assert len(b_matches) == 1
+        b_id = b_matches[0]["id"]
         await notif_store.archive(b_id)
         active = await notif_store.list()
         assert len(active) == 1
@@ -117,15 +145,19 @@ class TestNotificationStore:
         assert len(history) == 1
         assert history[0]["id"] == a_id
 
-    async def test_archive_excluded_from_unread_count(self, notif_store):
-        await notif_store.add("A", "a")
-        await notif_store.add("B", "b")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timestamp_kind", TIMESTAMP_KINDS)
+    async def test_archive_excluded_from_unread_count(self, notif_store, timestamp_kind):
+        ts = int(time.time())
+        pre_ts = ts - 1 if timestamp_kind == "pre_existing_1s_earlier" else ts
+        await self._add_with_timestamp(notif_store, "A", "a", timestamp=ts if timestamp_kind == "same_second" else None)
+        await self._add_with_timestamp(notif_store, "B", "b", timestamp=pre_ts if timestamp_kind == "pre_existing_1s_earlier" else None)
         assert await notif_store.unread_count() == 2
         items = await notif_store.list()
-        # Archive the most recent ("B")
-        b_id = next(i["id"] for i in items if i["title"] == "B")
+        b_matches = [i for i in items if i["title"] == "B"]
+        assert len(b_matches) == 1
+        b_id = b_matches[0]["id"]
         await notif_store.archive(b_id)
-        # Dismissed notification no longer counts toward the badge.
         assert await notif_store.unread_count() == 1
 
     async def test_list_limit(self, notif_store):
