@@ -1728,7 +1728,7 @@ registrations and heartbeats.
   always knows which controller instance accepted it.
 - A worker sends that generation back on subsequent requests. A request
   carrying a generation that does not match the controller's current one is
-  rejected -- registration answers `409` with `{"error": "stale_generation"}`
+  rejected -- registration answers `409` with `{"error": "stale_generation", "generation": <current>}`
   (or `"fenced"`), heartbeat answers `404` -- because it means the worker is
   talking to (or was adopted by) **another active controller**. Each rejection
   logs a warning naming the worker and both generations.
