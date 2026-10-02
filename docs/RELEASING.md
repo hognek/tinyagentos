@@ -80,9 +80,11 @@ Pushing the tag runs `.github/workflows/release.yml`, which:
    (`scripts/changelog_section.py`; it fails rather than publish empty or wrong notes),
 3. creates the release as a draft, attaches the prebuilt desktop bundle, then publishes it
    and marks it latest (only if it is the newest version; runs are serialised),
-4. fails unless `/releases/latest` now names the new tag.
+4. when the tag is the newest version, fails unless `/releases/latest` now names it.
+   An older tag (a re-run, or a backport) publishes without becoming latest.
 
-**The release is not done until that workflow run is green.** Check it, then confirm:
+**The release is not done until that workflow run is green.** Check it, then, when you
+released the newest version, confirm:
 
 ```bash
 gh api repos/jaylfc/taOS/releases/latest --jq .tag_name   # must print v1.0.0-beta.N
@@ -108,7 +110,12 @@ git rev-parse HEAD:desktop > desktop-tree.txt
 sha256sum desktop-bundle.tar.gz | awk '{print $1}' > desktop-bundle.sha256
 gh release create v1.0.0-beta.N --verify-tag --draft --title "v1.0.0-beta.N" --notes-file notes.md
 gh release upload v1.0.0-beta.N desktop-bundle.tar.gz desktop-tree.txt desktop-bundle.sha256
-gh release edit v1.0.0-beta.N --draft=false --latest
+gh release edit v1.0.0-beta.N --draft=false --latest=false
+# Mark latest ONLY if no published release is newer than this tag:
+newest=$(gh api --paginate "repos/jaylfc/taOS/releases?per_page=100" \
+  --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+  | python3 scripts/newest_release_tag.py)
+[ "$newest" = v1.0.0-beta.N ] && gh release edit v1.0.0-beta.N --latest
 ```
 
 ## Notes
