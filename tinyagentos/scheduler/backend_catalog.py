@@ -34,6 +34,9 @@ BACKEND_CAPABILITIES: dict[str, set[str]] = {
     "rkllama": {"llm-chat", "embedding", "reranking"},
     "ollama": {"llm-chat", "embedding"},
     "llama-cpp": {"llm-chat", "embedding"},
+    # llama-swap: OpenAI-compatible proxy that starts and swaps llama.cpp (or
+    # other) upstreams per requested model; same surface as llama-cpp.
+    "llama-swap": {"llm-chat", "embedding"},
     "vllm": {"llm-chat"},
     "exo": {"llm-chat"},
     "mlx": {"llm-chat"},
