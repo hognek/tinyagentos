@@ -173,6 +173,7 @@ class DiskQuotaMonitor:
 
         if new_state == "hard" and agent is not None and not agent.get("paused"):
             agent["paused"] = True
+            agent["paused_by_restart"] = False
             logger.warning("disk_quota: pausing agent %s — disk full", agent_name)
 
         ts = time.time()
