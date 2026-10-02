@@ -25,11 +25,36 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Module-level _incus helper with timeout kill, used by both sweep and bake
+async def _incus(*args: str, timeout: int = 60) -> tuple[int, str]:
+    """Run an incus subcommand with timeout and kill on timeout.
+
+    Returns (returncode, stdout). Kills the process on timeout and re-raises
+    TimeoutError. Other exceptions propagate.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "incus", *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise
+    return proc.returncode, (stdout or b"").decode()
+
 # Progress state for the current (or most recent) prefetch operation.
 # Read by the /api/agent-image/status endpoint so the frontend can
 # show download progress. Keys: status (idle|downloading|importing|done|failed),
 # started_at (ISO timestamp), url (str).
 _prefetch_state: dict = {"status": "idle"}
+
+# Bake containers currently mid-flight. Set while _bake_scripts_into_image
+# is between launch and publish so concurrent ensure_image_present calls
+# do not sweep-delete the in-flight temp container.
+_INFLIGHT_BAKES: set[str] = set()
 
 _FRAMEWORK_UPDATE_SCRIPT_SRC = Path(__file__).parent / "scripts" / "taos-framework-update.sh"
 
@@ -163,28 +188,53 @@ async def is_image_present(alias: str = BASE_IMAGE_ALIAS, remote: str | None = N
     (incus not installed, daemon down) returns False -- the caller will fall
     back to the uncached deploy path.
     """
-    args = ["incus", "image", "list", "--format=csv", "-c", "f"]
+    args = ["image", "list", "--format=csv", "-c", "f"]
     if remote:
         args.append(f"{remote}:")
     args.append(alias)
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+        code, out = await _incus(*args, timeout=30)
     except (FileNotFoundError, asyncio.TimeoutError):
         return False
     except Exception:  # pragma: no cover - defensive
         return False
-    if proc.returncode != 0:
+    if code != 0:
         return False
-    for line in (stdout or b"").decode().splitlines():
+    for line in (out or "").splitlines():
         if line.strip():
             return True
     return False
 
+
+
+async def _sweep_stale_bake_containers() -> None:
+    """Find and force-delete any leftover taos-bake-*-tmp containers.
+
+    Non-fatal: logs every result but never raises. Called before a bake launch
+    and from the startup path to avoid name clashes and permanent orphans.
+    """
+    try:
+        # List ALL containers (no filter -- incus treats bare filter as regex)
+        # Filter in Python: name.startswith("taos-bake-") and name.endswith("-tmp")
+        code, out = await _incus("list", "--format=csv", "-c", "n")
+        if code != 0:
+            logger.warning("agent_image: sweep list failed: %s", out[:300])
+            return
+        for line in (out or "").splitlines():
+            name = line.strip()
+            if not name:
+                continue
+            if name.startswith("taos-bake-") and name.endswith("-tmp"):
+                if name in _INFLIGHT_BAKES:
+                    logger.debug("agent_image: sweep skipping in-flight %s", name)
+                    continue
+                del_code, del_out = await _incus("delete", name, "--force", timeout=30)
+                if del_code != 0:
+                    logger.warning("agent_image: sweep delete failed for %s: %s", name, del_out[:300])
+                else:
+                    logger.info("agent_image: sweep deleted stale %s", name)
+    except Exception as exc:  # pragma: no cover - defensive non-fatal
+        logger.warning("agent_image: sweep failed: %s", exc)
 
 
 async def _bake_scripts_into_image(alias: str) -> None:
@@ -200,15 +250,10 @@ async def _bake_scripts_into_image(alias: str) -> None:
     tmp_name = f"taos-bake-{alias}-tmp"
     script_dest = "/usr/local/bin/taos-framework-update"
 
-    async def _incus(*args: str, timeout: int = 60) -> tuple[int, str]:
-        proc = await asyncio.create_subprocess_exec(
-            "incus", *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        return proc.returncode, (stdout or b"").decode()
+    # Sweep any stale temp containers before launching to avoid name clashes
+    await _sweep_stale_bake_containers()
 
+    _INFLIGHT_BAKES.add(tmp_name)
     try:
         # Launch a temporary container from the just-imported image
         code, out = await _incus("launch", alias, tmp_name, timeout=120)
@@ -235,11 +280,14 @@ async def _bake_scripts_into_image(alias: str) -> None:
     except Exception as exc:
         logger.warning("agent_image: bake scripts failed for %s: %s", alias, exc)
     finally:
+        _INFLIGHT_BAKES.discard(tmp_name)
         # Always clean up the temp container regardless of outcome
         try:
-            await _incus("delete", tmp_name, "--force", timeout=30)
-        except Exception:
-            pass
+            code, out = await _incus("delete", tmp_name, "--force", timeout=30)
+            if code != 0:
+                logger.warning("agent_image: bake cleanup delete failed for %s: %s", tmp_name, out[:300])
+        except Exception as exc:
+            logger.warning("agent_image: bake cleanup delete error for %s: %s", tmp_name, exc)
 
 async def ensure_image_present(
     alias: str = BASE_IMAGE_ALIAS,
@@ -263,6 +311,11 @@ async def ensure_image_present(
     temp dir so it lands on the same filesystem as /var/tmp and can be
     imported without extra copying.
     """
+    # Sweep stale bake containers on the startup path (local incus only).
+    # This runs even if the image is already present, to clean up orphans.
+    if not remote:
+        await _sweep_stale_bake_containers()
+
     if await is_image_present(alias, remote=remote):
         return True
     # Derive the URL from the alias so a non-openclaw alias never imports the

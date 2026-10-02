@@ -26,6 +26,7 @@ from tinyagentos.middleware.upload_body_limit import register_upload_cap
 from tinyagentos.safe_archive import ArchiveError, extract_tar_safely
 from tinyagentos.update_runner import switch_to_branch
 from tinyagentos.restart_orchestrator import write_pending_restart
+from tinyagentos.launchd_migration import apply_launchd_migration
 
 logger = logging.getLogger(__name__)
 
@@ -864,14 +865,15 @@ async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
     )
 
 
-async def _pip_rebuild_restart(project_dir: Path, target_sha: str) -> tuple[int, str]:
+async def _pip_rebuild_restart(project_dir: Path, target_sha: str) -> tuple[int, str, str | None]:
     """Sync deps, rebuild the SPA, flag the pending restart, trigger restart.
 
-    Returns (returncode, output); non-zero means a step failed.
+    Returns (returncode, output, launchd_warning); non-zero means a step failed.
+    launchd_warning is None on success, or a structured warning message.
     """
     install_returncode, install_output = await _install_dependencies(project_dir)
     if install_returncode != 0:
-        return install_returncode, install_output
+        return install_returncode, install_output, None
 
     # Venv python for the import smoke test below (.venv/bin/python).
     venv_python: Path | None = None
@@ -915,7 +917,7 @@ async def _pip_rebuild_restart(project_dir: Path, target_sha: str) -> tuple[int,
             timeout=60.0,  # imports should be fast; 60s is generous
         )
         if smoke_returncode != 0:
-            return smoke_returncode, smoke_output
+            return smoke_returncode, smoke_output, None
 
     # Force a desktop bundle rebuild on every applied update. The mtime-based
     # staleness check in rebuild_desktop_bundle_if_stale is unreliable when
@@ -938,7 +940,20 @@ async def _pip_rebuild_restart(project_dir: Path, target_sha: str) -> tuple[int,
     if target_sha:
         write_pending_restart(target_sha)
 
-    return 0, ""
+    # macOS: migrate old bare-uvicorn launchd plist to `python -m tinyagentos`
+    # so the LLM gateway agent listener starts and local agent deploys work.
+    # This runs after deps are synced but before the restart is flagged.
+    # Failure is non-fatal: we log a warning and surface it in the update result.
+    launchd_warning = None
+    try:
+        _, launchd_warning = await apply_launchd_migration(str(project_dir))
+    except Exception as e:
+        launchd_warning = f"Launchd migration failed: {e}"
+
+    if launchd_warning:
+        logger.warning("Launchd migration: %s", launchd_warning)
+
+    return 0, "", launchd_warning
 
 
 async def _stash_local_source_changes(project_dir) -> bool:
@@ -1206,7 +1221,7 @@ async def apply_update(request: Request):
     sha_out, _ = await sha_proc.communicate()
     new_sha = sha_out.decode().strip() if sha_out else ""
 
-    rc, out = await _pip_rebuild_restart(project_dir, new_sha)
+    rc, out, launchd_warning = await _pip_rebuild_restart(project_dir, new_sha)
     if rc != 0:
         return JSONResponse(
             {
@@ -1270,6 +1285,7 @@ async def apply_update(request: Request):
                 if taosmd_report.get("updated")
                 else ""
             )
+            + (f"{launchd_warning} " if launchd_warning else "")
             + "Restarting now…"
         ),
     }
@@ -1371,7 +1387,7 @@ async def set_update_channel(request: Request, body: UpdateChannel):
     prefs["tracked_branch"] = branch
     await store.save_preference("user", PREF_NAMESPACE, prefs)
 
-    rc, out = await _pip_rebuild_restart(project_dir, result.new_sha)
+    rc, out, launchd_warning = await _pip_rebuild_restart(project_dir, result.new_sha)
     if rc != 0:
         return JSONResponse(
             {"error": f"Switched to {branch} but rebuild failed: {out[:300]}",
@@ -1391,7 +1407,7 @@ async def set_update_channel(request: Request, body: UpdateChannel):
         "branch": branch,
         "snapshot": str(snapshot_path) if snapshot_path else None,
         "recovery_tag": result.recovery_tag,
-        "message": result.message,
+        "message": result.message + (f" {launchd_warning}" if launchd_warning else ""),
     }
 
 

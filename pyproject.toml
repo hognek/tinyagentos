@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tinyagentos"
-version = "1.0.0-beta.54"
+version = "1.0.0-beta.55"
 description = "Self-hosted AI agent memory system for low-power hardware"
 license = { file = "LICENSE" }
 # Upper-capped at <3.15 because the proxy extra's litellm (pinned
@@ -32,7 +32,7 @@ dependencies = [
     "argon2-cffi>=23.1.0",
     "sqlcipher3>=0.6.2",
     "psutil>=5.9.0",
-    "python-multipart>=0.0.9",
+    "python-multipart>=0.0.13",  # python_multipart module name (llm_gateway STT parser)
     # Project canvas board renders low-fidelity PNG snapshots for vision
     # agents (tinyagentos/projects/canvas/render.py).
     "Pillow>=10.0",

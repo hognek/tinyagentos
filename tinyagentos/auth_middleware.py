@@ -11,6 +11,10 @@ from starlette.responses import HTMLResponse, RedirectResponse
 
 from tinyagentos.agent_token_auth import check_agent_identity, _get_keypair, _get_store
 from tinyagentos.auth import AuthStoreCorruptError
+from tinyagentos.device_scopes import (
+    AGENTS_READ, CHAT_SEND, DECISIONS_ANSWER, FILES_UPLOAD, LIBRARY_INGEST,
+    PUSH_REGISTER, VOICE_STT, VOICE_TTS,
+)
 from tinyagentos.device_store import DEVICE_TOKEN_PREFIX
 from tinyagentos.rate_limit import MovingWindowLimiter
 
@@ -274,21 +278,46 @@ _AGENT_NOTIFICATIONS_ROUTES = (
 # calls still work: the session-cookie check runs when no Bearer header is
 # present, so GET/POST without a Bearer reach the guard normally.
 _DEVICE_BEARER_PATHS = (
-    ("PATCH", re.compile(r"^/api/devices/[^/]+/push-token$")),
-    ("GET", re.compile(r"^/api/decisions$")),
-    ("GET", re.compile(r"^/api/decisions/[^/]+$")),
-    ("GET", re.compile(r"^/api/decisions/[^/]+/history$")),
-    ("POST", re.compile(r"^/api/decisions/[^/]+/answer$")),
-    ("POST", re.compile(r"^/api/library/ingest$")),
-    ("POST", re.compile(rf"^/api/projects/{_SEG}/files/upload$")),
-    ("POST", re.compile(r"^/api/chat/messages$")),
+    ("PATCH", re.compile(r"^/api/devices/[^/]+/push-token$"), PUSH_REGISTER),
+    ("GET", re.compile(r"^/api/decisions$"), AGENTS_READ),
+    ("GET", re.compile(r"^/api/decisions/[^/]+$"), AGENTS_READ),
+    ("GET", re.compile(r"^/api/decisions/[^/]+/history$"), AGENTS_READ),
+    ("POST", re.compile(r"^/api/decisions/[^/]+/answer$"), DECISIONS_ANSWER),
+    ("POST", re.compile(r"^/api/library/ingest$"), LIBRARY_INGEST),
+    ("POST", re.compile(rf"^/api/projects/{_SEG}/files/upload$"), FILES_UPLOAD),
+    ("POST", re.compile(r"^/api/chat/messages$"), CHAT_SEND),
+    # S6 / S6b: device voice. Device-bearer only; the routes name their own
+    # scope via device_scope(), this entry is what lets the Bearer past the gate.
+    ("POST", re.compile(r"^/api/device/v1/voice$"), VOICE_STT),
+    ("POST", re.compile(r"^/api/device/v1/voice/tts$"), VOICE_TTS),
+)
+
+# Device-bearer routes that are NOT in _DEVICE_BEARER_PATHS because they sit in
+# EXEMPT_PATHS (the auth gate must not change for them) but still authenticate
+# the device themselves via require_device. Kept in a separate table so the
+# gate behaviour is untouched; device_scope_for consults both.
+# Classification of share destinations is provisional: it lists the library and
+# the owner's project/DM write targets, so it is gated on the same scope as the
+# library ingest it feeds. Fail closed: a device without library:ingest (e.g.
+# embedded) is refused rather than shown the destinations.
+_DEVICE_EXEMPT_SCOPED_PATHS = (
+    ("GET", re.compile(r"^/api/share/destinations$"), LIBRARY_INGEST),
 )
 
 
 def _is_device_bearer_path(method: str, path: str) -> bool:
     """True only for the exact device-bearer self-service routes. Strict
     method + anchored-regex match; everything else stays session-only."""
-    return any(m == method and rx.match(path) for m, rx in _DEVICE_BEARER_PATHS)
+    return any(m == method and rx.match(path) for m, rx, _scope in _DEVICE_BEARER_PATHS)
+
+
+def device_scope_for(method: str, path: str) -> str | None:
+    """The scope a device bearer needs for this method + path, or None when
+    the path is unclassified (callers must treat None as a refusal)."""
+    for m, rx, scope in _DEVICE_BEARER_PATHS + _DEVICE_EXEMPT_SCOPED_PATHS:
+        if m == method and rx.match(path):
+            return scope
+    return None
 
 
 def _any_route_matches(method: str, path: str, routes, *, match_method: bool = True) -> bool:
@@ -503,14 +532,16 @@ _INVITE_INFO_PREFIX = "/i/"
 _AGENT_MODEL_MODELS = "/v1/models"
 _AGENT_MODEL_CHAT = "/v1/chat/completions"
 
-# In-process LLM gateway (tinyagentos/llm_gateway). Exactly three method+path
-# pairs are EXEMPT (models, chat completions, embeddings), like the Agent-as-a-Model pair above: a scoped gateway key
+# In-process LLM gateway (tinyagentos/llm_gateway). Exactly five method+path
+# pairs are EXEMPT (models, chat completions, embeddings, audio transcriptions, audio speech), like the Agent-as-a-Model pair above: a scoped gateway key
 # (or the host local token, or a signed-in session) IS the credential and the
 # route's ``gateway_caller`` dependency enforces it, answering an OpenAI-shaped
 # 401 otherwise. Every other /api/llm path or method stays gated here.
 _LLM_GATEWAY_MODELS = "/api/llm/v1/models"
 _LLM_GATEWAY_CHAT = "/api/llm/v1/chat/completions"
 _LLM_GATEWAY_EMBEDDINGS = "/api/llm/v1/embeddings"  # LiteLLM removal stage 2a
+_LLM_GATEWAY_TRANSCRIPTIONS = "/api/llm/v1/audio/transcriptions"  # local speech-to-text
+_LLM_GATEWAY_SPEECH = "/api/llm/v1/audio/speech"  # local text-to-speech
 # The gated rest of /api/llm/ still gets an OpenAI-shaped 401: an OpenAI
 # client reads error.message from an object, and the plain
 # {"error": "Authentication required"} string there surfaces as a crash in
@@ -662,6 +693,10 @@ def _is_exempt(method: str, path: str) -> bool:
     if method == "POST" and path == _LLM_GATEWAY_CHAT:
         return True
     if method == "POST" and path == _LLM_GATEWAY_EMBEDDINGS:
+        return True
+    if method == "POST" and path == _LLM_GATEWAY_TRANSCRIPTIONS:
+        return True
+    if method == "POST" and path == _LLM_GATEWAY_SPEECH:
         return True
     return False
 

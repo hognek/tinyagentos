@@ -13,7 +13,7 @@ Access the kanban board for a project. Granting `project_tasks` also makes the a
 - `GET /api/projects/{pid}/tasks/{id}` — get a specific task
 - `GET /api/projects/{pid}/tasks/{id}/comments` — list task comments
 - `POST /api/projects/{pid}/tasks/{id}/claim` — claim a task (LEAD-only)
-- `POST /api/projects/{pid}/tasks/{id}/release` — release a claimed task
+- `POST /api/projects/{pid}/tasks/{id}/release` — releaser_id + strike?
 - `POST /api/projects/{pid}/tasks/{id}/close` — close a task
 - `POST /api/projects/{pid}/tasks/{id}/reopen` — reopen a closed task
 - `GET /api/projects/tasks/{id}/context` — get task context
@@ -122,7 +122,7 @@ Content-negotiated advert: `Accept: application/json` → the redeem contract (`
 - `controller.endpoints` — non-loopback LAN IPv4s (priority ordered, operator override first) and the mesh (Tailscale) node IP when joined; optional relay endpoint when `TAOS_CONTROLLER_RELAY_URL` is configured with `https://`
 - `apis` — agent-JWT-reachable surface, scoped exactly to the granted scopes (mirrors the middleware allowlist)
 - `delivery` — timed-check contract (`poll_path`, `stream_path`, `check_interval_secs`, `cursor: ts`, `filter: mentions+project`)
-- `onboarding` + `guide_markdown` — capability guide (repo + manual links, scoped Projects/Canvas summary, A2A proxy contract, memory + timed checks). `harness=grok` adds secure-form token storage, routine polling and a shared-account warning.
+- `onboarding` + `guide_markdown` — capability guide (repo + manual links, scoped Projects/Canvas summary, A2A proxy contract, memory + timed checks). `harness=grok` adds secure-form token storage, onboarding polling, and a shared-account warning.
 
 See `docs/design/external-agent-project-invite.md` (issue #1780); canvas routes advertise only when that scope was granted.
 

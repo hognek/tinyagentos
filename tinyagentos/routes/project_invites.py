@@ -656,7 +656,8 @@ def _build_guide_markdown(
         )
         lines.append(
             f"Set a Grok routine to poll the taOS status endpoint every {check_interval_secs} seconds. "
-            "taOS cannot push to your bot, so the poll is the reliable delivery path."
+            "Polling is for onboarding only (to retrieve your token). "
+            "Ongoing messages and @mentions arrive on the A2A bus, and ready tasks are found by the timed check of `tasks/ready`."
         )
         lines.append(
             "This token is readable by every bot on this Grok account. "
@@ -687,9 +688,7 @@ def _build_guide_markdown(
         f"Poll every {check_interval_secs} seconds (or hold the SSE stream at "
         "`/api/a2a/bus/stream`) for your ready tasks and any @mentions addressed to "
         f"`{agent_handle}`. On each check: read ready tasks, act on them, comment "
-        "progress, post on the bus, and report status. This timed check is the "
-        "reliable delivery floor; the stream is an optional optimization only if your "
-        "harness can hold a connection and wake on a message."
+        "progress, post on the bus, and report status. The timed check is the reliable delivery floor and the stream is an optional optimization."
     )
     lines.append("")
     return "\n".join(lines)
@@ -749,7 +748,8 @@ def _build_os_guide_markdown(
         )
         lines.append(
             f"Set a Grok routine to poll the taOS status endpoint every {check_interval_secs} seconds. "
-            "taOS cannot push to your bot, so the poll is the reliable delivery path."
+            "Polling is for onboarding only (to retrieve your token). "
+            "Ongoing messages and @mentions arrive on the A2A bus, and ready tasks are found by the timed check of `tasks/ready`."
         )
         lines.append(
             "This token is readable by every bot on this Grok account. "
@@ -780,9 +780,7 @@ def _build_os_guide_markdown(
         f"Poll every {check_interval_secs} seconds (or hold the SSE stream at "
         "`/api/a2a/bus/stream`) for any @mentions addressed to "
         f"`{agent_handle}`. On each check: read your mentions, act on them, and "
-        "report status. This timed check is the reliable delivery floor; the "
-        "stream is an optional optimization only if your harness can hold a "
-        "connection and wake on a message."
+        "report status. The timed check is the reliable delivery floor and the stream is an optional optimization."
     )
     lines.append("")
     return "\n".join(lines)

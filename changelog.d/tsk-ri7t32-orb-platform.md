@@ -1,2 +1,0 @@
-### Fixed
-- BLE pairing now correctly registers the platform from the board's info caps. Boards advertising `caps: ["orb"]` are registered as platform "orb", while boards with `caps: ["agent"]` or missing/invalid caps are registered as platform "taosusb". The default node name for Orb boards is now "taOS Orb-{board_id}".

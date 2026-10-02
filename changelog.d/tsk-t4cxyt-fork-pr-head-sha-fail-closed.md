@@ -1,2 +1,0 @@
-### Fixed
-- Fork PR bot-review gate now fails closed when the head SHA is empty (prevented a null commit_id from matching an empty head sha). Added fail-closed tests for collaborator permission read and reviews read failures.

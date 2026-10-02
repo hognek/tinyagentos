@@ -12251,6 +12251,12 @@ async def set_lock_radios(request: Request):
 
 _USB_BIN = "/usr/local/bin/taos-usb-mode"
 
+#: Wall-clock bound on POST /lock-usb waiting for a switch to land. Each read
+#: is two helper calls of up to 4s, so counting iterations alone let a hung
+#: helper hold the request for minutes.
+_USB_SETTLE_SECONDS = 12.0
+_usb_clock = time.monotonic
+
 #: What the page may ask for, mapped to the verb the root helper accepts. CLOSED.
 _USB_VERBS = {
     "ncm": "usb-ncm",
@@ -12274,24 +12280,29 @@ def _read_usb() -> dict:
         got = subprocess.run(
             [_USB_BIN], capture_output=True, text=True, timeout=4,
         )
-        if got.returncode != 0:
-            return state
-        for line in got.stdout.splitlines():
-            key, sep, value = line.partition(":")
-            if not sep:
-                continue
-            key, value = key.strip().lower(), value.strip().lower()
-            if key in ("mode", "saved"):
-                state[key] = value if value in _USB_VERBS else "unknown"
+    except Exception:
+        return state
+    if got.returncode != 0:
+        return state
+    for line in got.stdout.splitlines():
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        key, value = key.strip().lower(), value.strip().lower()
+        if key in ("mode", "saved"):
+            state[key] = value if value in _USB_VERBS else "unknown"
+    # A failing `list` keeps the mode already read: the tile still hides
+    # (available stays empty), but the POST poll can see a switch land.
+    try:
         got = subprocess.run(
             [_USB_BIN, "list"], capture_output=True, text=True, timeout=4,
         )
-        if got.returncode == 0:
-            state["available"] = [
-                m for m in got.stdout.split() if m in _USB_VERBS
-            ]
     except Exception:
-        return {"available": []}
+        return state
+    if got.returncode == 0:
+        state["available"] = [
+            m for m in got.stdout.split() if m in _USB_VERBS
+        ]
     return state
 
 
@@ -12317,8 +12328,9 @@ async def set_lock_usb(request: Request):
     it.
 
     A switch can take up to ~8s to land (ncm restarts a systemd helper), so
-    this polls the read-back until it matches, and answers with the READ-BACK
-    even when it never does: the page shows the truth, not the request.
+    this polls the read-back until it matches or 12s of wall clock pass, and
+    answers with the READ-BACK even when it never lands: the page shows the
+    truth, not the request.
     """
     refusal = _lock_post_refusal(request)
     if refusal is not None:
@@ -12341,9 +12353,23 @@ async def set_lock_usb(request: Request):
             {"error": "request failed", "detail": str(exc)}, status_code=503
         )
     state = current
+    deadline = _usb_clock() + _USB_SETTLE_SECONDS
     for _ in range(24):
-        await asyncio.sleep(0.5)
-        state = await asyncio.to_thread(_read_usb)
+        remaining = deadline - _usb_clock()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(0.5, remaining))
+        remaining = deadline - _usb_clock()
+        if remaining <= 0:
+            break
+        # A hung helper must not carry the request past the deadline. The
+        # abandoned read finishes in its thread on the helper's own timeout.
+        try:
+            state = await asyncio.wait_for(
+                asyncio.to_thread(_read_usb), remaining
+            )
+        except asyncio.TimeoutError:
+            break
         if state.get("mode") == mode:
             break
     return JSONResponse(state)
