@@ -3,6 +3,7 @@ worker manifest's health_url/port. Bad entries are skipped with a warning."""
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from urllib.parse import urlsplit
@@ -38,13 +39,17 @@ class _Resp:
     def json(self):
         return self._body
 
+    def raise_for_status(self):
+        return None
+
 
 class _FakeHttpx:
     """Stands in for httpx.AsyncClient: an origin answers only if live. Each
     client records its timeout; all share one log of (timeout, url)."""
 
-    def __init__(self, live, delay=0.0):
+    def __init__(self, live, delay=0.0, stall=()):
         self.live, self.delay, self.requested = set(live), delay, []
+        self.stall, self.posted = set(stall), []
 
     def __call__(self, timeout=None, **_):
         fake = self
@@ -59,12 +64,19 @@ class _FakeHttpx:
             async def get(self, url):
                 fake.requested.append((timeout, url))
                 parts = urlsplit(url)
-                if f"{parts.scheme}://{parts.netloc}" not in fake.live:
+                origin = f"{parts.scheme}://{parts.netloc}"
+                if origin in fake.stall:  # answers, but never finishes the body
+                    await asyncio.sleep(3600)
+                if origin not in fake.live:
                     await asyncio.sleep(fake.delay)
                     raise ConnectionError("connection refused")
                 if parts.path in ("/api/tags", "/api/ps"):
                     return _Resp({"models": [{"model": "m:latest", "size": 0}]})
                 return _Resp({"data": [{"id": "m"}]})
+
+            async def post(self, url, content=None, headers=None):
+                fake.posted.append((url, json.loads(content)))
+                return _Resp({"generation": 1})
 
         return _Client()
 
@@ -74,14 +86,14 @@ class _FakeHttpx:
         ))
 
 
-async def _detect(monkeypatch, live=(), *, extra=None, models=(), delay=0.0):
+async def _detect(monkeypatch, live=(), *, extra=None, models=(), delay=0.0, stall=()):
     if extra is None:
         monkeypatch.delenv("TAOS_EXTRA_BACKENDS", raising=False)
     else:
         monkeypatch.setenv("TAOS_EXTRA_BACKENDS", extra)
     manifest = {"resource_id": "", "models": list(models)}
     monkeypatch.setattr("tinyagentos.worker.worker_manifest.load_manifest", lambda: manifest)
-    fake = _FakeHttpx(live, delay)
+    fake = _FakeHttpx(live, delay, stall)
     monkeypatch.setattr("tinyagentos.worker.agent.httpx.AsyncClient", fake)
     return await WorkerAgent("http://localhost:6969").detect_backends(), fake
 
@@ -189,7 +201,9 @@ def test_dedupe_against_defaults():
 
 
 @pytest.mark.parametrize("entry, expected", [
-    ({"port": 9090, "health_url": "http://127.0.0.1:9091/health"}, "http://127.0.0.1:9091"),
+    ({"port": 9090, "health_url": "http://127.0.0.1:9090/health"}, "http://127.0.0.1:9090"),
+    # A health_url on another port than the declared one falls back to the port.
+    ({"port": 9090, "health_url": "http://127.0.0.1:9091/health"}, "http://localhost:9090"),
     ({"port": 9090}, "http://localhost:9090"),
     ({"port": 0}, None),
     ({"port": "9090"}, None),
@@ -285,3 +299,66 @@ class TestDetectBackends:
         backends, _ = await _detect(monkeypatch, models=models)
         assert _summary(backends) == [("llama-cpp:9090", None, "stopped")]
         assert [x["model_id"] for x in backends[0]["available_models"]] == ["a", "b"]
+
+
+    @pytest.mark.guards(
+        "tinyagentos.worker.agent:WorkerAgent.detect_backends",
+        replace=[("_PROBE_DEADLINE_S)", "None)")],
+    )
+    async def test_trickling_lan_server_cut_off_at_deadline(self, monkeypatch):
+        monkeypatch.setattr(agent_mod, "_PROBE_DEADLINE_S", 0.2)
+        # Without the deadline the stalled probe never returns; fail, not hang.
+        backends, _ = await asyncio.wait_for(_detect(
+            monkeypatch, {"http://localhost:11434"}, stall={"http://10.0.0.5:11434"},
+            extra="ollama=http://10.0.0.5:11434",
+        ), 5)
+        assert _summary(backends) == [("ollama:11434", "http://localhost:11434", "ok")]
+
+    async def test_manifest_health_port_mismatch_reported_on_declared_port(self, monkeypatch):
+        m = {"model_id": "qwen", "software": "llamacpp", "port": 9090,
+             "health_url": "http://127.0.0.1:9091/health"}
+        backends, _ = await _detect(monkeypatch, models=[m])
+        assert _summary(backends) == [("llama-cpp:9090", None, "stopped")]
+        assert backends[0]["available_models"][0]["port"] == 9090
+
+
+# --- the worker's own advertised URL ------------------------------------------
+
+
+@pytest.fixture
+def _paired(monkeypatch):
+    monkeypatch.delenv("TAOS_ADVERTISE_IP", raising=False)
+    monkeypatch.setattr("tinyagentos.worker.pairing.load_signing_key", lambda d: b"k" * 32)
+    monkeypatch.setattr(agent_mod, "_detect_lan_ip", lambda url: "192.168.1.7")
+    monkeypatch.setattr(WorkerAgent, "get_worker_url", lambda self: "http://192.168.1.7:8765")
+
+
+@pytest.mark.asyncio
+@pytest.mark.guards(
+    "tinyagentos.worker.agent:WorkerAgent._advertised_url",
+    replace=[('if url and _candidate_key(b.get("type", ""), url)[2] == "loopback":', "if url:")],
+)
+async def test_lan_extra_never_becomes_the_worker_url(monkeypatch, _paired):
+    """A live LAN extra with no live local backend: register and heartbeat
+    advertise this worker's own address, not the LAN box's."""
+    _, fake = await _detect(monkeypatch, {"http://192.168.1.5:11434"},
+                            extra="ollama=http://192.168.1.5:11434")
+    agent = WorkerAgent("http://192.168.1.2:6969", name="w1")
+    assert await agent.register() is True
+    await agent.heartbeat()
+    urls = {u.rsplit("/", 1)[-1]: body["url"] for u, body in fake.posted}
+    assert urls == {"workers": "http://192.168.1.7:8765", "heartbeat": "http://192.168.1.7:8765"}
+    backends = [body["backends"] for _, body in fake.posted]
+    assert all([b["url"] for b in bs] == ["http://192.168.1.5:11434"] for bs in backends)
+
+
+@pytest.mark.asyncio
+async def test_live_local_backend_still_used_as_worker_url(monkeypatch, _paired):
+    """Unchanged legacy fallback: a co-located worker without advertise
+    settings is reached through its first live loopback backend."""
+    _, fake = await _detect(monkeypatch, {"http://localhost:11434", "http://192.168.1.5:11434"},
+                            extra="ollama=http://192.168.1.5:11434")
+    agent = WorkerAgent("http://192.168.1.2:6969", name="w1")
+    assert await agent.register() is True
+    await agent.heartbeat()
+    assert [body["url"] for _, body in fake.posted] == ["http://localhost:11434"] * 2
