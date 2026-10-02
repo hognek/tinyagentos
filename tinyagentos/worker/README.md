@@ -48,6 +48,16 @@ Default name is the machine's hostname.
 3. **Registers** with the controller via `POST /api/cluster/workers`
 4. **Heartbeats** every 5 seconds via `POST /api/cluster/heartbeat` with CPU load
 
+## Extra backends (`TAOS_EXTRA_BACKENDS`)
+
+Probe backends beyond the default ports with comma-separated `type=url` pairs, e.g. `TAOS_EXTRA_BACKENDS="ollama=http://192.168.1.20:11434,llama-cpp=http://127.0.0.1:9000"`. At most 16 entries are used.
+
+- `type`: a local backend the worker can probe: `rkllama`, `ollama`, `hailo-ollama`, `llama-cpp`, `vllm`, `exo`, `mlx`, `sd-cpp`.
+- `url`: a base URL whose host is `localhost` or a literal loopback or private-LAN IP (127/8, 10/8, 172.16/12, 192.168/16, ::1, fc00::/7). Hostnames are not resolved, and link-local and cloud-metadata addresses are refused.
+- Invalid entries are skipped with one warning in the worker log. An entry that repeats a default (same type and port; `localhost`, `127.0.0.1` and `::1` count as the same host) is probed once.
+
+The worker manifest is probed too: for each entry, the origin of its `health_url` (loopback only; the path is not used), else, or if that is rejected, `http://localhost:<port>`. Declared software that is running is reported live. Software that is not running appears as `stopped`, one entry per declared port.
+
 ## Standalone binaries
 
 Build a single-file executable with PyInstaller:
