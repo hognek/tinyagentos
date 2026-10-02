@@ -86,6 +86,7 @@ export function RequestsPanel() {
 
   async function act(req: ScopeRequestRow, approve: boolean) {
     setActing(req.id);
+    setActionErr(null);
     try {
       const base =
         `/api/agents/registry/${encodeURIComponent(req.canonical_id)}/scope-requests/${encodeURIComponent(req.id)}`;
