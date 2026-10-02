@@ -19,8 +19,11 @@ on:
 permissions:
   contents: write
 
+# ONE group for every tag: runs are serialised, so two tags pushed close
+# together cannot race each other for /releases/latest. The "Mark latest" step
+# additionally refuses to promote a tag older than the newest published one.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release
   cancel-in-progress: false
 
 jobs:
@@ -60,19 +63,39 @@ jobs:
           git rev-parse HEAD:desktop > desktop-tree.txt
           sha256sum desktop-bundle.tar.gz | awk '{print $1}' > desktop-bundle.sha256
 
-      - name: Publish the GitHub Release
+      - name: Publish the GitHub Release (assets first, then public)
         run: |
-          # Betas are our normal releases: never --prerelease, or /releases/latest
-          # (the in-app update check) skips it.
+          # Created as a DRAFT so the bundle is attached before anyone can see the
+          # release: a failed upload must never leave a public "latest" release
+          # without its bundle. Betas are our normal releases: never --prerelease,
+          # or /releases/latest (the in-app update check) skips it.
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            echo "release ${TAG} already exists; refreshing its bundle only"
+            echo "release ${TAG} already exists; repairing notes and flags"
+            gh release edit "${TAG}" --notes-file release-notes.md --title "${TAG}" --prerelease=false
           else
-            gh release create "${TAG}" --verify-tag --title "${TAG}" \
-              --notes-file release-notes.md --latest
+            gh release create "${TAG}" --verify-tag --draft --title "${TAG}" \
+              --notes-file release-notes.md
           fi
           gh release upload "${TAG}" desktop-bundle.tar.gz desktop-tree.txt desktop-bundle.sha256 --clobber
+          gh release edit "${TAG}" --draft=false --latest=false
+
+      - name: Mark latest only if this is the newest published version
+        id: latest
+        run: |
+          pip install --quiet packaging
+          newest=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+            | python3 scripts/newest_release_tag.py)
+          if [ "${newest}" = "${TAG}" ]; then
+            gh release edit "${TAG}" --latest
+            echo "is_newest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::${TAG} is older than ${newest}; published but NOT marked latest"
+            echo "is_newest=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Verify /releases/latest now names this tag
+        if: steps.latest.outputs.is_newest == 'true'
         run: |
           latest=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)
           if [ "${latest}" != "${TAG}" ]; then

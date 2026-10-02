@@ -7,7 +7,8 @@ published release with the same notes the CHANGELOG carries.
 
     python3 scripts/changelog_section.py 1.0.0-beta.56 [CHANGELOG.md]
 
-Prints the body between `## [<version>] - <date>` and the next `## [` heading.
+Prints the body between the `## [<version>]` heading (any trailing text, usually
+`- <date>`, is allowed) and the next `## [` heading.
 Exits non-zero when the section is missing or empty: a release must never be
 published with notes from the wrong version or no notes at all.
 """

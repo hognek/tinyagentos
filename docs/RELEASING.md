@@ -78,7 +78,8 @@ Pushing the tag runs `.github/workflows/release.yml`, which:
 1. refuses to publish if the tagged commit's `pyproject.toml` version is not the tag,
 2. takes the release body from the `## [1.0.0-beta.N]` section of `CHANGELOG.md`
    (`scripts/changelog_section.py`; it fails rather than publish empty or wrong notes),
-3. publishes the release with `--latest` and attaches the prebuilt desktop bundle,
+3. creates the release as a draft, attaches the prebuilt desktop bundle, then publishes it
+   and marks it latest (only if it is the newest version; runs are serialised),
 4. fails unless `/releases/latest` now names the new tag.
 
 **The release is not done until that workflow run is green.** Check it, then confirm:
@@ -95,11 +96,19 @@ seeing beta.53. The taos.my changelog page also pulls from GitHub Releases.
 Do NOT create the release as a prerelease: `/releases/latest` skips prereleases.
 
 **Fallback** if the workflow cannot run (Actions outage), publish by hand from the same
-notes; ci.yml's `release: published` trigger then attaches the bundle:
+notes. Nothing else will attach the bundle in an outage (ci.yml's `release: published`
+job needs Actions too), so build and upload it yourself BEFORE making the release public:
 
 ```bash
+git checkout v1.0.0-beta.N
 python3 scripts/changelog_section.py v1.0.0-beta.N > notes.md
-gh release create v1.0.0-beta.N --verify-tag --title "v1.0.0-beta.N" --notes-file notes.md --latest
+(cd desktop && npm ci && npm run build)
+tar -C static -czf desktop-bundle.tar.gz desktop
+git rev-parse HEAD:desktop > desktop-tree.txt
+sha256sum desktop-bundle.tar.gz | awk '{print $1}' > desktop-bundle.sha256
+gh release create v1.0.0-beta.N --verify-tag --draft --title "v1.0.0-beta.N" --notes-file notes.md
+gh release upload v1.0.0-beta.N desktop-bundle.tar.gz desktop-tree.txt desktop-bundle.sha256
+gh release edit v1.0.0-beta.N --draft=false --latest
 ```
 
 ## Notes
