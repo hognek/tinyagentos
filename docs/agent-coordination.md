@@ -1302,6 +1302,29 @@ Route module `tinyagentos/routes/device_pair_requests.py`:
 Approval or denial of a pair request is surfaced to the user through the Decisions app;
 agents must not grant pairing directly.
 
+## Device voice routes (S6 / S6b)
+
+Route module `tinyagentos/routes/device_voice.py`. Device bearer only (a session
+user has no device, so no session is accepted: `401` without a device token);
+embedded tokens are refused `403 device_tls_required` off the TLS listener. Both
+routes call the in-process `llm_gateway.stt` / `llm_gateway.tts` helpers, never
+a cloud backend, and never log or store the text or the audio. Errors are
+`{"detail": {"error": <code>, "message": ...}}`.
+
+- `POST /api/device/v1/voice` (scope `voice:stt`): body is raw PCM16 LE 16 kHz
+  mono (`application/octet-stream` or `audio/pcm`), at most 960000 bytes (30 s)
+  or `413 audio_too_large`; empty or odd length `400 invalid_audio`. Returns
+  `{"text": ...}`. `409 stt_not_installed`, `503 stt_unavailable`.
+- `POST /api/device/v1/voice/tts` (scope `voice:tts`): JSON `{"text", "sample_rate"?}`,
+  text at most 4096 characters (`413 input_too_long`), `sample_rate` omitted =
+  native 22050, `16000` = resampled, anything else `400` (never a silent
+  native answer). Streams PCM16 mono as `audio/pcm` with `X-Sample-Rate` (the
+  rate sent) and `X-Channels: 1`. `409 tts_not_installed`, `503 tts_unavailable`,
+  `502 upstream_error`. A client gone before synthesis starts gets `499` and the
+  daemon is never called.
+
+The full device protocol doc lands with S9.
+
 ## taOSusb Bluetooth pairing: commit/reveal (protocol v2)
 
 `tinyagentos/cluster/ble/proto.py` is shared byte-identical with the taOSusb

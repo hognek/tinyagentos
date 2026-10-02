@@ -13,7 +13,7 @@ from tinyagentos.agent_token_auth import check_agent_identity, _get_keypair, _ge
 from tinyagentos.auth import AuthStoreCorruptError
 from tinyagentos.device_scopes import (
     AGENTS_READ, CHAT_SEND, DECISIONS_ANSWER, FILES_UPLOAD, LIBRARY_INGEST,
-    PUSH_REGISTER,
+    PUSH_REGISTER, VOICE_STT, VOICE_TTS,
 )
 from tinyagentos.device_store import DEVICE_TOKEN_PREFIX
 from tinyagentos.rate_limit import MovingWindowLimiter
@@ -286,6 +286,10 @@ _DEVICE_BEARER_PATHS = (
     ("POST", re.compile(r"^/api/library/ingest$"), LIBRARY_INGEST),
     ("POST", re.compile(rf"^/api/projects/{_SEG}/files/upload$"), FILES_UPLOAD),
     ("POST", re.compile(r"^/api/chat/messages$"), CHAT_SEND),
+    # S6 / S6b: device voice. Device-bearer only; the routes name their own
+    # scope via device_scope(), this entry is what lets the Bearer past the gate.
+    ("POST", re.compile(r"^/api/device/v1/voice$"), VOICE_STT),
+    ("POST", re.compile(r"^/api/device/v1/voice/tts$"), VOICE_TTS),
 )
 
 # Device-bearer routes that are NOT in _DEVICE_BEARER_PATHS because they sit in
