@@ -122,9 +122,6 @@ _AGENT_TOKEN_PATHS = (
         "/api/desktop/command",
         "/api/desktop/screenshot",
         "/api/desktop/layout",
-        # Memory routes - registry-JWT agents can reach these if they have memory_read scope
-        "/api/memory/browse",
-        "/api/memory/search",
     })
 )
 
