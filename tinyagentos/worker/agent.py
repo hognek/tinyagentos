@@ -297,7 +297,8 @@ def _manifest_entry_url(m: dict) -> str | None:
 
 # llama-swap's GET /running is {"running": [{"model": <id>, "state": ..., ...}]}
 # (internal/server/api.go handleRunning, verified against llama-swap v261). It
-# lists every process not stopped: "starting", "ready" or "stopping". Plain
+# lists every process not stopped: "starting", "ready" or "stopping" (the
+# last is excluded below). Plain
 # llama.cpp serves /v1/models but no /running, which is how the two differ.
 _LLAMA_SWAP_UNLOADING_STATES = frozenset({"stopping", "stopped", "shutdown"})
 

@@ -109,7 +109,7 @@ def test_llama_swap_is_a_local_probeable_type():
     ]
     assert "llama-swap" in LOCAL_TYPES and "llama-swap" in LOCAL_BACKENDS
     assert BACKEND_TYPE_MAP["llama-swap"] == "openai"
-    assert BACKEND_CAPABILITIES["llama-swap"] == {"llm-chat", "embedding"}
+    assert BACKEND_CAPABILITIES["llama-swap"] == {"llm-chat", "embedding", "reranking"}
     get_adapter("llama-swap")  # raises for an unknown type
 
 
@@ -160,7 +160,7 @@ class TestDetect:
             "llama-swap:9292", "llama-swap", "http://127.0.0.1:9292")
         assert [m["name"] for m in b["models"]] == ["org/embed-model", "qwen-chat"]
         assert b["loaded_models"] == [{"name": "qwen-chat", "size_mb": 0}]
-        assert b["capabilities"] == ["embedding", "llm-chat"]
+        assert b["capabilities"] == ["embedding", "llm-chat", "reranking"]
 
     @pytest.mark.guards(
         "tinyagentos.worker.agent:WorkerAgent.detect_backends",
