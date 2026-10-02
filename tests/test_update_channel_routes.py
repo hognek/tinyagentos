@@ -114,7 +114,7 @@ class TestUpdateChannelRoute:
             return UpdateResult(previous_sha="aaa", new_sha="bbb", recovery_tag="tag1", message="ok")
 
         async def fake_pip_rebuild_restart(project_dir, target_sha):
-            return 0, ""
+            return 0, "", None
 
         monkeypatch.setattr(s, "_remote_branches", fake_lsremote, raising=False)
         monkeypatch.setattr(s, "resolve_tracked_branch", fake_resolve, raising=False)
