@@ -1330,6 +1330,13 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         app.state.system_events = _system_events
         app.state.event_bus = EventBus()
 
+        # Model Activity feed (#208): bounded in-process ring buffer that the
+        # scheduler and LLM gateway record into; the Activity app reads it via
+        # GET /api/activity/models and the SSE stream. No init()/close(): it is
+        # pure in-memory state, deliberately not persisted.
+        from tinyagentos.model_activity import ModelActivityFeed
+        app.state.model_activity = ModelActivityFeed()
+
         # Wire NotificationStore → EventBus so SSE clients get instant push.
         # The emitter is best-effort: failures are logged and never break add().
         async def _notify_emitter(row: dict) -> None:

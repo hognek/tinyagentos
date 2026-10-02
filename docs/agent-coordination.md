@@ -1465,6 +1465,65 @@ subscriber's ids and hand that subscriber a replayed event it already handled
 when it owned a stream of its own, and the same window is what makes the
 overlap during a filter widening invisible to callers.
 
+## Model Activity feed (`/api/activity/models`, session-only)
+
+Route module `tinyagentos/routes/model_activity.py`. A ring buffer of
+model-level events on the controller (`app.state.model_activity`, a
+`ModelActivityFeed` from `tinyagentos/model_activity.py`, 500 records by
+default). Two producers feed it:
+
+- `llm_gateway/forward.py` records `request.start` / `request.finish` (with
+  duration, tokens and output token rate) and `model.route` on backend
+  failover. These fire on every gateway request, so the feed is live on any box
+  with `TAOS_LLM_GATEWAY=1`.
+- `CoreAwareModelScheduler` records load / unload / evict / shrink when it is
+  constructed with the feed (`activity_feed=...`, or
+  `set_activity_feed(...)` later). **Today nothing in `create_app` constructs
+  one** -- that wiring is the Phase-1.5 sequential-loading task tracked as
+  #172 -- so on a live box the scheduler half of the feed stays empty until it
+  lands. The hook is at the module's existing event surface and is covered by
+  tests; only the instantiation is missing.
+
+It is an operational window, not a system of record: nothing is persisted, and
+`SystemEventStore` remains the durable log.
+
+Both paths sit behind the session cookie: the paths are NOT in
+`EXEMPT_PATHS`, so `AuthMiddleware` 401s an unauthenticated request before the
+handler runs, and no registry scope reaches them. The route's own
+`get_current_user` dependency is what enforces that, not the middleware: a
+local-token bearer is a valid credential for the middleware (it stamps a
+`user_id`), and the routes still answer `401` to it. The stream answers `503`
+while `app.state.model_activity` is still starting.
+
+Reads are owner-scoped. A gateway event carries the principal that made the
+request as its `owner` (`user:<id>` for a session, an agent's registry name for
+an agent, the gateway master-key label for the admin key), on `model.route` as
+well as on `request.start` / `request.finish`; the scheduler hooks have no owner
+because a load is a controller-level fact, not a caller's. An admin session sees
+the whole ring, while a member session sees only the events its own principal
+owns, so one user cannot read which models another user's agents call, how
+often, or under which agent names. Controller-level events and other
+principals' traffic stay admin-only; the AI-stack manager panel remains the
+member-visible view of what is loaded.
+
+- `GET /api/activity/models`: newest-first history. `?limit=` (1-500, default
+  100), `?model=`, `?worker=`, `?event=`. Answers
+  `{"events": [...], "count": N, "event_types": [...]}`; `event_types` is the
+  vocabulary the UI builds its filter list from.
+- `GET /api/activity/models/stream`: SSE. `?limit=` (0-500, default 50) caps
+  the ring window a new subscriber is caught up with; `0` means live-only,
+  which is the right choice for a caller that already fetched the history and
+  is deduplicating by `seq`. Filter parameters are the same three as above and
+  apply to the live frames as well as the catch-up window. Frames are
+  `id: <seq>` + `data: <event JSON>`, with `:keepalive` every 10 s.
+- Event vocabulary (stable): `model.load`, `model.unload`, `model.evict`,
+  `model.shrink`, `model.route`, `request.start`, `request.finish`. `seq` is
+  monotonic and is the de-dupe key across the catch-up/live seam; `worker` is
+  `"controller"` for local events; `duration_ms`, `tokens_in`, `tokens_out` and
+  `token_rate` are populated on `request.finish`.
+- Telemetry is best-effort at every hook: a feed failure is logged and never
+  fails a model load or an inference request.
+
 ## LoRA Studio routes (session-only, no agent scope)
 
 Route module `tinyagentos/routes/lora_studio.py`. These are OWNER routes: they
