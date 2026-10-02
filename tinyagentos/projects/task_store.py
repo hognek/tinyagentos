@@ -578,6 +578,12 @@ class ProjectTaskStore(ProjectsDBStore):
                         task_id, "dispatch_failed", actor=releaser_id
                     )
                     if count >= StrikeStore.STRIKE_THRESHOLD:
+                        # The conditional UPDATE inside quarantine_task is itself
+                        # the decision: it only fires while the task is still
+                        # open and unclaimed.  A separate pre-read here would
+                        # leave a window in which another worker claims the task
+                        # between the check and the quarantine, and the
+                        # quarantine would then swallow that worker's live claim.
                         await self.quarantine_task(
                             task_id, "system", only_if_unclaimed=True
                         )

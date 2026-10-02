@@ -13,7 +13,7 @@ Access the kanban board for a project. Granting `project_tasks` also makes the a
 - `GET /api/projects/{pid}/tasks/{id}` — get a specific task
 - `GET /api/projects/{pid}/tasks/{id}/comments` — list task comments
 - `POST /api/projects/{pid}/tasks/{id}/claim` — claim a task (LEAD-only)
-- `POST /api/projects/{pid}/tasks/{id}/release` — release a claimed task. The body accepts `releaser_id` (required) and `strike` (optional, defaults to true). When `strike` is false the release clears the claim without recording a dispatch-failed strike or quarantining the card. Callers that release because the executor killed the run (watchdog, model hang, tooling fault) should set `strike` to false so those innocent exits do not accumulate strikes.
+- `POST /api/projects/{pid}/tasks/{id}/release` — releaser_id + strike?
 - `POST /api/projects/{pid}/tasks/{id}/close` — close a task
 - `POST /api/projects/{pid}/tasks/{id}/reopen` — reopen a closed task
 - `GET /api/projects/tasks/{id}/context` — get task context
