@@ -20,8 +20,9 @@ from typing import Any, AsyncGenerator
 
 import httpx
 
-from tinyagentos.llm_gateway.errors import upstream_error, bad_request
+from tinyagentos.llm_gateway.errors import GatewayError, upstream_error, bad_request, rate_limit_error
 from tinyagentos.llm_usage.usage import from_anthropic
+from tinyagentos.llm_gateway.forward import _notify_lifecycle
 
 ANTHROPIC_API_BASE = "https://api.anthropic.com"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -36,6 +37,8 @@ _FINISH_REASONS = {
     "stop_sequence": "stop",
     "max_tokens": "length",
     "tool_use": "tool_calls",
+    "refusal": "content_filter",
+    "model_context_window_exceeded": "length",
 }
 
 
@@ -66,48 +69,154 @@ def _redact(text: str, *secrets: str | None) -> str:
     return text
 
 
-async def _openai_to_anthropic(body: dict, principal: str, state: Any, api_key: str | None = None) -> dict:
+def _convert_openai_tool_to_anthropic(tool: dict) -> dict:
+    fn = tool.get("function", {})
+    return {
+        "name": fn.get("name", ""),
+        "description": fn.get("description", ""),
+        "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
+    }
+
+
+def _convert_tool_choice(tool_choice: dict | str | None) -> dict | str | None:
+    if tool_choice is None:
+        return None
+    if isinstance(tool_choice, str):
+        if tool_choice == "auto":
+            return {"type": "auto"}
+        if tool_choice == "required":
+            return {"type": "any"}
+        if tool_choice == "none":
+            return {"type": "none"}
+        return tool_choice
+    if isinstance(tool_choice, dict):
+        if tool_choice.get("type") == "function":
+            fn = tool_choice.get("function", {})
+            return {"type": "tool", "name": fn.get("name", "")}
+    return tool_choice
+
+
+async def _openai_to_anthropic(
+    body: dict,
+    principal: str,
+    state: Any,
+    api_key: str | None = None,
+    route: Any = None,
+    stream: bool = False,
+) -> dict:
     """Convert OpenAI chat request to Anthropic Messages API request."""
     request = {}
-    
-    # Extract system message if present
+
+    request["model"] = getattr(route, "upstream_model", "") if route else ""
+    request.setdefault("model", body.get("model", ""))
+    if stream:
+        request["stream"] = True
+
     messages = body.get("messages", [])
     system_message = None
     anthropic_messages = []
-    
+
     for msg in messages:
         role = msg.get("role")
         content = msg.get("content")
-        
+
         if role == "system":
             system_message = content
         elif role == "user":
             anthropic_messages.append({"role": "user", "content": content or ""})
         elif role == "assistant":
-            anthropic_messages.append({"role": "assistant", "content": content or ""})
+            tool_calls = msg.get("tool_calls")
+            if tool_calls:
+                content_blocks = []
+                if content:
+                    content_blocks.append({"type": "text", "text": content})
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    arguments = fn.get("arguments", "{}")
+                    try:
+                        parsed_input = json.loads(arguments)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed_input = {}
+                    content_blocks.append({
+                        "type": "tool_use",
+                        "id": tc.get("id", ""),
+                        "name": fn.get("name", ""),
+                        "input": parsed_input,
+                    })
+                anthropic_messages.append({"role": "assistant", "content": content_blocks})
+            else:
+                anthropic_messages.append({"role": "assistant", "content": content or ""})
         elif role == "tool":
-            # Convert tool response to user message
-            anthropic_messages.append({"role": "user", "content": f"Tool response: {content or ''}"})
-    
+            tool_call_id = msg.get("tool_call_id", "")
+            tool_content = msg.get("content", "")
+            anthropic_messages.append({
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": tool_call_id, "content": tool_content}],
+            })
+
     if system_message:
         request["system"] = system_message
-    
-    # Handle tools and tool_choice
-    if body.get("tools"):
-        request["tools"] = body.get("tools", [])
-        tool_choice = body.get("tool_choice")
-        if tool_choice:
+
+    tools = body.get("tools")
+    if tools:
+        request["tools"] = [_convert_openai_tool_to_anthropic(t) for t in tools]
+        tool_choice = _convert_tool_choice(body.get("tool_choice"))
+        if tool_choice is not None and tool_choice != "none":
             request["tool_choice"] = tool_choice
-    
+
     request["messages"] = anthropic_messages
     request["max_tokens"] = body.get("max_tokens", DEFAULT_MAX_TOKENS)
-    
-    # Handle optional Anthropic-specific parameters that OpenAI supports
+
     for param in ["temperature", "top_p", "top_k", "stop_sequences"]:
         if param in body:
             request[param] = body[param]
-    
+
     return request
+
+
+async def _anthropic_status_error(
+    resp: httpx.Response,
+    api_key: str | None,
+    api_key_for_redaction: str | None = None,
+) -> GatewayError | None:
+    """Map an upstream Anthropic response to a GatewayError, or None for 2xx."""
+    status = resp.status_code
+    if 200 <= status < 300:
+        return None
+
+    # Read body for streaming responses
+    try:
+        _ = resp.content
+    except httpx.ResponseNotRead:
+        try:
+            await resp.aread()
+        except Exception:
+            pass
+
+    error_msg = resp.text
+    if resp.headers.get("content-type", "").startswith("application/json"):
+        try:
+            error_data = resp.json()
+            error_msg = error_data.get("error", {}).get("message", resp.text)
+        except Exception:
+            pass
+
+    redacted_msg = _redact(error_msg, api_key, api_key_for_redaction)
+
+    if status == 429:
+        retry_after = resp.headers.get("retry-after")
+        return rate_limit_error(f"the Anthropic API failed (HTTP 429): {redacted_msg}", retry_after)
+
+    if 500 <= status < 600 or status == 529:
+        return upstream_error(f"the Anthropic API failed (HTTP {status}): {redacted_msg}")
+
+    if status in {401, 403}:
+        return upstream_error(f"the Anthropic API failed (HTTP {status}): {redacted_msg}")
+
+    if status in {400, 404}:
+        return bad_request(redacted_msg)
+
+    return upstream_error(f"the Anthropic API failed (HTTP {status}): {redacted_msg}")
 
 
 async def _call_anthropic(
@@ -124,48 +233,23 @@ async def _call_anthropic(
         "anthropic-version": ANTHROPIC_VERSION,
     }
     
-    what = "the Anthropic API"
-    
     # This will make a real HTTP request, which will be intercepted by respx during testing
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0)) as client:
         resp = await client.post(url, json=request, headers=headers)
     
-    # Handle response based on status code
-    if resp.status_code == 200:
-        try:
-            data = resp.json()
-        except ValueError:
-            data = None
-        
-        if not isinstance(data, dict):
-            raise upstream_error(f"{what} returned a response that is not a JSON object")
-        
-        return data
+    err = await _anthropic_status_error(resp, api_key, api_key_for_redaction)
+    if err is not None:
+        raise err
     
-    # For error responses, extract and redact error message
-    error_msg = resp.text
-    if resp.headers.get("content-type", "").startswith("application/json"):
-        try:
-            error_data = resp.json()
-            error_msg = error_data.get("error", {}).get("message", resp.text)
-        except:
-            pass
+    try:
+        data = resp.json()
+    except ValueError:
+        data = None
     
-    # Redact API key from error message
-    redacted_msg = _redact(error_msg, api_key, api_key_for_redaction)
+    if not isinstance(data, dict):
+        raise upstream_error("the Anthropic API returned a response that is not a JSON object")
     
-    # Raise appropriate error based on status code
-    # 5xx and 529 are retryable (upstream errors)
-    if 500 <= resp.status_code < 600 or resp.status_code == 529:
-        raise upstream_error(f"{what} failed (HTTP {resp.status_code}): {redacted_msg}")
-    
-    # 401/403 errors are taOS key/config issues -> upstream error (502)
-    if resp.status_code in {401, 403}:
-        raise upstream_error(f"{what} failed (HTTP {resp.status_code}): {redacted_msg}")
-    
-    # 400, 404 are caller request errors -> passed through (400)
-    if resp.status_code in {400, 404}:
-        raise bad_request(redacted_msg)
+    return data
 
 
 async def _anthropic_to_openai(response: dict, original_body: dict, api_key: str | None = None) -> dict:
@@ -356,13 +440,15 @@ async def chat_completion_anthropic(
     route = routes[0]
 
     # Build Anthropic request
-    anthropic_request = await _openai_to_anthropic(body, principal, state, api_key)
+    anthropic_request = await _openai_to_anthropic(body, principal, state, api_key, route=route, stream=False)
 
     # Make request (respx will intercept this for testing)
     response = await _call_anthropic(anthropic_request, api_key)
 
     # Translate back to OpenAI
-    return await _anthropic_to_openai(response, body)
+    result = await _anthropic_to_openai(response, body)
+    _notify_lifecycle(state, route.backend_name)
+    return result
 
 
 async def chat_completion_stream_anthropic(
@@ -376,7 +462,7 @@ async def chat_completion_stream_anthropic(
     route = routes[0]
 
     # Build Anthropic request
-    anthropic_request = await _openai_to_anthropic(body, principal, state, api_key)
+    anthropic_request = await _openai_to_anthropic(body, principal, state, api_key, route=route, stream=True)
     translator = _StreamTranslator(body.get("model", "unknown"))
 
     # Make request (respx will intercept this for testing). The stream is
@@ -393,6 +479,9 @@ async def chat_completion_stream_anthropic(
             },
         )
         resp = await client.send(req, stream=True)
+        err = await _anthropic_status_error(resp, api_key)
+        if err is not None:
+            raise err
         try:
             # Anthropic frames are "event: <type>\ndata: {json}\n\n"; the type
             # is repeated inside the JSON, so only the data line is read.
@@ -420,6 +509,7 @@ async def chat_completion_stream_anthropic(
                         yield f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
                     if translator.done:
                         yield b"data: [DONE]\n\n"
+                        _notify_lifecycle(state, route.backend_name)
                         return
         finally:
             await resp.aclose()

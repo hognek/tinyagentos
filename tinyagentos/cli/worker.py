@@ -33,11 +33,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tinyagentos.app import resolve_data_dir
+from tinyagentos.cli.taosctl.client import ApiError, TaosClient
 from tinyagentos.cluster.convert_to_lxc import (
     drain_and_delete_agents,
     list_flat_mode_agents,
     redeploy_agents,
 )
+from tinyagentos.config import load_config
+from tinyagentos.llm_proxy import LLMProxy
 from tinyagentos.size_units import parse_size_bytes
 
 logger = logging.getLogger(__name__)
@@ -50,7 +54,77 @@ def _load_agents_json(path: Path = Path("data/agents.json")) -> list[dict]:
     return json.loads(path.read_text())
 
 
+async def _get_verified_gateway_port() -> int:
+    """Query the LOCAL controller for the verified LLM gateway agent-listener port.
+
+    Uses the taosctl authenticated client (TAOS_TOKEN or ~/.config/taosctl/config.json).
+    Returns 0 and exits non-zero when the local controller is unreachable, returns
+    non-2xx, or reports the gateway as not running.
+    """
+    try:
+        resp = await asyncio.to_thread(TaosClient().get, "/api/settings/llm-proxy")
+    except ApiError as exc:
+        if exc.status in (401, 403):
+            print(
+                f"ERROR: local controller rejected the token (HTTP {exc.status}): "
+                "set TAOS_TOKEN or run taosctl login. "
+                f"Detail: {exc.message}",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"ERROR: local controller returned HTTP {exc.status} for "
+                f"/api/settings/llm-proxy: {exc.message}",
+                file=sys.stderr,
+            )
+        return 0
+    except Exception as exc:
+        print(
+            "ERROR: cannot reach local controller at http://127.0.0.1:6969 "
+            "(TAOS_TOKEN or ~/.config/taosctl/config.json required). "
+            f"Detail: {exc}",
+            file=sys.stderr,
+        )
+        return 0
+    if not isinstance(resp, dict) or not resp.get("running") or not resp.get("port"):
+        print(
+            "ERROR: local controller reports gateway not running or port missing. "
+            "Ensure TAOS_TOKEN or ~/.config/taosctl/config.json is set and the "
+            "controller is active.",
+            file=sys.stderr,
+        )
+        return 0
+    try:
+        return int(resp["port"])
+    except (TypeError, ValueError):
+        print(
+            "ERROR: local controller returned an invalid gateway port.",
+            file=sys.stderr,
+        )
+        return 0
+
+
 async def _convert_to_lxc(args) -> int:
+    # Preflight: verify gateway port against the LOCAL controller before
+    # touching anything. If this fails, exit non-zero having deleted nothing.
+    print("Verifying gateway port on local controller...")
+    gateway_port = await _get_verified_gateway_port()
+    if gateway_port == 0:
+        return 1
+
+    # Load config and build LLMProxy before touching anything. A bad
+    # config.yaml must abort having deleted nothing.
+    try:
+        data_dir = resolve_data_dir()
+        config = load_config(data_dir / "config.yaml")
+    except (ValueError, OSError) as exc:
+        print(f"ERROR: invalid config: {exc}", file=sys.stderr)
+        return 1
+    llm_proxy = LLMProxy(
+        port=config.server.get("litellm_port", 7834),
+        data_dir=data_dir,
+    )
+
     print("Enumerating flat-mode agents...")
     agents = list_flat_mode_agents()
     if not agents:
@@ -86,7 +160,10 @@ async def _convert_to_lxc(args) -> int:
 
     print("Redeploying agents into worker LXC...")
     agent_cfgs = _load_agents_json()
-    await redeploy_agents(agent_cfgs)
+    failed = await redeploy_agents(agent_cfgs, llm_proxy=llm_proxy, gateway_port=gateway_port)
+    if failed:
+        print(f"Redeploy failed for: {', '.join(failed)}", file=sys.stderr)
+        return 1
 
     print("Convert-to-LXC complete.")
     return 0
