@@ -112,10 +112,15 @@ gh release create v1.0.0-beta.N --verify-tag --draft --title "v1.0.0-beta.N" --n
 gh release upload v1.0.0-beta.N desktop-bundle.tar.gz desktop-tree.txt desktop-bundle.sha256
 gh release edit v1.0.0-beta.N --draft=false --latest=false
 # Mark latest ONLY if no published release is newer than this tag:
+python3 -m pip install --quiet packaging   # newest_release_tag.py needs it
 newest=$(gh api --paginate "repos/jaylfc/taOS/releases?per_page=100" \
   --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
   | python3 scripts/newest_release_tag.py)
-[ "$newest" = v1.0.0-beta.N ] && gh release edit v1.0.0-beta.N --latest
+if [ "$newest" = v1.0.0-beta.N ]; then
+  gh release edit v1.0.0-beta.N --latest
+else
+  echo "published, NOT latest: ${newest:-<none>} is newer"
+fi
 ```
 
 ## Notes
