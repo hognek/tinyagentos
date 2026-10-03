@@ -344,19 +344,47 @@ describe("useOsEvents", () => {
       lastEs?.onopen?.();
     });
 
+    const es = lastEs;
+
+    // Let the watchdog age partway toward its deadline.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+
     act(() => {
       lastEs?._fire({ kind: "events.heartbeat", id: null, ts: 1 });
     });
 
     expect(onEvent).not.toHaveBeenCalled();
 
-    // The watchdog was re-armed by the onmessage handler before handleMessage
-    // ran, so the stream must still be open after the old 25 s deadline.
+    // The onmessage armWatchdog() re-armed the watchdog before
+    // handleMessage ran, so the stream must still be open after another
+    // 20 s (total 30 s, past the original 25 s deadline).
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20000);
+    });
+
+    expect(es?.close).not.toHaveBeenCalled();
+
+    vi.useRealTimers();
+  });
+
+  it("closes the EventSource when the watchdog fires with no heartbeat", async () => {
+    vi.useFakeTimers();
+    renderHook(() => useOsEvents(["projects.task.changed"], () => {}));
+
+    act(() => {
+      lastEs?.onopen?.();
+    });
+
+    const es = lastEs;
+
+    // No heartbeat arrives. Advance past the 25 s watchdog deadline.
     await act(async () => {
       await vi.advanceTimersByTimeAsync(30000);
     });
 
-    expect(lastEs?.close).not.toHaveBeenCalled();
+    expect(es?.close).toHaveBeenCalled();
 
     vi.useRealTimers();
   });
