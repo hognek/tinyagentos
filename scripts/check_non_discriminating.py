@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import functools
 import importlib
 import inspect
 import json
@@ -122,6 +123,14 @@ def resolve_target(target: str) -> types.FunctionType:
             raise GuardError(f"{target!r}: no attribute {part!r}") from exc
         if isinstance(obj, (staticmethod, classmethod)):
             obj = obj.__func__
+    # Detect caching decorators (lru_cache, cache) that make mutation ineffective:
+    # the wrapper caches results at call time, so swapping __code__ on the
+    # inner function never reaches the mutated code for cached inputs.
+    if type(obj).__name__ == "_lru_cache_wrapper" and type(obj).__module__ == "functools":
+        raise GuardError(
+            f"{target!r} is wrapped with functools.lru_cache/cache; "
+            "mutations cannot invalidate the cache, so the guard is uncheckable"
+        )
     obj = inspect.unwrap(obj)
     if not isinstance(obj, types.FunctionType):
         raise GuardError(f"{target!r} is not a Python function ({type(obj).__name__})")
@@ -147,8 +156,18 @@ def _parse_function(src: str, start: int, name: str) -> ast.AST:
 
 
 def _own_scope(node: ast.AST):
-    """Pre-order walk of *node*'s own scope (not nested defs, lambdas, classes)."""
+    """Pre-order walk of *node*'s own scope (not nested defs, lambdas, classes).
+
+    Skips decorators and default argument values because they are evaluated
+    at import/definition time and mutations there cannot affect runtime behavior.
+    """
     for child in ast.iter_child_nodes(node):
+        # Skip decorators (evaluated at import time)
+        if isinstance(child, ast.expr) and child in getattr(node, 'decorator_list', []):
+            continue
+        # Skip default argument values (evaluated at definition time)
+        if isinstance(node, ast.arguments) and child in node.defaults:
+            continue
         yield child
         if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
             yield from _own_scope(child)
@@ -171,16 +190,20 @@ def _site_kind(node: ast.AST) -> str | None:
 
 
 def _site_ids(fn: ast.AST) -> list[tuple[str, ast.AST]]:
-    """Stable ids for every mutable site in *fn*, in source order."""
+    """Stable ids for every mutable site in *fn*, in source order.
+
+    IDs are of the form ``kind#N`` where N is the 1-based ordinal of that
+    kind within the function (e.g. ``negate-if#1``, ``negate-if#2``).
+    This is stable across edits that insert lines above the function.
+    """
     sites: list[tuple[str, ast.AST]] = []
-    seen: dict[str, int] = {}
+    counters: dict[str, int] = {}
     for node in _own_scope(fn):
         kind = _site_kind(node)
         if kind is None:
             continue
-        base = f"{kind}@{node.lineno}"
-        seen[base] = seen.get(base, 0) + 1
-        sites.append((base if seen[base] == 1 else f"{base}.{seen[base]}", node))
+        counters[kind] = counters.get(kind, 0) + 1
+        sites.append((f"{kind}#{counters[kind]}", node))
     return sites
 
 
@@ -207,6 +230,16 @@ def _mutate_site(node: ast.AST) -> ast.AST:
     raise GuardError(f"cannot mutate {type(node).__name__}")
 
 
+def _function_header(src: str) -> str:
+    """Return the header portion of a function source (decorators + def line)."""
+    lines = src.splitlines(keepends=True)
+    def_line_idx = next(
+        (i for i, line in enumerate(lines) if line.lstrip().startswith("def ")),
+        len(lines) - 1,
+    )
+    return "".join(lines[: def_line_idx + 1])
+
+
 class _Replace(ast.NodeTransformer):
     def __init__(self, target: ast.AST):
         self.target = target
@@ -221,6 +254,14 @@ def _mutant_ast(func: types.FunctionType, mutant: str | tuple[str, str]) -> ast.
     src, start, _ = _function_source(func)
     if isinstance(mutant, tuple):
         old, new = mutant
+        # Check if the replacement targets an uncheckable location (decorator or default arg)
+        header = _function_header(src)
+        if old in header:
+            raise GuardError(
+                f"replace {old!r} targets a decorator or default argument value; "
+                "these are evaluated at import/definition time and mutations there "
+                "cannot affect runtime behavior"
+            )
         count = src.count(old)
         if count != 1:
             raise GuardError(
