@@ -528,9 +528,145 @@ def compute(x):
 import pytest
 from nd_product import compute
 
-@pytest.mark.guards("nd_product:compute", replace=[("@my_decorator", "@my_decorator")])
+@pytest.mark.guards("nd_product:compute", replace=[("@my_decorator", "@staticmethod")])
 def test_compute_decorated():
     assert compute(1) == 11
+'''
+    proc = _gate(_project(tmp_path, tests=tests, product=product))
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    (r,) = _verdicts(proc).values()
+    assert r["verdict"] == "ERROR"
+    assert "decorator" in r["reason"].lower()
+
+
+def test_lru_cache_target_with_must_kill_is_error(tmp_path):
+    """A guard on an lru_cache-wrapped function with must_kill is uncheckable (ERROR)."""
+    product = '''
+from functools import lru_cache
+
+@lru_cache(maxsize=None)
+def cached_compute(x):
+    if x > 0:
+        return "positive"
+    return "non-positive"
+'''
+    tests = '''
+import pytest
+from nd_product import cached_compute
+
+@pytest.mark.guards("nd_product:cached_compute", must_kill=["negate-if#1"])
+def test_cached_compute_positive():
+    assert cached_compute(1) == "positive"
+'''
+    proc = _gate(_project(tmp_path, tests=tests, product=product))
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    (r,) = _verdicts(proc).values()
+    assert r["verdict"] == "ERROR"
+    assert "lru_cache" in r["reason"].lower() or "cache" in r["reason"].lower()
+
+
+def test_own_scope_excludes_decorator_and_default_mutants(tmp_path):
+    """_own_scope does not yield mutation sites in decorators or default args."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    import check_non_discriminating as cnd
+    import ast
+
+    product = '''
+def simple_decorator(fn):
+    return fn
+
+@simple_decorator
+def compute(x, threshold=10):  # simple default, no mutable site
+    if x > threshold:
+        return "high"
+    return "low"
+'''
+    tests = '''
+import pytest
+from nd_product import compute
+
+@pytest.mark.guards("nd_product:compute", must_kill=["negate-if#1"])
+def test_compute():
+    assert compute(15) == "high"
+    assert compute(5) == "low"
+'''
+    # The function has:
+    # - 1 negate-if in body (x > threshold)
+    # - 1 flip-cmp in body (x > threshold)
+    # - NO mutants from decorator or default arg (excluded by _own_scope)
+    root = _project(tmp_path, tests=tests, product=product)
+    
+    # First check list_mutants directly
+    import sys
+    sys.path.insert(0, str(root))
+    import nd_product
+    ids = cnd.list_mutants(nd_product.compute)
+    # Should only have body mutants: return-true, return-false, return-none, negate-if#1, flip-cmp#1
+    assert "negate-if#1" in ids
+    assert "flip-cmp#1" in ids
+    # No other negate-if or flip-cmp from decorator/default
+    negate_ifs = [i for i in ids if i.startswith("negate-if#")]
+    flip_cmps = [i for i in ids if i.startswith("flip-cmp#")]
+    assert len(negate_ifs) == 1, f"Expected 1 negate-if, got {negate_ifs}"
+    assert len(flip_cmps) == 1, f"Expected 1 flip-cmp, got {flip_cmps}"
+    
+    # Now run the gate - should pass because the test kills the only negate-if
+    proc = _gate(root)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    (r,) = _verdicts(proc).values()
+    assert r["verdict"] == "OK"
+
+
+def test_default_arg_with_mutable_site_is_error(tmp_path):
+    """A default argument containing a mutable site (ternary) makes the target uncheckable."""
+    product = '''
+def some_condition():
+    return True
+
+def compute(x, threshold=10 if some_condition() else 20):
+    if x > threshold:
+        return "high"
+    return "low"
+'''
+    tests = '''
+import pytest
+from nd_product import compute
+
+@pytest.mark.guards("nd_product:compute", must_kill=["negate-if#1"])
+def test_compute():
+    assert compute(15) == "high"
+    assert compute(5) == "low"
+'''
+    proc = _gate(_project(tmp_path, tests=tests, product=product))
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    (r,) = _verdicts(proc).values()
+    assert r["verdict"] == "ERROR"
+    assert "default argument" in r["reason"].lower()
+
+
+def test_decorator_with_mutable_site_is_error(tmp_path):
+    """A decorator expression containing a mutable site (ternary) makes the target uncheckable."""
+    product = '''
+def deco1(fn): return fn
+def deco2(fn): return fn
+
+condition = True
+
+@deco1 if condition else deco2
+def compute(x):
+    if x > 0:
+        return "pos"
+    return "neg"
+'''
+    tests = '''
+import pytest
+from nd_product import compute
+
+@pytest.mark.guards("nd_product:compute", must_kill=["negate-if#1"])
+def test_compute():
+    assert compute(1) == "pos"
+    assert compute(-1) == "neg"
 '''
     proc = _gate(_project(tmp_path, tests=tests, product=product))
     assert proc.returncode == 2, proc.stdout + proc.stderr
@@ -569,7 +705,7 @@ def test_compute_positive():
     assert proc1.returncode == 0, proc1.stdout + proc1.stderr
     (r1,) = _verdicts(proc1).values()
     assert r1["verdict"] == "OK"
-    
+
     # Version 2 (line added above)
     root2 = _project(tmp_path_factory.mktemp("v2"), tests=tests, product=product_v2)
     proc2 = _gate(root2)

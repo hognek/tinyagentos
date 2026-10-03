@@ -123,10 +123,16 @@ def resolve_target(target: str) -> types.FunctionType:
             raise GuardError(f"{target!r}: no attribute {part!r}") from exc
         if isinstance(obj, (staticmethod, classmethod)):
             obj = obj.__func__
+    # Capture the original source (with decorators) before unwrapping
+    original_source = None
+    try:
+        original_source = inspect.getsource(obj)
+    except (OSError, TypeError):
+        pass
     # Detect caching decorators (lru_cache, cache) that make mutation ineffective:
     # the wrapper caches results at call time, so swapping __code__ on the
     # inner function never reaches the mutated code for cached inputs.
-    if type(obj).__name__ == "_lru_cache_wrapper" and type(obj).__module__ == "functools":
+    if isinstance(obj, functools._lru_cache_wrapper):
         raise GuardError(
             f"{target!r} is wrapped with functools.lru_cache/cache; "
             "mutations cannot invalidate the cache, so the guard is uncheckable"
@@ -134,11 +140,83 @@ def resolve_target(target: str) -> types.FunctionType:
     obj = inspect.unwrap(obj)
     if not isinstance(obj, types.FunctionType):
         raise GuardError(f"{target!r} is not a Python function ({type(obj).__name__})")
+    # Attach original source for mutation analysis (includes decorators)
+    if original_source is not None:
+        obj.__nondiscrim_original_source__ = original_source
+    # Check for uncheckable mutation sites in decorators or default arguments
+    _check_uncheckable_target_shapes(obj, target)
     return obj
 
 
+def _check_uncheckable_target_shapes(func: types.FunctionType, target: str) -> None:
+    """Raise GuardError if the target has mutation sites in decorators or default args."""
+    src = getattr(func, '__nondiscrim_original_source__', None)
+    if src is None:
+        return
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func.__name__:
+            # Check decorators for mutable sites
+            for dec in node.decorator_list:
+                for child in ast.walk(dec):
+                    if _site_kind(child) is not None:
+                        raise GuardError(
+                            f"{target!r} has a mutable site in a decorator; "
+                            "decorators are evaluated at import time and mutations there "
+                            "cannot affect runtime behavior"
+                        )
+            # Check default argument values for mutable sites
+            if node.args.defaults:
+                for default in node.args.defaults:
+                    for child in ast.walk(default):
+                        if _site_kind(child) is not None:
+                            raise GuardError(
+                                f"{target!r} has a mutable site in a default argument value; "
+                                "default values are evaluated at definition time and mutations there "
+                                "cannot affect runtime behavior"
+                            )
+            if node.args.kw_defaults:
+                for default in node.args.kw_defaults:
+                    if default is not None:
+                        for child in ast.walk(default):
+                            if _site_kind(child) is not None:
+                                raise GuardError(
+                                    f"{target!r} has a mutable site in a keyword-only default argument value; "
+                                    "default values are evaluated at definition time and mutations there "
+                                    "cannot affect runtime behavior"
+                                )
+            break
+
+
 def _function_source(func: types.FunctionType) -> tuple[str, int, str]:
-    """(dedented source, first line number, filename) of *func*."""
+    """(dedented source, first line number, filename) of *func*.
+
+    Uses the original source (with decorators) if available, otherwise falls
+    back to inspect.getsourcelines on the unwrapped function.
+    """
+    original_src = getattr(func, '__nondiscrim_original_source__', None)
+    if original_src is not None:
+        # Parse to find the function node and get its line range
+        try:
+            tree = ast.parse(original_src)
+        except SyntaxError:
+            pass
+        else:
+            for node in tree.body:
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func.__name__:
+                    # Get line range including decorators
+                    if node.decorator_list:
+                        start_line = node.decorator_list[0].lineno
+                    else:
+                        start_line = node.lineno
+                    end_line = node.end_lineno or node.lineno
+                    lines = original_src.splitlines(keepends=True)
+                    src_segment = "".join(lines[start_line - 1:end_line])
+                    return textwrap.dedent(src_segment), start_line, inspect.getsourcefile(func) or "<unknown>"
+    # Fallback: use inspect on the unwrapped function (no decorators)
     try:
         lines, start = inspect.getsourcelines(func)
     except (OSError, TypeError) as exc:
@@ -162,11 +240,11 @@ def _own_scope(node: ast.AST):
     at import/definition time and mutations there cannot affect runtime behavior.
     """
     for child in ast.iter_child_nodes(node):
-        # Skip decorators (evaluated at import time)
-        if isinstance(child, ast.expr) and child in getattr(node, 'decorator_list', []):
+        # Skip decorators (evaluated at import time) - they are direct children of FunctionDef
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and child in node.decorator_list:
             continue
-        # Skip default argument values (evaluated at definition time)
-        if isinstance(node, ast.arguments) and child in node.defaults:
+        # Skip default argument values (evaluated at definition time) - they are in arguments.defaults/kw_defaults
+        if isinstance(node, ast.arguments) and (child in node.defaults or child in node.kw_defaults):
             continue
         yield child
         if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
@@ -230,14 +308,21 @@ def _mutate_site(node: ast.AST) -> ast.AST:
     raise GuardError(f"cannot mutate {type(node).__name__}")
 
 
-def _function_header(src: str) -> str:
+def _function_header(src: str, func_name: str) -> str:
     """Return the header portion of a function source (decorators + def line)."""
-    lines = src.splitlines(keepends=True)
-    def_line_idx = next(
-        (i for i, line in enumerate(lines) if line.lstrip().startswith("def ")),
-        len(lines) - 1,
-    )
-    return "".join(lines[: def_line_idx + 1])
+    tree = ast.parse(src)
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func_name:
+            # Get the line range: from first decorator (if any) to the def line
+            if node.decorator_list:
+                start_line = node.decorator_list[0].lineno
+            else:
+                start_line = node.lineno
+            end_line = node.lineno
+            lines = src.splitlines(keepends=True)
+            # lineno is 1-indexed
+            return "".join(lines[start_line - 1:end_line])
+    raise GuardError(f"could not find def {func_name} in its own source")
 
 
 class _Replace(ast.NodeTransformer):
@@ -255,7 +340,7 @@ def _mutant_ast(func: types.FunctionType, mutant: str | tuple[str, str]) -> ast.
     if isinstance(mutant, tuple):
         old, new = mutant
         # Check if the replacement targets an uncheckable location (decorator or default arg)
-        header = _function_header(src)
+        header = _function_header(src, func.__name__)
         if old in header:
             raise GuardError(
                 f"replace {old!r} targets a decorator or default argument value; "
