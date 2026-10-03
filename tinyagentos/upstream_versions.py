@@ -14,15 +14,24 @@ matches the pinned tag's shape (see :func:`select_upstream_tag`), plus
 when it was checked, so the catalog API can expose:
 
     upstream_version            -- newest matching registry tag, or null
+    upstream_pinned_version     -- the image tag it was compared against
     upstream_update_available   -- true when it is newer than the pin
     upstream_checked_at         -- epoch seconds of the last check
+
+The pin is the image tag from ``install.image``, never the manifest's
+``version:`` field: the two drift apart on real apps (code-server
+declares ``version: 4.96.0`` while pinning a 4.135.0 image, uptime-kuma
+declares ``1.0.0`` while pinning ``1.23``), so comparing an upstream
+tag against the catalog version claims an update that no catalog
+release can ever clear. Pre-release tags (``-rc``, ``-beta``) are not
+releases: they are skipped unless the pin is itself a pre-release.
 
 The request path NEVER calls the registry. The Store catalog endpoint
 reads only the in-memory cache (persisted to
 ``data_dir/upstream_versions.json``) and returns immediately. A
 background warmer refreshes entries on a daily TTL; a transient
 network failure keeps the previous value and is retried on a short
-TTL, so an outage reads as "unknown", never as "no update".
+TTL, so an outage reads as "last known", never as "no update".
 
 Nothing here upgrades anything: detection only. The install path keeps
 pinning whatever the catalog manifest says until the catalog itself is
@@ -107,6 +116,26 @@ def _registry_host(path: str) -> str | None:
     return None
 
 
+def pinned_tag(app: Any) -> str | None:
+    """The image tag a docker-installed catalog app pins, or None.
+
+    This is the baseline every upstream comparison is made against.
+    The manifest's ``version:`` field cannot serve: it is the catalog's
+    own revision of the app and drifts from the image it installs
+    (code-server ``version: 4.96.0`` with a ``:4.135.0`` image,
+    uptime-kuma ``version: 1.0.0`` with a ``:1.23`` image). Returns
+    None for non-docker apps and for image refs with no tag.
+    """
+    install = getattr(app, "install", None)
+    if not isinstance(install, dict) or install.get("method") != "docker":
+        return None
+    image = install.get("image")
+    if not isinstance(image, str) or not image:
+        return None
+    ref = parse_image_ref(image)
+    return None if ref is None else ref[1]
+
+
 def _hub_path(path: str) -> str:
     """Docker Hub repository path, prefixing official images with ``library/``."""
     if "/" not in path:
@@ -139,11 +168,17 @@ def select_upstream_tag(pinned_tag: str, tags: list[str]) -> str | None:
     Only tags with the same shape as the pin are eligible, so a
     ``1.22`` pin is never compared against ``1.23.0`` tags and a
     ``v1.13.0`` pin never picks an unprefixed tag. ``latest`` and all
-    other non-version tags are ignored. Returns None when the pin is
-    not version-shaped or no eligible tag exists.
+    other non-version tags are ignored. Pre-release tags (``-rc``,
+    ``-beta``, ``-alpha``) are not releases and are skipped, unless the
+    pin is itself a pre-release. Returns None when the pin is not
+    version-shaped or no eligible tag exists.
     """
     pinned_shape = tag_shape(pinned_tag)
     if pinned_shape is None:
+        return None
+    try:
+        pin_is_prerelease = Version(pinned_tag).is_prerelease
+    except (InvalidVersion, TypeError):
         return None
     best: tuple[Version, str] | None = None
     for tag in tags:
@@ -152,6 +187,8 @@ def select_upstream_tag(pinned_tag: str, tags: list[str]) -> str | None:
         try:
             parsed = Version(tag)
         except (InvalidVersion, TypeError):
+            continue
+        if parsed.is_prerelease and not pin_is_prerelease:
             continue
         if best is None or parsed > best[0]:
             best = (parsed, tag)
@@ -298,23 +335,27 @@ def upstream_info(app_id: str) -> dict[str, Any] | None:
     """Last-known upstream state for ``app_id``, or None when unknown.
 
     Never performs network I/O: this is what the request path reads.
-    ``upstream_version`` is None when the last check could not
-    determine a version (network failure, or no matching tag).
+    ``upstream_version`` is None when nothing has been determined yet
+    (never checked, or every check failed). ``pinned_version`` is the
+    image tag that version was compared against.
     """
     entry = _cache.get(app_id)
     if entry is None:
         return None
     return {
         "upstream_version": entry["upstream_version"],
+        "pinned_version": entry.get("pinned_version"),
         "upstream_checked_at": entry["checked_at"],
     }
 
 
 def compare_versions(catalog_version: str, upstream_version: str | None) -> bool | None:
-    """True when ``upstream_version`` is newer than the catalog pin.
+    """True when ``upstream_version`` is newer than the pinned version.
 
-    None means unknown (no upstream version, or a version string that
-    does not parse) -- which must not read as "no update".
+    Callers pass the pinned image tag (see :func:`pinned_tag`), not the
+    manifest's ``version:`` field. None means unknown (no upstream
+    version, or a version string that does not parse) -- which must not
+    read as "no update".
     """
     if upstream_version is None:
         return None
@@ -326,18 +367,34 @@ def compare_versions(catalog_version: str, upstream_version: str | None) -> bool
     return upstream > pinned
 
 
-def record_upstream(app_id: str, upstream_version: str | None, *, ok: bool) -> None:
+def record_upstream(
+    app_id: str,
+    upstream_version: str | None,
+    *,
+    ok: bool,
+    pinned_version: str | None = None,
+) -> None:
     """Record the outcome of one upstream check in the cache.
 
     ``ok`` marks whether the registry was actually reached: a reached
     registry with no matching tag is a stable answer (24h TTL), while
     a network failure is transient (1h retry TTL) so the warmer asks
-    again soon. The cache is persisted on every record so a cold boot
-    reloads the last known versions instead of reading "unknown".
+    again soon. A transient failure KEEPS the last known version (and
+    its pin) rather than wiping it, so a short outage does not make a
+    real update vanish from the Store. The cache is persisted on every
+    record so a cold boot reloads the last known versions instead of
+    reading "unknown".
     """
     now = time.time()
+    previous = _cache.get(app_id)
+    if not ok and previous is not None:
+        if upstream_version is None:
+            upstream_version = previous["upstream_version"]
+        if pinned_version is None:
+            pinned_version = previous.get("pinned_version")
     _cache[app_id] = {
         "upstream_version": upstream_version,
+        "pinned_version": pinned_version,
         "checked_at": now,
         "expires_at": now + (_CHECK_TTL if ok else _RETRY_TTL),
     }
@@ -358,20 +415,14 @@ async def check_upstream(
     non-version-shaped pins) return ``(True, None)`` -- nothing to
     check, not a failure. Never raises.
     """
-    install = getattr(app, "install", None)
-    if not isinstance(install, dict) or install.get("method") != "docker":
+    tag = pinned_tag(app)
+    if tag is None:
         return True, None
-    image = install.get("image")
-    if not isinstance(image, str) or not image:
-        return True, None
-    ref = parse_image_ref(image)
-    if ref is None:
-        return True, None
-    _path, pinned_tag = ref
+    image = app.install["image"]
     tags = await fetch_registry_tags(image, client=client)
     if tags is None:
         return False, None
-    return True, select_upstream_tag(pinned_tag, tags)
+    return True, select_upstream_tag(tag, tags)
 
 
 async def warm_upstream_cache(
@@ -397,14 +448,15 @@ async def warm_upstream_cache(
     sem = asyncio.Semaphore(_WARM_CONCURRENCY)
 
     async def _one(app: Any) -> None:
+        pin = pinned_tag(app)
         async with sem:
             try:
                 reached, version = await check_upstream(app, client=client)
             except Exception as exc:  # noqa: BLE001 -- never kill the loop
                 logger.debug("upstream check failed for %s: %s", app.id, exc)
-                record_upstream(app.id, None, ok=False)
+                record_upstream(app.id, None, ok=False, pinned_version=pin)
                 return
-            record_upstream(app.id, version, ok=reached)
+            record_upstream(app.id, version, ok=reached, pinned_version=pin)
 
     try:
         if owns_client:
@@ -443,6 +495,9 @@ def _load_cache() -> None:
         try:
             _cache[str(app_id)] = {
                 "upstream_version": entry["upstream_version"],
+                # Absent in cache files written before the pin was
+                # recorded; the request path falls back to the manifest.
+                "pinned_version": entry.get("pinned_version"),
                 "checked_at": float(entry["checked_at"]),
                 "expires_at": float(entry["expires_at"]),
             }

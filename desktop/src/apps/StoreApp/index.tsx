@@ -525,9 +525,9 @@ function AppCard(props: {
               {app.update_available && app.upstream_update_available && app.upstream_version && (
                 <span
                   className="font-semibold px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300"
-                  title={`Newer upstream release v${app.upstream_version} of the pinned docker image (catalog pins v${app.version}); updates ship with the next catalog release`}
+                  title={`Newer upstream release v${app.upstream_version} of the pinned docker image (pinned at v${app.upstream_pinned_version || app.version}); updates ship with the next catalog release`}
                 >
-                  → v{app.upstream_version}
+                  v{app.upstream_pinned_version || app.version} → v{app.upstream_version}
                 </span>
               )}
             </span>
@@ -1051,6 +1051,7 @@ export function StoreApp({ windowId: _windowId }: { windowId: string }) {
             license_class: a.license_class ? String(a.license_class) : undefined,
             update_available: Boolean(a.update_available),
             upstream_version: a.upstream_version ? String(a.upstream_version) : null,
+            upstream_pinned_version: a.upstream_pinned_version ? String(a.upstream_pinned_version) : null,
             upstream_update_available: a.upstream_update_available === true ? true : (a.upstream_update_available === false ? false : null),
             upstream_checked_at: typeof a.upstream_checked_at === "number" ? a.upstream_checked_at : null,
           }));

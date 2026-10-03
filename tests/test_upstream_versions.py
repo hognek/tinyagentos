@@ -12,6 +12,8 @@ Covers:
 - The API field: /api/store/catalog exposes update_available,
   upstream_version, upstream_update_available and upstream_checked_at,
   and the request path never calls a registry.
+- The real shipped app-catalog manifests: the upstream tag is compared
+  against the PINNED IMAGE TAG, not the catalog ``version:`` field.
 """
 from __future__ import annotations
 
@@ -23,9 +25,14 @@ from unittest.mock import MagicMock
 import pytest
 
 from tinyagentos import upstream_versions as uv
+from tinyagentos.registry import AppManifest
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "upstream_versions"
+
+# The manifests this project actually ships, not invented fixtures: their
+# catalog ``version:`` fields are deliberately not the image tags.
+CATALOG = Path(__file__).resolve().parents[1] / "app-catalog" / "services"
 
 
 def _load_fixture(name: str) -> dict:
@@ -140,6 +147,19 @@ class TestSelectUpstreamTag:
         # Recorded whisper image tag list: date-shaped calver tags.
         tags = _fixture_tags("dockerhub-whisper.json")
         assert uv.select_upstream_tag("20241115", tags) == "20251208"
+
+    def test_prerelease_tags_are_skipped_for_a_ga_pin(self):
+        # A release candidate is not a release: a GA pin must not be
+        # dragged forward by (or flagged against) a newer -rc/-beta.
+        assert uv.select_upstream_tag("1.22.0", ["1.22.0", "1.23.0-rc1"]) == "1.22.0"
+        assert uv.select_upstream_tag("1.22", ["1.22", "1.23-beta1"]) == "1.22"
+        assert uv.select_upstream_tag("2024.12.0", ["2024.12.0", "2025.1.0-alpha2"]) == "2024.12.0"
+
+    def test_prerelease_tags_stay_eligible_for_a_prerelease_pin(self):
+        # A pin that is itself a pre-release opts into pre-releases:
+        # a newer rc is the newest tag of the pin's shape.
+        assert uv.select_upstream_tag("1.23.0-rc1", ["1.23.0-rc1", "1.23.0-rc2"]) == "1.23.0-rc2"
+        assert uv.select_upstream_tag("1.22.0-rc1", ["1.22.0-rc1", "1.23.0-rc1"]) == "1.23.0-rc1"
 
     def test_latest_only_returns_none(self):
         assert uv.select_upstream_tag("2024.12.0", ["latest"]) is None
@@ -267,6 +287,30 @@ class TestCachedRequestPath:
         entry = uv._cache["searxng"]
         # Short TTL so the warmer retries within the hour.
         assert entry["expires_at"] - entry["checked_at"] < uv._CHECK_TTL
+
+    def test_failure_keeps_the_last_known_version(self):
+        # A transient outage must not wipe a good answer: the badge
+        # disappears and reappears today, and the module docstring
+        # promises the previous value is kept.
+        uv.record_upstream("searxng", "2026.10.2", ok=True, pinned_version="2024.12.0")
+        uv.record_upstream("searxng", None, ok=False, pinned_version="2024.12.0")
+        info = uv.upstream_info("searxng")
+        assert info["upstream_version"] == "2026.10.2"
+        assert info["pinned_version"] == "2024.12.0"
+        entry = uv._cache["searxng"]
+        # Short TTL so the warmer retries within the hour.
+        assert entry["expires_at"] - entry["checked_at"] < uv._CHECK_TTL
+
+    def test_reached_registry_with_no_tag_overwrites(self):
+        # ok=True with no version means the registry answered and has
+        # no tag of the pin's shape: a stable answer, so it replaces
+        # the previous value (unlike a transient failure).
+        uv.record_upstream("searxng", "2026.10.2", ok=True, pinned_version="2024.12.0")
+        uv.record_upstream("searxng", None, ok=True, pinned_version="2024.12.0")
+        assert uv.upstream_info("searxng")["upstream_version"] is None
+        assert uv.compare_versions(
+            "2024.12.0", uv.upstream_info("searxng")["upstream_version"]
+        ) is None
 
     def test_success_records_daily_ttl(self):
         uv.record_upstream("searxng", "2026.10.2", ok=True)
@@ -554,3 +598,156 @@ class TestCatalogApiUpstreamFields:
         entry = res.json()[0]
         assert entry["upstream_update_available"] is False
         assert entry["update_available"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Real app-catalog manifests: the baseline is the pinned image tag
+# --------------------------------------------------------------------------- #
+
+
+def _real_manifest(app_id: str) -> AppManifest:
+    """Load the manifest this repo actually ships for ``app_id``."""
+    return AppManifest.from_file(CATALOG / app_id / "manifest.yaml")
+
+
+async def _warm_with_tags(apps, routes: dict[str, list[str]]) -> FakeRegistryClient:
+    """Warm the cache from registry answers given as plain tag lists.
+
+    Docker Hub's repositories API wraps tags in ``results``; the plain
+    Registry v2 ``tags/list`` returns ``{"tags": [...]}``.
+    """
+    payloads: dict[str, dict] = {}
+    for needle, tags in routes.items():
+        if "hub.docker.com" in needle:
+            payloads[needle] = {"results": [{"name": t} for t in tags]}
+        else:
+            payloads[needle] = {"tags": tags}
+    fake = FakeRegistryClient(
+        {needle: _FakeResponse(200, payload) for needle, payload in payloads.items()}
+    )
+    await uv.warm_upstream_cache(apps, client=fake)
+    return fake
+
+
+class TestRealManifestsAreNotPermanentUpdates:
+    def test_shipped_catalog_versions_drift_from_their_image_pins(self):
+        # The premise of the fix: the catalog ``version:`` field is an
+        # internal revision, not the image tag. Comparing the upstream
+        # tag against it flags these apps forever.
+        assert _real_manifest("code-server").version == "4.96.0"
+        assert _real_manifest("code-server").install["image"].endswith(":4.135.0")
+        assert _real_manifest("uptime-kuma").version == "1.0.0"
+        assert _real_manifest("uptime-kuma").install["image"].endswith(":1.23")
+
+    @pytest.mark.asyncio
+    async def test_upstream_equal_to_pin_is_not_an_update(self, client):
+        """Real manifests, registries whose newest release IS the pin.
+
+        code-server pins 4.135.0 and uptime-kuma 1.23; with the newest
+        matching upstream release equal to the pin there is nothing to
+        update, so the Store must not list them under Updates.
+        """
+        app = client._transport.app
+        code_server = _real_manifest("code-server")
+        uptime_kuma = _real_manifest("uptime-kuma")
+        _patch_registry(
+            app,
+            [code_server, uptime_kuma],
+            [
+                {"id": "code-server", "version": code_server.version, "state": "installed"},
+                {"id": "uptime-kuma", "version": uptime_kuma.version, "state": "installed"},
+            ],
+        )
+        await _warm_with_tags(
+            [code_server, uptime_kuma],
+            {
+                "lscr.io/v2/linuxserver/code-server/tags/list": [
+                    "4.135.0", "4.134.2", "latest", "4.134.2-web",
+                ],
+                "hub.docker.com/v2/repositories/louislam/uptime-kuma/tags": [
+                    "1.23", "1.22.15", "latest", "beta",
+                ],
+            },
+        )
+
+        res = await client.get("/api/store/catalog")
+        entries = {e["id"]: e for e in res.json()}
+        assert entries["code-server"]["upstream_version"] == "4.135.0"
+        assert entries["uptime-kuma"]["upstream_version"] == "1.23"
+        assert entries["code-server"]["update_available"] is False
+        assert entries["uptime-kuma"]["update_available"] is False
+        assert entries["code-server"]["upstream_update_available"] is False
+        assert entries["uptime-kuma"]["upstream_update_available"] is False
+        # The badge shows the pin the comparison was made against.
+        assert entries["code-server"]["upstream_pinned_version"] == "4.135.0"
+        assert entries["uptime-kuma"]["upstream_pinned_version"] == "1.23"
+
+    @pytest.mark.asyncio
+    async def test_newer_prerelease_is_not_an_update(self, client):
+        """A newer pre-release must not flag a GA pin as updatable.
+
+        4.136.0-rc1 and 1.24-rc1 exist upstream; neither is a release,
+        so the pinned 4.135.0 / 1.23 are still current.
+        """
+        app = client._transport.app
+        code_server = _real_manifest("code-server")
+        uptime_kuma = _real_manifest("uptime-kuma")
+        _patch_registry(
+            app,
+            [code_server, uptime_kuma],
+            [
+                {"id": "code-server", "version": code_server.version, "state": "installed"},
+                {"id": "uptime-kuma", "version": uptime_kuma.version, "state": "installed"},
+            ],
+        )
+        await _warm_with_tags(
+            [code_server, uptime_kuma],
+            {
+                "lscr.io/v2/linuxserver/code-server/tags/list": [
+                    "4.136.0-rc1", "4.135.0", "latest",
+                ],
+                "hub.docker.com/v2/repositories/louislam/uptime-kuma/tags": [
+                    "1.24-rc1", "1.23", "latest",
+                ],
+            },
+        )
+
+        res = await client.get("/api/store/catalog")
+        entries = {e["id"]: e for e in res.json()}
+        # The pre-release is skipped, so the newest release is the pin.
+        assert entries["code-server"]["upstream_version"] == "4.135.0"
+        assert entries["uptime-kuma"]["upstream_version"] == "1.23"
+        assert entries["code-server"]["update_available"] is False
+        assert entries["uptime-kuma"]["update_available"] is False
+        assert entries["code-server"]["upstream_update_available"] is False
+        assert entries["uptime-kuma"]["upstream_update_available"] is False
+
+    @pytest.mark.asyncio
+    async def test_newer_release_than_the_pin_is_still_an_update(self, client):
+        """Guard the other direction: a real release past the pin fires.
+
+        The stale-pin case is the whole point of the upstream check, and
+        it must survive the switch to comparing against the pin.
+        """
+        app = client._transport.app
+        code_server = _real_manifest("code-server")
+        _patch_registry(
+            app,
+            [code_server],
+            [{"id": "code-server", "version": code_server.version, "state": "installed"}],
+        )
+        await _warm_with_tags(
+            [code_server],
+            {
+                "lscr.io/v2/linuxserver/code-server/tags/list": [
+                    "4.136.0", "4.135.0", "latest",
+                ],
+            },
+        )
+
+        res = await client.get("/api/store/catalog")
+        entry = res.json()[0]
+        assert entry["upstream_version"] == "4.136.0"
+        assert entry["update_available"] is True
+        assert entry["upstream_update_available"] is True
+        assert entry["upstream_pinned_version"] == "4.135.0"

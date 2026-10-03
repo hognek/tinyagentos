@@ -40,7 +40,13 @@ export interface CatalogApp {
    * failed) -- unknown is never "no update".
    */
   upstream_version?: string | null;
-  /** True when upstream_version is newer than the pinned catalog version. */
+  /**
+   * The docker image tag the upstream check compared against. This --
+   * not `version`, the catalog's own revision of the app -- is the
+   * baseline, so the badge shows `v<pin> → v<upstream>`.
+   */
+  upstream_pinned_version?: string | null;
+  /** True when upstream_version is newer than the pinned image tag. */
   upstream_update_available?: boolean | null;
   /** Epoch seconds of the last upstream check, when one has happened. */
   upstream_checked_at?: number | null;

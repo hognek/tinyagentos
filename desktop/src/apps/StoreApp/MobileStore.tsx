@@ -114,7 +114,7 @@ function AppRow({
         <div className="text-[12.5px] text-shell-text-secondary leading-tight truncate">{subtitleFor(app)}</div>
         {app.update_available && app.upstream_update_available && app.upstream_version && (
           <div className="mt-0.5 text-[11px] font-semibold text-amber-300/90 leading-tight truncate">
-            v{app.version} → v{app.upstream_version}
+            v{app.upstream_pinned_version || app.version} → v{app.upstream_version}
           </div>
         )}
         {app.stars ? (

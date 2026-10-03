@@ -74,6 +74,24 @@ def _installed_version_index(installation, registry) -> dict[str, str]:
     return out
 
 
+def _upstream_baseline(app: Any, info: dict[str, Any]) -> str:
+    """The version an upstream tag is compared against: the image pin.
+
+    The registry check picks the newest tag shaped like the tag in
+    ``install.image``, so that pin is the only meaningful comparison
+    point. The manifest's ``version:`` field is NOT: it is the
+    catalog's own revision and drifts from the image it installs
+    (code-server ``4.96.0`` vs a pinned ``4.135.0``), which made
+    apps whose pin was already the newest upstream claim an update
+    forever. Falls back to the manifest's ``version:`` when the app
+    has no usable image pin.
+    """
+    recorded = info.get("pinned_version")
+    if isinstance(recorded, str) and recorded:
+        return recorded
+    return upstream_versions.pinned_tag(app) or app.version
+
+
 def _update_fields(
     app: Any, installed: bool, recorded_version: str | None
 ) -> dict[str, Any]:
@@ -84,21 +102,24 @@ def _update_fields(
     OR a cached upstream check found a newer registry tag (the
     stale-pin case: SearXNG pin 2024.12.0, upstream 2026.10.2).
 
-    ``upstream_update_available`` is True/False from the cached
-    registry check, or None when unknown -- a network failure or an
-    uncheckable pin is unknown, never "no update". The check itself
-    runs on a daily TTL in the background; this never touches the
-    network.
+    ``upstream_version`` is the newest matching registry tag,
+    ``upstream_update_available`` is True/False from comparing it
+    against the pinned image tag, or None when unknown -- a network
+    failure or an uncheckable pin is unknown, never "no update". The
+    check itself runs on a daily TTL in the background; this never
+    touches the network.
     """
     upstream_version: str | None = None
     upstream_checked_at: float | None = None
     upstream_update: bool | None = None
+    upstream_pinned: str | None = None
     info = upstream_versions.upstream_info(app.id)
     if info is not None:
         upstream_version = info["upstream_version"]
         upstream_checked_at = info["upstream_checked_at"]
+        upstream_pinned = _upstream_baseline(app, info)
         upstream_update = upstream_versions.compare_versions(
-            app.version, upstream_version
+            upstream_pinned, upstream_version
         )
 
     update_available = installed and upstream_update is True
@@ -111,6 +132,7 @@ def _update_fields(
     return {
         "update_available": update_available,
         "upstream_version": upstream_version,
+        "upstream_pinned_version": upstream_pinned,
         "upstream_update_available": upstream_update,
         "upstream_checked_at": upstream_checked_at,
     }
@@ -185,11 +207,13 @@ async def list_catalog(request: Request, type: str | None = None):
 
     Each entry carries update-detection fields: ``update_available``
     (installed app with a newer catalog pin or cached upstream
-    release), plus ``upstream_version`` / ``upstream_update_available``
-    / ``upstream_checked_at`` from the daily, cached registry check of
-    docker-image apps. ``upstream_update_available`` is null when the
-    upstream state is unknown (not yet checked, or the check failed);
-    the request path never queries a registry itself.
+    release), plus ``upstream_version`` / ``upstream_pinned_version`` /
+    ``upstream_update_available`` / ``upstream_checked_at`` from the
+    daily, cached registry check of docker-image apps. The upstream
+    comparison is against the pinned image tag, which is what
+    ``upstream_pinned_version`` reports. ``upstream_update_available``
+    is null when the upstream state is unknown (not yet checked, or the
+    check failed); the request path never queries a registry itself.
     """
     registry = request.app.state.registry
     installation = getattr(request.app.state, "installation_state", None)
