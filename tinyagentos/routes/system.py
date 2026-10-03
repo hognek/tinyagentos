@@ -129,6 +129,37 @@ async def _do_restart(app_state) -> None:
     if os.path.exists("/.dockerenv"):
         os._exit(0)
 
+    # 2b. Darwin launchd helper bootstrap
+    if sys.platform == "darwin":
+        from tinyagentos.launchd_migration import (
+            clear_pending_launchd_reload,
+            HELPER_PLIST_PATH,
+            read_pending_launchd_reload,
+        )
+        if read_pending_launchd_reload():
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "launchctl",
+                    "bootstrap",
+                    f"gui/{os.getuid()}",
+                    str(HELPER_PLIST_PATH),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
+                if proc.returncode == 0:
+                    clear_pending_launchd_reload()
+                    os._exit(0)
+            except Exception:
+                pass
+            if notif:
+                await notif.add(
+                    title="Launchd reload helper failed",
+                    message="New launch settings will apply after the next login.",
+                    level="warning",
+                    source="system.lifecycle",
+                )
+
     # 3. execv (no service manager — replace ourselves in-place)
     try:
         os.execv(sys.executable, [sys.executable] + sys.argv)

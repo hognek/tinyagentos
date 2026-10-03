@@ -643,6 +643,24 @@ class WorkerAgent:
                 )
                 if _is_repair_rejection(resp):
                     return _NEEDS_REPAIR
+                # taOS #...: handle stale_generation 409 by adopting the echoed
+                # generation monotonically (only if higher than current).
+                if resp.status_code == 409:
+                    try:
+                        error_body = resp.json()
+                        if (
+                            error_body.get("error") == "stale_generation"
+                            and isinstance(error_body.get("generation"), int)
+                        ):
+                            echoed_gen = error_body["generation"]
+                            if self._generation is None or echoed_gen > self._generation:
+                                self._generation = echoed_gen
+                                logger.info(
+                                    f"Adopted controller generation {echoed_gen} from stale_generation 409"
+                                )
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return False
                 resp.raise_for_status()
                 self._registered = True
                 # Capture the controller's current generation from the response
@@ -795,18 +813,20 @@ class WorkerAgent:
                     headers=auth_headers,
                 )
                 # Capture the controller's current generation from the response
-                try:
-                    resp_json = resp.json()
-                    gen = resp_json.get("generation")
-                    if gen is not None:
-                        self._generation = gen
-                    elif self._generation is not None:
-                        logger.warning(
-                            "heartbeat response stopped echoing generation - "
-                            "split-brain layer-2 protection may be degraded"
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"could not read generation from heartbeat response: {exc}")
+                # only on successful responses
+                if resp.status_code == 200:
+                    try:
+                        resp_json = resp.json()
+                        gen = resp_json.get("generation")
+                        if gen is not None:
+                            self._generation = gen
+                        elif self._generation is not None:
+                            logger.warning(
+                                "heartbeat response stopped echoing generation - "
+                                "split-brain layer-2 protection may be degraded"
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(f"could not read generation from heartbeat response: {exc}")
                 return resp.status_code
         except Exception as exc:  # noqa: BLE001
             # Log before swallowing: a payload-build bug (not just a network
