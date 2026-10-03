@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
+from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel
 
+from tinyagentos import upstream_versions
 from tinyagentos.catalog.resolver import (
     ResolveErr,
     ResolveOk,
@@ -34,6 +37,82 @@ def _popularity_by_app_id(apps) -> dict[str, dict]:
     return {
         app.id: popularity_for_homepage_cached(getattr(app, "homepage", "") or "")
         for app in apps
+    }
+
+
+def _parse_version(version: str) -> Version | None:
+    """Parse a version string, or None when it does not parse.
+
+    An unparseable version is unknown, not ancient, so it must never
+    read as "older than everything".
+    """
+    try:
+        return Version(version)
+    except (InvalidVersion, TypeError):
+        return None
+
+
+def _installed_version_index(installation, registry) -> dict[str, str]:
+    """Map app_id -> the version recorded at install time.
+
+    The registry breadcrumb (or the joined InstallationState view when
+    present) records the catalog version each app was installed at;
+    that is what the catalog-version half of update detection compares
+    against.
+    """
+    rows = (
+        installation.list_installed()
+        if installation is not None
+        else registry.list_installed()
+    )
+    out: dict[str, str] = {}
+    for row in rows:
+        app_id = row.get("id")
+        version = row.get("version")
+        if app_id and isinstance(version, str):
+            out[app_id] = version
+    return out
+
+
+def _update_fields(
+    app: Any, installed: bool, recorded_version: str | None
+) -> dict[str, Any]:
+    """Update-detection fields for one catalog entry.
+
+    ``update_available`` is true only when the app is installed AND
+    either the catalog pin is newer than the recorded install version
+    OR a cached upstream check found a newer registry tag (the
+    stale-pin case: SearXNG pin 2024.12.0, upstream 2026.10.2).
+
+    ``upstream_update_available`` is True/False from the cached
+    registry check, or None when unknown -- a network failure or an
+    uncheckable pin is unknown, never "no update". The check itself
+    runs on a daily TTL in the background; this never touches the
+    network.
+    """
+    upstream_version: str | None = None
+    upstream_checked_at: float | None = None
+    upstream_update: bool | None = None
+    info = upstream_versions.upstream_info(app.id)
+    if info is not None:
+        upstream_version = info["upstream_version"]
+        upstream_checked_at = info["upstream_checked_at"]
+        upstream_update = upstream_versions.compare_versions(
+            app.version, upstream_version
+        )
+
+    update_available = installed and upstream_update is True
+    if installed and recorded_version is not None:
+        recorded = _parse_version(recorded_version)
+        pinned = _parse_version(app.version)
+        if recorded is not None and pinned is not None and recorded < pinned:
+            update_available = True
+
+    return {
+        "update_available": update_available,
+        "upstream_version": upstream_version,
+        "upstream_update_available": upstream_update,
+        "upstream_checked_at": upstream_checked_at,
     }
 
 
@@ -102,7 +181,16 @@ def _build_app_items(registry, profile_id: str, type_filter: str | None = None, 
 
 @router.get("/api/store/catalog")
 async def list_catalog(request: Request, type: str | None = None):
-    """List all available apps in the catalog, optionally filtered by type."""
+    """List all available apps in the catalog, optionally filtered by type.
+
+    Each entry carries update-detection fields: ``update_available``
+    (installed app with a newer catalog pin or cached upstream
+    release), plus ``upstream_version`` / ``upstream_update_available``
+    / ``upstream_checked_at`` from the daily, cached registry check of
+    docker-image apps. ``upstream_update_available`` is null when the
+    upstream state is unknown (not yet checked, or the check failed);
+    the request path never queries a registry itself.
+    """
     registry = request.app.state.registry
     installation = getattr(request.app.state, "installation_state", None)
     apps = registry.list_available(type_filter=type)
@@ -146,9 +234,11 @@ async def list_catalog(request: Request, type: str | None = None):
         return installation.state(app_id) in ("running", "installed")
 
     popularity = _popularity_by_app_id(apps)
+    installed_versions = _installed_version_index(installation, registry)
 
-    return [
-        {
+    def _entry(a) -> dict:
+        installed = _installed_flag(a.id)
+        return {
             "id": a.id, "name": a.name, "type": a.type, "category": a.category,
             "version": a.version,
             "description": a.description, "icon": a.icon,
@@ -156,7 +246,7 @@ async def list_catalog(request: Request, type: str | None = None):
             "license_class": a.license_class,
             "requires": a.requires, "hardware_tiers": a.hardware_tiers,
             "install_method": (a.install.get("method") or a.install.get("backend") or "") if isinstance(a.install, dict) else "",
-            "installed": _installed_flag(a.id),
+            "installed": installed,
             "state": (installation.state(a.id) if installation else ("installed" if registry.is_installed(a.id) else "not_installed")),
             "variants": _slim_variants(a),
             # Popularity (telemetry-ready). repo + stars are flattened for the
@@ -165,9 +255,14 @@ async def list_catalog(request: Request, type: str | None = None):
             "repo": parse_repo(getattr(a, "homepage", "") or ""),
             "stars": popularity[a.id]["github_stars"],
             "popularity": popularity[a.id],
+            # Upstream release detection (docker-image apps): cached,
+            # daily-checked registry state. update_available folds in an
+            # upstream-newer-than-pin result so a stale catalog pin still
+            # surfaces in the Store's Updates tab.
+            **_update_fields(a, installed, installed_versions.get(a.id)),
         }
-        for a in apps
-    ]
+
+    return [_entry(a) for a in apps]
 
 
 @router.get("/api/store/popularity")
