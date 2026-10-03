@@ -1376,7 +1376,12 @@ subscribe. `503` while `app.state.event_bus` is still starting.
   **The payload never crosses the wire** -- `id` is the event's trace id, so a
   subscriber learns that something changed and must refetch to learn what.
 - A comment frame `:keepalive` is sent every 10 s so proxies do not close an
-  idle stream.
+  idle stream. A data frame `{"kind": "events.heartbeat", "ts": ...}` is sent
+  alongside it so the client can detect a half-open connection that the native
+  EventSource would otherwise never notice. The hook arms a 25 s watchdog
+  (2.5x the keepalive interval) that resets on any frame including the
+  heartbeat; on expiry it closes the stream, marks it stale, and reconnects
+  through the existing backoff.
 - Frames deliberately carry **no SSE `id:` line**. An `id:` is what makes a
   browser send `Last-Event-ID` on reconnect, and this endpoint ignores that
   header: resume is best-effort through the EventBus replay buffer (the last

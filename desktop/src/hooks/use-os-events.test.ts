@@ -897,4 +897,33 @@ describe("useOsEvents", () => {
     });
     expect(openStreams()).toHaveLength(1);
   });
+
+  it("flips to stale and reopens when the stream goes silent with readyState OPEN and no error event", async () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() =>
+      useOsEvents(["projects.task.changed"], () => {}),
+    );
+
+    act(() => {
+      lastEs?.onopen?.();
+    });
+    expect(result.current.connected).toBe(true);
+    expect(result.current.stale).toBe(false);
+
+    // The server sends a heartbeat every 10 s. The client watchdog is set to
+    // 2.5x that interval (25 s) so it rides out one missed heartbeat on a
+    // jittery network but detects a dead socket in under half a minute.
+    // Advance past the watchdog deadline without firing onerror or any
+    // message -- simulating a half-open TCP session the native EventSource
+    // never notices.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30000);
+    });
+
+    expect(result.current.connected).toBe(false);
+    expect(result.current.stale).toBe(true);
+    expect(MockEventSourceCtor).toHaveBeenCalledTimes(2);
+
+    vi.useRealTimers();
+  });
 });
