@@ -675,6 +675,126 @@ def test_compute():
     assert "decorator" in r["reason"].lower()
 
 
+METHOD_DEFAULT_SITE = '''
+FLAG = True
+
+class K:
+    def compute(self, x=(1 if FLAG else 2)):
+        if x > 0:
+            return "pos"
+        return "neg"
+'''
+
+
+def test_method_default_arg_with_mutable_site_is_error(tmp_path):
+    """A method is checked too: its indented source must not skip the shape check."""
+    tests = '''
+import pytest
+from nd_product import K
+
+@pytest.mark.guards("nd_product:K.compute", must_kill=["negate-if#1"])
+def test_compute():
+    assert K().compute() == "pos"
+    assert K().compute(-1) == "neg"
+'''
+    proc = _gate(_project(tmp_path, tests=tests, product=METHOD_DEFAULT_SITE))
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    (r,) = _verdicts(proc).values()
+    assert r["verdict"] == "ERROR"
+    assert "default argument" in r["reason"].lower()
+
+
+METHOD_DECORATOR_SITE = '''
+def deco1(fn): return fn
+def deco2(fn): return fn
+
+condition = True
+
+class K:
+    @deco1 if condition else deco2
+    def compute(self, x):
+        if x > 0:
+            return "pos"
+        return "neg"
+'''
+
+
+def test_method_decorator_with_mutable_site_is_error(tmp_path):
+    """A decorated method is checked too: a ternary in its decorator is uncheckable."""
+    tests = '''
+import pytest
+from nd_product import K
+
+@pytest.mark.guards("nd_product:K.compute", must_kill=["negate-if#1"])
+def test_compute():
+    assert K().compute(1) == "pos"
+    assert K().compute(-1) == "neg"
+'''
+    proc = _gate(_project(tmp_path, tests=tests, product=METHOD_DECORATOR_SITE))
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    (r,) = _verdicts(proc).values()
+    assert r["verdict"] == "ERROR"
+    assert "decorator" in r["reason"].lower()
+
+
+def test_method_without_a_definition_time_site_still_checks_out(tmp_path):
+    """The method check is not over-broad: a plain method is still checked."""
+    product = '''
+class K:
+    def compute(self, x, threshold=10):
+        if x > threshold:
+            return "pos"
+        return "neg"
+'''
+    tests = '''
+import pytest
+from nd_product import K
+
+@pytest.mark.guards("nd_product:K.compute", must_kill=["negate-if#1"])
+def test_compute():
+    assert K().compute(15) == "pos"
+    assert K().compute(5) == "neg"
+'''
+    proc = _gate(_project(tmp_path, tests=tests, product=product))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    (r,) = _verdicts(proc).values()
+    assert r["verdict"] == "OK", r
+    assert r["mutants"] == {"negate-if#1": "killed"}, r
+
+
+def test_lru_cache_under_a_wraps_decorator_is_error(tmp_path):
+    """lru_cache anywhere in the decorator stack caches results, so the guard is uncheckable."""
+    product = '''
+import functools
+
+def deco(fn):
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        return fn(*a, **kw)
+    return wrapper
+
+@deco
+@functools.lru_cache(maxsize=None)
+def cached_compute(x):
+    if x > 0:
+        return "positive"
+    return "non-positive"
+'''
+    tests = '''
+import pytest
+from nd_product import cached_compute
+
+@pytest.mark.guards("nd_product:cached_compute", must_kill=["negate-if#1"])
+def test_cached_compute_positive():
+    assert cached_compute(1) == "positive"
+'''
+    proc = _gate(_project(tmp_path, tests=tests, product=product))
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    (r,) = _verdicts(proc).values()
+    assert r["verdict"] == "ERROR"
+    assert "lru_cache" in r["reason"].lower() or "cache" in r["reason"].lower()
+
+
 def test_must_kill_stable_across_line_insertion(tmp_path_factory):
     """Stable mutant IDs (kind#ordinal) survive inserting lines above the function."""
     product_v1 = '''

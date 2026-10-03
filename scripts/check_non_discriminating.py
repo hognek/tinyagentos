@@ -131,12 +131,15 @@ def resolve_target(target: str) -> types.FunctionType:
         pass
     # Detect caching decorators (lru_cache, cache) that make mutation ineffective:
     # the wrapper caches results at call time, so swapping __code__ on the
-    # inner function never reaches the mutated code for cached inputs.
-    if isinstance(obj, functools._lru_cache_wrapper):
-        raise GuardError(
-            f"{target!r} is wrapped with functools.lru_cache/cache; "
-            "mutations cannot invalidate the cache, so the guard is uncheckable"
-        )
+    # inner function never reaches the mutated code for cached inputs. Every
+    # layer of the decorator stack is checked, not just the outermost: a
+    # functools.wraps decorator stacked on top of lru_cache caches just the same.
+    for layer in _wrapped_chain(obj):
+        if isinstance(layer, functools._lru_cache_wrapper):
+            raise GuardError(
+                f"{target!r} is wrapped with functools.lru_cache/cache; "
+                "mutations cannot invalidate the cache, so the guard is uncheckable"
+            )
     obj = inspect.unwrap(obj)
     if not isinstance(obj, types.FunctionType):
         raise GuardError(f"{target!r} is not a Python function ({type(obj).__name__})")
@@ -148,15 +151,32 @@ def resolve_target(target: str) -> types.FunctionType:
     return obj
 
 
+def _wrapped_chain(obj: object) -> list[object]:
+    """*obj* and every object reachable through ``__wrapped__``, outermost first."""
+    chain: list[object] = []
+    seen: set[int] = set()
+    while obj is not None and id(obj) not in seen:
+        chain.append(obj)
+        seen.add(id(obj))
+        obj = getattr(obj, "__wrapped__", None)
+    return chain
+
+
 def _check_uncheckable_target_shapes(func: types.FunctionType, target: str) -> None:
     """Raise GuardError if the target has mutation sites in decorators or default args."""
     src = getattr(func, '__nondiscrim_original_source__', None)
     if src is None:
         return
+    # A method's source is indented, so it is dedented before parsing; parsing
+    # it as-is raises IndentationError, which used to skip this check for every
+    # method target. A source the gate cannot read is uncheckable, not checked.
     try:
-        tree = ast.parse(src)
-    except SyntaxError:
-        return
+        tree = ast.parse(textwrap.dedent(src))
+    except SyntaxError as exc:
+        raise GuardError(
+            f"{target!r} has a source this gate cannot parse ({exc}); "
+            "the guard is uncheckable"
+        ) from exc
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == func.__name__:
             # Check decorators for mutable sites
