@@ -99,7 +99,10 @@ def _fixture_repo(
 
 
 def _git(repo: Path, *args: str) -> None:
-    subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-c", "user.name=doc-gate-test", "-c", "user.email=doc-gate-test@example.invalid", "-c", "commit.gpgsign=false", *args],
+        cwd=repo, check=True, capture_output=True,
+    )
 
 
 def _run_gate(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
