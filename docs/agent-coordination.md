@@ -1136,9 +1136,9 @@ before any lookup, which discloses nothing.
 Requested scopes are validated against the same closed `VALID_SCOPES` vocabulary
 as the consent flow. The project-bound scopes -- `project_tasks`,
 `project_tasks_create`, `project_tasks_update`, `project_lists`, `project_notes`,
-the canvas scopes (`canvas_read`, `canvas_write`) and the files scopes
-(`files_read`, `files_write`) -- all require an explicit, operator-validated
-`project_id` on approval (see `_PROJECT_SCOPES` in
+`project_doc_review`, the canvas scopes (`canvas_read`, `canvas_write`) and the
+files scopes (`files_read`, `files_write`) -- all require an explicit,
+operator-validated `project_id` on approval (see `_PROJECT_SCOPES` in
 `tinyagentos/routes/agent_auth_requests.py`). Omitting the project picker for
 one of these scopes is rejected with 400; the only way to mint a project-bound
 grant unbound (`project_id=None`) is the explicit `defer_binding` opt-in, and
@@ -1149,7 +1149,12 @@ matches nothing and authorizes nothing until assign-agent later binds it.
 `project_notes` joined this set in the beta.47 promote (#2320): it was
 previously grantable without a `project_id`, which minted an inert note grant
 the operator believed was usable; it now follows the same rule as
-`project_tasks`. `decisions_read` /
+`project_tasks`. `project_doc_review` joined it for the same reason (tsk-66mnhr):
+its routes have always authorized with `check_agent_scope_for_project`, so a
+`project_id`-less approval minted an inert doc-review grant. Existing
+`project_doc_review` grant rows carrying `project_id = None` were already inert
+and are left alone (no rewrite, no revocation); re-approve the scope with a
+project picker to get a usable grant. `decisions_read` /
 `decisions_write` (and the other global scopes) may be granted globally
 (`project_id=None`) or per-project.
 
