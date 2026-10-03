@@ -335,6 +335,32 @@ describe("useOsEvents", () => {
     expect(onEvent).toHaveBeenCalledTimes(2);
   });
 
+  it("does not dispatch events.heartbeat to subscribers", async () => {
+    vi.useFakeTimers();
+    const onEvent = vi.fn();
+    renderHook(() => useOsEvents(["projects.task.changed"], onEvent));
+
+    act(() => {
+      lastEs?.onopen?.();
+    });
+
+    act(() => {
+      lastEs?._fire({ kind: "events.heartbeat", id: null, ts: 1 });
+    });
+
+    expect(onEvent).not.toHaveBeenCalled();
+
+    // The watchdog was re-armed by the onmessage handler before handleMessage
+    // ran, so the stream must still be open after the old 25 s deadline.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30000);
+    });
+
+    expect(lastEs?.close).not.toHaveBeenCalled();
+
+    vi.useRealTimers();
+  });
+
   // One shared stream means one dispatch loop for every subscriber. Before the
   // multiplex each caller owned an EventSource, so a throwing handler could only
   // ever break its own delivery; on the shared loop an unguarded throw aborts
@@ -896,5 +922,34 @@ describe("useOsEvents", () => {
       widened?.onopen?.();
     });
     expect(openStreams()).toHaveLength(1);
+  });
+
+  it("flips to stale and reopens when the stream goes silent with readyState OPEN and no error event", async () => {
+    vi.useFakeTimers();
+    const { result } = renderHook(() =>
+      useOsEvents(["projects.task.changed"], () => {}),
+    );
+
+    act(() => {
+      lastEs?.onopen?.();
+    });
+    expect(result.current.connected).toBe(true);
+    expect(result.current.stale).toBe(false);
+
+    // The server sends a heartbeat every 10 s. The client watchdog is set to
+    // 2.5x that interval (25 s) so it rides out one missed heartbeat on a
+    // jittery network but detects a dead socket in under half a minute.
+    // Advance past the watchdog deadline without firing onerror or any
+    // message -- simulating a half-open TCP session the native EventSource
+    // never notices.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30000);
+    });
+
+    expect(result.current.connected).toBe(false);
+    expect(result.current.stale).toBe(true);
+    expect(MockEventSourceCtor).toHaveBeenCalledTimes(2);
+
+    vi.useRealTimers();
   });
 });
