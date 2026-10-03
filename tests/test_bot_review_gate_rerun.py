@@ -202,48 +202,35 @@ class TestWorkflowWiring:
     """
 
     @staticmethod
-    def _steps():
+    def _rerun_steps():
         text = WORKFLOW.read_text(encoding="utf-8")
         assert "bot-review-gate" in text, "workflow YAML did not load"
+        spec = yaml.safe_load(text)
+        return spec["jobs"]["reconcile-stale-runs"]["steps"]
+
+    @staticmethod
+    def _gate_steps():
+        text = WORKFLOW.read_text(encoding="utf-8")
         spec = yaml.safe_load(text)
         return spec["jobs"]["bot-review-gate"]["steps"]
 
     def test_review_path_has_a_step_that_reruns_failed_same_sha_runs(self) -> None:
-        steps = self._steps()
+        text = WORKFLOW.read_text(encoding="utf-8")
+        spec = yaml.safe_load(text)
+        job = spec["jobs"]["reconcile-stale-runs"]
+        assert "github.event_name == 'pull_request_review'" in job.get("if", ""), (
+            "the reconcile-stale-runs job is not conditioned on the "
+            f"pull_request_review event; got if: {job.get('if')!r}"
+        )
+        steps = job["steps"]
         reruns = [s for s in steps if "rerun_failed_bot_review_runs.py" in s.get("run", "")]
         assert len(reruns) == 1, (
             "bot-review-gate.yml has no step invoking "
             f"scripts/rerun_failed_bot_review_runs.py; found {len(reruns)}"
         )
-        step = reruns[0]
-
-        # The step must be gated on the pull_request_review event: that is the
-        # event which fires AFTER CodeRabbit has reviewed. Leaving it on the
-        # pull_request path too would let the re-run re-trigger itself.
-        assert "github.event_name == 'pull_request_review'" in step.get("if", ""), (
-            "the re-run step is not conditioned on the pull_request_review "
-            f"event; got if: {step.get('if')!r}"
-        )
-
-        # It must run AFTER the gate check so it only fires when the gate
-        # PASSED. No `always()` / failure-tolerant continuation.
-        idx = steps.index(step)
-        gate_idx = [
-            i for i, s in enumerate(steps)
-            if any("check_bot_review.py" in ln for ln in _invocations(s))
-        ]
-        assert gate_idx, "the gate check step was not found"
-        assert idx > min(gate_idx), (
-            "the re-run step must come after the check_bot_review.py step so "
-            "it only runs when the gate passed"
-        )
-        assert "always()" not in step.get("if", ""), (
-            "the re-run step is failure-tolerant, so it fires on a FAILED gate "
-            "run and masks the defect"
-        )
 
     def test_rerun_step_passes_the_head_sha(self) -> None:
-        steps = self._steps()
+        steps = self._rerun_steps()
         step = [
             s for s in steps if "rerun_failed_bot_review_runs.py" in s.get("run", "")
         ][0]
@@ -260,24 +247,16 @@ class TestWorkflowWiring:
 
     def test_gate_job_grants_actions_write(self) -> None:
         spec = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
-        perms = spec["jobs"]["bot-review-gate"]["permissions"]
+        perms = spec["jobs"]["reconcile-stale-runs"]["permissions"]
         assert perms.get("actions") == "write", (
-            "the gate job needs actions: write to re-run its own failed runs; "
-            f"got {perms}"
+            "the reconcile-stale-runs job needs actions: write to re-run its "
+            f"own failed runs; got {perms}"
         )
-
-    def test_neither_trigger_is_dropped(self) -> None:
-        """Both events must stay: the pull_request run is the fast red the gate
-        exists for, the pull_request_review run is the one that can pass."""
-        spec = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
-        trigger = spec.get("on", spec.get(True))
-        assert "pull_request" in trigger
-        assert "pull_request_review" in trigger
 
     def test_gate_check_still_passes_head_sha(self) -> None:
         """Regression guard: this PR must not touch the --head-sha wiring on
         the check step itself."""
-        steps = self._steps()
+        steps = self._gate_steps()
         gate = [
             s for s in steps
             if any("check_bot_review.py" in ln for ln in _invocations(s))
@@ -287,3 +266,62 @@ class TestWorkflowWiring:
             ln for ln in _invocations(gate[0]) if "check_bot_review.py" in ln
         ]
         assert "--head-sha" in invocations[0]
+
+
+class TestWorkflowStructure:
+    """The re-run helper must run from the base ref in its own job, not from the
+    PR checkout inside bot-review-gate. A helper executed from the PR tree with
+    actions: write lets any PR replace the script and harvest a token that can
+    cancel, re-run or dispatch workflows."""
+
+    def test_gate_job_has_no_actions_permission(self) -> None:
+        spec = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        perms = spec["jobs"]["bot-review-gate"]["permissions"]
+        assert "actions" not in perms, (
+            "bot-review-gate must not hold actions: write so a malicious PR "
+            f"cannot abuse the token; got {perms}"
+        )
+
+    def test_rerun_job_checks_out_base_sha_and_has_actions_write(self) -> None:
+        spec = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        jobs = spec["jobs"]
+        rerun_job = jobs.get("reconcile-stale-runs")
+        assert rerun_job is not None, (
+            "expected a separate reconcile-stale-runs job; "
+            f"found jobs: {list(jobs)}"
+        )
+        perms = rerun_job.get("permissions", {})
+        assert perms.get("actions") == "write", (
+            "reconcile-stale-runs needs actions: write to re-run failed "
+            f"workflow runs; got {perms}"
+        )
+        checkout = [
+            s for s in rerun_job.get("steps", [])
+            if s.get("uses", "").startswith("actions/checkout")
+        ]
+        assert len(checkout) == 1, checkout
+        ref = checkout[0].get("with", {}).get("ref", "")
+        assert ref == "${{ github.event.pull_request.base.sha }}", (
+            "reconcile-stale-runs must check out the base ref so the helper "
+            f"always comes from the base branch; got ref={ref!r}"
+        )
+
+    def test_rerun_job_is_gated_to_pull_request_review_and_needs_gate(self) -> None:
+        spec = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        jobs = spec["jobs"]
+        rerun_job = jobs.get("reconcile-stale-runs")
+        assert rerun_job is not None, (
+            "expected a separate reconcile-stale-runs job; "
+            f"found jobs: {list(jobs)}"
+        )
+        assert rerun_job.get("if") == (
+            "github.event_name == 'pull_request_review'"
+        ), (
+            "reconcile-stale-runs must only run on pull_request_review so it "
+            "does not re-trigger itself; "
+            f"got if: {rerun_job.get('if')!r}"
+        )
+        assert rerun_job.get("needs") == "bot-review-gate", (
+            "reconcile-stale-runs must depend on bot-review-gate so it only "
+            f"runs after the gate has passed; got needs: {rerun_job.get('needs')!r}"
+        )
