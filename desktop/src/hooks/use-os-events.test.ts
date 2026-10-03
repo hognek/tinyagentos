@@ -335,6 +335,32 @@ describe("useOsEvents", () => {
     expect(onEvent).toHaveBeenCalledTimes(2);
   });
 
+  it("does not dispatch events.heartbeat to subscribers", async () => {
+    vi.useFakeTimers();
+    const onEvent = vi.fn();
+    renderHook(() => useOsEvents(["projects.task.changed"], onEvent));
+
+    act(() => {
+      lastEs?.onopen?.();
+    });
+
+    act(() => {
+      lastEs?._fire({ kind: "events.heartbeat", id: null, ts: 1 });
+    });
+
+    expect(onEvent).not.toHaveBeenCalled();
+
+    // The watchdog was re-armed by the onmessage handler before handleMessage
+    // ran, so the stream must still be open after the old 25 s deadline.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(30000);
+    });
+
+    expect(lastEs?.close).not.toHaveBeenCalled();
+
+    vi.useRealTimers();
+  });
+
   // One shared stream means one dispatch loop for every subscriber. Before the
   // multiplex each caller owned an EventSource, so a throwing handler could only
   // ever break its own delivery; on the shared loop an unguarded throw aborts

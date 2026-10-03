@@ -145,7 +145,9 @@ function handleMessage(msg: MessageEvent) {
   }
   if (!event || typeof event !== "object" || !event.kind) return;
 
-  if (event.kind === LAGGED_KIND || event.kind === HEARTBEAT_KIND) {
+  if (event.kind === HEARTBEAT_KIND) return;
+
+  if (event.kind === LAGGED_KIND) {
     subscribers.forEach((sub) => dispatch(sub, event));
     return;
   }
@@ -206,6 +208,9 @@ function openStream(kinds: Coverage): EventSource {
     armWatchdog();
     reconnectManager.reset();
     if (es === pendingEs) {
+      // The widened stream is live, so the narrow one can go now -- not before.
+      // Overlapping the two is what keeps delivery unbroken across a filter
+      // change, and the per-subscriber dedup drops whatever arrives on both.
       sharedEs?.close();
       sharedEs = pendingEs;
       servedKinds = pendingKinds;
@@ -218,6 +223,10 @@ function openStream(kinds: Coverage): EventSource {
   es.onerror = () => {
     clearWatchdog();
     if (es === pendingEs) {
+      // The widened stream failed. If the narrow one is still up it keeps
+      // delivering everything it covers, so drop the attempt and let the next
+      // mount or kinds change retry the widening. If it is NOT up, deferring
+      // to this stream is what left the backoff unscheduled, so schedule it.
       if (es.readyState === EventSource.CLOSED) {
         es.close();
         pendingEs = null;
@@ -226,13 +235,23 @@ function openStream(kinds: Coverage): EventSource {
       }
       return;
     }
+    // A stream we already handed off from has nothing left to say.
     if (es !== sharedEs) return;
 
     reconnectManager.cancel();
+    // An `error` means the stream is down RIGHT NOW, whether or not the browser
+    // means to retry it. Nothing resumes the gap -- the endpoint sends no SSE
+    // `id:` line and ignores `Last-Event-ID` -- so a subscriber told it is
+    // still live would silently miss every change until the retry lands.
+    // Report it; the no-op guard in setStatus is what keeps a long retry storm
+    // from thrashing anyone's UI.
     setStatus(false, true);
 
     if (es.readyState === EventSource.CLOSED) {
       sharedEs = null;
+      // A widened stream is already on its way and covers everything this one
+      // did, so it IS the reconnect. Scheduling another on top would open a
+      // stream the handoff then immediately closes.
       if (!pendingEs) reconnectManager.schedule();
     }
   };
