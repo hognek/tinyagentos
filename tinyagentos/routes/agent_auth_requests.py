@@ -107,6 +107,8 @@ VALID_SCOPES = frozenset({
     # project_notes' single-scope read+write surface for a lightweight lists
     # surface scoped to a project.
     "project_lists",
+    # Memory access: read an agent's own memory index.
+    "memory_read",
 })
 
 
