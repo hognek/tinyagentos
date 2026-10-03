@@ -13,6 +13,18 @@ Fix: when the `pull_request_review` run of the gate PASSES, re-run the failed
 re-reads review state from the API at run time, so it reaches the same
 verdict as the run that just passed.
 
+# RED-FIRST evidence (run against base-branch workflow, then fixed workflow):
+#
+# === RED (base branch exec/tsk-dzd77m) ===
+# FAILED tests/test_bot_review_gate_rerun.py::TestWorkflowStructure::test_gate_job_has_no_actions_permission
+# FAILED tests/test_bot_review_gate_rerun.py::TestWorkflowStructure::test_rerun_job_checks_out_base_sha_and_has_actions_write
+# FAILED tests/test_bot_review_gate_rerun.py::TestWorkflowStructure::test_rerun_job_is_gated_to_pull_request_review_and_needs_gate
+# ======================================
+#
+# === GREEN (this branch head) ===
+# 18 passed in 0.53s
+# ================================
+
 Measured on #3394 (runs 37080299756 pull_request/failure,
 37080574868 pull_request_review/success) and #3400.
 """
@@ -215,18 +227,22 @@ class TestWorkflowWiring:
         return spec["jobs"]["bot-review-gate"]["steps"]
 
     def test_review_path_has_a_step_that_reruns_failed_same_sha_runs(self) -> None:
-        text = WORKFLOW.read_text(encoding="utf-8")
-        spec = yaml.safe_load(text)
-        job = spec["jobs"]["reconcile-stale-runs"]
-        assert "github.event_name == 'pull_request_review'" in job.get("if", ""), (
-            "the reconcile-stale-runs job is not conditioned on the "
-            f"pull_request_review event; got if: {job.get('if')!r}"
-        )
-        steps = job["steps"]
+        steps = self._rerun_steps()
         reruns = [s for s in steps if "rerun_failed_bot_review_runs.py" in s.get("run", "")]
         assert len(reruns) == 1, (
             "bot-review-gate.yml has no step invoking "
             f"scripts/rerun_failed_bot_review_runs.py; found {len(reruns)}"
+        )
+        step = reruns[0]
+        invocations = [
+            ln for ln in _invocations(step)
+            if "rerun_failed_bot_review_runs.py" in ln
+        ]
+        assert len(invocations) == 1, invocations
+        assert "--head-sha" in invocations[0], invocations[0]
+        assert "PR_HEAD" in step.get("env", {}), (
+            "the re-run step passes --head-sha but does not bind PR_HEAD; the "
+            "flag expands to empty and nothing is selected"
         )
 
     def test_rerun_step_passes_the_head_sha(self) -> None:
@@ -252,6 +268,14 @@ class TestWorkflowWiring:
             "the reconcile-stale-runs job needs actions: write to re-run its "
             f"own failed runs; got {perms}"
         )
+
+    def test_neither_trigger_is_dropped(self) -> None:
+        """Both events must stay: the pull_request run is the fast red the gate
+        exists for, the pull_request_review run is the one that can pass."""
+        spec = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        trigger = spec.get("on", spec.get(True))
+        assert "pull_request" in trigger
+        assert "pull_request_review" in trigger
 
     def test_gate_check_still_passes_head_sha(self) -> None:
         """Regression guard: this PR must not touch the --head-sha wiring on

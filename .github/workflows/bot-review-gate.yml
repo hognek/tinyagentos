@@ -165,6 +165,9 @@ jobs:
     #   - The helper exits 0 even when a re-run POST is refused: this run is
     #     not itself a required check, but it still must not recreate the
     #     BLOCKED condition the step exists to remove.
+    #   - needs: bot-review-gate + default success() means the re-run step
+    #     has no always(); a failed gate stays red and the helper does not
+    #     fire. A future "make it resilient" edit must not silently add one.
     #
     # Neither trigger is dropped and check_bot_review.py is not weakened:
     # the fast red on open stays, it is just reconciled once the review has
@@ -184,6 +187,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
 
       - uses: actions/setup-python@v7
         with:
