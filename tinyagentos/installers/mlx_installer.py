@@ -188,6 +188,17 @@ def requirements_file(python_version: str) -> Path | None:
     return path if path.exists() else None
 
 
+def _is_safe_app_id(app_id: str) -> bool:
+    """True when *app_id* is a single, plain path segment.
+
+    ``app_id`` reaches us from a catalog manifest but names a directory this
+    installer creates and later ``rmtree``s, so ``/``, ``\\`` or ``..`` -- which
+    could point that delete at a sibling, an ancestor, or the whole ``mlx`` tree
+    -- are rejected outright.
+    """
+    return bool(app_id) and not any(part in app_id for part in ("/", "\\", ".."))
+
+
 class MLXInstaller(AppInstaller):
     """Install MLX models for serving via `mlx-lm` on Apple Silicon."""
 
@@ -225,15 +236,23 @@ class MLXInstaller(AppInstaller):
         return self._root() / BACKEND_ID / family_from_manifest(app_id) / app_id
 
     def _contained(self, target: Path) -> Path | None:
-        """Resolved *target* when it stays inside the MLX backend root, else None.
+        """Resolved *target* when it stays strictly inside the MLX backend root.
 
         ``app_id`` arrives from a catalog manifest, but a model download writes
         through this path and uninstall deletes it recursively, so it is
-        validated at the boundary rather than trusted.
+        validated at the boundary rather than trusted. ``backend_root`` itself
+        is rejected: a target that resolves *to* ``<root>/mlx`` would delete the
+        whole backend tree, so the delete must land at family/id depth below it.
         """
         backend_root = (self._root() / BACKEND_ID).resolve()
         resolved = target.resolve()
-        return resolved if resolved.is_relative_to(backend_root) else None
+        if resolved == backend_root or not resolved.is_relative_to(backend_root):
+            return None
+        # ``<root>/mlx/<family>/<app_id>``: a shallower path means the segments
+        # collapsed (``.``/``..``/``…/…``) even though it still points inside.
+        if resolved.parent.parent != backend_root:
+            return None
+        return resolved
 
     async def _runtime_version(self) -> str:
         """Version of `mlx-lm` installed in the runtime venv, or "".
@@ -397,7 +416,7 @@ class MLXInstaller(AppInstaller):
         # before the runtime step so an escaping app_id cannot trigger a venv
         # creation or an install as a side effect of being rejected.
         target = self._target_dir(app_id)
-        if self._contained(target) is None:
+        if not _is_safe_app_id(app_id) or self._contained(target) is None:
             return {
                 "success": False,
                 "error": f"refusing to install {app_id!r}: target {target} is outside the mlx root",
@@ -453,7 +472,11 @@ class MLXInstaller(AppInstaller):
         venv is deliberately left alone.
         """
         backend_root = (self._root() / BACKEND_ID).resolve()
-        target = self._contained(self._target_dir(app_id))
+        target = (
+            self._contained(self._target_dir(app_id))
+            if _is_safe_app_id(app_id)
+            else None
+        )
         # The recursive delete below must never escape the mlx backend root,
         # whatever the caller passes as app_id ("../..", an absolute path).
         if target is None:

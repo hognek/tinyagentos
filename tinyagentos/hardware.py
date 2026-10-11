@@ -165,9 +165,13 @@ def is_apple_silicon() -> bool:
 def _probe_metal_support() -> bool | None:
     """Read the ``Metal Support`` line out of ``system_profiler``.
 
-    True when macOS reports a Metal device, False when it reports the display
-    subsystem without one (an arm64 VM), None when the probe could not run at
-    all (not macOS, no ``system_profiler``, or no output).
+    True when macOS reports a Metal device and False when it explicitly reports
+    the display subsystem *without* one ("Metal Support: Unsupported"). None --
+    "unknown, fail open" -- when the probe could not run (not macOS, no
+    ``system_profiler``, no output) *or* ran but produced no ``Metal Support``
+    line: an unrecognised output shape (a new macOS, a localised system_profiler)
+    is not the same fact as "this Mac has no GPU", and hiding a real GPU over a
+    parsing miss is the worse error.
     """
     if platform.system() != "Darwin":
         return None
@@ -180,7 +184,7 @@ def _probe_metal_support() -> bool | None:
         key, _, value = line.partition(":")
         if key.strip().lower() == "metal support":
             return value.strip().lower().startswith("metal")
-    return False
+    return None
 
 
 def metal_available() -> bool:

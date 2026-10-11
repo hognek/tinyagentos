@@ -8,9 +8,11 @@ install cannot pull an unpinned (or silently substituted) package off an index.
 
 What this script does, for each CPython minor taOS supports:
 
-1. ``pip download`` the pinned closure (``mlx-lm`` plus ``mlx``, which pip
-   skips for a foreign platform because its requirement carries a
-   ``platform_system == "Darwin"`` marker) for macOS arm64 wheels.
+1. ``pip download`` the pinned closure (``mlx-lm``, ``mlx`` and ``mlx-metal``)
+   for macOS arm64 wheels. ``mlx-lm`` requires ``mlx`` and ``mlx`` requires
+   ``mlx-metal``, both behind a ``platform_system == "Darwin"`` marker, so a
+   resolver running on this (non-Darwin) host skips them entirely -- each must
+   be pinned explicitly or it silently drops out of the lock.
 2. Add the sha256 of *every* macOS-arm64 / pure-python wheel PyPI publishes for
    those exact versions -- pip picks the best wheel compatible with the machine
    it runs on, and ``--require-hashes`` rejects a file whose digest is absent,
@@ -107,7 +109,15 @@ def _release_hashes(pkg: str, version: str, cache: dict) -> list[str]:
 
 def _download_closure(py: str, abi: str, dest: pathlib.Path) -> list[pathlib.Path]:
     requirements = dest / "mlx_lm_runtime.in"
-    requirements.write_text(f"mlx-lm=={MLX_LM_VERSION}\nmlx=={MLX_VERSION}\n")
+    # ``mlx`` and ``mlx-metal`` are requirements of ``mlx-lm``/``mlx`` guarded by
+    # ``platform_system == "Darwin"``; pinning them here is what pulls them (and
+    # their hashes) into a lock built on a non-Darwin host. ``mlx-metal``'s
+    # version tracks ``mlx``'s, so it reuses MLX_VERSION.
+    requirements.write_text(
+        f"mlx-lm=={MLX_LM_VERSION}\n"
+        f"mlx=={MLX_VERSION}\n"
+        f"mlx-metal=={MLX_VERSION}\n"
+    )
     try:
         proc = subprocess.run(
             [
@@ -141,7 +151,7 @@ def main() -> int:
             for wheel in wheels:
                 pkg, version = _package_of(wheel.name)
                 pins[pkg] = version
-            missing = {"mlx-lm", "mlx"} - set(pins)
+            missing = {"mlx-lm", "mlx", "mlx-metal"} - set(pins)
             if missing:
                 print(f"py{py}: closure missing {sorted(missing)}", file=sys.stderr)
                 return 1

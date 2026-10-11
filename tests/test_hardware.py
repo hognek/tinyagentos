@@ -510,11 +510,14 @@ class TestMetalAvailability:
         assert hardware_mod.is_apple_silicon() is True
         assert hardware_mod.metal_available() is True
 
-    def test_apple_silicon_without_a_metal_device_is_not_metal(self, monkeypatch):
-        """The arm64 VM case: the host is Apple Silicon, the GPU is not there."""
+    def test_output_without_a_metal_support_line_fails_open(self, monkeypatch):
+        """A display block we cannot parse for a ``Metal Support`` line is
+        *unknown*, not "no GPU": hiding a real Mac's GPU over a parsing miss
+        would be the worse error, so we fail open like the unavailable probe."""
         self._darwin_arm64(monkeypatch)
         self._system_profiler(monkeypatch, SYSTEM_PROFILER_NO_METAL)
-        assert hardware_mod.metal_available() is False
+        assert hardware_mod._probe_metal_support() is None
+        assert hardware_mod.metal_available() is True
 
     def test_explicitly_unsupported_metal_is_not_metal(self, monkeypatch):
         self._darwin_arm64(monkeypatch)
