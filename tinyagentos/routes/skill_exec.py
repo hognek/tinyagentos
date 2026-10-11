@@ -28,7 +28,8 @@ _bg_receipt_tasks: set = set()
 
 
 def _is_admin_or_local_token(request: Request) -> bool:
-    """True if the caller is an admin session or presented the host's local token.
+    """True if the caller is an admin session, presented the host's local token,
+    or is the native taOS agent presenting its scoped registry JWT.
 
     Skill EXECUTION (unlike the read-only discovery GET) must never be reachable
     by a plain non-admin user session -- built-in skills include ``code_exec``,
@@ -36,19 +37,23 @@ def _is_admin_or_local_token(request: Request) -> bool:
     supplied code, i.e. host RCE (GHSA-h24f-gp4c-8qjm). The legitimate callers
     are: (a) an admin session, or (b) a deployed agent presenting the
     ``TAOS_LOCAL_TOKEN`` local token (see ``deployer.py`` + ``AuthManager.
-    validate_local_token``).
+    validate_local_token``), or (c) the native taOS agent presenting its
+    scoped registry JWT (via == "registry_jwt_native_agent").
 
     ``AuthMiddleware`` (tinyagentos/auth_middleware.py) sets both signals on
     ``request.state``: ``is_admin`` is True for an admin session AND for a
     local token that maps to the primary user, while ``via == "local_token"``
     is set for a valid local token even in the pre-onboarding edge case where
-    there is no primary user yet (so ``is_admin`` is False there). Checking
-    both keeps agent tool-calls working in every state the middleware allows,
-    without ever accepting a bare non-admin user session.
+    there is no primary user yet (so ``is_admin`` is False there). The native
+    agent's registry JWT sets ``via == "registry_jwt_native_agent"`` and
+    ``user_id`` to the owner's user_id. Checking all three keeps agent
+    tool-calls working in every state the middleware allows, without ever
+    accepting a bare non-admin user session.
     """
     if getattr(request.state, "is_admin", False):
         return True
-    return getattr(request.state, "via", None) == "local_token"
+    via = getattr(request.state, "via", None)
+    return via == "local_token" or via == "registry_jwt_native_agent"
 
 
 # ---------------------------------------------------------------------------
@@ -155,17 +160,47 @@ async def _skill_list_files(args: dict, request: Request) -> dict:
 async def _skill_web_search(args: dict, request: Request) -> dict:
     """Search the web via SearXNG (if available)."""
     import httpx
+    import os
 
     query = args.get("query", "")
     max_results = args.get("max_results", 5)
+
+    base_url = os.environ.get("TAOS_SEARXNG_URL", "").strip()
+    if not base_url:
+        store = getattr(request.app, "state", None)
+        installed_apps = getattr(store, "installed_apps", None) if store else None
+        if installed_apps is not None:
+            try:
+                runtime = await installed_apps.get_runtime_location("searxng")
+                if runtime and runtime.get("runtime_port"):
+                    host = runtime.get("runtime_host", "127.0.0.1")
+                    base_url = f"http://{host}:{runtime['runtime_port']}"
+            except Exception:
+                pass
+
+    if not base_url:
+        base_url = "http://localhost:8888"
+
+    base_url = base_url.rstrip("/")
+
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                f"http://localhost:8888/search?q={query}&format=json"
+                base_url + "/search",
+                params={"q": query, "format": "json"},
             )
             if resp.status_code == 200:
                 data = resp.json()
-                return {"results": data.get("results", [])[:max_results]}
+                results = data.get("results", [])[:max_results]
+                if not results and data.get("unresponsive_engines"):
+                    return {
+                        "results": [],
+                        "error": (
+                            "Web search returned zero results: unresponsive engines: "
+                            + ", ".join(data.get("unresponsive_engines", []))
+                        ),
+                    }
+                return {"results": results}
     except Exception:
         pass
     return {"error": "Web search not configured. Install SearXNG."}

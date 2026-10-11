@@ -109,6 +109,8 @@ interface Channel {
   created_at?: string;
   last_message_at?: string;
   lastPreview?: string;
+  last_preview?: string;
+  last_preview_author?: string;
   project_id?: string;
   settings?: {
     archived?: boolean;
@@ -916,7 +918,7 @@ export function MessagesApp({
   const [showCreate, setShowCreate] = useState(false);
   const [showEmoji, setShowEmoji] = useState<{ messageId: string; rect: DOMRect } | null>(null); // message id + anchor
   const [viewingCanvas, setViewingCanvas] = useState<{ url: string; title?: string } | null>(null);
-  const [newChannel, setNewChannel] = useState({ name: "", type: "topic" as "topic" | "group", description: "" });
+  const [newChannel, setNewChannel] = useState({ name: "", type: "topic" as "topic" | "group", topic: "" });
   const [prefillBanner, setPrefillBanner] = useState<{ promptName: string; agentName?: string } | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showConnectWizard, setShowConnectWizard] = useState(false);
@@ -1004,7 +1006,12 @@ export function MessagesApp({
       ]);
       if (chRes.ok) {
         const data = await chRes.json();
-        setChannels(data.channels ?? []);
+        setChannels(
+          (data.channels ?? []).map((c: Channel) => ({
+            ...c,
+            lastPreview: c.last_preview ?? c.lastPreview,
+          }))
+        );
       }
       if (unRes.ok) {
         const data = await unRes.json();
@@ -1026,7 +1033,12 @@ export function MessagesApp({
       const res = await fetch(url);
       if (res.ok) {
         const data = await res.json();
-        setArchivedChannels(data.channels ?? []);
+        setArchivedChannels(
+          (data.channels ?? []).map((c: Channel) => ({
+            ...c,
+            lastPreview: c.last_preview ?? c.lastPreview,
+          }))
+        );
       }
     } catch {
       /* offline */
@@ -1347,7 +1359,7 @@ export function MessagesApp({
       }
     };
     es.onerror = () => {
-      es.close();
+      /* let the browser reconnect; do not force-close */
     };
     return () => es.close();
   }, []);
@@ -1915,19 +1927,19 @@ export function MessagesApp({
       const res = await fetch("/api/chat/channels", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: newChannel.name.trim(),
-          type: newChannel.type,
-          description: newChannel.description.trim() || undefined,
-          ...(scope?.projectId ? { project_id: scope.projectId } : {}),
-        }),
+body: JSON.stringify({
+            name: newChannel.name.trim(),
+            type: newChannel.type,
+            topic: newChannel.topic.trim() || undefined,
+            ...(scope?.projectId ? { project_id: scope.projectId } : {}),
+          }),
       });
       if (res.ok) {
         const ch = await res.json();
         await fetchChannels();
         setSelectedChannel(ch.id);
         setShowCreate(false);
-        setNewChannel({ name: "", type: "topic", description: "" });
+        setNewChannel({ name: "", type: "topic", topic: "" });
       }
     } catch {
       /* ignore */
@@ -2695,7 +2707,8 @@ className="shrink-0 p-0.5 rounded hover:bg-shell-surface-active transition-color
                 body: JSON.stringify({
                   name: slug, type: "dm",
                   members: ["user", slug],
-                  description: "", topic: "",
+                  description: "",
+                  topic: "",
                 }),
               });
               if (r.ok) {
@@ -2824,13 +2837,13 @@ className="shrink-0 p-0.5 rounded hover:bg-shell-surface-active transition-color
                 </select>
               </div>
               <div className="space-y-1">
-                <Label htmlFor="new-channel-description-mobile" className="block uppercase tracking-wider">Description</Label>
+                <Label htmlFor="new-channel-description-mobile" className="block uppercase tracking-wider">Topic</Label>
                 <Input
                   id="new-channel-description-mobile"
-                  value={newChannel.description}
-                  onChange={(e) => setNewChannel((s) => ({ ...s, description: e.target.value }))}
+                  value={newChannel.topic}
+                  onChange={(e) => setNewChannel((s) => ({ ...s, topic: e.target.value }))}
                   placeholder="What's this channel about?"
-                  aria-label="Channel description"
+                  aria-label="Channel topic"
                 />
               </div>
               <Button onClick={createChannel} disabled={!newChannel.name.trim()} className="w-full">
@@ -2878,13 +2891,13 @@ className="shrink-0 p-0.5 rounded hover:bg-shell-surface-active transition-color
                   </select>
                 </div>
                 <div className="space-y-1">
-                  <Label htmlFor="new-channel-description" className="block uppercase tracking-wider">Description</Label>
+                  <Label htmlFor="new-channel-description" className="block uppercase tracking-wider">Topic</Label>
                   <Input
                     id="new-channel-description"
-                    value={newChannel.description}
-                    onChange={(e) => setNewChannel((s) => ({ ...s, description: e.target.value }))}
+                    value={newChannel.topic}
+                    onChange={(e) => setNewChannel((s) => ({ ...s, topic: e.target.value }))}
                     placeholder="What's this channel about?"
-                    aria-label="Channel description"
+                    aria-label="Channel topic"
                   />
                 </div>
                 <Button

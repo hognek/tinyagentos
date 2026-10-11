@@ -216,6 +216,22 @@ canonical hook, and a second module-level `def pytest_configure` is last-wins
 rebinding rather than additive registration, so the earlier body never runs and
 its next edit is a silent no-op in CI.
 
+- **`@pytest.mark.guards("module:function", replace=[(correct, defective)])`
+  declares what a guard test protects.** It is inert in a normal run.
+  `scripts/check_non_discriminating.py` (workflow
+  `guard-discrimination-gate.yml`, not a required check) re-runs every declared
+  test against the broken variant, compiled from the function's own source and
+  swapped in via `__code__`; a test that still passes is NON-DISCRIMINATING
+  (exit 1). `must_kill=[ids]` names generated mutants instead (list them with
+  `--list-mutants module:function`); with neither, one generated mutant must
+  kill it. A test that monkeypatches the function it guards can never pass
+  this. Ad-hoc mode (`--guard NODEID --target ... --replace OLD NEW --root DIR`)
+  checks an undecorated test in any repo.
+  **It proves the DECLARED edit, not the card's defect:** a `replace` that
+  raises on entry, or default mode's `return-none`, is killed by any test that
+  merely calls the function. Review the `replace` pair against the real
+  defect; a default-mode OK only proves the test reaches the function. A kill
+  counts only if an unmutated control rerun still passes (else ERROR).
 - **`@pytest.mark.skip_if_no_embed_backend` skips a test that cannot run without
   an embedding backend** — a reachable qmd service, or an installed
   `onnxruntime`. There is no opt-out marker and no `-o` switch: not applying it
@@ -245,7 +261,7 @@ time, so patching the module attribute AFTER `create_app` does nothing.
   component test fails CI), `desktop-e2e` (the Playwright suite under `desktop/tests`, run on
   webkit - see "Desktop SPA build + test" below), a "Verify app starts" `create_app` import
   smoke, `lint`
-  (`compileall`), `docs-build`, and `cla`. `docs-build` is the only job with the mkdocs
+  (`compileall`), and `docs-build`. `docs-build` is the only job with the mkdocs
   toolchain installed (mkdocs is NOT a project dependency, so `uv sync` does not provide
   it): it runs `tests/test_mkdocs_exclude.py` with `TAOS_DOCS_BUILD_TESTS=1`, which turns
   off the `importorskip` the ordinary shards rely on — put any test that has to build the
@@ -281,25 +297,6 @@ time, so patching the module attribute AFTER `create_app` does nothing.
   actually inspected. If you change a PR's base and this gate goes red, that is
   the new diff being judged, not a flake -- re-read what the failure names.
 
-## CLA - HUMAN signs
-
-taOS requires a Contributor License Agreement for first-time contributors. The CLA bot
-flags the PR with a `cla: fail` check.
-
-**The agent does NOT sign the CLA.** Posting the acceptance text accepts a legal agreement - that is the human account-holder's action, not the agent's.
-
-### Procedure when `cla: fail` appears:
-
-1. Verify the commit author email matches a GitHub-verified email.
-   If the email was wrong, amend the commit with the correct email, force-push.
-2. Surface the bot's comment + link to the human. Do NOT post the acceptance text yourself.
-   Do NOT post `recheck`.
-
-The bot accepts a PR comment in this format (for the human to post):
-```
-I have read the CLA Document and I hereby sign the CLA
-```
-
 ## PR / CI flow (fork specifics)
 
 1. After creating the draft PR, check both `gh pr checks <PR#>` **and**
@@ -307,7 +304,7 @@ I have read the CLA Document and I hereby sign the CLA
    `pr checks` while it awaits approval.
 2. **If the CI run shows `action_required`**: the first-time-contributor workflow-approval policy
    is blocking it. Surface this to the human - do not re-poll, re-push, or re-create the PR.
-   Lightweight checks (CLA, Gitar, CodeRabbit) run independently and don't need approval.
+   Lightweight checks (Gitar, CodeRabbit) run independently and don't need approval.
 3. Once code is done and local tests pass, `gh pr ready`. Address review feedback with additional
    commits on the same branch. The maintainer merges upstream.
 
@@ -346,6 +343,18 @@ run went green. A red `bot-review-gate` check means the PR has no substantive Co
 review yet — wait for (or retrigger) a real review; do not merge on the
 stub. A lead may waive a known rate-limit/stub false positive by applying the
 `bot-review-allow` label (see below).
+
+The gate also self-heals its own stale red. `pull_request` and
+`pull_request_review` are separate runs producing separate check suites on one head SHA, so the
+pre-review FAIL used to survive next to the later SUCCESS and the required-check rollup stayed
+FAILURE, leaving `mergeStateStatus` BLOCKED and `gh pr merge --auto` unable to fire. Once the
+gate passes on a `pull_request_review` event, a separate `reconcile-stale-runs` job
+(`scripts/rerun_failed_bot_review_runs.py`, with `actions: write` scoped to that job only, and
+checking out `ref: ${{ github.event.pull_request.base.sha }}` so the helper always comes from
+the base branch) re-runs the failed `pull_request` runs of this workflow for that same SHA --
+this workflow only, that SHA only, `conclusion=failure` only, `event=pull_request` only. So a
+red that predates the review clears itself once the review lands; a genuine stub verdict stays
+red, because the re-run re-reads review state and reaches the same verdict.
 
 Enforcement parity is a GitHub-side branch-protection setting, not in-repo config:
 `bot-review-gate` is REQUIRED on `master` but only ADVISORY on `dev` (absent from dev's
@@ -623,8 +632,13 @@ If your PR trips a rule and there is genuinely nothing to document, add a traile
 ```
 Docs-Reviewed: no user-facing change, internal refactor only
 ```
-The trailer passes **every** rule for that PR, so it is an escape hatch, not a shortcut:
-the gate prints `doc-gate: trailer override used in <sha> by <author>: <why>` in its CI
+The trailer covers **only the commit that carries it**: it waives the rules tripped by the
+files that commit touched, and nothing else. A trailer on an unrelated or empty commit
+waives nothing, and code pushed in a later commit is gated on its own (a doc edit or
+changelog fragment in any commit still satisfies a rule PR-wide). `Docs-Reviewed: [routes]
+<why>` narrows the waiver to the named rules, which is how a squash-merged single commit
+waives one rule and still owes its fragment. The gate prints
+`doc-gate: trailer override used in <sha> by <author>: <why> [covers: <files>]` in its CI
 log for each commit that carries one, and that line is reviewable. A reviewer may ask for
 a real doc instead.
 
@@ -682,7 +696,7 @@ drops each pattern from a copy of the real `.gitignore` and asserts the guard fa
 - Branch naming: `feat/<slug>` or `fix/<slug>`
 - Conventional commits (see table above)
 - No AI tool attribution in commits
-- Python 3.11+ floor (pyproject.toml: `>=3.11,<3.14`). `match`/`case` and `X | None` union syntax
+- Python 3.11+ floor (pyproject.toml: `>=3.11,<3.15`). `match`/`case` and `X | None` union syntax
   are available. Most modules use `from __future__ import annotations`.
 - Code style: match surrounding code, one concern per module
 - Use `uv` for dependency management and test running: `uv sync --extra dev`, `uv run pytest`
@@ -811,7 +825,7 @@ controls which hardware profiles see the app as recommended.
 - **Secrets have a dedicated store.** `tinyagentos/secrets.py` (routes in
   `tinyagentos/routes/secrets.py`, attached as `app.state.secrets`) is the credential store. Store
   credentials there - never in config or in code.
-- **CONTRIBUTING.md** says Python 3.10+, but `pyproject.toml` requires `>=3.11,<3.14`.
+- **CONTRIBUTING.md** says Python 3.10+, but `pyproject.toml` requires `>=3.11,<3.15`.
   Python 3.11 is the effective floor.
 - **Routes do not import stores directly.** They access them via `request.app.state`.
   This is a common mistake - check existing routes for the pattern.

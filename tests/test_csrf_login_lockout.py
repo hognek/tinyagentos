@@ -53,8 +53,7 @@ def configured_app(tmp_path, monkeypatch):
     """An app with one existing account that has both a password and a PIN."""
     from tinyagentos.app import create_app
 
-    monkeypatch.setenv("TINYAGENTOS_DATA_DIR", str(tmp_path))
-    app = create_app()
+    app = create_app(data_dir=tmp_path)
     mgr = AuthManager(tmp_path)
     mgr.setup_user("tester", "Bring-up Test", "", PASSWORD)
     mgr.set_pin("tester", PIN)
@@ -67,8 +66,7 @@ def unconfigured_app(tmp_path, monkeypatch):
     """An app with NO account yet — the first-run setup surface."""
     from tinyagentos.app import create_app
 
-    monkeypatch.setenv("TINYAGENTOS_DATA_DIR", str(tmp_path))
-    app = create_app()
+    app = create_app(data_dir=tmp_path)
     app.state.auth = AuthManager(tmp_path)
     return app
 
@@ -255,6 +253,39 @@ class TestStaleCookieDoesNotBlockSignIn:
         mgr = configured_app.state.auth
         assert mgr.validate_session(session_value, user_agent=UA) is not None, (
             "fresh taos_session cookie after login does not resolve to a live session"
+        )
+
+    @pytest.mark.asyncio
+    async def test_stale_session_cookie_is_cleared_when_no_route_mints_one(
+        self, stale_console
+    ):
+        """The positive direction of the stale-cookie clear (#3138).
+
+        `CSRFMiddleware.dispatch` only deletes taos_session when the route did
+        NOT set one itself (`already_set` is False). Every sign-in and setup
+        route mints a fresh cookie, so posting to them never reaches the clear.
+        `POST /auth/lock-screen-off` is on the session gate's exempt list, sits
+        under the router-wide `verify_csrf`, is console-only (this client is
+        loopback) and writes no taos_session cookie of its own, so the only
+        thing that can emit a taos_session Set-Cookie here is the clear.
+        """
+        resp = await stale_console.post(
+            "/auth/lock-screen-off", headers={"X-taOS-Console": "1"}
+        )
+        assert resp.status_code == 200, resp.text
+        session_cookies = [
+            raw
+            for raw in resp.headers.get_list("set-cookie")
+            if raw.split(";")[0].strip().split("=", 1)[0].strip() == "taos_session"
+        ]
+        assert len(session_cookies) == 1, (
+            "stale taos_session cookie was not cleared: "
+            f"Set-Cookie headers={resp.headers.get_list('set-cookie')!r}"
+        )
+        cleared = session_cookies[0]
+        assert "Max-Age=0" in cleared, f"not an expiring Set-Cookie: {cleared!r}"
+        assert cleared.split(";")[0].strip() in ('taos_session=""', "taos_session="), (
+            f"clearing Set-Cookie still carries a value: {cleared!r}"
         )
 
     @pytest.mark.asyncio

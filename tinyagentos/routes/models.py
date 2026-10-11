@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 
 import httpx
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -18,6 +18,7 @@ from tinyagentos.model_sources import (
     search_huggingface,
     search_ollama,
 )
+from tinyagentos.auth_context import require_admin
 
 logger = logging.getLogger(__name__)
 
@@ -365,7 +366,7 @@ async def list_models(request: Request):
     }
 
 
-@router.post("/api/models/download")
+@router.post("/api/models/download", dependencies=[Depends(require_admin)])
 async def download_model(request: Request, body: DownloadRequest):
     """Start a background download for a specific model variant."""
     registry = request.app.state.registry
@@ -682,7 +683,7 @@ async def get_model_files(request: Request, model_id: str):
     return {"model_id": model_id, "files": files, "ram_available_mb": ram_mb}
 
 
-@router.post("/api/models/pull")
+@router.post("/api/models/pull", dependencies=[Depends(require_admin)])
 async def pull_model(request: Request, body: PullRequest):
     """Pull an Ollama model by calling the configured backend."""
     model_name = body.model_name.strip()
@@ -847,6 +848,29 @@ async def loaded_models(request: Request):
                                 "expires_at": m.get("expires_at"),
                                 "details": m.get("details", {}) or {},
                             })
+                elif backend_type == "llama-swap":
+                    # /running lists what llama-swap holds in memory; /v1/models
+                    # lists every configured model, loaded or not.
+                    resp = await client.get(f"{base}/running", timeout=5)
+                    running = resp.json().get("running") if resp.status_code == 200 else None
+                    for m in running if isinstance(running, list) else []:
+                        model_id = m.get("model") if isinstance(m, dict) else None
+                        if not isinstance(model_id, str) or not model_id:
+                            continue
+                        if m.get("state") == "stopping":  # being unloaded
+                            continue
+                        loaded.append({
+                            "name": model_id,
+                            "backend": backend_name,
+                            "backend_type": backend_type,
+                            "backend_url": backend_url,
+                            "purpose": _infer_purpose(model_id),
+                            "size_mb": None,
+                            "vram_mb": None,
+                            "ram_mb": None,
+                            "expires_at": None,
+                            "details": {},
+                        })
                 elif backend_type in ("llama-cpp", "vllm", "openai", "exo", "mlx", "anthropic"):
                     resp = await client.get(f"{base}/v1/models", timeout=5)
                     if resp.status_code == 200:
@@ -902,7 +926,7 @@ async def get_model(request: Request, model_id: str):
     return _model_to_dict(manifest, hardware_profile, downloaded)
 
 
-@router.delete("/api/models/{model_id}")
+@router.delete("/api/models/{model_id}", dependencies=[Depends(require_admin)])
 async def delete_model(request: Request, model_id: str):
     """Delete all downloaded files for a model."""
     registry = request.app.state.registry

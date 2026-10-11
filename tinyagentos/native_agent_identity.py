@@ -65,6 +65,28 @@ NATIVE_AGENT_ORIGIN = "taos-native"
 # Bus participation only.  See property 4 above before adding to this.
 NATIVE_AGENT_SCOPES = ("a2a_send", "a2a_receive")
 
+# Scopes for the system agent's API access (desktop control, skill-exec, files,
+# projects, notes, todo, decisions, canvas, observatory).  These are granted to
+# the native agent identity so its registry JWT can reach the endpoints the
+# taOS Agent manual uses.  Admin-only scopes (user management, secrets, settings)
+# are deliberately excluded.
+SYSTEM_AGENT_API_SCOPES = (
+    "files_read",
+    "files_write",
+    "project_tasks",
+    "project_tasks_create",
+    "canvas_read",
+    "canvas_write",
+    "decisions_read",
+    "decisions_write",
+    "project_notes",
+    "project_lists",
+    "project_doc_review",
+    "observatory_control",
+    "registry_feeds_read",
+    "notifications_write",
+)
+
 # How much of the install id goes into the canonical_id and the handle.  The
 # full id is on the row in install_id; this is for humans reading either one in
 # an audit log.
@@ -245,6 +267,12 @@ async def ensure_native_agent_identity(
     for scope in NATIVE_AGENT_SCOPES:
         await grants.add_grant(record["canonical_id"], scope)
 
+    # Also grant the system agent API scopes so its registry JWT can reach the
+    # endpoints the taOS Agent manual uses (desktop control, skill-exec, files,
+    # projects, notes, todo, decisions, canvas, observatory).
+    for scope in SYSTEM_AGENT_API_SCOPES:
+        await grants.add_grant(record["canonical_id"], scope)
+
     if not _has_token(data_dir):
         token = mint_registry_token(
             record["canonical_id"],
@@ -263,3 +291,87 @@ async def ensure_native_agent_identity(
             logger.info("native agent token already present at %s", written)
 
     return record
+
+
+async def rotate_native_agent_token(
+    *,
+    registry: Any,
+    data_dir: Path | str,
+    signing_key_pem: bytes,
+) -> Optional[str]:
+    """Rotate the native agent's token by bumping token_min_iat and minting a new one.
+
+    Returns the new token, or None if the native agent identity does not exist.
+
+    The cutoff is ``max(now + 1, current_cutoff + 1)`` and the replacement is
+    minted AT that cutoff.  Bumping to ``now`` would leave a token minted
+    earlier in the same second unsuperseded (its ``iat`` equals the cutoff, and
+    the cutoff check rejects only a strictly older ``iat``); advancing only by
+    the second would let two rotations in one second share a cutoff, so the
+    first replacement would survive the second. Monotonic advancement makes
+    every rotation supersede every token issued before it.
+    """
+    install = read_install_id(Path(data_dir))
+    if not install:
+        return None
+
+    existing = await registry.list_for_install(install, status="active")
+    record = next(
+        (r for r in existing if r.get("origin") == NATIVE_AGENT_ORIGIN), None
+    )
+    if record is None:
+        return None
+
+    # Bump token_min_iat to invalidate all existing tokens for this identity.
+    # The target is above both the current cutoff and this second; the store
+    # applies it as a single MAX(token_min_iat + 1, ?), so concurrent rotations
+    # cannot share a cutoff.  Mint BEFORE the cutoff moves: minting is the step
+    # that can fail, and a moved cutoff with no replacement leaves the agent
+    # with no usable credential.
+    import time
+    before_iat = record.get("token_min_iat") or 0
+    target = max(int(time.time()) + 1, before_iat + 1)
+
+    def _mint(at: int) -> str:
+        return mint_registry_token(
+            record["canonical_id"],
+            signing_key_pem,
+            user_id=record.get("user_id", ""),
+            framework=record.get("framework", NATIVE_AGENT_ORIGIN),
+            iat=at,
+        )
+
+    token = _mint(target)
+
+    updated = await registry.bump_token_min_iat(record["canonical_id"], target)
+    cutoff = int((updated or record).get("token_min_iat") or 0)
+    if updated is not None and cutoff != target:
+        # A concurrent rotation advanced the cutoff past our target; re-mint at
+        # the cutoff that actually landed so the credential we write clears it.
+        token = _mint(cutoff)
+
+    # Write the new token, replacing the old one.
+    path = token_path(data_dir)
+    try:
+        # Remove old token file first (it may exist from a previous run).
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as exc:
+        logger.error("native agent token could not be written to %s: %s", path, exc)
+        return None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(token)
+    except OSError as exc:
+        logger.error("native agent token write failed at %s: %s", path, exc)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None
+
+    logger.info("native agent token rotated at %s", path)
+    return token

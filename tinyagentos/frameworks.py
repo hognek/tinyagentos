@@ -1,7 +1,27 @@
 """Framework manifest registry with update-metadata and validation."""
 from __future__ import annotations
 
+from tinyagentos.hardware import _snap_ram_to_canonical_gb
 from tinyagentos.shortcuts.validation import validate_shortcuts
+
+
+DEFAULT_FRAMEWORK = "hermes"
+
+
+def recommended_framework(ram_mb: int, device_class: str | None = None) -> str:
+    """Return the recommended agent framework for the given RAM and device class.
+
+    Returns "picoclaw" for:
+    - Hosts with <=8 GB RAM (after canonical snapping to the closest bucket,
+      so a board reporting ~7.6 GiB counts as 8 GB), OR
+    - Mobile device class (taOSmobile handsets), regardless of RAM.
+    Otherwise returns the current default framework.
+    """
+    if device_class == "mobile":
+        return "picoclaw"
+    if _snap_ram_to_canonical_gb(ram_mb) <= 8:
+        return "picoclaw"
+    return DEFAULT_FRAMEWORK
 
 
 class FrameworkManifestError(ValueError):
@@ -218,6 +238,15 @@ FRAMEWORKS: dict[str, dict] = {
             {"name": "help", "description": "Show PicoClaw help"},
         ],
     },
+    "claude_code": {
+        "id": "claude_code",
+        "name": "Claude Code",
+        "description": "Claude Code CLI as the taOS Agent harness (anthropics/claude-code), signed in with a `claude setup-token` token stored in Secrets",
+        "verification_status": "experimental",
+        "slash_commands": [
+            {"name": "help", "description": "Show Claude Code help"},
+        ],
+    },
     "shibaclaw": {
         "id": "shibaclaw",
         "name": "ShibaClaw",
@@ -234,6 +263,19 @@ FRAMEWORKS: dict[str, dict] = {
         "verification_status": "experimental",
         "slash_commands": [
             {"name": "help", "description": "Show ZeroClaw help"},
+        ],
+    },
+    "thclaws": {
+        "id": "thclaws",
+        "name": "thClaws",
+        "description": "thClaws agent framework (thClaws/thClaws) -- taOS bridge to /v1/chat/completions on :8443",
+        "verification_status": "experimental",
+        "slash_commands": [
+            {"name": "help", "description": "List available commands"},
+        ],
+        "shortcuts": [
+            {"kind": "container-terminal", "label": "Container shell",
+             "icon": "terminal", "requires_capability": "agent.shell"},
         ],
     },
 }

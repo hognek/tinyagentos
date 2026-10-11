@@ -11,9 +11,11 @@ import httpx
 import yaml
 
 logger = logging.getLogger(__name__)
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi import HTTPException, Depends
 
 
 class _CacheAwareStaticFiles(StaticFiles):
@@ -30,12 +32,26 @@ class _CacheAwareStaticFiles(StaticFiles):
         is_manifest_json = (
             filename.startswith("manifest") and filename.endswith(".json")
         )
+        is_font = filename.endswith((".woff", ".woff2", ".ttf", ".otf", ".eot"))
+        # excalidraw-assets fonts are not fingerprinted by content hash, so
+        # their URL does not change across app versions; apply a short
+        # revalidate window so a font byte change is not stuck with a
+        # year-long immutable cache.
+        is_excalidraw_asset = path.startswith("desktop/excalidraw-assets/")
         if (
             filename.endswith((".html", ".webmanifest"))
             or filename == "sw.js"
             or is_manifest_json
         ):
             response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        elif is_font and not is_excalidraw_asset:
+            response.headers.setdefault(
+                "Cache-Control", "public, max-age=31536000, immutable"
+            )
+        elif is_font and is_excalidraw_asset:
+            response.headers.setdefault(
+                "Cache-Control", "public, max-age=86400"
+            )
         else:
             response.headers.setdefault(
                 "Cache-Control", "public, max-age=86400"
@@ -43,6 +59,7 @@ class _CacheAwareStaticFiles(StaticFiles):
         return response
 
 from tinyagentos.auth import AuthManager
+from tinyagentos.auth_context import current_user, require_owner_or_admin
 from tinyagentos.backend_fallback import BackendFallback
 from tinyagentos.capabilities import CapabilityChecker
 from tinyagentos.cluster.manager import ClusterManager
@@ -83,7 +100,6 @@ from tinyagentos.app_orchestrator import AppOrchestrator
 from tinyagentos.computer_use import ComputerUseManager
 from tinyagentos.webhook_notifier import WebhookNotifier
 from tinyagentos.llm_proxy import LLMProxy
-from tinyagentos.litellm_migrate import migrate as _litellm_migrate
 from tinyagentos.agent_image import ensure_all_base_images_present as _ensure_agent_images_present
 from tinyagentos.agent_image import is_prefetch_enabled as _is_prefetch_enabled
 from tinyagentos.agent_image import register_prefetch_endpoint
@@ -155,6 +171,7 @@ _STARTUP_EXEMPT_PATHS = frozenset({"/api/health", "/api/version", "/setup"})
 _STARTUP_EXEMPT_PREFIXES = ("/static/", "/desktop/", "/chat-pwa/", "/ws/", "/auth/", "/setup/", "/shortcut/")
 
 from tinyagentos.task_utils import _create_supervised_task, cancel_and_wait  # noqa: E402
+from tinyagentos.routes import device_state  # noqa: E402
 
 
 def _resolve_browser_cookie_key(data_dir: "Path") -> str:
@@ -201,6 +218,19 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     from tinyagentos.hardware import get_hardware_profile
 
     data_dir = resolve_data_dir(data_dir)
+    # Root the process-global taosmd agent registry at the app's resolved
+    # data_dir so every consumer (the /api/agents/deploy route, the v2 persona
+    # startup migration, CLI entry points) registers into a single source of
+    # truth instead of the default "data/" process-global default. In tests
+    # this keeps registration inside tmp_path and out of the repository's
+    # data/ directory.
+    import importlib
+    _tm_agents = importlib.import_module("taosmd.agents")
+    taosmd_agent_registry = _tm_agents.AgentRegistry(data_dir)
+    _tm_agents._default_registry = taosmd_agent_registry
+    # App-scoped consumers must use app.state.taosmd_agent_registry (not the
+    # module-level wrapper). CLI entry points and other callers still rely on
+    # taosmd.agents.register_agent, which routes through _default_registry above.
     config_path = data_dir / "config.yaml"
     # Copy example config on first run
     if not config_path.exists():
@@ -323,8 +353,12 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     agent_grants_store = AgentGrantsStore(data_dir / "agent_grants.db")
     from tinyagentos.user_shares_store import UserSharesStore
     user_shares_store = UserSharesStore(data_dir / "user_shares.db")
+    from tinyagentos.sharing_grants import SharingGrantStore
+    sharing_grants_store = SharingGrantStore(data_dir / "sharing_grants.db")
     from tinyagentos.app_grants_store import AppGrantsStore
     app_grants_store = AppGrantsStore(data_dir / "app_grants.db")
+    from tinyagentos.knowledge_fetchers.x import XWatchStore
+    x_watch_store = XWatchStore(data_dir / "x-watches.db")
     from tinyagentos.license_acceptances_store import LicenseAcceptancesStore
     license_acceptances_store = LicenseAcceptancesStore(data_dir / "license_acceptances.db")
     from tinyagentos.agent_model_key_store import AgentModelKeyStore
@@ -383,6 +417,17 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     task_router = TaskRouter(cluster_manager, http_client)
     cap_checker = CapabilityChecker(hardware_profile, cluster_manager)
     cluster_manager._capabilities = cap_checker  # wire after creation (circular dep)
+    # taOSusb Bluetooth pairing (S1) -- the controller side of
+    # docs/taosusb-pairing-plan.md. bleak is an optional dependency (see
+    # pyproject.toml's `ble` extra): BlePairingManager only imports it lazily
+    # on first scan/connect, so constructing it here never requires it.
+    from tinyagentos.cluster.ble.pairing import BlePairingManager
+    ble_pairing_manager = BlePairingManager(
+        data_dir=data_dir,
+        cluster_manager=cluster_manager,
+        pairing_store=cluster_pairing_store,
+        bind_port=controller_port,
+    )
     training_manager = TrainingManager(data_dir / "training.db")
     conversion_manager = ConversionManager(data_dir / "conversion.db")
     agent_messages = AgentMessageStore(data_dir / "agent_messages.db")
@@ -394,47 +439,13 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     auth_manager = AuthManager(data_dir)
     webhook_notifier = WebhookNotifier(config.to_dict())
     notif_store.set_webhook_notifier(webhook_notifier)
-    # Optional Postgres URL for LiteLLM's virtual key store. When this
-    # file is present, LiteLLM can mint per-agent keys via /key/generate;
-    # otherwise the deployer falls back to the shared master key. See
-    # docs/design/framework-agnostic-runtime.md.
-    db_url_path = data_dir / ".litellm_db_url"
-    db_url = db_url_path.read_text().strip() if db_url_path.exists() else None
-    # Authorize per-agent virtual keys against taOS's own SQLite key store via
-    # LiteLLM's custom_auth hook, instead of its Postgres/prisma virtual-key
-    # table. Lets per-agent keys work with NO DATABASE_URL and no prisma (the
-    # ARM / no-Postgres fix) and gives every install real per-agent isolation.
-    # Default ON whenever there is NO Postgres configured (the common case,
-    # incl. every ARM install). A Postgres-backed install already has per-agent
-    # keys via LiteLLM's native table, so defer to it rather than silently
-    # switching on upgrade (which would orphan its already-minted keys and 401
-    # running agents). Force in-house even with Postgres via a
-    # ``.litellm_force_inhouse_keys`` marker; disable entirely via
-    # ``.litellm_disable_inhouse_keys``.
-    if (data_dir / ".litellm_disable_inhouse_keys").exists():
-        inhouse_keys = False
-    elif (data_dir / ".litellm_force_inhouse_keys").exists():
-        inhouse_keys = True
-    else:
-        inhouse_keys = db_url is None
-    # Read the local auth token so LLMProxy can forward it to LiteLLM's
-    # subprocess — otherwise the taOS callback can't POST llm_call events
-    # back to /api/trace and the 401s fill the log instead of trace rows.
-    local_token_path = data_dir / ".auth_local_token"
-    local_token = local_token_path.read_text().strip() if local_token_path.exists() else None
+    # Per-agent key admin over the local key and budget stores. There is no
+    # LiteLLM process any more (removal stage 2b-2a); ``port`` is the old
+    # LiteLLM host port, kept only so the startup cutover can recognise proxy
+    # devices that still point at it and move them to the gateway.
     llm_proxy = LLMProxy(
         port=config.server.get("litellm_port", 7834),
-        controller_port=controller_port,
-        database_url=db_url,
-        local_token=local_token,
-        # registry lets generate_litellm_config register installed local
-        # models (e.g. gemma-4-e2b-gguf) as LiteLLM model_name aliases
-        # routing through the matching backend's URL. Without it, the
-        # agent picker can show a local model but chatting with it 400s
-        # at the proxy because no alias exists for that model_name.
-        registry=registry,
         data_dir=data_dir,
-        inhouse_keys=inhouse_keys,
     )
     channel_hub_router = MessageRouter()
     adapter_manager = AdapterManager(channel_hub_router)
@@ -470,6 +481,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     project_element_store = ProjectElementStore(data_dir / "projects.db")
     from tinyagentos.projects.routines_store import RoutineStore
     routine_store = RoutineStore(data_dir / "routines.db")
+    from tinyagentos.projects.dispatcher_store import DispatcherStore
+    dispatcher_store = DispatcherStore(data_dir / "projects.db")
     project_canvas_store = ProjectCanvasStoreImpl(data_dir / "projects.db", broker=project_event_broker)
     doc_review_store = DocReviewStore(data_dir / "projects.db")
     from tinyagentos.projects.notes_store import ProjectNotesStore
@@ -576,6 +589,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await agent_scope_requests_store.init()
         await agent_grants_store.init()
         app.state.agent_grants = agent_grants_store
+        await x_watch_store.init()
+        app.state.x_watch_store = x_watch_store
 
         # First-boot identity for the OS-native agent.  Runs on EVERY start, not
         # only on a fresh install: it is how an install that upgraded into this
@@ -603,6 +618,8 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
             logger.exception("native agent identity could not be ensured at startup")
         await user_shares_store.init()
         app.state.user_shares = user_shares_store
+        await sharing_grants_store.init()
+        app.state.sharing_grants = sharing_grants_store
         await app_grants_store.init()
         await license_acceptances_store.init()
         await agent_model_key_store.init()
@@ -617,6 +634,15 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await notif_push_store.init()
         await qmd_client.init()
         await secrets_store.init()
+        # The harness decision ran at create_app time, before the Secrets
+        # store was readable; claude_code needs its token secret, so re-decide
+        # now when that is the preferred harness.
+        _fw_decision = getattr(app.state, "taos_agent_framework_decision", None)
+        if _fw_decision is not None and _fw_decision.preference == "claude_code":
+            from tinyagentos.claude_code_runtime import claude_code_token_present
+            from tinyagentos.taos_agent_runtime import refresh_framework_decision
+            refresh_framework_decision(
+                app.state, claude_code_token_present=await claude_code_token_present(app.state))
         # -------------------------------------------------------------------
         # Migrate legacy github_app_private_key from config.yaml → SecretsStore.
         # The key was previously stored as plaintext in config and re-serialized
@@ -671,6 +697,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await chat_channels.init()
         await peer_outbox_store.init()
         await project_store.init()
+        await dispatcher_store.init()
         await project_invite_store.init()
         await board_audit_store.init()
         await receipt_store.init()
@@ -791,8 +818,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         # taosmd.  Idempotent — safe to run on every startup.
         try:
             from tinyagentos.migrations import migrate_persona_v2
-            import taosmd.agents as _tm_agents
-            migrate_persona_v2(config.agents, register_fn=_tm_agents.register_agent)
+            migrate_persona_v2(config.agents, register_fn=taosmd_agent_registry.register_agent)
             if config.config_path and config.config_path.exists():
                 await save_config_locked(config, config.config_path)
         except Exception:
@@ -964,6 +990,12 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
             await apply_pending_restart_check(app.state)
         except Exception:
             logger.exception("boot-time pending restart check failed")
+        # Boot-time: refresh stored agent hosts from incus before resuming
+        try:
+            from tinyagentos.restart_orchestrator import refresh_all_agent_hosts
+            await refresh_all_agent_hosts(app.state)
+        except Exception:
+            logger.exception("boot-time agent host refresh failed")
         # Boot-time: resume any agents that have resume notes from a prior shutdown
         try:
             await resume_agents_from_notes(app.state)
@@ -987,33 +1019,6 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         except Exception:
             logger.exception("agent base image bootstrap scheduling failed")
 
-        # LiteLLM bring-up runs in the background so the startup guard clears
-        # immediately. migrate must finish before start (it generates the prisma
-        # client the LiteLLM subprocess imports). All consumers null-check
-        # llm_proxy.is_running() so they degrade gracefully while the proxy warms.
-        async def _litellm_bringup() -> None:
-            try:
-                try:
-                    await _litellm_migrate(data_dir)
-                except Exception:
-                    logger.exception("litellm prisma migration failed — virtual keys will not work")
-                resolved_secrets: dict[str, str] = {}
-                for backend in config.backends:
-                    name = backend.get("api_key_secret")
-                    if not name or name in resolved_secrets:
-                        continue
-                    try:
-                        rec = await secrets_store.get(name)
-                    except Exception as exc:
-                        logger.warning("llm_proxy: secret lookup for %s failed: %s", name, exc)
-                        continue
-                    if rec and rec.get("value"):
-                        resolved_secrets[name] = rec["value"]
-                await llm_proxy.start(config.backends, secrets=resolved_secrets)
-            except Exception:
-                pass  # LiteLLM is optional
-
-        _create_supervised_task(_litellm_bringup(), app.state._background_tasks)
         # Start background health monitor
         from tinyagentos.health import HealthMonitor
         monitor = HealthMonitor(config, metrics_store, qmd_client, http_client, notif_store)
@@ -1043,6 +1048,28 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
                 await _asyncio.sleep(600)
 
         _create_supervised_task(_popularity_warm_loop(app), app.state._background_tasks)
+
+        # Upstream release detection for docker-image apps: the warmer
+        # queries each app's container registry (daily TTL per app) so
+        # the Store's Updates tab can surface apps whose catalog pin is
+        # stale. The request path only reads the cache, never the
+        # registry; failures read as "unknown", never as "no update".
+        from tinyagentos import upstream_versions
+        upstream_versions.configure_persistence(data_dir)
+
+        async def _upstream_warm_loop(app: FastAPI) -> None:
+            import asyncio as _asyncio
+            while True:
+                try:
+                    apps = app.state.registry.list_available()
+                    await upstream_versions.warm_upstream_cache(apps)
+                except Exception as _e:
+                    logger.warning("upstream version warm failed: %s", _e)
+                # Hourly pass; warm_upstream_cache skips entries whose
+                # 24h TTL has not expired, so each app is checked ~daily.
+                await _asyncio.sleep(3600)
+
+        _create_supervised_task(_upstream_warm_loop(app), app.state._background_tasks)
 
         # Hourly auto-update checker. Polls the git remote, notifies the
         # user on new commits, optionally applies automatically (user
@@ -1181,11 +1208,12 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         # can call it after each write.
         app.state.trace_registry.set_emitter(_otel_emitter)
         # Phase 4: reasoning judge — fire on lifecycle session_end.
-        from tinyagentos.litellm_config import get_litellm_master_key
         from tinyagentos.otel.judge import ReasoningJudge
+        # The gateway on this controller, as the host (local token = the
+        # admin kind). The gateway is always mounted (LiteLLM removal 2b-2a).
         _judge = ReasoningJudge(
-            litellm_base_url=f"http://localhost:{app.state.llm_proxy.port}/v1",
-            litellm_api_key=get_litellm_master_key(data_dir),
+            litellm_base_url=f"http://127.0.0.1:{controller_port}/api/llm/v1",
+            litellm_api_key=app.state.auth.get_local_token() or "",
         )
         app.state.trace_registry.set_judge(_judge)
 
@@ -1211,29 +1239,6 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         from tinyagentos.install_progress import get_global_store
         app.state.install_progress_store = get_global_store()
 
-        # LiteLLM config reload on catalog change — keeps the proxy's
-        # routing table in sync with live backend state. Subscriber is
-        # a no-op if the proxy isn't running (LiteLLM not installed) or
-        # if the catalog signature hasn't changed.
-        async def _reload_llm_proxy_on_catalog_change() -> None:
-            if not llm_proxy.is_running():
-                return
-            # Re-resolve secrets so rotated keys or newly-added providers
-            # that changed between SIGHUPs pick up the current values.
-            resolved: dict[str, str] = {}
-            for backend in config.backends:
-                name = backend.get("api_key_secret")
-                if not name or name in resolved:
-                    continue
-                try:
-                    rec = await secrets_store.get(name)
-                except Exception:
-                    continue
-                if rec and rec.get("value"):
-                    resolved[name] = rec["value"]
-            await llm_proxy.reload_config(config.backends, secrets=resolved)
-
-        backend_catalog.subscribe(_reload_llm_proxy_on_catalog_change)
 
         # Start the score cache — bridges the async benchmark store to the
         # scheduler's sync admission path via a 15s polling loop.
@@ -1396,6 +1401,13 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         app.state.system_events = _system_events
         app.state.event_bus = EventBus()
 
+        # Model Activity feed (#208): bounded in-process ring buffer that the
+        # scheduler and LLM gateway record into; the Activity app reads it via
+        # GET /api/activity/models and the SSE stream. No init()/close(): it is
+        # pure in-memory state, deliberately not persisted.
+        from tinyagentos.model_activity import ModelActivityFeed
+        app.state.model_activity = ModelActivityFeed()
+
         # Wire NotificationStore → EventBus so SSE clients get instant push.
         # The emitter is best-effort: failures are logged and never break add().
         async def _notify_emitter(row: dict) -> None:
@@ -1463,6 +1475,13 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         # All startup init complete — allow requests through.
         from tinyagentos.agent_budget_store import AgentBudgetStore, default_budget_path
         app.state.agent_budget_store = AgentBudgetStore(default_budget_path(data_dir))
+
+        # Gateway cutover: point every agent proxy device still on an old
+        # LiteLLM port at the gateway agent listener (there is no LiteLLM to
+        # go back to). A no-op unless __main__ recorded the listener port.
+        from tinyagentos.llm_gateway.cutover import run_startup_reconcile
+        _create_supervised_task(run_startup_reconcile(app.state), app.state._background_tasks)
+
         app.state._startup_complete = True
         logger.info("startup complete — accepting requests")
 
@@ -1502,7 +1521,6 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await cluster_manager.stop()
         if app.state.gpu_arbiter is not None:
             await app.state.gpu_arbiter.stop()
-        llm_proxy.stop()
         try:
             from tinyagentos.taos_agent_runtime import stop_taos_opencode_server
             await stop_taos_opencode_server(app.state)
@@ -1601,6 +1619,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await project_task_store.close()
         await project_element_store.close()
         await routine_store.close()
+        await dispatcher_store.close()
         await project_store.close()
         await chat_channels.close()
         await chat_messages.close()
@@ -1626,6 +1645,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         await qmd_client.close()
         await http_client.aclose()
         await agent_grants_store.close()
+        await x_watch_store.close()
         await app_grants_store.close()
         await license_acceptances_store.close()
         await agent_model_key_store.close()
@@ -1675,6 +1695,11 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
             },
             status_code=503,
         )
+
+    # LLM gateway keys: the default keystore location for mint/revoke callers
+    # (node pairing, agent lifecycle) that pass no data_dir.
+    from tinyagentos.llm_gateway.auth import configure_gateway_keystore
+    configure_gateway_keystore(data_dir)
 
     # Auth middleware -- added first so it is innermost. Starlette builds the
     # middleware stack in reverse add order (last added is outermost), so the
@@ -1743,6 +1768,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.config = config
     app.state.config_path = config_path
     app.state.data_dir = data_dir
+    device_state.seed_id_epoch(app.state.data_dir)
     app.state.agent_workspaces_dir = data_dir / "agent-workspaces"
     app.state.agent_memory_dir = data_dir / "agent-memory"
     app.state.agent_workspaces_dir.mkdir(parents=True, exist_ok=True)
@@ -1789,6 +1815,7 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.chat_messages = chat_messages
     app.state.chat_channels = chat_channels
     app.state.project_store = project_store
+    app.state.dispatcher_store = dispatcher_store
     app.state.project_invites = project_invite_store
     app.state.board_audit = board_audit_store
     app.state.receipt_store = receipt_store
@@ -1818,14 +1845,18 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     projects_root.mkdir(parents=True, exist_ok=True)
     app.state.projects_root = projects_root
     app.state.chat_hub = chat_hub
-    from tinyagentos.chat.unified_chat_bridge import ChatBusBridge
-    app.state.chat_bus_bridge = ChatBusBridge(app)
     # wants_reply and typing are initialised by the lifespan — do not create
     # duplicate instances here that would shadow the lifespan-created ones.
     app.state.wants_reply = None
     app.state.typing = None
     app.state.canvas_store = canvas_store
     app.state.desktop_settings = desktop_settings
+    # Which harness runs the system taOS Agent (opencode, or PicoClaw on a
+    # taOSmobile handset). Decided now so the lock screen and the config
+    # endpoint report it from the first request; a PicoClaw key left over
+    # from before a switch back to opencode is revoked here.
+    from tinyagentos.taos_agent_runtime import startup_framework_reconcile
+    startup_framework_reconcile(app.state)
     app.state.device_store = device_store
     app.state.device_pair_requests = device_pair_requests_store
     app.state.apns_sender = apns_sender
@@ -1870,18 +1901,23 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
     app.state.copilot_ticket_store = None
     app.state.copilot_hub = None
     app.state.vapid_keypair = None
-    # agent_registry and its keypair are created by the lifespan; None here
-    # ensures attribute-existence checks work during the pre-startup window.
+    # agent_registry (AgentRegistryStore) and its keypair are created by the
+    # lifespan; None here ensures attribute-existence checks work during the
+    # pre-startup window. In-app taosmd registration uses the separate
+    # taosmd_agent_registry key so the two stores do not shadow each other.
     app.state.agent_registry = agent_registry_store
+    app.state.taosmd_agent_registry = taosmd_agent_registry
     app.state.agent_registry_keypair = agent_registry_keypair
     app.state.agent_model_keys = agent_model_key_store
     app.state.auth_requests = auth_requests_store
     app.state.password_reset = password_reset_store
     app.state.agent_scope_requests = agent_scope_requests_store
     app.state.agent_grants = agent_grants_store
+    app.state.x_watch_store = x_watch_store
     app.state.app_grants = app_grants_store
     app.state.license_acceptances = license_acceptances_store
     app.state.cluster_pairing = cluster_pairing_store
+    app.state.ble_pairing = ble_pairing_manager
     app.state.capability_map = capability_map_store
     app.state.council_roles = council_role_registry
     app.state.council_members = council_member_store
@@ -1899,18 +1935,73 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         app.mount("/static", _CacheAwareStaticFiles(directory=str(static_dir)), name="static")
 
     # Mount workspace for serving generated images and other workspace files
+    # NOTE: The StaticFiles mount is replaced by a custom route below that adds
+    # per-user authorization for paths under /data/workspace/users/<uid>/.
     workspace_dir = data_dir / "workspace"
     workspace_dir.mkdir(parents=True, exist_ok=True)
-    app.mount("/data/workspace", StaticFiles(directory=str(workspace_dir)), name="workspace")
 
     # Desktop SPA assets are served by the desktop route handler (routes/desktop.py)
 
     # Register all routers (extracted to routes/register_all_routers)
     from tinyagentos.routes import register_all_routers
+    # Device TLS cert: generate on first boot, persist under data dir (0600).
+    # The fingerprint is served to pairing devices so they can pin it.
+    try:
+        from tinyagentos.device_tls import load_or_create_device_tls_cert
+        _cert_path, _key_path, _tls_fp = load_or_create_device_tls_cert(data_dir)
+        app.state.device_tls_cert_path = _cert_path
+        app.state.device_tls_key_path = _key_path
+        app.state.device_tls_fingerprint = _tls_fp
+    except Exception:
+        logger.exception("device TLS cert could not be created")
+
     register_all_routers(app)
 
     # Agent base image prefetch status endpoint
     register_prefetch_endpoint(app)
+
+    # Workspace file serving with per-user authorization
+    # This route replaces the bare StaticFiles mount to enforce ownership checks
+    # for user-scoped paths while keeping legacy shared paths session-gated only.
+    @app.get("/data/workspace/{path:path}")
+    async def serve_workspace_file(request: Request, path: str):
+        """Serve files from the workspace directory with per-user authorization.
+
+        Path structure:
+        - /data/workspace/users/<uid>/images/generated/<file> -> requires ownership or admin
+        - /data/workspace/users/<uid>/music/generated/<file> -> requires ownership or admin
+        - /data/workspace/images/generated/<file> (legacy) -> session gate only
+        - /data/workspace/music/generated/<file> (legacy) -> session gate only
+        - Other paths under /data/workspace/ -> session gate only (existing behavior)
+        """
+        # Resolve the requested path relative to workspace_dir
+        workspace_root = workspace_dir.resolve()
+        try:
+            requested_path = (workspace_dir / path).resolve()
+            # Path traversal protection: the resolved path must stay inside
+            # the workspace. ``relative_to`` raises ValueError otherwise.
+            rel_parts = requested_path.relative_to(workspace_root).parts
+        except (ValueError, OSError):
+            raise HTTPException(status_code=404, detail="Not found")
+
+        # Owner decision comes from the RESOLVED path, never the raw one.
+        # Starlette percent-decodes the path parameter, so a raw-path check is
+        # bypassed by dot segments: ``%2e/users/<uid>/...`` or
+        # ``images/%2e%2e/users/<uid>/...`` resolve into users/<uid>/ while
+        # their first raw segment is not ``users`` (tsk-shj7wq).
+        if len(rel_parts) >= 2 and rel_parts[0] == "users":
+            # This is a user-scoped path, require ownership or admin
+            target_user_id = rel_parts[1]
+            user = current_user(request)
+            require_owner_or_admin(user, target_user_id)
+
+        # For legacy paths (non-user-scoped), the session gate from AuthMiddleware
+        # already ensures the request is authenticated (401 if not)
+
+        if not requested_path.exists() or not requested_path.is_file():
+            raise HTTPException(status_code=404, detail="Not found")
+
+        return FileResponse(requested_path)
 
     return app
 
@@ -1983,6 +2074,11 @@ def main():
     # the auth store directly (no running server needed).
     if len(sys.argv) > 1 and sys.argv[1] == "recover-password":
         raise SystemExit(_recover_password_cli(sys.argv[2:]))
+
+    # `taos reset --onboarding` -- offline re-arm of first-run onboarding.
+    if len(sys.argv) > 1 and sys.argv[1] == "reset":
+        from tinyagentos.reset_cli import reset_cli
+        raise SystemExit(reset_cli(sys.argv[2:]))
 
     import uvicorn
     config = load_config(PROJECT_DIR / "data" / "config.yaml")

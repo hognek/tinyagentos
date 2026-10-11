@@ -227,7 +227,7 @@ describe("MessageList", () => {
       });
       // dayLabel returns "Today", "Yesterday", or a formatted date — verify
       // the separator element exists and contains human-readable text
-      const separator = document.querySelector(".select-none .text-white\\/40");
+      const separator = document.querySelector(".select-none .text-shell-text-tertiary");
       expect(separator).not.toBeNull();
       expect(separator?.textContent?.trim().length).toBeGreaterThan(0);
     });
@@ -242,7 +242,7 @@ describe("MessageList", () => {
         ],
       });
       // Should have two day separator elements
-      const separators = document.querySelectorAll(".select-none .text-white\\/40");
+      const separators = document.querySelectorAll(".select-none .text-shell-text-tertiary");
       expect(separators.length).toBe(2);
     });
   });
@@ -483,12 +483,27 @@ describe("MessageList", () => {
       expect(screen.getByText("General discussion")).toBeInTheDocument();
     });
 
+    it("shows channel topic in the header when set", () => {
+      renderWithMsg({
+        channel: channel({ topic: "Release planning", description: "old" }),
+      });
+      expect(screen.getByText("Release planning")).toBeInTheDocument();
+      expect(screen.queryByText("old")).not.toBeInTheDocument();
+    });
+
+    it("falls back to description when topic is empty", () => {
+      renderWithMsg({
+        channel: channel({ topic: "", description: "General discussion" }),
+      });
+      expect(screen.getByText("General discussion")).toBeInTheDocument();
+    });
+
     it("shows member count for group channels", () => {
       const { container } = renderWithMsg({
         channel: channel({ type: "group", members: ["user", "alice", "bob"] }),
       });
       // Member count is rendered next to the Users icon
-      const memberDiv = container.querySelector(".text-white\\/30.flex.items-center");
+      const memberDiv = container.querySelector(".text-shell-text-tertiary.flex.items-center");
       expect(memberDiv).not.toBeNull();
       expect(memberDiv?.textContent).toContain("3");
     });
@@ -784,12 +799,27 @@ describe("MessageList", () => {
       );
       expect(checkSvg).toBeFalsy();
     });
+
+    it("renders exactly one tick element for own completed dm-remote message", () => {
+      renderWithMsg({
+        channel: channel({ type: "dm-remote", members: ["user", "hub:peer"] }),
+        messages: [
+          msg({
+            channel_id: "dmr-1",
+            author_id: "user",
+            delivered_at: 1700000001,
+          }),
+        ],
+      });
+      const tickWrappers = document.querySelectorAll('[data-message-id="m1"] span.ml-1.inline-flex');
+      expect(tickWrappers).toHaveLength(1);
+    });
   });
 
   describe("A2A receipt ticks", () => {
     it("renders single check (sent) when no receipt row exists", () => {
       renderWithMsg({
-        channel: channel({ type: "dm-remote", members: ["user", "peer"] }),
+        channel: channel({ type: "group", settings: { kind: "a2a" }, members: ["user", "peer"] }),
         messages: [
           msg({ channel_id: "ch1", author_id: "user", receipts: [] }),
         ],
@@ -803,7 +833,7 @@ describe("MessageList", () => {
 
     it("renders double check (delivered) when receipt has no seen_at", () => {
       renderWithMsg({
-        channel: channel({ type: "dm-remote", members: ["user", "peer"] }),
+        channel: channel({ type: "group", settings: { kind: "a2a" }, members: ["user", "peer"] }),
         messages: [
           msg({
             channel_id: "ch1",
@@ -823,7 +853,7 @@ describe("MessageList", () => {
 
     it("renders coloured double check (seen) when receipt has seen_at", () => {
       renderWithMsg({
-        channel: channel({ type: "dm-remote", members: ["user", "peer"] }),
+        channel: channel({ type: "group", settings: { kind: "a2a" }, members: ["user", "peer"] }),
         messages: [
           msg({
             channel_id: "ch1",
@@ -844,7 +874,7 @@ describe("MessageList", () => {
 
     it("does not render receipt tick for non-own messages", () => {
       renderWithMsg({
-        channel: channel({ type: "dm-remote", members: ["user", "peer"] }),
+        channel: channel({ type: "group", settings: { kind: "a2a" }, members: ["user", "peer"] }),
         messages: [
           msg({
             channel_id: "ch1",

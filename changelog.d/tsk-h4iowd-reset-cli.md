@@ -1,0 +1,2 @@
+- New `taos reset --onboarding` command re-arms first-run onboarding offline (removes accounts, sessions, password-reset and auth-request stores and the setup checklist state, with a timestamped backup) while keeping models, apps and agents.
+- The pre-reset safety probe checks the port the controller actually binds (TAOS_PORT, else server.port in config.yaml, else 6969), and each reset writes its own backup directory.

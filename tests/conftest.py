@@ -15,8 +15,17 @@ import pytest_asyncio
 import yaml
 from httpx import ASGITransport, AsyncClient
 
-from tinyagentos.app import create_app
+from tinyagentos.app import create_app, PROJECT_DIR
 from tinyagentos.routes.desktop import SPA_DIR
+
+# Data-dir mutation guard: defined in tests/_data_guard_plugin.py (shared with
+# tests/test_xdist_data_mutation_guard.py) and re-bound here so pytest registers it.
+from _data_guard_plugin import (  # noqa: F401
+    _collect_data_mtimes,
+    _guard_data_dir_mutation,
+    pytest_sessionfinish,
+    pytest_testnodedown,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +739,23 @@ async def client(app, tmp_data_dir):
         if user_shares._db is not None:
             await user_shares.close()
         await user_shares.init()
+    else:
+        from tinyagentos.user_shares_store import UserSharesStore
+        user_shares = UserSharesStore(tmp_data_dir / "user_shares.db")
+        await user_shares.init()
+        app.state.user_shares = user_shares
+    # sharing_grants store (account-to-account app sharing) is lifespan-owned;
+    # tests that bypass the lifespan must init it so routes can consult it.
+    sharing_grants = getattr(app.state, "sharing_grants", None)
+    if sharing_grants is not None:
+        if sharing_grants._db is not None:
+            await sharing_grants.close()
+        await sharing_grants.init()
+    else:
+        from tinyagentos.sharing_grants import SharingGrantStore
+        sharing_grants = SharingGrantStore(tmp_data_dir / "sharing_grants.db")
+        await sharing_grants.init()
+        app.state.sharing_grants = sharing_grants
     # BrowserApp v2 stores
     from tinyagentos.routes.desktop_browser.store import BrowserStore, BrowserCookieStore
     _browser_store = BrowserStore(tmp_data_dir / "browser.sqlite3")
@@ -810,6 +836,9 @@ async def client(app, tmp_data_dir):
     await app.state.council_members.close()
     if user_shares is not None:
         await user_shares.close()
+    sharing_grants = getattr(app.state, "sharing_grants", None)
+    if sharing_grants is not None:
+        await sharing_grants.close()
 
 
 def create_test_qmd_db(db_path):

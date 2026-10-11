@@ -12,7 +12,7 @@ desktop SPA and a YAML app catalog. It runs hardware-frugally across a Python 3.
 
 1. **Target `dev`, never `master`.** `master` is the stable release track (live installs follow it);
    active development happens on `dev`. PRs go to `jaylfc/taOS:dev`.
-2. **Python 3.11 floor.** The pyproject.toml pins `>=3.11,<3.14`. `match`/`case` and `X | None`
+2. **Python 3.11 floor.** The pyproject.toml pins `>=3.11,<3.15`. `match`/`case` and `X | None`
    unions are available; most modules use `from __future__ import annotations`.
 3. **Conventional commits, no AI attribution - anywhere public.** `feat: fix: docs: refactor:
    test: chore:`. No "Co-authored-by" or "Generated with" trailers, and the same rule extends to
@@ -23,9 +23,9 @@ desktop SPA and a YAML app catalog. It runs hardware-frugally across a Python 3.
    CI waits for maintainer approval (waiting on it is a deadlock - mark ready and surface it); a
    RETURNING contributor's CI runs automatically, and you own making it green before the task is
    done.
-5. **The human account-holder signs the CLA - not the agent.** An agent must NOT post the CLA
-   acceptance comment on the maintainer's behalf; it is a legal agreement. If the CLA check fails,
-   surface the bot's link to the human.
+5. **Legal agreements belong to the human account-holder - not the agent.** taOS has no CLA, but
+   if any check or bot ever asks you to accept terms, do NOT post the acceptance on the human's
+   behalf; surface the link to them.
 6. **One task = one focused branch.** The initial change is one atomic commit (no bundling
    unrelated changes); review/bot fixes are *additional* commits on the same branch. Never
    force-push over reviewed history unless explicitly asked.
@@ -73,7 +73,8 @@ System-level recovery is a human decision.
 
 A gate blocks PRs that add or remove certain feature code without a matching doc update
 (configured in `docs/doc-gate.toml`). When a rule fires and there is genuinely nothing to
-document, add a `Docs-Reviewed:` trailer to a commit message.
+document, add a `Docs-Reviewed:` trailer to the commit that makes the change (the
+trailer covers only that commit's files).
 
 ## PR workflow
 
@@ -81,7 +82,7 @@ document, add a `Docs-Reviewed:` trailer to a commit message.
 2. Create a branch: `feat/<slug>` or `fix/<slug>`
 3. Code → test → commit (single conventional commit) → push
 4. Open draft PR against `dev`; mark ready immediately (do NOT wait for CI)
-5. If CLA check fails: surface to human, do NOT sign it yourself
+5. If a check asks you to accept legal terms: surface to human, do NOT accept them yourself
 6. Address review feedback with additional commits on the same branch
 
 ## Commit messages

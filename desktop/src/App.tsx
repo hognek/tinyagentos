@@ -16,9 +16,9 @@ import { usePushClickHandler } from "@/hooks/use-push-click";
 import { useProcessStore } from "@/stores/process-store";
 import { useDockStore } from "@/stores/dock-store";
 import { getApp, pinnedAppId, pinnedLaunchProps } from "@/registry/app-registry";
-import { MobileDock } from "@/components/mobile/MobileDock";
+import { MobileDock, useMobileDockMetrics } from "@/components/mobile/MobileDock";
 import { CardSwitcher } from "@/components/mobile/CardSwitcher";
-import { MobileTopBar } from "@/components/mobile/MobileTopBar";
+import { MobileTopBar, MOBILE_TOP_BAR_HEIGHT } from "@/components/mobile/MobileTopBar";
 import { MobileAppWindow } from "@/components/mobile/MobileAppWindow";
 import { MobileHomePages } from "@/components/mobile/MobileHomePages";
 import { LoginGate } from "@/components/LoginGate";
@@ -35,6 +35,9 @@ import { InstallPromptBanner } from "@/shell/InstallPromptBanner";
 import { EffectsLayer } from "@/theme/effects/EffectsLayer";
 import { SafetyFloor } from "@/components/SafetyFloor";
 import { withCsrf, getCsrfToken } from "@/lib/csrf";
+import { useLockOnScreenOff } from "@/shell/useLockOnScreenOff";
+import { useHomeKey } from "@/hooks/use-home-key";
+import { primeDeviceClass } from "@/lib/mobile-shell";
 
 interface SystemShortcutsProps {
   toggleSearch: () => void;
@@ -214,6 +217,10 @@ export function App() {
   // Browser-mode flag: when on mobile but not in PWA, apply browser-safe
   // layout that accounts for Safari's dynamic URL bar + share/tab bars
   const isBrowserMobile = mode !== "desktop" && !isPwa;
+  const { height: mobileDockHeight } = useMobileDockMetrics(isBrowserMobile);
+
+  // On the handset, the power key locks: see useLockOnScreenOff.
+  useLockOnScreenOff();
 
   const activeWindow = windows.find((w) => w.id === activeWindowId);
 
@@ -288,6 +295,9 @@ export function App() {
   // later re-login.
   useOnAuthReady(() => {
     void restoreActiveTheme();
+    // Learn once whether this is a taOSmobile handset, so app opens can go to
+    // the device shell as their own windows (lib/mobile-shell).
+    void primeDeviceClass();
   });
 
   // Apply reduce-effects / performance mode (#58) as a root attribute so the CSS
@@ -327,7 +337,11 @@ export function App() {
     setActiveWindowId(null);
     setCardSwitcherOpen(false);
     setSearchOpen(false);
+    setLaunchpadOpen(false);
   }, []);
+  // The handset nav bar's home button: the open app goes to the background
+  // (it stays in the switcher), the home screen shows.
+  useHomeKey(mode !== "desktop", handleMobileHome);
 
   const handleSelectApp = useCallback((windowId: string) => {
     setActiveWindowId(windowId);
@@ -335,20 +349,17 @@ export function App() {
   }, []);
 
   const handleMobileOpenApp = useCallback((appId: string) => {
-    // If already open, focus it
-    const existing = windows.find((w) => w.appId === appId);
-    if (existing) {
-      setActiveWindowId(existing.id);
-    } else {
-      const app = getApp(appId);
-      if (app) {
-        const wid = openWindow(appId, app.defaultSize);
-        setActiveWindowId(wid);
-      }
+    // openWindow focuses an already-open window itself (returning its id), and
+    // on a taOSmobile handset hands the open to the device shell first -- so
+    // do not short-circuit an existing window here.
+    const app = getApp(appId);
+    if (app) {
+      const wid = openWindow(appId, app.defaultSize);
+      setActiveWindowId(wid || null);
     }
     setCardSwitcherOpen(false);
     setSearchOpen(false);
-  }, [windows, openWindow]);
+  }, [openWindow]);
 
   const handleMobileClose = useCallback(() => {
     if (activeWindowId) {
@@ -419,8 +430,7 @@ export function App() {
       {isBrowserMobile && <InstallPromptBanner />}
       <div className={`relative z-[1] flex-1 flex flex-col overflow-hidden transition-all duration-500 ${launched ? "opacity-100 scale-100" : "opacity-0 scale-95"}`}>
         <MobileTopBar
-          onHome={handleMobileHome}
-          onSearch={() => { setCardSwitcherOpen(false); setSearchOpen((v) => !v); }}
+          onSearch={() => { setCardSwitcherOpen(false); setLaunchpadOpen(false); setSearchOpen((v) => !v); }}
         />
         {/* Main content area */}
         <div className="flex-1 relative overflow-hidden">
@@ -458,9 +468,14 @@ export function App() {
           setLaunchpadOpen(true);
         }}
       />
-      <Launchpad open={launchpadOpen} onClose={() => setLaunchpadOpen(false)} onOpenApp={(wid) => setActiveWindowId(wid)} />
+      <Launchpad
+        open={launchpadOpen}
+        onClose={() => setLaunchpadOpen(false)}
+        onOpenApp={(wid) => setActiveWindowId(wid)}
+        insets={{ top: MOBILE_TOP_BAR_HEIGHT, bottom: mobileDockHeight }}
+      />
       <SearchPalette open={searchOpen} onClose={() => setSearchOpen(false)} onOpenApp={(wid) => setActiveWindowId(wid)} />
-      <NotificationToasts />
+      <NotificationToasts topInset={MOBILE_TOP_BAR_HEIGHT} />
       <NotificationCentre />
       <TaosAssistantPanel />
       <SafetyFloor />

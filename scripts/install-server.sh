@@ -88,6 +88,39 @@ fi
 
 set -euo pipefail
 
+# Determine controller extras (none, or ble on a handset)
+# A taOSmobile handset needs bleak for Orb scan/pair routes.
+# Detection uses the same signal as the controller: systemctl cat taos-kiosk.service
+# returns 0 on a handset, non-zero otherwise.
+# An explicit TAOS_EXTRAS_BLE=1 overrides auto-detection and forces ble inclusion;
+# TAOS_EXTRAS_BLE=0 forces exclusion (rare, e.g., a desktop with a BLE dongle).
+# Inlined here (identical to scripts/lib/controller_extras.sh) so the installer
+# works when piped via `curl | sh` where $0 is not a readable path.
+taos_controller_extras() {
+    local is_handset=0
+    if systemctl cat taos-kiosk.service >/dev/null 2>&1; then
+        is_handset=1
+    fi
+
+    local extras=""
+    case "${TAOS_EXTRAS_BLE:-}" in
+        "1"|"true")
+            extras="ble"
+            ;;
+        "0"|"false")
+            extras=""
+            ;;
+        *)
+            if [[ $is_handset -eq 1 ]]; then
+                extras="ble"
+            else
+                extras=""
+            fi
+            ;;
+    esac
+    echo "$extras"
+}
+
 # If taOS is already installed, default to ITS directory so a re-run updates the
 # existing install in place rather than forking a second copy (e.g. a root
 # `curl | sudo bash` landing in /root while the service runs from /opt). An
@@ -181,7 +214,7 @@ ensure_linux_deps() {
             libtorrent-rasterbar boost sqlite nodejs npm sqlcipher vulkan-tools
     elif command -v apk >/dev/null 2>&1; then
         log "installing apk deps"
-        sudo apk add --no-cache bash python3 py3-pip git curl libtorrent-rasterbar sqlite nodejs npm sqlcipher-dev vulkan-tools
+        sudo apk add --no-cache bash python3 py3-pip git curl libtorrent-rasterbar sqlite nodejs npm sqlcipher-dev vulkan-tools py3-onnxruntime
     else
         warn "unrecognised package manager — assuming python3/git/curl/libtorrent/nodejs already present"
     fi
@@ -825,11 +858,44 @@ COW_EFFECTIVE_MODE="n/a"
 # worker containers. On macOS, the Apple Containerization framework
 # (bundled with macOS 26) is used instead — no install needed here.
 # On Linux, if no runtime is found, we install Incus via the system
-# package manager on Debian/Ubuntu/Fedora. On Arch/Alpine we log a
-# manual-install notice and continue — those distros have it in the
-# repos but the AUR/apk setup varies too much to auto-invoke here.
+# package manager on Debian/Ubuntu/Fedora. On Arch and Alpine we now
+# install Incus from the official repos automatically.
 # A failed Incus install is non-fatal: taOS still starts; cluster and
 # worker-container features are simply unavailable until one is added.
+
+_start_incusd() {
+    local _systemd_run_dir="${TAOS_SYSTEMD_RUN_DIR:-/run/systemd/system}"
+    local _openrc_run_dir="${TAOS_OPENRC_RUN_DIR:-/run/openrc}"
+
+    if [[ -d "$_systemd_run_dir" ]]; then
+        if ! systemctl cat incus.service >/dev/null 2>&1; then
+            warn "incus.service unit not found - skipping incus init"
+            return 1
+        fi
+        sudo systemctl enable --now incus.service || {
+            warn "systemctl enable --now incus failed - skipping incus init"
+            return 1
+        }
+        return 0
+    elif command -v rc-service >/dev/null 2>&1 && [[ -d "$_openrc_run_dir" ]]; then
+        local _name="incus"
+        if [[ -f /etc/init.d/incusd ]]; then
+            _name="incusd"
+        fi
+        sudo rc-update add "$_name" default || {
+            warn "rc-update add $_name failed - skipping incus init"
+            return 1
+        }
+        sudo rc-service "$_name" start || {
+            warn "rc-service $_name start failed - skipping incus init"
+            return 1
+        }
+        return 0
+    else
+        warn "incus installed but no service unit for this init system - incusd not started; skipping incus init"
+        return 1
+    fi
+}
 
 ensure_container_runtime() {
     if [[ "$os_name" == "Darwin" ]]; then
@@ -880,6 +946,7 @@ ensure_container_runtime() {
     fi
 
     local installed=0
+    local _incus_start_service=0
     local _incus_pkg=""
     if command -v apt-get >/dev/null 2>&1; then
         # Try the distro's default repos first (Ubuntu 24.04+ ships incus in
@@ -983,18 +1050,45 @@ ensure_container_runtime() {
             && installed=1 \
             || warn "dnf install incus failed — continuing without container support"
     elif command -v pacman >/dev/null 2>&1; then
-        warn "container runtime: Arch detected — install Incus manually with:"
-        warn "  sudo pacman -S incus"
-        warn "  (or install Docker/Podman if you prefer)"
-        warn "  worker containers will be unavailable until a runtime is installed"
+        if pacman -Si incus >/dev/null 2>&1; then
+            log "installing incus via pacman"
+            if sudo pacman -S --noconfirm --needed incus; then
+                installed=1
+                _incus_start_service=1
+                log "container runtime: incus installed via pacman"
+            else
+                warn "pacman install incus failed - continuing without container support"
+            fi
+        else
+            warn "container runtime: Arch detected — install Incus manually with:"
+            warn "  sudo pacman -S incus"
+            warn "  (or install Docker/Podman if you prefer)"
+            warn "  worker containers will be unavailable until a runtime is installed"
+        fi
     elif command -v apk >/dev/null 2>&1; then
-        warn "container runtime: Alpine detected — install Incus manually with:"
-        warn "  sudo apk add incus"
-        warn "  worker containers will be unavailable until a runtime is installed"
+        if [[ -n "$(apk search -x incus 2>/dev/null)" ]]; then
+            log "installing incus via apk"
+            if sudo apk add incus incus-client; then
+                if command -v rc-update >/dev/null 2>&1; then
+                    sudo apk add incus-openrc || true
+                fi
+                installed=1
+                _incus_start_service=1
+                log "container runtime: incus installed via apk"
+            else
+                warn "apk add incus failed - continuing without container support"
+            fi
+        else
+            warn "container runtime: Alpine detected — install Incus manually with:"
+            warn "  sudo apk add incus"
+            warn "  worker containers will be unavailable until a runtime is installed"
+        fi
     else
         warn "container runtime: unrecognised package manager — install Incus or Docker manually"
         warn "  worker containers will be unavailable until a runtime is installed"
     fi
+
+    if (( installed && _incus_start_service )); then _start_incusd || installed=0; fi
 
     if (( installed )); then
         if command -v incus >/dev/null 2>&1; then
@@ -1558,18 +1652,19 @@ install_rk3588_perf_if_needed
 # --- python venv + controller deps ---------------------------------------
 
 # Resolve a Python the controller deps support: litellm (the proxy extra) needs
-# >=3.10,<3.14. Prefer a system interpreter in range; otherwise provision a
+# >=3.10,<3.15. Prefer a system interpreter in range; otherwise provision a
 # standalone 3.13 with uv. The reported failure was a fresh WSL/Ubuntu 26.04 that
 # ships only Python 3.14 and does not package python3.13, so apt cannot help and
 # uv (which downloads a standalone CPython on any distro) is the reliable path.
-# libtorrent is optional, so the venv is clean -- no system-site-packages binding
-# juggling (a 3.13 venv could not import a 3.14-built system binding anyway).
+# On Alpine, the system python3 is the expected path: py3-onnxruntime is built
+# against the distro's Python, so the venv must use --system-site-packages to
+# import it (a uv-provisioned 3.13 cannot import a 3.14-built binding).
 pick_system_python() {
     local c v
     for c in python3.13 python3.12 python3.11 python3; do
         command -v "$c" >/dev/null 2>&1 || continue
         v=$("$c" -c 'import sys;print(sys.version_info[0]*100+sys.version_info[1])' 2>/dev/null) || continue
-        if [ "$v" -ge 311 ] && [ "$v" -lt 314 ]; then echo "$c"; return 0; fi
+        if [ "$v" -ge 311 ] && [ "$v" -lt 315 ]; then echo "$c"; return 0; fi
     done
     return 1
 }
@@ -1584,13 +1679,13 @@ ensure_uv() {
 }
 
 # Self-heal a stale venv: a re-install over a .venv built with an unsupported
-# Python (e.g. a 3.14 venv from an attempt before this fix) would otherwise be
-# reused, and `pip install -e .` fails the requires-python <3.14 check. Recreate
-# it if its interpreter is out of the supported [3.11,3.14) range.
+# Python (e.g. a 3.15 venv from an attempt before this fix) would otherwise be
+# reused, and `pip install -e .` fails the requires-python <3.15 check. Recreate
+# it if its interpreter is out of the supported [3.11,3.15) range.
 if [[ -d .venv ]]; then
     _vv=$(.venv/bin/python -c 'import sys;print(sys.version_info[0]*100+sys.version_info[1])' 2>/dev/null || echo 0)
-    if [ "$_vv" -lt 311 ] || [ "$_vv" -ge 314 ]; then
-        warn "existing .venv uses an unsupported Python ($_vv); recreating with a 3.11-3.13 interpreter"
+    if [ "$_vv" -lt 311 ] || [ "$_vv" -ge 315 ]; then
+        warn "existing .venv uses an unsupported Python ($_vv); recreating with a 3.11-3.14 interpreter"
         rm -rf .venv
     fi
 fi
@@ -1599,27 +1694,35 @@ if [[ ! -d .venv ]]; then
     PYBIN="$(pick_system_python || true)"
     if [[ -n "$PYBIN" ]]; then
         log "creating venv with $PYBIN ($("$PYBIN" --version 2>&1))"
-        "$PYBIN" -m venv .venv
+        if command -v apk >/dev/null 2>&1; then
+            "$PYBIN" -m venv --system-site-packages .venv
+        else
+            "$PYBIN" -m venv .venv
+        fi
     elif ensure_uv; then
-        log "no system Python 3.11-3.13; provisioning 3.13 with uv"
+        log "no system Python 3.11-3.14; provisioning 3.13 with uv"
         uv python install 3.13 >/dev/null 2>&1 || true
         uv venv --seed --python 3.13 .venv || die "uv could not create a Python 3.13 venv"
     else
-        die "taOS needs Python 3.11-3.13 (litellm has no 3.14 build yet) and uv could not be installed to provision one. Install python3.13 (e.g. 'sudo apt install python3.13 python3.13-venv') and re-run."
+        die "taOS needs Python 3.11-3.14 and uv could not be installed to provision one. Install python3.13 (e.g. 'sudo apt install python3.13 python3.13-venv') and re-run."
     fi
 fi
 
-log "installing controller python deps into .venv (pip install -e '.[proxy]')"
-./.venv/bin/pip install --quiet --upgrade pip
-./.venv/bin/pip install --quiet -e ".[proxy]"
+# No extras by default (the LiteLLM `proxy` extra is gone: the in-process LLM
+# gateway replaced it); a handset adds `ble`. `.[]` is not a valid pip target,
+# so the brackets are added only when there is an extra.
+_taos_extras="$(taos_controller_extras)"
+log "installing controller python deps into .venv (pip install -e '.${_taos_extras:+[$_taos_extras]}')"
+./.venv/bin/pip install --quiet --upgrade pip -c scripts/install-constraints.txt
+./.venv/bin/pip install --quiet -c scripts/install-constraints.txt -e ".${_taos_extras:+[$_taos_extras]}"
 
-# The proxy extra no longer routes through litellm[proxy], so the proprietary
-# litellm-enterprise wheel is no longer part of the install set. A FRESH install
-# therefore never lands it -- but pip does not prune what an EARLIER install put
+# litellm (and with it the proprietary litellm-enterprise wheel an older
+# litellm[proxy] pulled in) is no longer part of the install set. A FRESH
+# install never lands it -- but pip does not prune what an EARLIER install put
 # in the venv, so upgrading an existing box would silently keep redistributing
 # it. Nothing in taOS imports it (grep -rn litellm_enterprise tinyagentos/ is
 # empty), so removing it is inert; and it is the shipped venv, not the source
-# tree, that a commercial licensee redistributes.
+# tree, that every install redistributes.
 #
 # Probed with importlib.metadata.distribution(), not importlib.util.find_spec():
 # that is exactly what `pip uninstall` itself consults, so the probe and the
@@ -1667,112 +1770,6 @@ if [[ -f data/config.yaml.example && ! -f data/config.yaml ]]; then
     log "copying data/config.yaml.example → data/config.yaml (first-run defaults)"
     cp data/config.yaml.example data/config.yaml
 fi
-
-# --- LiteLLM virtual-key store (Postgres) --------------------------------
-#
-# LiteLLM uses a Postgres-backed key store to mint per-agent virtual keys
-# via /key/generate. Without it, agent deploys log a "DB not connected"
-# error and fall back to a shared master key (functional, but every agent
-# in this controller authenticates as the same identity). We install a
-# small local Postgres and write data/.litellm_db_url so the controller
-# picks it up on next start. Idempotent: re-runs leave the existing URL
-# in place — bumping the password would invalidate any keys already
-# minted against it.
-
-ensure_litellm_postgres() {
-    if [[ -f data/.litellm_db_url && -s data/.litellm_db_url ]]; then
-        log "litellm postgres: data/.litellm_db_url present — skipping setup"
-        return 0
-    fi
-
-    if ! command -v sudo >/dev/null 2>&1 && [[ "$(id -u)" != "0" ]]; then
-        warn "litellm postgres: sudo not available and not running as root — skipping"
-        warn "  per-agent virtual keys will not work; deployer will use the shared master key"
-        return 0
-    fi
-
-    if ! command -v psql >/dev/null 2>&1; then
-        log "installing postgresql for LiteLLM virtual keys"
-        if command -v apt-get >/dev/null 2>&1; then
-            sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq postgresql \
-                || { warn "apt install postgresql failed — skipping virtual key setup"; return 0; }
-        elif command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y -q postgresql postgresql-server \
-                || { warn "dnf install postgresql failed — skipping virtual key setup"; return 0; }
-            # Fedora/RHEL ship Postgres uninitialised — set up the data
-            # cluster before systemd can start it.
-            if [[ ! -d /var/lib/pgsql/data/base ]]; then
-                sudo postgresql-setup --initdb >/dev/null 2>&1 || true
-            fi
-        elif command -v pacman >/dev/null 2>&1; then
-            sudo pacman -S --noconfirm postgresql \
-                || { warn "pacman -S postgresql failed — skipping virtual key setup"; return 0; }
-            # Arch ships postgresql binaries without an initialised data
-            # directory; systemd refuses to start until initdb has run.
-            if [[ ! -d /var/lib/postgres/data/base ]]; then
-                sudo mkdir -p /var/lib/postgres/data
-                sudo chown postgres:postgres /var/lib/postgres/data
-                sudo -u postgres initdb --locale=C.UTF-8 --encoding=UTF8 \
-                    -D /var/lib/postgres/data >/dev/null 2>&1 || true
-            fi
-        else
-            warn "litellm postgres: unrecognised package manager — install postgresql manually then re-run"
-            return 0
-        fi
-    fi
-
-    if command -v systemctl >/dev/null 2>&1; then
-        sudo systemctl enable --now postgresql >/dev/null 2>&1 \
-            || { warn "litellm postgres: could not start postgresql service — skipping"; return 0; }
-    fi
-
-    # Wait for Postgres to accept connections (cold start can take a few seconds).
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        sudo -u postgres psql -tAc 'SELECT 1' >/dev/null 2>&1 && break
-        sleep 1
-    done
-
-    local pw
-    pw=$(openssl rand -hex 24 2>/dev/null || head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32)
-    if [[ -z "$pw" ]]; then
-        warn "litellm postgres: could not generate password — skipping"
-        return 0
-    fi
-
-    # Pipe the password via stdin instead of -c "...PASSWORD '...'" so it
-    # never appears in /proc/<pid>/cmdline. Quoting nuance: psql's :'var'
-    # interpolation produces a properly-escaped SQL string literal.
-    local role_sql
-    if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='litellm'" 2>/dev/null | grep -q 1; then
-        role_sql="CREATE ROLE litellm WITH LOGIN PASSWORD :'pw';"
-    else
-        role_sql="ALTER ROLE litellm WITH LOGIN PASSWORD :'pw';"
-    fi
-    if ! printf '%s\n' "$role_sql" \
-            | sudo -u postgres psql -v ON_ERROR_STOP=1 -v "pw=${pw}" >/dev/null 2>&1; then
-        warn "litellm postgres: role create/alter failed — skipping"
-        return 0
-    fi
-
-    if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='litellm'" 2>/dev/null | grep -q 1; then
-        printf 'CREATE DATABASE litellm OWNER litellm;\n' \
-            | sudo -u postgres psql -v ON_ERROR_STOP=1 >/dev/null 2>&1 \
-            || { warn "litellm postgres: CREATE DATABASE failed — skipping"; return 0; }
-    fi
-
-    # Subshell scopes umask so we don't leak 077 into the rest of the
-    # install script (the SPA build below relies on the calling shell's
-    # default umask for npm-managed files). chmod is belt-and-braces.
-    ( umask 077 && \
-        printf 'postgresql://litellm:%s@127.0.0.1:5432/litellm\n' "$pw" > data/.litellm_db_url )
-    chmod 600 data/.litellm_db_url
-    log "litellm postgres: data/.litellm_db_url written — virtual keys enabled"
-}
-
-# Postgres backs LiteLLM virtual keys; without it the controller still runs and
-# falls back gracefully. Never let DB setup abort the core install (e.g. WSL
-# without systemd, where the postgres daemon cannot start).
-ensure_litellm_postgres || warn "litellm postgres setup did not complete -- virtual keys disabled, controller still runs; continuing"
 
 # --- desktop SPA bundle --------------------------------------------------
 # The bundle is not committed to git (static/desktop/ is gitignored), so it has
@@ -1977,9 +1974,10 @@ if [[ -z "${TAOS_SKIP_QMD:-}" ]]; then
             # is the non-RK3588 embedding backend, better-sqlite3 backs qmd's
             # dbPath routing), so we pass --allow-scripts explicitly.
             #
-            # cd /tmp avoids a project-level .npmrc in the invoking user's
-            # checkout from vetoing the global install with
-            # "config prefix cannot be changed from project config".
+            # cd into a root-owned temp dir avoids a project-level .npmrc in
+            # the invoking user's checkout from vetoing the global install with
+            # "config prefix cannot be changed from project config". /tmp itself
+            # is world-writable, so npm's project-config load must not land there.
             # Pre-clean a partial qmd install dir before we try again.
             # If a prior run failed mid-extraction, the leftover directory
             # makes npm's tar extractor stumble on a second attempt with
@@ -2007,12 +2005,13 @@ if [[ -z "${TAOS_SKIP_QMD:-}" ]]; then
             # npm packages are signed via the registry's package-lock integrity
             # mechanism (sha512 in package-lock.json); pinning the version here
             # is the supply-chain control available at install time.
-            qmd_npm_version="${TAOS_QMD_NPM_VERSION:-2.6.0}"
+            qmd_npm_version="${TAOS_QMD_NPM_VERSION:-2.8.3-taos.2}"
             qmd_install_log=$(mktemp /tmp/taos-qmd-install.XXXXXX)
             mv -- "$qmd_install_log" "${qmd_install_log}.log"
             qmd_install_log="${qmd_install_log}.log"
+            _qmd_cwd="$(mktemp -d /tmp/taos-qmd-cwd.XXXXXX)"
             log "npm install -g @jaylfc/qmd@${qmd_npm_version} (log: $qmd_install_log)"
-            if ! ( cd /tmp && sudo HOME=/root npm install -g --allow-scripts=better-sqlite3,node-llama-cpp,tree-sitter-* "@jaylfc/qmd@${qmd_npm_version}" ) >"$qmd_install_log" 2>&1; then
+            if ! ( cd "$_qmd_cwd" && sudo HOME=/root npm install -g '--allow-scripts=better-sqlite3,node-llama-cpp,tree-sitter-*' "@jaylfc/qmd@${qmd_npm_version}" ) >"$qmd_install_log" 2>&1; then
                 if grep -q "TAR_ENTRY_ERROR" "$qmd_install_log" \
                    && grep -q "spawn sh" "$qmd_install_log"; then
                     warn "npm install of qmd hit the node-llama-cpp tar-extraction"
@@ -2029,7 +2028,7 @@ if [[ -z "${TAOS_SKIP_QMD:-}" ]]; then
                 if grep -qiE "ETARGET|No matching version found" "$qmd_install_log" \
                    && [[ "$qmd_npm_version" != "latest" ]]; then
                     warn "qmd ${qmd_npm_version} not found on npm (ETARGET); retrying @latest"
-                     if ( cd /tmp && sudo HOME=/root npm install -g --allow-scripts=better-sqlite3,node-llama-cpp,tree-sitter-* "@jaylfc/qmd@latest" ) >>"$qmd_install_log" 2>&1; then
+                     if ( cd "$_qmd_cwd" && sudo HOME=/root npm install -g '--allow-scripts=better-sqlite3,node-llama-cpp,tree-sitter-*' "@jaylfc/qmd@latest" ) >>"$qmd_install_log" 2>&1; then
                         log "qmd installed via @latest fallback"
                     else
                         tail -20 "$qmd_install_log" >&2
@@ -2041,6 +2040,7 @@ if [[ -z "${TAOS_SKIP_QMD:-}" ]]; then
                 fi
             fi
             rm -f "$qmd_install_log"
+            rm -rf "$_qmd_cwd"
             # Confirm the binary is reachable before we proceed.
             if ! command -v qmd >/dev/null 2>&1; then
                 die "qmd binary not found on PATH after npm install — check npm global prefix and PATH"
@@ -2514,6 +2514,10 @@ install_macos_launchd() {
     local plist_dir="$HOME/Library/LaunchAgents"
     local plist="$plist_dir/com.tinyagentos.controller.plist"
     mkdir -p "$plist_dir"
+    # `python -m tinyagentos`, not bare uvicorn: only the package entrypoint
+    # starts the LLM gateway's agent listener, which is every agent's only LLM
+    # path since LiteLLM was removed (a bare-uvicorn controller refuses local
+    # agent deploys). It reads TAOS_HOST / TAOS_PORT from the environment.
     cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -2524,13 +2528,7 @@ install_macos_launchd() {
     <array>
         <string>$INSTALL_DIR/.venv/bin/python</string>
         <string>-m</string>
-        <string>uvicorn</string>
-        <string>tinyagentos.app:create_app</string>
-        <string>--factory</string>
-        <string>--host</string>
-        <string>0.0.0.0</string>
-        <string>--port</string>
-        <string>$TAOS_PORT</string>
+        <string>tinyagentos</string>
     </array>
     <key>WorkingDirectory</key><string>$INSTALL_DIR</string>
     <key>RunAtLoad</key><true/>
@@ -2540,6 +2538,8 @@ install_macos_launchd() {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PYTHONUNBUFFERED</key><string>1</string>
+        <key>TAOS_HOST</key><string>0.0.0.0</string>
+        <key>TAOS_PORT</key><string>$TAOS_PORT</string>
         <key>TAOS_BROWSER_PROXY_PORT</key><string>$TAOS_BROWSER_PROXY_PORT</string>
         <key>TAOS_SPA_DIR</key><string>$INSTALL_DIR/static/desktop</string>
     </dict>

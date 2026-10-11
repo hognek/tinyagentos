@@ -2,12 +2,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
 import secrets
 import time
 from typing import TYPE_CHECKING, Coroutine
 
-from tinyagentos.cluster.worker_protocol import GpuLease, WorkerInfo
+from tinyagentos.cluster.worker_protocol import (
+    RESOURCE_CLASS_RE,
+    GpuLease,
+    WorkerInfo,
+)
 
 if TYPE_CHECKING:
     from tinyagentos.cluster.failure_tracker import FailureTracker
@@ -18,9 +21,12 @@ logger = logging.getLogger(__name__)
 
 HEARTBEAT_TIMEOUT = 30  # seconds before marking worker offline
 
-# Legacy resource-name grammar for backward compatibility with workers that
-# do not send a `resources` inventory on registration.
-_LEGACY_RESOURCE_RE = re.compile(r'^gpu-cuda-\d+$|^npu-[a-z0-9-]+$|^cpu-inference$')
+# Resource-name grammar for backward compatibility with workers that
+# do not send a `resources` inventory on registration. Aliases the same
+# grammar the register/heartbeat paths validate against, so the two cannot
+# drift: the local copy this replaced predated `gpu-metal` and would have
+# rejected an Apple Silicon worker's lease claim.
+_LEGACY_RESOURCE_RE = RESOURCE_CLASS_RE
 
 # Valid worker-initiated status values that gate drain/update protection.
 # Keep in sync with the notification block below and the heartbeat guard.
@@ -83,6 +89,7 @@ class ClusterManager:
         self._fenced: bool = False  # True when another controller has advanced generation
         # Maximum number of leases a single worker can hold (prevents DoS)
         self._max_leases_per_worker = max_leases_per_worker
+        self._lease_seq = 0
 
     def _spawn_background_task(self, coro: Coroutine) -> asyncio.Task:
         """Create a fire-and-forget task that survives garbage collection.
@@ -357,7 +364,16 @@ class ClusterManager:
             return (False, "stale_generation")
         self._ever_seen.add(info.name)
 
-        prev_status = self._workers[info.name].status if info.name in self._workers else None
+        prev = self._workers.get(info.name)
+        prev_status = prev.status if prev is not None else None
+        # A device never becomes a worker by re-registering: the stored
+        # kind="device" wins over whatever the new registration carries, so
+        # the device exclusions in get_workers_for_capability and
+        # browser_sessions._capable_workers keep holding (last line of
+        # defence behind routes/cluster.py register_worker).
+        if prev is not None and getattr(prev, "kind", "worker") == "device" and info.kind != "device":
+            logger.warning("Registration for device '%s' asked for kind=%r; kept kind=device", info.name, info.kind)
+            info.kind = "device"
 
         info.registered_at = time.time()
         info.last_heartbeat = time.time()
@@ -717,9 +733,11 @@ class ClusterManager:
 
         When a worker is explicitly unregistered (admin action), every
         active lease tied to the worker's resources is released so that
-        those resource slots become available for new claims immediately.
+        those resource slots become available for new claims immediately,
+        and any GPU arbiter task still running on those leases is cancelled
+        so it cannot keep its VRAM reservation alongside a returning worker.
         This mirrors the lease-release logic in ``_monitor_loop`` for the
-        heartbeat-timeout path (taOS #1705).
+        heartbeat-timeout path (taOS #1705, taOS #1992 H2).
         """
         worker = self._workers.get(name)
         if worker is None:
@@ -741,6 +759,21 @@ class ClusterManager:
 
             self._workers.pop(name, None)
         logger.info("Worker '%s' unregistered — %d leases released", name, len(lids))
+        # taOS #1992 (H2): releasing the lease rows is not enough — a task still
+        # running on the arbiter keeps its VRAM reservation and ``_running``
+        # slot, so a returning worker (or a fresh claimant) would execute
+        # concurrently with the orphan on the same physical GPU. Cancel those
+        # tasks, mirroring the heartbeat-timeout/offline branches in
+        # ``_monitor_loop`` and the force-drain path in ``drain_worker``.
+        if lids and self._gpu_arbiter is not None:
+            try:
+                cancelled, already_done = await self._gpu_arbiter.cancel_running_for_leases(set(lids))
+                logger.info(
+                    "Worker '%s' unregistered — arbiter cancelled %d task(s), %d already done",
+                    name, cancelled, already_done,
+                )
+            except Exception:
+                logger.exception("gpu-arbiter: cancel for unregister of '%s' failed", name)
         # taOS #640: remove from persistent store.
         if self._registry_store is not None:
             try:
@@ -911,6 +944,8 @@ class ClusterManager:
                 return None
 
             lease_id = f"l_{secrets.token_hex(16)}"
+            self._lease_seq += 1
+            epoch = f"{self._generation}.{self._lease_seq}"
             lease = GpuLease(
                 lease_id=lease_id,
                 resource_id=resource_id,
@@ -919,6 +954,7 @@ class ClusterManager:
                 required_vram_mb=required_vram_mb,
                 granted_at=time.time(),
                 claim_channel=claim_channel,
+                epoch=epoch,
             )
             self._leases[lease_id] = lease
             logger.info(
@@ -927,24 +963,41 @@ class ClusterManager:
             )
             return lease
 
-    async def release_lease(self, lease_id: str) -> bool:
-        """Release a lease by id.  Idempotent — returns True even if the
-        lease was already expired or never existed."""
-        async with self._lease_lock:
-            lease = self._leases.pop(lease_id, None)
-        if lease is not None:
-            logger.info("Lease released: %s on %s", lease_id, lease.resource_id)
-        return True  # idempotent
+    async def release_lease_result(self, lease_id: str, epoch: str | None = None) -> tuple[bool, str]:
+        """Release a lease by id, returning ``(ok, lease_epoch)`` atomically.
 
-    async def renew_lease(self, lease_id: str, ttl_seconds: float = 30) -> GpuLease | None:
+        ``lease_epoch`` is the epoch of the lease that was just popped, or an
+        empty string when no lease existed (already released or expired).  On
+        an epoch mismatch the lease is left in place and ``(False, "")`` is
+        returned."""
+        async with self._lease_lock:
+            lease = self._leases.get(lease_id)
+            if lease is not None:
+                if epoch is not None and epoch != lease.epoch:
+                    logger.warning("lease %s epoch mismatch", lease_id)
+                    return False, ""
+                if epoch is None:
+                    logger.debug("lease %s: unfenced release accepted (epoch=None)", lease_id)
+                self._leases.pop(lease_id, None)
+                logger.info("Lease released: %s on %s", lease_id, lease.resource_id)
+                return True, lease.epoch
+        return True, ""  # idempotent
+
+    async def release_lease(self, lease_id: str, epoch: str | None = None) -> bool:
+        """Release a lease by id.  Idempotent, returns True even if the
+        lease was already expired or never existed."""
+        ok, _ = await self.release_lease_result(lease_id, epoch=epoch)
+        return ok
+
+    async def renew_lease(self, lease_id: str, ttl_seconds: float = 30, epoch: str | None = None) -> GpuLease | None:
         """Extend a lease's TTL.  Returns the lease, or None if expired/unknown."""
         lease, _previous_expiry = await self.renew_lease_with_previous(
-            lease_id, ttl_seconds=ttl_seconds
+            lease_id, ttl_seconds=ttl_seconds, epoch=epoch
         )
         return lease
 
     async def renew_lease_with_previous(
-        self, lease_id: str, ttl_seconds: float = 30
+        self, lease_id: str, ttl_seconds: float = 30, epoch: str | None = None
     ) -> tuple[GpuLease | None, float | None]:
         """Extend a lease's TTL, returning ``(lease, previous_expiry)``.
 
@@ -961,6 +1014,11 @@ class ClusterManager:
             lease = self._leases.get(lease_id)
             if lease is None:
                 return None, None
+            if epoch is not None and epoch != lease.epoch:
+                logger.warning("lease %s epoch mismatch", lease_id)
+                return None, None
+            if epoch is None:
+                logger.debug("lease %s: unfenced renew accepted (epoch=None)", lease_id)
             now = time.time()
             if lease.expires_at <= now:
                 self._leases.pop(lease_id, None)
@@ -1127,10 +1185,19 @@ class ClusterManager:
     def get_workers_for_capability(self, capability: str) -> list[WorkerInfo]:
         """Get online workers that support a capability, sorted by priority (lowest load first).
 
-        Draining workers are excluded (taOS #890)."""
+        Draining workers are excluded (taOS #890). A ``kind="device"`` node
+        (a taOSusb board paired over Bluetooth) is excluded unconditionally,
+        never by whatever it happens to list in ``capabilities`` -- a
+        capability flag alone reads as fine until someone adds a new job
+        type that a device's capability list was never checked against (see
+        docs/taosusb-pairing-plan.md). This is the model mesh's candidate
+        pool (``TaskRouter.route_request`` -> chat/embed/image-generation),
+        so the guard here is the one that matters most."""
         eligible = [
             w for w in self._workers.values()
-            if w.status in ("online", "update-available") and capability in w.capabilities
+            if w.status in ("online", "update-available")
+            and capability in w.capabilities
+            and getattr(w, "kind", "worker") != "device"
         ]
         return sorted(eligible, key=lambda w: w.load)
 
@@ -1271,6 +1338,7 @@ class ClusterManager:
             "free_vram_mb": worker.free_vram_mb,
             "used_vram_mb": worker.used_vram_mb,
             "resources": json.dumps(worker.resources or []),
+            "kind": worker.kind or "worker",
         }
         await self._registry_store.upsert_worker(info)
 
@@ -1332,6 +1400,7 @@ class ClusterManager:
                     free_vram_mb=row.get("free_vram_mb"),
                     used_vram_mb=row.get("used_vram_mb"),
                     resources=json.loads(row.get("resources", "[]")),
+                    kind=row.get("kind") or "worker",
                 )
                 self._workers[name] = worker
                 self._ever_seen.add(name)

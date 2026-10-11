@@ -27,7 +27,7 @@ function okJson(body: unknown, status = 200) {
 function vocabHit(url: unknown, projectScopes: string[] = SERVER_PROJECT_SCOPES) {
   if (!String(url).startsWith("/api/agents/scope-vocabulary")) return null;
   return okJson({
-    valid_scopes: [...projectScopes, "memory_read", "memory_write", "a2a_send"].sort(),
+    valid_scopes: [...projectScopes, "memory_read", "a2a_send"].sort(),
     project_scopes: projectScopes,
   });
 }
@@ -58,6 +58,18 @@ describe("ConsentActions", () => {
     render(<ConsentActions requestId="req-1" scopes={["memory_read"]} />);
     expect(screen.getByRole("button", { name: /allow/i })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /deny/i })).toBeInTheDocument();
+  });
+
+  it("shows the shared-VM warning when harness is grok", () => {
+    vi.stubGlobal("fetch", okFetch());
+    render(<ConsentActions requestId="req-1" scopes={["memory_read"]} harness="grok" />);
+    expect(screen.getByText(/This token will be readable by all bots on this Grok account/i)).toBeInTheDocument();
+  });
+
+  it("does not show the shared-VM warning when harness is not grok", () => {
+    vi.stubGlobal("fetch", okFetch());
+    render(<ConsentActions requestId="req-1" scopes={["memory_read"]} harness="claude" />);
+    expect(screen.queryByText(/This token will be readable by all bots on this Grok account/i)).not.toBeInTheDocument();
   });
 
   it("posts the requested scopes to the approve endpoint and calls onResolved", async () => {
@@ -164,6 +176,85 @@ describe("ConsentActions", () => {
       granted_scopes: ["project_tasks", "a2a_send"],
       project_id: "p1",
     });
+  });
+
+  it("sends is_lead when Make project lead is ticked", async () => {
+    const fetchMock = vi.fn((url: string) => {
+      const vocab = vocabHit(url);
+      if (vocab) return vocab;
+      if (String(url).startsWith("/api/projects")) {
+        return okJson({ items: [{ id: "p1", name: "Strata" }] });
+      }
+      return okJson({ status: "ok", lead_assigned: true });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onResolved = vi.fn();
+    render(
+      <ConsentActions requestId="req-lead" scopes={["project_tasks", "a2a_send"]} onResolved={onResolved} />,
+    );
+    await screen.findByLabelText(/Grant project access for/i);
+    await projectListLoaded();
+    fireEvent.click(screen.getByRole("checkbox", { name: /Make project lead/i }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /allow/i })).not.toBeDisabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /allow/i }));
+    await waitFor(() => expect(onResolved).toHaveBeenCalledTimes(1));
+
+    const approveCall = fetchMock.mock.calls.find((c) => String(c[0]).includes("/approve"));
+    expect(JSON.parse((approveCall![1] as RequestInit).body as string)).toEqual({
+      granted_scopes: ["project_tasks", "a2a_send"],
+      project_id: "p1",
+      is_lead: true,
+    });
+  });
+
+  async function approveAsLead(approveResponse: () => Promise<unknown>) {
+    const fetchMock = vi.fn((url: string) => {
+      const vocab = vocabHit(url);
+      if (vocab) return vocab;
+      if (String(url).startsWith("/api/projects")) {
+        return okJson({ items: [{ id: "p1", name: "Strata" }] });
+      }
+      return approveResponse();
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const onResolved = vi.fn();
+    render(
+      <ConsentActions requestId="req-lead" scopes={["project_tasks", "a2a_send"]} onResolved={onResolved} />,
+    );
+    await screen.findByLabelText(/Grant project access for/i);
+    await projectListLoaded();
+    fireEvent.click(screen.getByRole("checkbox", { name: /Make project lead/i }));
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /allow/i })).not.toBeDisabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /allow/i }));
+    return onResolved;
+  }
+
+  it("keeps the card terminal when lead_assigned is false", async () => {
+    const onResolved = await approveAsLead(() => okJson({ status: "ok", lead_assigned: false }));
+    await screen.findByText(/project lead could not be set/i);
+    expect(onResolved).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: /allow/i })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /dismiss/i }));
+    expect(onResolved).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats a response without lead_assigned as unconfirmed", async () => {
+    const onResolved = await approveAsLead(() => okJson({ status: "ok" }));
+    await screen.findByText(/project lead could not be set/i);
+    expect(onResolved).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: /allow/i })).toBeNull();
+  });
+
+  it("offers no lead checkbox without a membership scope", async () => {
+    render(<ConsentActions requestId="req-nolead" scopes={["a2a_send"]} />);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: /allow/i })).not.toBeDisabled(),
+    );
+    expect(screen.queryByRole("checkbox", { name: /Make project lead/i })).toBeNull();
   });
 
   it("gates Allow until a project is chosen when several projects exist", async () => {
@@ -409,6 +500,28 @@ describe("ConsentActions", () => {
     // No dropped or added badges.
     expect(container.querySelectorAll('[data-state="dropped"]')).toHaveLength(0);
     expect(container.querySelectorAll('[data-state="added"]')).toHaveLength(0);
+  });
+
+  it("renders the human duration text when humanDuration is provided", () => {
+    render(
+      <ConsentActions
+        requestId="req-dur"
+        scopes={["memory_read"]}
+        humanDuration="expires 1 hour after approval"
+      />,
+    );
+    expect(screen.getByText("expires 1 hour after approval")).toBeInTheDocument();
+  });
+
+  it("renders 'no expiry' when humanDuration is 'no expiry'", () => {
+    render(
+      <ConsentActions
+        requestId="req-ne"
+        scopes={["memory_read"]}
+        humanDuration="no expiry"
+      />,
+    );
+    expect(screen.getByText("no expiry")).toBeInTheDocument();
   });
 
   const missingProjectScopes = [
@@ -661,8 +774,8 @@ describe("ConsentActions", () => {
             );
           });
         }
-        return okJson({ status: "ok" });
-      });
+return okJson({ status: "ok", lead_assigned: true });
+    });
       vi.stubGlobal("fetch", fetchMock);
       render(<ConsentActions requestId="req-hang" scopes={["files_write"]} />);
 
@@ -786,5 +899,26 @@ describe("consentPayload", () => {
       requestId: "x",
       scopes: [],
     });
+  });
+
+  it("extracts framework as harness when present", () => {
+    const payload = consentPayload({
+      request_id: "req-1",
+      requested_scopes: ["memory_read"],
+      framework: "grok",
+    });
+    expect(payload).toEqual({
+      requestId: "req-1",
+      scopes: ["memory_read"],
+      harness: "grok",
+    });
+  });
+
+  it("omits harness when framework is absent", () => {
+    const payload = consentPayload({
+      request_id: "req-2",
+      requested_scopes: ["memory_read"],
+    });
+    expect(payload?.harness).toBeUndefined();
   });
 });
