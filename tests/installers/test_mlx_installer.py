@@ -250,6 +250,10 @@ class TestVendoredRuntimeLocks:
             body = lock.read_text()
             assert f"mlx-lm=={mlx_mod.MLX_LM_VERSION}" in body
             assert f"mlx=={mlx_mod.MLX_VERSION}" in body
+            # `mlx` requires `mlx-metal` behind a `platform_system == "Darwin"`
+            # marker; a lock generated on a non-Darwin host must still pin it,
+            # or `--require-hashes` aborts on a real Mac.
+            assert f"mlx-metal=={mlx_mod.MLX_VERSION}" in body
 
             lines = body.splitlines()
             index = 0
@@ -274,6 +278,21 @@ class TestVendoredRuntimeLocks:
     def test_an_unsupported_python_has_no_lock(self):
         assert mlx_mod.requirements_file("3.10") is None
         assert mlx_mod.requirements_file("3.14") is None
+
+    def test_the_darwin_only_transitive_deps_are_locked(self):
+        """``mlx-lm`` -> ``mlx`` -> ``mlx-metal`` are all guarded by a
+        ``platform_system == "Darwin"`` marker, so a resolver on a non-Darwin
+        host (CI) skips them; the lock has to pin every one of them itself or
+        ``--require-hashes`` aborts on a real Mac."""
+        for python_version in mlx_mod.SUPPORTED_PYTHONS:
+            lock = mlx_mod.requirements_file(python_version)
+            assert lock is not None, python_version
+            names = {
+                line.split("==", 1)[0]
+                for line in lock.read_text().splitlines()
+                if line and not line.startswith(("#", " ")) and "==" in line
+            }
+            assert {"mlx", "mlx-metal"} <= names, (python_version, names)
 
 
 @pytest.mark.asyncio
@@ -1202,3 +1221,25 @@ class TestMLXMultiModelServing:
         assert mlx_mod.mlx_agent_model_dir(plist) != str(
             tmp_path / "mlx" / "qwen2.5" / "qwen2.5-3b"
         )
+    async def test_uninstall_refuses_an_app_id_that_would_remove_the_backend_root(
+        self, tmp_path
+    ):
+        """`.`, whose family/id segments collapse onto `<root>/mlx`, must not
+        turn the recursive delete loose on the whole backend tree."""
+        models = tmp_path / "mlx" / "qwen2.5" / "qwen2.5-3b"
+        models.mkdir(parents=True)
+        (models / "config.json").write_text("{}")
+
+        result = await MLXInstaller(models_dir=tmp_path).uninstall(".")
+
+        assert result["success"] is False
+        assert "refusing to remove" in result["error"]
+        assert (tmp_path / "mlx").exists(), "the mlx backend tree survives"
+        assert (models / "config.json").exists()
+
+    async def test_uninstall_refuses_an_app_id_with_a_path_separator(self, tmp_path):
+        installer = MLXInstaller(models_dir=tmp_path)
+        for bad in ("a/b", "a\\b"):
+            result = await installer.uninstall(bad)
+            assert result["success"] is False, bad
+            assert "refusing to remove" in result["error"], bad

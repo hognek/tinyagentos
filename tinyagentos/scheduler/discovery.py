@@ -17,7 +17,6 @@ from tinyagentos.hardware import (
     METAL_RESOURCE_NAME,
     metal_available,
 )
-from tinyagentos.installers.mlx_installer import mlx_runtime_installed
 from tinyagentos.scheduler.backend_catalog import BackendCatalog
 from tinyagentos.scheduler.history_store import HistoryStore
 from tinyagentos.scheduler.gpu_arbiter import _probe_nvidia_vram
@@ -269,12 +268,6 @@ def build_scheduler(
             ),
             runtime_version="",
         )
-        if is_metal and not mlx_runtime_installed():
-            logger.info(
-                "discovery: %s is Apple Silicon without the pinned mlx-lm "
-                "runtime installed; an mlx model install provisions it",
-                METAL_RESOURCE_NAME,
-            )
 
         def _gpu_vram_probe() -> int:
             free, total = _probe_nvidia_vram()
