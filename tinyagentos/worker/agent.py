@@ -173,6 +173,7 @@ _DEFAULT_PROBE_CANDIDATES: tuple[tuple[str, str], ...] = (
     ("vllm", "http://localhost:18000"),           # TAOS-bundled vLLM (future)
     ("sd-cpp", "http://localhost:7864"),
     ("exo", "http://localhost:52415"),           # exo distributed inference (default port)
+    ("lmstudio", "http://localhost:1234"),       # LM Studio local server (default port)
 )
 
 # Types an extra/manifest candidate may declare: the local servers whose API

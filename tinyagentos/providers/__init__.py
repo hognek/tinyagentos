@@ -27,6 +27,7 @@ ALL_TYPES: set[str] = {
     "vllm",
     "exo",
     "mlx",
+    "lmstudio",
     # -- cloud LLM providers --
     "openai",
     "anthropic",
@@ -80,6 +81,7 @@ BACKEND_TYPE_MAP: dict[str, str] = {
     "deepseek": "deepseek",  # native LiteLLM provider; api_base set to official base
     "nous": "openai",  # Nous Portal is OpenAI-compatible; api_base set explicitly
     "openai-compatible": "openai",  # user-supplied OpenAI-compatible endpoint
+    "lmstudio": "openai",  # LM Studio serves an OpenAI-compatible API on :1234
 }
 
 # Chat prefix is different from the embedding prefix for ollama-compat
