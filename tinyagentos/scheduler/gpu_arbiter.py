@@ -99,7 +99,12 @@ class GpuArbiter:
         self._queue: asyncio.PriorityQueue[_QueuedGpuTask] = asyncio.PriorityQueue(maxsize=max_queue_size)
         self._seq = 0
         self._running: dict[str, tuple[Task, str | None, int, int]] = {}
+        self._RENEW_INTERVAL_S = 200
+
         self._running_tasks: dict[str, asyncio.Task] = {}
+        # lease_id -> epoch of the lease this arbiter claimed; renew/release
+        # present it so a lease taken over by another holder is refused.
+        self._lease_epochs: dict[str, str | None] = {}
         self._running_lock = asyncio.Lock()
         self._queued_entries: dict[str, _QueuedGpuTask] = {}
         self._cancelled_ids: set[str] = set()
@@ -430,6 +435,7 @@ class GpuArbiter:
         self, lease_id: str, stop_event: asyncio.Event,
         task_to_cancel: asyncio.Task | None = None,
         arbiter_future: asyncio.Future | None = None,
+        epoch: str | None = None,
     ) -> None:
         """Periodically renew a lease until *stop_event* is set.
 
@@ -445,7 +451,7 @@ class GpuArbiter:
         so the lease-loss path must resolve the future directly (taOS
         #1984 — lease-loss cancellation hang fix).
         """
-        RENEW_INTERVAL = 200
+        RENEW_INTERVAL = self._RENEW_INTERVAL_S
         while not stop_event.is_set():
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=RENEW_INTERVAL)
@@ -455,7 +461,7 @@ class GpuArbiter:
             try:
                 if self._cluster_manager is not None:
                     renewed = await self._cluster_manager.renew_lease(
-                        lease_id, ttl_seconds=300,
+                        lease_id, ttl_seconds=300, epoch=epoch,
                     )
                     if renewed is None:
                         logger.warning(
@@ -478,7 +484,7 @@ class GpuArbiter:
                 try:
                     if self._cluster_manager is not None:
                         renewed2 = await self._cluster_manager.renew_lease(
-                            lease_id, ttl_seconds=300,
+                            lease_id, ttl_seconds=300, epoch=epoch,
                         )
                         if renewed2 is not None:
                             logger.info(
@@ -512,6 +518,7 @@ class GpuArbiter:
         claim_lease fails (taOS #1705 — reservation leak fix).
         """
         lease_id: str | None = None
+        registered: bool = False
         renew_task: asyncio.Task | None = None
         renew_stop: asyncio.Event | None = None
         try:
@@ -525,6 +532,7 @@ class GpuArbiter:
                         f"GPU lease claim failed for {resource_id} (task {task.id})"
                     )
                 lease_id = lease.lease_id
+                self._lease_epochs[lease_id] = getattr(lease, "epoch", None)
                 # Start periodic lease renewal so the lease doesn't expire
                 # mid-run (taOS #1864 defect 4 — fixed 300 s TTL).
                 renew_stop = asyncio.Event()
@@ -533,12 +541,14 @@ class GpuArbiter:
                     self._renew_lease_loop(
                         lease_id, renew_stop, current,
                         getattr(task, "_arbiter_future", None),
+                        epoch=self._lease_epochs.get(lease_id),
                     ),
                     name=f"gpu-arbiter-renew-{task.id}",
                 )
             current = asyncio.current_task()
             async with self._running_lock:
                 self._running[task.id] = (task, lease_id, int(task.priority), required_vram_mb)
+                registered = True
                 if current is not None:
                     self._running_tasks[task.id] = current
             if self._scheduler is not None:
@@ -575,7 +585,22 @@ class GpuArbiter:
             if entry is not None:
                 _task, _lid, _pri, _vram = entry
                 if _lid is not None and self._cluster_manager is not None:
-                    await self._cluster_manager.release_lease(_lid)
+                    await self._cluster_manager.release_lease(
+                        _lid, epoch=self._lease_epochs.pop(_lid, None),
+                    )
+            # If we claimed a lease but failed to register (task cancelled between claim and _running add),
+            # we still need to release the lease and stop renewal.
+            if lease_id is not None and not registered and self._cluster_manager is not None:
+                # Stop lease renewal (if any) - already handled above (lines 566-571)
+                try:
+                    await self._cluster_manager.release_lease(
+                        lease_id, epoch=self._lease_epochs.pop(lease_id, None)
+                    )
+                except Exception:
+                    logger.warning(
+                        "gpu-arbiter: failed to release lease %s for cancelled task %s",
+                        lease_id, task.id,
+                    )
 
     async def cancel_running_for_leases(self, lease_ids: set[str]) -> tuple[int, int]:
         """Cancel all running GPU tasks whose leases are in *lease_ids*.
@@ -653,7 +678,9 @@ class GpuArbiter:
         # (the task skipped it because we popped _running first).
         self._release_reservation(task_id)
         if lease_id is not None and self._cluster_manager is not None:
-            await self._cluster_manager.release_lease(lease_id)
+            await self._cluster_manager.release_lease(
+                lease_id, epoch=self._lease_epochs.pop(lease_id, None),
+            )
         # Also cancel the arbiter future for queued tasks (belt-and-suspenders)
         future = getattr(task, "_arbiter_future", None)
         if future is not None and not future.done():

@@ -1,0 +1,1 @@
+- taOS talk mobile: new unified chat list component (search, filter chips, recency sort, coordination bus behind an Agent activity row); not yet wired into the sidebar.

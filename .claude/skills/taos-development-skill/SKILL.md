@@ -196,6 +196,11 @@ What this means when you write a test:
   It lives in its own module, not in `conftest.py`, because `tests/` is not a package and
   several `conftest.py` files exist, so a bare `from conftest import ...` binds whichever one
   is on `sys.path` first.
+- **The `csrf_token` must be bound to the session.** `verify_csrf` also checks
+  `verify_bound(secret, cookie, taos_session)`, so an arbitrary value next to a real session 403s.
+  The hook mints a bound token for any session made by `AuthManager.create_session`. If you
+  set the cookie and header by hand, mint it:
+  `from taos_test_csrf import bound_csrf_token; token = bound_csrf_token(app, session)`.
 - **`verify_csrf` exempts** safe methods, `Authorization: Bearer` callers, `_CREDENTIAL_PATHS`
   (the sign-in surfaces), and any request with no `taos_session` cookie. A test that never
   authenticates is unaffected.
@@ -261,7 +266,7 @@ time, so patching the module attribute AFTER `create_app` does nothing.
   component test fails CI), `desktop-e2e` (the Playwright suite under `desktop/tests`, run on
   webkit - see "Desktop SPA build + test" below), a "Verify app starts" `create_app` import
   smoke, `lint`
-  (`compileall`), `docs-build`, and `cla`. `docs-build` is the only job with the mkdocs
+  (`compileall`), and `docs-build`. `docs-build` is the only job with the mkdocs
   toolchain installed (mkdocs is NOT a project dependency, so `uv sync` does not provide
   it): it runs `tests/test_mkdocs_exclude.py` with `TAOS_DOCS_BUILD_TESTS=1`, which turns
   off the `importorskip` the ordinary shards rely on — put any test that has to build the
@@ -297,25 +302,6 @@ time, so patching the module attribute AFTER `create_app` does nothing.
   actually inspected. If you change a PR's base and this gate goes red, that is
   the new diff being judged, not a flake -- re-read what the failure names.
 
-## CLA - HUMAN signs
-
-taOS requires a Contributor License Agreement for first-time contributors. The CLA bot
-flags the PR with a `cla: fail` check.
-
-**The agent does NOT sign the CLA.** Posting the acceptance text accepts a legal agreement - that is the human account-holder's action, not the agent's.
-
-### Procedure when `cla: fail` appears:
-
-1. Verify the commit author email matches a GitHub-verified email.
-   If the email was wrong, amend the commit with the correct email, force-push.
-2. Surface the bot's comment + link to the human. Do NOT post the acceptance text yourself.
-   Do NOT post `recheck`.
-
-The bot accepts a PR comment in this format (for the human to post):
-```
-I have read the CLA Document and I hereby sign the CLA
-```
-
 ## PR / CI flow (fork specifics)
 
 1. After creating the draft PR, check both `gh pr checks <PR#>` **and**
@@ -323,7 +309,7 @@ I have read the CLA Document and I hereby sign the CLA
    `pr checks` while it awaits approval.
 2. **If the CI run shows `action_required`**: the first-time-contributor workflow-approval policy
    is blocking it. Surface this to the human - do not re-poll, re-push, or re-create the PR.
-   Lightweight checks (CLA, Gitar, CodeRabbit) run independently and don't need approval.
+   Lightweight checks (Gitar, CodeRabbit) run independently and don't need approval.
 3. Once code is done and local tests pass, `gh pr ready`. Address review feedback with additional
    commits on the same branch. The maintainer merges upstream.
 
@@ -362,6 +348,18 @@ run went green. A red `bot-review-gate` check means the PR has no substantive Co
 review yet — wait for (or retrigger) a real review; do not merge on the
 stub. A lead may waive a known rate-limit/stub false positive by applying the
 `bot-review-allow` label (see below).
+
+The gate also self-heals its own stale red. `pull_request` and
+`pull_request_review` are separate runs producing separate check suites on one head SHA, so the
+pre-review FAIL used to survive next to the later SUCCESS and the required-check rollup stayed
+FAILURE, leaving `mergeStateStatus` BLOCKED and `gh pr merge --auto` unable to fire. Once the
+gate passes on a `pull_request_review` event, a separate `reconcile-stale-runs` job
+(`scripts/rerun_failed_bot_review_runs.py`, with `actions: write` scoped to that job only, and
+checking out `ref: ${{ github.event.pull_request.base.sha }}` so the helper always comes from
+the base branch) re-runs the failed `pull_request` runs of this workflow for that same SHA --
+this workflow only, that SHA only, `conclusion=failure` only, `event=pull_request` only. So a
+red that predates the review clears itself once the review lands; a genuine stub verdict stays
+red, because the re-run re-reads review state and reaches the same verdict.
 
 Enforcement parity is a GitHub-side branch-protection setting, not in-repo config:
 `bot-review-gate` is REQUIRED on `master` but only ADVISORY on `dev` (absent from dev's

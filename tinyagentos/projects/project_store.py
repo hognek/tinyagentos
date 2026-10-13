@@ -5,7 +5,7 @@ import logging
 import sqlite3
 import time
 
-from tinyagentos.projects.ids import new_id
+from tinyagentos.projects.ids import friendly_project_id, new_id
 from tinyagentos.projects.tx import ProjectsDBStore
 
 logger = logging.getLogger(__name__)
@@ -236,7 +236,7 @@ class ProjectStore(ProjectsDBStore):
                     """INSERT INTO projects
                        (id, name, slug, description, status, created_by, user_id, created_at, updated_at, settings)
                        VALUES (?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)""",
-                    (new_id("prj"), name, slug, description, created_by, user_id, now, now, json.dumps(settings or {})),
+                    (friendly_project_id(slug), name, slug, description, created_by, user_id, now, now, json.dumps(settings or {})),
                     id_index=0,
                     new_id_fn=lambda: new_id("prj"),
                 )

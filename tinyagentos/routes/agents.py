@@ -742,7 +742,7 @@ async def deploy_agent_endpoint(request: Request, body: DeployAgentRequest):
         # because that mode explicitly opts out of taOSmd.
         if body.memory_mode != "framework":
             try:
-                tm_agents.register_agent(unique_slug)
+                request.app.state.taosmd_agent_registry.register_agent(unique_slug)
             except tm_agents.AgentExistsError:
                 pass  # idempotent — agent already registered, proceed normally
             except Exception as e:
@@ -934,6 +934,7 @@ async def deploy_agent_endpoint(request: Request, body: DeployAgentRequest):
                         agent["host"] = result.get("ip", "")
                         if deploy_remote:
                             agent["remote"] = deploy_remote
+                            agent["placement_source"] = "user"
                         agent["status"] = "running"
                         agent["llm_key"] = result.get("llm_key")
                         # Save config now so the bootstrap endpoint can return
@@ -1254,6 +1255,7 @@ async def pause_agent(request: Request, name: str, user: CurrentUser = Depends(c
     # Persist the flag only once the freeze succeeded (prepare() may already
     # have set it; set it here so it is recorded without an orchestrator too).
     agent["paused"] = True
+    agent["paused_by_restart"] = False
     await save_config_locked(config, config.config_path)
     return {"status": "paused", "name": name, "paused": True, "frozen": True, "report": report}
 

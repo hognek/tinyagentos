@@ -46,6 +46,7 @@ import logging
 import os
 import socket
 import time
+import weakref
 from dataclasses import dataclass
 
 import httpx
@@ -122,6 +123,41 @@ _CHANNEL_LIMIT = 500
 # Default lease TTL. Long enough for a model load to start and renew; short
 # enough that a crashed holder stops blocking the node (issue: advisory keep-alive).
 _DEFAULT_TTL_SECONDS = 300.0
+
+# One lock per (bus identity, resource): an identity's claim and release on the
+# same resource must not interleave between their local lease step and their
+# bus post, or a release parked before its post can clear a newer [GPU CLAIM]
+# (CodeRabbit on #3626). Process-local, like the leases it orders. Keyed on the
+# IDENTITY whose bus claim the line opens or closes, never the display handle:
+# the fold keys claims on identity, and an operator releasing an agent's lease
+# by id must queue behind that agent's re-claim (CR on #3675). Weak values: the
+# keys are caller-supplied text, and a lock held inside ``async with`` keeps its
+# own strong reference, so idle entries are collected instead of accumulating.
+_HOLDER_LOCKS: weakref.WeakValueDictionary[tuple[str, str], asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _holder_lock(identity: str, resource_id: str) -> asyncio.Lock:
+    """Return the lock serializing *identity*'s claim/release on *resource_id*."""
+    key = (identity, resource_id)
+    lock = _HOLDER_LOCKS.get(key)
+    if lock is None:
+        lock = _HOLDER_LOCKS[key] = asyncio.Lock()
+    return lock
+
+
+def _lock_resource(cluster, node: str, resource: str | None) -> str:
+    """The lock's resource component, built the same way on claim and release.
+
+    A cluster worker keys on its lease resource id; a node the cluster does not
+    know is bus-only and keys on the bare node label. Deriving a ``node:res`` id
+    for a non-worker on one route but not the other would hand the two routes
+    different locks and reopen the race the lock exists to close.
+    """
+    if cluster is not None and _match_worker(cluster, node) is not None:
+        return _resource_id(_canonical_node(cluster, node), resource)
+    return node
 
 # Upper bound on a caller-supplied TTL. Without it an authenticated agent could
 # take the shared GPU with `ttl_seconds: 1e9` and remove the auto-expiry the
@@ -482,6 +518,7 @@ class ClaimBody(_LeaseBody):
 class ReleaseBody(_LeaseBody):
     lease_id: str | None = None
     holder: str | None = None
+    epoch: str | None = None
 
 
 class RequestBody(_LeaseBody):
@@ -493,6 +530,7 @@ class RequestBody(_LeaseBody):
 
 class RenewBody(BaseModel):
     lease_id: str
+    epoch: str | None = None
     ttl_seconds: float = Field(
         default=_DEFAULT_TTL_SECONDS, gt=0, le=MAX_LEASE_TTL_SECONDS
     )
@@ -697,157 +735,170 @@ async def gpu_claim(request: Request, body: ClaimBody):
         if lease_node and cluster is not None
         else None
     )
-    existing = (
-        cluster.find_existing_lease(resource_id)
-        if cluster is not None and resource_id is not None
-        else None
-    )
-    # A re-claim of our own lease replaces the reservation rather than adding
-    # a second one. Charging the caller's own claim again would read a card
-    # whose load is already reflected in the live free VRAM as full and deny
-    # the idempotent re-POST the fold window needs (CR on #2988).
-    reclaimer = existing is not None and existing.caller == caller
+    async with _holder_lock(actor.identity, _lock_resource(cluster, node, body.resource)):
+        existing = (
+            cluster.find_existing_lease(resource_id)
+            if cluster is not None and resource_id is not None
+            else None
+        )
+        # A re-claim of our own lease replaces the reservation rather than adding
+        # a second one. Charging the caller's own claim again would read a card
+        # whose load is already reflected in the live free VRAM as full and deny
+        # the idempotent re-POST the fold window needs (CR on #2988).
+        reclaimer = existing is not None and existing.caller == caller
 
-    admission, _claims = await _check_node(
-        request,
-        node=node,
-        required_mb=vram_mb,
-        actor=actor,
-        channel=channel,
-        resource=body.resource,
-        replace_own=reclaimer,
-    )
-    if not admission["admitted"]:
-        return JSONResponse({"status": "denied", **admission}, status_code=409)
+        admission, _claims = await _check_node(
+            request,
+            node=node,
+            required_mb=vram_mb,
+            actor=actor,
+            channel=channel,
+            resource=body.resource,
+            replace_own=reclaimer,
+        )
+        if not admission["admitted"]:
+            return JSONResponse({"status": "denied", **admission}, status_code=409)
 
-    lease_id: str | None = None
-    lease = None
-    created_lease = False
-    previous_expiry: float | None = None
-    if cluster is not None and resource_id is not None:
-        if existing is not None and existing.caller != caller:
-            return JSONResponse(
-                {
-                    "status": "denied",
-                    **admission,
-                    "reason": f"{resource_id} is leased by {existing.caller}",
-                    "blockers": [existing.caller],
-                },
-                status_code=409,
-            )
-        if existing is not None:
-            # Idempotent re-claim: extend our own lease rather than failing on
-            # the "already leased" guard (which the manager applies to every
-            # caller, including the current holder). The lease keeps the
-            # contract it was taken with: `renew_lease` only moves `expires_at`,
-            # so publishing a different vram figure - or onto a different
-            # channel - would leave the GpuLease and the bus claim disagreeing,
-            # and the original channel's claim unaware of the renewal. Releasing
-            # first is how a reservation changes shape (CR on #2988).
-            held_channel = getattr(existing, "claim_channel", "") or ""
-            if (existing.required_vram_mb or 0) != vram_mb or held_channel != channel:
+        lease_id: str | None = None
+        lease = None
+        created_lease = False
+        previous_expiry: float | None = None
+        if cluster is not None and resource_id is not None:
+            if existing is not None and existing.caller != caller:
                 return JSONResponse(
                     {
                         "status": "denied",
                         **admission,
-                        "reason": (
-                            f"{resource_id} is already leased by {caller} with "
-                            f"vram_mb={existing.required_vram_mb or 0} on channel "
-                            f"{held_channel or _DEFAULT_CHANNEL}; release it "
-                            "before re-claiming with different parameters"
-                        ),
+                        "reason": f"{resource_id} is leased by {existing.caller}",
                         "blockers": [existing.caller],
                     },
                     status_code=409,
                 )
-            # The expiry this renewal replaces, read under the manager's lock:
-            # a failed repost must undo exactly this extension (and a renewal
-            # that landed meanwhile owns the lease - see the rollback below).
-            lease, previous_expiry = await cluster.renew_lease_with_previous(
-                existing.lease_id, ttl_seconds=float(body.ttl_seconds)
-            )
-            lease_id = existing.lease_id if lease is not None else None
-        else:
-            lease = await cluster.claim_lease(
-                resource_id=resource_id,
-                caller=caller,
-                ttl_seconds=float(body.ttl_seconds),
-                required_vram_mb=vram_mb,
-                claim_channel=channel,
-            )
-            if lease is None:
-                return JSONResponse(
-                    {
-                        "status": "denied",
-                        **admission,
-                        "reason": f"cluster refused a lease on {resource_id}",
-                    },
-                    status_code=409,
+            if existing is not None:
+                # Idempotent re-claim: extend our own lease rather than failing on
+                # the "already leased" guard (which the manager applies to every
+                # caller, including the current holder). The lease keeps the
+                # contract it was taken with: `renew_lease` only moves `expires_at`,
+                # so publishing a different vram figure - or onto a different
+                # channel - would leave the GpuLease and the bus claim disagreeing,
+                # and the original channel's claim unaware of the renewal. Releasing
+                # first is how a reservation changes shape (CR on #2988).
+                held_channel = getattr(existing, "claim_channel", "") or ""
+                if (existing.required_vram_mb or 0) != vram_mb or held_channel != channel:
+                    return JSONResponse(
+                        {
+                            "status": "denied",
+                            **admission,
+                            "reason": (
+                                f"{resource_id} is already leased by {caller} with "
+                                f"vram_mb={existing.required_vram_mb or 0} on channel "
+                                f"{held_channel or _DEFAULT_CHANNEL}; release it "
+                                "before re-claiming with different parameters"
+                            ),
+                            "blockers": [existing.caller],
+                        },
+                        status_code=409,
+                    )
+                # The expiry this renewal replaces, read under the manager's lock:
+                # a failed repost must undo exactly this extension (and a renewal
+                # that landed meanwhile owns the lease - see the rollback below).
+                lease, previous_expiry = await cluster.renew_lease_with_previous(
+                    existing.lease_id,
+                    ttl_seconds=float(body.ttl_seconds),
+                    epoch=existing.epoch,
                 )
-            lease_id = lease.lease_id
-            created_lease = True
+                if lease is None:
+                    return JSONResponse(
+                        {
+                            "status": "denied",
+                            **admission,
+                            "reason": f"lease {existing.lease_id} on {resource_id} was replaced or expired; claim again",
+                        },
+                        status_code=409,
+                    )
+                lease_id = existing.lease_id
+            else:
+                lease = await cluster.claim_lease(
+                    resource_id=resource_id,
+                    caller=caller,
+                    ttl_seconds=float(body.ttl_seconds),
+                    required_vram_mb=vram_mb,
+                    claim_channel=channel,
+                )
+                if lease is None:
+                    return JSONResponse(
+                        {
+                            "status": "denied",
+                            **admission,
+                            "reason": f"cluster refused a lease on {resource_id}",
+                        },
+                        status_code=409,
+                    )
+                lease_id = lease.lease_id
+                created_lease = True
 
-    # Publish the holder's own expiry on the line, so a peer's fold can drop a
-    # claim whose holder crashed or stopped keeping alive instead of blocking
-    # the card forever. It is the backing cluster lease's expiry when there is
-    # one, else the TTL this call asked for (a bus-only node is governed by the
-    # bus alone, so the line is the only thing that can free it).
-    claim_expires_at = (
-        getattr(lease, "expires_at", None)
-        if lease is not None
-        else time.time() + float(body.ttl_seconds)
-    )
-    line = render_claim(
-        node,
-        actor.holder,
-        vram_mb,
-        body.reason,
-        body.eta,
-        expires_at=claim_expires_at,
-    )
-    try:
-        posted = await _post_line(channel, actor, line)
-    except HTTPException:
-        # Undo the LOCAL half of the lease this call touched. A call that
-        # created the lease frees it; one that re-claimed only extended the
-        # caller's own lease, and freeing that would drop a reservation the
-        # holder still believes it owns - but leaving the extension standing
-        # would be just as wrong the other way: the bus claim keeps its OLD
-        # expiry, so after that older instant peers free the card while this
-        # controller still holds it. Roll the extension back to the expiry it
-        # replaced, compare-and-set so a concurrent renewal is never clobbered
-        # (CR on #2988).
-        if cluster is not None and lease is not None:
-            if created_lease and lease_id is not None:
-                await cluster.release_lease(lease_id)
-            elif previous_expiry is not None:
-                restored = await cluster.restore_lease_expiry(
-                    lease.lease_id,
-                    previous_expiry,
-                    attempted_expiry=lease.expires_at,
-                )
-                logger.warning(
-                    "A2A GPU lease %s re-claim rolled back (restored=%s): "
-                    "claim repost failed (channel=%s)",
-                    lease.lease_id,
-                    restored,
-                    channel,
-                )
-        raise
+        # Publish the holder's own expiry on the line, so a peer's fold can drop a
+        # claim whose holder crashed or stopped keeping alive instead of blocking
+        # the card forever. It is the backing cluster lease's expiry when there is
+        # one, else the TTL this call asked for (a bus-only node is governed by the
+        # bus alone, so the line is the only thing that can free it).
+        claim_expires_at = (
+            getattr(lease, "expires_at", None)
+            if lease is not None
+            else time.time() + float(body.ttl_seconds)
+        )
+        line = render_claim(
+            node,
+            actor.holder,
+            vram_mb,
+            body.reason,
+            body.eta,
+            expires_at=claim_expires_at,
+        )
+        try:
+            posted = await _post_line(channel, actor, line)
+        except HTTPException:
+            # Undo the LOCAL half of the lease this call touched. A call that
+            # created the lease frees it; one that re-claimed only extended the
+            # caller's own lease, and freeing that would drop a reservation the
+            # holder still believes it owns - but leaving the extension standing
+            # would be just as wrong the other way: the bus claim keeps its OLD
+            # expiry, so after that older instant peers free the card while this
+            # controller still holds it. Roll the extension back to the expiry it
+            # replaced, compare-and-set so a concurrent renewal is never clobbered
+            # (CR on #2988).
+            if cluster is not None and lease is not None:
+                if created_lease and lease_id is not None:
+                    await cluster.release_lease(lease_id, epoch=getattr(lease, "epoch", None))
+                elif previous_expiry is not None:
+                    restored = await cluster.restore_lease_expiry(
+                        lease.lease_id,
+                        previous_expiry,
+                        attempted_expiry=lease.expires_at,
+                    )
+                    logger.warning(
+                        "A2A GPU lease %s re-claim rolled back (restored=%s): "
+                        "claim repost failed (channel=%s)",
+                        lease.lease_id,
+                        restored,
+                        channel,
+                    )
+            raise
 
-    return {
-        "status": "claimed",
-        "node": node,
-        "holder": actor.holder,
-        "vram_mb": vram_mb,
-        "lease_id": lease_id,
-        "expires_at": getattr(lease, "expires_at", None),
-        "claim_expires_at": claim_expires_at,
-        "line": line,
-        "channel": channel,
-        "message": posted,
-        "admission": admission,
-    }
+        return {
+            "status": "claimed",
+            "node": node,
+            "holder": actor.holder,
+            "vram_mb": vram_mb,
+            "lease_id": lease_id,
+            "epoch": getattr(lease, "epoch", None),
+            "expires_at": getattr(lease, "expires_at", None),
+            "claim_expires_at": claim_expires_at,
+            "line": line,
+            "channel": channel,
+            "message": posted,
+            "admission": admission,
+        }
 
 
 @router.post("/api/a2a/gpu/release")
@@ -864,79 +915,113 @@ async def gpu_release(request: Request, body: ReleaseBody):
     channel = (body.channel or "").strip() or _channel()
 
     cluster = getattr(request.app.state, "cluster_manager", None)
-    released_id = body.lease_id
-    lease = None
-    if cluster is not None:
-        if released_id is not None:
-            # A caller-supplied id must belong to the caller: releasing another
-            # holder's lease (and posting the RELEASE that clears its bus claim)
-            # would hand any agent with a2a_send the power to free someone
-            # else's GPU. An id that names no ACTIVE lease is a no-op (it has
-            # already expired), so it falls through to the idempotent post.
-            lease = _find_lease(cluster, released_id)
-            if lease is not None and not _may_act_on(lease, actor):
-                return JSONResponse(
-                    {"error": "not the lease holder", "lease_id": released_id},
-                    status_code=403,
-                )
-        else:
-            # No lease_id: find this actor's lease on the node. An omitted
-            # `resource` is resolved from the worker's inventory, but that
-            # inventory can have moved since the claim, so fall back to the
-            # actor's single lease on the node rather than an exact resource
-            # lookup that may no longer match (and would leave the lease alive
-            # while the bus reports the node free).
-            canonical_node = _canonical_node(cluster, node)
-            if (body.resource or "").strip():
+    # Serialize with the claims this line closes, on the same resource: the lease
+    # the id names (if any) owns the resource and was taken under a bus identity
+    # (an operator's release by id queues behind THAT identity's re-claim); a
+    # node-scoped release keys on the request exactly as the claim did.
+    _named = _find_lease(cluster, body.lease_id) if cluster is not None and body.lease_id is not None else None
+    _rid = (
+        _named.resource_id
+        if _named is not None and getattr(_named, "resource_id", None)
+        else _lock_resource(cluster, node, body.resource)
+    )
+    _who = (_lease_bus_identity(_named) if _named is not None else None) or actor.identity
+    async with _holder_lock(_who, _rid):
+        released_id = body.lease_id
+        lease = None
+        if cluster is not None:
+            if released_id is not None:
+                # A caller-supplied id must belong to the caller: releasing another
+                # holder's lease (and posting the RELEASE that clears its bus claim)
+                # would hand any agent with a2a_send the power to free someone
+                # else's GPU. An id that names no ACTIVE lease is a no-op (it has
+                # already expired), so it falls through to the idempotent post.
+                lease = _find_lease(cluster, released_id)
+                if lease is not None and not _may_act_on(lease, actor):
+                    return JSONResponse(
+                        {"error": "not the lease holder", "lease_id": released_id},
+                        status_code=403,
+                     )
+                if lease is None:
+                    newer = _lease_for_actor(cluster, _resource_id(_canonical_node(cluster, node), body.resource), actor)
+                    if newer is not None and newer.lease_id != released_id:
+                        return JSONResponse(
+                            {"status": "already_released", "node": node, "holder": actor.holder, "lease_id": released_id, "current_lease_id": newer.lease_id}
+                        )
+
+            else:
                 lease = _lease_for_actor(
                     cluster,
-                    _resource_id(canonical_node, body.resource, cluster),
+                    _resource_id(_canonical_node(cluster, node), body.resource),
                     actor,
                 )
-            else:
-                lease = _lease_for_actor_on_node(cluster, canonical_node, actor)
-            released_id = lease.lease_id if lease is not None else None
+                released_id = lease.lease_id if lease is not None else None
 
-    # A lease found by id OWNS the release's node and channel: the request's
-    # `node`/`channel` are free text, so honouring them would post a RELEASE
-    # for a different resource - on a thread the claim was never on - and only
-    # then delete the identified local lease, leaving the real claim open
-    # (CR on #2988). Request values stand for a bus-only release with no
-    # matching lease, which is the idempotent "the node is free" post.
-    if lease is not None:
-        node = (lease.resource_id or "").partition(":")[0] or node
-        channel = getattr(lease, "claim_channel", "") or channel
+        # A lease found by id OWNS the release's node and channel: the request's
+        # `node`/`channel` are free text, so honouring them would post a RELEASE
+        # for a different resource - on a thread the claim was never on - and only
+        # then delete the identified local lease, leaving the real claim open
+        # (CR on #2988). Request values stand for a bus-only release with no
+        # matching lease, which is the idempotent "the node is free" post.
+        if lease is not None:
+            node = (lease.resource_id or "").partition(":")[0] or node
+            channel = getattr(lease, "claim_channel", "") or channel
 
-    # Whose claim the [GPU RELEASE] closes. An operator freeing another holder's
-    # lease by explicit id must attribute the line to THAT holder: a claim is
-    # keyed on its bus AUTHOR, so a line posted as @operator clears nothing and
-    # every peer's fold keeps reading the node as claimed while the local lease
-    # is already gone (CodeRabbit on #2988). A bus that authenticates senders
-    # refuses the substitution, and the post-before-release ordering below then
-    # leaves the local lease intact, so the override cannot half-apply.
-    line_actor = (
-        actor if lease is None else await _claim_holder_actor(request, lease, actor)
-    )
+        # Whose claim the [GPU RELEASE] closes. An operator freeing another holder's
+        # lease by explicit id must attribute the line to THAT holder: a claim is
+        # keyed on its bus AUTHOR, so a line posted as @operator clears nothing and
+        # every peer's fold keeps reading the node as claimed while the local lease
+        # is already gone (CodeRabbit on #2988). A bus that authenticates senders
+        # refuses the substitution, and the post-before-release ordering below then
+        # leaves the local lease intact, so the override cannot half-apply.
+        line_actor = (
+            actor if lease is None else await _claim_holder_actor(request, lease, actor)
+        )
 
-    # Post BEFORE releasing the local lease, so a bus failure changes nothing
-    # and the caller can retry. Releasing first would free the node here while
-    # peers still read an open claim, i.e. block a node that is actually free
-    # (Kilo review of #2988). release_lease itself is an idempotent in-memory
-    # pop, so the two halves cannot be left disagreeing in the other direction.
-    line = render_release(node, line_actor.holder)
-    posted = await _post_line(channel, line_actor, line)
-    if released_id is not None and cluster is not None:
-        await cluster.release_lease(released_id)
-    return {
-        "status": "released",
-        "node": node,
-        "holder": actor.holder,
-        "released_holder": line_actor.holder,
-        "lease_id": released_id,
-        "line": line,
-        "channel": channel,
-        "message": posted,
-    }
+        # Epoch to fence on: caller-supplied epoch takes precedence, else the
+        # lease's own epoch. This matches the renew path and the docs contract.
+        fence_epoch = body.epoch if body.epoch is not None else getattr(lease, "epoch", None)
+
+        # Before posting, re-check the lease still exists with the same epoch.
+        # If it was replaced between _find_lease and now, refuse without posting.
+        if released_id is not None and cluster is not None and fence_epoch is not None:
+            current = _find_lease(cluster, released_id)
+            if current is not None and getattr(current, "epoch", None) != fence_epoch:
+                return JSONResponse(
+                    {"status": "denied", "reason": "lease was replaced; nothing released"},
+                    status_code=409,
+                )
+
+        # Post BEFORE releasing the local lease, so a bus failure changes nothing
+        # and the caller can retry. Releasing first would free the node here while
+        # peers still read an open claim, i.e. block a node that is actually free
+        # (Kilo review of #2988). release_lease itself is an idempotent in-memory
+        # pop, so the two halves cannot be left disagreeing in the other direction.
+        line = render_release(node, line_actor.holder)
+        posted = await _post_line(channel, line_actor, line)
+        if released_id is not None and cluster is not None:
+            ok = await cluster.release_lease(released_id, epoch=fence_epoch)
+            if not ok:
+                return JSONResponse(
+                    {
+                        "status": "release_refused",
+                        "reason": "lease was replaced after bus post; release not applied",
+                        "line": line,
+                        "channel": channel,
+                    },
+                    status_code=409,
+                )
+        return {
+            "status": "released",
+            "node": node,
+            "holder": actor.holder,
+            "released_holder": line_actor.holder,
+            "lease_id": released_id,
+            "epoch": getattr(lease, "epoch", None),
+            "line": line,
+            "channel": channel,
+            "message": posted,
+        }
 
 
 @router.post("/api/a2a/gpu/request")
@@ -994,7 +1079,9 @@ async def gpu_renew(request: Request, body: RenewBody):
     # seen lapse. Reading the expiry here instead would be stale as soon as a
     # concurrent renewal lands (CR on #2988).
     lease, previous_expiry = await cluster.renew_lease_with_previous(
-        body.lease_id, ttl_seconds=float(body.ttl_seconds)
+        body.lease_id,
+        ttl_seconds=float(body.ttl_seconds),
+        epoch=body.epoch,
     )
     if lease is None:
         return JSONResponse(
@@ -1050,6 +1137,7 @@ async def gpu_renew(request: Request, body: RenewBody):
     return {
         "status": "renewed",
         "lease_id": lease.lease_id,
+        "epoch": lease.epoch,
         "resource_id": lease.resource_id,
         "expires_at": lease.expires_at,
         "line": line,

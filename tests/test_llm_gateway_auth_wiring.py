@@ -1,5 +1,7 @@
 """G2 wiring: node/agent revocation cuts gateway access, and the middleware
-exempts exactly the two gateway method+path pairs.
+exempts exactly the four gateway method+path pairs (embeddings joined models
+and chat completions in LiteLLM removal stage 2a; local speech-to-text
+transcriptions joined them after).
 
 All through the real app (create_app on a tmp data dir, gateway flag on) and
 the real gateway routes.
@@ -26,6 +28,9 @@ from test_llm_gateway_auth import (  # noqa: F401
     gateway_client,
 )
 from test_routes_cluster_pairing import pair_worker, sign_worker_request
+
+TRANSCRIPTIONS = "/api/llm/v1/audio/transcriptions"
+SPEECH = "/api/llm/v1/audio/speech"
 
 
 @pytest_asyncio.fixture(scope="module", loop_scope="module", autouse=True)
@@ -181,7 +186,7 @@ class TestAgentArchiveCutsModelAccess:
 
 
 # ---------------------------------------------------------------------------
-# Middleware exemption: exactly two method+path pairs
+# Middleware exemption: exactly five method+path pairs
 # ---------------------------------------------------------------------------
 
 
@@ -189,6 +194,9 @@ class TestExemptionUnit:
     def test_exact_pairs_exempt(self):
         assert _is_exempt("POST", CHAT)
         assert _is_exempt("GET", MODELS)
+        assert _is_exempt("POST", "/api/llm/v1/embeddings")
+        assert _is_exempt("POST", TRANSCRIPTIONS)
+        assert _is_exempt("POST", SPEECH)
 
     @pytest.mark.parametrize("method,path", [
         ("GET", CHAT),
@@ -204,7 +212,18 @@ class TestExemptionUnit:
         ("POST", "/api/llm/v1/chat/completions/"),
         ("POST", "/api/llm/v1/chat/completions/x"),
         ("POST", "/api/llm/v1/completions"),
-        ("POST", "/api/llm/v1/embeddings"),
+        ("GET", "/api/llm/v1/embeddings"),
+        ("POST", "/api/llm/v1/embeddings/"),
+        ("GET", TRANSCRIPTIONS),
+        ("PUT", TRANSCRIPTIONS),
+        ("POST", TRANSCRIPTIONS + "/"),
+        ("POST", "/api/llm/v1/audio"),
+        ("POST", "/api/llm/v1/audio/translations"),
+        ("GET", SPEECH),
+        ("PUT", SPEECH),
+        ("POST", SPEECH + "/"),
+        ("POST", "/api/llm/v1/Audio/speech"),
+        ("POST", "/api/llm/v1/Audio/transcriptions"),
         ("GET", "/api/llm/v1"),
         ("GET", "/api/llm/v1/"),
         ("GET", "/api/llm/v1/Models"),
@@ -229,9 +248,18 @@ class TestExemptionThroughRealMiddleware:
         # Reaching the route: a body the route rejects (400), not the gate (401).
         resp = await bare.post(CHAT, json={"model": "gpt-small"}, headers=_h(key))
         assert resp.status_code == 400, resp.text
+        resp = await bare.post("/api/llm/v1/embeddings", json={"model": "gpt-small"}, headers=_h(key))
+        assert resp.status_code == 400, resp.text
+        # JSON is not the multipart upload the route wants: the route's 400, not the gate's 401.
+        resp = await bare.post(TRANSCRIPTIONS, json={"model": "gpt-small"}, headers=_h(key))
+        assert resp.status_code == 400, resp.text
+        resp = await bare.post(SPEECH, json={"model": "gpt-small"}, headers=_h(key))
+        assert resp.status_code == 400, resp.text
 
     async def test_exempt_pairs_without_key_are_401(self, bare):
-        for resp in (await bare.get(MODELS), await bare.post(CHAT, json={})):
+        for resp in (await bare.get(MODELS), await bare.post(CHAT, json={}),
+                     await bare.post(TRANSCRIPTIONS, json={}),
+                     await bare.post(SPEECH, json={})):
             _assert_openai_401(resp)
 
     @pytest.mark.parametrize("method,path", [
@@ -242,7 +270,10 @@ class TestExemptionThroughRealMiddleware:
         ("GET", "/api/llm/v2/models"),
         ("POST", "/api/llm/v2/chat/completions"),
         ("GET", "/api/llm/v1/models/x"),
-        ("POST", "/api/llm/v1/embeddings"),
+        ("GET", "/api/llm/v1/embeddings"),
+        ("GET", TRANSCRIPTIONS),
+        ("GET", SPEECH),
+        ("POST", "/api/llm/v1/audio/speeches"),
     ])
     async def test_neighbours_stay_gated_with_a_gateway_key(self, bare, app, method, path):
         """A neighbour that got past the middleware would answer 404/405; the

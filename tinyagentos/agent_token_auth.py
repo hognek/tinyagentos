@@ -66,6 +66,76 @@ def _grant_unexpired(expires_at, now: datetime) -> bool:
     return exp > now
 
 
+async def active_project_grants(
+    registry,
+    grants_store,
+    canonical_id: str,
+    scope: str,
+    now: datetime | None = None,
+) -> set[str]:
+    """Return the set of project_ids for which *canonical_id* holds an active
+    grant of *scope*.
+
+    This predicate is usable outside an HTTP request (no Request, no fastapi
+    exceptions). It returns an empty set for a missing or non-active registry
+    record. The same ``_grant_unexpired`` logic and fail-closed parsing are used
+    as the HTTP-layer checks.
+
+    Args:
+        registry: An object with an async ``get(canonical_id) -> dict | None``
+            method (e.g. AgentRegistryStore).
+        grants_store: An object with an async ``list_grants(canonical_id) ->
+            list[dict]`` method (e.g. AgentGrantsStore).
+        canonical_id: The agent's canonical registry id.
+        scope: The grant scope to filter on (e.g. "project_tasks").
+        now: Optional reference time for expiry checks. Defaults to
+            ``datetime.now(timezone.utc)``.
+
+    Returns:
+        Set of project_id strings for active, unexpired grants of the given
+        scope. Empty if the agent is not active, has no grants, or all matching
+        grants are expired/unparseable.
+    """
+    by_project = await _active_project_grants_by_project(
+        registry, grants_store, canonical_id, scope, now
+    )
+    return set(by_project.keys())
+
+
+async def _active_project_grants_by_project(
+    registry,
+    grants_store,
+    canonical_id: str,
+    scope: str,
+    now: datetime | None = None,
+) -> dict[str, dict]:
+    """Internal helper returning active grants keyed by project_id.
+
+    Same logic as ``active_project_grants`` but preserves the full grant dict
+    for each project. Used by ``check_agent_project_grants`` to avoid
+    re-fetching grants.
+    """
+    record = await registry.get(canonical_id)
+    if record is None or record.get("status") != "active":
+        return {}
+
+    if now is None:
+        now = datetime.now(timezone.utc)
+
+    grants = await grants_store.list_grants(canonical_id)
+    by_project: dict[str, dict] = {}
+    for g in grants:
+        if g.get("scope") != scope:
+            continue
+        pid = g.get("project_id")
+        if not pid:
+            continue
+        if not _grant_unexpired(g.get("expires_at"), now):
+            continue
+        by_project[pid] = g
+    return by_project
+
+
 def _enforce_rotation_cutoff(record: dict, payload: dict) -> None:
     """Reject a token issued before the identity's ``token_min_iat`` cutoff.
 
@@ -187,6 +257,35 @@ async def check_agent_scope(request: Request, required_scope: str) -> Optional[s
     return canonical_id
 
 
+async def registry_agent_caller(request: Request, required_scope: str) -> Optional[str]:
+    """Resolve a session-or-agent caller the way ``_authorize_task_actor``
+    (routes/projects.py) does, for routes that are NOT project-bound.
+
+    Resolution order:
+      1. An authenticated session (or local token) already set
+         ``request.state.user_id`` -> return None; the caller takes its
+         existing human path unchanged.
+      2. No Bearer, or a device bearer (``taosdev_`` prefix) -> return None;
+         the caller's own session/device handling decides.
+      3. Any other Bearer is treated as a registry JWT and verified exactly as
+         ``check_agent_scope`` (401 bad token, 403 inactive agent or missing
+         *required_scope* grant).  Returns the agent's canonical_id.
+
+    A human-principal registry token returns None (as ``check_agent_scope``
+    does) and so falls through to the caller's human path, which 401s it.
+    """
+    if getattr(request.state, "user_id", None):
+        return None
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.lower().startswith("bearer "):
+        return None
+    from tinyagentos.device_store import DEVICE_TOKEN_PREFIX
+
+    if auth_header[7:].strip().startswith(DEVICE_TOKEN_PREFIX):
+        return None
+    return await check_agent_scope(request, required_scope)
+
+
 async def check_human_identity(request: Request) -> Optional[str]:
     """Return the user_id from a valid Bearer registry JWT for a HUMAN principal.
 
@@ -234,15 +333,14 @@ async def check_human_identity(request: Request) -> Optional[str]:
     return user_id
 
 
-async def check_agent_identity(request: Request) -> Optional[str]:
-    """Return the canonical_id from a valid Bearer registry JWT for an ACTIVE
+async def check_agent_identity_claims(request: Request) -> Optional[tuple[str, int]]:
+    """Return (canonical_id, iat) from a valid Bearer registry JWT for an ACTIVE
     agent, without requiring any scope grant.
 
-    This proves only *who* the caller is, not *what* it may do — the caller is
-    responsible for the authorization decision (e.g. only allowing an agent to
-    act on its OWN canonical_id).  It is used by the scope-request create flow,
-    where an already-registered agent asks for MORE scopes: it must not need a
-    scope it does not yet hold in order to request one.
+    This proves only *who* the caller is and *when* the token was issued. The
+    caller is responsible for the authorization decision. Used by the auth-request
+    create flow to store the token's iat so a later token rotation can be detected
+    at approve time.
 
     Returns None when no Authorization header is present (the caller falls
     through to its own admin/session handling).
@@ -275,14 +373,36 @@ async def check_agent_identity(request: Request) -> Optional[str]:
         raise HTTPException(status_code=403, detail="agent is not active in the registry")
 
     # Reject tokens issued before the identity's token_min_iat cutoff (rotation),
-    # exactly as check_agent_scope and check_agent_scope_for_project do. Identity
-    # is the ONLY auth on the surfaces that do not need a grant -- creating a
-    # scope request, the agent decisions routes, container-provisioning requests,
-    # the auth-request flow -- so skipping it here would leave rotate-tokens
-    # unable to kill a leaked token on precisely the route that can widen its own
-    # privileges.
+    # exactly as check_agent_scope and check_agent_scope_for_project do.
     _enforce_rotation_cutoff(record, payload)
 
+    iat = payload.get("iat") or 0
+    return canonical_id, iat
+
+
+async def check_agent_identity(request: Request) -> Optional[str]:
+    """Return the canonical_id from a valid Bearer registry JWT for an ACTIVE
+    agent, without requiring any scope grant.
+
+    This proves only *who* the caller is, not *what* it may do — the caller is
+    responsible for the authorization decision (e.g. only allowing an agent to
+    act on its OWN canonical_id).  It is used by the scope-request create flow,
+    where an already-registered agent asks for MORE scopes: it must not need a
+    scope it does not yet hold in order to request one.
+
+    Returns None when no Authorization header is present (the caller falls
+    through to its own admin/session handling).
+
+    Raises:
+      401 -- Authorization header present but the token is malformed, has a bad
+             signature, is missing the sub claim, or was superseded by a token
+             rotation on the identity.
+      403 -- Token is valid but the agent is not active in the registry.
+    """
+    result = await check_agent_identity_claims(request)
+    if result is None:
+        return None
+    canonical_id, _iat = result
     return canonical_id
 
 
@@ -385,16 +505,7 @@ async def check_agent_project_grants(
     _enforce_rotation_cutoff(record, payload)
 
     grants_store = _get_grants_store(request)
-    grants = await grants_store.list_grants(canonical_id)
-    now = datetime.now(timezone.utc)
-    by_project: dict[str, dict] = {}
-    for g in grants:
-        if g.get("scope") != required_scope:
-            continue
-        pid = g.get("project_id")
-        if not pid:
-            continue
-        if not _grant_unexpired(g.get("expires_at"), now):
-            continue
-        by_project[pid] = g
+    by_project = await _active_project_grants_by_project(
+        registry, grants_store, canonical_id, required_scope, now=datetime.now(timezone.utc)
+    )
     return canonical_id, by_project

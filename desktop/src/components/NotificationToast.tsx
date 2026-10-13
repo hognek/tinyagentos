@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { X, Info, CheckCircle, AlertTriangle, AlertCircle, Server, Bot, BellOff } from "lucide-react";
 import { useNotificationStore, type Notification } from "@/stores/notification-store";
 import { useProcessStore } from "@/stores/process-store";
@@ -18,6 +18,8 @@ const LEVEL_COLORS = {
   warning: "text-amber-400 bg-amber-500/10 border-amber-500/20",
   error: "text-red-400 bg-red-500/10 border-red-500/20",
 };
+
+const TOAST_AUTO_DISMISS_MS = 5000;
 
 /* ------------------------------------------------------------------ */
 /*  Model picker modal for agent.paused notifications                  */
@@ -265,13 +267,13 @@ function extractTagged(text: string, tag: string): string | undefined {
 /*  ToastItem                                                          */
 /* ------------------------------------------------------------------ */
 
-function ToastItem({ notif, onExpire }: { notif: Notification; onExpire: () => void }) {
+function ToastItem({ notif, onExpire, fullWidth = false }: { notif: Notification; onExpire: (id: string) => void; fullWidth?: boolean }) {
   const dismiss = useNotificationStore((s) => s.dismiss);
   const archiveRead = useNotificationStore((s) => s.archiveRead);
   const Icon = LEVEL_ICONS[notif.level];
   const isAgentPaused = notif.source === "agent.paused";
   const consent = (notif.source === "auth_requests" || notif.source === "agent_scope_requests") ? consentPayload(notif.data) : null;
-  // Stable boolean for the effect dependency — using the `consent` object
+  // Stable boolean for the effect dependency: using the `consent` object
   // would recreate the timer on every render because consentPayload() returns
   // a new object reference each time.
   const isConsentToast = consent !== null;
@@ -282,13 +284,15 @@ function ToastItem({ notif, onExpire }: { notif: Notification; onExpire: () => v
     // Auto-expiry only hides the toast; it must NOT archive. Archiving is an
     // explicit user action (the X button / "Keep paused"). Otherwise every
     // toast that simply times out would silently fill the History view.
-    const timer = setTimeout(onExpire, 5000);
+    // onExpire is a stable callback (see NotificationToasts) so parent
+    // re-renders on mobile do not reset this timer.
+    const timer = setTimeout(() => onExpire(notif.id), TOAST_AUTO_DISMISS_MS);
     return () => clearTimeout(timer);
   }, [notif.id, onExpire, isAgentPaused, isConsentToast]);
 
   return (
     <div
-      className={`flex items-start gap-3 p-3 rounded-xl border backdrop-blur-lg shadow-xl w-80 ${LEVEL_COLORS[notif.level]}`}
+      className={`flex items-start gap-3 p-3 rounded-xl border backdrop-blur-lg shadow-xl ${fullWidth ? "w-full" : "w-80"} ${LEVEL_COLORS[notif.level]}`}
       style={{ backgroundColor: "var(--color-dock-bg)" }}
       role="alert"
       aria-live="assertive"
@@ -333,11 +337,19 @@ function ToastItem({ notif, onExpire }: { notif: Notification; onExpire: () => v
 // still populates the bell; it just does not pop.
 const TOAST_FRESH_MS = 20_000;
 
-export function NotificationToasts() {
+export function NotificationToasts({ topInset }: { topInset?: string } = {}) {
   const notifications = useNotificationStore((s) => s.notifications);
   // Each notification toasts at most once per session.
   const toastedRef = useRef<Set<string>>(new Set());
   const [toastIds, setToastIds] = useState<string[]>([]);
+
+  // Stable callback: the ToastItem effect depends on this reference, so a
+  // stable identity prevents mobile shell re-renders from resetting the
+  // per-toast dismiss timer (which previously kept info toasts glued to
+  // the home grid).
+  const handleExpire = useCallback((id: string) => {
+    setToastIds((prev) => prev.filter((toastId) => toastId !== id));
+  }, []);
 
   useEffect(() => {
     const now = Date.now();
@@ -358,7 +370,10 @@ export function NotificationToasts() {
 
   return (
     <div
-      className="fixed top-12 right-4 z-[10001] flex flex-col gap-2 pointer-events-auto"
+      // Mobile passes the top bar height: toasts sit full width just below
+      // the top bar, as on a phone.
+      className={`fixed z-[10001] flex flex-col gap-2 pointer-events-auto ${topInset ? "left-4 right-4" : "top-12 right-4"}`}
+      style={topInset ? { top: `calc(${topInset} + 8px)` } : undefined}
       aria-label="Notifications"
       role="region"
     >
@@ -366,7 +381,8 @@ export function NotificationToasts() {
         <ToastItem
           key={n.id}
           notif={n}
-          onExpire={() => setToastIds((prev) => prev.filter((id) => id !== n.id))}
+          fullWidth={!!topInset}
+          onExpire={handleExpire}
         />
       ))}
     </div>
