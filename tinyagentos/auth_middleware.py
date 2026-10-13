@@ -13,7 +13,9 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import HTMLResponse, RedirectResponse
 
-from tinyagentos.agent_token_auth import _get_keypair, _get_store, check_agent_identity
+from tinyagentos.agent_token_auth import (
+    _enforce_rotation_cutoff, _get_keypair, _get_store, check_agent_identity,
+)
 from tinyagentos.auth import AuthStoreCorruptError
 from tinyagentos.device_scopes import (
     AGENTS_READ, CHAT_SEND, DECISIONS_ANSWER, FILES_UPLOAD, LIBRARY_INGEST,
@@ -164,6 +166,7 @@ _AGENT_TOKEN_PATHS = (
         "/api/desktop/command",
         "/api/desktop/screenshot",
         "/api/desktop/layout",
+        "/api/desktop/panel-shot",
     })
 )
 
@@ -309,13 +312,18 @@ _AGENT_DECISIONS_ROUTES = (
     ("GET", re.compile(r"^/api/decisions/[^/]+/agent$")),
     ("GET", re.compile(r"^/api/decisions/agent$")),
     ("POST", re.compile(r"^/api/decisions/[^/]+/withdraw$")),
+    # tsk-f75p3z: the plain list. With a registry JWT the route returns ONLY
+    # the agent's own decisions (same set as /api/decisions/agent).
+    ("GET", re.compile(r"^/api/decisions$")),
 )
 
-# Notification route an agent may reach with its own registry JWT (scope
-# notifications_write). POST /api/notifications only.  The route verifies
-# the JWT + grant + project binding.  GET and mark-read stay session-only.
+# Notification routes an agent may reach with its own registry JWT (scope
+# notifications_write). POST creates; GET (tsk-f75p3z) lists ONLY the
+# notifications that agent posted.  The route verifies the JWT + grant (+
+# project binding on POST).  Count, mark-read and archive stay session-only.
 _AGENT_NOTIFICATIONS_ROUTES = (
     ("POST", re.compile(r"^/api/notifications$")),
+    ("GET", re.compile(r"^/api/notifications$")),
 )
 
 # Device-bearer self-service paths (lock-screen push-token rotation plus
@@ -469,14 +477,16 @@ def _is_agent_decisions_path(method: str, path: str) -> bool:
       - GET  /api/decisions/{id}/agent        -> decisions_write (read own)
       - GET  /api/decisions/agent             -> decisions_write (list own)
       - POST /api/decisions/{id}/withdraw     -> decisions_write (withdraw own)
+      - GET  /api/decisions                   -> decisions_write (list own)
     The route verifies the JWT + grant + project binding."""
     return any(m == method and rx.match(path) for m, rx in _AGENT_DECISIONS_ROUTES)
 
 
 def _is_agent_notifications_path(method: str, path: str) -> bool:
-    """True only for POST /api/notifications, which a notifications_write token
-    may reach.  GET and mark-read stay session-only.  The route verifies the
-    JWT + grant + project binding."""
+    """True only for POST /api/notifications (create) and GET
+    /api/notifications (list own), which a notifications_write token may
+    reach.  Count, mark-read and archive stay session-only.  The route
+    verifies the JWT + grant (+ project binding on POST)."""
     return any(m == method and rx.match(path) for m, rx in _AGENT_NOTIFICATIONS_ROUTES)
 
 
@@ -940,7 +950,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     # agent's token, set user_id to the native agent's user_id
                     # (the owner) so desktop control works. For other agents,
                     # user_id remains None (they cannot drive the desktop).
-                    if path in ("/api/desktop/command", "/api/desktop/screenshot", "/api/desktop/layout") or _is_agent_skill_exec_path(request.method, path):
+                    if path in ("/api/desktop/command", "/api/desktop/screenshot", "/api/desktop/layout", "/api/desktop/panel-shot") or _is_agent_skill_exec_path(request.method, path):
                         # Verify the token and check if it's the native agent.
                         # We do a lightweight verification here; the route will
                         # do the full scope check.
@@ -958,6 +968,9 @@ class AuthMiddleware(BaseHTTPMiddleware):
                                 registry = _get_store(request)
                                 record = await registry.get(canonical_id)
                                 if record and record.get("origin") == NATIVE_AGENT_ORIGIN and record.get("status") == "active":
+                                    # A token superseded by rotation raises here and
+                                    # falls through to registry_jwt_candidate below.
+                                    _enforce_rotation_cutoff(record, payload)
                                     request.state.user_id = record.get("user_id")
                                     request.state.is_admin = False
                                     request.state.via = "registry_jwt_native_agent"

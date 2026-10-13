@@ -9,7 +9,11 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
 
-from tinyagentos.auth_context import CurrentUser
+from tinyagentos.auth_context import (
+    CurrentUser,
+    current_user,
+    require_agent_owner_or_admin,
+)
 from tinyagentos.chat.reactions import maybe_trigger_semantic
 from tinyagentos.device_auth import current_user_or_device
 
@@ -700,6 +704,58 @@ async def edit_message_endpoint(message_id: str, request: Request):
         router_svc = getattr(request.app.state, "agent_chat_router", None)
         if router_svc is not None and channel is not None:
             router_svc.dispatch(updated, channel)
+    return JSONResponse(updated)
+
+
+@router.patch("/api/chat/messages/{message_id}/agent-reply")
+async def edit_agent_reply_endpoint(
+    message_id: str, request: Request, user: CurrentUser = Depends(current_user),
+):
+    """Rewrite the last completed agent reply of a thread in place (#834).
+
+    The stored content changes, so the next turn's context window carries
+    the edited text. Nothing after it is truncated and the agent is not
+    re-run. Any other message (an older agent reply, one still streaming,
+    a rich reply with content blocks, or a non-agent message) is refused
+    with 409.
+    """
+    body = await request.json()
+    if not isinstance(body, dict) or set(body.keys()) - {"content"}:
+        return JSONResponse(
+            {"error": "only 'content' may be edited"}, status_code=400,
+        )
+    content = body.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return JSONResponse({"error": "content required"}, status_code=400)
+    msg_store = request.app.state.chat_messages
+    msg = await msg_store.get_message(message_id)
+    if msg is None or msg.get("deleted_at"):
+        return JSONResponse({"error": "message not found"}, status_code=404)
+    if msg.get("author_type") != "agent":
+        return JSONResponse({"error": "not an agent reply"}, status_code=409)
+    # A per-agent local token maps to the admin user, so the owner check
+    # alone would let agent A rewrite agent B's reply.
+    bound = _bound_agent(request)
+    if bound and bound != msg["author_id"]:
+        return JSONResponse({"error": "not your reply"}, status_code=403)
+    await require_agent_owner_or_admin(request, user, msg["author_id"])
+    # Recency, state and the no-content-blocks rule are checked in the same
+    # UPDATE that writes, so a reply landing mid-request cannot slip past.
+    # Rich replies render their content_blocks, not content, so a text edit
+    # would change what the agent sees but not what the user sees.
+    if not await msg_store.edit_last_agent_reply(message_id, content):
+        return JSONResponse(
+            {"error": "only the last completed agent reply can be edited"},
+            status_code=409,
+        )
+    updated = await msg_store.get_message(message_id)
+    hub = request.app.state.chat_hub
+    await hub.broadcast(msg["channel_id"], {
+        "type": "message_edit", "seq": hub.next_seq(),
+        "message_id": message_id,
+        "content": updated["content"],
+        "edited_at": updated["edited_at"],
+    })
     return JSONResponse(updated)
 
 

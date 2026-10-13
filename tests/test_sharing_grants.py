@@ -270,8 +270,8 @@ async def test_revoke_grant_non_owner_403(client, app):
 
     # Try to revoke as other user
     from httpx import AsyncClient, ASGITransport
-    import secrets
-    csrf_token = secrets.token_hex(32)
+    from taos_test_csrf import bound_csrf_token
+    csrf_token = bound_csrf_token(app, other_token)
     transport = ASGITransport(app=app)
     async with AsyncClient(
         transport=transport,
@@ -329,8 +329,8 @@ async def test_list_shared_with_me_route(client, app):
     grantee_token = app.state.auth.create_session(user_id=grantee_record["id"], long_lived=True)
 
     from httpx import AsyncClient, ASGITransport
-    import secrets
-    csrf_token = secrets.token_hex(32)
+    from taos_test_csrf import bound_csrf_token
+    csrf_token = bound_csrf_token(app, grantee_token)
     transport = ASGITransport(app=app)
     async with AsyncClient(
         transport=transport,
@@ -367,8 +367,8 @@ async def test_list_shared_with_me_only_active(client, app):
     grantee_token = app.state.auth.create_session(user_id=grantee_record["id"], long_lived=True)
 
     from httpx import AsyncClient, ASGITransport
-    import secrets
-    csrf_token = secrets.token_hex(32)
+    from taos_test_csrf import bound_csrf_token
+    csrf_token = bound_csrf_token(app, grantee_token)
     transport = ASGITransport(app=app)
     async with AsyncClient(
         transport=transport,
@@ -399,8 +399,8 @@ async def test_other_owner_cannot_hijack_active_grant(client, app):
     user_b_token = app.state.auth.create_session(user_id=user_b_record["id"], long_lived=True)
 
     from httpx import AsyncClient, ASGITransport
-    import secrets
-    csrf_token = secrets.token_hex(32)
+    from taos_test_csrf import bound_csrf_token
+    csrf_token = bound_csrf_token(app, user_b_token)
     transport = ASGITransport(app=app)
     async with AsyncClient(
         transport=transport,

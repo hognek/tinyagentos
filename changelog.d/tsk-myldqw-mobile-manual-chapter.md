@@ -1,0 +1,2 @@
+### Added
+- The taOS Agent manual has a phone chapter (`docs/agent-manual/mobile/15-mobile.md`: lock screen and unlocking, home screen, Launchpad, nav bar, volume keys and the agent carousel, location, battery, Phone Mode, demo mode, a dark screen). The chat route appends it to the system prompt only when the effective device class is `mobile`; a persona override still replaces the whole prompt, and the desktop manual build does not include it.

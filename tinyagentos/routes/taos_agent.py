@@ -121,6 +121,32 @@ def _load_manual() -> str:
 
 SYSTEM_PROMPT: str = _load_manual()
 
+# The phone chapter lives in a subdirectory so the desktop manual build (which
+# globs docs/agent-manual/[0-9]*.md) never includes it; the chat route appends
+# it only when the effective device class is "mobile".
+_MOBILE_CHAPTER_PATH = _MANUAL_PATH.parent / "agent-manual" / "mobile" / "15-mobile.md"
+
+
+def _load_mobile_chapter() -> str:
+    try:
+        return _MOBILE_CHAPTER_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        logger.warning("mobile manual chapter not found at %s", _MOBILE_CHAPTER_PATH)
+        return ""
+
+
+MOBILE_CHAPTER: str = _load_mobile_chapter()
+
+
+def _system_prompt_for(persona: str, device_class: str | None) -> str | None:
+    """The taOS Agent's system prompt: a persona override replaces everything,
+    else the manual, plus the phone chapter on a mobile device."""
+    if persona:
+        return persona
+    if device_class == "mobile" and MOBILE_CHAPTER:
+        return f"{SYSTEM_PROMPT}\n\n{MOBILE_CHAPTER}" if SYSTEM_PROMPT else MOBILE_CHAPTER
+    return SYSTEM_PROMPT or None
+
 
 def _mask_key(key: str | None) -> str | None:
     if not key:
@@ -492,9 +518,12 @@ async def chat(request: Request, body: ChatRequest):
         )
 
     app_state = request.app.state
-    # Use persona override if set, else fall back to the built-in manual.
+    # Use persona override if set, else fall back to the built-in manual
+    # (with the phone chapter on a mobile device).
     persona: str = prefs.get("persona", "").strip()
-    system_prompt = persona if persona else (SYSTEM_PROMPT or None)
+    decision = getattr(app_state, "taos_agent_framework_decision", None)
+    device_class = decision.device_class if isinstance(decision, FrameworkDecision) else None
+    system_prompt = _system_prompt_for(persona, device_class)
 
     use_picoclaw = system_agent_framework(app_state) == FRAMEWORK_PICOCLAW
     if use_picoclaw:

@@ -323,6 +323,32 @@ class ChatMessageStore(BaseStore):
         )
         await self._db.commit()
 
+    async def edit_last_agent_reply(self, message_id: str, content: str) -> bool:
+        """Rewrite *message_id* only if it is still the last completed agent reply.
+
+        One conditional UPDATE, so the eligibility check and the write are
+        atomic: the row must be a live, complete agent message with no
+        content blocks, and the most recent live agent message of its thread
+        (top level when ``thread_id`` is NULL; ephemeral rows never count).
+        Returns ``False`` when any condition fails and nothing was written.
+        """
+        cursor = await self._db.execute(
+            "UPDATE chat_messages SET content = ?, edited_at = ?"
+            " WHERE id = ? AND author_type = 'agent' AND deleted_at IS NULL"
+            " AND state = 'complete'"
+            " AND COALESCE(json_array_length(NULLIF(content_blocks, '')), 0) = 0"
+            " AND id = ("
+            "   SELECT latest.id FROM chat_messages AS latest"
+            "   WHERE latest.channel_id = chat_messages.channel_id"
+            "   AND latest.thread_id IS chat_messages.thread_id"
+            "   AND latest.author_type = 'agent'"
+            "   AND latest.deleted_at IS NULL AND latest.ephemeral = 0"
+            "   ORDER BY latest.created_at DESC, latest.rowid DESC LIMIT 1)",
+            (content, time.time(), message_id),
+        )
+        await self._db.commit()
+        return cursor.rowcount == 1
+
     async def set_metadata(self, message_id: str, metadata: dict) -> None:
         await self._db.execute(
             "UPDATE chat_messages SET metadata = ? WHERE id = ?",

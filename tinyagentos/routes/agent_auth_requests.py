@@ -1202,14 +1202,29 @@ async def add_agent_to_project(
 
     # Check for existing deferred grants (project_id=None) with expires_at
     deferred_grants = await grants_store.list_grants(canonical_id)
-    deferred_grant_with_expiry = None
     now = datetime.now(timezone.utc).isoformat()
-    
-    for grant in deferred_grants:
-        if grant.get("project_id") is None and grant.get("expires_at"):
-            deferred_grant_with_expiry = grant
-            break
-    
+    now_dt = datetime.fromisoformat(now)
+
+    candidates = [
+        g for g in deferred_grants
+        if g.get("project_id") is None and g.get("expires_at")
+    ]
+    live = [g for g in candidates if datetime.fromisoformat(g["expires_at"]) > now_dt]
+    deferred_grant_with_expiry = None
+    if candidates and not live:
+        latest_expired = max(
+            candidates, key=lambda g: datetime.fromisoformat(g["expires_at"])
+        )["expires_at"]
+        raise HTTPException(
+            status_code=400,
+            detail=f"cannot bind agent {canonical_id} to project {project_id}: "
+                   f"the agent's deferred grant expired at {latest_expired}",
+        )
+    if live:
+        deferred_grant_with_expiry = min(
+            live, key=lambda g: datetime.fromisoformat(g["expires_at"])
+        )
+
     # Determine the expires_at to use:
     # 1. Use the deferred grant's expiry if it exists and is not expired
     # 2. Otherwise, use the expires_at parameter passed to this function
@@ -1219,14 +1234,7 @@ async def add_agent_to_project(
     if deferred_grant_with_expiry:
         deferred_expires_at = deferred_grant_with_expiry["expires_at"]
         deferred_dt = datetime.fromisoformat(deferred_expires_at)
-        now_dt = datetime.fromisoformat(now)
-        if deferred_dt <= now_dt:
-            raise HTTPException(
-                status_code=400,
-                detail=f"cannot bind agent {canonical_id} to project {project_id}: "
-                       f"the agent's deferred grant expired at {deferred_expires_at}",
-            )
-        elif renew:
+        if renew:
             pass
         elif target_expires_at is None:
             target_expires_at = deferred_expires_at

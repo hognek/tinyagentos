@@ -37,6 +37,8 @@ import { SafetyFloor } from "@/components/SafetyFloor";
 import { withCsrf, getCsrfToken } from "@/lib/csrf";
 import { useLockOnScreenOff } from "@/shell/useLockOnScreenOff";
 import { useHomeKey } from "@/hooks/use-home-key";
+import { useSwitcherKey } from "@/hooks/use-switcher-key";
+import { installShellLinks } from "@/lib/shell-links";
 import { primeDeviceClass } from "@/lib/mobile-shell";
 
 interface SystemShortcutsProps {
@@ -342,6 +344,13 @@ export function App() {
   // The handset nav bar's home button: the open app goes to the background
   // (it stays in the switcher), the home screen shows.
   useHomeKey(mode !== "desktop", handleMobileHome);
+  // The nav bar's switcher button: open it (F14 while open keeps it open).
+  const handleSwitcherKey = useCallback(() => setCardSwitcherOpen(true), []);
+  useSwitcherKey(mode !== "desktop", handleSwitcherKey);
+  // On the handset, links apps open in a new window go to Firefox.
+  useEffect(() => {
+    installShellLinks();
+  }, []);
 
   const handleSelectApp = useCallback((windowId: string) => {
     setActiveWindowId(windowId);

@@ -74,6 +74,7 @@ jobs:
     # merits; raising this stops it corrupting merge decisions in the meantime.
     timeout-minutes: 75
     strategy:
+      fail-fast: false
       matrix:
         # PR + push runs cover the latest two; the daily cron run
         # below adds 3.11 so the minimum-supported version stays tested.
