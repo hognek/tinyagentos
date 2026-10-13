@@ -16,9 +16,9 @@ import { usePushClickHandler } from "@/hooks/use-push-click";
 import { useProcessStore } from "@/stores/process-store";
 import { useDockStore } from "@/stores/dock-store";
 import { getApp, pinnedAppId, pinnedLaunchProps } from "@/registry/app-registry";
-import { MobileDock } from "@/components/mobile/MobileDock";
+import { MobileDock, useMobileDockMetrics } from "@/components/mobile/MobileDock";
 import { CardSwitcher } from "@/components/mobile/CardSwitcher";
-import { MobileTopBar } from "@/components/mobile/MobileTopBar";
+import { MobileTopBar, MOBILE_TOP_BAR_HEIGHT } from "@/components/mobile/MobileTopBar";
 import { MobileAppWindow } from "@/components/mobile/MobileAppWindow";
 import { MobileHomePages } from "@/components/mobile/MobileHomePages";
 import { LoginGate } from "@/components/LoginGate";
@@ -36,6 +36,9 @@ import { EffectsLayer } from "@/theme/effects/EffectsLayer";
 import { SafetyFloor } from "@/components/SafetyFloor";
 import { withCsrf, getCsrfToken } from "@/lib/csrf";
 import { useLockOnScreenOff } from "@/shell/useLockOnScreenOff";
+import { useHomeKey } from "@/hooks/use-home-key";
+import { useSwitcherKey } from "@/hooks/use-switcher-key";
+import { installShellLinks } from "@/lib/shell-links";
 import { primeDeviceClass } from "@/lib/mobile-shell";
 
 interface SystemShortcutsProps {
@@ -216,6 +219,7 @@ export function App() {
   // Browser-mode flag: when on mobile but not in PWA, apply browser-safe
   // layout that accounts for Safari's dynamic URL bar + share/tab bars
   const isBrowserMobile = mode !== "desktop" && !isPwa;
+  const { height: mobileDockHeight } = useMobileDockMetrics(isBrowserMobile);
 
   // On the handset, the power key locks: see useLockOnScreenOff.
   useLockOnScreenOff();
@@ -335,6 +339,17 @@ export function App() {
     setActiveWindowId(null);
     setCardSwitcherOpen(false);
     setSearchOpen(false);
+    setLaunchpadOpen(false);
+  }, []);
+  // The handset nav bar's home button: the open app goes to the background
+  // (it stays in the switcher), the home screen shows.
+  useHomeKey(mode !== "desktop", handleMobileHome);
+  // The nav bar's switcher button: open it (F14 while open keeps it open).
+  const handleSwitcherKey = useCallback(() => setCardSwitcherOpen(true), []);
+  useSwitcherKey(mode !== "desktop", handleSwitcherKey);
+  // On the handset, links apps open in a new window go to Firefox.
+  useEffect(() => {
+    installShellLinks();
   }, []);
 
   const handleSelectApp = useCallback((windowId: string) => {
@@ -424,8 +439,7 @@ export function App() {
       {isBrowserMobile && <InstallPromptBanner />}
       <div className={`relative z-[1] flex-1 flex flex-col overflow-hidden transition-all duration-500 ${launched ? "opacity-100 scale-100" : "opacity-0 scale-95"}`}>
         <MobileTopBar
-          onHome={handleMobileHome}
-          onSearch={() => { setCardSwitcherOpen(false); setSearchOpen((v) => !v); }}
+          onSearch={() => { setCardSwitcherOpen(false); setLaunchpadOpen(false); setSearchOpen((v) => !v); }}
         />
         {/* Main content area */}
         <div className="flex-1 relative overflow-hidden">
@@ -463,9 +477,14 @@ export function App() {
           setLaunchpadOpen(true);
         }}
       />
-      <Launchpad open={launchpadOpen} onClose={() => setLaunchpadOpen(false)} onOpenApp={(wid) => setActiveWindowId(wid)} />
+      <Launchpad
+        open={launchpadOpen}
+        onClose={() => setLaunchpadOpen(false)}
+        onOpenApp={(wid) => setActiveWindowId(wid)}
+        insets={{ top: MOBILE_TOP_BAR_HEIGHT, bottom: mobileDockHeight }}
+      />
       <SearchPalette open={searchOpen} onClose={() => setSearchOpen(false)} onOpenApp={(wid) => setActiveWindowId(wid)} />
-      <NotificationToasts />
+      <NotificationToasts topInset={MOBILE_TOP_BAR_HEIGHT} />
       <NotificationCentre />
       <TaosAssistantPanel />
       <SafetyFloor />

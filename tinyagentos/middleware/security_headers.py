@@ -26,7 +26,7 @@ def _build_csp(frame_src_extra: str = "") -> str:
         "style-src 'self' 'unsafe-inline'; "
         "img-src 'self' data: https: blob:; "
         f"{frame_src}; "
-        # data: lets the canvas (tldraw) load its bundled translation URIs
+        # data: lets the canvas load its bundled translation URIs
         # (data:application/json), which are inline data, not a network fetch.
         # The two open-meteo origins are the geocoding (city search) and
         # forecast APIs the built-in Weather app fetches directly; without them

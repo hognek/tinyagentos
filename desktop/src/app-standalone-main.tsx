@@ -4,6 +4,8 @@ import { AppStandalone } from "./AppStandalone";
 import { AppShell } from "./components/AppShell";
 import { NotificationToasts } from "./components/NotificationToast";
 import { installAuthGuard } from "./lib/auth-guard";
+import { primeDeviceClass } from "./lib/mobile-shell";
+import { installShellLinks } from "./lib/shell-links";
 import { restoreActiveTheme, installWebkitRepaintGuards } from "./stores/theme-store";
 import { getApp } from "./registry/app-registry";
 import "./theme/tokens.css";
@@ -12,6 +14,15 @@ import "./theme/tokens.css";
 // event that LoginGate picks up and shows the login screen (same guard
 // installed by main.tsx for the desktop shell PWA).
 installAuthGuard();
+
+// This window is a taOSmobile shell window when device_class says so: learn
+// that, then send links it opens in a new window to Firefox.
+const PRIME_TIMEOUT_MS = 2000;
+await Promise.race([
+  primeDeviceClass(),
+  new Promise<void>((resolve) => setTimeout(resolve, PRIME_TIMEOUT_MS)),
+]); // render must not wait on a hung config fetch; a late prime still sets device_class for later link opens
+installShellLinks();
 
 // Apply the user's persisted theme on boot, same as chat-main.tsx.
 void restoreActiveTheme();

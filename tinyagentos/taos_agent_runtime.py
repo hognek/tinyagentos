@@ -1,6 +1,6 @@
 """The system taOS Agent's harness: which one runs it, and its lifecycle.
 
-Two harnesses can run the system taOS Agent:
+Three harnesses can run the system taOS Agent:
 
 - opencode (every host by default): a single host ``opencode serve`` used
   exclusively by the taOS agent chat endpoint, started lazily on the first
@@ -9,6 +9,9 @@ Two harnesses can run the system taOS Agent:
 - PicoClaw (a taOSmobile handset by default): one ``picoclaw agent`` process
   per turn, talking to the controller's own LLM gateway with a scoped key
   (see :mod:`tinyagentos.picoclaw_runtime`).
+- Claude Code (operator override only, never chosen by ``auto``): one
+  ``claude -p`` process per turn, signed in with a ``claude setup-token``
+  token kept in the device Secrets (see :mod:`tinyagentos.claude_code_runtime`).
 
 :func:`decide_framework` is the ONE place the choice is made, from
 ``device.class`` / ``taos_agent.framework`` in config.yaml, the detected
@@ -26,7 +29,6 @@ import secrets
 from dataclasses import dataclass
 from pathlib import Path
 
-from tinyagentos.litellm_config import get_litellm_master_key
 from tinyagentos.opencode_runtime import OpenCodeServer, OpenCodeServerConfig
 
 logger = logging.getLogger(__name__)
@@ -35,7 +37,8 @@ TAOS_OPENCODE_PORT = 4188  # local-only port for the taOS agent opencode server
 
 FRAMEWORK_OPENCODE = OpenCodeServer.__name__.split("Server")[0].lower()  # "opencode"
 FRAMEWORK_PICOCLAW = "picoclaw"
-FRAMEWORK_CHOICES = ("auto", FRAMEWORK_OPENCODE, FRAMEWORK_PICOCLAW)
+FRAMEWORK_CLAUDE_CODE = "claude_code"
+FRAMEWORK_CHOICES = ("auto", FRAMEWORK_OPENCODE, FRAMEWORK_PICOCLAW, FRAMEWORK_CLAUDE_CODE)
 DEVICE_CLASS_CHOICES = ("auto", "mobile", "desktop")
 
 #: The gateway principal the PicoClaw-run taOS Agent's key is bound to.
@@ -43,6 +46,8 @@ PICOCLAW_PRINCIPAL = "agent:taos-agent"
 
 REASON_GATEWAY_DISABLED = "picoclaw preferred, gateway disabled, using opencode"
 REASON_NO_BINARY = "picoclaw preferred, picoclaw binary not found, using opencode"
+REASON_NO_CLAUDE_BINARY = "claude_code preferred, claude binary not found, using opencode"
+REASON_NO_CLAUDE_TOKEN = "claude_code preferred, no claude_code_oauth_token secret, using opencode"
 
 
 @dataclass(frozen=True)
@@ -74,14 +79,17 @@ def decide_framework(
     detected_device_class: str | None,
     gateway_enabled: bool,
     picoclaw_available: bool,
+    claude_code_available: bool = False,
+    claude_code_token_present: bool = False,
 ) -> FrameworkDecision:
     """Pick the system taOS Agent's harness. Pure: no I/O besides a warning.
 
-    ``taos_agent.framework`` "opencode"/"picoclaw" is an operator override;
+    ``taos_agent.framework`` "opencode"/"picoclaw"/"claude_code" is an operator override;
     "auto" means picoclaw on a mobile device and opencode everywhere else.
     ``device.class`` "auto" takes the detected class (hardware.py's kiosk-unit
     probe). PicoClaw needs the LLM gateway and the binary; without either,
-    opencode runs and the reason says why.
+    opencode runs and the reason says why. Claude Code needs the ``claude``
+    binary and the token secret, not the gateway.
     """
     dev = _setting(device_class_setting, DEVICE_CLASS_CHOICES, "device.class")
     if dev == "auto":
@@ -100,13 +108,23 @@ def decide_framework(
             return FrameworkDecision(FRAMEWORK_OPENCODE, preference, REASON_GATEWAY_DISABLED, device_class)
         if not picoclaw_available:
             return FrameworkDecision(FRAMEWORK_OPENCODE, preference, REASON_NO_BINARY, device_class)
+    if preference == FRAMEWORK_CLAUDE_CODE:
+        if not claude_code_available:
+            return FrameworkDecision(FRAMEWORK_OPENCODE, preference, REASON_NO_CLAUDE_BINARY, device_class)
+        if not claude_code_token_present:
+            return FrameworkDecision(FRAMEWORK_OPENCODE, preference, REASON_NO_CLAUDE_TOKEN, device_class)
     return FrameworkDecision(preference, preference, why, device_class)
 
 
-def refresh_framework_decision(app_state) -> FrameworkDecision:
+def refresh_framework_decision(app_state, *, claude_code_token_present: bool = False) -> FrameworkDecision:
     """Decide from app_state's config, hardware profile and the gateway flag;
-    store it on ``app_state.taos_agent_framework_decision`` and log it."""
+    store it on ``app_state.taos_agent_framework_decision`` and log it.
+
+    The Secrets store is async, so the caller that wants claude_code honoured
+    awaits :func:`tinyagentos.claude_code_runtime.claude_code_token_present`
+    and passes the answer in."""
     from tinyagentos import llm_gateway
+    from tinyagentos.claude_code_runtime import resolve_claude_binary
     from tinyagentos.picoclaw_runtime import resolve_picoclaw_binary
 
     config = getattr(app_state, "config", None)
@@ -117,6 +135,8 @@ def refresh_framework_decision(app_state) -> FrameworkDecision:
         detected_device_class=getattr(profile, "device_class", None),
         gateway_enabled=llm_gateway.enabled(),
         picoclaw_available=resolve_picoclaw_binary() is not None,
+        claude_code_available=resolve_claude_binary() is not None,
+        claude_code_token_present=claude_code_token_present,
     )
     app_state.taos_agent_framework_decision = decision
     if decision.framework != decision.preference:
@@ -173,9 +193,9 @@ async def ensure_taos_opencode_server(app_state, model: str) -> OpenCodeServer:
     The key is scoped to the full ``permitted_models`` set read from the
     ``taos_agent`` desktop_settings namespace (falls back to ``[model]``).
 
-    If the server was created while LiteLLM was not yet ready (born degraded),
-    it is torn down and rebuilt transparently on the next call once the proxy
-    is running so callers never need to know about the race.
+    Its model calls go to the in-process LLM gateway; there is no LiteLLM
+    readiness race any more (LiteLLM removal 2b-2a removed the "born degraded"
+    rebuild).
 
     Returns the running :class:`~tinyagentos.opencode_runtime.OpenCodeServer`.
     """
@@ -211,30 +231,7 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
         app_state.taos_opencode_sessions = sessions
 
     existing: OpenCodeServer | None = servers.get(model)
-    born_degraded = getattr(app_state, "taos_opencode_born_degraded", None)
-    if born_degraded is None:
-        born_degraded = {}
-        app_state.taos_opencode_born_degraded = born_degraded
 
-
-    # Self-heal: if the cached server was born before LiteLLM was ready and
-    # LiteLLM is now running, tear down the degraded server and fall through
-    # to a fresh build so the key re-scope and model_ids are applied properly.
-    if existing is not None and born_degraded.get(model, False):
-        llm_proxy_check = getattr(app_state, "llm_proxy", None)
-        if llm_proxy_check is not None and llm_proxy_check.is_running():
-            logger.info(
-                "taos_agent_runtime: LiteLLM now ready; rebuilding taOS opencode server "
-                "for %s that was born degraded", model,
-            )
-            try:
-                await existing.stop()
-            except Exception:
-                logger.debug("taos_agent_runtime: error stopping degraded server", exc_info=True)
-            servers.pop(model, None)
-            sessions.pop(model, None)
-            born_degraded[model] = False
-            existing = None
 
     if existing is None:
         # Stop-on-model-change: all per-model servers share TAOS_OPENCODE_PORT,
@@ -257,7 +254,6 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
                     logger.debug("taos_agent_runtime: error stopping old server", exc_info=True)
                 servers.pop(other_model, None)
                 sessions.pop(other_model, None)
-                born_degraded.pop(other_model, None)
         # Clear the legacy session id so the desktop chat path does not feed
         # a stale session from a now-stopped model to the new server.
         app_state.taos_opencode_session_id = None
@@ -271,12 +267,7 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
         if desktop_settings is not None:
             try:
                 prefs = await desktop_settings.get_preference("user", "taos_agent") or {}
-                stored = prefs.get("permitted_models", [])
-                if stored:
-                    # Always ensure the current model is in the set.
-                    permitted_models = list(stored)
-                    if model not in permitted_models:
-                        permitted_models = [model, *permitted_models]
+                permitted_models = permitted_models_for(model, prefs)
                 stored_key = prefs.get("llm_key") or None
             except Exception:
                 logger.debug("taos_agent_runtime: could not read taos_agent prefs", exc_info=True)
@@ -285,21 +276,31 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
         # (re-scoping it to the current permitted set), else mint once and persist
         # it. create_agent_key uses a fixed alias, so re-minting would 400 on the
         # alias collision — persisting the value avoids that and keeps it stable.
+        # The deployer injects TAOS_EMBEDDING_MODEL=taos-embedding-default into
+        # every agent that has an LLM proxy, so the taOS agent's key must also
+        # allow the embedding alias. This is now added inside llm_proxy.create_agent_key.
         llm_proxy = getattr(app_state, "llm_proxy", None)
         litellm_key: str | None = None
-        born_degraded_now = False
-        if llm_proxy is None or not llm_proxy.is_running():
-            born_degraded_now = True
         if stored_key:
             litellm_key = stored_key
             if llm_proxy is not None:
                 try:
                     rescoped = await llm_proxy.update_agent_key(stored_key, permitted_models)
                     if not rescoped:
+                        # The stored key is not in the local key store (legacy
+                        # Postgres key or another agent's key). Mint a fresh
+                        # local-store key so the gateway can accept it.
                         logger.warning(
                             "taos_agent_runtime: re-scoping the taOS agent key returned False "
-                            "(key scope may be stale)"
+                            "(key not in local store); minting a new local-store key"
                         )
+                        litellm_key = _mint_local_taos_agent_key(app_state, permitted_models)
+                        if litellm_key and desktop_settings is not None:
+                            try:
+                                prefs["llm_key"] = litellm_key
+                                await desktop_settings.save_preference("user", "taos_agent", prefs)
+                            except Exception:
+                                logger.debug("taos_agent_runtime: persisting key failed", exc_info=True)
                 except Exception:
                     logger.debug("taos_agent_runtime: re-scoping stored key failed", exc_info=True)
         elif llm_proxy is not None:
@@ -314,7 +315,22 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
                 except Exception:
                     logger.debug("taos_agent_runtime: persisting key failed", exc_info=True)
         if not litellm_key:
-            litellm_key = get_litellm_master_key(getattr(app_state, "data_dir", None))
+            # No key from the key service (none on app.state, or it could
+            # not mint): a key scoped to the permitted models straight from
+            # the local key store, which the LLM gateway accepts.
+            litellm_key = _mint_local_taos_agent_key(app_state, permitted_models)
+            if litellm_key and desktop_settings is not None:
+                try:
+                    prefs["llm_key"] = litellm_key
+                    await desktop_settings.save_preference("user", "taos_agent", prefs)
+                except Exception:
+                    logger.debug("taos_agent_runtime: persisting key failed", exc_info=True)
+        if not litellm_key:
+            logger.error(
+                "taos_agent_runtime: no scoped LLM key could be minted for the taOS "
+                "agent; it starts without one (the LiteLLM master key is never used)"
+            )
+            litellm_key = ""
         app_state.taos_opencode_key = litellm_key
 
         # Get the native agent's scoped credential (rotated token) for taOS API access.
@@ -366,7 +382,7 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
             home=home,
             port=TAOS_OPENCODE_PORT,
             server_password=app_state.taos_opencode_password,
-            litellm_base_url=f"http://127.0.0.1:{llm_proxy.port if llm_proxy is not None else 7834}/v1",
+            litellm_base_url=await _llm_base_url(app_state, permitted_models),
             litellm_key=litellm_key,
             model_ids=permitted_models,
             taos_api_base_url=taos_api_base_url,
@@ -374,7 +390,6 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
         )
         server = OpenCodeServer(cfg)
         servers[model] = server
-        born_degraded[model] = born_degraded_now
         if model not in sessions:
             sessions[model] = None
 
@@ -390,6 +405,66 @@ async def _ensure_taos_opencode_server_locked(app_state, model: str) -> OpenCode
     # spuriously time out the very first taOS-agent chat.
     await server.ensure_running(deadline_s=180.0)
     return server
+
+
+def _mint_local_taos_agent_key(app_state, models: list[str]) -> str | None:
+    """A ``taos-agent`` key scoped to ``models`` from the local key store."""
+    from tinyagentos.litellm_keystore import LiteLLMKeyStore, default_keystore_path
+    from tinyagentos.llm_proxy import scoped_key_models
+
+    data_dir = getattr(app_state, "data_dir", None)
+    if data_dir is None:
+        return None
+    try:
+        return LiteLLMKeyStore(default_keystore_path(Path(data_dir))).mint(
+            "taos-agent", scoped_key_models(models or None))
+    except Exception:
+        logger.warning("taos_agent_runtime: local key store mint failed", exc_info=True)
+        return None
+
+
+def permitted_models_for(model: str, prefs: dict | None) -> list[str]:
+    """The taOS agent's permitted model set: the stored one (current model
+    always included, first when added), else just ``model``."""
+    stored = (prefs or {}).get("permitted_models") or []
+    if not stored:
+        return [model]
+    permitted = list(stored)
+    return permitted if model in permitted else [model, *permitted]
+
+
+async def opencode_gateway_problem(app_state, model: str, prefs: dict | None) -> str | None:
+    """Why the in-process gateway cannot serve opencode's permitted models,
+    or None. Same inputs and checks as the cutover applies to container
+    agents. With LiteLLM gone this no longer picks another path; callers use
+    it to explain a model error up front."""
+    from tinyagentos.llm_gateway.cutover import models_problem
+
+    try:
+        problem = await models_problem(app_state, permitted_models_for(model, prefs))
+    except Exception as exc:  # noqa: BLE001 - unknown routability is a problem
+        problem = f"routability check failed: {type(exc).__name__}"
+    return f"the taOS LLM gateway cannot serve it: {problem}" if problem else None
+
+
+async def _llm_base_url(app_state, models: list[str]) -> str:
+    """Where the taOS agent's opencode sends model calls: the in-process LLM
+    gateway on this controller. It is the only LLM path since LiteLLM removal
+    2b-2a; a model the gateway cannot route is logged here and answered with a
+    model error at request time."""
+    from tinyagentos.llm_gateway.cutover import models_problem
+    from tinyagentos.llm_gateway.router import PREFIX
+
+    try:
+        problem = await models_problem(app_state, models)
+    except Exception as exc:  # noqa: BLE001 - logged, the gateway is still the path
+        problem = f"routability check failed: {type(exc).__name__}"
+    if problem:
+        logger.warning("taos_agent_runtime: the LLM gateway cannot serve the taOS agent's models: %s",
+                       problem)
+    config = getattr(app_state, "config", None)
+    port = int((getattr(config, "server", None) or {}).get("port", 6969))
+    return f"http://127.0.0.1:{port}{PREFIX}"
 
 
 async def stop_taos_opencode_server(app_state) -> None:
@@ -416,7 +491,6 @@ async def stop_taos_opencode_server(app_state) -> None:
             logger.debug("taos_agent_runtime: error during stop", exc_info=True)
     app_state.taos_opencode_servers = {}
     app_state.taos_opencode_sessions = {}
-    app_state.taos_opencode_born_degraded = {}
     app_state.taos_opencode_session_id = None
 
 # ---------------------------------------------------------------------------
@@ -582,11 +656,69 @@ async def ensure_taos_picoclaw_harness(app_state):
         return await _provision_picoclaw_locked(app_state, models)
 
 
+async def ensure_taos_claude_code_harness(app_state, model: str, system_prompt: str | None):
+    """The Claude Code harness for ``model`` and ``system_prompt``.
+
+    Reads the token from the Secrets store at provision time (it is never in
+    the controller env) and caches the harness on
+    ``app_state.taos_claude_code_harness``; rebuilt when the model, the system
+    prompt or the token changes. Raises ``ClaudeCodeBinaryNotFoundError`` when
+    ``claude`` is missing and ``ClaudeCodeTokenMissingError`` without the secret.
+    """
+    from tinyagentos.claude_code_runtime import (
+        CLAUDE_CODE_TOKEN_SECRET,
+        ClaudeCodeBinaryNotFoundError,
+        ClaudeCodeHarness,
+        ClaudeCodeTokenMissingError,
+        home_for,
+        resolve_claude_binary,
+    )
+
+    binary = resolve_claude_binary()
+    if binary is None:
+        raise ClaudeCodeBinaryNotFoundError("claude binary not found")
+    store = getattr(app_state, "secrets", None)
+    row = await store.get(CLAUDE_CODE_TOKEN_SECRET) if store is not None else None
+    token = (row or {}).get("value") or ""
+    if not token:
+        raise ClaudeCodeTokenMissingError(CLAUDE_CODE_TOKEN_SECRET)
+    harness = getattr(app_state, "taos_claude_code_harness", None)
+    if (
+        harness is not None
+        and harness.model == model
+        and harness.system == system_prompt
+        and harness.token == token
+        and harness.binary == binary
+    ):
+        return harness
+    harness = ClaudeCodeHarness(
+        home=home_for(app_state.data_dir), token=token, model=model,
+        binary=binary, system=system_prompt,
+    )
+    harness.write_home()
+    app_state.taos_claude_code_harness = harness
+    return harness
+
+
 async def apply_framework(app_state) -> FrameworkDecision:
     """Re-decide and make the running harness match: the agent restarts, the
     controller does not. Leaving PicoClaw revokes its key; entering it stops
-    opencode and provisions PicoClaw (a fresh key, a fresh config)."""
-    decision = refresh_framework_decision(app_state)
+    opencode and provisions PicoClaw (a fresh key, a fresh config). Claude
+    Code needs no provisioning here: its harness is built per chat request
+    from the token in Secrets."""
+    from tinyagentos.claude_code_runtime import claude_code_token_present
+
+    decision = refresh_framework_decision(
+        app_state, claude_code_token_present=await claude_code_token_present(app_state))
+    if decision.framework == FRAMEWORK_CLAUDE_CODE:
+        await stop_taos_opencode_server(app_state)
+        async with _picoclaw_lock(app_state):
+            retire_picoclaw(app_state)
+        app_state.taos_claude_code_harness = None
+        app_state.taos_claude_code_session_id = None
+        return decision
+    app_state.taos_claude_code_harness = None
+    app_state.taos_claude_code_session_id = None
     if decision.framework == FRAMEWORK_PICOCLAW:
         await stop_taos_opencode_server(app_state)
         await provision_picoclaw(app_state)

@@ -14,6 +14,7 @@ from tinyagentos.contacts_store import ContactsStore, generate_peer_token, _hash
 from tinyagentos.peer import (
     build_envelope,
     deliver_handshake,
+    local_contact_id,
     resolve_local_identity_id,
     verify_envelope,
     verify_envelope_signature,
@@ -22,6 +23,8 @@ from tinyagentos.peer import (
 
 # Local hub username used in route integration tests.
 _TEST_HUB_USERNAME = "testnode"
+# A well-formed remote contact id for envelope unit tests (any 64-hex fingerprint).
+_PEER_ID = "hub:" + "ab" * 32
 
 
 # ---------------------------------------------------------------------------
@@ -289,15 +292,16 @@ class TestContactsStore:
 
 
 class TestPeerEnvelope:
-    def test_build_envelope_structure(self):
+    def test_build_envelope_structure(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
+            to_contact_id=_PEER_ID,
             kind="handshake",
             body={"greeting": "hello"},
         )
-        assert env["from"] == "hub:jaylfc"
-        assert env["to"] == "hub:hogne"
+        assert env["from"] == local_contact_id()
+        assert env["from"].startswith("hub:") and len(env["from"]) == 4 + 64
+        assert env["to"] == _PEER_ID
         assert env["kind"] == "handshake"
         assert env["body"] == {"greeting": "hello"}
         assert "ts" in env
@@ -305,19 +309,19 @@ class TestPeerEnvelope:
         assert "sig" in env
         assert len(env["sig"]) == 128  # 64 bytes hex
 
-    def test_build_envelope_no_body(self):
+    def test_build_envelope_no_body(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
+            to_contact_id=_PEER_ID,
             kind="ack",
         )
         assert "body" not in env
         assert env["kind"] == "ack"
 
-    def test_verify_envelope_fresh(self):
+    def test_verify_envelope_fresh(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
+            to_contact_id=_PEER_ID,
             kind="handshake",
         )
         ok, err = verify_envelope(env)
@@ -329,20 +333,20 @@ class TestPeerEnvelope:
         assert not ok
         assert "missing required field" in err
 
-    def test_verify_envelope_wrong_kind(self):
+    def test_verify_envelope_wrong_kind(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
+            to_contact_id=_PEER_ID,
             kind="handshake",
         )
         ok, err = verify_envelope(env, expected_kind="chat")
         assert not ok
         assert "unexpected kind" in err
 
-    def test_verify_envelope_too_old(self):
+    def test_verify_envelope_too_old(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
+            to_contact_id=_PEER_ID,
             kind="handshake",
         )
         # Artificially age the timestamp
@@ -351,11 +355,11 @@ class TestPeerEnvelope:
         assert not ok
         assert "too old" in err
 
-    def test_verify_envelope_nan_ts_rejected(self):
+    def test_verify_envelope_nan_ts_rejected(self, monkeypatch, tmp_path):
         """NaN timestamp must be rejected (bypass fix)."""
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
+            to_contact_id=_PEER_ID,
             kind="handshake",
         )
         env["ts"] = float("nan")
@@ -363,11 +367,11 @@ class TestPeerEnvelope:
         assert not ok
         assert "non-finite" in err
 
-    def test_verify_envelope_future_ts_rejected(self):
+    def test_verify_envelope_future_ts_rejected(self, monkeypatch, tmp_path):
         """Timestamp more than 30s in the future must be rejected."""
+        monkeypatch.setenv("TAOS_DATA_DIR", str(tmp_path))
         env = build_envelope(
-            from_username="jaylfc",
-            to_username="hogne",
+            to_contact_id=_PEER_ID,
             kind="handshake",
         )
         env["ts"] = time.time() + 60  # 60s in the future
@@ -388,8 +392,7 @@ class TestPeerEnvelope:
             signing_pub = pub["signing_pubkey"]
 
             env = build_envelope(
-                from_username="jaylfc",
-                to_username="hogne",
+                to_contact_id=_PEER_ID,
                 kind="handshake",
                 body={"hello": "world"},
             )
@@ -410,8 +413,7 @@ class TestPeerEnvelope:
             signing_pub = pub["signing_pubkey"]
 
             env = build_envelope(
-                from_username="jaylfc",
-                to_username="hogne",
+                to_contact_id=_PEER_ID,
                 kind="handshake",
             )
             # Tamper with the payload
@@ -432,8 +434,7 @@ class TestPeerEnvelope:
             signing_pub = pub["signing_pubkey"]
 
             env = build_envelope(
-                from_username="jaylfc",
-                to_username="hogne",
+                to_contact_id=_PEER_ID,
                 kind="handshake",
             )
 
@@ -455,8 +456,7 @@ class TestPeerEnvelope:
             signing_pub = pub["signing_pubkey"]
 
             env = build_envelope(
-                from_username="jaylfc",
-                to_username="hogne",
+                to_contact_id=_PEER_ID,
                 kind="handshake",
             )
             original_sig = env["sig"]
@@ -657,10 +657,9 @@ class TestPeerRoutes:
             outbound_token=generate_peer_token(),
         )
 
-        # Envelope claims to be from "jaylfc" but auth token is for "spoofer"
+        # Envelope is from THIS node's id but the auth token belongs to "spoofer"
         env = build_envelope(
-            from_username="jaylfc",  # impersonation!
-            to_username=_TEST_HUB_USERNAME,
+            to_contact_id=local_contact_id(),
             kind="handshake",
         )
         resp = await client_with_contacts.post(
@@ -672,22 +671,24 @@ class TestPeerRoutes:
 
     async def test_inbox_wrong_to_field(self, client_with_contacts, app_with_contacts):
         """Envelope addressed to a different identity must be rejected."""
+        from tinyagentos.hub.identity import public_identity as _hub_pub
+        self_id = local_contact_id()
+
         store = app_with_contacts.state.contacts_store
         await store.add_contact(
-            contact_id="hub:wrong-to", hub_username="wrong-to", display_name="W",
-            ed25519_pub="pk", x25519_pub="ek",
+            contact_id=self_id, hub_username="wrong-to", display_name="W",
+            ed25519_pub=_hub_pub()["signing_pubkey"], x25519_pub="ek",
         )
         inbound = generate_peer_token()
         await store.establish_peer_link(
-            contact_id="hub:wrong-to",
+            contact_id=self_id,
             inbound_token=inbound,
             outbound_token=generate_peer_token(),
         )
 
         # Envelope addressed to a different hub identity, from the authenticated contact.
         env = build_envelope(
-            from_username="wrong-to",
-            to_username="someone-else",  # wrong recipient
+            to_contact_id=_PEER_ID,  # wrong recipient
             kind="handshake",
         )
         resp = await client_with_contacts.post(
@@ -710,22 +711,22 @@ class TestPeerRoutes:
         from tinyagentos.hub.identity import public_identity as _hub_pub
         signing_pub = _hub_pub()["signing_pubkey"]
 
+        self_id = local_contact_id()
         store = app_with_contacts.state.contacts_store
         await store.add_contact(
-            contact_id="hub:nonce-test", hub_username="nonce-test", display_name="N",
+            contact_id=self_id, hub_username="nonce-test", display_name="N",
             ed25519_pub=signing_pub, x25519_pub="ek",
         )
         inbound = generate_peer_token()
         await store.establish_peer_link(
-            contact_id="hub:nonce-test",
+            contact_id=self_id,
             inbound_token=inbound,
             outbound_token=generate_peer_token(),
         )
 
         # Envelope from the authenticated contact to the local node.
         env = build_envelope(
-            from_username="nonce-test",
-            to_username=_TEST_HUB_USERNAME,
+            to_contact_id=self_id,
             kind="handshake",
         )
 
@@ -755,21 +756,21 @@ class TestPeerRoutes:
         from tinyagentos.hub.identity import public_identity as _hub_pub
         signing_pub = _hub_pub()["signing_pubkey"]
 
+        self_id = local_contact_id()
         store = app_with_contacts.state.contacts_store
         await store.add_contact(
-            contact_id="hub:drain-fail", hub_username="drain-fail", display_name="D",
+            contact_id=self_id, hub_username="drain-fail", display_name="D",
             ed25519_pub=signing_pub, x25519_pub="ek",
         )
         inbound = generate_peer_token()
         await store.establish_peer_link(
-            contact_id="hub:drain-fail",
+            contact_id=self_id,
             inbound_token=inbound,
             outbound_token=generate_peer_token(),
         )
 
         env = build_envelope(
-            from_username="drain-fail",
-            to_username=_TEST_HUB_USERNAME,
+            to_contact_id=self_id,
             kind="handshake",
         )
         headers = {"Authorization": f"Bearer {inbound}"}
@@ -840,21 +841,23 @@ class TestPeerRoutes:
         """A tampered envelope must be rejected with 403 at the route level."""
         local_id = resolve_local_identity_id()
 
+        from tinyagentos.hub.identity import public_identity as _hub_pub
+        self_id = local_contact_id()
+
         store = app_with_contacts.state.contacts_store
         await store.add_contact(
-            contact_id="hub:tamper-test", hub_username="tamper-test", display_name="T",
-            ed25519_pub="pk", x25519_pub="ek",
+            contact_id=self_id, hub_username="tamper-test", display_name="T",
+            ed25519_pub=_hub_pub()["signing_pubkey"], x25519_pub="ek",
         )
         inbound = generate_peer_token()
         await store.establish_peer_link(
-            contact_id="hub:tamper-test",
+            contact_id=self_id,
             inbound_token=inbound,
             outbound_token=generate_peer_token(),
         )
 
         env = build_envelope(
-            from_username="tamper-test",
-            to_username=_TEST_HUB_USERNAME,
+            to_contact_id=self_id,
             kind="handshake",
         )
         env["kind"] = "evil"
@@ -870,21 +873,23 @@ class TestPeerRoutes:
         """An envelope with a future timestamp must be rejected with 400."""
         local_id = resolve_local_identity_id()
 
+        from tinyagentos.hub.identity import public_identity as _hub_pub
+        self_id = local_contact_id()
+
         store = app_with_contacts.state.contacts_store
         await store.add_contact(
-            contact_id="hub:future-ts", hub_username="future-ts", display_name="F",
-            ed25519_pub="pk", x25519_pub="ek",
+            contact_id=self_id, hub_username="future-ts", display_name="F",
+            ed25519_pub=_hub_pub()["signing_pubkey"], x25519_pub="ek",
         )
         inbound = generate_peer_token()
         await store.establish_peer_link(
-            contact_id="hub:future-ts",
+            contact_id=self_id,
             inbound_token=inbound,
             outbound_token=generate_peer_token(),
         )
 
         env = build_envelope(
-            from_username="future-ts",
-            to_username=_TEST_HUB_USERNAME,
+            to_contact_id=self_id,
             kind="handshake",
         )
         env["ts"] = time.time() + 400

@@ -42,6 +42,7 @@ CONSOLE_HEADER = {"X-taOS-Console": "1"}
 #: that a refusal can only have come from the gate under test.
 LOCK_POSTS = [
     ("/auth/lock-radios", {"radio": "wifi", "on": False}),
+    ("/auth/lock-usb", {"mode": "ncm"}),
     ("/auth/lock-volume-key", {"key": "up", "action": "press"}),
     ("/auth/lock-volume", {"percent": 40}),
     ("/auth/lock-torch", {"on": True}),
@@ -79,7 +80,7 @@ def _built_app(tmp_path_factory):
     from tinyagentos.app import create_app
 
     data = tmp_path_factory.mktemp("lockdata")
-    # data_dir= explicitly: TINYAGENTOS_DATA_DIR is read by nothing, and an app
+    # data_dir= explicitly: the legacy data-dir env var is read by nothing, and an app
     # on the default data dir would have the tests below write the REPO's
     # data/demo_mode.json.
     app = create_app(data_dir=data)

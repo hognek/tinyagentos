@@ -53,6 +53,7 @@ import { MessageList, type MessageListHandle } from "../chat/MessageList";
 import {
   pinMessage, unpinMessage, listPins,
   editMessage as apiEditMessage, deleteMessage as apiDeleteMessage,
+  editAgentReply as apiEditAgentReply,
   markUnread as apiMarkUnread,
 } from "@/lib/chat-messages-api";
 import { getReceipts, markSeen, type Receipt } from "@/lib/a2a-receipts-api";
@@ -73,6 +74,7 @@ import { getApp } from "@/registry/app-registry";
 import { CodeBlock } from "@/components/CodeBlock";
 import { ToolCallBlock } from "@/components/ToolCallBlock";
 import { StatusBlock } from "@/components/StatusBlock";
+import { GateGrantDetails } from "@/components/GateGrantDetails";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { SearchPanel } from "../chat/SearchPanel";
@@ -109,6 +111,8 @@ interface Channel {
   created_at?: string;
   last_message_at?: string;
   lastPreview?: string;
+  last_preview?: string;
+  last_preview_author?: string;
   project_id?: string;
   settings?: {
     archived?: boolean;
@@ -472,6 +476,8 @@ interface DecisionData {
   status: DecisionBlockStatus;
   answer?: { value: unknown; answered_by?: string; answered_at?: number } | null;
   created_at: number | string;
+  // Grant-bearing metadata for a server-raised gate decision (tsk-mul5pa).
+  metadata?: Record<string, unknown> | null;
 }
 
 function decisionTypeLabel(t: string): string {
@@ -664,6 +670,7 @@ export function DecisionBlock({ block }: { block: DecisionContentBlock }): React
       {/* header: question + type badge + state */}
       <div className="flex flex-col gap-1 px-3">
         <p className="text-sm font-semibold text-shell-text">{decision.question}</p>
+        <GateGrantDetails metadata={decision.metadata} />
         {decision.context && (
           <p className="text-xs leading-relaxed text-shell-text-secondary">
             {decision.context}
@@ -916,7 +923,7 @@ export function MessagesApp({
   const [showCreate, setShowCreate] = useState(false);
   const [showEmoji, setShowEmoji] = useState<{ messageId: string; rect: DOMRect } | null>(null); // message id + anchor
   const [viewingCanvas, setViewingCanvas] = useState<{ url: string; title?: string } | null>(null);
-  const [newChannel, setNewChannel] = useState({ name: "", type: "topic" as "topic" | "group", description: "" });
+  const [newChannel, setNewChannel] = useState({ name: "", type: "topic" as "topic" | "group", topic: "" });
   const [prefillBanner, setPrefillBanner] = useState<{ promptName: string; agentName?: string } | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showConnectWizard, setShowConnectWizard] = useState(false);
@@ -941,6 +948,7 @@ export function MessagesApp({
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const [overflowMenu, setOverflowMenu] = useState<{ messageId: string; x: number; y: number } | null>(null);
   const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editError, setEditError] = useState<string | null>(null);
   const [pinnedPopoverOpen, setPinnedPopoverOpen] = useState(false);
   const [pinnedMessages, setPinnedMessages] = useState<PinnedMessage[]>([]);
   const [showAllThreads, setShowAllThreads] = useState(false);
@@ -1004,7 +1012,12 @@ export function MessagesApp({
       ]);
       if (chRes.ok) {
         const data = await chRes.json();
-        setChannels(data.channels ?? []);
+        setChannels(
+          (data.channels ?? []).map((c: Channel) => ({
+            ...c,
+            lastPreview: c.last_preview ?? c.lastPreview,
+          }))
+        );
       }
       if (unRes.ok) {
         const data = await unRes.json();
@@ -1026,7 +1039,12 @@ export function MessagesApp({
       const res = await fetch(url);
       if (res.ok) {
         const data = await res.json();
-        setArchivedChannels(data.channels ?? []);
+        setArchivedChannels(
+          (data.channels ?? []).map((c: Channel) => ({
+            ...c,
+            lastPreview: c.last_preview ?? c.lastPreview,
+          }))
+        );
       }
     } catch {
       /* offline */
@@ -1347,7 +1365,7 @@ export function MessagesApp({
       }
     };
     es.onerror = () => {
-      es.close();
+      /* let the browser reconnect; do not force-close */
     };
     return () => es.close();
   }, []);
@@ -1918,7 +1936,7 @@ export function MessagesApp({
         body: JSON.stringify({
           name: newChannel.name.trim(),
           type: newChannel.type,
-          description: newChannel.description.trim() || undefined,
+          topic: newChannel.topic.trim() || undefined,
           ...(scope?.projectId ? { project_id: scope.projectId } : {}),
         }),
       });
@@ -1927,7 +1945,7 @@ export function MessagesApp({
         await fetchChannels();
         setSelectedChannel(ch.id);
         setShowCreate(false);
-        setNewChannel({ name: "", type: "topic", description: "" });
+        setNewChannel({ name: "", type: "topic", topic: "" });
       }
     } catch {
       /* ignore */
@@ -1983,15 +2001,19 @@ export function MessagesApp({
   /* ---- overflow menu handlers ---- */
   const handleEdit = (msgId: string) => {
     setEditingMessageId(msgId);
+    setEditError(null);
     setOverflowMenu(null);
   };
 
   const handleSaveEdit = async (msgId: string, content: string) => {
+    setEditError(null);
     try {
-      await apiEditMessage(msgId, content);
+      const target = messages.find((m) => m.id === msgId);
+      if (target?.author_type === "agent") await apiEditAgentReply(msgId, content);
+      else await apiEditMessage(msgId, content);
       setEditingMessageId(null);
     } catch (e) {
-      setSendError((e as Error).message);
+      setEditError((e as Error).message);
     }
   };
 
@@ -2290,8 +2312,10 @@ export function MessagesApp({
             pinnedPopoverOpen={pinnedPopoverOpen}
             onTogglePinnedPopover={() => setPinnedPopoverOpen((o) => !o)}
             editingMessageId={editingMessageId}
-            onCancelEdit={() => setEditingMessageId(null)}
+            onCancelEdit={() => { setEditingMessageId(null); setEditError(null); }}
             onSaveEdit={handleSaveEdit}
+            editError={editError}
+            onEditAgentReply={(id) => { setEditingMessageId(id); setEditError(null); }}
             onToggleReaction={toggleReaction}
             showEmoji={showEmoji}
             onShowEmoji={setShowEmoji}
@@ -2695,7 +2719,8 @@ className="shrink-0 p-0.5 rounded hover:bg-shell-surface-active transition-color
                 body: JSON.stringify({
                   name: slug, type: "dm",
                   members: ["user", slug],
-                  description: "", topic: "",
+                  description: "",
+                  topic: "",
                 }),
               });
               if (r.ok) {
@@ -2824,13 +2849,13 @@ className="shrink-0 p-0.5 rounded hover:bg-shell-surface-active transition-color
                 </select>
               </div>
               <div className="space-y-1">
-                <Label htmlFor="new-channel-description-mobile" className="block uppercase tracking-wider">Description</Label>
+                <Label htmlFor="new-channel-topic-mobile" className="block uppercase tracking-wider">Topic</Label>
                 <Input
-                  id="new-channel-description-mobile"
-                  value={newChannel.description}
-                  onChange={(e) => setNewChannel((s) => ({ ...s, description: e.target.value }))}
+                  id="new-channel-topic-mobile"
+                  value={newChannel.topic}
+                  onChange={(e) => setNewChannel((s) => ({ ...s, topic: e.target.value }))}
                   placeholder="What's this channel about?"
-                  aria-label="Channel description"
+                  aria-label="Channel topic"
                 />
               </div>
               <Button onClick={createChannel} disabled={!newChannel.name.trim()} className="w-full">
@@ -2878,13 +2903,13 @@ className="shrink-0 p-0.5 rounded hover:bg-shell-surface-active transition-color
                   </select>
                 </div>
                 <div className="space-y-1">
-                  <Label htmlFor="new-channel-description" className="block uppercase tracking-wider">Description</Label>
+                  <Label htmlFor="new-channel-topic" className="block uppercase tracking-wider">Topic</Label>
                   <Input
-                    id="new-channel-description"
-                    value={newChannel.description}
-                    onChange={(e) => setNewChannel((s) => ({ ...s, description: e.target.value }))}
+                    id="new-channel-topic"
+                    value={newChannel.topic}
+                    onChange={(e) => setNewChannel((s) => ({ ...s, topic: e.target.value }))}
                     placeholder="What's this channel about?"
-                    aria-label="Channel description"
+                    aria-label="Channel topic"
                   />
                 </div>
                 <Button

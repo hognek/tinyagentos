@@ -13,7 +13,7 @@ Access the kanban board for a project. Granting `project_tasks` also makes the a
 - `GET /api/projects/{pid}/tasks/{id}` — get a specific task
 - `GET /api/projects/{pid}/tasks/{id}/comments` — list task comments
 - `POST /api/projects/{pid}/tasks/{id}/claim` — claim a task (LEAD-only)
-- `POST /api/projects/{pid}/tasks/{id}/release` — release a claimed task
+- `POST /api/projects/{pid}/tasks/{id}/release` — releaser_id + strike?
 - `POST /api/projects/{pid}/tasks/{id}/close` — close a task
 - `POST /api/projects/{pid}/tasks/{id}/reopen` — reopen a closed task
 - `GET /api/projects/tasks/{id}/context` — get task context
@@ -59,6 +59,8 @@ Files routes key on the project SLUG. `GET .../files/{path}`, `POST .../files/up
 
 `POST /api/decisions` — raise a human-in-the-loop decision. `POST /api/decisions/{id}/answer/agent` — mirror an answer.
 
+`POST /api/decisions/{id}/withdraw`: withdraw its own pending decision as moot (`{"reason": "..."}` required; asker only; 409 once answered/superseded/withdrawn).
+
 ### a2a bus surface
 
 `GET /api/a2a/bus/channels`, `GET /api/a2a/bus/messages`, `GET|POST /api/a2a/bus/stream`. `a2a_receive` cannot post; `a2a_send` isn't thereby a reader.
@@ -99,32 +101,9 @@ Files routes key on the project SLUG. `GET .../files/{path}`, `POST .../files/up
 
 ---
 
-# Project invite redeem route (link + PIN)
+# Project invite redeem route
 
-## Endpoints
-
-### POST /api/projects/invites/redeem
-
-Body: `{invite_id, pin, harness, label?}`
-
-- Verifies the PIN (wrong / expired / attempt-capped → 403; already redeemed / revoked → 409)
-- Derives the agent handle `{project_slug}-{harness}[-{label}]`, de-duped against active registry agents in the project
-- Auto-approves via `approve_request_record` (decided_by = the invite's creator), or leaves the request pending (manual mode)
-- Returns a connection bundle plus `{request_id, agent_handle, poll_path}`
-- `project_tasks` is force-included so a successful redeem always yields a project member
-
-### GET /i/{invite_id}
-
-Content-negotiated advert: `Accept: application/json` → the redeem contract (`{method, path, fields}`); browser → a minimal HTML page. No PIN check here; it only advertises the contract.
-
-## Connection bundle
-
-- `controller.endpoints` — non-loopback LAN IPv4s (priority ordered, operator override first) and the mesh (Tailscale) node IP when joined; no relay in Phase 1
-- `apis` — agent-JWT-reachable surface, scoped exactly to the granted scopes (mirrors the middleware allowlist)
-- `delivery` — timed-check contract (`poll_path`, `stream_path`, `check_interval_secs`, `cursor: ts`, `filter: mentions+project`)
-- `onboarding` + `guide_markdown` — personalized capability guide (repo link, agent manual links, scoped Projects/Canvas summary, the A2A authenticated-proxy contract)
-
-See `docs/design/external-agent-project-invite.md` (issue #1780); canvas routes advertise only when that scope was granted.
+See docs/project-invite-api.md (link + PIN redeem, auth-exempt endpoints).
 
 ---
 
@@ -195,14 +174,13 @@ See `docs/design/external-agent-project-invite.md` (issue #1780); canvas routes 
 
 ## Grant shaping which decisions come back
 
-- **Global (null-project) grant**: null-project decisions ONLY
-- **Exactly one project grant**: that project's decisions, filtered in the store query
-- **Two or more projects**: fetched by agent, filtered in Python
+- **Global (null-project) grant**: null-project decisions, plus granted projects
+- **Exactly one granted scope**: those decisions, filtered in the store query
+- **Two or more scopes**: one store query per scope, merged newest first
 
 ### Limit interaction
 
-- The global and single-project paths push the project filter into the store query, so the 500 limit applies AFTER scoping (issue #2194)
-- The two-or-more-project path still fetches up to 500 rows then filters in Python, so an agent with several project grants and more than 500 decisions in total can still lose allowed-project rows to the limit (same shape as the original bug, narrower blast radius)
+- Every scope pushes the project filter into the store query, and the merged list is capped at 500, so the limit applies AFTER scoping (issue #2194)
 
 ---
 
@@ -384,7 +362,7 @@ Under `/api/agents/{agent_name}/desktop/`:
 
 ## Compile order
 
-Run `python3 scripts/build-routes-doc.py` to compile these into `docs/routes.md`. Source files, in order: `01-project-tasks.md`, `02-agent-api.md`, `03-device-bearer.md`, `04-project-invite.md`, `05-os-events.md`, `06-lora-studio.md`, `07-decisions-return.md`, `08-config-save-restore.md`, `09-agent-memory.md`, `10-cluster-admin.md`, `11-select-decision.md`, `12-share-routes.md`, `13-admin-gates.md`, `14-agent-desktop.md`, `15-decision-note.md`.
+Run `python3 scripts/build-routes-doc.py` to compile these into `docs/routes.md`. Source files, in order: `01-project-tasks.md`, `02-agent-api.md`, `03-device-bearer.md`, `04-project-invite.md`, `05-os-events.md`, `06-lora-studio.md`, `07-decisions-return.md`, `08-config-save-restore.md`, `09-agent-memory.md`, `10-cluster-admin.md`, `11-select-decision.md`, `12-share-routes.md`, `13-admin-gates.md`, `14-agent-desktop.md`, `15-decision-note.md`, `16-agent-notifications.md`, `16-device-v1.md`. Device API v1 is now its own file, `docs/device-api-v1.md`.
 
 ---
 
@@ -421,8 +399,8 @@ Publishes a `decision.note` event on the owner's `user:<id>` channel so open sur
 
 `POST /api/notifications` body: `title` (max 120 chars), `message` (max 1000 chars), `level` (`info`/`warning`), `source` (ignored on agent path), `data.project_id` (optional).
 
-- Admits exactly `POST /api/notifications` for agent registry bearers. `GET` and mark-read stay session-only.
-- Verifies JWT + grant + project binding via `check_agent_scope_for_project`.
+- Admits `POST`/`GET /api/notifications` for agent bearers; `GET` lists only the agent's own posts. Mark-read stays session-only.
+- `POST`: JWT + grant + project via `check_agent_scope_for_project`; `GET`: JWT + grant
 - Global grant posts to instance admin(s). Per-project grant posts to that project's owner only.
 - `source` from grant. Store row: `agent:<canonical_id>`. `data.from_agent` stamped to canonical_id.
 - `info`/`warning` only. `error` returns 400.
@@ -430,3 +408,83 @@ Publishes a `decision.note` event on the owner's `user:<id>` channel so open sur
 - Rate limit: 10 posts per 10 minutes per canonical_id. Exceeding returns 429 `{"error": "rate_limited", "retry_after": N}`.
 - Delivery through `store.add`: SSE and web-push fire.
 - Human path unchanged: `_require_admin` gate, any valid level, source from body.
+
+---
+
+# Notification history (session-only)
+
+- `GET /api/notifications/history`
+- `GET /api/notifications/history/sources`
+- `GET /api/notifications/archived` (legacy)
+- Detail: `docs/notifications-history.md`
+
+---
+
+## Device API v1
+
+The full spec lives in `docs/device-api-v1.md`; routes under `/api/devices`
+are bearer-authenticated. Public routes: `POST /api/devices/pair-requests`,
+`GET /api/devices/pair-requests/{pair_request_id}`.
+
+### GET /api/device/v1/state
+
+**Scope:** `agents:read` (device bearer).
+
+Returns the owner-filtered agent list plus server version, time, and demo flag.
+String fields are capped: `name` 48, `status` 120, `last_recap` 180,
+`question` 280, each `option` 40.
+
+**Errors:** `401` missing/invalid bearer, `403` scope missing.
+
+### GET /api/device/v1/events
+
+**Scope:** `agents:read` (device bearer).
+
+SSE stream of owner-filtered agent state changes. Emits one event per change
+and a heartbeat comment every 15 seconds. Events are name-keyed.
+
+**Events:**
+
+- `agent.upsert` -- agent appeared or changed. Data: full agent object
+  (same shape as one `agents[]` entry of the state body).
+- `agent.remove` -- agent disappeared. Data: `{"name": "<name>"}`.
+- `decision.close` -- decision resolved. Data:
+  `{"name": "<name>", "decision_id": "<old id>"}`.
+- `decision.open` -- decision appeared. Data:
+  `{"name": "<name>", "decision": {...}}`.
+- `agent.recap` -- recap changed. Data:
+  `{"name": "<name>", "last_recap": "<text>"}`.
+- `snapshot` -- full state body, sent when `Last-Event-ID` is outside the
+  server's buffer.
+
+**Heartbeat:**
+
+`: ping` every 15 seconds. Heartbeat frames carry no `id:` line.
+
+**Resume:**
+
+The client may send `Last-Event-ID` to resume. If the ID is inside the
+server's per-owner event buffer, replay only events with a higher id and
+do not send a snapshot. If the ID is older than the oldest buffered event,
+newer than the newest, or the owner has no buffer yet, send one `snapshot`
+first. Fresh connects (no `Last-Event-ID` or `Last-Event-ID: 0`) start with
+typed `agent.upsert` events.
+
+**Close-on-revoke:**
+
+The stream re-checks the device bearer token on every loop tick. If the
+device is revoked, blocked or the scope is lost (specifically `agents:read`),
+the stream closes immediately.
+
+### GET /api/device/v1/agents/{name}/avatar
+
+**Scope:** `agents:read` (device bearer). `size` (required): `45` or `96`.
+
+LVGL 9 RGB565A8 avatar (`application/x-taos-lvimg`): a 12-byte
+`lv_image_header_t` (magic `0x19`, cf `0x14`), then RGB565 and A8 (circle mask)
+planes, `12 + w*h*3` bytes. `ETag: "<avatar_hash>-<size>"`; a matching
+`If-None-Match` returns `304`.
+
+**Errors:** `400` `size_not_supported`; `401`/`403` as for state; `404`
+`avatar_not_found` (non-owned, unknown, no avatar, undecodable; never
+`403` or `500`).

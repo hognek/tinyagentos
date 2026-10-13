@@ -416,7 +416,7 @@ a real lease:
 |--------|------|-------|---------|
 | GET  | `/api/a2a/gpu/check`   | `a2a_receive` | Fold the channel's open claims + the node's live VRAM and answer "may I load?" |
 | POST | `/api/a2a/gpu/claim`   | `a2a_send`    | Admission-checked claim: cluster lease (TTL) + `[GPU CLAIM]` post |
-| POST | `/api/a2a/gpu/release` | `a2a_send`    | Release the lease + `[GPU RELEASE]` post |
+| POST | `/api/a2a/gpu/release` | `a2a_send`    | Release the lease (if any) and `[GPU RELEASE]` post, unless releasing an expired lease ID when a newer lease exists (then returns `already_released` without posting) |
 | POST | `/api/a2a/gpu/request` | `a2a_send`    | Post `[GPU REQUEST]` when blocked |
 | POST | `/api/a2a/gpu/renew`   | `a2a_send`    | Keep-alive: extend a lease TTL |
 
@@ -503,7 +503,10 @@ Rules that matter when you use it:
 
 `check` returns `admitted`, `blockers`, `free_mb`, `capacity_mb`, `claimed_mb`,
 `vram_verified`, `reason`, and the `claims` it folded. `claim` returns the
-`lease_id` (when the node is a cluster worker) and the exact `line` posted.
+`lease_id` and `epoch` (when the node is a cluster worker) and the exact `line`
+posted. `renew` accepts an optional `epoch` body field that must match the lease's
+current epoch; a mismatch is refused with `409` so a replaced lease is not
+silently extended. `release` also accepts an optional `epoch` field.
 
 ## Bus restarts during a controller update
 
@@ -707,17 +710,33 @@ different project, and 403 when the agent lacks the `canvas_read` scope or the
 
 - **files_read**: `GET /api/projects/{slug}/files` (list), `.../files/watch`,
   `GET .../files/{path}` (download), `.../trash`, `.../stats`. **files_write**:
-  `POST .../files/upload` (multipart), `POST .../mkdir`, `DELETE .../files/{path}`,
+  `POST .../files/upload` (multipart; `path` = target directory via query or
+  form field, optional form `filename` sets the stored name, response echoes
+  `stored_as`), `POST .../mkdir`, `DELETE .../files/{path}`,
   and the trash restore/purge/empty routes. NOTE: the files routes key on the
   project SLUG in the path, not the id.
 - **decisions_write**: `POST /api/decisions` (raise a human-in-the-loop
-  decision), `POST /api/decisions/{id}/answer/agent` (mirror an answer),
+  decision; a `metadata.kind` naming a server-owned gate, `execution_gate`,
+  `delegation_gate`, `device_pairing`, `app_grant`, `project_create` or
+  `collab_delegation_gate`, is refused with 400 for every caller, since only
+  the server's internal raisers may open a gate, tsk-mul5pa), `POST /api/decisions/{id}/answer/agent` (mirror an answer),
   `GET /api/decisions/{id}/agent` (read its own), `GET /api/decisions/agent`
-  (list its own). The GENERAL routes stay session-only -- `GET /api/decisions`,
-  `GET /api/decisions/{id}`, `GET /api/decisions/{id}/history` and
-  `POST /api/decisions/{id}/answer`. The agent set is a separate, narrower
-  allowlist distinguished by the `/agent` suffix
-  (`_is_agent_decisions_path` in `tinyagentos/auth_middleware.py`).
+  (list its own), `POST /api/decisions/{id}/withdraw` (withdraw its own pending
+  decision as moot: body `{"reason": "..."}`, reason required (400), allowed
+  only from `pending` (409 otherwise), the asking agent only (any other caller
+  gets 404); the record stays in history as `status=withdrawn` with the reason,
+  and the withdraw is audit-logged). The same withdraw route also serves the
+  session path for the decision's owner or an admin. `GET /api/decisions`
+  also accepts the registry JWT (tsk-f75p3z): with a registry JWT it returns ONLY
+  the decisions this agent raised in its granted projects (the same set as
+  `GET /api/decisions/agent`, honouring the `status`, `project_id` and `limit`
+  query params), never the user's inbox; with a session it is unchanged. The
+  other GENERAL routes stay session-only -- `GET /api/decisions/{id}`,
+  `GET /api/decisions/{id}/history` and `POST /api/decisions/{id}/answer`.
+  The agent set is a separate, narrower allowlist distinguished by the
+  `/agent` suffix, except withdraw and the list, which are one route serving
+  both callers (`_is_agent_decisions_path` in
+  `tinyagentos/auth_middleware.py`).
 - **observatory_control**: the Observatory fleet dials.
   `GET|POST /api/observatory/pause`, `GET|POST /api/observatory/throttle`,
   `GET|POST /api/observatory/approval-mode`, `GET /api/observatory/fleet`,
@@ -733,6 +752,12 @@ different project, and 403 when the agent lacks the `canvas_read` scope or the
   `tinyagentos/auth_middleware.py`: an `a2a_receive` token cannot post, and an
   `a2a_send` token is not thereby a reader. Do not describe them as one scope
   covering four routes.
+- **memory_read**: read an agent's own memory index via qmd serve.
+  `GET /api/memory/browse`, `POST /api/memory/search`, `GET /api/memory/collections/{agent_name}`.
+  These routes restrict results to the calling agent's OWN memory namespace (its own
+  agent name / canonical_id) — an agent must never read another agent's memory.
+  The DELETE `/api/memory/chunk/{content_hash}` route stays human-only and is not
+  reachable by agent tokens, even with memory_read.
 
 Access is per-project: a token is authorized for a project only when the agent
 holds an active grant + membership there; a request for a project it has no
@@ -752,6 +777,13 @@ A bool, string, float, zero, negative or over-ten-years value is refused with
 **422** at request time. The rule is: a grant with no duration is unbounded,
 and a bound that is set is never silently dropped or lengthened. To explicitly
 renew or extend an existing bound, set `renew: true` on the approve body.
+
+Set `is_lead: true` on the approve body to make the approved agent the
+project's lead: the membership row gets role `lead` and the project's lead
+pointer is set to it. It is refused with **400** unless the body names an
+explicit `project_id` and grants `project_tasks` or a canvas scope (the grants
+that create the membership row), and it cannot be combined with
+`defer_binding`.
 
 Deferred binding (`defer_binding=True`) mints the token and grants UNBOUND
 (project_id=None) with the same `expires_at` from `duration_secs`. When the
@@ -773,7 +805,7 @@ purely from a matching active grant. An already-registered agent is added to a
 further project via `POST /api/projects/{project_id}/members/assign-agent`
 (admin/owner gated) or by redeeming an invite whose handle collides with an
 active identity (the existing canonical_id and token are reused instead of
-409ing). The reverse is
+409ing). **To reuse an existing identity for a multi-project approval, the requester must re-submit the request with that agent's registry token as a Bearer header, otherwise the approval returns 409.** The reverse is
 `POST /api/projects/{project_id}/members/revoke-agent` (taOS #2148), which drops
 the agent's grants on that ONE project and leaves its other projects, its other
 scopes and the identity itself standing.
@@ -978,6 +1010,19 @@ approval channel for privileged grants. Device scoped tokens do not expire and
 cannot be self-rotated; the only revocation is `DELETE /api/devices/{id}` from
 a session.
 
+The device-bearer self-service allowlist in `tinyagentos/auth_middleware.py`
+covers:
+
+- `PATCH /api/devices/{id}/push-token` — scope `push:register`
+- `GET /api/decisions`, `GET /api/decisions/{id}`, `GET /api/decisions/{id}/history` — scope `agents:read`
+- `POST /api/decisions/{id}/answer` — scope `decisions:answer`
+- `POST /api/library/ingest` — scope `library:ingest`
+- `POST /api/projects/{slug}/files/upload` — scope `files:upload`
+- `POST /api/chat/messages` — scope `chat:send`
+- `POST /api/device/v1/voice`, `POST /api/device/v1/voice/tts` — scope `voice:stt` / `voice:tts`
+- `GET /api/device/v1/state` — scope `agents:read` (owner-filtered agent list)
+- `GET /api/device/v1/events` -- scope `agents:read` (SSE of owner-filtered agent changes; `Last-Event-ID` resume, closes on revoke or scope loss; see docs/routes.d/16-device-v1.md)
+
 ## Share destinations (device bearer)
 
 `GET /api/share/destinations` lets a paired device DISCOVER share destinations. It is
@@ -1029,6 +1074,12 @@ The auth-request flow (`POST /api/agents/auth-requests`) MINTS A NEW identity on
 approval, so an agent that already holds an active registry identity cannot use
 it to gain more scopes without duplicating itself. A scope request adds grants to
 that SAME canonical_id instead:
+
+**Auth model.** When `POST /api/agents/auth-requests` receives an Authorization header, it calls `check_agent_identity` and records the proven canonical id (or None on rejection). A `proof_status` field now indicates the result:
+   - `"none"` when no Authorization header is present
+   - `"accepted"` when a token validates and the record's `proven_canonical_id` is set
+   - `"rejected"` when an Authorization header is present but validation raises OR returns no identity (empty or non-Bearer header value)
+   The status is exposed in the response so the caller can distinguish these three states.
 
 - `POST /api/agents/registry/{canonical_id}/scope-requests`
   `{requested_scopes, project_id?, reason?}`: create a pending request. Unlike
@@ -1136,9 +1187,9 @@ before any lookup, which discloses nothing.
 Requested scopes are validated against the same closed `VALID_SCOPES` vocabulary
 as the consent flow. The project-bound scopes -- `project_tasks`,
 `project_tasks_create`, `project_tasks_update`, `project_lists`, `project_notes`,
-the canvas scopes (`canvas_read`, `canvas_write`) and the files scopes
-(`files_read`, `files_write`) -- all require an explicit, operator-validated
-`project_id` on approval (see `_PROJECT_SCOPES` in
+`project_doc_review`, the canvas scopes (`canvas_read`, `canvas_write`) and the
+files scopes (`files_read`, `files_write`) -- all require an explicit,
+operator-validated `project_id` on approval (see `_PROJECT_SCOPES` in
 `tinyagentos/routes/agent_auth_requests.py`). Omitting the project picker for
 one of these scopes is rejected with 400; the only way to mint a project-bound
 grant unbound (`project_id=None`) is the explicit `defer_binding` opt-in, and
@@ -1149,7 +1200,12 @@ matches nothing and authorizes nothing until assign-agent later binds it.
 `project_notes` joined this set in the beta.47 promote (#2320): it was
 previously grantable without a `project_id`, which minted an inert note grant
 the operator believed was usable; it now follows the same rule as
-`project_tasks`. `decisions_read` /
+`project_tasks`. `project_doc_review` joined it for the same reason (tsk-66mnhr):
+its routes have always authorized with `check_agent_scope_for_project`, so a
+`project_id`-less approval minted an inert doc-review grant. Existing
+`project_doc_review` grant rows carrying `project_id = None` were already inert
+and are left alone (no rewrite, no revocation); re-approve the scope with a
+project picker to get a usable grant. `decisions_read` /
 `decisions_write` (and the other global scopes) may be granted globally
 (`project_id=None`) or per-project.
 
@@ -1215,13 +1271,22 @@ request gets a 429 carrying `Retry-After` in whole seconds:
   a browser gets a minimal HTML page. No PIN check here; it only advertises the
   contract.
 
+The invite create body accepts a `kind` field (default `agent`; valid values
+`agent` or `cloud_agent`; any other value returns 400 with the valid list).
+For `cloud_agent` the controller must have `TAOS_CONTROLLER_RELAY_URL` set to a
+safe public `https://` URL or minting fails with "set up taOSgo first".
+`cloud_agent` defaults `check_interval_secs` to 900 (the `agent` kind keeps its
+existing default of 1800). The redeemed `cloud_agent` bundle carries ONLY relay
+endpoints (LAN and mesh are stripped).
+
 The redeem response carries a **connection bundle** (design section 4 plus the
 Approved-build addendum). It contains NO token or secret (the token still
 arrives via the status poll). The bundle has:
 
 - `controller.endpoints`: the controller's reachable addresses: non-loopback
   LAN IPv4s (priority ordered, operator override first) and the mesh (Tailscale)
-  node IP when joined. No relay in Phase 1.
+  node IP when joined. An optional relay endpoint is present when
+  `TAOS_CONTROLLER_RELAY_URL` is configured with `https://`.
 - `apis`: the agent-JWT-reachable surface, scoped EXACTLY to the granted scopes
   and mirroring the middleware canvas allowlist so the advertised routes are the
   ones the token can call: task routes when `project_tasks` is granted; canvas
@@ -1235,6 +1300,8 @@ arrives via the status poll). The bundle has:
   agent manual links, scoped Projects/Canvas summary, the A2A authenticated-proxy
   contract, and explicit instructions to write the identity/project/token-file/bus
   contract into the agent's OWN memory and to poll every `check_interval_secs`).
+  For `harness=grok` the guide includes a Grok-specific section covering secure-form
+  token storage (no file or chat), routine polling, and the shared-account warning.
 
 See `docs/design/external-agent-project-invite.md` (issue #1780) for the full
 design; the bundle advertises canvas routes only when the corresponding scope
@@ -1255,7 +1322,10 @@ registry token in the mandatory header:
 Authorization: Bearer <registry token>
 ```
 
-Without a valid registry token the request returns **401**. The token subject is
+Without a valid registry token the request returns **401**. The `proof_status`
+field on the response is always `"accepted"` on this path, because an unproven
+caller receives 401 before any auth-request record is created; the path never
+returns `"none"` or `"rejected"`. The token subject is
 the only source of the canonical agent id. The body's `identity_claim` must equal the registry handle of the agent the token was minted for; a mismatch returns **403**. The body
 carries the desired project name, slug, and purpose:
 
@@ -1298,6 +1368,29 @@ Route module `tinyagentos/routes/device_pair_requests.py`:
 
 Approval or denial of a pair request is surfaced to the user through the Decisions app;
 agents must not grant pairing directly.
+
+## Device voice routes (S6 / S6b)
+
+Route module `tinyagentos/routes/device_voice.py`. Device bearer only (a session
+user has no device, so no session is accepted: `401` without a device token);
+embedded tokens are refused `403 device_tls_required` off the TLS listener. Both
+routes call the in-process `llm_gateway.stt` / `llm_gateway.tts` helpers, never
+a cloud backend, and never log or store the text or the audio. Errors are
+`{"detail": {"error": <code>, "message": ...}}`.
+
+- `POST /api/device/v1/voice` (scope `voice:stt`): body is raw PCM16 LE 16 kHz
+  mono (`application/octet-stream` or `audio/pcm`), at most 960000 bytes (30 s)
+  or `413 audio_too_large`; empty or odd length `400 invalid_audio`. Returns
+  `{"text": ...}`. `409 stt_not_installed`, `503 stt_unavailable`.
+- `POST /api/device/v1/voice/tts` (scope `voice:tts`): JSON `{"text", "sample_rate"?}`,
+  text at most 4096 characters (`413 input_too_long`), `sample_rate` omitted =
+  native 22050, `16000` = resampled, anything else `400` (never a silent
+  native answer). Streams PCM16 mono as `audio/pcm` with `X-Sample-Rate` (the
+  rate sent) and `X-Channels: 1`. `409 tts_not_installed`, `503 tts_unavailable`,
+  `502 upstream_error`. A client gone before synthesis starts gets `499` and the
+  daemon is never called.
+
+The full device protocol doc lands with S9.
 
 ## taOSusb Bluetooth pairing: commit/reveal (protocol v2)
 
@@ -1350,7 +1443,12 @@ subscribe. `503` while `app.state.event_bus` is still starting.
   **The payload never crosses the wire** -- `id` is the event's trace id, so a
   subscriber learns that something changed and must refetch to learn what.
 - A comment frame `:keepalive` is sent every 10 s so proxies do not close an
-  idle stream.
+  idle stream. A data frame `{"kind": "events.heartbeat", "ts": ...}` is sent
+  alongside it so the client can detect a half-open connection that the native
+  EventSource would otherwise never notice. The hook arms a 25 s watchdog
+  (2.5x the keepalive interval) that resets on any frame including the
+  heartbeat; on expiry it closes the stream, marks it stale, and reconnects
+  through the existing backoff.
 - Frames deliberately carry **no SSE `id:` line**. An `id:` is what makes a
   browser send `Last-Event-ID` on reconnect, and this endpoint ignores that
   header: resume is best-effort through the EventBus replay buffer (the last
@@ -1439,6 +1537,65 @@ subscriber's ids and hand that subscriber a replayed event it already handled
 when it owned a stream of its own, and the same window is what makes the
 overlap during a filter widening invisible to callers.
 
+## Model Activity feed (`/api/activity/models`, session-only)
+
+Route module `tinyagentos/routes/model_activity.py`. A ring buffer of
+model-level events on the controller (`app.state.model_activity`, a
+`ModelActivityFeed` from `tinyagentos/model_activity.py`, 500 records by
+default). Two producers feed it:
+
+- `llm_gateway/forward.py` records `request.start` / `request.finish` (with
+  duration, tokens and output token rate) and `model.route` on backend
+  failover. These fire on every gateway request, so the feed is live on any box
+  with `TAOS_LLM_GATEWAY=1`.
+- `CoreAwareModelScheduler` records load / unload / evict / shrink when it is
+  constructed with the feed (`activity_feed=...`, or
+  `set_activity_feed(...)` later). **Today nothing in `create_app` constructs
+  one** -- that wiring is the Phase-1.5 sequential-loading task tracked as
+  #172 -- so on a live box the scheduler half of the feed stays empty until it
+  lands. The hook is at the module's existing event surface and is covered by
+  tests; only the instantiation is missing.
+
+It is an operational window, not a system of record: nothing is persisted, and
+`SystemEventStore` remains the durable log.
+
+Both paths sit behind the session cookie: the paths are NOT in
+`EXEMPT_PATHS`, so `AuthMiddleware` 401s an unauthenticated request before the
+handler runs, and no registry scope reaches them. The route's own
+`get_current_user` dependency is what enforces that, not the middleware: a
+local-token bearer is a valid credential for the middleware (it stamps a
+`user_id`), and the routes still answer `401` to it. The stream answers `503`
+while `app.state.model_activity` is still starting.
+
+Reads are owner-scoped. A gateway event carries the principal that made the
+request as its `owner` (`user:<id>` for a session, an agent's registry name for
+an agent, the gateway master-key label for the admin key), on `model.route` as
+well as on `request.start` / `request.finish`; the scheduler hooks have no owner
+because a load is a controller-level fact, not a caller's. An admin session sees
+the whole ring, while a member session sees only the events its own principal
+owns, so one user cannot read which models another user's agents call, how
+often, or under which agent names. Controller-level events and other
+principals' traffic stay admin-only; the AI-stack manager panel remains the
+member-visible view of what is loaded.
+
+- `GET /api/activity/models`: newest-first history. `?limit=` (1-500, default
+  100), `?model=`, `?worker=`, `?event=`. Answers
+  `{"events": [...], "count": N, "event_types": [...]}`; `event_types` is the
+  vocabulary the UI builds its filter list from.
+- `GET /api/activity/models/stream`: SSE. `?limit=` (0-500, default 50) caps
+  the ring window a new subscriber is caught up with; `0` means live-only,
+  which is the right choice for a caller that already fetched the history and
+  is deduplicating by `seq`. Filter parameters are the same three as above and
+  apply to the live frames as well as the catch-up window. Frames are
+  `id: <seq>` + `data: <event JSON>`, with `:keepalive` every 10 s.
+- Event vocabulary (stable): `model.load`, `model.unload`, `model.evict`,
+  `model.shrink`, `model.route`, `request.start`, `request.finish`. `seq` is
+  monotonic and is the de-dupe key across the catch-up/live seam; `worker` is
+  `"controller"` for local events; `duration_ms`, `tokens_in`, `tokens_out` and
+  `token_rate` are populated on `request.finish`.
+- Telemetry is best-effort at every hook: a feed failure is logged and never
+  fails a model load or an inference request.
+
 ## LoRA Studio routes (session-only, no agent scope)
 
 Route module `tinyagentos/routes/lora_studio.py`. These are OWNER routes: they
@@ -1476,6 +1633,23 @@ A Civitai URL added to the Library takes the same path: `detect_kind` tags it
 `url:civitai` and `CivitaiProcessor` runs the identical ingest job, linking the
 resulting `lora_id` back onto the library item.
 
+## Cast discovery status (`GET /api/cast/discovery/status`, session-only)
+
+Route module `tinyagentos/routes/cast_discovery.py`. Session cookie only; no
+registry scope reaches it. It reports whether the opt-in mDNS reflector
+(`mdns_reflector.enabled` in config.yaml, off by default) is actually bridging
+cast discovery across a container boundary.
+
+- `{"state": "ok"}` -- running, bridging at least two interfaces, traffic seen.
+- `{"state": "unavailable", "reason": ...}` -- enabled but not bridging.
+  `reason` is `not_running`, `single_interface`, `bind_failed`, `send_failed`,
+  `no_traffic`, or `start_failed` (enabled in config but the reflector raised
+  during startup; `error` carries the message).
+- `{"state": "disabled"}` -- not enabled; it makes no claim either way.
+
+The cast device list must treat `unavailable` as "discovery is not working",
+never as an empty network.
+
 ## What `GET /api/decisions/agent` returns (grant scoping)
 
 Route module `tinyagentos/routes/decisions.py`, scope `decisions_write`. Lists
@@ -1486,23 +1660,22 @@ Which of its own decisions come back depends on the shape of the grant:
 
 | grant | returns |
 |---|---|
-| global (null-project) | **null-project decisions ONLY** |
+| global (null-project) only | **null-project decisions ONLY** |
 | exactly one project | that project's decisions, filtered in the store query |
-| two or more projects | fetched by agent, then filtered in Python |
+| two or more scopes (global counts as one) | the union, one store query per scope, merged newest first |
 
 **A global grant does NOT mean "see everything".** It means null-project
 decisions, matching the rule `_resolve_decision_actor` already applies when the
 agent POSTS a decision: an agent with a global grant raises null-project
-decisions, so that is what it reads back. Anything relying on a global grant
-returning every project's decisions is relying on the older, wider behaviour.
+decisions, so that is what it reads back. An agent that also holds a grant on
+project B can post there too, so it also reads back its project-B decisions;
+projects it holds no grant for stay hidden. The registry-JWT path of
+`GET /api/decisions` returns the same set.
 
-**The `limit` interacts with scoping and only two of the three paths are safe.**
-The global and single-project paths push the project filter into the store query,
-so the 500 limit applies AFTER scoping (issue #2194). The **two-or-more-project
-path still fetches up to 500 rows for the agent and filters afterwards in
-Python**, so an agent holding grants on several projects and carrying more than
-500 decisions in total can still lose allowed-project rows to the limit. Same
-shape as the original bug, narrower blast radius.
+**The `limit` applies AFTER scoping (issue #2194).** Each granted scope
+(global, or one project) is its own store query with the project filter inside
+it, and the merged result is capped at 500 newest first, so decisions in
+ungranted projects can never crowd allowed ones out of the list.
 
 ## MCP tool calls (`POST /api/mcp/call`)
 
@@ -1652,6 +1825,12 @@ Behaviour common to all three:
   scheduler stops routing tasks to it, rather than waiting out the heartbeat
   timeout. The worker stays REGISTERED and therefore still visible in
   `GET /api/cluster/workers`, which is what makes it unblockable from the UI.
+- `DELETE /api/cluster/workers/{name}` additionally unpins every agent whose
+  `remote` matches the worker name: `remote` and `placement_source` are popped,
+  `host` is set to empty, `status` is set to `failed`, and `placement_error`
+  records the worker name. The response includes `unpinned_agents` (the list of
+  affected agent names, empty when none). Marking a worker offline via revoke or
+  block does NOT unpin agents, only full deletion does.
 
 **Blocked devices keep consuming a per-user slot.** `list_for_user` returns rows
 where `revoked=0 OR blocked=1`, so a blocked device counts against
@@ -1689,7 +1868,9 @@ snapshot, not a lock.
   `loaded`. Note the corollary: the non-ollama backends (llama.cpp / vLLM /
   sd-cpp) publish no in-memory probe — their `loaded_models` is empty by design
   — so a model they are actively serving still reads `installed`, following the
-  worker's own `available_models[].status`.
+  worker's own `available_models[].status`. llama-swap does publish one: its
+  `loaded_models` (and the controller's `GET /api/models/loaded` rows for a
+  `llama-swap` provider) come from its `/running` list.
 - `capabilities` -- the union of capabilities across the mesh, each split into
   mutually exclusive buckets: `active_nodes` (serving now), `installed_nodes`
   (present but not serving) and `potential_nodes` (hardware could run it,
@@ -1725,7 +1906,7 @@ registrations and heartbeats.
   always knows which controller instance accepted it.
 - A worker sends that generation back on subsequent requests. A request
   carrying a generation that does not match the controller's current one is
-  rejected -- registration answers `409` with `{"error": "stale_generation"}`
+  rejected -- registration answers `409` with `{"error": "stale_generation", "generation": <current>}`
   (or `"fenced"`), heartbeat answers `404` -- because it means the worker is
   talking to (or was adopted by) **another active controller**. Each rejection
   logs a warning naming the worker and both generations.
@@ -1751,7 +1932,9 @@ A `single_select` or `multi_select` decision can be answered off-menu by sending
 - `multi_select`: `value` must still be a list and **every element is still
   validated against the declared options**; the free-text entry is appended, so
   the stored answer is `[*declared_values, other_value.strip()]`. A non-list
-  `value` is a `400`.
+  `value` is a `400`. `value` may be an empty list when `other_value` is
+  non-empty; the stored answer is then `[other_value.strip()]`. An empty
+  `value` with an empty `other_value` is a `400`.
 - `note` is a separate optional field. When present it is appended to the text
   routed to the agent as `<answer> (note: <note>)`.
 - With no `other_value`, the original strict validation is unchanged: the answer
@@ -1877,14 +2060,28 @@ eliminating the last-deploy-wins collision where two agents bound to the same
 host token would overwrite each other's identity. The shared host token remains
 valid for admin/system callers but is no longer bound to any agent name.
 
+## Chat author identity (credential-bound for per-agent local tokens)
+
+`POST /api/chat/messages`, `POST /api/chat/messages/{id}/reactions`,
+`DELETE /api/chat/messages/{id}/reactions/{emoji}`, and
+`POST /api/chat/channels/{id}/typing` now bind the caller-supplied author to the
+per-agent local token when one is presented. `POST /api/chat/messages/{id}/delta`
+and `POST /api/chat/messages/{id}/state` CHECK message ownership (403 when the
+message is missing or not authored by the bound agent) rather than overriding an
+author field. `POST /api/chat/channels/{id}/thinking` REJECTS a mismatched slug
+(it does not override it). The auth middleware sets `request.state.agent_name`
+for bound tokens (`AuthManager.get_local_token_agent`); the routes use a
+`_bound_agent(request)` helper and override `author_id`/`slug` with that name.
+The host local token, admin sessions, session cookies, and device bearers are
+not bound, so their caller-supplied values are preserved (byte-for-byte
+compatibility with taosctl and the SPA).
+
 ## In-process LLM gateway (`/api/llm/v1`, scoped gateway keys, session or host local token)
 
 `tinyagentos/llm_gateway/` is the in-controller replacement for the LiteLLM
-proxy, and it is ON BY DEFAULT (cutover stage 1). An operator turns it off
-with `TAOS_LLM_GATEWAY=0` (or `false` / `no` / `off`) in the controller's
-environment; then `/api/llm/v1/*` does not exist (404 for a signed-in caller)
-and agents are moved back to LiteLLM at the next start. LiteLLM still runs
-beside the gateway in stage 1 and is removed in a later stage.
+proxy, and since LiteLLM removal stage 2b-2a it is the ONLY LLM path: there is
+no LiteLLM process, and `TAOS_LLM_GATEWAY=0` (or `false` / `no` / `off`) is
+ignored (logged once at startup); `/api/llm/v1/*` is always mounted.
 
 How agents reach it. An agent's base URL does not change: it is still
 `http://127.0.0.1:4000/v1` inside its container (openclaw:
@@ -1892,12 +2089,27 @@ How agents reach it. An agent's base URL does not change: it is still
 `taos-proxy-litellm`; its host side (`connect`) used to be LiteLLM's host port
 (`server.litellm_port`, 7834) and is now the gateway's AGENT LISTENER,
 `127.0.0.1:7838` on the host (`server.llm_gateway_port` or
-`TAOS_LLM_GATEWAY_PORT`; `0` disables the listener and keeps every agent on
-LiteLLM; not 7837, which is the MLX backend's port). The listener binds
-loopback only and serves an allowlist: `/v1/models` and
-`/v1/chat/completions` (and the un-prefixed forms) from the gateway, and
-`/v1/embeddings` / `/embeddings` (what `TAOS_EMBEDDING_URL` points at)
-relayed unchanged to LiteLLM. Every other path is a 404, including
+`TAOS_LLM_GATEWAY_PORT`; `0` disables the listener, which leaves agents with
+no LLM path; not 7837, which is the MLX backend's port). The device keeps its
+`taos-proxy-litellm` name and its in-container listen side; there is no
+rename migration. The listener binds
+loopback only and serves an allowlist, all from the gateway itself:
+`/v1/models`, `/v1/chat/completions` and `/v1/embeddings` (what
+`TAOS_EMBEDDING_URL` points at), and the un-prefixed forms. Embeddings used to
+be relayed to LiteLLM; since LiteLLM removal stage 2a (tsk-ilqzq6) the gateway
+routes them itself (`llm_gateway/embeddings.py`: `taos-embedding-default` and
+discovered embedding models to the Ollama-shaped backend's `/api/embed`, a
+llama.cpp/OpenAI-compatible model to its `/embeddings`), under the same key
+allowlist and usage recording as chat, so nothing an agent calls needs
+LiteLLM running. An agent's key must name the embedding model (e.g.
+`taos-embedding-default`) to use it: `scoped_key_models` adds the
+embedding alias to every mint and re-scope, so the key always allows
+embeddings. Chat answers also carry
+`reasoning_content` (same text) wherever the upstream sent `reasoning`, as
+LiteLLM did. A remote agent has no gateway path (no proxy device, loopback
+listener): a remote deploy is REFUSED with "remote agents need the network LLM
+gateway, not built yet" (decision dec-26f4cw), and the cutover skips an
+existing remote agent with the same reason. Every other path is a 404, including
 LiteLLM's admin API (`/key/generate`, `/model/new`, `/config/update`,
 `/user/new`) and `/v1/messages` / `/v1/responses`. Paths are normalised first
 (a trailing slash cannot route around the gateway) and request bodies are
@@ -1912,34 +2124,38 @@ live in e.g. `user-999`) and passing `--project`:
   answer with this start's nonce in `x-taos-llm-listener` and the gateway's
   own 401 (`code: invalid_api_key`). Accepting TCP is not enough: a
   different process holding the port (an unauthenticated model server, say)
-  would otherwise receive every agent's traffic. Unverified: nobody moves,
-  agents already on the listener go back to LiteLLM, and new deploys stay on
-  LiteLLM.
-- gateway on: an agent moves only if the gateway can serve EVERY model its
-  key allows (`cutover.models_problem`, read from the same routing table):
-  the highest-priority route must be OpenAI-compatible (`openai`,
-  `openrouter`), Anthropic, or Ollama on a backend of type `ollama`.
-  rkllama and hailo-ollama (no `/v1/chat/completions`), deepseek, unknown
-  models and an empty allowlist keep the agent on LiteLLM, with the reason
-  logged. An agent already on the gateway whose models stop being servable
-  goes back. New deploys apply the same check.
-- Then the agent's gateway key is minted from its LiteLLM `agent_keys` row
-  (same hash, `key_id` `gk_lit_...`, same allowlist, so the key the agent
-  already holds keeps working), checked to be live, and only then is the
-  device set to the listener. No restart, no redeploy.
-- An agent whose key cannot be read stays on LiteLLM and is logged
-  (`llm gateway cutover: <agent> left as is: <reason>`): no key recorded, the
-  shared master key, a key the local key store does not hold (for example a
-  LiteLLM Postgres virtual key) or another agent's key. Nothing unscoped is
-  minted. Remote agents have no device and are skipped.
-- gateway off: every device pointing at the listener is pointed back at
-  LiteLLM.
+  would otherwise receive every agent's traffic. Unverified: nobody is moved
+  onto it, agents already on it are left as they are (there is no LiteLLM to
+  send them back to), and new local deploys are refused with the reason.
+- A device whose `connect` is an old LiteLLM host port (4000, 7834, or the
+  configured `server.litellm_port`) is moved to the listener
+  UNCONDITIONALLY: that port is dead. Whether the gateway can serve EVERY
+  model its key allows (`cutover.models_problem`, read from the same routing
+  table) no longer decides the move; a problem is logged on the agent's
+  item. A model is servable when its highest-priority route is
+  OpenAI-compatible (`openai`,
+  `openrouter`, `deepseek`), Anthropic, or Ollama-shaped on a backend of
+  type `ollama`, `rkllama` or `hailo-ollama` (all three serve
+  `/v1/chat/completions` at the refs taOS installs; hailo-ollama streams
+  Ollama NDJSON, which the gateway translates to OpenAI SSE). New deploys
+  run the same check and record a warning step instead of failing.
+- When the agent's key is its own `agent_keys` row, its gateway key is
+  minted from it first (same hash, `key_id` `gk_lit_...`, same allowlist, so
+  the key the agent already holds keeps working) and checked to be live,
+  then the device is set to the listener. No restart, no redeploy.
+- An agent whose key cannot be read (no key recorded, the old master key, a
+  key the local key store does not hold such as a LiteLLM Postgres virtual
+  key, or another agent's key) is still moved, nothing is minted for it, and
+  the reason ("re-key or redeploy it") is logged on its item. Remote agents
+  have no device and are skipped.
 - A container that errors or hangs (each incus call is capped at 30 s) is
   logged and skipped; the rest are still reconciled.
 
 Only a device whose current value was read and recognised is changed, so a
 second run changes nothing. New local deploys go straight to the listener
-once it has been verified and their models are servable. By hand (the same commands the
+once it has been verified, with `OPENAI_BASE_URL=http://127.0.0.1:4000/v1`
+and `TAOS_EMBEDDING_URL=http://127.0.0.1:4000/v1/embeddings` (the container's
+own address, never the host's `litellm_port`). By hand (the same commands the
 reconcile runs):
 `incus config device get <container> taos-proxy-litellm connect --project <project>`
 and
@@ -1961,8 +2177,8 @@ It is deliberately NOT bare `/v1`: `/v1/models` and `/v1/chat/completions`
 are Agent-as-a-Model (consent-key auth, see `routes/agent_model_api.py`) and
 are unchanged.
 
-Routing: model names resolve through `litellm_config.build_model_list`, the
-same function `generate_litellm_config` wraps, read per request.
+Routing: model names resolve through `litellm_config.build_model_list`, read
+per request (the LiteLLM config writer that also wrapped it is gone).
 `taos-default` resolves per request to the taOS agent's model preference
 (desktop settings `("user", "taos_agent")["model"]`, set by
 `PATCH /api/taos-agent/settings`), so changing it needs no restart.
@@ -1984,9 +2200,16 @@ so OpenAI clients surface it as bad credentials. `gateway_caller` accepts:
   minted from it by the cutover once that exists (its revocation is final),
   otherwise the `agent_keys` row itself.
 
-The per-install LiteLLM master key is NOT accepted (it was admin until cutover
-stage 1): it is a 401 like any unknown key. The host's own callers (the
-reasoning judge, for one) use the host local token.
+The old per-install LiteLLM master key is NOT accepted (it was admin until
+cutover stage 1): it is a 401 like any unknown key. The host's own callers
+(the reasoning judge, for one) use the host local token. Since stage 2b-2a
+nothing generates or reads the master key at all (an old install may still
+have the `.litellm_master_key` file; nothing uses it): every deploy gets a key
+scoped to its models from the local key store
+(`TAOS_DISABLE_AGENT_MASTER_KEY_FALLBACK` no longer does anything), the taOS
+agent's opencode likewise, per-agent key admin (mint / re-scope / delete /
+usage) is the local key store with no process gating it, and the provider
+model catalog is read in process from the routing table.
 
 The `taos-default` alias rule: a caller allowed `taos-default` may use
 whatever it CURRENTLY resolves to, without the concrete model in its list.
@@ -2005,7 +2228,7 @@ the LiteLLM hook's 429 before anything is forwarded. Revoking, blocking or
 deleting a cluster node, and archiving an agent, revoke the keys bound to it
 in the same request.
 
-## The system taOS Agent's harness (opencode, or PicoClaw on a handset)
+## The system taOS Agent's harness (opencode, PicoClaw on a handset, or Claude Code)
 
 The built-in taOS Agent runs on opencode (a host `opencode serve`) on every
 host, except a taOSmobile handset, where it runs on PicoClaw (the catalog's
@@ -2015,13 +2238,27 @@ the choice is made, from two config.yaml keys:
 - `device.class`: `auto` (default; `hardware._detect_device_class`, which
   reads the `taos-kiosk.service` unit), `mobile` or `desktop`;
 - `taos_agent.framework`: `auto` (default; picoclaw on mobile, opencode
-  elsewhere), `opencode` or `picoclaw` (operator overrides).
+  elsewhere), `opencode`, `picoclaw` or `claude_code` (operator overrides;
+  `auto` never picks `claude_code`).
 
 PicoClaw needs the LLM gateway (on unless `TAOS_LLM_GATEWAY=0`) and a `picoclaw` binary
 (`TAOS_PICOCLAW_BIN`, PATH, `/usr/local/bin`, `/usr/bin`). Without either,
 opencode runs and the reason is logged, e.g. exactly
 `picoclaw preferred, gateway disabled, using opencode`. An unknown config
 value is ignored (treated as `auto`) with a warning.
+
+`claude_code` runs one `claude -p --output-format stream-json` turn per chat
+message (`tinyagentos/claude_code_runtime.py`), continued with `--resume`. It
+signs in with the long-lived token `claude setup-token` prints, stored as the
+Secrets entry `claude_code_oauth_token` (never the controller env); the child
+gets only `HOME`, `PATH`, `LANG`, `NO_COLOR`, `TZ` and
+`CLAUDE_CODE_OAUTH_TOKEN`. It needs the `claude` binary (PATH,
+`~/.local/bin/claude`, `/usr/local/bin/claude`) and that secret, not the
+gateway. Without them opencode runs, with the reason exactly
+`claude_code preferred, claude binary not found, using opencode` or
+`claude_code preferred, no claude_code_oauth_token secret, using opencode`;
+a chat request while it is selected but not ready answers 503 with a plain
+message. Attachments are not supported yet.
 
 - `GET /api/taos-agent/config` and the lock screen (`/auth/lock-widgets`)
   report `framework` = the harness that RUNS the agent (never the
@@ -2070,3 +2307,38 @@ The agent's own A2A identity token (`.taos_agent_token`) is a2a-only
 (scope `a2a_send` + `a2a_receive`) and covers none of the above endpoints.
 Leaving PicoClaw, or any controller start into opencode, revokes the old
 credential and mints a fresh one.
+
+## taOS Agent action gate (pending, confirm, execute)
+
+Every tier-B operation the taOS Agent wants to perform (an external write such
+as a GitHub PR or issue, or an irreversible local change) goes through a
+two-step gate in `tinyagentos/routes/taos_agent_actions.py`. The gate is a
+server-side mechanism, so it binds every harness the same way.
+
+- `POST /api/taos-agent/actions` `{kind, summary, payload}` stores the action
+  and answers `{action_id, kind, summary, state, confirmed_by}`. Under the
+  default `ask` policy the state is `pending` and a `taos_agent.action_pending`
+  event (`{action_id, kind, summary}`) goes to the owner's `user:<id>` event
+  channel for the chat confirm card. Under `auto` the state is `confirmed`,
+  `confirmed_by` is `auto`, and no card is shown.
+- `GET /api/taos-agent/actions?state=pending` lists the caller's own actions
+  (`{actions: [...]}`, oldest first, optional `state` filter), so a confirm
+  card lost to a restart or a failed event publish can be shown again.
+- `POST /api/taos-agent/actions/{id}/confirm` and `/decline` answer a pending
+  action (`confirmed_by` becomes `user` or `declined`). A second answer is a
+  409. Both are refused with 403 for anything but a signed-in browser session:
+  an agent credential can ask, never answer for the user.
+- `POST /api/taos-agent/actions/{id}/execute` runs the executor registered for
+  the action's kind (`app.state.taos_agent_action_executors[kind]`) exactly
+  once. The row reads `executing` while the executor runs and `executed` only
+  after it returns. Anything not `confirmed` is a 409 (pending, declined,
+  executing, executed or failed); a kind with no executor is a 422. A raising
+  executor marks the action `failed` (502) and it is never re-run. A row left
+  `executing` by a stopped process is never replayed either, because the
+  external write may already have happened: it stays visible in the list.
+- `PUT /api/taos-agent/actions/policy` `{kind, policy: ask|auto}` (browser
+  session only) sets `action_policy[kind]` in the signed-in user's own
+  `(<user id>, "taos_agent")` preference blob, so one account's `auto` never
+  skips the card for another account. Every kind defaults to `ask`.
+
+Another user's action answers 404. Rows live in `taos_agent_actions.db`.

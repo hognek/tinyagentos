@@ -21,6 +21,10 @@ async def app(tmp_path):
     config_path.write_text(yaml.dump(config))
     (tmp_path / ".setup_complete").touch()
     _app = create_app(data_dir=tmp_path)
+    chat_messages = _app.state.chat_messages
+    if chat_messages._db is not None:
+        await chat_messages.close()
+    await chat_messages.init()
     chat_channels = _app.state.chat_channels
     if chat_channels._db is not None:
         await chat_channels.close()
