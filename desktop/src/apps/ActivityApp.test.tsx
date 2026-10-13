@@ -79,6 +79,8 @@ function baseResponses(activity = makeActivity(), overrides: Record<string, { ok
     "/api/scheduler/stats": { ok: true, body: schedulerStatsBody() },
     "/api/scheduler/tasks?limit=8": { ok: true, body: { tasks: [] } },
     "/api/cluster/workers": { ok: true, body: [] },
+    // Model Activity feed (#208): its own panel inside the Activity app.
+    "/api/activity/models?limit=200": { ok: true, body: { events: [], count: 0, event_types: [] } },
     ...overrides,
   };
 }
@@ -288,5 +290,24 @@ describe("ActivityApp", () => {
 
     const activityCallsAfter = fetchMock.mock.calls.filter((c) => c[0] === "/api/activity").length;
     expect(activityCallsAfter).toBe(activityCallsBefore + 1);
+  });
+
+  it("renders the Model Activity header with wrap classes for mobile responsiveness", async () => {
+    vi.stubGlobal("fetch", mockFetch(baseResponses()));
+    render(<ActivityApp windowId="win-1" />);
+    await flush();
+
+    await waitFor(() =>
+      expect(screen.getByRole("heading", { name: "Activity" })).toBeTruthy(),
+    );
+
+    const header = screen.getByRole("heading", { name: "Model Activity" });
+    expect(header).toHaveClass("whitespace-nowrap");
+
+    // Find the filter group by looking for the select's parent div
+    // The filter group has flex-wrap class
+    const select = screen.getByLabelText("Filter by worker");
+    const filterGroup = select.closest("div[class*=\"flex flex-wrap\"]");
+    expect(filterGroup).toHaveClass("flex-wrap");
   });
 });

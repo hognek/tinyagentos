@@ -152,6 +152,20 @@ FRAMEWORKS: dict[str, dict] = {
              "icon": "diagnostic", "requires_capability": "agent.terminal"},
         ],
     },
+    "nanobot": {
+        "id": "nanobot",
+        "name": "nanobot",
+        "description": "Lightweight personal AI agent (HKUDS/nanobot) -- taOS bridge to /v1/chat/completions on :8900",
+        "verification_status": "experimental",
+        "slash_commands": [
+            {"name": "help", "description": "List available commands"},
+            {"name": "clear", "description": "Clear the session context"},
+        ],
+        "shortcuts": [
+            {"kind": "container-terminal", "label": "Container shell",
+             "icon": "terminal", "requires_capability": "agent.shell"},
+        ],
+    },
     "opencrabs": {
         "id": "opencrabs",
         "name": "OpenCrabs",
@@ -238,6 +252,15 @@ FRAMEWORKS: dict[str, dict] = {
             {"name": "help", "description": "Show PicoClaw help"},
         ],
     },
+    "claude_code": {
+        "id": "claude_code",
+        "name": "Claude Code",
+        "description": "Claude Code CLI as the taOS Agent harness (anthropics/claude-code), signed in with a `claude setup-token` token stored in Secrets",
+        "verification_status": "experimental",
+        "slash_commands": [
+            {"name": "help", "description": "Show Claude Code help"},
+        ],
+    },
     "shibaclaw": {
         "id": "shibaclaw",
         "name": "ShibaClaw",
@@ -254,6 +277,19 @@ FRAMEWORKS: dict[str, dict] = {
         "verification_status": "experimental",
         "slash_commands": [
             {"name": "help", "description": "Show ZeroClaw help"},
+        ],
+    },
+    "thclaws": {
+        "id": "thclaws",
+        "name": "thClaws",
+        "description": "thClaws agent framework (thClaws/thClaws) -- taOS bridge to /v1/chat/completions on :8443",
+        "verification_status": "experimental",
+        "slash_commands": [
+            {"name": "help", "description": "List available commands"},
+        ],
+        "shortcuts": [
+            {"kind": "container-terminal", "label": "Container shell",
+             "icon": "terminal", "requires_capability": "agent.shell"},
         ],
     },
 }

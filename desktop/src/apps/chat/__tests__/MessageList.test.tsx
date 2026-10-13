@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import { MessageList } from "../MessageList";
 import type { MessageRow, MessageListProps } from "../MessageList";
 import type { Channel, LiveAgent, ArchivedAgentEntry } from "../types";
@@ -227,7 +227,7 @@ describe("MessageList", () => {
       });
       // dayLabel returns "Today", "Yesterday", or a formatted date — verify
       // the separator element exists and contains human-readable text
-      const separator = document.querySelector(".select-none .text-white\\/40");
+      const separator = document.querySelector(".select-none .text-shell-text-tertiary");
       expect(separator).not.toBeNull();
       expect(separator?.textContent?.trim().length).toBeGreaterThan(0);
     });
@@ -242,7 +242,7 @@ describe("MessageList", () => {
         ],
       });
       // Should have two day separator elements
-      const separators = document.querySelectorAll(".select-none .text-white\\/40");
+      const separators = document.querySelectorAll(".select-none .text-shell-text-tertiary");
       expect(separators.length).toBe(2);
     });
   });
@@ -306,6 +306,73 @@ describe("MessageList", () => {
       });
       // The textarea has the content, not the raw rendered markdown
       expect(screen.getByDisplayValue("old text")).toBeInTheDocument();
+    });
+  });
+
+  /* ---- editing the last agent reply (#834) ---- */
+
+  describe("edit last agent reply", () => {
+    const agentMsgs = () => [
+      msg({ id: "a1", author_id: "tom", author_type: "agent", content: "older reply" }),
+      msg({ id: "u1", content: "question" }),
+      msg({ id: "a2", author_id: "tom", author_type: "agent", content: "latest reply" }),
+    ];
+
+    it("shows the edit button only on the last completed agent message", () => {
+      const onEditAgentReply = vi.fn();
+      const { container } = renderWithMsg({ messages: agentMsgs(), onEditAgentReply });
+      const buttons = screen.getAllByRole("button", { name: "Edit reply" });
+      expect(buttons).toHaveLength(1);
+      const row = container.querySelector('[data-message-id="a2"]');
+      expect(row?.contains(buttons[0])).toBe(true);
+      fireEvent.click(buttons[0]);
+      expect(onEditAgentReply).toHaveBeenCalledWith("a2");
+    });
+
+    it("hides the edit button while the last agent message is streaming", () => {
+      const messages = agentMsgs();
+      messages[2] = { ...messages[2], state: "streaming" };
+      renderWithMsg({ messages, onEditAgentReply: vi.fn() });
+      expect(screen.queryByRole("button", { name: "Edit reply" })).toBeNull();
+    });
+
+    it("hides the edit button on a rich reply with content blocks", () => {
+      const messages = agentMsgs();
+      messages[2] = { ...messages[2], content_blocks: [{ kind: "text", text: "rich" }] };
+      renderWithMsg({ messages, onEditAgentReply: vi.fn() });
+      expect(screen.queryByRole("button", { name: "Edit reply" })).toBeNull();
+    });
+
+    it("scopes 'last' per thread: a newer thread reply keeps the top-level pencil", () => {
+      const messages = [
+        ...agentMsgs(),
+        msg({ id: "t1", author_id: "tom", author_type: "agent", content: "in thread", thread_id: "a2" }),
+      ];
+      const { container } = renderWithMsg({ messages, onEditAgentReply: vi.fn() });
+      const buttons = screen.getAllByRole("button", { name: "Edit reply" });
+      const top = container.querySelector('[data-message-id="a2"]');
+      expect(buttons.some((b) => top?.contains(b))).toBe(true);
+    });
+
+    it("skips ephemeral agent messages when picking the editable reply", () => {
+      const messages = [
+        ...agentMsgs(),
+        msg({ id: "e1", author_id: "tom", author_type: "agent", content: "only you can see this", ephemeral: 1 }),
+      ];
+      const { container } = renderWithMsg({ messages, onEditAgentReply: vi.fn() });
+      const buttons = screen.getAllByRole("button", { name: "Edit reply" });
+      expect(buttons).toHaveLength(1);
+      expect(container.querySelector('[data-message-id="a2"]')?.contains(buttons[0])).toBe(true);
+    });
+
+    it("opens MessageEditor on the agent bubble being edited", () => {
+      renderWithMsg({
+        messages: agentMsgs(),
+        onEditAgentReply: vi.fn(),
+        editingMessageId: "a2",
+      });
+      expect(screen.getByLabelText("Edit message")).toHaveValue("latest reply");
+      expect(screen.queryByRole("button", { name: "Edit reply" })).toBeNull();
     });
   });
 
@@ -483,12 +550,27 @@ describe("MessageList", () => {
       expect(screen.getByText("General discussion")).toBeInTheDocument();
     });
 
+    it("shows channel topic in the header when set", () => {
+      renderWithMsg({
+        channel: channel({ topic: "Release planning", description: "old" }),
+      });
+      expect(screen.getByText("Release planning")).toBeInTheDocument();
+      expect(screen.queryByText("old")).not.toBeInTheDocument();
+    });
+
+    it("falls back to description when topic is empty", () => {
+      renderWithMsg({
+        channel: channel({ topic: "", description: "General discussion" }),
+      });
+      expect(screen.getByText("General discussion")).toBeInTheDocument();
+    });
+
     it("shows member count for group channels", () => {
       const { container } = renderWithMsg({
         channel: channel({ type: "group", members: ["user", "alice", "bob"] }),
       });
       // Member count is rendered next to the Users icon
-      const memberDiv = container.querySelector(".text-white\\/30.flex.items-center");
+      const memberDiv = container.querySelector(".text-shell-text-tertiary.flex.items-center");
       expect(memberDiv).not.toBeNull();
       expect(memberDiv?.textContent).toContain("3");
     });
@@ -784,12 +866,27 @@ describe("MessageList", () => {
       );
       expect(checkSvg).toBeFalsy();
     });
+
+    it("renders exactly one tick element for own completed dm-remote message", () => {
+      renderWithMsg({
+        channel: channel({ type: "dm-remote", members: ["user", "hub:peer"] }),
+        messages: [
+          msg({
+            channel_id: "dmr-1",
+            author_id: "user",
+            delivered_at: 1700000001,
+          }),
+        ],
+      });
+      const tickWrappers = document.querySelectorAll('[data-message-id="m1"] span.ml-1.inline-flex');
+      expect(tickWrappers).toHaveLength(1);
+    });
   });
 
   describe("A2A receipt ticks", () => {
     it("renders single check (sent) when no receipt row exists", () => {
       renderWithMsg({
-        channel: channel({ type: "dm-remote", members: ["user", "peer"] }),
+        channel: channel({ type: "group", settings: { kind: "a2a" }, members: ["user", "peer"] }),
         messages: [
           msg({ channel_id: "ch1", author_id: "user", receipts: [] }),
         ],
@@ -803,7 +900,7 @@ describe("MessageList", () => {
 
     it("renders double check (delivered) when receipt has no seen_at", () => {
       renderWithMsg({
-        channel: channel({ type: "dm-remote", members: ["user", "peer"] }),
+        channel: channel({ type: "group", settings: { kind: "a2a" }, members: ["user", "peer"] }),
         messages: [
           msg({
             channel_id: "ch1",
@@ -823,7 +920,7 @@ describe("MessageList", () => {
 
     it("renders coloured double check (seen) when receipt has seen_at", () => {
       renderWithMsg({
-        channel: channel({ type: "dm-remote", members: ["user", "peer"] }),
+        channel: channel({ type: "group", settings: { kind: "a2a" }, members: ["user", "peer"] }),
         messages: [
           msg({
             channel_id: "ch1",
@@ -844,7 +941,7 @@ describe("MessageList", () => {
 
     it("does not render receipt tick for non-own messages", () => {
       renderWithMsg({
-        channel: channel({ type: "dm-remote", members: ["user", "peer"] }),
+        channel: channel({ type: "group", settings: { kind: "a2a" }, members: ["user", "peer"] }),
         messages: [
           msg({
             channel_id: "ch1",

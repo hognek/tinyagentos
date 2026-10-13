@@ -31,10 +31,15 @@ from tinyagentos.worker.agent import WorkerAgent
 
 
 def _collapse_resources(backends: list[dict], hardware) -> list[str]:
-    """Call the shipped helper (lazy import: it does not exist pre-fix)."""
+    """Call the shipped helper (lazy import: it does not exist pre-fix).
+
+    The helper takes the hardware dict; the CUDA/ROCm usability flags in
+    ``hardware["gpu"]`` gate those classes (PR #3242), while the live-backend
+    gate is gone (taOS #3228).
+    """
     from tinyagentos.worker.agent import _collect_resources
 
-    return _collect_resources(backends, hardware)
+    return _collect_resources(backends, hardware, platform_name="linux")
 
 
 # Hardware profiles as ``_detect_gpu()`` builds them.
@@ -75,17 +80,20 @@ class TestResourceInventoryContract:
         ]
 
     def test_rocm_evidence_advertises_the_gpu_class(self):
-        # ``gpu-cuda-0`` is the name the scheduler gives every GPU resource
-        # (discovery.py), ROCm included, so the ROCm equivalent keeps it.
+        # ROCm gets its own class name now (dev's hardware-class refactor);
+        # the scheduler still maps it appropriately.
         assert _collapse_resources([OLLAMA], _hw_dict(ROCM_DEVICE)) == [
+            "cpu-inference",
+            "gpu-rocm-0",
+        ]
+
+    def test_gpu_hardware_without_a_live_backend_advertises_the_class(self):
+        # taOS #3228: the hardware class is trusted directly; a live backend
+        # is not required. The CUDA usability flag is still required (#3242).
+        assert _collapse_resources([], _hw_dict(CUDA_DEVICE)) == [
             "cpu-inference",
             "gpu-cuda-0",
         ]
-
-    def test_gpu_hardware_without_a_live_backend_stays_cpu_only(self):
-        # Both halves of the contract still have to hold: the class is about a
-        # *serving* accelerator, and the old backend probe was the other half.
-        assert _collapse_resources([], _hw_dict(CUDA_DEVICE)) == ["cpu-inference"]
 
     def test_vulkan_only_gpu_is_not_advertised_as_cuda(self):
         assert _collapse_resources([OLLAMA], _hw_dict(VULKAN_ONLY)) == ["cpu-inference"]
@@ -99,12 +107,17 @@ class TestResourceInventoryContract:
             "npu-rk3588",
         ]
 
-    def test_a_stopped_backend_is_not_evidence(self):
+    def test_a_stopped_backend_does_not_create_a_class(self):
         # detect_backends() appends manifest-synthetic status="stopped" entries
-        # for declared-but-not-answering software; they must not resurrect an
-        # accelerator class on a host that has the hardware but is not serving.
-        assert _collapse_resources([STOPPED_OLLAMA], _hw_dict(CUDA_DEVICE)) == ["cpu-inference"]
-        assert _collapse_resources([STOPPED_RKLLAMA], _hw_dict(NO_ACCELERATOR)) == ["cpu-inference"]
+        # for declared-but-not-answering software; a stopped rkllama must not
+        # advertise npu-rk3588. (The GPU classes are hardware-decided now, so a
+        # stopped GPU backend on CUDA hardware does not remove the class.)
+        assert _collapse_resources([STOPPED_OLLAMA], _hw_dict(NO_ACCELERATOR)) == [
+            "cpu-inference"
+        ]
+        assert _collapse_resources([STOPPED_RKLLAMA], _hw_dict(NO_ACCELERATOR)) == [
+            "cpu-inference"
+        ]
 
     def test_a_live_backend_beside_a_stopped_one_still_counts(self):
         assert _collapse_resources([STOPPED_RKLLAMA, OLLAMA], _hw_dict(CUDA_DEVICE)) == [
@@ -211,10 +224,12 @@ class TestWorkerRegistrationInventory:
             "gpu-cuda-0",
         ]
 
-    async def test_register_ignores_a_stopped_backend_on_a_cuda_host(self):
+    async def test_register_keeps_cuda_class_with_stopped_backend(self):
+        # The GPU class is hardware-decided (taOS #3228); a stopped backend
+        # does not remove it. (Stopped backends only matter for npu-rk3588.)
         assert await _register(
             HardwareProfile(ram_mb=16384, gpu=CUDA_DEVICE), backends=[STOPPED_OLLAMA]
-        ) == ["cpu-inference"]
+        ) == ["cpu-inference", "gpu-cuda-0"]
 
 
 @pytest.mark.asyncio
@@ -230,13 +245,12 @@ class TestWorkerHeartbeatInventory:
             "gpu-cuda-0",
         ]
 
-    async def test_heartbeat_ignores_a_stopped_backend_on_a_cuda_host(self):
-        # Twin of the register case: the heartbeat rebuilds the inventory on
-        # every tick, so a backend that stops between ticks must drop the class
-        # here too, not just at registration.
+    async def test_heartbeat_keeps_cuda_class_with_stopped_backend(self):
+        # Twin of the register case: the GPU class is hardware-decided, so a
+        # backend that stops between ticks does not remove the class.
         assert await _heartbeat(
             HardwareProfile(ram_mb=16384, gpu=CUDA_DEVICE), backends=[STOPPED_OLLAMA]
-        ) == ["cpu-inference"]
+        ) == ["cpu-inference", "gpu-cuda-0"]
 
 
 class _EmptyPath:

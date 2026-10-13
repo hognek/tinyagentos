@@ -13,6 +13,7 @@ import {
   Check,
   CheckCheck,
   Globe,
+  Pencil,
 } from "lucide-react";
 import Picker, { Theme } from "emoji-picker-react";
 import { Button } from "@/components/ui";
@@ -98,6 +99,7 @@ export interface MessageRow {
   reactions?: Record<string, string[]>;
   edited_at?: number | string;
   deleted_at?: number | null;
+  ephemeral?: number | boolean;
   delivered_at?: number | null;
   attachments?: AttachmentRecord[];
   reply_count?: number;
@@ -137,6 +139,10 @@ export interface MessageListProps {
   editingMessageId: string | null;
   onCancelEdit: () => void;
   onSaveEdit: (msgId: string, content: string) => void;
+  /** Start editing the last completed agent reply in place. */
+  onEditAgentReply?: (msgId: string) => void;
+  /** Error message when saving an edit fails. */
+  editError?: string | null;
 
   /* ---- reactions ---- */
   onToggleReaction: (messageId: string, emoji: string) => void;
@@ -215,6 +221,8 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
   editingMessageId,
   onCancelEdit,
   onSaveEdit,
+  onEditAgentReply,
+  editError,
   onToggleReaction,
   showEmoji,
   onShowEmoji,
@@ -249,9 +257,19 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
     },
   }), []);
 
+  // Only the most recent non-ephemeral agent reply of each thread (top level keyed "") is
+  // editable, and only once it has finished streaming; the server applies
+  // the same per-thread rule and refuses anything else.
+  const lastAgentByThread = new Map<string, string>();
+  for (const m of messages) {
+    if (m.author_type === "agent" && !m.deleted_at && !m.ephemeral) {
+      lastAgentByThread.set(m.thread_id ?? "", m.id);
+    }
+  }
+
   if (!selectedChannel) {
     return (
-      <div className="flex-1 flex items-center justify-center text-white/20">
+      <div className="flex-1 flex items-center justify-center text-shell-text-tertiary">
         <div className="text-center px-6">
           <MessageCircle size={48} className="mx-auto mb-3 opacity-30" />
           <p className="text-sm mb-3">Pick a channel or start a DM</p>
@@ -263,15 +281,15 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
   return (
     <>
       {/* channel header */}
-      <div className="px-4 py-2.5 border-b border-white/[0.06] flex items-center gap-3 shrink-0">
+      <div className="px-4 py-2.5 border-b border-shell-border flex items-center gap-3 shrink-0">
         {channel?.type === "topic" ? (
-          <Hash size={16} className="text-white/40" />
+          <Hash size={16} className="text-shell-text-tertiary" />
         ) : channel?.type === "group" ? (
-          <Users size={16} className="text-white/40" />
+          <Users size={16} className="text-shell-text-tertiary" />
         ) : channel?.type === "dm-remote" ? (
-          <Globe size={16} className="text-white/40" />
+          <Globe size={16} className="text-shell-text-tertiary" />
         ) : (
-          <AtSign size={16} className="text-white/40" />
+          <AtSign size={16} className="text-shell-text-tertiary" />
         )}
         {/* DM agent emoji */}
         {channel?.type === "dm" &&
@@ -334,7 +352,7 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
             <button
               type="button"
               onClick={onToggleAllThreads}
-              className="ml-2 p-1 rounded hover:bg-white/10 text-white/60 hover:text-white"
+              className="ml-2 p-1 rounded hover:bg-shell-border-strong text-shell-text-secondary hover:text-shell-text"
               aria-label={showAllThreads ? "Hide all threads" : "Show all threads"}
               aria-expanded={showAllThreads}
               aria-controls="all-threads-panel"
@@ -345,7 +363,7 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
             <button
               type="button"
               onClick={onToggleSearch}
-              className="ml-2 p-1 rounded hover:bg-white/10 text-white/60 hover:text-white"
+              className="ml-2 p-1 rounded hover:bg-shell-border-strong text-shell-text-secondary hover:text-shell-text"
               aria-label={showSearch ? "Hide search" : "Search messages"}
               aria-expanded={showSearch}
               aria-controls="search-panel"
@@ -353,15 +371,15 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
             >
               <Search size={14} aria-hidden="true" />
             </button>
+        </div>
+        {channel?.topic || channel?.description ? (
+          <div className="text-[11px] text-shell-text-tertiary truncate">
+            {channel.topic || channel.description}
           </div>
-          {channel?.description && (
-            <div className="text-[11px] text-white/35 truncate">
-              {channel.description}
-            </div>
-          )}
+        ) : null}
         </div>
         {channel?.members && (
-          <div className="text-[11px] text-white/30 flex items-center gap-1">
+          <div className="text-[11px] text-shell-text-tertiary flex items-center gap-1">
             <Users size={12} /> {channel.members.length}
           </div>
         )}
@@ -373,9 +391,9 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
         onScroll={onScroll}
         className={`flex-1 min-h-0 overflow-y-auto px-4 py-3 space-y-0.5 select-text message-list-drop-target ${
           dropTarget.isOver
-            ? "ring-2 ring-sky-400/60 ring-inset bg-sky-500/5"
+            ? "ring-2 ring-accent/60 ring-inset bg-accent/5"
             : dropTarget.isValidTarget
-              ? "ring-2 ring-sky-400/30 ring-inset"
+              ? "ring-2 ring-accent/30 ring-inset"
               : ""
         }`}
         style={
@@ -407,7 +425,7 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
         )}
 
         {messages.length === 0 && fetchedChannel === selectedChannel && (
-          <div className="flex flex-col items-center justify-center h-full text-white/25 text-center px-6">
+          <div className="flex flex-col items-center justify-center h-full text-shell-text-hint text-center px-6">
             <MessageCircle size={40} className="mb-3 opacity-30" />
             <p className="text-sm">
               No messages yet. Say hello to{" "}
@@ -448,11 +466,11 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
             <React.Fragment key={msg.id}>
               {showDaySeparator && (
                 <div className="flex items-center gap-3 my-4 select-none">
-                  <div className="flex-1 h-px bg-white/10" />
-                  <span className="text-[11px] text-white/40 font-medium">
+                  <div className="flex-1 h-px bg-shell-border-strong" />
+                  <span className="text-[11px] text-shell-text-tertiary font-medium">
                     {dayLabel(msg.created_at)}
                   </span>
-                  <div className="flex-1 h-px bg-white/10" />
+                  <div className="flex-1 h-px bg-shell-border-strong" />
                 </div>
               )}
               {newDividerAtId === msg.id && (
@@ -572,6 +590,7 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
                       initial={msg.content}
                       onSave={(content) => onSaveEdit(msg.id, content)}
                       onCancel={onCancelEdit}
+                      error={editError}
                     />
                   ) : (
                     <div className="relative">
@@ -581,8 +600,22 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
                         msg.state !== "pending" && (
                           <CopyButton
                             content={msg.content}
-                            className="absolute -top-1 right-0 p-1 rounded opacity-0 group-hover:opacity-100 focus:opacity-100 bg-shell-surface border border-white/10 text-shell-text-secondary hover:text-shell-text transition-opacity select-none z-10"
+                            className="absolute -top-1 right-0 p-1 rounded opacity-0 group-hover:opacity-100 focus:opacity-100 bg-shell-surface border border-shell-border-strong text-shell-text-secondary hover:text-shell-text transition-opacity select-none z-10"
                           />
+                        )}
+                      {onEditAgentReply &&
+                        msg.id === lastAgentByThread.get(msg.thread_id ?? "") &&
+                        (msg.state ?? "complete") === "complete" &&
+                        !msg.content_blocks?.length && (
+                          <button
+                            type="button"
+                            onClick={() => onEditAgentReply(msg.id)}
+                            aria-label="Edit reply"
+                            title="Edit reply"
+                            className="absolute -top-1 right-7 p-1 rounded opacity-0 group-hover:opacity-100 focus:opacity-100 bg-shell-surface border border-shell-border-strong text-shell-text-secondary hover:text-shell-text transition-opacity select-none z-10"
+                          >
+                            <Pencil size={14} aria-hidden="true" />
+                          </button>
                         )}
                       <div
                         className={`${isMobile ? "text-[14px]" : "text-[15px]"} leading-[1.46] whitespace-pre-wrap break-words select-text ${
@@ -621,6 +654,7 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
                             </span>
                           )}
                         {msg.author_id === currentUserId &&
+                          channel?.type !== "dm-remote" &&
                           msg.state !== "pending" &&
                           msg.state !== "streaming" &&
                           (() => {
@@ -821,7 +855,7 @@ export const MessageList = forwardRef<MessageListHandle, MessageListProps>(funct
                                   onClick={() =>
                                     onToggleReaction(msg.id, em)
                                   }
-                                  className="text-lg hover:bg-white/10 rounded p-0.5 transition-colors"
+                                  className="text-lg hover:bg-shell-border-strong rounded p-0.5 transition-colors"
                                 >
                                   {em}
                                 </button>

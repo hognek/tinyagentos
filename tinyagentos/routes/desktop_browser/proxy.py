@@ -51,7 +51,11 @@ from tinyagentos.routes.desktop_browser.profile import (
     ensure_default_profiles,
     get_profile_or_404,
 )
-from tinyagentos.routes.desktop_browser.rewriter import rewrite_html
+from tinyagentos.routes.desktop_browser.rewriter import (
+    CSS_REWRITE_MAX_BYTES,
+    rewrite_css,
+    rewrite_html,
+)
 from tinyagentos.routes.desktop_browser.ssrf import (
     SsrfBlockedError,
     guarded_async_client,
@@ -66,6 +70,9 @@ _FETCH_TIMEOUT = 15.0   # seconds — total deadline including all redirect hops
 _HOP_TIMEOUT = 5.0      # seconds — per-operation (connect + read) limit per hop
 _MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MB hard cap
 _MAX_REQUEST_BYTES = 10 * 1024 * 1024   # 10 MB cap on forwarded request bodies (POST forms/uploads)
+# CSS rewriting limit (shared with the HTML inline-CSS budget in rewriter.py):
+# larger stylesheets are refused (502) so the per-match rewrite cost stays bounded
+_CSS_REWRITE_MAX_BYTES = CSS_REWRITE_MAX_BYTES
 # Request headers we forward to upstream for non-GET methods. Only the content
 # framing — never the client's cookies (we use the server-side jar), Host,
 # auth, or other ambient headers, which could leak or be abused.
@@ -386,7 +393,9 @@ async def proxy_get(
             continue
         out_headers[k] = v
 
-    content_type = response.headers.get("content-type", "")
+    # Media types are case-insensitive (RFC 2045); normalise once so neither
+    # the text/css nor the text/html branch can be bypassed by Text/CSS.
+    content_type = response.headers.get("content-type", "").lower()
 
     if len(response.content) > _MAX_RESPONSE_BYTES:
         _logger.info(
@@ -397,16 +406,43 @@ async def proxy_get(
             {"error": "response too large"}, status_code=502,
         )
 
-    if "text/html" in content_type:
-        # Rewrite + inject for HTML
-        proxy_prefix = (
-            f"/api/desktop/browser/proxy?profile_id={quote(profile_id, safe='')}"
-            f"&url="
+    proxy_prefix = (
+        f"/api/desktop/browser/proxy?profile_id={quote(profile_id, safe='')}"
+        f"&url="
+    )
+
+    def _proxy_url(absolute: str) -> str:
+        return f"{proxy_prefix}{quote(absolute, safe='')}"
+
+    if "text/css" in content_type:
+        # Stylesheets carry origin-absolute url() and @import references too.
+        # Oversized bodies are refused outright: the regex is linear-time but
+        # every match runs a Python callback, so a 10 MB url(x) flood still
+        # costs ~20s, and serving the body unrewritten would hand the page
+        # unproxied references instead.
+        charset = _detect_charset(content_type, b"")
+        decoded_len = len(response.content.decode(charset or "utf-8", errors="replace"))
+        if decoded_len > _CSS_REWRITE_MAX_BYTES:
+            _logger.info(
+                "browser proxy stylesheet too large: bytes=%d limit=%d",
+                decoded_len, _CSS_REWRITE_MAX_BYTES,
+            )
+            return JSONResponse(
+                {"error": "stylesheet too large"}, status_code=502,
+            )
+        rewritten_css = rewrite_css(
+            response.content, base_url=str(response.url), proxy=_proxy_url,
+            charset=charset,
+        )
+        return Response(
+            content=rewritten_css,
+            status_code=response.status_code,
+            headers=out_headers,
+            media_type="text/css; charset=utf-8",
         )
 
-        def _proxy_url(absolute: str) -> str:
-            return f"{proxy_prefix}{quote(absolute, safe='')}"
-
+    if "text/html" in content_type:
+        # Rewrite + inject for HTML
         charset = _detect_charset(content_type, response.content)
         rewritten = rewrite_html(
             response.content, base_url=str(response.url), proxy=_proxy_url,

@@ -133,6 +133,28 @@ class _PersistentSessions:
     def items(self):
         return list(self._load().items())
 
+    def set_capped(self, key: str, value: dict, limit: int) -> None:
+        """Store *value* under *key*, then evict the same user's oldest
+        sessions so that user keeps at most *limit* live ones.
+
+        One load/modify/save under the lock, so concurrent mints cannot race
+        each other past the cap. "Oldest" is dict insertion order, which is
+        mint order: tokens are never re-inserted and JSON round-trips keep
+        the order. Legacy float entries carry no user_id and are not counted.
+        """
+        user_id = value.get("user_id", "")
+        with self._lock:
+            data = self._load()
+            data[key] = value
+            if limit > 0:
+                owned = [
+                    token for token, entry in data.items()
+                    if isinstance(entry, dict) and entry.get("user_id", "") == user_id
+                ]
+                for token in owned[: max(0, len(owned) - limit)]:
+                    del data[token]
+            self._save(data)
+
 
 def hash_password(password: str, salt: str = "") -> str:
     """Hash a password with argon2id.
@@ -227,6 +249,40 @@ def validate_pin(pin: str) -> str:
     if not (PIN_MIN_LEN <= len(pin) <= PIN_MAX_LEN):
         raise ValueError(f"PIN must be {PIN_MIN_LEN}-{PIN_MAX_LEN} digits")
     return pin
+
+
+#: How the console lock screen opens. Stored per user as ``unlock_method``.
+#:
+#: ``swipe`` is NO credential at all: whoever holds the device opens taOS. It is
+#: honoured only on the console of a single-user install (see
+#: ``routes.auth.swipe_unlock``), and choosing it costs the account password.
+UNLOCK_METHODS: tuple[str, ...] = ("swipe", "pin", "password")
+
+#: Shown in Settings but not implemented. Refused by the API until they are, so
+#: a stored value can never name a method no route knows how to honour.
+UNLOCK_METHODS_PLANNED: tuple[str, ...] = ("pattern",)
+
+
+def effective_unlock_method(record: Mapping[str, Any] | None) -> str:
+    """The unlock method that actually applies to *record*, never a wish.
+
+    An unset or unknown stored value falls back to the pre-existing behaviour:
+    ``pin`` when the user has a PIN, otherwise ``password``. A stored ``pin``
+    with no PIN behind it (the PIN was turned off afterwards) also degrades to
+    ``password`` rather than rendering a keypad nothing can satisfy.
+
+    Only ever degrades toward a STRONGER method: nothing here can turn a
+    missing or malformed value into ``swipe``.
+    """
+    if not record:
+        return "password"
+    has_pin = bool(record.get("pin_hash"))
+    method = record.get("unlock_method")
+    if method not in UNLOCK_METHODS:
+        method = "pin" if has_pin else "password"
+    if method == "pin" and not has_pin:
+        method = "password"
+    return method
 
 
 def _is_loopback(host: str) -> bool:
@@ -404,6 +460,10 @@ class AuthManager:
         self._users_lock = threading.RLock()
         self.session_ttl = 86400 * 7  # 7 days, default
         self.long_session_ttl = 86400 * 30  # 30 days for "stay signed in"
+        # Live sessions kept per user; minting past it evicts that user's
+        # oldest. Bounds the store when a client logs in per invocation
+        # instead of reusing its session (tsk-wmclfd: 37,521 for one user).
+        self.max_sessions_per_user = 50
         self._prune_sessions_on_startup()
 
     def _prune_sessions_on_startup(self) -> None:
@@ -866,6 +926,54 @@ class AuthManager:
             return (False, None)
         return (True, record)
 
+    # ------------------------------------------------------------------ #
+    #  Lock-screen unlock method (console-only; see effective_unlock_method) #
+    # ------------------------------------------------------------------ #
+
+    def lock_screen_user(self) -> dict | None:
+        """The one account the console lock screen belongs to, or None.
+
+        Exactly one record in the store, and it is a full account (has a
+        password). Anything else -- no users, two users, a pending invite beside
+        the owner -- is not single-user, and the lock screen must not guess
+        whose device this is. Fails closed on an unreadable store.
+        """
+        try:
+            users = self._read_users().get("users", [])
+        except AuthStoreCorruptError:
+            return None
+        if len(users) != 1:
+            return None
+        record = users[0]
+        if not isinstance(record, dict) or "password_hash" not in record:
+            return None
+        return record
+
+    def unlock_method(self, username: str) -> str:
+        """*username*'s effective unlock method."""
+        return effective_unlock_method(self.find_user(username))
+
+    @_serialized
+    def set_unlock_method(self, username: str, method: str) -> None:
+        """Store *username*'s unlock method.
+
+        The caller must already have re-verified the account password; like
+        ``set_pin`` this does not re-check it. Only implemented methods are
+        accepted, and ``pin`` only once a PIN exists -- a stored ``pin`` with no
+        PIN would silently mean ``password``, which is not what was asked for.
+        """
+        if method not in UNLOCK_METHODS:
+            raise ValueError(f"unknown unlock method '{method}'")
+        data = self._read_users()
+        for i, u in enumerate(data.get("users", [])):
+            if u.get("username") == username:
+                if method == "pin" and not u.get("pin_hash"):
+                    raise ValueError("set a PIN first")
+                data["users"][i]["unlock_method"] = method
+                self._write_users(data)
+                return
+        raise ValueError(f"user '{username}' not found")
+
     def check_password(self, password: str, username: str | None = None) -> tuple[bool, dict | None]:
         """Verify credentials.
 
@@ -1011,7 +1119,7 @@ class AuthManager:
         }
         if user_agent:
             entry["user_agent_hash"] = hashlib.sha256(user_agent.encode()).hexdigest()
-        self._sessions[token] = entry
+        self._sessions.set_capped(token, entry, self.max_sessions_per_user)
         return token
 
     def session_ttl_for(self, long_lived: bool = False) -> int:
@@ -1193,7 +1301,8 @@ class AuthManager:
         serialises the read-modify-write cycle so concurrent deploys cannot
         lose one another's binding. The bindings file must be readable and
         a valid JSON object; a corrupt or mis-shaped file raises rather than
-        being silently replaced.
+        being silently replaced. Any previous binding for the same agent is
+        removed first so an agent has at most one live token.
         """
         path = self._local_token_agent_path()
         lock_path = self._local_token_agent_lock_path()
@@ -1220,8 +1329,41 @@ class AuthManager:
                     )
             else:
                 data = {}
+            for existing_hash in [k for k, v in data.items() if v == agent_name]:
+                del data[existing_hash]
             data[token_hash] = agent_name
             atomic_write_text(path, json.dumps(data), mode=0o600)
+
+    def unbind_local_token_agent(self, agent_name: str) -> int:
+        """Remove every entry bound to *agent_name*. Returns the count removed."""
+        path = self._local_token_agent_path()
+        lock_path = self._local_token_agent_lock_path()
+        lock = FileLock(str(lock_path), timeout=10)
+        with lock:
+            if not path.exists():
+                return 0
+            try:
+                raw = path.read_text()
+            except OSError as exc:
+                raise AuthStoreCorruptError(
+                    f"cannot read bindings file {path}: {exc}"
+                ) from exc
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise AuthStoreCorruptError(
+                    f"bindings file {path} is not valid JSON: {exc}"
+                ) from exc
+            if not isinstance(data, dict):
+                raise AuthStoreCorruptError(
+                    f"bindings file {path} is a "
+                    f"{type(data).__name__}, expected an object"
+                )
+            keys_to_remove = [k for k, v in data.items() if v == agent_name]
+            for k in keys_to_remove:
+                del data[k]
+            atomic_write_text(path, json.dumps(data), mode=0o600)
+            return len(keys_to_remove)
 
     def get_local_token_agent(self, presented: str) -> str | None:
         """Return the agent name bound to this local token, or ``None``."""

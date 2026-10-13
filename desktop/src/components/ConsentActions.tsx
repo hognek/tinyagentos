@@ -126,6 +126,8 @@ export function ConsentActions({
   onResolved,
   source = "auth_requests",
   canonicalId,
+  humanDuration,
+  harness,
 }: {
   requestId: string;
   scopes: string[];
@@ -137,6 +139,8 @@ export function ConsentActions({
   onResolved?: () => void;
   source?: string;
   canonicalId?: string;
+  humanDuration?: string;
+  harness?: string;
 }) {
   // `granted` is what the approve call will actually send. It defaults to the
   // full requested set, so the out-of-the-box behaviour (grant exactly what was
@@ -169,6 +173,16 @@ export function ConsentActions({
   const [requestedProjectNotFound, setRequestedProjectNotFound] =
     useState<boolean>(false);
   const [creating, setCreating] = useState(false);
+  // Only the consent route takes is_lead, and the backend refuses it unless
+  // the grant creates a membership row (project_tasks or a canvas scope).
+  const canLead =
+    source === "auth_requests" &&
+    needsProject &&
+    granted.some((s) => s === "project_tasks" || s.startsWith("canvas_"));
+  const [makeLead, setMakeLead] = useState(false);
+  // The request was accepted but the lead assignment is unconfirmed. Terminal:
+  // Allow/Deny never come back, because a second approve would 409.
+  const [leadUnconfirmed, setLeadUnconfirmed] = useState(false);
   const [newName, setNewName] = useState("");
 
   useEffect(() => {
@@ -354,10 +368,15 @@ export function ConsentActions({
     const url = `${baseUrl}/${approved ? "approve" : "deny"}`;
     let body: string | undefined;
     if (approved) {
-      const payload: { granted_scopes: string[]; project_id?: string } = {
+      const payload: {
+        granted_scopes: string[];
+        project_id?: string;
+        is_lead?: boolean;
+      } = {
         granted_scopes: granted,
       };
       if (needsProject && projectId) payload.project_id = projectId;
+      if (canLead && makeLead && projectId) payload.is_lead = true;
       body = JSON.stringify(payload);
     }
     try {
@@ -378,6 +397,16 @@ export function ConsentActions({
         );
         setBusy(false);
         return;
+      }
+      if (body && JSON.parse(body).is_lead) {
+        const data = (await res.json().catch(() => ({}))) as {
+          lead_assigned?: boolean;
+        };
+        if (data.lead_assigned !== true) {
+          setLeadUnconfirmed(true);
+          setBusy(false);
+          return;
+        }
       }
       onResolved?.();
     } catch (e) {
@@ -448,137 +477,184 @@ export function ConsentActions({
           )}
         </div>
       )}
-      {needsProject && (
+      {humanDuration && (
         <div className="mb-2">
-          {requestedProjectId && requestedProjectNotFound && (
-            <p
-              role="alert"
-              className="mb-1.5 text-[11px] text-red-300"
-            >
-              Requested project {requestedProjectId} not found (not visible to
-              you). Pick a project you can see below, or create one.
-            </p>
-          )}
-          {requestedProjectId && resolvedRequestedProject && (
-            <p className="mb-1 text-[11px] text-shell-text-secondary">
-              Requesting access for{" "}
-              <span className="font-medium text-shell-text">
-                {resolvedRequestedProject.name}
-              </span>
-              {" "}
-              (<code className="text-shell-text-tertiary">
-                {resolvedRequestedProject.id}
-              </code>)
-            </p>
-          )}
-          {!creating ? (
-            <div className="flex items-center gap-1.5">
-              <select
-                id={`consent-project-${requestId}`}
-                aria-label="Grant project access for"
-                value={selectedProjectId}
-                onChange={(e) => {
-                  e.stopPropagation();
-                  setSelectedProjectId(e.target.value);
-                  setRequestedProjectNotFound(false);
-                }}
-                onClick={(e) => e.stopPropagation()}
-                disabled={busy || loadingProjects}
-                className="flex-1 min-w-0 px-2 py-1 rounded-md text-[11px] bg-white/5 border border-white/10 text-shell-text disabled:opacity-50"
-                aria-invalid={requestedProjectNotFound ? "true" : undefined}
-              >
-                <option value="">
-                  {loadingProjects ? "Loading..." : "Select a project"}
-                </option>
-                {projects.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
-              </select>
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setRequestedProjectNotFound(false);
-                  setCreating(true);
-                }}
-                disabled={busy}
-                className="px-2 py-1 rounded-md text-[11px] bg-white/5 hover:bg-white/10 border border-white/10 text-shell-text-secondary disabled:opacity-50"
-              >
-                New
-              </button>
-            </div>
-          ) : (
-            <div className="flex items-center gap-1.5">
-              <input
-                aria-label="New project name"
-                value={newName}
-                onChange={(e) => {
-                  e.stopPropagation();
-                  setNewName(e.target.value);
-                }}
-                onClick={(e) => e.stopPropagation()}
-                placeholder="New project name"
-                className="flex-1 min-w-0 px-2 py-1 rounded-md text-[11px] bg-white/5 border border-white/10 text-shell-text"
-              />
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setCreating(false);
-                  setNewName("");
-                }}
-                disabled={busy}
-                className="px-2 py-1 rounded-md text-[11px] bg-white/5 hover:bg-white/10 border border-white/10 text-shell-text-secondary disabled:opacity-50"
-              >
-                Cancel
-              </button>
-            </div>
-          )}
+          <p className="text-[11px] text-shell-text-tertiary">
+            {humanDuration}
+          </p>
         </div>
       )}
-      <div className="flex flex-wrap gap-1.5">
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            decide(true);
-          }}
-          disabled={allowDisabled}
-          className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          <CheckCircle size={11} />
-          Allow
-        </button>
-        <button
-          type="button"
-          onClick={(e) => {
-            e.stopPropagation();
-            decide(false);
-          }}
-          disabled={busy}
-          className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-white/5 hover:bg-red-500/15 hover:text-red-300 text-shell-text-secondary border border-white/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          <XCircle size={11} />
-          Deny
-        </button>
-      </div>
-      {error && (
-        <p role="alert" className="mt-1.5 text-[11px] text-red-300">
-          {error}
+      {harness === "grok" && (
+        <p className="mb-2 text-[11px] text-amber-300">
+          This token will be readable by all bots on this Grok account.
         </p>
       )}
-    </div>
-  );
+      {needsProject && (
+          <div className="mb-2">
+            {requestedProjectId && requestedProjectNotFound && (
+              <p
+                role="alert"
+                className="mb-1.5 text-[11px] text-red-300"
+              >
+                Requested project {requestedProjectId} not found (not visible to
+                you). Pick a project you can see below, or create one.
+              </p>
+            )}
+            {requestedProjectId && resolvedRequestedProject && (
+              <p className="mb-1 text-[11px] text-shell-text-secondary">
+                Requesting access for{" "}
+                <span className="font-medium text-shell-text">
+                  {resolvedRequestedProject.name}
+                </span>
+                {" "}
+                (<code className="text-shell-text-tertiary">
+                  {resolvedRequestedProject.id}
+                </code>)
+              </p>
+            )}
+            {!creating ? (
+              <div className="flex items-center gap-1.5">
+                <select
+                  id={`consent-project-${requestId}`}
+                  aria-label="Grant project access for"
+                  value={selectedProjectId}
+                  onChange={(e) => {
+                    e.stopPropagation();
+                    setSelectedProjectId(e.target.value);
+                    setRequestedProjectNotFound(false);
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+                  disabled={busy || loadingProjects}
+                  className="flex-1 min-w-0 px-2 py-1 rounded-md text-[11px] bg-white/5 border border-white/10 text-shell-text disabled:opacity-50"
+                  aria-invalid={requestedProjectNotFound ? "true" : undefined}
+                >
+                  <option value="">
+                    {loadingProjects ? "Loading..." : "Select a project"}
+                  </option>
+                  {projects.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.name}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setRequestedProjectNotFound(false);
+                    setCreating(true);
+                  }}
+                  disabled={busy}
+                  className="px-2 py-1 rounded-md text-[11px] bg-white/5 hover:bg-white/10 border border-white/10 text-shell-text-secondary disabled:opacity-50"
+                >
+                  New
+                </button>
+              </div>
+            ) : (
+              <div className="flex items-center gap-1.5">
+                <input
+                  aria-label="New project name"
+                  value={newName}
+                  onChange={(e) => {
+                    e.stopPropagation();
+                    setNewName(e.target.value);
+                  }}
+                  onClick={(e) => e.stopPropagation()}
+                  placeholder="New project name"
+                  className="flex-1 min-w-0 px-2 py-1 rounded-md text-[11px] bg-white/5 border border-white/10 text-shell-text"
+                />
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setCreating(false);
+                    setNewName("");
+                  }}
+                  disabled={busy}
+                  className="px-2 py-1 rounded-md text-[11px] bg-white/5 hover:bg-white/10 border border-white/10 text-shell-text-secondary disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
+            {canLead && (
+              <label
+                className="mt-1.5 flex items-center gap-1.5 text-[11px] text-shell-text-secondary"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <input
+                  type="checkbox"
+                  checked={makeLead}
+                  onChange={(e) => {
+                    e.stopPropagation();
+                    setMakeLead(e.target.checked);
+                  }}
+                  disabled={busy}
+                />
+                Make project lead
+              </label>
+            )}
+          </div>
+        )}
+        {leadUnconfirmed ? (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <p role="alert" className="text-[11px] text-amber-300">
+              Approved, but the project lead could not be set. Make the agent lead from the project&apos;s Members.
+            </p>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onResolved?.();
+              }}
+              className="px-2 py-1 rounded-md text-[11px] font-medium bg-white/5 hover:bg-white/10 text-shell-text-secondary border border-white/10 transition-colors"
+            >
+              Dismiss
+            </button>
+          </div>
+        ) : (
+          <div className="flex flex-wrap gap-1.5">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                decide(true);
+              }}
+              disabled={allowDisabled}
+              className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-400 border border-emerald-500/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <CheckCircle size={11} />
+              Allow
+            </button>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                decide(false);
+              }}
+              disabled={busy}
+              className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium bg-white/5 hover:bg-red-500/15 hover:text-red-300 text-shell-text-secondary border border-white/10 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <XCircle size={11} />
+              Deny
+            </button>
+          </div>
+        )}
+        {error && (
+          <p role="alert" className="mt-1.5 text-[11px] text-red-300">
+            {error}
+          </p>
+        )}
+      </div>
+    );
 }
 
 /** Pull the consent payload (request id + requested scopes + any requested
- * project) out of a notification's `data` field. Returns null when the shape
- * is missing. */
+ * project + human-readable duration) out of a notification's `data` field.
+ * Returns null when the shape is missing. */
 export function consentPayload(
   data: Record<string, unknown> | undefined,
-): { requestId: string; scopes: string[]; projectId?: string; canonicalId?: string } | null {
+): { requestId: string; scopes: string[]; projectId?: string; canonicalId?: string; humanDuration?: string; harness?: string } | null {
   if (!data) return null;
   const requestId = data.request_id;
   if (typeof requestId !== "string") return null;
@@ -586,5 +662,7 @@ export function consentPayload(
   const scopes = Array.isArray(raw) ? raw.filter((s): s is string => typeof s === "string") : [];
   const projectId = typeof data.project_id === "string" ? data.project_id : undefined;
   const canonicalId = typeof data.canonical_id === "string" ? data.canonical_id : undefined;
-  return { requestId, scopes, projectId, canonicalId };
+  const humanDuration = typeof data.human_duration === "string" ? data.human_duration : undefined;
+  const harness = typeof data.framework === "string" ? data.framework : undefined;
+  return { requestId, scopes, projectId, canonicalId, humanDuration, harness };
 }

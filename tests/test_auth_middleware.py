@@ -346,6 +346,15 @@ class TestIsAgentCanvasPath:
         assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/snapshot_png") is False
         assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/snapshotXtldr") is False
 
+    def test_original_element_get_allowed(self):
+        assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/elements/el-1/original") is True
+
+    def test_legacy_elements_get_allowed(self):
+        assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/legacy") is True
+
+    def test_legacy_elements_with_query_allowed(self):
+        assert _is_agent_canvas_path("GET", "/api/projects/proj-1/canvas/legacy") is True
+
 
 class TestCanvasAgentTokenDispatch:
     @pytest.mark.asyncio
@@ -382,6 +391,50 @@ class TestCanvasAgentTokenDispatch:
             routes=[_fake_route("/api/projects/{pid}/canvas/elements/{eid}", {"PATCH", "DELETE"})],
         )
         call_next = AsyncMock(return_value=JSONResponse({"ok": True}))
+
+        with patch("tinyagentos.auth_middleware.check_agent_identity", AsyncMock(return_value="agent-1")):
+            resp = await middleware.dispatch(req, call_next)
+
+        assert resp.status_code == 200
+        assert req.state.via == "registry_jwt_candidate"
+        call_next.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_canvas_original_element_bearer_passes(self):
+        middleware = AuthMiddleware(app=MagicMock())
+        auth_mgr = _default_auth_mgr()
+        auth_mgr.validate_local_token.return_value = False
+        req = _request(
+            method="GET",
+            path="/api/projects/proj-1/canvas/elements/el-1/original",
+            headers={"authorization": "Bearer registry-jwt"},
+            auth_mgr=auth_mgr,
+            routes=[
+                _fake_route("/api/projects/{pid}/canvas/elements/{eid}/original", {"GET"}),
+            ],
+        )
+        call_next = AsyncMock(return_value=JSONResponse({"element_id": "el-1"}))
+
+        with patch("tinyagentos.auth_middleware.check_agent_identity", AsyncMock(return_value="agent-1")):
+            resp = await middleware.dispatch(req, call_next)
+
+        assert resp.status_code == 200
+        assert req.state.via == "registry_jwt_candidate"
+        call_next.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_canvas_legacy_bearer_passes(self):
+        middleware = AuthMiddleware(app=MagicMock())
+        auth_mgr = _default_auth_mgr()
+        auth_mgr.validate_local_token.return_value = False
+        req = _request(
+            method="GET",
+            path="/api/projects/proj-1/canvas/legacy",
+            headers={"authorization": "Bearer registry-jwt"},
+            auth_mgr=auth_mgr,
+            routes=[_fake_route("/api/projects/{pid}/canvas/legacy", {"GET"})],
+        )
+        call_next = AsyncMock(return_value=JSONResponse({"elements": []}))
 
         with patch("tinyagentos.auth_middleware.check_agent_identity", AsyncMock(return_value="agent-1")):
             resp = await middleware.dispatch(req, call_next)
@@ -600,9 +653,28 @@ class TestIsAgentDecisionsPath:
             "DELETE", "/api/decisions/dec-abc123/agent"
         ) is False
 
-    def test_human_list_refused(self):
-        """GET /api/decisions (human session list) must NOT match."""
-        assert _is_agent_decisions_path("GET", "/api/decisions") is False
+    def test_plain_list_admits_agent_bearer(self):
+        """tsk-f75p3z: GET /api/decisions admits an agent bearer; the route
+        then scopes the list to the agent's own decisions (see
+        tests/test_decisions_notifications_registry_jwt.py)."""
+        assert _is_agent_decisions_path("GET", "/api/decisions") is True
+        # Only the exact list path: by-id and history stay session-only.
+        assert _is_agent_decisions_path("GET", "/api/decisions/abc") is False
+        assert _is_agent_decisions_path("GET", "/api/decisions/abc/history") is False
+
+    def test_post_withdraw_allowed(self):
+        """tsk-5dulr5: the asker-side withdraw route admits an agent bearer."""
+        assert _is_agent_decisions_path(
+            "POST", "/api/decisions/dec-abc123/withdraw"
+        ) is True
+
+    def test_withdraw_nested_or_wrong_method_refused(self):
+        assert _is_agent_decisions_path(
+            "POST", "/api/decisions/a/b/withdraw"
+        ) is False
+        assert _is_agent_decisions_path(
+            "GET", "/api/decisions/dec-abc123/withdraw"
+        ) is False
 
 
 class TestAgentDecisionsDispatch:

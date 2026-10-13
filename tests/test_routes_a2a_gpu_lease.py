@@ -20,7 +20,7 @@ from httpx import ASGITransport, AsyncClient
 from taos_test_csrf import csrf_event_hooks
 from tinyagentos.agent_registry_store import mint_registry_token
 from tinyagentos.cluster.manager import ClusterManager
-from tinyagentos.cluster.worker_protocol import WorkerInfo
+from tinyagentos.cluster.worker_protocol import GpuLease, WorkerInfo
 from tinyagentos.gpu_lease import claims_for_node, open_claims
 
 _ROUTE_PATCH = "tinyagentos.routes.a2a_gpu_lease.httpx.AsyncClient"
@@ -1100,6 +1100,391 @@ class TestClusterLeaseIntegration:
         assert data["admitted"] is True
         assert data["claimed_mb"] == 4096
 
+    async def test_renew_with_wrong_epoch_is_refused(
+        self, lease_client, bus, cluster
+    ):
+        """A renew that does not present the held epoch is refused (epoch fence).
+
+        After the route claims a lease, if the controller's lease for that
+        resource is replaced with one of the same lease_id but a different epoch,
+        the route's next renew must be refused, not silently renewed.
+        """
+        claimed = await lease_client.post(
+            "/api/a2a/gpu/claim", json={"node": "linstation", "vram_mb": 4096}
+        )
+        assert claimed.status_code == 200
+        lease_id = claimed.json()["lease_id"]
+        held_epoch = claimed.json()["epoch"]
+        assert lease_id is not None
+        assert held_epoch
+
+        old_lease = cluster._leases.pop(lease_id)
+        new_lease = GpuLease(
+            lease_id=old_lease.lease_id,
+            resource_id=old_lease.resource_id,
+            caller=old_lease.caller,
+            expires_at=old_lease.expires_at + 300,
+            required_vram_mb=old_lease.required_vram_mb,
+            granted_at=old_lease.granted_at,
+            claim_channel=old_lease.claim_channel,
+            epoch="99.99",
+        )
+        cluster._leases[lease_id] = new_lease
+
+        renewed = await lease_client.post(
+            "/api/a2a/gpu/renew",
+            json={"lease_id": lease_id, "ttl_seconds": 600, "epoch": held_epoch},
+        )
+        assert renewed.status_code == 409, renewed.json()
+        assert renewed.json()["error"] == "lease not found or expired"
+
+    async def test_renew_with_held_epoch_succeeds(self, lease_client, bus, cluster):
+        """Renewing while presenting the held epoch succeeds (epoch fence happy path)."""
+        claimed = await lease_client.post(
+            "/api/a2a/gpu/claim", json={"node": "linstation", "vram_mb": 4096}
+        )
+        assert claimed.status_code == 200
+        lease_id = claimed.json()["lease_id"]
+        held_epoch = claimed.json()["epoch"]
+        assert lease_id is not None
+        assert held_epoch
+        before = cluster.get_leases()[0].expires_at
+
+        renewed = await lease_client.post(
+            "/api/a2a/gpu/renew",
+            json={"lease_id": lease_id, "ttl_seconds": 600, "epoch": held_epoch},
+        )
+        assert renewed.status_code == 200
+        assert cluster.get_leases()[0].expires_at > before
+
+    async def test_reclaim_with_wrong_epoch_is_refused(
+        self, lease_client, bus, cluster
+    ):
+        """A re-claim that does not present the held epoch is refused (epoch fence).
+
+        After the route claims a lease, if the controller's lease for that
+        resource is replaced with one of the same lease_id but a different epoch,
+        the route's next re-claim must be refused, not silently claimed.
+        """
+        claimed = await lease_client.post(
+            "/api/a2a/gpu/claim", json={"node": "linstation", "vram_mb": 4096}
+        )
+        assert claimed.status_code == 200
+        lease_id = claimed.json()["lease_id"]
+        held_epoch = claimed.json()["epoch"]
+        assert lease_id is not None
+        assert held_epoch
+
+        # Simulate the race where the lease is replaced between reading it and
+        # calling renew_lease_with_previous by patching the method to return
+        # (None, None) as if an epoch mismatch or expiry occurred.
+        original_renew = cluster.renew_lease_with_previous
+        async def refused_renew(lease_id, ttl_seconds, epoch):
+            return None, None
+        cluster.renew_lease_with_previous = refused_renew
+
+        try:
+            sends_before = len(bus.sends)
+            reclaimed = await lease_client.post(
+                "/api/a2a/gpu/claim",
+                json={"node": "linstation", "vram_mb": 4096},
+            )
+            assert reclaimed.status_code == 409, reclaimed.json()
+            assert reclaimed.json()["status"] == "denied"
+            assert "was replaced or expired" in reclaimed.json()["reason"]
+            # No new [GPU CLAIM] posted after the swap
+            assert len(bus.sends) == sends_before
+        finally:
+            cluster.renew_lease_with_previous = original_renew
+
+    async def test_release_with_wrong_epoch_is_refused(
+        self, lease_client, bus, cluster
+    ):
+        """A release that does not present the held epoch is refused (epoch fence).
+
+        After the route claims a lease, if the controller's lease for that
+        resource is replaced with one of the same lease_id but a different epoch,
+        the route's next release must be refused, not silently released.
+        """
+        claimed = await lease_client.post(
+            "/api/a2a/gpu/claim", json={"node": "linstation", "vram_mb": 4096}
+        )
+        assert claimed.status_code == 200
+        lease_id = claimed.json()["lease_id"]
+        held_epoch = claimed.json()["epoch"]
+        assert lease_id is not None
+        assert held_epoch
+
+        old_lease = cluster._leases.pop(lease_id)
+        new_lease = GpuLease(
+            lease_id=old_lease.lease_id,
+            resource_id=old_lease.resource_id,
+            caller=old_lease.caller,
+            expires_at=old_lease.expires_at + 300,
+            required_vram_mb=old_lease.required_vram_mb,
+            granted_at=old_lease.granted_at,
+            claim_channel=old_lease.claim_channel,
+            epoch="99.99",
+        )
+        cluster._leases[lease_id] = new_lease
+
+        sends_before = len(bus.sends)
+        released = await lease_client.post(
+            "/api/a2a/gpu/release",
+            json={"node": "linstation", "lease_id": lease_id, "epoch": held_epoch},
+        )
+        assert released.status_code == 409, released.json()
+        assert released.json()["status"] == "denied"
+        assert "was replaced" in released.json()["reason"]
+        # The replacement lease still exists
+        assert cluster.get_leases()[0].lease_id == lease_id
+        assert cluster.get_leases()[0].epoch == "99.99"
+        # No [GPU RELEASE] posted
+        assert len(bus.sends) == sends_before
+
+    async def test_release_with_held_epoch_succeeds(self, lease_client, bus, cluster):
+        """Release while presenting the held epoch succeeds (epoch fence happy path)."""
+        claimed = await lease_client.post(
+            "/api/a2a/gpu/claim", json={"node": "linstation", "vram_mb": 4096}
+        )
+        assert claimed.status_code == 200
+        lease_id = claimed.json()["lease_id"]
+        held_epoch = claimed.json()["epoch"]
+        assert lease_id is not None
+        assert held_epoch
+
+        released = await lease_client.post(
+            "/api/a2a/gpu/release",
+            json={"node": "linstation", "lease_id": lease_id, "epoch": held_epoch},
+        )
+        assert released.status_code == 200, released.json()
+        assert released.json()["status"] == "released"
+        # Lease is gone
+        assert cluster.get_leases() == []
+        # [GPU RELEASE] was posted
+        assert released.json()["line"] == "[GPU RELEASE] node=linstation holder=@operator"
+    async def test_release_twice_with_held_epoch_is_idempotent(self, lease_client, bus, cluster):
+        """Releasing an already-gone lease with an epoch must stay idempotent.
+
+        Claim a lease, then release it with the held epoch (should succeed).
+        Release the same lease again with the same epoch (should also succeed
+        and be idempotent, leaving no lease and posting a second [GPU RELEASE]).
+        """
+        claimed = await lease_client.post(
+            "/api/a2a/gpu/claim", json={"node": "linstation", "vram_mb": 4096}
+        )
+        assert claimed.status_code == 200
+        lease_id = claimed.json()["lease_id"]
+        held_epoch = claimed.json()["epoch"]
+        assert lease_id is not None
+        assert held_epoch
+
+        # First release
+        released1 = await lease_client.post(
+            "/api/a2a/gpu/release",
+            json={"node": "linstation", "lease_id": lease_id, "epoch": held_epoch},
+        )
+        assert released1.status_code == 200
+        assert released1.json()["status"] == "released"
+        assert cluster.get_leases() == []
+        assert released1.json()["line"] == "[GPU RELEASE] node=linstation holder=@operator"
+
+        # Second release with the same body (idempotent)
+        released2 = await lease_client.post(
+            "/api/a2a/gpu/release",
+            json={"node": "linstation", "lease_id": lease_id, "epoch": held_epoch},
+        )
+        assert released2.status_code == 200
+        assert released2.json()["status"] == "released"
+        assert cluster.get_leases() == []
+        assert released2.json()["line"] == "[GPU RELEASE] node=linstation holder=@operator"
+    async def test_stale_release_retry_does_not_clear_newer_claim(self, lease_client, bus, cluster):
+        # claim node linstation (lease A, epoch eA)
+        claim_a = await lease_client.post(
+            "/api/a2a/gpu/claim", json={"node": "linstation", "vram_mb": 4096}
+        )
+        assert claim_a.status_code == 200
+        lease_id_a = claim_a.json()["lease_id"]
+        epoch_a = claim_a.json()["epoch"]
+        assert lease_id_a is not None
+        assert epoch_a
+    
+        # release A with lease_id A + epoch eA (200)
+        released_a = await lease_client.post(
+            "/api/a2a/gpu/release",
+            json={"node": "linstation", "lease_id": lease_id_a, "epoch": epoch_a},
+        )
+        assert released_a.status_code == 200
+        assert released_a.json()["status"] == "released"
+    
+        # claim linstation again (lease B)
+        claim_b = await lease_client.post(
+            "/api/a2a/gpu/claim", json={"node": "linstation", "vram_mb": 4096}
+        )
+        assert claim_b.status_code == 200
+        lease_id_b = claim_b.json()["lease_id"]
+        assert lease_id_b is not None
+        assert lease_id_b != lease_id_a
+    
+        # record n = len(bus.messages)
+        n = len(bus.messages)
+    
+        # POST /api/a2a/gpu/release with lease_id A + epoch eA again
+        released_a_again = await lease_client.post(
+            "/api/a2a/gpu/release",
+            json={"node": "linstation", "lease_id": lease_id_a, "epoch": epoch_a},
+        )
+    
+        # Assert status 200, json status == "already_released"
+        assert released_a_again.status_code == 200
+        assert released_a_again.json()["status"] == "already_released"
+        # len(bus.messages) == n (nothing posted)
+        assert len(bus.messages) == n
+        # B's lease_id is still in [l.lease_id for l in cluster.get_leases()]
+        assert lease_id_b in [l.lease_id for l in cluster.get_leases()]
+        # claims_for_node(open_claims(bus.messages), "linstation") is non-empty
+        from tinyagentos.gpu_lease import claims_for_node, open_claims
+        folded = open_claims(bus.messages)
+        assert claims_for_node(folded, "linstation")
+
+    async def test_release_retry_and_concurrent_claim_are_serialized(
+        self, lease_client, bus, cluster, monkeypatch
+    ):
+        """A release parked before its bus post cannot let a concurrent claim by the
+        same holder on the same node post its [GPU CLAIM] first: claim and release
+        are serialized per (holder, resource), so the RELEASE lands before the
+        CLAIM and the new claim survives the fold.
+        """
+        from tinyagentos.gpu_lease import claims_for_node, open_claims
+        from tinyagentos.routes import a2a_gpu_lease as mod
+
+        claim_a = await lease_client.post(
+            "/api/a2a/gpu/claim", json={"node": "linstation", "vram_mb": 4096}
+        )
+        assert claim_a.status_code == 200, claim_a.json()
+        lease_id_a = claim_a.json()["lease_id"]
+        epoch_a = claim_a.json()["epoch"]
+        assert lease_id_a is not None and epoch_a
+
+        release_parked = asyncio.Event()
+        release_gate = asyncio.Event()
+        claim_reached_post = asyncio.Event()
+        posted_lines: list[str] = []
+        original_post_line = mod._post_line
+
+        async def parked_post_line(channel, actor, text):
+            if text.startswith("[GPU RELEASE]"):
+                release_parked.set()
+                await release_gate.wait()
+            elif text.startswith("[GPU CLAIM]"):
+                claim_reached_post.set()
+            posted_lines.append(text.split("]")[0] + "]")
+            return await original_post_line(channel, actor, text)
+
+        monkeypatch.setattr(mod, "_post_line", parked_post_line)
+
+        release_task = asyncio.create_task(
+            lease_client.post(
+                "/api/a2a/gpu/release",
+                json={"node": "linstation", "lease_id": lease_id_a, "epoch": epoch_a},
+            )
+        )
+        await asyncio.wait_for(release_parked.wait(), timeout=5.0)
+
+        claim_task = asyncio.create_task(
+            lease_client.post(
+                "/api/a2a/gpu/claim", json={"node": "linstation", "vram_mb": 4096}
+            )
+        )
+        # Give the claim every chance to run ahead of the parked release: on an
+        # unserialized route it reaches the bus post well inside this window.
+        reached = asyncio.create_task(claim_reached_post.wait())
+        done, _pending = await asyncio.wait({reached}, timeout=2.0)
+        if not done:
+            reached.cancel()
+        assert not claim_reached_post.is_set(), (
+            "the claim posted while the same holder's release was still parked: "
+            f"{posted_lines}"
+        )
+
+        release_gate.set()
+        release_resp, claim_resp = await asyncio.gather(release_task, claim_task)
+        assert release_resp.status_code == 200, release_resp.json()
+        assert claim_resp.status_code == 200, claim_resp.json()
+        assert claim_resp.json()["status"] == "claimed"
+        assert posted_lines == ["[GPU RELEASE]", "[GPU CLAIM]"]
+
+        folded = open_claims(bus.messages)
+        assert claims_for_node(folded, "linstation"), (
+            f"the new claim must survive the earlier release: {bus.messages}"
+        )
+        assert claim_resp.json()["lease_id"] in [
+            lease.lease_id for lease in cluster.get_leases()
+        ]
+
+    async def test_bus_only_node_claim_and_release_share_one_lock(
+        self, lease_client, bus, cluster, monkeypatch
+    ):
+        """A node the cluster does not know is coordinated over the bus alone. Its
+        claim and release must still key the same lock: with a cluster present the
+        release used to derive a ``node:resource`` key while the claim locked on
+        the bare node, so the two never serialized (CodeRabbit on #3675).
+        """
+        from tinyagentos.gpu_lease import claims_for_node, open_claims
+        from tinyagentos.routes import a2a_gpu_lease as mod
+
+        assert cluster.get_worker("orb") is None
+        claim_a = await lease_client.post(
+            "/api/a2a/gpu/claim", json={"node": "orb", "vram_mb": 4096}
+        )
+        assert claim_a.status_code == 200, claim_a.json()
+
+        release_parked = asyncio.Event()
+        release_gate = asyncio.Event()
+        claim_reached_post = asyncio.Event()
+        posted_lines: list[str] = []
+        original_post_line = mod._post_line
+
+        async def parked_post_line(channel, actor, text):
+            if text.startswith("[GPU RELEASE]"):
+                release_parked.set()
+                await release_gate.wait()
+            elif text.startswith("[GPU CLAIM]"):
+                claim_reached_post.set()
+            posted_lines.append(text.split("]")[0] + "]")
+            return await original_post_line(channel, actor, text)
+
+        monkeypatch.setattr(mod, "_post_line", parked_post_line)
+
+        release_task = asyncio.create_task(
+            lease_client.post("/api/a2a/gpu/release", json={"node": "orb"})
+        )
+        await asyncio.wait_for(release_parked.wait(), timeout=5.0)
+
+        claim_task = asyncio.create_task(
+            lease_client.post(
+                "/api/a2a/gpu/claim", json={"node": "orb", "vram_mb": 4096}
+            )
+        )
+        reached = asyncio.create_task(claim_reached_post.wait())
+        done, _pending = await asyncio.wait({reached}, timeout=2.0)
+        if not done:
+            reached.cancel()
+        assert not claim_reached_post.is_set(), (
+            "the bus-only claim posted while the same holder's release was still "
+            f"parked: {posted_lines}"
+        )
+
+        release_gate.set()
+        release_resp, claim_resp = await asyncio.gather(release_task, claim_task)
+        assert release_resp.status_code == 200, release_resp.json()
+        assert claim_resp.status_code == 200, claim_resp.json()
+        assert posted_lines == ["[GPU RELEASE]", "[GPU CLAIM]"]
+
+        folded = open_claims(bus.messages)
+        assert claims_for_node(folded, "orb"), (
+            f"the new claim must survive the earlier release: {bus.messages}"
+        )
 
 @pytest.mark.asyncio
 class TestRequest:

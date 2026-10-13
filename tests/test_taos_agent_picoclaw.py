@@ -395,36 +395,18 @@ async def test_framework_switch_requires_admin(mobile):
 # ---------------------------------------------------------------------------
 
 @_ASYNC
-async def test_picoclaw_with_gateway_disabled_falls_back_visibly(mobile, monkeypatch, caplog):
+@pytest.mark.parametrize("choice", ["picoclaw", "auto"])
+async def test_old_gateway_off_flag_no_longer_downgrades_picoclaw(mobile, monkeypatch, choice):
+    """TAOS_LLM_GATEWAY=0 used to force opencode (picoclaw needs the gateway).
+    The gateway is always on since LiteLLM removal 2b-2a, so the flag is
+    ignored and picoclaw stays the effective harness on a handset."""
     app, client = mobile
     monkeypatch.setenv("TAOS_LLM_GATEWAY", "0")
-    caplog.set_level(logging.INFO)
-    resp = await client.put("/api/taos-agent/framework", json={"framework": "picoclaw"})
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    assert body["framework"] == "opencode"
-    cfg = await _framework(client)
-    # The EFFECTIVE harness, never the preference.
-    assert cfg["framework"] == "opencode"
-    assert cfg["framework_preference"] == "picoclaw"
-    assert cfg["framework_reason"] == FALLBACK_REASON
-    assert await _lock_framework(client, monkeypatch) == "opencode"
-    assert FALLBACK_REASON in caplog.text
-    assert not _picoclaw_config_path(app).exists()
-    assert _live_keys(app) == 0
-
-
-@_ASYNC
-async def test_auto_on_mobile_with_gateway_disabled_falls_back(mobile, monkeypatch, caplog):
-    app, client = mobile
-    monkeypatch.setenv("TAOS_LLM_GATEWAY", "0")
-    caplog.set_level(logging.INFO)
-    resp = await client.put("/api/taos-agent/framework", json={"framework": "auto"})
+    resp = await client.put("/api/taos-agent/framework", json={"framework": choice})
     assert resp.status_code == 200, resp.text
     cfg = await _framework(client)
-    assert cfg["framework"] == "opencode"
-    assert cfg["framework_reason"] == FALLBACK_REASON
-    assert FALLBACK_REASON in caplog.text
+    assert cfg["framework"] == "picoclaw"
+    assert cfg["framework_reason"] != FALLBACK_REASON
 
 
 # ---------------------------------------------------------------------------
@@ -855,3 +837,68 @@ async def test_picoclaw_workspace_has_no_admin_token(mobile):
         if file_path.is_file():
             content = file_path.read_text(errors="ignore")
             assert admin_token not in content, f"Admin token found in {file_path}"
+
+
+# ---------------------------------------------------------------------------
+# Claude Code harness (operator override, token in Secrets)
+# ---------------------------------------------------------------------------
+
+_CC_TOKEN = "sk-ant-oat01-ROUTETESTSECRET"
+_FAKE_CLAUDE = """#!/bin/bash
+cat > /dev/null
+echo '{"type":"system","subtype":"init","session_id":"route-sess"}'
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"hi from claude"}]}}'
+echo '{"type":"result","is_error":false,"result":"hi from claude","session_id":"route-sess"}'
+"""
+
+
+@_ASYNC
+async def test_claude_code_without_token_falls_back_and_chat_stays_opencode(desktop, tmp_path, monkeypatch):
+    app, client = desktop
+    _write_exec(tmp_path / "claude", _FAKE_CLAUDE)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    await app.state.secrets.delete("claude_code_oauth_token")
+    resp = await client.put("/api/taos-agent/framework", json={"framework": "claude_code"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["framework"] == "opencode"
+    cfg = await _framework(client)
+    assert cfg["framework_preference"] == "claude_code"
+    assert cfg["framework_reason"] == "claude_code preferred, no claude_code_oauth_token secret, using opencode"
+
+
+@_ASYNC
+async def test_claude_code_chat_turn_never_leaks_the_token(desktop, tmp_path, monkeypatch, caplog):
+    app, client = desktop
+    _write_exec(tmp_path / "claude", _FAKE_CLAUDE)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    await app.state.secrets.add("claude_code_oauth_token", _CC_TOKEN)
+    try:
+        resp = await client.put("/api/taos-agent/framework", json={"framework": "claude_code"})
+        assert resp.json()["framework"] == "claude_code", resp.text
+        caplog.set_level(logging.DEBUG)
+        body, frames = await _chat(client)
+        assert any(f.get("delta") == "hi from claude" for f in frames), frames
+        assert frames[-1] == {"done": True}
+        assert _CC_TOKEN not in body and _CC_TOKEN not in caplog.text
+        assert app.state.taos_claude_code_session_id == "route-sess"
+    finally:
+        await app.state.secrets.delete("claude_code_oauth_token")
+        await client.put("/api/taos-agent/framework", json={"framework": "auto"})
+
+
+@_ASYNC
+async def test_claude_code_chat_503_when_secret_vanishes(desktop, tmp_path, monkeypatch):
+    app, client = desktop
+    _write_exec(tmp_path / "claude", _FAKE_CLAUDE)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ.get('PATH', '')}")
+    await app.state.secrets.add("claude_code_oauth_token", _CC_TOKEN)
+    try:
+        await client.put("/api/taos-agent/framework", json={"framework": "claude_code"})
+        await app.state.secrets.delete("claude_code_oauth_token")
+        resp = await client.post("/api/taos-agent/chat",
+                                 json={"messages": [{"role": "user", "content": "hi"}]})
+        assert resp.status_code == 503
+        assert "claude_code_oauth_token" in resp.json()["error"]
+        assert _CC_TOKEN not in resp.text
+    finally:
+        await client.put("/api/taos-agent/framework", json={"framework": "auto"})
