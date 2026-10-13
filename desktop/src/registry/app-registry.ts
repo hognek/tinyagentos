@@ -1,5 +1,14 @@
 import type { ComponentType } from "react";
 
+/**
+ * The kind of engine an app runs on. Powers the app-type indicator badge: a
+ * taOS app needs no badge (it IS the platform), while a Linux/Android/web/
+ * container/agent app gets a small corner chip so the user sees at a glance
+ * what is running under the hood. Built-in manifests omit this and default to
+ * "taos" (see appRuntime).
+ */
+export type AppRuntime = "taos" | "linux" | "android" | "web" | "container" | "agent";
+
 export interface AppManifest {
   id: string;
   name: string;
@@ -41,6 +50,12 @@ export interface AppManifest {
   /** If true, the app is a file handler: hidden from the launcher but still
    *  openable by id (agents open them directly). */
   handler?: boolean;
+  /**
+   * The engine the app runs on. Omit to default to "taos" (built-in apps are
+   * taOS-native); set explicitly for userspace apps (see appRuntime) and for
+   * any third-party manifest that wants a non-taos badge.
+   */
+  runtime?: AppRuntime;
 }
 
 export const apps: AppManifest[] = [

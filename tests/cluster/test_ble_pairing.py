@@ -46,7 +46,8 @@ def fast_timeouts(monkeypatch):
     monkeypatch.setattr(pairing_mod, "_CONNECT_TIMEOUT_S", 0.3)
 
 
-def make_manager(cluster, store, tmp_path, boards, **conn_kwargs) -> BlePairingManager:
+def make_manager(cluster, store, tmp_path, boards, llm_gateway_enabled=None,
+                 **conn_kwargs) -> BlePairingManager:
     transport = FakeTransport(boards, **conn_kwargs)
     return BlePairingManager(
         data_dir=tmp_path,
@@ -54,6 +55,7 @@ def make_manager(cluster, store, tmp_path, boards, **conn_kwargs) -> BlePairingM
         pairing_store=store,
         bind_port=6969,
         transport=transport,
+        llm_gateway_enabled=llm_gateway_enabled,
     )
 
 
@@ -257,7 +259,7 @@ async def test_orb_caps_register_platform_orb(cluster, store, tmp_path):
     worker = cluster.get_worker("taOS Orb-ORB1")
     assert worker is not None
     assert worker.platform == "orb"
-    assert worker.capabilities == ["agent"]
+    assert worker.capabilities == ["agent", "orb"]
 
 
 @pytest.mark.asyncio
@@ -272,6 +274,48 @@ async def test_agent_caps_still_register_taosusb(cluster, store, tmp_path):
     worker = cluster.get_worker("taOSusb-TAOS1")
     assert worker is not None
     assert worker.platform == "taosusb"
+
+
+@pytest.mark.asyncio
+async def test_orb_caps_registered(cluster, store, tmp_path):
+    """info caps ["agent","orb"] -> registered capabilities == ["agent","orb"]."""
+    board = FakeBoard(board_id="ORB2", name="taOS Orb-ORB2", caps=["agent", "orb"])
+    mgr = make_manager(cluster, store, tmp_path, {"addr1": board})
+    started = await mgr.start("addr1")
+    result = await mgr.confirm(started["session"])
+
+    assert result["name"] == "taOS Orb-ORB2"
+    worker = cluster.get_worker("taOS Orb-ORB2")
+    assert worker is not None
+    assert worker.capabilities == ["agent", "orb"]
+
+
+@pytest.mark.asyncio
+async def test_board_cannot_claim_unlisted_caps(cluster, store, tmp_path):
+    """info caps ["agent","browser","gpu","orb"] -> capabilities == ["agent","orb"]."""
+    board = FakeBoard(board_id="UNLIST", name="taOS Orb-UNLIST", caps=["agent", "browser", "gpu", "orb"])
+    mgr = make_manager(cluster, store, tmp_path, {"addr1": board})
+    started = await mgr.start("addr1")
+    result = await mgr.confirm(started["session"])
+
+    assert result["name"] == "taOS Orb-UNLIST"
+    worker = cluster.get_worker("taOS Orb-UNLIST")
+    assert worker is not None
+    assert worker.capabilities == ["agent", "orb"]
+
+
+@pytest.mark.asyncio
+async def test_taosusb_caps_unchanged(cluster, store, tmp_path):
+    """caps ["agent"] -> ["agent"]."""
+    board = FakeBoard(board_id="SUB1", name="taOSusb-SUB1", caps=["agent"])
+    mgr = make_manager(cluster, store, tmp_path, {"addr1": board})
+    started = await mgr.start("addr1")
+    result = await mgr.confirm(started["session"])
+
+    assert result["name"] == "taOSusb-SUB1"
+    worker = cluster.get_worker("taOSusb-SUB1")
+    assert worker is not None
+    assert worker.capabilities == ["agent"]
 
 
 @pytest.mark.asyncio
@@ -298,11 +342,11 @@ async def test_missing_or_junk_caps_default_to_taosusb(cluster, store, tmp_path)
 
 @pytest.mark.asyncio
 async def test_scan_start_confirm_happy_path(cluster, store, tmp_path, monkeypatch):
-    # S1 scope, with the LLM gateway pinned OFF: the gateway is on by default
-    # now, and the default-on provision is covered by the sibling below.
-    monkeypatch.setenv("TAOS_LLM_GATEWAY", "0")
+    # S1 scope, with the LLM provision pinned OFF through the manager's own
+    # switch (the gateway is always on since LiteLLM removal 2b-2a; the
+    # default-on provision is covered by the sibling below).
     board = FakeBoard(board_id="HAPP", name="taOSusb-HAPP")
-    mgr = make_manager(cluster, store, tmp_path, {"addr1": board})
+    mgr = make_manager(cluster, store, tmp_path, {"addr1": board}, llm_gateway_enabled=False)
 
     devices = await mgr.scan(2)
     assert len(devices) == 1

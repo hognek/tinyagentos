@@ -3,8 +3,11 @@
 Every gateway route takes ``caller: GatewayCaller = Depends(gateway_caller)``
 and asks ``caller.may_use(model)`` (for the requested model AND the model it
 resolves to); nothing else in the package looks at credentials. The auth
-middleware exempts exactly ``GET /api/llm/v1/models`` and
-``POST /api/llm/v1/chat/completions`` so a bearer key reaches this function.
+middleware exempts exactly ``GET /api/llm/v1/models``,
+``POST /api/llm/v1/chat/completions``, ``POST /api/llm/v1/embeddings``,
+``POST /api/llm/v1/audio/transcriptions`` and
+``POST /api/llm/v1/audio/speech`` so a
+bearer key reaches this function.
 
 Accepted, in order:
 

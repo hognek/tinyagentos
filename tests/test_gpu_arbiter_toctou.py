@@ -93,6 +93,7 @@ class TestToctouReservation:
 
         task = _make_task("t-evict", vram_mb=0)
         task.payload = blocking
+        resource_id = "gpu-cuda-0:t-evict-lease"
 
         # Reserve against the shared ledger exactly as _reserve_and_check would
         # before _run_gpu_task is entered.
@@ -103,7 +104,7 @@ class TestToctouReservation:
 
         async def runner():
             try:
-                await arbiter._run_gpu_task(task, 4096, False, None)
+                await arbiter._run_gpu_task(task, 4096, False, resource_id)
             except asyncio.CancelledError:
                 pass
 
@@ -207,3 +208,229 @@ class TestToctouReservation:
         stats = await arbiter.stats()
         assert stats["reserved_vram_mb"] == 2048
         assert stats["pending_reservations"] == 1
+
+
+class _EpochFakeCluster:
+    """Fake controller that fences renew/release by lease epoch, like ClusterManager."""
+
+    class _Lease:
+        def __init__(self, lease_id, epoch):
+            self.lease_id = lease_id
+            self.epoch = epoch
+
+    def __init__(self):
+        self.current_epoch = "g.1"
+        self.claim_calls = []
+        self.renew_epochs = []
+        self.release_epochs = []
+
+    async def claim_lease(self, resource_id, caller, ttl_seconds, required_vram_mb):
+        self.claim_calls.append(resource_id)
+        return self._Lease("lease-1", self.current_epoch)
+
+    async def renew_lease(self, lease_id, ttl_seconds=30, epoch=None):
+        self.renew_epochs.append(epoch)
+        if epoch is not None and epoch != self.current_epoch:
+            return None  # takeover: the stored lease now has a different epoch
+        return self._Lease(lease_id, self.current_epoch)
+
+    async def release_lease(self, lease_id, epoch=None):
+        self.release_epochs.append(epoch)
+        return True
+
+
+class TestGpuArbiterLeaseEpochs:
+    @pytest.mark.asyncio
+    async def test_renew_presents_claim_epoch_and_takeover_stops_task(self):
+        cm = _EpochFakeCluster()
+        arbiter = GpuArbiter(vram_probe=lambda: (8192, 8192), cluster_manager=cm, max_queue_size=10)
+        arbiter._RENEW_INTERVAL_S = 0.02
+        started = asyncio.Event()
+
+        async def blocking(_resource):
+            started.set()
+            await asyncio.sleep(30)
+
+        task = _make_task("t-epoch", vram_mb=0)
+        task.payload = blocking
+        resource_id = "gpu-cuda-0:t-evict-lease"
+        runner = asyncio.create_task(arbiter._run_gpu_task(task, 0, False, "gpu-cuda-0:t-epoch"))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        await asyncio.sleep(0.1)  # a few renews with the claim epoch
+        assert cm.renew_epochs and set(cm.renew_epochs) == {"g.1"}, cm.renew_epochs
+        cm.current_epoch = "g.2"  # takeover: same lease_id, new epoch
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(runner, timeout=5)
+        assert len(cm.claim_calls) == 1  # never re-claimed
+        assert cm.release_epochs == ["g.1"]  # release presents the epoch it holds
+
+    @pytest.mark.asyncio
+    async def test_lease_renew_happy_path_keeps_task_running(self):
+        cm = _EpochFakeCluster()
+        arbiter = GpuArbiter(vram_probe=lambda: (8192, 8192), cluster_manager=cm, max_queue_size=10)
+        arbiter._RENEW_INTERVAL_S = 0.02
+
+        async def short(_resource):
+            await asyncio.sleep(0.15)
+            return "done"
+
+        task = _make_task("t-happy", vram_mb=0)
+        task.payload = short
+        result = await asyncio.wait_for(arbiter._run_gpu_task(task, 0, False, "gpu-cuda-0:t-happy"), timeout=5)
+        assert result == "done"
+        assert len(cm.renew_epochs) >= 2 and set(cm.renew_epochs) == {"g.1"}
+        assert cm.release_epochs == ["g.1"]
+
+
+class TestClaimWindowCancel:
+    """Test that a task cancelled between claim_lease and _running registration releases the lease."""
+
+    @pytest.mark.asyncio
+    async def test_cancel_between_claim_and_register_releases_lease(self):
+        """FakeClusterManager that records release_lease(lease_id, epoch) calls; replace
+        `arbiter._running_lock` with an object whose `__aenter__` raises asyncio.CancelledError
+        on first entry (and behaves like a normal lock afterwards, so the finally can take it);
+        run the task; assert exactly one release_lease call with the claimed lease_id and its
+        epoch, and that lease_id is not in arbiter._lease_epochs.
+        """
+        # We need a fake cluster manager that records the calls.
+        class RecordingClusterManager:
+            def __init__(self):
+                self.claimed = None
+                self.renewed = None
+                self.released = []  # list of (lease_id, epoch)
+
+            async def claim_lease(self, resource_id, caller, ttl_seconds, required_vram_mb):
+                self.claimed = resource_id
+                # Return a fake lease with lease_id and epoch
+                return type('Lease', (), {'lease_id': 'lease-123', 'epoch': 'epoch-456'})()
+
+            async def renew_lease(self, lease_id, ttl_seconds=300, epoch=None):
+                self.renewed = (lease_id, epoch)
+                return type('Lease', (), {'lease_id': lease_id, 'epoch': epoch})()
+
+            async def release_lease(self, lease_id, epoch=None):
+                self.released.append((lease_id, epoch))
+                return True
+
+            # We also need to provide the other methods that the arbiter might call.
+            def get_workers(self):
+                return []
+
+            def get_leases(self):
+                return []
+
+        cm = RecordingClusterManager()
+        arbiter = GpuArbiter(vram_probe=lambda: (8192, 8192), cluster_manager=cm, max_queue_size=10)
+
+        # Create a lock that will raise CancelledError on first entry, then behave normally.
+        class CancelOnceLock:
+            def __init__(self):
+                self._lock = asyncio.Lock()
+                self._cancelled = False
+
+            async def __aenter__(self):
+                if not self._cancelled:
+                    self._cancelled = True
+                    raise asyncio.CancelledError()
+                return await self._lock.__aenter__()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return await self._lock.__aexit__(exc_type, exc, tb)
+
+        # Replace the arbiter's _running_lock with our CancelOnceLock
+        arbiter._running_lock = CancelOnceLock()
+
+        # Create a task that will be cancelled when trying to acquire the lock.
+        task = _make_task("t-cancel-window", vram_mb=1024)
+        task.payload = lambda r: asyncio.sleep(0)  # dummy payload
+
+        # We'll run the _run_gpu_task method directly to test the run method's try block.
+        # We expect it to be cancelled when trying to acquire the lock.
+        with pytest.raises(asyncio.CancelledError):
+            await arbiter._run_gpu_task(task, 1024, False, "gpu-cuda-0:t-cancel-window")
+
+        # After the cancelled run, we should have exactly one release_lease call.
+        assert len(cm.released) == 1, f"Expected exactly one release_lease call, got {cm.released}"
+        lease_id, epoch = cm.released[0]
+        assert lease_id == "lease-123", f"Expected lease_id 'lease-123', got {lease_id}"
+        assert epoch == "epoch-456", f"Expected epoch 'epoch-456', got {epoch}"
+        # The lease_id should have been popped from _lease_epochs
+        assert "lease-123" not in arbiter._lease_epochs, f"Expected lease_id not in _lease_epochs, got {arbiter._lease_epochs}"
+
+    @pytest.mark.asyncio
+    async def test_evicted_task_does_not_double_release(self):
+        """Existing eviction path still releases exactly once."""
+        # We'll use a similar recording cluster manager.
+        class RecordingClusterManager:
+            def __init__(self):
+                self.claimed = None
+                self.renewed = None
+                self.released = []  # list of (lease_id, epoch)
+
+            async def claim_lease(self, resource_id, caller, ttl_seconds, required_vram_mb):
+                self.claimed = resource_id
+                lease = type('Lease', (), {'lease_id': 'lease-123', 'epoch': 'epoch-456'})()
+                return lease
+
+            async def renew_lease(self, lease_id, ttl_seconds=300, epoch=None):
+                self.renewed = (lease_id, epoch)
+                return type('Lease', (), {'lease_id': lease_id, 'epoch': epoch})()
+
+            async def release_lease(self, lease_id, epoch=None):
+                self.released.append((lease_id, epoch))
+                return True
+
+            def get_workers(self):
+                return []
+
+            def get_leases(self):
+                return []
+
+        cm = RecordingClusterManager()
+        arbiter = GpuArbiter(vram_probe=lambda: (8192, 8192), cluster_manager=cm, max_queue_size=10)
+
+        # We need to get a task into the running state, then evict it.
+        # We'll adapt the existing test_reservation_released_on_eviction to also check lease release.
+
+        started = asyncio.Event()
+
+        async def blocking(_resource):
+            started.set()
+            await asyncio.sleep(60)  # long running so we can evict it
+
+        task = _make_task("t-evict-lease", vram_mb=4096)
+        task.payload = blocking
+        resource_id = "gpu-cuda-0:t-evict-lease"
+
+        # Reserve against the shared ledger exactly as _reserve_and_check would
+        # before _run_gpu_task is entered.
+        reservation = await arbiter._vram.reserve(4096, caller="gpu-task:t-evict-lease")
+        assert reservation is not None
+        arbiter._pending_reservations["t-evict-lease"] = reservation.reservation_id
+        assert arbiter._vram.reserved_vram_mb == 4096
+
+        async def runner():
+            try:
+                await arbiter._run_gpu_task(task, 4096, False, resource_id)
+            except asyncio.CancelledError:
+                pass
+
+        runner_task = asyncio.create_task(runner())
+        await asyncio.wait_for(started.wait(), timeout=5)
+
+        # Evict — cancels the task, awaits it, then releases the reservation and lease.
+        result = await arbiter._evict_task("t-evict-lease")
+        assert result == 1, f"Expected _evict_task to return 1, got {result}"
+        await runner_task
+
+        # After eviction, we should have exactly one release_lease call.
+        assert len(cm.released) == 1, f"Expected exactly one release_lease call, got {cm.released}"
+        lease_id, epoch = cm.released[0]
+        assert lease_id == "lease-123", f"Expected lease_id 'lease-123', got {lease_id}"
+        assert epoch == "epoch-456", f"Expected epoch 'epoch-456', got {epoch}"
+        # The lease_id should have been popped from _lease_epochs
+        assert "lease-123" not in arbiter._lease_epochs, f"Expected lease_id not in _lease_epochs, got {arbiter._lease_epochs}"
+        # Also, the VRAM reservation should be released.
+        assert arbiter._vram.reserved_vram_mb == 0
+        assert "t-evict-lease" not in arbiter._pending_reservations

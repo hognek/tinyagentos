@@ -1,6 +1,7 @@
 import pytest
 from tinyagentos.config import load_config
 from tinyagentos.cluster.worker_protocol import WorkerInfo
+from tinyagentos.cluster.placement import rank
 from tinyagentos.containers.backend import ContainerInfo
 
 
@@ -352,7 +353,7 @@ class TestDeployRouting:
         assert data["pinned_worker"] == "arch-box"
         assert data["available_on"] == ["fedora"]
 
-    async def test_canonical_host_is_alphabetical_when_multiple_workers_have_model(
+    async def test_canonical_host_is_rendezvous_winner_when_multiple_workers_have_model(
         self, client, app
     ):
         _seed_worker(app, "zeta", ["shared-model"])
@@ -365,10 +366,17 @@ class TestDeployRouting:
         })
         assert resp.status_code == 202
         data = resp.json()
-        assert data["worker"] == "alpha"
+        assert data["worker"] == rank("shared-model", ["alpha", "mid", "zeta"])[0]
+        assert data["worker"] == "mid"
         assert data["available_on"] == ["alpha", "mid", "zeta"]
 
-    async def test_controller_local_model_falls_through(self, client, app):
+    async def test_controller_local_model_falls_through(self, client, app, tmp_data_dir, monkeypatch):
+        # Root the process-global taosmd agent registry at this test's tmp_path
+        # instead of the repository's data/ directory so registration cannot
+        # trip the xdist data-dir mutation guard on data/agents.json.
+        import taosmd.agents
+        monkeypatch.setattr(taosmd.agents, "_default_registry", taosmd.agents.AgentRegistry(tmp_data_dir))
+
         class _FakeCatalog:
             def all_models(self, capability=None):
                 return [{"name": "local-model", "id": "local-model"}]
@@ -627,7 +635,6 @@ class TestDeployRegistryRegistration:
 
     async def test_deploy_creates_registry_row(self, client, app, monkeypatch):
         import re
-        import taosmd.agents as tm_agents
         from unittest.mock import AsyncMock, MagicMock
 
         app.state.archive = MagicMock(
@@ -650,7 +657,7 @@ class TestDeployRegistryRegistration:
 
         def fake_register_agent(name, **kwargs):
             pass
-        monkeypatch.setattr(tm_agents, "register_agent", fake_register_agent)
+        monkeypatch.setattr(app.state.taosmd_agent_registry, "register_agent", fake_register_agent)
 
         async def fake_deploy(req):
             return {"success": True, "name": req.name, "ip": "10.0.0.42",
@@ -682,7 +689,6 @@ class TestDeployRegistryRegistration:
         """Display names are not unique; a second deploy with the same name is
         a NEW agent (suffixed slug) and must get its own canonical_id, never
         inherit the first agent's identity."""
-        import taosmd.agents as tm_agents
         from unittest.mock import AsyncMock, MagicMock
 
         app.state.archive = MagicMock(
@@ -707,7 +713,7 @@ class TestDeployRegistryRegistration:
 
         def fake_register_agent(name, **kwargs):
             pass
-        monkeypatch.setattr(tm_agents, "register_agent", fake_register_agent)
+        monkeypatch.setattr(app.state.taosmd_agent_registry, "register_agent", fake_register_agent)
 
         async def fake_deploy(req):
             return {"success": True, "name": req.name, "ip": "10.0.0.42",
@@ -748,7 +754,6 @@ class TestDeployRegistryRegistration:
     async def test_reserved_name_registration_rejected_as_400(self, client, app, monkeypatch):
         """A name the registry rejects (reserved prefix) is a user error: the
         deploy must return 400 with the registry's message and add no agent."""
-        import taosmd.agents as tm_agents
         from unittest.mock import AsyncMock, MagicMock
 
         app.state.archive = MagicMock(
@@ -768,7 +773,7 @@ class TestDeployRegistryRegistration:
 
         def fake_register_agent(name, **kwargs):
             pass
-        monkeypatch.setattr(tm_agents, "register_agent", fake_register_agent)
+        monkeypatch.setattr(app.state.taosmd_agent_registry, "register_agent", fake_register_agent)
 
         async def fake_deploy(req):
             return {"success": True, "name": req.name, "ip": "10.0.0.42",
@@ -794,7 +799,49 @@ class TestDeployRegistryRegistration:
 
 
 @pytest.mark.asyncio
+class TestDeployUsesAppScopedTaosmdRegistry:
+    """Deploy must register agents via app.state.taosmd_agent_registry, not the
+    module-level global, so multiple create_app() calls do not share state."""
+
+    async def test_deploy_registers_into_app_scoped_registry(self, client, app, tmp_path, monkeypatch):
+        from unittest.mock import AsyncMock, MagicMock
+
+        app.state.archive = MagicMock(
+            record=AsyncMock(), query=AsyncMock(return_value=[{}])
+        )
+
+        assert hasattr(app.state, "taosmd_agent_registry"), (
+            "create_app must set app.state.taosmd_agent_registry"
+        )
+        pre_count = len(app.state.taosmd_agent_registry.list_agents())
+
+        async def fake_deploy(req):
+            return {"success": True, "name": req.name, "ip": "10.0.0.42",
+                    "llm_key": "sk-test", "steps": ["deployment_complete"],
+                    "container": f"taos-agent-{req.name}"}
+        monkeypatch.setattr("tinyagentos.deployer.deploy_agent", fake_deploy)
+
+        class _FakeCatalog:
+            def all_models(self, capability=None):
+                return [{"name": "test-model", "id": "test-model"}]
+        app.state.backend_catalog = _FakeCatalog()
+        app.state.cluster_manager._workers.clear()
+
+        resp = await client.post("/api/agents/deploy", json={
+            "name": "ScopedReg",
+            "framework": "openclaw",
+            "model": "test-model",
+        })
+        assert resp.status_code == 200
+
+        post_count = len(app.state.taosmd_agent_registry.list_agents())
+        assert post_count == pre_count + 1
+        names = {r["name"] for r in app.state.taosmd_agent_registry.list_agents()}
+        assert "scopedreg" in names
+
+@pytest.mark.asyncio
 class TestAgentArchiveLifecycle:
+
     async def test_archive_creates_snapshot_not_rename(self, client, monkeypatch):
         """DELETE /api/agents/{name} archives via snapshot; no rename called."""
         stopped = []
@@ -1016,7 +1063,8 @@ class TestAgentArchiveLifecycle:
         assert op_names.index("rename") < op_names.index("start")
 
     async def test_restore_env_rewrite_uses_incus_config_set(self, client, app, monkeypatch):
-        """When proxy is running, set_env is called with OPENAI_API_KEY=<new>."""
+        """Restore mints a new key (no process needed) and set_env pushes it as
+        OPENAI_API_KEY (and LITELLM_API_KEY)."""
         env_calls = []
 
         async def fake_deploy(req):
@@ -1051,7 +1099,6 @@ class TestAgentArchiveLifecycle:
         monkeypatch.setattr("tinyagentos.containers.exec_in_container", fake_exec)
 
         proxy = app.state.llm_proxy
-        monkeypatch.setattr(proxy, "is_running", lambda: True)
         async def fake_create_agent_key(name, models=None, budget_duration=None):
             return "sk-incus-key"
         monkeypatch.setattr(proxy, "create_agent_key", fake_create_agent_key)

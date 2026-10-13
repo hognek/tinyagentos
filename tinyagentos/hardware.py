@@ -623,7 +623,7 @@ def _detect_gpu() -> GpuInfo:
             if drm_path.exists():
                 for card in drm_path.glob("card*/device/driver"):
                     driver = card.resolve().name if card.exists() else ""
-                    if "mali" in driver.lower() or "panfrost" in driver.lower():
+                    if "mali" in driver.lower() or "panfrost" in driver.lower() or "panthor" in driver.lower():
                         gpu.type = "mali"
                         gpu.model = "Mali (integrated)"
                         mali_found = True

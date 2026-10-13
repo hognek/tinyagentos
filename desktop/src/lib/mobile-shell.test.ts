@@ -2,6 +2,10 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { useProcessStore } from "@/stores/process-store";
 import {
   _resetMobileShellForTests,
+  closeShellWindow,
+  focusShellWindow,
+  listShellWindows,
+  openUrlInShell,
   primeDeviceClass,
   SHELL_LAUNCH_TIMEOUT_MS,
   SHELL_LAUNCH_URL,
@@ -278,4 +282,72 @@ describe("mobile shell launch (via process-store openWindow)", () => {
       expect(shellCalls(fetchMock)).toHaveLength(0);
     });
   });
+});
+
+describe("shell window and url calls", () => {
+  const BASE = "http://127.0.0.1:6973";
+  const WIN = { con_id: 7, app_id: "firefox", title: "t", label: "Firefox", workspace: "1", focused: true };
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it("listShellWindows GETs /windows and returns the array", async () => {
+    const fetchMock = vi.fn(() => Promise.resolve(jsonResponse([WIN])));
+    vi.stubGlobal("fetch", fetchMock);
+    expect(await listShellWindows()).toEqual([WIN]);
+    expect(String(fetchMock.mock.calls[0][0])).toBe(`${BASE}/windows`);
+  });
+
+  it("listShellWindows returns [] on non-200, a non-array body, a network error and a hang", async () => {
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(jsonResponse([WIN], 500))));
+    expect(await listShellWindows()).toEqual([]);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(jsonResponse({ ok: true }))));
+    expect(await listShellWindows()).toEqual([]);
+    vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new TypeError("down"))));
+    expect(await listShellWindows()).toEqual([]);
+    vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => {})));
+    vi.useFakeTimers();
+    const p = listShellWindows();
+    await vi.advanceTimersByTimeAsync(SHELL_LAUNCH_TIMEOUT_MS + 1);
+    expect(await p).toEqual([]);
+  });
+
+  const posts: Array<[string, (a: never) => Promise<boolean>, unknown, string, unknown]> = [
+    ["focusShellWindow", focusShellWindow as never, 7, "/focus", { con_id: 7 }],
+    ["closeShellWindow", closeShellWindow as never, 7, "/close", { con_id: 7 }],
+    ["openUrlInShell", openUrlInShell as never, "https://example.com/", "/open-url", { url: "https://example.com/" }],
+  ];
+
+  for (const [name, fn, arg, path, body] of posts) {
+    it(`${name} POSTs ${path} with the shell header and resolves true on ok`, async () => {
+      const fetchMock = vi.fn(() => Promise.resolve(jsonResponse({ ok: true })));
+      vi.stubGlobal("fetch", fetchMock);
+      expect(await fn(arg as never)).toBe(true);
+      const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+      expect(url).toBe(`${BASE}${path}`);
+      expect(init).toEqual(
+        expect.objectContaining({
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-taOS-Shell": "1" },
+          body: JSON.stringify(body),
+        }),
+      );
+    });
+
+    it(`${name} resolves false on non-200, ok:false, network error and timeout`, async () => {
+      vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(jsonResponse({ ok: true }, 404))));
+      expect(await fn(arg as never)).toBe(false);
+      vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(jsonResponse({ ok: false }))));
+      expect(await fn(arg as never)).toBe(false);
+      vi.stubGlobal("fetch", vi.fn(() => Promise.reject(new TypeError("down"))));
+      expect(await fn(arg as never)).toBe(false);
+      vi.stubGlobal("fetch", vi.fn(() => new Promise<Response>(() => {})));
+      vi.useFakeTimers();
+      const p = fn(arg as never);
+      await vi.advanceTimersByTimeAsync(SHELL_LAUNCH_TIMEOUT_MS + 1);
+      expect(await p).toBe(false);
+    });
+  }
 });

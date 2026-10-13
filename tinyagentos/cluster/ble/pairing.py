@@ -54,6 +54,8 @@ from tinyagentos.cluster.worker_protocol import WorkerInfo
 
 logger = logging.getLogger(__name__)
 
+DEVICE_CAPS_ALLOWED = frozenset({"agent", "orb"})
+
 MAX_SESSIONS = 2
 SESSION_TTL_S = 120.0
 _HELLO_TIMEOUT_S = 10.0
@@ -71,6 +73,23 @@ _MID_NONCE = 2
 # request by the gateway (llm_gateway/resolve.py TAOS_DEFAULT).
 BOARD_LLM_MODELS = ["taos-default"]
 LLM_PATH = "/api/llm/v1"
+
+
+def _device_caps(caps: list[str]) -> list[str]:
+    """Return the device capabilities for a worker registration.
+    
+    Always includes "agent", plus any caps from DEVICE_CAPS_ALLOWED that the board sent.
+    Unknown caps are dropped and logged once at INFO with the board_id.
+    Returns a deduplicated list in stable order ("agent" first)."""
+    result = ["agent"]
+    seen = {"agent"}
+    for cap in caps:
+        if cap in DEVICE_CAPS_ALLOWED and cap not in seen:
+            result.append(cap)
+            seen.add(cap)
+        elif cap not in DEVICE_CAPS_ALLOWED:
+            logger.info("Board with unknown capabilities: dropping '%s' from %s", cap, caps)
+    return result
 
 
 def _platform_from_caps(caps: list[str]) -> str:
@@ -429,27 +448,40 @@ class BlePairingManager:
 
         urls = controller_urls(self._bind_port)
         llm = None
+        # A board re-paired under the same name (reset, not revoked) leaves
+        # its old model key behind; one live key per node. Revocation is a
+        # local store write and does not need the gateway up.
+        from tinyagentos.llm_gateway.auth import revoke_for_node
+
+        try:
+            revoke_for_node(name, data_dir=self._data_dir)
+        except Exception as exc:
+            await self._rollback(name, key, sess)
+            await self._close_session(sess)
+            # type only: never the exception text, which is not ours to vouch for
+            raise PairError(500, f"failed to revoke model keys: {type(exc).__name__}") from exc
+
         if self._llm_enabled and urls:
             try:
-                from tinyagentos.llm_gateway.auth import mint_for_node, revoke_for_node
+                from tinyagentos.llm_gateway.auth import mint_for_node
 
-                # A board re-paired under the same name (reset, not revoked)
-                # leaves its old model key behind; one live key per node.
-                revoke_for_node(name, data_dir=self._data_dir)
-                llm_key = mint_for_node(name, BOARD_LLM_MODELS, data_dir=self._data_dir)
+                if platform != "orb":
+                    llm_key = mint_for_node(
+                        name, BOARD_LLM_MODELS, data_dir=self._data_dir
+                    )
+                    llm = {"base": urls[0] + LLM_PATH, "key": llm_key}
             except Exception as exc:
                 await self._rollback(name, key, sess)
                 await self._close_session(sess)
                 # type only: never the exception text, which is not ours to vouch for
                 raise PairError(500, f"failed to mint model key: {type(exc).__name__}") from exc
-            llm = {"base": urls[0] + LLM_PATH, "key": llm_key}
 
         worker = WorkerInfo(
             name=name,
             url="",
             kind="device",
             platform=platform,
-            capabilities=["agent"],
+            capabilities=_device_caps(sess.caps),
             signing_key=key,
         )
         try:
@@ -522,10 +554,9 @@ class BlePairingManager:
             await self._pairing_store.revoke_if_key(name, key)
         except Exception:
             logger.exception("ble pairing rollback: failed to revoke key for '%s'", name)
-        if self._llm_enabled:
-            try:
-                from tinyagentos.llm_gateway.auth import revoke_for_node
+        try:
+            from tinyagentos.llm_gateway.auth import revoke_for_node
 
-                revoke_for_node(name, data_dir=self._data_dir)
-            except Exception:
-                logger.exception("ble pairing rollback: failed to revoke model keys for '%s'", name)
+            revoke_for_node(name, data_dir=self._data_dir)
+        except Exception:
+            logger.exception("ble pairing rollback: failed to revoke model keys for '%s'", name)

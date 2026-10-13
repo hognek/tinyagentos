@@ -281,17 +281,27 @@ describe("ChannelSidebar — channel type icons", () => {
 /* ------------------------------------------------------------------ */
 
 describe("ChannelSidebar — mobile", () => {
-  it("renders connection status with mobile inline styles", () => {
+  it("renders connection status with mobile inline styles when connecting", () => {
     const { container } = render(
-      <ChannelSidebar {...buildProps({ isMobile: true, wsStatus: "connected" })} />,
+      <ChannelSidebar {...buildProps({ isMobile: true, wsStatus: "connecting" })} />,
     );
-    expect(screen.getByText("Connected")).toBeInTheDocument();
+    expect(screen.getByText("Connecting…")).toBeInTheDocument();
     // Mobile uses inline styles — verify the wrapper div padding via longhands
     // (jsdom re-serialises shorthands; asserting longhands is stable across versions)
     const mobileContainer = container.firstChild as HTMLElement;
     expect(mobileContainer.style.paddingTop).toBe("8px");
     expect(mobileContainer.style.paddingRight).toBe("0px");
     expect(mobileContainer.style.paddingBottom).toBe("16px");
+  });
+
+  it("does not render connection status text when wsStatus is connected", () => {
+    render(<ChannelSidebar {...buildProps({ isMobile: true, wsStatus: "connected" })} />);
+    expect(screen.queryByText("Connected")).not.toBeInTheDocument();
+  });
+
+  it("renders MobileChatList search input on mobile", () => {
+    render(<ChannelSidebar {...buildProps({ isMobile: true, wsStatus: "connected" })} />);
+    expect(screen.getByLabelText("Search chats")).toBeInTheDocument();
   });
 
   it("renders empty state on mobile", () => {
@@ -361,7 +371,7 @@ describe("ChannelSidebar — mobile", () => {
         {...buildProps({ isMobile: true, sections, onSelectChannel })}
       />,
     );
-    fireEvent.click(screen.getByRole("button", { name: `Channel ${ch.name}` }));
+    fireEvent.click(screen.getByRole("button", { name: `Chat ${ch.name}` }));
     expect(onSelectChannel).toHaveBeenCalledWith("ch-1");
   });
 });
@@ -574,13 +584,15 @@ describe("ChannelSidebar — projects", () => {
     expect(onSelectChannel).toHaveBeenCalledWith("pc-1");
   });
 
-  it("renders Projects section on mobile", () => {
+  it("renders project channels in unified list on mobile", () => {
     render(
       <ChannelSidebar
         {...buildProps({ isMobile: true, projectGroups: [projectGroup] })}
       />,
     );
-    expect(screen.getByText(/Projects/)).toBeInTheDocument();
+    // Project channels appear in the unified MobileChatList
+    expect(screen.getByText("proj-general")).toBeInTheDocument();
+    expect(screen.getByText("proj-dev")).toBeInTheDocument();
   });
 
   it("shows a working dot on a working bound project channel (desktop)", () => {
@@ -598,37 +610,19 @@ describe("ChannelSidebar — projects", () => {
     expect(dot).toHaveClass("bg-amber-400");
   });
 
-  it("shows a working dot on a working bound project channel (mobile)", () => {
+  it("does not show presence dot on mobile for project channel (intentionally omitted)", () => {
     render(
       <ChannelSidebar
         {...buildProps({
           isMobile: true,
           projectGroups: [projectGroup],
-          projectsExpanded: true,
           agentPresence: { "pc-1": "working" },
         })}
       />,
     );
-    const btn = screen.getByRole("button", { name: "Channel proj-general" });
-    const dot = btn.querySelector(".taos-status-pulse");
-    expect(dot).toBeTruthy();
-    expect(dot).toHaveClass("bg-amber-400");
-  });
-
-  it("calls onToggleProjects on mobile Projects header click", () => {
-    const onToggleProjects = vi.fn();
-    render(
-      <ChannelSidebar
-        {...buildProps({
-          isMobile: true,
-          projectGroups: [projectGroup],
-          projectsExpanded: false,
-          onToggleProjects,
-        })}
-      />,
-    );
-    fireEvent.click(screen.getByText(/Projects/));
-    expect(onToggleProjects).toHaveBeenCalledOnce();
+    const btn = screen.getByRole("button", { name: "Chat proj-general" });
+    expect(btn.querySelector(".taos-status-pulse")).toBeNull();
+    expect(btn.querySelector('[aria-label^="Agent is"]')).toBeNull();
   });
 });
 
@@ -665,6 +659,8 @@ describe("ChannelSidebar — A2A bus", () => {
         })}
       />,
     );
+    // Bus section is collapsible on mobile — expand it first
+    fireEvent.click(screen.getByText("Agent activity"));
     expect(screen.getByText("mobile-bus")).toBeInTheDocument();
   });
 });
@@ -816,7 +812,7 @@ describe("ChannelSidebar — presence dots", () => {
     expect(btn.querySelector('[aria-label^="Agent is"]')).toBeNull();
   });
 
-  it("shows working dot on mobile", () => {
+  it("does not show presence dot on mobile (intentionally omitted)", () => {
     const ch = makeChannel({ id: "ch-1", name: "session-bob" });
     const sections = [makeSection("Agents-DMs", [ch])];
     render(
@@ -824,10 +820,9 @@ describe("ChannelSidebar — presence dots", () => {
         {...buildProps({ isMobile: true, sections, agentPresence: { "ch-1": "working" } })}
       />,
     );
-    const btn = screen.getByRole("button", { name: `Channel ${ch.name}` });
-    const dot = btn.querySelector(".taos-status-pulse");
-    expect(dot).toBeTruthy();
-    expect(dot).toHaveClass("bg-amber-400");
+    const btn = screen.getByRole("button", { name: `Chat ${ch.name}` });
+    expect(btn.querySelector(".taos-status-pulse")).toBeNull();
+    expect(btn.querySelector('[aria-label^="Agent is"]')).toBeNull();
   });
 
   it("clears presence dot when channel leaves the presence map", () => {
@@ -850,7 +845,7 @@ describe("ChannelSidebar — presence dots", () => {
     expect(btn.querySelector(".taos-status-pulse")).toBeNull();
   });
 
-  it("shows live dot on mobile when channel is live", () => {
+  it("does not show live dot on mobile when channel is live (intentionally omitted)", () => {
     const ch = makeChannel({ id: "ch-1", name: "session-dave" });
     const sections = [makeSection("Agents-DMs", [ch])];
     render(
@@ -858,10 +853,9 @@ describe("ChannelSidebar — presence dots", () => {
         {...buildProps({ isMobile: true, sections, agentPresence: { "ch-1": "live" } })}
       />,
     );
-    const btn = screen.getByRole("button", { name: `Channel ${ch.name}` });
-    const dot = btn.querySelector('[aria-label="Agent is live"]');
-    expect(dot).toBeTruthy();
-    expect(dot).toHaveClass("bg-emerald-400");
+    const btn = screen.getByRole("button", { name: `Chat ${ch.name}` });
+    expect(btn.querySelector(".taos-status-pulse")).toBeNull();
+    expect(btn.querySelector('[aria-label="Agent is live"]')).toBeNull();
   });
 });
 
@@ -896,7 +890,7 @@ describe("ChannelSidebar — accent rail", () => {
     expect(btn.className).not.toContain("border-accent-line");
   });
 
-  it("applies accent-left border to the selected channel (mobile)", () => {
+  it("highlights selected channel with active background on mobile", () => {
     const ch = makeChannel({ id: "ch-1", name: "general" });
     const sections = [makeSection("Channels", [ch])];
     render(
@@ -904,11 +898,11 @@ describe("ChannelSidebar — accent rail", () => {
         {...buildProps({ isMobile: true, sections, selectedChannel: "ch-1" })}
       />,
     );
-    const btn = screen.getByRole("button", { name: `Channel ${ch.name}` });
-    expect(btn.style.borderLeft).toContain("var(--color-accent-line)");
+    const btn = screen.getByRole("button", { name: `Chat ${ch.name}` });
+    expect(btn.style.background).toBe("var(--color-shell-surface-active)");
   });
 
-  it("does not apply accent-left border to unselected channel (mobile)", () => {
+  it("does not highlight unselected channel on mobile", () => {
     const ch = makeChannel({ id: "ch-1", name: "general" });
     const sections = [makeSection("Channels", [ch])];
     render(
@@ -916,8 +910,8 @@ describe("ChannelSidebar — accent rail", () => {
         {...buildProps({ isMobile: true, sections, selectedChannel: null })}
       />,
     );
-    const btn = screen.getByRole("button", { name: `Channel ${ch.name}` });
-    expect(btn.style.borderLeft).not.toContain("accent-line");
+    const btn = screen.getByRole("button", { name: `Chat ${ch.name}` });
+    expect(btn.style.background).not.toBe("var(--color-shell-surface-active)");
   });
 });
 
@@ -942,22 +936,18 @@ describe("ChannelSidebar — selected accent rail", () => {
     expect(btn).toHaveClass("border-l-2", "border-accent-line");
   });
 
-  it("shows the accent rail on the selected project channel (mobile)", () => {
+  it("highlights selected project channel with active background on mobile", () => {
     render(
       <ChannelSidebar
         {...buildProps({
           isMobile: true,
           projectGroups: [projectGroup],
-          projectsExpanded: true,
-          projectChannelExpanded: { "proj-1": true },
           selectedChannel: "pc-1",
         })}
       />,
     );
-    const btn = screen.getByRole("button", { name: "Channel proj-general" });
-    expect(btn.getAttribute("style")).toContain(
-      "border-left: 3px solid var(--color-accent-line)",
-    );
+    const btn = screen.getByRole("button", { name: "Chat proj-general" });
+    expect(btn.style.background).toBe("var(--color-shell-surface-active)");
   });
 
   it("shows the accent rail on the selected archived channel (desktop)", () => {
@@ -974,7 +964,7 @@ describe("ChannelSidebar — selected accent rail", () => {
     expect(btn).toHaveClass("border-l-2", "border-accent-line");
   });
 
-  it("shows the accent rail on the selected archived channel (mobile)", () => {
+  it("highlights selected archived channel with active background on mobile", () => {
     render(
       <ChannelSidebar
         {...buildProps({
@@ -986,8 +976,6 @@ describe("ChannelSidebar — selected accent rail", () => {
       />,
     );
     const btn = screen.getByRole("button", { name: "Archived channel old-chan" });
-    expect(btn.getAttribute("style")).toContain(
-      "border-left: 3px solid var(--color-accent-line)",
-    );
+    expect(btn.style.background).toBe("var(--color-shell-surface-active)");
   });
 });

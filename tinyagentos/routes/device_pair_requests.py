@@ -44,7 +44,10 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 # F5: the store does not validate the platform, so the whitelist lives here.
-_VALID_PLATFORMS = frozenset({"ios", "watchos", "android"})
+# embedded (ESP32 class) and wearos are pair-request platforms; neither has a
+# push channel, so neither may carry a push token.
+_VALID_PLATFORMS = frozenset({"ios", "watchos", "android", "embedded", "wearos"})
+_NO_PUSH_PLATFORMS = frozenset({"embedded", "wearos"})
 _VERIFY_CODE_DIGITS = 6
 _MAX_DISPLAY_NAME = 200
 
@@ -52,6 +55,9 @@ _MAX_DISPLAY_NAME = 200
 class CreatePairRequest(BaseModel):
     platform: str
     display_name: str = Field(default="", max_length=_MAX_DISPLAY_NAME)
+    # Never stored (pairing mints with no push token); declared only so a
+    # non-empty one on a no-push platform is refused instead of ignored.
+    push_token: str = Field(default="", max_length=4096)
 
 
 def _get_pair_requests_store(request: Request) -> DevicePairRequestsStore:
@@ -107,6 +113,12 @@ async def create_pair_request(request: Request, body: CreatePairRequest):
             detail=f"platform must be one of {sorted(_VALID_PLATFORMS)}",
         )
 
+    if body.platform in _NO_PUSH_PLATFORMS and body.push_token:
+        raise HTTPException(
+            status_code=400,
+            detail=f"push_token is not accepted for {body.platform} devices",
+        )
+
     store = _get_pair_requests_store(request)
 
     if not _admin_user_id(request):
@@ -144,6 +156,7 @@ async def create_pair_request(request: Request, body: CreatePairRequest):
     # THIS pair_request (F2) so a racing attacker's request cannot ride the
     # victim's approval.  Approval is surfaced through Decisions exactly like the
     # agent consent loop -- no taOSgo-specific shortcut (F7).
+    _fingerprint = getattr(request.app.state, "device_tls_fingerprint", None)
     admin_id = _admin_user_id(request)
     decision_store = getattr(request.app.state, "decision_store", None)
     if decision_store is not None and admin_id:
@@ -161,6 +174,7 @@ async def create_pair_request(request: Request, body: CreatePairRequest):
                     SERVER_RAISED_KEY: True,
                     "kind": "device_pairing",
                     "pair_request_id": pair_request_id,
+                    **({"server_cert_fingerprint": _fingerprint} if _fingerprint else {}),
                 },
                 context=(
                     f"Pairing request from {body.platform} device "
@@ -187,7 +201,11 @@ async def create_pair_request(request: Request, body: CreatePairRequest):
                 pass
 
     # F3 / criterion 5: verify_code is returned ONLY here -- never on the poll.
-    return {"pair_request_id": pair_request_id, "verify_code": verify_code}
+    result: dict = {"pair_request_id": pair_request_id, "verify_code": verify_code}
+    _fingerprint = getattr(request.app.state, "device_tls_fingerprint", None)
+    if _fingerprint:
+        result["server_cert_fingerprint"] = _fingerprint
+    return result
 
 
 @router.get("/api/devices/pair-requests/{pair_request_id}")

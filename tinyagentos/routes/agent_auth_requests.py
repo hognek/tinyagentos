@@ -8,6 +8,7 @@ POST   /api/agents/auth-requests/{request_id}/approve  — approve + mint identi
 POST   /api/agents/auth-requests/{request_id}/deny     — deny the request (admin only)
 GET    /api/agents/auth-requests                       — list pending requests (admin only)
 GET    /api/agents/scope-vocabulary                    — grantable scopes + the project-bound subset
+GET    /api/agents/scope-requests                      — list scope requests (admin: all; owner: their agents)
 
 The two public endpoints (create + status poll) are added to auth_middleware.EXEMPT_PATHS
 so unauthenticated external agents can reach them.  The opaque UUID request_id acts as a
@@ -15,7 +16,7 @@ capability token for the poll endpoint — only the caller who received the id c
 
 Security notes
 --------------
-* The token field is returned ONLY on status == 'accepted'.
+ * The token field is returned ONLY on status == 'accepted'.
 * Admin gate on approve / deny / list — checked via current_user + is_admin flag.
 * Abuse cap: at most _PENDING_CAP pending requests per (identity_claim, framework) pair;
   further submissions receive 429.
@@ -36,6 +37,7 @@ from tinyagentos.agent_registry_store import (
     agent_slug_or_fallback,
     mint_registry_token,
 )
+from tinyagentos.agent_token_auth import check_agent_identity, check_agent_identity_claims
 from tinyagentos.auth_context import CurrentUser, current_user, require_owner_or_admin
 from tinyagentos.base_store import PendingCapExceeded
 from tinyagentos.routes.projects import _free_suggestions
@@ -106,6 +108,8 @@ VALID_SCOPES = frozenset({
     # project_notes' single-scope read+write surface for a lightweight lists
     # surface scoped to a project.
     "project_lists",
+    # Memory access: read an agent's own memory index.
+    "memory_read",
 })
 
 
@@ -145,6 +149,10 @@ class ApproveBody(BaseModel):
     project_id: Optional[str] = None
     defer_binding: bool = False
     renew: bool = False
+    # Make the approved agent the project's lead (membership role + the
+    # projects.lead_member_id pointer). Needs an explicit project_id and a
+    # membership-creating grant; refused otherwise rather than silently ignored.
+    is_lead: bool = False
 
 
 class AssignAgentBody(BaseModel):
@@ -227,6 +235,32 @@ def _get_relationships(request: Request):
     return rel
 
 
+async def _classify_proof(request: Request) -> tuple[str, str | None, int | None]:
+    """Return (proof_status, proven_cid, proven_iat) from the request's Authorization header.
+
+    Header absent -> ("none", None, None).
+    Header present -> check_agent_identity_claims; truthy -> ("accepted", cid, iat);
+    None or HTTPException -> ("rejected", None, None).
+    """
+    authorization_header = request.headers.get("authorization")
+    has_auth_header = authorization_header is not None
+    proof_status = "none" if not has_auth_header else "rejected"
+    proven = None
+    proven_iat = None
+    if has_auth_header:
+        try:
+            result = await check_agent_identity_claims(request)
+            if result is not None:
+                proven, proven_iat = result
+            if proven:
+                proof_status = "accepted"
+        except HTTPException:
+            proven = None
+            proven_iat = None
+            proof_status = "rejected"
+    return proof_status, proven, proven_iat
+
+
 async def _retire_request_notification(request: Request, request_id: str) -> None:
     """Archive the bell notification for a now-decided auth request so it leaves
     the active list. Best effort: never fails the decision."""
@@ -258,7 +292,7 @@ async def _retire_scope_request_notification(request: Request, request_id: str) 
 # project_tasks_create globally. One definition, referenced everywhere.
 _CANVAS_SCOPES = {"canvas_read", "canvas_write"}
 _FILES_SCOPES = {"files_read", "files_write"}
-_PROJECT_SCOPES = {"project_tasks", "project_tasks_create", "project_tasks_update", "project_lists", "project_notes"} | _CANVAS_SCOPES | _FILES_SCOPES
+_PROJECT_SCOPES = {"project_tasks", "project_tasks_create", "project_tasks_update", "project_lists", "project_notes", "project_doc_review"} | _CANVAS_SCOPES | _FILES_SCOPES
 
 
 def _get_approve_lock(request: Request, request_id: str) -> asyncio.Lock:
@@ -281,7 +315,6 @@ async def _resolve_agent_identity(request: Request, identity_claim: str, *, stri
     ``check_agent_identity`` is propagated, and a missing or unresolved identity
     raises 401 instead of returning the caller-supplied string.
     """
-    from tinyagentos.agent_token_auth import check_agent_identity
 
     try:
         cid = await check_agent_identity(request)
@@ -371,12 +404,17 @@ async def _handle_project_create_request(
 
     from_agent = await _resolve_agent_identity(request, body.identity_claim, strict=True)
 
+    proof_status, proven = "accepted", from_agent
+
     admins = [u for u in request.app.state.auth.list_users() if u.get("is_admin")]
     if not admins:
         raise HTTPException(status_code=409, detail="no admin to receive the decision")
     decider = admins[0]["id"]
 
     decision_store = request.app.state.decision_store
+
+    # proof_status is fixed above; only the token iat is needed for rotation detection.
+    _, _, proven_iat = await _classify_proof(request)
 
     record = None
     try:
@@ -395,6 +433,8 @@ async def _handle_project_create_request(
             purpose=body.purpose or body.reason,
             cap_identity=from_agent,
             cap_framework="project_create",
+            proven_canonical_id=proven,
+            proven_token_iat=proven_iat,
         )
     except PendingCapExceeded as exc:
         raise HTTPException(
@@ -463,7 +503,7 @@ async def _handle_project_create_request(
             pass
 
     return JSONResponse(
-        {"request_id": record["id"], "status": "pending", "decision_id": decision["id"]}
+        {"request_id": record["id"], "status": "pending", "decision_id": decision["id"], "proof_status": proof_status}
     )
 
 
@@ -545,6 +585,9 @@ async def create_auth_request(request: Request, body: CreateAuthRequest):
     # than counted here first: this route takes no credentials, so a burst of
     # concurrent posts is free, and a count-then-insert check hands every
     # request in that burst the same pre-insert count.
+    
+    proof_status, proven, proven_iat = await _classify_proof(request)
+
     try:
         record = await store.create(
             identity_claim=body.identity_claim,
@@ -555,6 +598,8 @@ async def create_auth_request(request: Request, body: CreateAuthRequest):
             duration_secs=body.duration_secs,
             project_id=body.project_id,
             pending_cap=_PENDING_CAP,
+            proven_canonical_id=proven,
+            proven_token_iat=proven_iat,
         )
     except PendingCapExceeded as exc:
         raise HTTPException(
@@ -597,7 +642,7 @@ async def create_auth_request(request: Request, body: CreateAuthRequest):
         except Exception:
             pass
 
-    return {"request_id": record["id"], "status": "pending"}
+    return {"request_id": record["id"], "status": "pending", "proof_status": proof_status}
 
 
 @router.get("/api/agents/auth-requests/{request_id}")
@@ -736,6 +781,7 @@ async def approve_request_record(
     display_name: str | None = None,
     defer_binding: bool = False,
     renew: bool = False,
+    is_lead: bool = False,
 ) -> dict:
     """Register an agent, mint its token, write grants + relationships +
     membership + a2a sync, and record the decision.
@@ -897,6 +943,27 @@ async def approve_request_record(
                 ),
             )
         if project_id and set(granted_scopes) & _PROJECT_SCOPES:
+            # PROOF REQUIRED: the requester must have proven they are the agent
+            # the existing active agent owns, by presenting a valid registry token.
+            if record.get("proven_canonical_id") != existing_active["canonical_id"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"handle '{handle}' belongs to active agent "
+                        f"{existing_active['canonical_id']}; resubmit the request with that agent's registry token as a Bearer header"
+                    ),
+                )
+            # Also reject if the proof token was superseded by a rotation since
+            # the request was filed. The stored token iat must be >= the
+            # identity's current token_min_iat.
+            if (record.get("proven_token_iat") or 0) < (existing_active.get("token_min_iat") or 0):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"handle '{handle}' belongs to active agent "
+                        f"{existing_active['canonical_id']}; the proof token was superseded by a rotation and the request must be resubmitted with a current token"
+                    ),
+                )
             existing_cid = existing_active["canonical_id"]
             token = mint_registry_token(
                 existing_cid,
@@ -911,6 +978,7 @@ async def approve_request_record(
                 project_id=project_id,
                 granted_scopes=granted_scopes,
                 decided_by=decided_by,
+                is_lead=is_lead,
                 expires_at=expires_at,
                 renew=renew,
             )
@@ -1032,8 +1100,13 @@ async def approve_request_record(
                         project_id=binding_project,
                         member_id=canonical_id,
                         member_kind="native",
-                        role="member",
+                        role="lead" if is_lead else "member",
                     )
+                    # The role is only a label; set_lead writes the
+                    # lead_member_id pointer the lead-gated checks read
+                    # (same split as add_agent_to_project, taOS #2113).
+                    if is_lead:
+                        await pstore.set_lead(binding_project, canonical_id)
                     if granted_canvas:
                         await pstore.set_member_canvas(
                             project_id=binding_project,
@@ -1129,14 +1202,29 @@ async def add_agent_to_project(
 
     # Check for existing deferred grants (project_id=None) with expires_at
     deferred_grants = await grants_store.list_grants(canonical_id)
-    deferred_grant_with_expiry = None
     now = datetime.now(timezone.utc).isoformat()
-    
-    for grant in deferred_grants:
-        if grant.get("project_id") is None and grant.get("expires_at"):
-            deferred_grant_with_expiry = grant
-            break
-    
+    now_dt = datetime.fromisoformat(now)
+
+    candidates = [
+        g for g in deferred_grants
+        if g.get("project_id") is None and g.get("expires_at")
+    ]
+    live = [g for g in candidates if datetime.fromisoformat(g["expires_at"]) > now_dt]
+    deferred_grant_with_expiry = None
+    if candidates and not live:
+        latest_expired = max(
+            candidates, key=lambda g: datetime.fromisoformat(g["expires_at"])
+        )["expires_at"]
+        raise HTTPException(
+            status_code=400,
+            detail=f"cannot bind agent {canonical_id} to project {project_id}: "
+                   f"the agent's deferred grant expired at {latest_expired}",
+        )
+    if live:
+        deferred_grant_with_expiry = min(
+            live, key=lambda g: datetime.fromisoformat(g["expires_at"])
+        )
+
     # Determine the expires_at to use:
     # 1. Use the deferred grant's expiry if it exists and is not expired
     # 2. Otherwise, use the expires_at parameter passed to this function
@@ -1146,14 +1234,7 @@ async def add_agent_to_project(
     if deferred_grant_with_expiry:
         deferred_expires_at = deferred_grant_with_expiry["expires_at"]
         deferred_dt = datetime.fromisoformat(deferred_expires_at)
-        now_dt = datetime.fromisoformat(now)
-        if deferred_dt <= now_dt:
-            raise HTTPException(
-                status_code=400,
-                detail=f"cannot bind agent {canonical_id} to project {project_id}: "
-                       f"the agent's deferred grant expired at {deferred_expires_at}",
-            )
-        elif renew:
+        if renew:
             pass
         elif target_expires_at is None:
             target_expires_at = deferred_expires_at
@@ -1568,6 +1649,29 @@ async def _do_approve(request: Request, request_id: str, body: ApproveBody, user
             status_code=400,
             detail="defer_binding cannot be combined with an explicit project_id",
         )
+    # is_lead makes the agent lead of the EXPLICIT project, so it needs one
+    # (never the agent-supplied fallback) and a grant that creates the
+    # membership row the lead pointer must reference.
+    if body.is_lead:
+        if body.defer_binding or not (body.project_id and body.project_id.strip()):
+            raise HTTPException(
+                status_code=400,
+                detail="is_lead requires an explicit project_id",
+            )
+        if not ("project_tasks" in body.granted_scopes or set(body.granted_scopes) & _CANVAS_SCOPES):
+            raise HTTPException(
+                status_code=400,
+                detail="is_lead requires granting project_tasks or a canvas scope",
+            )
+        # Validate the project BEFORE minting: the lead write runs inside the
+        # best-effort membership block, so a missing project would otherwise
+        # surface only as a log line after the request is already accepted.
+        pstore = getattr(request.app.state, "project_store", None)
+        if pstore is None or await pstore.get_project(body.project_id) is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"is_lead: project {body.project_id!r} not found",
+            )
 
     approval_result = await approve_request_record(
         request,
@@ -1578,7 +1682,15 @@ async def _do_approve(request: Request, request_id: str, body: ApproveBody, user
         project_id=body.project_id,
         defer_binding=body.defer_binding,
         renew=body.renew,
+        is_lead=body.is_lead,
     )
+    # Report whether the lead pointer actually landed rather than trusting the
+    # best-effort write, so the approver is told when it did not.
+    if body.is_lead:
+        project = await request.app.state.project_store.get_project(body.project_id)
+        approval_result["lead_assigned"] = bool(
+            project and project.get("lead_member_id") == approval_result.get("canonical_id")
+        )
 
     # Attach duration information to the approval result.
     approval_result.update({
@@ -1717,8 +1829,6 @@ async def _authorize_scope_request_creation(
     if is_admin or (uid and uid == record.get("user_id")):
         return
 
-    from tinyagentos.agent_token_auth import check_agent_identity
-
     try:
         agent_cid = await check_agent_identity(request)
     except HTTPException as exc:
@@ -1807,7 +1917,19 @@ async def create_scope_request(
         try:
             scopes = rec["requested_scopes"] or []
             handle = record.get("handle") or record.get("display_name") or canonical_id
-            where = f"project {rec['project_id']}" if rec.get("project_id") else "global scope"
+            # Look up the project by its id to use its human name in notifications
+            where = "global scope"
+            project_id = rec.get("project_id")
+            if project_id:
+                pstore = getattr(request.app.state, "project_store", None)
+                project = None
+                if pstore is not None:
+                    try:
+                        project = await pstore.get_project(project_id)
+                    except Exception:
+                        project = None
+                name = (project or {}).get("name")
+                where = f"project {name or project_id}"
             await notifs.add(
                 title="Scope request",
                 message=f"{handle} is requesting {', '.join(scopes)} on {where}",
@@ -1872,6 +1994,75 @@ _PUBLIC_SCOPE_REQUEST_FIELDS = (
 def _public_scope_request(rec: dict) -> dict:
     """Project a stored scope-request row onto its public response shape."""
     return {field: rec.get(field) for field in _PUBLIC_SCOPE_REQUEST_FIELDS}
+
+
+@router.get("/api/agents/scope-requests")
+async def list_all_scope_requests(
+    request: Request,
+    status: Optional[str] = None,
+    user: CurrentUser = Depends(current_user),
+):
+    """List scope requests across every agent the caller is allowed to inspect.
+
+    * Admin — sees requests for all agents.
+    * Owner — sees requests only for agents they own.
+    * Everyone else — 403.
+
+    ``?status`` accepts ``pending``, ``accepted``, ``refused``, ``approved``
+    (alias for accepted), ``denied`` (alias for refused), or ``all`` (default
+    when omitted).  The response is ordered oldest-first.
+
+    Each row carries an extra ``agent_display_name`` field taken from the
+    registry so the caller does not have to join the two sources itself.
+    """
+    registry = _get_registry_store(request)
+    store = _get_scope_requests_store(request)
+
+    if user.is_admin:
+        agents = await registry.list_all()
+    else:
+        agents = await registry.list_for_user(user.user_id)
+        if not agents:
+            raise HTTPException(status_code=403, detail="forbidden")
+
+    canonical_ids = [a["canonical_id"] for a in agents]
+    name_map = {a["canonical_id"]: a.get("display_name", "") for a in agents}
+
+    # Normalise the user-facing filter values onto the store vocabulary.
+    if status is not None:
+        status = status.lower()
+        if status == "all":
+            norm = None
+        elif status == "approved":
+            norm = "accepted"
+        elif status == "denied":
+            norm = "refused"
+        elif status in _SCOPE_REQUEST_STATUSES:
+            norm = status
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"unknown status {status!r}; valid: "
+                    f"pending, approved, denied, all"
+                ),
+            )
+    else:
+        norm = None
+
+    rows: list[dict] = []
+    for cid in canonical_ids:
+        rows.extend(await store.list_for(cid, norm))
+
+    rows.sort(key=lambda r: (r["created_ts"], r["id"]))
+
+    out = []
+    for r in rows:
+        public = _public_scope_request(r)
+        public["agent_display_name"] = name_map.get(r["canonical_id"], "")
+        out.append(public)
+
+    return {"requests": out}
 
 
 @router.get("/api/agents/registry/{canonical_id}/scope-requests")

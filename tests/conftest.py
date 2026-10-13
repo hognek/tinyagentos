@@ -4,12 +4,9 @@ import hmac
 import importlib.util
 import json as _json
 import os
-import psutil
 import socket
 import sqlite3
-import subprocess
 import sys
-import threading
 import time
 from unittest.mock import patch
 
@@ -18,74 +15,17 @@ import pytest_asyncio
 import yaml
 from httpx import ASGITransport, AsyncClient
 
-# ---------------------------------------------------------------------------
-# LiteLLM proxy leak guard.
-#
-# Some tests spawn a real LiteLLM subprocess via subprocess.Popen and never
-# call LLMProxy.stop(), leaving an orphan that outlives the test session.
-# This guard tracks every Popen whose command line contains "litellm" and
-# fails the session if any such process is still alive at session end.
-# ---------------------------------------------------------------------------
-
-_LITELLM_LEAK_PIDS: dict[int, str] = {}
-_LITELLM_LEAK_LOCK = threading.Lock()
-_LITELLM_LEAK_CURRENT_TEST = ""
-
-_ORIG_POPEN = subprocess.Popen
-
-
-def _is_litellm_cmd(cmd):
-    if not cmd:
-        return False
-    return any("litellm" in str(arg) for arg in cmd)
-
-
-def _tracking_popen(*args, **kwargs):
-    proc = _ORIG_POPEN(*args, **kwargs)
-    cmd = args[0] if args else kwargs.get("args", [])
-    if _is_litellm_cmd(cmd):
-        with _LITELLM_LEAK_LOCK:
-            _LITELLM_LEAK_PIDS[proc.pid] = _LITELLM_LEAK_CURRENT_TEST
-    return proc
-
-
-subprocess.Popen = _tracking_popen
-
-
-def pytest_runtest_logstart(nodeid, location):
-    global _LITELLM_LEAK_CURRENT_TEST
-    _LITELLM_LEAK_CURRENT_TEST = nodeid
-
-
-def pytest_sessionfinish(session, exitstatus):
-    my_pid = os.getpid()
-    leaked = []
-    try:
-        my_proc = psutil.Process(my_pid)
-        for child in my_proc.children(recursive=True):
-            try:
-                cmdline = child.cmdline()
-            except (psutil.NoSuchProcess, psutil.AccessDenied):
-                continue
-            if _is_litellm_cmd(cmdline):
-                started_by = _LITELLM_LEAK_PIDS.get(child.pid, "unknown test")
-                leaked.append((child.pid, started_by, cmdline))
-    except Exception:
-        pass
-
-    if leaked:
-        lines = [
-            "LITELLM PROCESS LEAK: the following litellm process(es) survived the session:"
-        ]
-        for pid, started_by, cmdline in leaked:
-            lines.append(
-                f"  pid {pid} started by {started_by}: {' '.join(cmdline)}"
-            )
-        raise RuntimeError("\n".join(lines))
-
-
-from tinyagentos.app import create_app
+from tinyagentos.app import create_app, PROJECT_DIR
 from tinyagentos.routes.desktop import SPA_DIR
+
+# Data-dir mutation guard: defined in tests/_data_guard_plugin.py (shared with
+# tests/test_xdist_data_mutation_guard.py) and re-bound here so pytest registers it.
+from _data_guard_plugin import (  # noqa: F401
+    _collect_data_mtimes,
+    _guard_data_dir_mutation,
+    pytest_sessionfinish,
+    pytest_testnodedown,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -799,6 +739,23 @@ async def client(app, tmp_data_dir):
         if user_shares._db is not None:
             await user_shares.close()
         await user_shares.init()
+    else:
+        from tinyagentos.user_shares_store import UserSharesStore
+        user_shares = UserSharesStore(tmp_data_dir / "user_shares.db")
+        await user_shares.init()
+        app.state.user_shares = user_shares
+    # sharing_grants store (account-to-account app sharing) is lifespan-owned;
+    # tests that bypass the lifespan must init it so routes can consult it.
+    sharing_grants = getattr(app.state, "sharing_grants", None)
+    if sharing_grants is not None:
+        if sharing_grants._db is not None:
+            await sharing_grants.close()
+        await sharing_grants.init()
+    else:
+        from tinyagentos.sharing_grants import SharingGrantStore
+        sharing_grants = SharingGrantStore(tmp_data_dir / "sharing_grants.db")
+        await sharing_grants.init()
+        app.state.sharing_grants = sharing_grants
     # BrowserApp v2 stores
     from tinyagentos.routes.desktop_browser.store import BrowserStore, BrowserCookieStore
     _browser_store = BrowserStore(tmp_data_dir / "browser.sqlite3")
@@ -879,6 +836,9 @@ async def client(app, tmp_data_dir):
     await app.state.council_members.close()
     if user_shares is not None:
         await user_shares.close()
+    sharing_grants = getattr(app.state, "sharing_grants", None)
+    if sharing_grants is not None:
+        await sharing_grants.close()
 
 
 def create_test_qmd_db(db_path):
