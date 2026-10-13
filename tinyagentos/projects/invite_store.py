@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS project_invites (
 MIGRATIONS: list = []
 
 # Valid values for the invite kind column.
-_VALID_KINDS = frozenset({"agent", "collab"})
+_VALID_KINDS = frozenset({"agent", "collab", "cloud_agent"})
 
 
 class InvitePinError(Exception):

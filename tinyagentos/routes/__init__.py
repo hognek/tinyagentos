@@ -66,6 +66,11 @@ def register_all_routers(app):
     from tinyagentos.routes.settings import router as settings_router
     app.include_router(settings_router, dependencies=_csrf)
 
+    # Settings -> Lock screen. NOT on the settings router: that one is admin-
+    # only, and every signed-in user owns their own unlock method.
+    from tinyagentos.routes.lock_settings import router as lock_settings_router
+    app.include_router(lock_settings_router, dependencies=_csrf)
+
     from tinyagentos.routes.share import router as share_router
     app.include_router(share_router, dependencies=_csrf)
 
@@ -74,6 +79,9 @@ def register_all_routers(app):
 
     from tinyagentos.routes import projects as projects_routes
     app.include_router(projects_routes.router, dependencies=_csrf)
+
+    from tinyagentos.routes.dispatcher import router as dispatcher_router
+    app.include_router(dispatcher_router, dependencies=_csrf)
 
     from tinyagentos.routes.community import router as community_router
     app.include_router(community_router, dependencies=_csrf)
@@ -95,6 +103,21 @@ def register_all_routers(app):
     # pair_request_id is the capability); CSRF is a cookie-auth defence.
     from tinyagentos.routes.device_pair_requests import router as device_pair_requests_router
     app.include_router(device_pair_requests_router)
+
+    # Device voice (S6/S6b): device-bearer only, so CSRF-exempt like the pair
+    # routes (the bearer is not an ambient cookie credential).
+    from tinyagentos.routes.device_voice import router as device_voice_router
+    app.include_router(device_voice_router)
+
+    # Device state (S2b): device-bearer only, so CSRF-exempt like the pair
+    # routes (the bearer is not an ambient cookie credential).
+    from tinyagentos.routes.device_state import router as device_state_router
+    app.include_router(device_state_router)
+
+    # Device avatar (S2b/S3): device-bearer only, so CSRF-exempt like the pair
+    # routes (the bearer is not an ambient cookie credential).
+    from tinyagentos.routes.device_avatar import router as device_avatar_router
+    app.include_router(device_avatar_router)
 
     from tinyagentos.routes.observatory import router as observatory_router
     app.include_router(observatory_router, dependencies=_csrf)
@@ -170,6 +193,9 @@ def register_all_routers(app):
 
     from tinyagentos.routes.cluster_capability import router as cluster_capability_router
     app.include_router(cluster_capability_router, dependencies=_csrf)
+
+    from tinyagentos.routes.cluster_map import router as cluster_map_router
+    app.include_router(cluster_map_router, dependencies=_csrf)
 
     from tinyagentos.routes.cluster_ble import router as cluster_ble_router
     app.include_router(cluster_ble_router, dependencies=_csrf)
@@ -262,6 +288,11 @@ def register_all_routers(app):
     from tinyagentos.routes.activity import router as activity_router
     app.include_router(activity_router, dependencies=_csrf)
 
+    # Model Activity feed (#208): ring-buffer snapshot + SSE stream. Owned by
+    # routes/model_activity.py; the buffer itself is app.state.model_activity.
+    from tinyagentos.routes.model_activity import router as model_activity_router
+    app.include_router(model_activity_router, dependencies=_csrf)
+
     from tinyagentos.routes.frameworks import router as frameworks_router
     app.include_router(frameworks_router, dependencies=_csrf)
 
@@ -319,6 +350,9 @@ def register_all_routers(app):
     from tinyagentos.routes.disk_quota import router as disk_quota_router
     app.include_router(disk_quota_router, dependencies=_csrf)
 
+    from tinyagentos.routes.cast_discovery import router as cast_discovery_router
+    app.include_router(cast_discovery_router, dependencies=_csrf)
+
     from tinyagentos.routes.recycle import router as recycle_router
     app.include_router(recycle_router, dependencies=_csrf)
 
@@ -355,6 +389,8 @@ def register_all_routers(app):
 
     from tinyagentos.routes.taos_agent import router as taos_agent_router
     app.include_router(taos_agent_router, dependencies=_csrf)
+    from tinyagentos.routes.taos_agent_actions import router as taos_agent_actions_router
+    app.include_router(taos_agent_actions_router, dependencies=_csrf)
 
     from tinyagentos.routes.taosmd import router as taosmd_router
     app.include_router(taosmd_router, dependencies=_csrf)
@@ -413,6 +449,10 @@ def register_all_routers(app):
     app.include_router(designs_router, dependencies=_csrf)
     from tinyagentos.routes.coding import router as coding_router
     app.include_router(coding_router, dependencies=_csrf)
+
+    from tinyagentos.routes.sharing import router as sharing_router
+    app.include_router(sharing_router, dependencies=_csrf)
+
     from tinyagentos.routes.store_submissions import router as store_submissions_router
     app.include_router(store_submissions_router, dependencies=_csrf)
     from tinyagentos.routes.install_registry import router as install_registry_router
@@ -430,12 +470,13 @@ def register_all_routers(app):
     from tinyagentos.routes.agent_model_api import router as agent_model_api_router
     app.include_router(agent_model_api_router, dependencies=_csrf)
 
-    # In-process LLM gateway (/api/llm/v1), the LiteLLM replacement. Off by
-    # default: not mounted at all unless TAOS_LLM_GATEWAY=1, so off is a 404.
+    # In-process LLM gateway (/api/llm/v1), the LiteLLM replacement. Always
+    # mounted: since LiteLLM removal 2b-2a it is the only LLM path, and
+    # TAOS_LLM_GATEWAY=0 is a logged no-op (see llm_gateway.enabled).
     from tinyagentos import llm_gateway
-    if llm_gateway.enabled():
-        from tinyagentos.llm_gateway.router import mount as mount_llm_gateway
-        mount_llm_gateway(app, dependencies=_csrf)
+    llm_gateway.enabled()  # logs once if the old off switch is still set
+    from tinyagentos.llm_gateway.router import mount as mount_llm_gateway
+    mount_llm_gateway(app, dependencies=_csrf)
 
     from tinyagentos.routes.agent_model_keys import router as agent_model_keys_router
     app.include_router(agent_model_keys_router, dependencies=_csrf)

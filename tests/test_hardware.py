@@ -53,6 +53,62 @@ class TestDetectHardware:
         profile = detect_hardware()
         assert profile.gpu.type in ("nvidia", "amd", "mali", "intel", "none")
 
+    def test_gpu_panthor_driver_no_mali0(self, monkeypatch):
+        # Test that panthor driver is detected in path 2 even without /sys/class/misc/mali0
+        # Simulates the mainline panthor GPU driver scenario
+        # Mirror the _stub_environment mocking style from TestDetectNpuRknpuModernPaths
+
+        # Stub Path.exists: mali0 absent, /sys/class/drm present, card1/device/driver
+        # present; all else falls through to real Path.exists
+        real_path_exists = Path.exists
+        def fake_path_exists(self):
+            s = str(self)
+            if s == "/sys/class/misc/mali0":
+                return False  # mali0 absent (panthor scenario)
+            if s == "/sys/class/drm":
+                return True  # drm directory exists (panthor scenario)
+            if "card1/device/driver" in s:
+                return True  # test card driver exists (panthor scenario)
+            return real_path_exists(self)
+        monkeypatch.setattr(Path, "exists", fake_path_exists)
+
+        # Single _path_exists_safe that blocks NVIDIA probe
+        real_safe = hardware_mod._path_exists_safe
+        def fake_path_exists_safe(p):
+            s = str(p)
+            if "/proc/driver/nvidia/gpus" in s or s == "/proc/driver/nvidia":
+                return False  # block NVIDIA probe
+            return real_safe(p)
+        monkeypatch.setattr(hardware_mod, "_path_exists_safe", fake_path_exists_safe)
+
+        real_glob = Path.glob
+        def fake_glob(self, pattern):
+            if str(self) == "/sys/class/drm" and pattern == "card*/device/driver":
+                return [Path("/sys/class/drm/card1/device/driver")]
+            return real_glob(self, pattern)
+        monkeypatch.setattr(Path, "glob", fake_glob)
+
+        real_resolve = Path.resolve
+        driver_targets = {
+            "/sys/class/drm/card1/device/driver": "panthor",
+        }
+        def fake_resolve(self, *args, **kwargs):
+            key = str(self)
+            if key in driver_targets:
+                # Return path whose .name is the driver name
+                return Path(f"/sys/bus/platform/drivers/{driver_targets[key]}")
+            return real_resolve(self, *args, **kwargs)
+        monkeypatch.setattr(Path, "resolve", fake_resolve)
+
+        # Mock _run to prevent lspci NVIDIA/AMD detection
+        real_run = hardware_mod._run
+        def fake_run(*a, **k):
+            return ""
+        monkeypatch.setattr(hardware_mod, "_run", fake_run)
+
+        profile = detect_hardware()
+        assert profile.gpu.type == "mali"
+
     def test_save_and_load(self, tmp_path):
         profile = detect_hardware()
         path = tmp_path / "hardware.json"

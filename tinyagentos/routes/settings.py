@@ -19,12 +19,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from tinyagentos.config import AppConfig, save_config_locked, validate_config
+from tinyagentos.hardware import _detect_device_class
 from tinyagentos.auto_update import resolve_tracked_branch, is_valid_branch_name, PREF_NAMESPACE
 from tinyagentos.data_snapshot import snapshot_data_dir
 from tinyagentos.middleware.upload_body_limit import register_upload_cap
-from tinyagentos.safe_archive import ArchiveError, extract_tar_safely
+from tinyagentos.safe_archive import ArchiveError, extract_tar_safely, open_tar_gz
 from tinyagentos.update_runner import switch_to_branch
 from tinyagentos.restart_orchestrator import write_pending_restart
+from tinyagentos.launchd_migration import apply_launchd_migration
 
 logger = logging.getLogger(__name__)
 
@@ -259,12 +261,26 @@ async def save_platform_settings(request: Request, body: PlatformUpdate):
 
 @router.get("/api/settings/llm-proxy")
 async def llm_proxy_status(request: Request):
-    """Return LLM proxy status for the settings page."""
-    proxy = request.app.state.llm_proxy
+    """Return LLM proxy status for the settings page.
+
+    The proxy agents use IS the in-process gateway (the only LLM path since
+    LiteLLM removal 2b-2a): ``port`` is its agent listener (what each
+    container's ``127.0.0.1:4000`` forwards to) and ``running`` says this
+    start verified the listener as its own. There is no LiteLLM to report.
+    """
+    from tinyagentos import llm_gateway
+    from tinyagentos.llm_gateway.cutover import llm_gateway_live_port
+
+    state = request.app.state
+    port = getattr(state, "llm_gateway_agent_port", None)
+    if port is None:
+        port = llm_gateway.agent_port(state.config)
     return {
-        "running": proxy.is_running() if hasattr(proxy, "is_running") else False,
-        "port": proxy.port if hasattr(proxy, "port") else 7834,
-        "backends": len(request.app.state.config.backends),
+        "mode": "gateway",
+        "running": bool(llm_gateway_live_port(state)),
+        "port": port,
+        "url": "/api/llm/v1",
+        "backends": len(state.config.backends),
     }
 
 
@@ -327,7 +343,7 @@ async def restore_backup(request: Request, file: UploadFile):
         return JSONResponse({"error": "backup file too large (64 MB max)"}, status_code=413)
     buf = io.BytesIO(content)
     try:
-        with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+        with open_tar_gz(buf, kind="backup") as tar:
             # Stage inside data_dir (same filesystem, so the moves are renames).
             # extract_tar_safely applies the shared bomb caps before anything is
             # written and PEP 706's "data" filter while it writes, so the
@@ -579,12 +595,28 @@ async def check_for_updates(request: Request):
     import re
     from tinyagentos import __version__
     from tinyagentos.auto_update import changes_are_docs_only, remote_is_strictly_ahead, branch_is_diverged
+    from tinyagentos.update_preflight import check_preflight
     project_dir = str(Path(__file__).parent.parent.parent)
 
-    # Track the user's selected branch (Updates → Advanced selector), or the
-    # checked-out branch when unset — never a hard-coded master, otherwise a
+    # Track the user's selected branch (Updates -> Advanced selector), or the
+    # checked-out branch when unset -- never a hard-coded master, otherwise a
     # dev box is told a stale master commit is "available" and Install fails.
     branch = await resolve_tracked_branch(request.app.state.desktop_settings, Path(project_dir))
+
+    # Pre-flight validation to prevent confusing errors or partial updates
+    preflight_issues = await asyncio.to_thread(check_preflight, project_dir, branch)
+    if preflight_issues:
+        return {
+            "has_updates": False,
+            "diverged": False,
+            "diverged_message": None,
+            "current_version": __version__,
+            "new_version": None,
+            "current_commit": None,
+            "new_commit": None,
+            "preflight_errors": preflight_issues,
+            "fetch_error": None,
+        }
 
     # Fetch remote refs so origin/<branch> is current, then compare SHAs.
     # Parsing dry-run output is unreliable on shallow clones / no tracking branch.
@@ -595,7 +627,20 @@ async def check_for_updates(request: Request):
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         cwd=project_dir,
     )
-    await fetch_proc.communicate()
+    fetch_out, _ = await fetch_proc.communicate()
+    if fetch_proc.returncode != 0:
+        # Surface fetch failure as an error field, never as 'unknown'
+        return {
+            "has_updates": False,
+            "diverged": False,
+            "diverged_message": None,
+            "current_version": __version__,
+            "new_version": None,
+            "current_commit": None,
+            "new_commit": None,
+            "preflight_errors": [],
+            "fetch_error": (fetch_out.decode(errors="replace") if fetch_out else "unknown error").strip()[:300],
+        }
 
     async def _rev_parse(ref: str) -> str:
         p = await asyncio.create_subprocess_exec(
@@ -761,12 +806,44 @@ def _find_uv(project_dir: Path) -> str | None:
     return None
 
 
+
+
 # Optional-dependency extras the updater must install so a `uv sync --frozen`
 # does not prune them out of the venv. Single source of truth for the Python
 # side; `scripts/install-server.sh` installs the same set via
-# `pip install -e ".[proxy]"`, and `test_updater_dep_install.py` asserts the two
-# stay in parity so they cannot silently drift (the bug that stripped litellm).
-UPDATE_EXTRAS: tuple[str, ...] = ("proxy",)
+# `$(taos_controller_extras)`, and `test_updater_dep_install.py` asserts the two
+# stay in parity so they cannot silently drift. There are none by default (the
+# LiteLLM `proxy` extra is gone); a handset (detected via
+# hardware._detect_device_class() or TAOS_EXTRAS_BLE=1) adds the "ble" extra so
+# Orb scan/pair routes work. TAOS_EXTRAS_BLE=0 excludes ble (rare).
+
+def _compute_update_extras() -> tuple[str, ...]:
+    """Compute UPDATE_EXTRAS based on device class and TAOS_EXTRAS_BLE env var.
+
+    Mirrors install-server.sh's logic: ble is added only on a taOSmobile handset
+    (hardware._detect_device_class() == "mobile") unless TAOS_EXTRAS_BLE=1 (force include)
+    or TAOS_EXTRAS_BLE=0 (force exclude). This ensures the scan/pair routes work on
+    a stock install while allowing operators with BLE dongles on non-handset hosts
+    to opt in.
+    """
+    import os
+
+    # Detect handset using the same signal as the controller
+    device_class = _detect_device_class()
+    is_handset = device_class == "mobile"
+
+    # Override via environment variable
+    taos_extras_ble = os.getenv("TAOS_EXTRAS_BLE")
+    if taos_extras_ble is not None:
+        if taos_extras_ble in ("1", "true"):
+            # Force include ble
+            return ("ble",)
+        elif taos_extras_ble in ("0", "false"):
+            # Force exclude ble
+            return ()
+
+    # Default: include ble on handsets only
+    return ("ble",) if is_handset else ()
 
 
 async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
@@ -777,11 +854,12 @@ async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
     deps onto a user's box. When uv is not present we fall back to the legacy
     ``pip install -e .`` so installs without uv still update.
 
-    Both paths carry the ``proxy`` extra (litellm + prisma) to match
-    ``install-server.sh``'s ``pip install -e ".[proxy]"``. The LLM proxy is a
-    core dependency, not optional: a bare ``uv sync --frozen`` prunes the venv
-    to the locked default set and silently uninstalls litellm, disabling the
-    proxy on every update and breaking basic agent functionality.
+    On a taOSmobile handset (detected via hardware._detect_device_class()) both
+    paths carry the ``ble`` extra so Orb scan/pair routes work; otherwise no
+    extra (the LiteLLM ``proxy`` extra is gone). Use TAOS_EXTRAS_BLE=1 to force
+    include ble on a non-handset, or TAOS_EXTRAS_BLE=0 to exclude it even on a
+    handset. A bare ``uv sync --frozen`` prunes the venv to the locked default
+    set plus the named extras, so an extra left out here is uninstalled.
 
     Capture output and surface failures -- silently swallowing a failed install
     lands users on a grey-screen the next time they restart, because the new
@@ -796,7 +874,7 @@ async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
         # HOME=project_dir so uv resolves its data/cache dir correctly under the
         # service user whose HOME is the install dir (the Pi layout).
         env = {**os.environ, "HOME": str(project_dir)}
-        extra_args = [arg for extra in UPDATE_EXTRAS for arg in ("--extra", extra)]
+        extra_args = [arg for extra in _compute_update_extras() for arg in ("--extra", extra)]
         cmd = [uv_cmd, "sync", "--frozen", *extra_args]
         logger.info("Updater dependency install: %s", " ".join(cmd))
         return await _run_capture(cmd, cwd=str(project_dir), env=env)
@@ -806,7 +884,9 @@ async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
         if candidate.exists():
             pip_cmd = str(candidate)
             break
-    pip_target = f".[{','.join(UPDATE_EXTRAS)}]"
+    extras = _compute_update_extras()
+    # ``.[]`` is not a valid pip target: brackets only when there is an extra.
+    pip_target = f".[{','.join(extras)}]" if extras else "."
     logger.info("Updater dependency install: uv not found, using %s install -e %s", pip_cmd, pip_target)
     return await _run_capture(
         [pip_cmd, "install", "-e", pip_target],
@@ -814,14 +894,15 @@ async def _install_dependencies(project_dir: Path) -> tuple[int, str]:
     )
 
 
-async def _pip_rebuild_restart(project_dir: Path, target_sha: str) -> tuple[int, str]:
+async def _pip_rebuild_restart(project_dir: Path, target_sha: str) -> tuple[int, str, str | None]:
     """Sync deps, rebuild the SPA, flag the pending restart, trigger restart.
 
-    Returns (returncode, output); non-zero means a step failed.
+    Returns (returncode, output, warning_message); non-zero means a step failed.
+    warning_message combines rebuild and launchd warnings, or None if none.
     """
     install_returncode, install_output = await _install_dependencies(project_dir)
     if install_returncode != 0:
-        return install_returncode, install_output
+        return install_returncode, install_output, None
 
     # Venv python for the import smoke test below (.venv/bin/python).
     venv_python: Path | None = None
@@ -865,7 +946,7 @@ async def _pip_rebuild_restart(project_dir: Path, target_sha: str) -> tuple[int,
             timeout=60.0,  # imports should be fast; 60s is generous
         )
         if smoke_returncode != 0:
-            return smoke_returncode, smoke_output
+            return smoke_returncode, smoke_output, None
 
     # Force a desktop bundle rebuild on every applied update. The mtime-based
     # staleness check in rebuild_desktop_bundle_if_stale is unreliable when
@@ -885,10 +966,37 @@ async def _pip_rebuild_restart(project_dir: Path, target_sha: str) -> tuple[int,
             "Update pulled but desktop rebuild failed: %s", rebuild_result.message
         )
 
+    # Combine rebuild and launchd warnings for user feedback
+    rebuild_warning = None
+    if not rebuild_result.success:
+        rebuild_warning = f"Frontend rebuild failed, so the old interface is still loaded: {rebuild_result.message}. Use Settings > Rebuild frontend after fixing it."
     if target_sha:
         write_pending_restart(target_sha)
 
-    return 0, ""
+    # macOS: migrate old bare-uvicorn launchd plist to `python -m tinyagentos`
+    # so the LLM gateway agent listener starts and local agent deploys work.
+    # This runs after deps are synced but before the restart is flagged.
+    # Failure is non-fatal: we log a warning and surface it in the update result.
+    launchd_warning = None
+    try:
+        _, launchd_warning = await apply_launchd_migration(str(project_dir))
+    except Exception as e:
+        launchd_warning = f"Launchd migration failed: {e}"
+
+    if launchd_warning:
+        logger.warning("Launchd migration: %s", launchd_warning)
+
+    # Combine rebuild and launchd warnings for user feedback
+    warning_message = None
+    if launchd_warning and rebuild_warning:
+        warning_message = f"{launchd_warning} {rebuild_warning}"
+    elif launchd_warning:
+        warning_message = launchd_warning
+    elif rebuild_warning:
+        warning_message = rebuild_warning
+    # else warning_message remains None
+
+    return 0, "", warning_message
 
 
 async def _stash_local_source_changes(project_dir) -> bool:
@@ -1047,6 +1155,27 @@ async def apply_update(request: Request):
     import asyncio
     project_dir = Path(__file__).parent.parent.parent
 
+    # Track the user's selected branch (Updates -> Advanced selector), or the
+    # checked-out branch when unset -- never a hard-coded master, otherwise a
+    # dev box is told a stale master commit is "available" and Install fails.
+    branch = await resolve_tracked_branch(request.app.state.desktop_settings, project_dir)
+
+    # Pre-flight validation to prevent confusing errors or partial updates
+    from tinyagentos.update_preflight import check_preflight
+
+    preflight_issues = await asyncio.to_thread(check_preflight, project_dir, branch)
+    if preflight_issues:
+        # REFUSE: check_for_updates returns 200 with preflight_errors: [...] and has_updates false;
+        # apply_update returns 409 with the messages and does NOT touch the tree
+        return JSONResponse(
+            {
+                "error": "Update blocked by preflight validation",
+                "preflight_errors": preflight_issues,
+                "message": "The update cannot proceed due to preflight validation errors. See preflight_errors for details.",
+            },
+            status_code=409,
+        )
+
     # The desktop rebuild leaves the tree dirty in three ways, and a dirty
     # tracked file makes the next git pull --ff-only refuse to overwrite the
     # local and the Install Update button 500s:
@@ -1075,11 +1204,6 @@ async def apply_update(request: Request):
     # the update applies; the change is recoverable via `git stash pop`.
     stashed_local = await _stash_local_source_changes(project_dir)
 
-    # Git pull — pull the branch this install tracks (master on stable, dev on
-    # a dev/test box). Pulling a hard-coded master onto a dev box fails ff-only
-    # (dev is ahead of master) and the update silently never applies.
-    branch = await resolve_tracked_branch(request.app.state.desktop_settings, project_dir)
-
     # Fetch first so we can verify GPG signature before merging.
     fetch_proc = await asyncio.create_subprocess_exec(
         "git", "fetch", "--quiet", "origin", "--", branch,
@@ -1089,7 +1213,7 @@ async def apply_update(request: Request):
     fetch_out, _ = await fetch_proc.communicate()
     if fetch_proc.returncode != 0:
         return JSONResponse(
-            {"error": f"Fetch failed: {(fetch_out.decode() if fetch_out else 'unknown error').strip()[:300]}"},
+            {"error": f"Fetch failed: {(fetch_out.decode(errors='replace') if fetch_out else 'unknown error').strip()[:300]}"},
             status_code=500,
         )
 
@@ -1156,7 +1280,7 @@ async def apply_update(request: Request):
     sha_out, _ = await sha_proc.communicate()
     new_sha = sha_out.decode().strip() if sha_out else ""
 
-    rc, out = await _pip_rebuild_restart(project_dir, new_sha)
+    rc, out, launchd_warning = await _pip_rebuild_restart(project_dir, new_sha)
     if rc != 0:
         return JSONResponse(
             {
@@ -1220,6 +1344,7 @@ async def apply_update(request: Request):
                 if taosmd_report.get("updated")
                 else ""
             )
+            + (f"{launchd_warning} " if launchd_warning else "")
             + "Restarting now…"
         ),
     }
@@ -1321,7 +1446,7 @@ async def set_update_channel(request: Request, body: UpdateChannel):
     prefs["tracked_branch"] = branch
     await store.save_preference("user", PREF_NAMESPACE, prefs)
 
-    rc, out = await _pip_rebuild_restart(project_dir, result.new_sha)
+    rc, out, launchd_warning = await _pip_rebuild_restart(project_dir, result.new_sha)
     if rc != 0:
         return JSONResponse(
             {"error": f"Switched to {branch} but rebuild failed: {out[:300]}",
@@ -1341,7 +1466,7 @@ async def set_update_channel(request: Request, body: UpdateChannel):
         "branch": branch,
         "snapshot": str(snapshot_path) if snapshot_path else None,
         "recovery_tag": result.recovery_tag,
-        "message": result.message,
+        "message": result.message + (f" {launchd_warning}" if launchd_warning else ""),
     }
 
 
@@ -1396,6 +1521,36 @@ async def _probe_taosmd(request: Request, url: str) -> tuple[bool, str | None]:
 
 class MemoryUrlUpdate(BaseModel):
     url: str
+
+
+@router.get("/api/settings/demo-mode")
+async def get_demo_mode(request: Request):
+    """Whether the lock screen's scripted demo content is SHOWN.
+
+    ``available`` says whether any ``TAOS_LOCK_DEMO_*`` flag defines demo
+    content on this device at all; with none, the switch has nothing to show.
+    """
+    from tinyagentos.demo_mode import demo_flags_configured, read_demo_mode
+
+    return {
+        "enabled": read_demo_mode(request.app.state.data_dir),
+        "available": demo_flags_configured(),
+    }
+
+
+@router.put("/api/settings/demo-mode")
+async def put_demo_mode(request: Request):
+    """Flip the demo switch. Admin-only via this router's dependency."""
+    from tinyagentos.demo_mode import demo_flags_configured, write_demo_mode
+
+    try:
+        body = await request.json()
+    except ValueError:
+        return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+    if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+        return JSONResponse({"error": "'enabled' must be true or false"}, status_code=400)
+    write_demo_mode(request.app.state.data_dir, body["enabled"])
+    return {"ok": True, "enabled": body["enabled"], "available": demo_flags_configured()}
 
 
 @router.get("/api/settings/memory-url")

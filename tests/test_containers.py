@@ -1,5 +1,6 @@
 import json
 import pytest
+import tinyagentos.containers
 from unittest.mock import AsyncMock, patch, call
 from tinyagentos.containers import (
     list_containers, create_container, set_root_quota, set_env,
@@ -71,6 +72,44 @@ class TestListContainers:
             assert containers[0].ip == "10.0.0.5"
             # "2GB" is SI: 2e9 bytes = 1907 MiB.
             assert containers[0].memory_mb == 1907
+
+    @pytest.mark.asyncio
+    async def test_stopped_container_with_null_network_is_listed(self):
+        # Real `incus list -f json` shape for a STOPPED instance (captured on an
+        # Orange Pi, Incus 6.x, 2026-09-29): "state" is an object but its
+        # "network" is null, not {}. The listing must not crash on it; one
+        # stopped agent used to 500 GET /api/agents/containers for every agent.
+        mock_output = json.dumps([
+            {
+                "name": "taos-agent-mary",
+                "status": "Running",
+                "config": {},
+                "state": {"network": {"eth0": {"addresses": [
+                    {"family": "inet", "address": "10.0.0.91", "scope": "global"},
+                ]}}},
+            },
+            {
+                "name": "taos-agent-speedtest",
+                "status": "Stopped",
+                "config": {},
+                "state": {"network": None},
+            },
+            {
+                "name": "taos-agent-nostate",
+                "status": "Stopped",
+                "config": {},
+                "state": None,
+            },
+        ])
+        with patch("tinyagentos.containers._run", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (0, mock_output)
+            containers = await list_containers()
+        by_name = {c.name: c for c in containers}
+        assert set(by_name) == {"taos-agent-mary", "taos-agent-speedtest", "taos-agent-nostate"}
+        assert by_name["taos-agent-mary"].ip == "10.0.0.91"
+        assert by_name["taos-agent-speedtest"].status == "Stopped"
+        assert by_name["taos-agent-speedtest"].ip is None
+        assert by_name["taos-agent-nostate"].ip is None
 
     @pytest.mark.asyncio
     async def test_handles_incus_failure(self):
@@ -465,3 +504,65 @@ class TestAddProxyDeviceSelfHeal:
         assert res["success"] is False
         # only the single add attempt, no project-set self-heal
         assert mr.call_count == 1
+
+
+class TestLXCBackendListNullNetwork:
+    @pytest.mark.asyncio
+    async def test_stopped_container_with_null_network_is_listed(self):
+        # Same real stopped-instance shape as TestListContainers: the LXC
+        # backend's own listing had the identical dict.get-default bug.
+        from tinyagentos.containers.lxc import LXCBackend
+        mock_output = json.dumps([
+            {"name": "taos-agent-speedtest", "status": "Stopped", "config": {},
+             "state": {"network": None}},
+            {"name": "taos-agent-nostate", "status": "Stopped", "config": {}, "state": None},
+        ])
+        with patch("tinyagentos.containers.lxc._run", new_callable=AsyncMock) as mock_run:
+            mock_run.return_value = (0, mock_output)
+            containers = await LXCBackend().list_containers()
+        assert {c.name for c in containers} == {"taos-agent-speedtest", "taos-agent-nostate"}
+        assert all(c.ip is None for c in containers)
+
+
+class TestGetContainerIpUsesProject:
+    @pytest.mark.asyncio
+    async def test_lookup_uses_agent_project_not_default(self, tmp_path, monkeypatch):
+        """The IP lookup must query the container's own project (user-999),
+        not the ambient default project."""
+        run_calls = []
+
+        async def fake_run(cmd, timeout=120):
+            run_calls.append(cmd)
+            # get_container_state uses --all-projects
+            if "--all-projects" in cmd:
+                return (0, json.dumps([{
+                    "name": "taos-agent-naira",
+                    "project": "user-999",
+                    "status": "Running",
+                }]))
+            # get_container_ip must use --project user-999
+            if "--project" in cmd:
+                project = cmd[cmd.index("--project") + 1]
+                if project == "user-999":
+                    return (0, json.dumps([{
+                        "name": "taos-agent-naira",
+                        "status": "Running",
+                        "state": {
+                            "network": {
+                                "eth0": {
+                                    "addresses": [
+                                        {"family": "inet", "address": "10.42.246.174", "scope": "global"}
+                                    ]
+                                }
+                            }
+                        }
+                    }]))
+            return (1, "not found")
+
+        monkeypatch.setattr("tinyagentos.containers._run", fake_run)
+
+        ip = await tinyagentos.containers.get_container_ip("taos-agent-naira")
+
+        assert ip == "10.42.246.174"
+        project_cmds = [cmd for cmd in run_calls if "--project" in cmd]
+        assert any("user-999" in str(cmd) for cmd in project_cmds)

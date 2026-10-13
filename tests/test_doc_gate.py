@@ -108,6 +108,26 @@ class TestEvaluateRules:
         assert len(failures) == 1
         assert failures[0].startswith("routes -- ")
 
+    def test_new_file_inside_existing_app_dir_does_not_fire_apps_rule(self):
+        """A new file inside an already-tracked desktop app directory must not
+        trip the apps-added rule -- only a brand-new top-level app directory
+        counts."""
+        changed = [("A", "desktop/src/apps/Foo/components/Bar.tsx")]
+        failures = dg.evaluate_rules(
+            changed, [], APPS_RULE_CONFIG, existing_toplevel_dirs={"Foo"},
+        )
+        assert failures == []
+
+    def test_brand_new_app_directory_does_fire_apps_rule(self):
+        """A new app directory (not in the existing set) must fire the
+        apps-added rule."""
+        changed = [("A", "desktop/src/apps/NewApp/NewApp.tsx")]
+        failures = dg.evaluate_rules(
+            changed, [], APPS_RULE_CONFIG, existing_toplevel_dirs=set(),
+        )
+        assert len(failures) == 1
+        assert failures[0].startswith("apps -- ")
+
 
 class TestGlobMatch:
     def test_single_star_stays_within_segment(self):
@@ -867,6 +887,21 @@ class TestDeletedRequireDocDoesNotSatisfy:
         assert "routes" in names
 
 
+def _make_gateable_trees(repo: Path, *extra: str) -> None:
+    """Give a fixture repo the trees the gate's own config (or its token regex)
+    points at.
+
+    Layer A0 (tsk-s73zth) resolves every name the config carries against the
+    repo being measured and refuses to evaluate any rule when one of them is
+    gone, so a fixture that runs the real gate over a real diff must contain
+    the trees its config names -- the four token-regex prefixes, plus any extra
+    tree one of its globs hangs off. Without them the fixture would go green
+    (or red) for a config error instead of for the behaviour under test.
+    """
+    for tree in ("scripts", "tinyagentos", "docs", "desktop", *extra):
+        (repo / tree).mkdir(parents=True, exist_ok=True)
+
+
 class TestGitHooksTrailerEnforcement:
     """End-to-end tests for the pre-commit / commit-msg hook split.
 
@@ -890,9 +925,9 @@ class TestGitHooksTrailerEnforcement:
     def _setup_repo(self, tmp_path: Path) -> Path:
         repo = tmp_path / "repo"
         repo.mkdir()
+        _make_gateable_trees(repo)
 
         scripts_dir = repo / "scripts"
-        scripts_dir.mkdir()
         (scripts_dir / "check_doc_gate.py").write_text(
             (REPO_ROOT / "scripts" / "check_doc_gate.py").read_text()
         )
@@ -901,7 +936,6 @@ class TestGitHooksTrailerEnforcement:
         )
 
         docs_dir = repo / "docs"
-        docs_dir.mkdir()
         (docs_dir / "doc-gate.toml").write_text(
             '[gate]\ntrailer = "Docs-Reviewed:"\n\n[[rules]]\n'
             'name = "test-rule"\non_modify = true\n'
@@ -1168,6 +1202,8 @@ class TestEndToEndPinOnlyWorkflowBump:
     def _setup_repo(self, tmp_path: Path) -> tuple[Path, Path]:
         repo = tmp_path / "repo"
         repo.mkdir()
+        # The contributor-skill rule requires a doc under this skill dir.
+        _make_gateable_trees(repo, ".claude/skills/taos-development-skill")
         wf_dir = repo / ".github" / "workflows"
         wf_dir.mkdir(parents=True)
         (wf_dir / "ci.yml").write_text(
@@ -1175,7 +1211,6 @@ class TestEndToEndPinOnlyWorkflowBump:
             "    steps:\n      - uses: actions/checkout@v4\n"
         )
         docs_dir = repo / "docs"
-        docs_dir.mkdir()
         config_path = docs_dir / "doc-gate.toml"
         config_path.write_text(self.CONTRIBUTOR_CONFIG)
         subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
@@ -1306,12 +1341,21 @@ class TestTrailerScopedToItsCommit:
     def _setup(self, tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
         repo = tmp_path / "repo"
         repo.mkdir()
+        # require_doc names the changelog and the coordination doc; the trigger
+        # and require_doc globs hang off changelog.d/, tinyagentos/routes/,
+        # desktop/src/ and .github/workflows/.
+        _make_gateable_trees(
+            repo, "changelog.d", "tinyagentos/routes", "desktop/src",
+            ".github/workflows",
+        )
+        (repo / "CHANGELOG.md").write_text("# Changelog\n")
+        (repo / "docs" / "agent-coordination.md").write_text("# Coordination\n")
         _git(repo, "init", "-q", "-b", "main")
         _git(repo, "config", "user.email", "dev@example.com")
         _git(repo, "config", "user.name", "dev")
         _git(repo, "config", "commit.gpgsign", "false")
         cfg = repo / "docs" / "doc-gate.toml"
-        cfg.parent.mkdir()
+        cfg.parent.mkdir(exist_ok=True)
         cfg.write_text(SCOPED_TRAILER_CONFIG_TOML)
         _commit_files(repo, "initial", {
             "tinyagentos/routes/foo.py": "# foo\n",
@@ -1620,3 +1664,68 @@ class TestCommitAttributionParsing:
         commits = self._parse(monkeypatch)
         monkeypatch.setattr(dg, "_run_git", lambda args, ref=None: self.LOG_OUTPUT)
         assert dg._git_commits_with_messages("base") == [c[:3] for c in commits]
+
+
+class TestNewAppDirOnlyTriggersAppsRule:
+    """A new file inside an existing app must not trip the apps rule.
+
+    Regression: tsk-h6flaz -- adding desktop/src/apps/ProjectsApp/canvas/new.ts
+    tripped the apps rule even though ProjectsApp already existed.
+    """
+
+    def _setup_repo(self, tmp_path: Path) -> tuple[Path, Path]:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _make_gateable_trees(repo)
+
+        (repo / "desktop" / "src" / "apps" / "ProjectsApp").mkdir(parents=True)
+        (repo / "desktop" / "src" / "apps" / "ProjectsApp" / "ProjectsApp.tsx").write_text(
+            "// app\n"
+        )
+        (repo / "README.md").write_text("# README\n")
+
+        subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"], cwd=repo, check=True
+        )
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "initial"],
+            cwd=repo, check=True, capture_output=True,
+        )
+
+        docs_dir = repo / "docs"
+        docs_dir.mkdir(exist_ok=True)
+        cfg = docs_dir / "doc-gate.toml"
+        cfg.write_text(
+            '[gate]\ntrailer = "Docs-Reviewed:"\n\n[[rules]]\n'
+            'name = "apps"\n'
+            'when_changed = ["desktop/src/apps/*/**"]\n'
+            'require_doc = ["README.md"]\n'
+            'hint = "a desktop app was added or removed"\n'
+        )
+        return repo, cfg
+
+    def test_new_file_in_existing_app_is_clean(self, tmp_path: Path, monkeypatch):
+        """Adding desktop/src/apps/ProjectsApp/canvas/new.ts to an existing app
+        must not trip the apps rule."""
+        repo, cfg = self._setup_repo(tmp_path)
+
+        (repo / "desktop" / "src" / "apps" / "ProjectsApp" / "canvas").mkdir(parents=True)
+        (repo / "desktop" / "src" / "apps" / "ProjectsApp" / "canvas" / "new.ts").write_text(
+            "// new\n"
+        )
+        subprocess.run(["git", "add", "."], cwd=repo, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add canvas file"],
+            cwd=repo, check=True, capture_output=True,
+        )
+
+        monkeypatch.setattr(dg, "REPO_ROOT", repo)
+        rc = dg.main(["--config", str(cfg), "diff-gate", "--base", "HEAD~1"])
+        assert rc == dg.EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -316,6 +316,9 @@ class TestSystemAgentFrameworkAgreement:
         expected = system_agent_framework()
         assert widgets_framework == expected, f"{widgets_framework!r} != {expected!r}"
         assert config_framework == expected, f"{config_framework!r} != {expected!r}"
+        # Jay: "taOS agent should show as idle, not on device". A status
+        # string only; the framework above still comes from the runtime.
+        assert taos_agent["status"] == "Idle", taos_agent
 
 
 class TestSafePathComponent:
