@@ -182,10 +182,10 @@ _DEFAULT_PROBE_CANDIDATES: tuple[tuple[str, str], ...] = (
 # port 8080 is also llama.cpp's and rkllama's legacy one, so it is configured.
 _PROBEABLE_TYPES = frozenset({
     "rkllama", "ollama", "hailo-ollama", "llama-cpp", "llama-swap", "vllm", "exo", "mlx",
-    "sd-cpp",
+    "sd-cpp", "lmstudio",
 })
 # Types detected by /v1/models alone, which a llama-swap server also answers.
-_OPENAI_MODELS_TYPES = frozenset({"llama-cpp", "vllm", "exo", "mlx"})
+_OPENAI_MODELS_TYPES = frozenset({"llama-cpp", "vllm", "exo", "mlx", "lmstudio"})
 _MAX_EXTRA_BACKENDS = 16
 # Total time one candidate may take. httpx timeouts are per read, so a server
 # trickling bytes could otherwise hold the probe (and the heartbeat, which the

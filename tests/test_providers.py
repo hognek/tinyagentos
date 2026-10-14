@@ -14,8 +14,10 @@ from tinyagentos.providers import (
     BACKEND_TYPE_MAP,
     CHAT_BACKEND_TYPE_MAP,
     CLOUD_TYPES,
+    INFERENCE_BASE_SUFFIX,
     LOCAL_TYPES,
     NEEDS_API_BASE_TYPES,
+    inference_api_base,
 )
 
 
@@ -47,6 +49,23 @@ class TestBackendTypeMap:
     def test_lmstudio_chat_map_inherits(self):
         # CHAT_BACKEND_TYPE_MAP spreads BACKEND_TYPE_MAP
         assert CHAT_BACKEND_TYPE_MAP["lmstudio"] == "openai"
+
+
+    def test_lmstudio_inference_base_is_versioned(self):
+        # LM Studio's OpenAI surface is under /v1 (measured: a bare
+        # /chat/completions answers 200 with an "Unexpected endpoint" error).
+        assert INFERENCE_BASE_SUFFIX["lmstudio"] == "/v1"
+        assert inference_api_base("lmstudio", "http://host:1234") == "http://host:1234/v1"
+
+    def test_lmstudio_inference_base_is_idempotent(self):
+        for url in ("http://host:1234/v1", "http://host:1234/v1/"):
+            assert inference_api_base("lmstudio", url) == "http://host:1234/v1"
+
+    def test_unversioned_types_keep_their_bare_base(self):
+        # Only types in INFERENCE_BASE_SUFFIX are touched; the rest pass through.
+        assert inference_api_base("llama-cpp", "http://host:8000") == "http://host:8000"
+        assert inference_api_base("ollama", "http://host:11434") == "http://host:11434"
+        assert inference_api_base("vllm", "http://host:18000/") == "http://host:18000"
 
     def test_every_type_has_litellm_prefix(self):
         from tinyagentos.providers import IMAGE_GEN_TYPES
