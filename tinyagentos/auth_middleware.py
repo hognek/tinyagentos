@@ -847,6 +847,64 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     )
                     request.state.via = "session"
                     return await call_next(request)
+            # taOS #3227: on exempt GET paths, a valid bearer token also
+            # authenticates the caller. Headless integrations (local token,
+            # device token, registry JWT) can then get the full view from
+            # routes like GET /api/cluster/workers that serve reduced data
+            # to anonymous callers. An absent or invalid bearer token falls
+            # through to anonymous handling below -- the path stays exempt,
+            # so we never 401 here.
+            if request.method == "GET":
+                auth_header = request.headers.get("authorization", "")
+                if auth_header.lower().startswith("bearer "):
+                    presented = auth_header[7:].strip()
+                    if presented and auth_mgr.validate_local_token(presented):
+                        # Local token: same-host trust. Mirrors the non-exempt
+                        # flow -- maps to the primary/admin user.
+                        primary = auth_mgr.get_primary_user()
+                        request.state.user_id = primary["id"] if primary else None
+                        request.state.is_admin = True
+                        request.state.via = "local_token"
+                        return await call_next(request)
+                    if presented.startswith(DEVICE_TOKEN_PREFIX):
+                        try:
+                            device = await request.app.state.device_store.get_by_token(
+                                presented
+                            )
+                        except Exception:
+                            device = None
+                        if device is not None:
+                            request.state.user_id = None
+                            request.state.is_admin = False
+                            request.state.headless_full_view = True
+                            request.state.via = "device_bearer"
+                            return await call_next(request)
+                    elif presented:
+                        # Registry JWT: valid signature + active agent.
+                        # (Scope checks stay route-level; here we only
+                        # establish that the caller is a known agent.)
+                        try:
+                            from tinyagentos.agent_token_auth import verify_registry_token
+
+                            _private_pem, public_pem = _get_keypair(request)
+                            payload = verify_registry_token(presented, public_pem)
+                            canonical_id = payload.get("sub", "")
+                            if (
+                                canonical_id
+                                and payload.get("principal_type") != "human"
+                            ):
+                                registry = _get_store(request)
+                                record = await registry.get(canonical_id)
+                                if record is not None and record.get("status") == "active":
+                                    _enforce_rotation_cutoff(record, payload)
+                                    request.state.user_id = None
+                                    request.state.is_admin = False
+                                    request.state.headless_full_view = True
+                                    request.state.agent_canonical_id = canonical_id
+                                    request.state.via = "registry_jwt"
+                                    return await call_next(request)
+                        except Exception:
+                            pass
             request.state.user_id = None
             request.state.is_admin = False
             request.state.via = "exempt"
