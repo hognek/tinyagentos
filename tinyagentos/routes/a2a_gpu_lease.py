@@ -950,11 +950,19 @@ async def gpu_release(request: Request, body: ReleaseBody):
                         )
 
             else:
-                lease = _lease_for_actor(
-                    cluster,
-                    _resource_id(_canonical_node(cluster, node), body.resource),
-                    actor,
-                )
+                if body.resource:
+                    lease = _lease_for_actor(
+                        cluster,
+                        _resource_id(_canonical_node(cluster, node), body.resource),
+                        actor,
+                    )
+                else:
+                    # No resource named: use the node-scoped lookup, which
+                    # returns None when the actor holds several leases on
+                    # this node rather than guessing one (taOS #3228).
+                    lease = _lease_for_actor_on_node(
+                        cluster, _canonical_node(cluster, node), actor
+                    )
                 released_id = lease.lease_id if lease is not None else None
 
         # A lease found by id OWNS the release's node and channel: the request's
