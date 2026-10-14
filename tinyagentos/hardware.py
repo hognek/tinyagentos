@@ -469,6 +469,33 @@ def _amd_vram_for_model(model: str) -> int:
     return 0
 
 
+def _detect_amd_via_wsl() -> tuple[str, int]:
+    """Detect AMD GPU under WSL2 via /dev/dxg and rocminfo.
+
+    WSL2 exposes GPUs through the /dev/dxg paravirtualization device;
+    lspci shows nothing and /opt/rocm may not exist. rocminfo reports
+    the actual hardware. Returns (model_name, vram_mb), or ("", 0)
+    if no AMD GPU is found.
+    """
+    if not _detect_wsl():
+        return "", 0
+    if not Path("/dev/dxg").exists():
+        return "", 0
+    info = _run(["rocminfo"])
+    if not info or "amd" not in info.lower():
+        return "", 0
+    model = ""
+    for line in info.split("\n"):
+        low = line.lower()
+        if "marketing name:" in low:
+            model = line.split(":", 1)[-1].strip()
+            break
+        if "name:" in low and "gfx" in low and not model:
+            model = line.split(":", 1)[-1].strip()
+    vram_mb = _amd_vram_for_model(model) if model else 0
+    return model, vram_mb
+
+
 def _detect_gpu() -> GpuInfo:
     gpu = GpuInfo()
     # Apple Silicon — unified memory acts as VRAM, MLX-accelerated
@@ -529,6 +556,16 @@ def _detect_gpu() -> GpuInfo:
         gpu.vulkan = gpu.rocm
         gpu.vram_mb = _amd_vram_for_model(gpu.model)
     else:
+        # WSL2: lspci is empty but AMD GPU is visible via /dev/dxg +
+        # rocminfo (taOS #3228).
+        wsl_model, wsl_vram = _detect_amd_via_wsl()
+        if wsl_model:
+            gpu.type = "amd"
+            gpu.model = wsl_model
+            gpu.rocm = True
+            gpu.vulkan = True
+            gpu.vram_mb = wsl_vram
+            return gpu
         # Check for integrated Mali (ARM) — multiple detection paths
         mali_found = False
         # Path 1: /sys/class/misc/mali0 (proprietary Mali driver)

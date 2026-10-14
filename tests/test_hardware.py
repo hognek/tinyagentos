@@ -504,3 +504,37 @@ class TestRecommendedFrameworkProperty:
     def test_unknown_device_class_with_low_ram_returns_picoclaw(self):
         profile = HardwareProfile(ram_mb=4096, device_class="desktop")
         assert profile.recommended_framework == "picoclaw"
+
+
+class TestWsl2AmdDetection:
+    """WSL2 exposes AMD GPUs via /dev/dxg + rocminfo (taOS #3228)."""
+
+    def test_detects_amd_via_rocminfo(self, monkeypatch):
+        import tinyagentos.hardware as hw
+        monkeypatch.setattr(hw, "_detect_wsl", lambda: True)
+        monkeypatch.setattr(hw.Path, "exists", lambda self: str(self) == "/dev/dxg")
+        rocminfo_out = (
+            "ROCkets\n"
+            "  Name:                    gfx1100\n"
+            "  Marketing Name:          AMD Radeon RX 7900 XTX\n"
+            "  Vendor Name:             AMD\n"
+        )
+        monkeypatch.setattr(hw, "_run", lambda cmd: rocminfo_out if cmd == ["rocminfo"] else "")
+        model, vram = hw._detect_amd_via_wsl()
+        assert model == "AMD Radeon RX 7900 XTX"
+        assert vram > 0  # RX 7900 XTX is in the VRAM table
+
+    def test_returns_empty_when_not_wsl(self, monkeypatch):
+        import tinyagentos.hardware as hw
+        monkeypatch.setattr(hw, "_detect_wsl", lambda: False)
+        model, vram = hw._detect_amd_via_wsl()
+        assert model == ""
+        assert vram == 0
+
+    def test_returns_empty_when_no_dxg(self, monkeypatch):
+        import tinyagentos.hardware as hw
+        monkeypatch.setattr(hw, "_detect_wsl", lambda: True)
+        monkeypatch.setattr(hw.Path, "exists", lambda self: False)
+        model, vram = hw._detect_amd_via_wsl()
+        assert model == ""
+        assert vram == 0
