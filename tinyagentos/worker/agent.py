@@ -173,6 +173,9 @@ _DEFAULT_PROBE_CANDIDATES: tuple[tuple[str, str], ...] = (
     ("vllm", "http://localhost:18000"),           # TAOS-bundled vLLM (future)
     ("sd-cpp", "http://localhost:7864"),
     ("exo", "http://localhost:52415"),           # exo distributed inference (default port)
+    ("whisper", "http://localhost:9000"),        # whisper-asr-webservice (faster-whisper)
+    ("kokoro", "http://localhost:8880"),         # kokoro-fastapi TTS server
+    ("moss", "http://localhost:30000"),          # SGLang server (MOSS TTS)
 )
 
 # Types an extra/manifest candidate may declare: the local servers whose API
@@ -181,7 +184,7 @@ _DEFAULT_PROBE_CANDIDATES: tuple[tuple[str, str], ...] = (
 # port 8080 is also llama.cpp's and rkllama's legacy one, so it is configured.
 _PROBEABLE_TYPES = frozenset({
     "rkllama", "ollama", "hailo-ollama", "llama-cpp", "llama-swap", "vllm", "exo", "mlx",
-    "sd-cpp",
+    "sd-cpp", "whisper", "kokoro", "moss",
 })
 # Types detected by /v1/models alone, which a llama-swap server also answers.
 _OPENAI_MODELS_TYPES = frozenset({"llama-cpp", "vllm", "exo", "mlx"})
