@@ -209,7 +209,7 @@ class TestGenerateLiteLLMLmStudioBackend:
         backends = [
             {"name": "lmstudio", "type": "lmstudio", "url": "http://192.168.1.50:1234"}
         ]
-        config = generate_litellm_config(backends)
+        config = _model_table(backends)
         entry = config["model_list"][0]
         assert entry["litellm_params"]["model"] == "openai/default"
         assert entry["litellm_params"]["api_base"] == "http://192.168.1.50:1234"
