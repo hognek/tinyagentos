@@ -559,7 +559,7 @@ def test_worker_unions_installer_detected_resources(monkeypatch: pytest.MonkeyPa
     from tinyagentos.worker.agent import _collect_resources
 
     monkeypatch.setenv("TAOS_WORKER_RESOURCES", "gpu-metal,cpu-inference")
-    resources = _collect_resources([], "apple")
+    resources = _collect_resources([], {"gpu": {"type": "apple"}})
     assert resources == ["cpu-inference", "gpu-metal"]
 
     monkeypatch.setenv("TAOS_WORKER_RESOURCES", " gpu-metal , ")
@@ -588,8 +588,11 @@ def test_both_resource_call_sites_share_the_gpu_extraction() -> None:
     """No attribute-vs-dict drift between the register and heartbeat paths."""
     source = (REPO_ROOT / "tinyagentos" / "worker" / "agent.py").read_text()
     assert "getattr(hw.gpu" not in source, "the attribute path was the drift risk"
-    # One definition plus exactly two call sites.
-    assert source.count("_gpu_type(") == 3
+    # _collect_resources takes the hardware dict and extracts gpu_type
+    # internally (one definition + one internal call); both call sites
+    # pass the hardware dict, so there is no second extraction to drift.
+    assert source.count("_gpu_type(") == 2
+    assert source.count("_collect_resources(") == 3  # def + 2 call sites
 
 
 def test_install_script_and_worker_agree_on_the_env_var() -> None:
