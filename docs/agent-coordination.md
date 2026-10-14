@@ -2364,3 +2364,14 @@ server-side mechanism, so it binds every harness the same way.
   skips the card for another account. Every kind defaults to `ask`.
 
 Another user's action answers 404. Rows live in `taos_agent_actions.db`.
+
+
+## Credential-aware worker list (#3760)
+
+GET /api/cluster/workers returns different views based on caller credentials:
+
+- Valid local token: full admin view (all worker fields).
+- Registry JWT with active cluster_read grant: worker detail (capabilities, backends, resources, free VRAM, loaded models) minus host-identifying fields and admin-only pairing state.
+- All other callers: stripped anonymous projection (byte-identical to before).
+
+Fail-closed: if credential validation fails or the grant is inactive, the caller falls through to the anonymous projection. The route auth-exempt gate is unchanged.
