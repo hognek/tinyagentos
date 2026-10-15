@@ -70,7 +70,16 @@ def _run_dispatch(req: MagicMock, auth_mgr: MagicMock) -> MagicMock:
         return MagicMock(status_code=200)
 
     mw = am.AuthMiddleware.__new__(am.AuthMiddleware)
-    asyncio.get_event_loop().run_until_complete(mw._dispatch(req, call_next))
+    # Use a dedicated loop rather than asyncio.get_event_loop(): when this file
+    # runs after another async test module (e.g. test_llm_gateway_auth.py),
+    # pytest-asyncio has already closed its loop and get_event_loop() raises
+    # RuntimeError("There is no current event loop in thread 'MainThread'") on
+    # 3.11+. A fresh loop makes these tests order-independent.
+    loop = asyncio.new_event_loop()
+    try:
+        loop.run_until_complete(mw._dispatch(req, call_next))
+    finally:
+        loop.close()
     out = MagicMock()
     out.state_flags = seen["state"]
     return out

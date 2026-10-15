@@ -630,6 +630,16 @@ _LLM_GATEWAY_PREFIX = "/api/llm/"
 # view or device), proven by tests/test_cast_tokens.py. Exactly one prefix,
 # GET/HEAD only; every other method and every /api/cast path stays gated.
 _CAST_MEDIA_PREFIX = "/cast/media/"
+# Exempt paths whose ROUTE owns its credential check (taOS #3790 follow-up to
+# #3227). The exempt-GET bearer promotion in _dispatch must NOT pre-authenticate
+# these: their handlers resolve the presented credential themselves and
+# deliberately refuse anything that is not their own key type -- the LLM gateway
+# 401s a local token (even the host's own) as a non-key credential, and
+# tests/test_llm_gateway*.py pin that refusal. Promoting would set
+# request.state.is_admin and short-circuit the route's check. The agent-model
+# surface (/v1/models) is credential-owned too, but its dependency reads only the
+# consent key and ignores is_admin, so it needs no exclusion here.
+_CREDENTIAL_OWNED_EXEMPT_PATHS = frozenset({_LLM_GATEWAY_MODELS})
 
 
 def _unauthenticated(path: str, body: dict) -> JSONResponse:
@@ -854,7 +864,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
             # to anonymous callers. An absent or invalid bearer token falls
             # through to anonymous handling below -- the path stays exempt,
             # so we never 401 here.
-            if request.method == "GET":
+            #
+            # Skipped on the routes whose handler owns its credential check
+            # (see _CREDENTIAL_OWNED_EXEMPT_PATHS): there the handler must see
+            # the raw request, not a pre-authenticated admin, or its own 401
+            # for a non-key credential never fires.
+            if request.method == "GET" and path not in _CREDENTIAL_OWNED_EXEMPT_PATHS:
                 auth_header = request.headers.get("authorization", "")
                 if auth_header.lower().startswith("bearer "):
                     presented = auth_header[7:].strip()
