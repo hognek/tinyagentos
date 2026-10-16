@@ -2356,3 +2356,10 @@ The trace store refuses either kind with a field missing, and
 signed-in user whose `user_id` it carries, so one account never reads
 another's audit trail. The rows show in the Agents app trace list (kind filter) and in the taOS
 agent's Activity tab.
+
+## Agent identity reuse (#2114)
+
+An agent's canonical id is minted once. When approving an auth request for a
+handle that already maps to an agent in any status (active, suspended, etc.),
+the controller reuses that agent's existing canonical_id instead of minting a
+fresh one. The requester must still prove ownership via a valid registry token.
