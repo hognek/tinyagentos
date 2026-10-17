@@ -67,6 +67,32 @@ FIRST_PARTY = {"taosmd", "tinyagentos"}
 
 # pip flags and non-package arguments to skip when reading the installer.
 _PIP_FLAG = re.compile(r"^-")
+# pip flags that consume the NEXT token as their value. Skipping the flag alone
+# is not enough: `pip install --retries 10` would otherwise read "10" as a
+# package name, which is how a quiet install line reddened the drift gate.
+_PIP_FLAGS_WITH_VALUE = {
+    "-r", "--requirement",
+    "-c", "--constraint",
+    "-e", "--editable",
+    "-i", "--index-url",
+    "-f", "--find-links",
+    "-t", "--target",
+    "--extra-index-url",
+    "--trusted-host",
+    "--prefix",
+    "--cache-dir",
+    "--log",
+    "--upgrade-strategy",
+    "--progress-bar",
+    "--root",
+    "--src",
+    "--platform",
+    "--python-version",
+    "--implementation",
+    "--abi",
+    "--retries",
+    "--timeout",
+}
 # Everything after one of these on the line belongs to the shell, not to pip.
 _SHELL_OPERATORS = {"||", "&&", ";", "|", ">", ">>", "2>", "2>&1", "&"}
 
@@ -137,6 +163,36 @@ def _pyproject_declared(pyproject_path: Path | None = None) -> set[str]:
     return names
 
 
+def _pip_package_tokens(args: str):
+    """Yield the tokens of a ``pip install`` argument string that name packages.
+
+    Flags are dropped, and a flag that takes a value (``--timeout 60``,
+    ``--index-url URL``, ``-r FILE``) is dropped together with the token that
+    follows it -- that token is the flag's value, never a package. The
+    ``--flag=value`` spelling carries its value inline and consumes nothing
+    further.
+    """
+    tokens = args.split()
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        index += 1
+        # The rest of the shell line (`|| log "..."`, `&& ...`, `# ...`) is not
+        # an argument to pip -- stop reading at the first operator.
+        if token in _SHELL_OPERATORS or token.startswith("#"):
+            return
+        token = token.strip("\"'")
+        if not token:
+            continue
+        if _PIP_FLAG.match(token):
+            if "=" not in token:
+                flag = token.split("=", 1)[0]
+                if flag in _PIP_FLAGS_WITH_VALUE and index < len(tokens):
+                    index += 1
+            continue
+        yield token
+
+
 def undeclared_pip_installs(installer_path: Path | None = None) -> list[str]:
     """Packages the installer pip-installs that pyproject.toml never declares.
 
@@ -153,14 +209,7 @@ def undeclared_pip_installs(installer_path: Path | None = None) -> list[str]:
         match = re.search(r"pip(?:3)?\s+install\s+(.*)$", stripped)
         if not match:
             continue
-        for token in match.group(1).split():
-            # The rest of the shell line (`|| log "..."`, `&& …`, `# …`) is not
-            # an argument to pip — stop reading at the first operator.
-            if token in _SHELL_OPERATORS or token.startswith("#"):
-                break
-            token = token.strip("\"'")
-            if not token or _PIP_FLAG.match(token):
-                continue
+        for token in _pip_package_tokens(match.group(1)):
             # Editable/local installs and requirement files are the lockfile
             # path, not an ad-hoc addition.
             if token.startswith((".", "/", "$")) or token.endswith((".txt", ".whl")):

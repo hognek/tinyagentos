@@ -62,6 +62,58 @@ def test_installer_installs_nothing_pyproject_does_not_declare():
     )
 
 
+def _parse_installer_line(tmp_path: Path, line: str) -> list[str]:
+    """Run the drift parser over a throwaway installer file (never the real one)."""
+    installer = tmp_path / "install-server.sh"
+    installer.write_text(line + "\n", encoding="utf-8")
+    return check_install_licences.undeclared_pip_installs(installer)
+
+
+def test_pip_value_flags_do_not_parse_as_package_names(tmp_path):
+    """A value-taking flag's argument is a value, not a package to install.
+
+    ``pip install --quiet --retries 10 --timeout 60 -e .`` installs the local
+    project and nothing else, so the drift parser must return no packages.
+    Reading the flag values as names produced ``['10', '60']`` and reddened the
+    installer chain.
+    """
+    undeclared = _parse_installer_line(
+        tmp_path, "./.venv/bin/pip install --quiet --retries 10 --timeout 60 -e ."
+    )
+    assert undeclared == []
+
+
+def test_pip_index_url_value_does_not_parse_as_package_name(tmp_path):
+    """``--index-url URL`` consumes its URL; the URL is not a package."""
+    undeclared = _parse_installer_line(
+        tmp_path, "pip install --index-url https://example/simple requests"
+    )
+    assert undeclared == ["requests"]
+
+
+def test_pip_index_url_only_yields_nothing(tmp_path):
+    """A line whose only non-flag token is a flag value declares no package."""
+    undeclared = _parse_installer_line(
+        tmp_path, "pip install --index-url https://example/simple"
+    )
+    assert undeclared == []
+
+
+def test_pip_equals_spelling_does_not_swallow_next_token(tmp_path):
+    """``--retries=10`` carries its value inline, so the next token is still read."""
+    undeclared = _parse_installer_line(tmp_path, "pip install --retries=10 requests")
+    assert undeclared == ["requests"]
+
+
+def test_pip_named_package_is_still_detected(tmp_path):
+    """Detection still works: an undeclared real package must be reported.
+
+    Without this the value-flag fix could pass by simply disabling the parser.
+    """
+    undeclared = _parse_installer_line(tmp_path, "pip install requests")
+    assert undeclared == ["requests"]
+
+
 def test_unreadable_licence_is_its_own_failing_finding():
     """A PyPI release with no expression/license/classifiers must fail the gate.
 

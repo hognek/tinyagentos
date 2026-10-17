@@ -1,0 +1,1 @@
+- The install licence gate no longer reads pip flag values as package names: `pip install --retries 10 --timeout 60 -e .` used to report undeclared packages `10` and `60`, which reddened the installer chain; `--flag value` and `--flag=value` are now consumed correctly.
