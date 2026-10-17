@@ -33,6 +33,9 @@ from tinyagentos.agent_registry_store import mint_registry_token
 _STRIPPED_KEYS = {"name", "status", "tier_id", "kind"}
 _PAIRING_STATE = {"revoked", "blocked", "live_token"}
 _HOST_FIELDS = {"host_lan_ip", "hardware"}
+# Address-bearing fields a read-only cluster_read caller must never receive:
+# the worker's base URL and its shortcut-proxy URL (#3760).
+_ADDRESS_FIELDS = {"url", "worker_url"}
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +57,7 @@ def _sign(key: bytes, name: str, method: str, path: str, body: bytes) -> dict:
     }
 
 
-async def _register_worker(client, app, name: str, url: str, host_lan_ip: str) -> bytes:
+async def _register_worker(client, app, name: str, url: str, host_lan_ip: str, backends=None) -> bytes:
     """Pair + register a worker carrying the full detail set, return its key."""
     await app.state.cluster_pairing.init()
     code = "test-pairing-code"
@@ -82,7 +85,9 @@ async def _register_worker(client, app, name: str, url: str, host_lan_ip: str) -
         "resources": ["gpu-cuda-0", "cpu-inference"],
         "host_lan_ip": host_lan_ip,
         "worker_url": f"http://{name}:9000",
-        "backends": [{"name": "llama-cpp", "models": [{"name": "llama3"}], "loaded_models": ["llama3"]}],
+        "backends": backends if backends is not None else [
+            {"name": "llama-cpp", "models": [{"name": "llama3"}], "loaded_models": ["llama3"]}
+        ],
     }).encode()
     r = await client.post(
         "/api/cluster/workers",
@@ -208,6 +213,46 @@ async def test_cluster_read_view_has_no_pairing_state_even_when_revoked(client, 
     assert r.status_code == 200, r.text
     w = _only(r.json())
     assert _PAIRING_STATE.isdisjoint(w)
+    await app.state.cluster_pairing.close()
+
+
+@pytest.mark.asyncio
+async def test_cluster_read_view_withholds_worker_addresses(client, app):
+    """#3760: a read-only ``cluster_read`` caller must not learn a worker's
+    network address. The view is "full but not admin" and is documented to
+    hide host-identifying fields, so it must not return ``url`` (the worker's
+    base URL) or ``worker_url`` (its shortcut-proxy URL), nor a per-backend
+    probe ``url``."""
+    await _register_worker(
+        client,
+        app,
+        "cr-addr",
+        "http://10.0.0.44:9000",
+        "192.168.1.144",
+        backends=[
+            {
+                "name": "llama-cpp",
+                "url": "http://10.0.0.44:11434",
+                "models": [{"name": "llama3"}],
+                "loaded_models": ["llama3"],
+            }
+        ],
+    )
+    _cid, token = await _mint_agent(app, ["cluster_read"])
+
+    async with _bearer_client(app, token) as ac:
+        r = await ac.get("/api/cluster/workers")
+    assert r.status_code == 200, r.text
+    w = _only(r.json())
+
+    # No top-level address-bearing field leaks.
+    assert _ADDRESS_FIELDS.isdisjoint(w), f"address leak: {_ADDRESS_FIELDS & set(w)}"
+    # The integration detail is still present...
+    assert w["backends"], "backends detail must still be present"
+    # ...but each backend entry loses its address-bearing probe url.
+    for b in w["backends"]:
+        assert "url" not in b, f"backend url leaked: {b}"
+        assert b["name"] == "llama-cpp"
     await app.state.cluster_pairing.close()
 
 

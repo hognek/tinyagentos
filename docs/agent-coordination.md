@@ -1897,8 +1897,13 @@ without widening the exempt gate on any other path:
 - **valid local token** -> the full admin view (same-host trust);
 - **registry JWT with an active `cluster_read` grant** -> the "full but not
   admin" view: worker detail (capabilities, backends, resources, `free_vram_mb`,
-  `models`/`loaded_models`) minus host-identifying fields (`host_lan_ip`,
-  `hardware`) and the admin-only pairing state (`revoked`/`blocked`/`live_token`);
+  `models`/`loaded_models`) built from an explicit field allowlist
+  (`_CLUSTER_READ_FIELDS` in `tinyagentos/routes/cluster.py`) that omits every
+  address- and host-identifying field -- the worker base `url`, its
+  `worker_url` shortcut-proxy address, `host_lan_ip`, `hardware`, and each
+  backend entry's probe `url` -- plus the admin-only pairing state
+  (`revoked`/`blocked`/`live_token`). A read-only credential therefore cannot
+  recover a worker's network address;
 - **anything else** (no credential, invalid token, or a registry JWT without the
   scope) -> the unchanged stripped anonymous projection, byte-identical to
   before. The check is fail-closed and silent: a malformed token or a missing
@@ -2371,7 +2376,7 @@ Another user's action answers 404. Rows live in `taos_agent_actions.db`.
 GET /api/cluster/workers returns different views based on caller credentials:
 
 - Valid local token: full admin view (all worker fields).
-- Registry JWT with active cluster_read grant: worker detail (capabilities, backends, resources, free VRAM, loaded models) minus host-identifying fields and admin-only pairing state.
+- Registry JWT with active cluster_read grant: worker detail (capabilities, backends, resources, free VRAM, loaded models) built from an explicit allowlist that omits address- and host-identifying fields (worker `url`, `worker_url`, `host_lan_ip`, `hardware`, and each backend's probe `url`) and admin-only pairing state, so the caller cannot recover a worker's network address.
 - All other callers: stripped anonymous projection (byte-identical to before).
 
 Fail-closed: if credential validation fails or the grant is inactive, the caller falls through to the anonymous projection. The route auth-exempt gate is unchanged.

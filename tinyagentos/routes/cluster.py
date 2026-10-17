@@ -318,6 +318,53 @@ class MoveRequest(BaseModel):
     to_worker: str
 
 
+# ---------------------------------------------------------------------------
+# cluster_read response allowlist (#3760)
+# ---------------------------------------------------------------------------
+# The ``cluster_read`` view is "full but not admin": it exposes the
+# integration-visible worker detail a headless caller needs (capabilities,
+# backends, resources, free VRAM, models) while withholding every address- or
+# host-identifying field and the admin-only pairing state. Build the response
+# from this allowlist rather than trimming the full ``asdict`` dump, so a new
+# ``WorkerInfo`` field can never leak by default -- it stays out until it is
+# reviewed into this tuple. Address-bearing fields deliberately excluded:
+#   * ``url``        -- the worker's base URL (its network address);
+#   * ``worker_url`` -- the public shortcut-proxy URL (another address);
+#   * ``host_lan_ip``, ``hardware`` -- the host's LAN IP and hardware detail;
+#   * ``backends[].url`` -- a worker-local probe address, stripped per entry
+#     below (a worker can put anything there).
+_CLUSTER_READ_FIELDS: tuple[str, ...] = (
+    "name",
+    "status",
+    "kind",
+    "tier_id",
+    "platform",
+    "capabilities",
+    "backends",
+    "resources",
+    "models",
+    "available_models",
+    "load",
+    "last_heartbeat",
+    "registered_at",
+    "potential_capabilities",
+    "kv_cache_quant_support",
+    "kv_cache_quant_k_support",
+    "kv_cache_quant_v_support",
+    "kv_cache_quant_boundary_layer_protect",
+    "storage_cap_bytes",
+    "storage_used_bytes",
+    "bytes_deduped_total",
+    "worker_lxc_image_version",
+    "degraded",
+    "degraded_reason",
+    "free_vram_mb",
+    "used_vram_mb",
+    "last_vram_report_at",
+    "vram_sampled_at",
+)
+
+
 async def _bearer_holds_cluster_read(request: Request, presented: str) -> bool:
     """True when *presented* is a valid registry JWT for an active agent that
     holds an unexpired ``cluster_read`` grant.
@@ -393,11 +440,23 @@ async def list_workers(request: Request):
             })
             continue
         if cluster_read and not is_admin:
-            # "full but not admin": drop the host-identifying fields. The
-            # admin-only pairing state is never computed on this path, so
-            # revoked/blocked/live_token stay absent as well.
-            d.pop("host_lan_ip", None)
-            d.pop("hardware", None)
+            # "full but not admin": build the projection from an explicit
+            # allowlist instead of trimming the full dump, so no address- or
+            # host-bearing field can leak by default (see
+            # _CLUSTER_READ_FIELDS). `url` and `worker_url` carry the worker's
+            # network address, so they are not in the allowlist; `backends`
+            # entries keep their name/models but drop the per-entry probe
+            # `url`. The admin-only pairing state is never computed on this
+            # path, so revoked/blocked/live_token stay absent as well.
+            d = {k: d[k] for k in _CLUSTER_READ_FIELDS if k in d}
+            backends = d.get("backends")
+            if isinstance(backends, list):
+                d["backends"] = [
+                    {bk: bv for bk, bv in b.items() if bk != "url"}
+                    if isinstance(b, dict)
+                    else b
+                    for b in backends
+                ]
             if registry is not None:
                 tier_id, pot_caps = _potential_capabilities(w.hardware, registry)
                 d["tier_id"] = tier_id
