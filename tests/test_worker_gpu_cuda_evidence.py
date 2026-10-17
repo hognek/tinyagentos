@@ -11,9 +11,10 @@ CUDA-typed tasks -- and every A2A lease caller, whose default resource id is
 ``gpu`` platform signature, so the resource name and the scheduler's own view
 of the class disagreed.
 
-Contract pinned here: ``gpu-cuda-0`` is advertised only when the hardware probe
-reports a usable CUDA/ROCm runtime (``GpuInfo.cuda`` / ``GpuInfo.rocm``) *and* a
-GPU-capable backend is live.
+Contract pinned here: a GPU class is advertised from the hardware probe alone
+(``gpu.type`` plus the ``GpuInfo.cuda`` / ``GpuInfo.rocm`` usability flag), with
+no backend needed (taOS #3228). The live-backend filter applies to
+``npu-rk3588`` only (PR #3242).
 
 Red on pre-fix ``dev``: the register/heartbeat cases below observe
 ``["cpu-inference", "gpu-cuda-0"]`` for a CPU-only host running Ollama.

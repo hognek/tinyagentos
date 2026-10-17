@@ -1900,14 +1900,19 @@ registrations and heartbeats.
   `WorkerInfo.resources` and uses it for lease allowlist validation
   instead of the legacy backend-name grammar. Workers that omit the
   field fall back to the grammar; a warning is logged once per mismatch.
-- The worker advertises `gpu-cuda-0` only with affirmative CUDA/ROCm
-  evidence (`GpuInfo.cuda` / `GpuInfo.rocm` from the hardware probe) and a
-  live backend, not merely because a GPU-capable backend is running:
-  Ollama, vLLM, exo and mlx all serve in CPU mode, and `detect_backends()`
-  also emits manifest-synthetic `status: "stopped"` entries for declared
-  software that is not answering. A backend probe alone would publish a
-  CUDA class -- and the `<worker>:gpu-cuda-0` lease id derived from it --
-  for a host that cannot run a CUDA task.
+- A worker advertises a GPU class from the hardware probe, with no backend
+  needed (taOS #3228): `gpu.type` plus the probe's usability flag --
+  `nvidia`/`cuda` with `GpuInfo.cuda` -> `gpu-cuda-0`, `amd`/`rocm` with
+  `GpuInfo.rocm` -> `gpu-rocm-0`, Apple Silicon -> `gpu-metal`. A running
+  backend is not evidence of a GPU: Ollama, vLLM, exo and mlx all serve in CPU
+  mode, and a PCI-visible NVIDIA card whose driver did not load reports no
+  CUDA runtime, so both fall back to `cpu-inference`. The live-backend filter
+  applies to `npu-rk3588` only: `detect_backends()` also emits
+  manifest-synthetic `status: "stopped"` entries for declared software that is
+  not answering, and a stopped rkllama does not advertise the NPU class -- so
+  a Pi advertises only `cpu-inference` while rkllama restarts. Without the
+  hardware check a host that cannot run a CUDA task would publish a CUDA class
+  and the `<worker>:gpu-cuda-0` lease id derived from it.
 - `POST /api/cluster/workers` (register) and `POST /api/cluster/heartbeat`
   both **echo the controller's current generation** in their response
   (`"generation"` key alongside the existing `status` field), so a worker
