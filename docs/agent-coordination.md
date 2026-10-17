@@ -1974,9 +1974,12 @@ owner can still see and act on.
 
 Auth-exempt. Anonymous callers get a stripped view (`name`, `status`,
 `tier_id`, `kind`). A valid bearer token on this exempt GET upgrades the
-caller to the full view: a local token authenticates as admin, while a
-valid device token or a registry JWT from an active agent gets the full
-worker objects without admin. `signing_key` is stripped for everyone.
+caller to the full view: a local token authenticates as the primary user
+(admin only once a primary user exists), a device token holding
+`agents:read` gets the full worker objects without admin, and a registry
+JWT from an active agent gets them too. A device token without
+`agents:read`, and any invalid token, stay anonymous. `signing_key` is
+stripped for everyone.
 
 ## Cluster capability + placement map (`GET /api/cluster/map`, admin-only)
 

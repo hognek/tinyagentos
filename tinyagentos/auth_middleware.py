@@ -19,7 +19,7 @@ from tinyagentos.agent_token_auth import (
 from tinyagentos.auth import AuthStoreCorruptError
 from tinyagentos.device_scopes import (
     AGENTS_READ, CHAT_SEND, DECISIONS_ANSWER, FILES_UPLOAD, LIBRARY_INGEST,
-    PUSH_REGISTER, VOICE_STT, VOICE_TTS,
+    PUSH_REGISTER, VOICE_STT, VOICE_TTS, effective_scopes,
 )
 from tinyagentos.device_store import DEVICE_TOKEN_PREFIX
 from tinyagentos.rate_limit import MovingWindowLimiter
@@ -875,10 +875,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
                     presented = auth_header[7:].strip()
                     if presented and auth_mgr.validate_local_token(presented):
                         # Local token: same-host trust. Mirrors the non-exempt
-                        # flow -- maps to the primary/admin user.
+                        # flow -- maps to the primary/admin user, and is NOT
+                        # admin before onboarding, when there is no primary
+                        # user to be admin of.
                         primary = auth_mgr.get_primary_user()
                         request.state.user_id = primary["id"] if primary else None
-                        request.state.is_admin = True
+                        request.state.is_admin = primary is not None
                         request.state.via = "local_token"
                         return await call_next(request)
                     if presented.startswith(DEVICE_TOKEN_PREFIX):
@@ -888,7 +890,12 @@ class AuthMiddleware(BaseHTTPMiddleware):
                             )
                         except Exception:
                             device = None
-                        if device is not None:
+                        # This branch bypasses require_device, so the scope
+                        # check it would have applied has to happen here: a
+                        # device token holding no agents:read (e.g. one minted
+                        # for push:register alone) stays anonymous rather than
+                        # reading the full worker list.
+                        if device is not None and AGENTS_READ in effective_scopes(device):
                             request.state.user_id = None
                             request.state.is_admin = False
                             request.state.headless_full_view = True
@@ -919,7 +926,16 @@ class AuthMiddleware(BaseHTTPMiddleware):
                                     request.state.via = "registry_jwt"
                                     return await call_next(request)
                         except Exception:
-                            pass
+                            # Keep the anonymous fall-through: an invalid
+                            # signature, expired token, rotation failure or
+                            # registry lookup error must not 401 an exempt
+                            # path. Log it (never the token itself) so the
+                            # failures are diagnosable.
+                            logger.warning(
+                                "exempt-GET bearer: registry JWT validation failed on %s",
+                                path,
+                                exc_info=True,
+                            )
             request.state.user_id = None
             request.state.is_admin = False
             request.state.via = "exempt"

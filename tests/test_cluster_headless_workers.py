@@ -110,15 +110,52 @@ class TestExemptGetBearerTokens:
         assert out.state_flags["is_admin"] is True
         assert out.state_flags["via"] == "local_token"
 
+    def test_local_token_without_primary_user_is_not_admin(self):
+        # Pre-onboarding there is no primary user. The non-exempt flow
+        # refuses admin in that case (user_id None, is_admin False); the
+        # exempt-GET promotion must match it instead of handing exempt GET
+        # handlers an admin with no user behind it.
+        mgr = _default_auth_mgr()
+        mgr.validate_local_token.return_value = True
+        mgr.get_primary_user.return_value = None
+        req = _make_request(headers={"authorization": "Bearer local-secret"})
+        out = _run_dispatch(req, mgr)
+        assert out.state_flags["is_admin"] is False
+        assert out.state_flags["via"] == "local_token"
+
     def test_valid_device_token_gets_full_view(self):
         mgr = _default_auth_mgr()
-        device = {"id": "dev-1", "name": "pi"}
+        device = {
+            "id": "dev-1",
+            "name": "pi",
+            "platform": "ios",
+            "scopes": "agents:read push:register",
+        }
         req = _make_request(headers={"authorization": "Bearer taosdev_abc123"})
         req.app.state.device_store.get_by_token = AsyncMock(return_value=device)
         out = _run_dispatch(req, mgr)
         assert out.state_flags["is_admin"] is False
         assert out.state_flags["headless_full_view"] is True
         assert out.state_flags["via"] == "device_bearer"
+
+    def test_device_token_without_agents_read_stays_anonymous(self):
+        # This branch bypasses require_device, so the scope check has to
+        # happen here: a device holding only push:register must not read the
+        # full worker list. It falls through to the anonymous view, exactly
+        # as an unknown token does -- never a 401.
+        mgr = _default_auth_mgr()
+        device = {
+            "id": "dev-2",
+            "name": "phone",
+            "platform": "ios",
+            "scopes": "push:register",
+        }
+        req = _make_request(headers={"authorization": "Bearer taosdev_push_only"})
+        req.app.state.device_store.get_by_token = AsyncMock(return_value=device)
+        out = _run_dispatch(req, mgr)
+        assert out.state_flags["headless_full_view"] is None
+        assert out.state_flags["is_admin"] is False
+        assert out.state_flags["via"] == "exempt"
 
     def test_unknown_device_token_stays_anonymous(self):
         mgr = _default_auth_mgr()
