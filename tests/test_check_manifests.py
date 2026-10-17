@@ -186,15 +186,18 @@ def _write_model(root: Path, mid: str, manifest: dict) -> None:
 
 def test_model_fields_complete_passes(tmp_path: Path) -> None:
     _write_model(tmp_path, "qwen3-8b", _model_ok())
-    assert check_manifests.lint_model_fields(tmp_path) == []
+    warns, errors = check_manifests.lint_model_fields(tmp_path)
+    assert warns == []
+    assert errors == []
 
 
 def test_model_fields_missing_family_warns(tmp_path: Path) -> None:
     m = _model_ok()
     del m["family"]
     _write_model(tmp_path, "qwen3-8b", m)
-    warns = check_manifests.lint_model_fields(tmp_path)
+    warns, errors = check_manifests.lint_model_fields(tmp_path)
     assert any("family" in w for w in warns)
+    assert errors == []
 
 
 def test_model_fields_missing_context_warns(tmp_path: Path) -> None:
@@ -202,8 +205,9 @@ def test_model_fields_missing_context_warns(tmp_path: Path) -> None:
     del m["min_context"]
     del m["max_context"]
     _write_model(tmp_path, "qwen3-8b", m)
-    warns = check_manifests.lint_model_fields(tmp_path)
+    warns, errors = check_manifests.lint_model_fields(tmp_path)
     assert any("min_context" in w for w in warns)
+    assert errors == []
 
 
 def test_model_fields_missing_envelope_warns(tmp_path: Path) -> None:
@@ -211,12 +215,45 @@ def test_model_fields_missing_envelope_warns(tmp_path: Path) -> None:
     del m["variants"][0]["vram_floor_mb"]
     del m["variants"][0]["approx_tok_s_by_profile"]
     _write_model(tmp_path, "qwen3-8b", m)
-    warns = check_manifests.lint_model_fields(tmp_path)
+    warns, errors = check_manifests.lint_model_fields(tmp_path)
     assert any("envelope" in w for w in warns)
+    assert errors == []
 
 
 def test_model_fields_non_model_skipped(tmp_path: Path) -> None:
     _write(tmp_path, "rkllama", _managed_ok())
     # lint_model_fields only looks under models/, so the service manifest
     # is invisible to it.
-    assert check_manifests.lint_model_fields(tmp_path) == []
+    warns, errors = check_manifests.lint_model_fields(tmp_path)
+    assert warns == []
+    assert errors == []
+
+
+def test_malformed_model_yaml_is_an_error(tmp_path: Path) -> None:
+    """Unparseable model YAML must be reported, not silently skipped.
+
+    lint_managed scans only services/, so a ``continue`` here left the gate
+    printing "clean" over a model manifest nothing could read.
+    """
+    d = tmp_path / "models" / "broken"
+    d.mkdir(parents=True)
+    (d / "manifest.yaml").write_text("id: broken\nfamily: {: bad")
+    warns, errors = check_manifests.lint_model_fields(tmp_path)
+    assert any("not valid YAML" in e for e in errors)
+    assert any("broken" in e for e in errors)
+
+
+def test_non_mapping_model_yaml_is_an_error(tmp_path: Path) -> None:
+    d = tmp_path / "models" / "listy"
+    d.mkdir(parents=True)
+    (d / "manifest.yaml").write_text("- id: listy\n")
+    warns, errors = check_manifests.lint_model_fields(tmp_path)
+    assert any("top-level is not a mapping" in e for e in errors)
+
+
+def test_main_fails_the_gate_on_malformed_model(tmp_path: Path) -> None:
+    """The gate must exit non-zero when a model manifest is malformed."""
+    d = tmp_path / "models" / "broken"
+    d.mkdir(parents=True)
+    (d / "manifest.yaml").write_text("id: broken\nfamily: {: bad")
+    assert check_manifests.main(["managed-lint", "--root", str(tmp_path)]) == 1
