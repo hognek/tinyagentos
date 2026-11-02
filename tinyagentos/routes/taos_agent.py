@@ -56,6 +56,7 @@ from tinyagentos.taos_agent_runtime import (
     FrameworkDecision,
     apply_framework,
     ensure_taos_claude_code_harness,
+    TAOS_GITHUB_AGENT,
     ensure_taos_opencode_server,
     ensure_taos_picoclaw_harness,
     opencode_gateway_problem,
@@ -141,6 +142,30 @@ def _load_mobile_chapter() -> str:
 
 
 MOBILE_CHAPTER: str = _load_mobile_chapter()
+
+
+# Same shape as the phone chapter: the compiled manual has no room to carry this
+# for every install, and it only matters to an agent that holds a GitHub token.
+_GITHUB_CHAPTER_PATH = _MANUAL_PATH.parent / "agent-manual" / "github" / "github-prs.md"
+
+
+def _load_github_chapter() -> str:
+    try:
+        return _GITHUB_CHAPTER_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        logger.warning("GitHub manual chapter not found at %s", _GITHUB_CHAPTER_PATH)
+        return ""
+
+
+GITHUB_CHAPTER: str = _load_github_chapter()
+
+
+def _with_github_chapter(system_prompt: str | None, persona: str, server) -> str | None:
+    """Add the pull request chapter while *server* holds a GitHub token. A persona
+    override still replaces everything."""
+    if persona or not GITHUB_CHAPTER or not getattr(server, "github_token", None):
+        return system_prompt
+    return f"{system_prompt}\n\n{GITHUB_CHAPTER}" if system_prompt else GITHUB_CHAPTER
 
 
 def _system_prompt_for(persona: str, device_class: str | None) -> str | None:
@@ -616,7 +641,7 @@ async def chat(request: Request, body: ChatRequest):
 
     # Ensure the host opencode server is running.
     try:
-        server = None if (use_picoclaw or use_claude_code) else await ensure_taos_opencode_server(request.app.state, model)
+        server = None if (use_picoclaw or use_claude_code) else await ensure_taos_opencode_server(request.app.state, model, github_agent=TAOS_GITHUB_AGENT)
     except OpenCodeBinaryNotFoundError as exc:
         # The binary genuinely isn't reachable (not on PATH, not at the
         # installer's default location) — a clear install instruction, not a
@@ -641,6 +666,8 @@ async def chat(request: Request, body: ChatRequest):
             {"error": f"taOS agent runtime failed to start: {exc}"},
             status_code=503,
         )
+
+    system_prompt = _with_github_chapter(system_prompt, persona, server)
 
     queue: asyncio.Queue = asyncio.Queue()
 

@@ -873,6 +873,8 @@ async def deploy_agent_endpoint(request: Request, body: DeployAgentRequest):
         deploy_tasks = request.app.state.deploy_tasks
         deploy_tasks[body.name] = {"status": "deploying", "name": body.name}
 
+        from tinyagentos.github_token import deploy_github_token
+
         from tinyagentos.deployer import deploy_agent, DeployRequest
         llm_proxy = getattr(request.app.state, "llm_proxy", None)
         secrets_store = getattr(request.app.state, "secrets", None)
@@ -981,6 +983,9 @@ async def deploy_agent_endpoint(request: Request, body: DeployAgentRequest):
                     taos_host=deploy_taos_host,
                     memory_mode=body.memory_mode,
                     agent_token=agent_jwt,
+                    github_token=await deploy_github_token(
+                        request.app.state, body.name, secrets_store, deploy_remote
+                    ),
                 ))
                 agent = find_agent(config, body.name)
                 if result.get("success"):

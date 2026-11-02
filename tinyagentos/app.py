@@ -1402,6 +1402,11 @@ def create_app(data_dir: Path | None = None, catalog_dir: Path | None = None) ->
         from tinyagentos.projects.routine_runner import routine_tick_loop
         _create_supervised_task(routine_tick_loop(app.state), app.state._background_tasks)
 
+        # GitHub tokens: agents hold an installation token that lasts an hour,
+        # so rotate them before they expire. Cheap no-op without a GitHub App.
+        from tinyagentos.github_token import github_token_refresh_loop
+        _create_supervised_task(github_token_refresh_loop(app.state), app.state._background_tasks)
+
         # Scheduled tasks executor: sweeps due TaskScheduler entries every 60s
         # and dispatches each via an allow-listed handler (v1: create_backup
         # only). Always runs; cheap no-op unless a task is due.

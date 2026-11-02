@@ -38,6 +38,8 @@ echo ""
 echo "Installing system dependencies..."
 apt-get update -qq
 apt-get install -y -qq python3 python3-pip python3-venv nodejs npm git curl avahi-daemon
+# gh lets the taOS agent open pull requests. Optional, so never fail the install on it.
+apt-get install -y -qq gh || echo "gh not installed: the taOS agent will not be able to open GitHub pull requests"
 
 # Check Python version
 PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')

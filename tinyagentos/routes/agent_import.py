@@ -201,6 +201,7 @@ async def import_hermes_agent(
     _BUNDLE_PATHS[unique_slug] = tmp_path
 
     async def _background_import():
+        from tinyagentos.github_token import deploy_github_token
         from tinyagentos.deployer import deploy_agent, DeployRequest
         try:
             result = await deploy_agent(DeployRequest(
@@ -216,6 +217,9 @@ async def import_hermes_agent(
                     "llm_gateway_models_problem": llm_gateway_models_check(request.app.state),
                 },
                 secrets_store=secrets_store,
+                github_token=await deploy_github_token(
+                    request.app.state, unique_slug, secrets_store
+                ),
             ))
             agent = find_agent(config, unique_slug)
             if not result.get("success"):

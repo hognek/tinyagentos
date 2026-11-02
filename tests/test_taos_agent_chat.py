@@ -159,7 +159,7 @@ async def test_chat_opencode_binary_not_found_returns_install_instructions(clien
     await client.patch("/api/taos-agent/settings", json={"model": "gpt-4o"})
     app.state.llm_proxy = _make_mock_proxy(running=True)
 
-    async def fake_ensure_server(state, model):
+    async def fake_ensure_server(state, model, github_agent=None):
         raise OpenCodeBinaryNotFoundError("opencode binary not found (tried 'opencode')")
 
     monkeypatch.setattr(
@@ -185,7 +185,7 @@ async def test_chat_opencode_start_failure_surfaces_real_error(client, app, monk
     await client.patch("/api/taos-agent/settings", json={"model": "gpt-4o"})
     app.state.llm_proxy = _make_mock_proxy(running=True)
 
-    async def fake_ensure_server(state, model):
+    async def fake_ensure_server(state, model, github_agent=None):
         raise TimeoutError("opencode server on port 4188 did not become healthy within 180.0s")
 
     monkeypatch.setattr(
@@ -218,7 +218,7 @@ async def test_chat_happy_path_ndjson(client, app, monkeypatch):
 
     server = _fake_server()
 
-    async def fake_ensure_server(state, model):
+    async def fake_ensure_server(state, model, github_agent=None):
         return server
 
     monkeypatch.setattr(
@@ -279,7 +279,7 @@ async def test_chat_error_path_ndjson(client, app, monkeypatch):
 
     server = _fake_server()
 
-    async def fake_ensure_server(state, model):
+    async def fake_ensure_server(state, model, github_agent=None):
         return server
 
     monkeypatch.setattr(
@@ -335,7 +335,7 @@ async def test_chat_queued_message_survives_turn_error(client, app, monkeypatch)
 
     server = _fake_server()
 
-    async def fake_ensure_server(state, model):
+    async def fake_ensure_server(state, model, github_agent=None):
         return server
 
     monkeypatch.setattr(
@@ -949,7 +949,7 @@ async def test_chat_empty_stream_yields_error_frame(client, app, monkeypatch):
 
     server = _fake_server()
 
-    async def fake_ensure_server(state, model):
+    async def fake_ensure_server(state, model, github_agent=None):
         return server
 
     monkeypatch.setattr(
@@ -999,7 +999,7 @@ async def test_chat_normal_stream_no_spurious_error(client, app, monkeypatch):
 
     server = _fake_server()
 
-    async def fake_ensure_server(state, model):
+    async def fake_ensure_server(state, model, github_agent=None):
         return server
 
     monkeypatch.setattr(
@@ -1058,7 +1058,7 @@ async def test_chat_concurrent_second_request_queued_and_surfaced(client, app, m
 
     server = _fake_server()
 
-    async def fake_ensure_server(state, model):
+    async def fake_ensure_server(state, model, github_agent=None):
         return server
 
     monkeypatch.setattr(
@@ -1137,7 +1137,7 @@ async def test_chat_loop_idle_again_after_turn(client, app, monkeypatch):
 
     server = _fake_server()
 
-    async def fake_ensure_server(state, model):
+    async def fake_ensure_server(state, model, github_agent=None):
         return server
 
     monkeypatch.setattr(
@@ -1308,3 +1308,226 @@ async def test_taos_agent_legacy_key_rescope_fail_remints(tmp_path, monkeypatch)
     assert "taos-embedding-default" in rec["allowed_models"]
     # The legacy key must NOT be in the store
     assert store.lookup("sk-legacy-postgres-key") is None
+
+
+# ---------------------------------------------------------------------------
+# ensure_taos_opencode_server: GitHub token (taOS #858)
+# ---------------------------------------------------------------------------
+
+def _github_fake_server(spawned: list, refreshed: list):
+    class _FakeServer:
+        def __init__(self, cfg):
+            spawned.append(cfg)
+            self._cfg = cfg
+
+        async def ensure_running(self, **kwargs):
+            pass
+
+        async def stop(self):
+            pass
+
+        @property
+        def base_url(self):
+            return f"http://127.0.0.1:{self._cfg.port}"
+
+        def is_running(self):
+            return True
+
+        def set_github_token(self, token):
+            refreshed.append(token)
+
+    return _FakeServer
+
+
+def _github_state(tmp_path):
+    mock_proxy = MagicMock()
+    mock_proxy.create_agent_key = AsyncMock(return_value="sk-test")
+    mock_proxy.is_running.return_value = True
+    return SimpleNamespace(
+        data_dir=tmp_path,
+        llm_proxy=mock_proxy,
+        secrets=AsyncMock(),
+        config=MagicMock(),
+        http_client=AsyncMock(),
+        taos_opencode_password=None,
+        taos_opencode_server=None,
+        taos_opencode_model=None,
+        taos_opencode_session_id=None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ensure_server_taos_agent_gets_its_github_token(tmp_path, monkeypatch):
+    import tinyagentos.taos_agent_runtime as rt
+
+    spawned: list = []
+    monkeypatch.setattr(rt, "OpenCodeServer", _github_fake_server(spawned, []))
+    state_fn = AsyncMock(return_value=("ghs_runtime", True))
+    monkeypatch.setattr(rt, "_github_token_state", state_fn)
+    state = _github_state(tmp_path)
+
+    await rt.ensure_taos_opencode_server(state, "gpt-4o", github_agent="taos-agent")
+
+    assert spawned[0].github_token == "ghs_runtime"
+    assert spawned[0].github_agent == "taos-agent"
+    state_fn.assert_awaited_once_with(state, "taos-agent")
+
+
+@pytest.mark.asyncio
+async def test_ensure_server_other_agents_never_get_the_taos_agent_token(tmp_path, monkeypatch):
+    """routes/agent_model_api.py runs other consented agents through this same
+    function, keyed by agent id. Handing them the taOS agent's token would give
+    every consented agent the taOS agent's GitHub access."""
+    import tinyagentos.taos_agent_runtime as rt
+
+    spawned: list = []
+    refreshed: list = []
+    monkeypatch.setattr(rt, "OpenCodeServer", _github_fake_server(spawned, refreshed))
+    state_fn = AsyncMock(return_value=("ghs_runtime", True))
+    monkeypatch.setattr(rt, "_github_token_state", state_fn)
+
+    await rt.ensure_taos_opencode_server(_github_state(tmp_path), "some-agent-id")
+
+    assert spawned[0].github_token is None
+    assert spawned[0].github_agent is None
+    assert refreshed == []
+    state_fn.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ensure_server_rotates_token_on_a_running_server(tmp_path, monkeypatch):
+    import tinyagentos.taos_agent_runtime as rt
+
+    refreshed: list = []
+    monkeypatch.setattr(rt, "OpenCodeServer", _github_fake_server([], refreshed))
+    monkeypatch.setattr(rt, "_github_token_state", AsyncMock(side_effect=[
+        ("ghs_first", True), ("ghs_second", True),
+    ]))
+    state = _github_state(tmp_path)
+
+    await rt.ensure_taos_opencode_server(state, "gpt-4o", github_agent="taos-agent")
+    await rt.ensure_taos_opencode_server(state, "gpt-4o", github_agent="taos-agent")
+
+    assert refreshed == ["ghs_first", "ghs_second"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_server_failed_mint_keeps_the_valid_token(tmp_path, monkeypatch):
+    import tinyagentos.taos_agent_runtime as rt
+
+    refreshed: list = []
+    monkeypatch.setattr(rt, "OpenCodeServer", _github_fake_server([], refreshed))
+    monkeypatch.setattr(rt, "_github_token_state", AsyncMock(side_effect=[
+        ("ghs_first", True), (None, True),
+    ]))
+    state = _github_state(tmp_path)
+
+    await rt.ensure_taos_opencode_server(state, "gpt-4o", github_agent="taos-agent")
+    await rt.ensure_taos_opencode_server(state, "gpt-4o", github_agent="taos-agent")
+
+    assert refreshed == ["ghs_first"]
+
+
+@pytest.mark.asyncio
+async def test_ensure_server_removed_grant_clears_the_token(tmp_path, monkeypatch):
+    import tinyagentos.taos_agent_runtime as rt
+
+    refreshed: list = []
+    monkeypatch.setattr(rt, "OpenCodeServer", _github_fake_server([], refreshed))
+    monkeypatch.setattr(rt, "_github_token_state", AsyncMock(side_effect=[
+        ("ghs_first", True), (None, False),
+    ]))
+    state = _github_state(tmp_path)
+
+    await rt.ensure_taos_opencode_server(state, "gpt-4o", github_agent="taos-agent")
+    await rt.ensure_taos_opencode_server(state, "gpt-4o", github_agent="taos-agent")
+
+    assert refreshed == ["ghs_first", None]
+
+
+@pytest.mark.asyncio
+async def test_github_token_state_unwired_means_not_granted():
+    import tinyagentos.taos_agent_runtime as rt
+
+    assert await rt._github_token_state(SimpleNamespace(), "taos-agent") == (None, False)
+
+
+@pytest.mark.asyncio
+async def test_chat_route_asks_for_the_taos_agent_github_token(client, app, monkeypatch):
+    """The desktop chat is the one caller that passes github_agent; without it
+    the taOS agent would never get a token."""
+    await client.patch("/api/taos-agent/settings", json={"model": "gpt-4o"})
+    app.state.llm_proxy = _make_mock_proxy(running=True)
+    seen: dict = {}
+
+    async def fake_ensure_server(state, model, github_agent=None):
+        seen["github_agent"] = github_agent
+        raise RuntimeError("stop here")
+
+    monkeypatch.setattr(
+        "tinyagentos.routes.taos_agent.ensure_taos_opencode_server",
+        fake_ensure_server,
+    )
+    await client.post(
+        "/api/taos-agent/chat",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert seen["github_agent"] == "taos-agent"
+
+
+def test_github_chapter_only_while_the_server_holds_a_token():
+    import tinyagentos.routes.taos_agent as ta
+
+    assert ta.GITHUB_CHAPTER.startswith("# Opening GitHub pull requests")
+    with_token = SimpleNamespace(github_token="ghs_x")
+
+    assert ta._with_github_chapter("manual", "", with_token) == f"manual\n\n{ta.GITHUB_CHAPTER}"
+    assert ta._with_github_chapter("manual", "", SimpleNamespace(github_token=None)) == "manual"
+    # PicoClaw and Claude Code turns have no server.
+    assert ta._with_github_chapter("manual", "", None) == "manual"
+    # A persona override replaces everything, as it does for the phone chapter.
+    assert ta._with_github_chapter("A pirate.", "A pirate.", with_token) == "A pirate."
+
+
+def test_github_chapter_stays_out_of_the_always_on_manual():
+    import tinyagentos.routes.taos_agent as ta
+
+    assert "Opening GitHub pull requests" not in ta.SYSTEM_PROMPT
+
+
+@pytest.mark.asyncio
+async def test_chat_route_sends_the_github_chapter_to_the_harness(client, app, monkeypatch):
+    import tinyagentos.routes.taos_agent as ta
+
+    await client.patch("/api/taos-agent/settings", json={"model": "gpt-4o"})
+    app.state.llm_proxy = _make_mock_proxy(running=True)
+    app.state.taos_opencode_password = "testpw"
+    app.state.taos_opencode_session_id = None
+    seen: dict = {}
+
+    async def fake_ensure_server(state, model, github_agent=None):
+        return SimpleNamespace(base_url="http://127.0.0.1:4188", github_token="ghs_x")
+
+    class _FakeAdapter:
+        def __init__(self, cfg, sink):
+            seen["system"] = cfg.system
+            self._sink = sink
+            self.session_id = None
+
+        async def ensure_session(self):
+            self.session_id = "ses_gh"
+
+        async def prompt(self, text, trace_id=None, attachments=None):
+            self._sink({"kind": "final", "content": "ok"})
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(ta, "ensure_taos_opencode_server", fake_ensure_server)
+    monkeypatch.setattr(ta, "OpenCodeAdapter", _FakeAdapter)
+    resp = await client.post(
+        "/api/taos-agent/chat",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+    )
+    assert resp.status_code == 200, resp.text
+    assert ta.GITHUB_CHAPTER in seen["system"]

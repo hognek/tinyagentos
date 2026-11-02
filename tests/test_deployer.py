@@ -1690,3 +1690,62 @@ class TestGitInitAndCommitter:
             assert "committer_failed" in result["steps"]
             assert result["versioning"] is False
             assert result["versioning_error"] is not None
+
+
+class TestDeployGitHubToken:
+    """taOS #858: a granted agent's token reaches its env and credential file."""
+
+    async def _deploy(self, tmp_path, **kwargs):
+        req = _req(name="gh", data_dir=tmp_path, **kwargs)
+        with patch("tinyagentos.deployer.create_container", new_callable=AsyncMock) as mock_create, \
+             patch("tinyagentos.deployer.exec_in_container", new_callable=AsyncMock, return_value=(0, "10.0.0.9")), \
+             patch("tinyagentos.deployer.push_file", new_callable=AsyncMock, return_value=(0, "")), \
+             patch("tinyagentos.deployer.add_proxy_device", new_callable=AsyncMock, return_value={"success": True}), \
+             patch("tinyagentos.containers.push_file", new_callable=AsyncMock, return_value=(0, "")) as token_push, \
+             patch("tinyagentos.containers.exec_in_container", new_callable=AsyncMock, return_value=(0, "")) as token_exec:
+            mock_create.return_value = {"success": True, "name": "taos-agent-gh"}
+            result = await deploy_agent(req)
+        return result, mock_create.call_args.kwargs["env"], token_push, token_exec
+
+    @pytest.mark.asyncio
+    async def test_token_lands_in_env_and_credential_file(self, tmp_path):
+        from tinyagentos.github_token import CONTAINER_TOKEN_PATH
+
+        result, env, token_push, token_exec = await self._deploy(tmp_path, github_token="ghs_x")
+
+        assert result["success"] is True
+        assert env["GITHUB_TOKEN"] == "ghs_x"
+        assert env["GH_TOKEN"] == "ghs_x"
+        assert token_push.await_args.args[0] == "taos-agent-gh"
+        assert token_push.await_args.args[2] == CONTAINER_TOKEN_PATH
+        token_exec.assert_awaited_once_with(
+            "taos-agent-gh", ["chmod", "600", CONTAINER_TOKEN_PATH]
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_token_means_no_env_and_no_file(self, tmp_path):
+        result, env, token_push, _ = await self._deploy(tmp_path)
+
+        assert result["success"] is True
+        assert "GITHUB_TOKEN" not in env
+        assert "GH_TOKEN" not in env
+        token_push.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_cold_install_includes_gh(self, tmp_path):
+        recorded = []
+
+        async def mock_exec_fn(name, cmd, **kwargs):
+            recorded.append(" ".join(cmd))
+            return (0, "10.0.0.9")
+
+        req = _req(name="gh", data_dir=tmp_path)
+        with patch("tinyagentos.deployer.create_container", new_callable=AsyncMock) as mock_create, \
+             patch("tinyagentos.deployer.exec_in_container", side_effect=mock_exec_fn), \
+             patch("tinyagentos.deployer.push_file", new_callable=AsyncMock, return_value=(0, "")), \
+             patch("tinyagentos.deployer.add_proxy_device", new_callable=AsyncMock, return_value={"success": True}):
+            mock_create.return_value = {"success": True, "name": "taos-agent-gh"}
+            await deploy_agent(req)
+
+        apt = [c for c in recorded if "apt-get install" in c][0]
+        assert " gh" in apt

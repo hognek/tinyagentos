@@ -243,6 +243,10 @@ ensure_linux_deps() {
             python3 python3-venv python3-pip git curl ca-certificates \
             libtorrent-rasterbar-dev libboost-python-dev sqlite3 libsqlcipher-dev \
             vulkan-tools
+        # gh lets the taOS agent open pull requests. Optional, so never fail the
+        # install on it.
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gh \
+            || log "gh not installed: the taOS agent will not be able to open GitHub pull requests"
     elif command -v dnf >/dev/null 2>&1; then
         log "installing dnf deps (python3, git, curl, libtorrent, nodejs, sqlcipher, vulkan-tools)"
         # rb_libtorrent: Fedora's libtorrent-rasterbar is split into the C++

@@ -9,11 +9,16 @@ module adds:
 - Per-agent lookups: ``get_agent_github_token(agent_name)`` queries the
   SecretsStore for ``github-installation`` secrets the agent is granted,
   mints a token scoped to those repos, and returns it.
+- Delivery: ``refresh_agent_tokens`` keeps every granted agent's token current,
+  and ``github_token_refresh_loop`` runs it for the life of the controller.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
+import tempfile
 import time
 from typing import TYPE_CHECKING
 
@@ -32,6 +37,16 @@ logger = logging.getLogger(__name__)
 _lifetime_cache: dict[str, tuple[str, float]] = {}
 _MAX_CACHE_SIZE = 100
 _REFRESH_WINDOW = 300  # Refresh when < 5 min remain (token lifetime is 1 hour)
+
+# Shorter than _REFRESH_WINDOW, so a pass always lands inside the window and the
+# delivered token is replaced before it expires.
+REFRESH_INTERVAL_S = 240
+
+# The App's private key lives in the encrypted SecretsStore, not in config.
+APP_KEY_SECRET = "github-app-private-key"
+# Inside an agent container. Frameworks run as root (see the SSH key step in
+# deployer.py). The agent manual re-exports from this file before using git/gh.
+CONTAINER_TOKEN_PATH = "/root/.taos-github-token"
 
 
 def _cache_key(app_id: str, installation_id: int) -> str:
@@ -123,6 +138,11 @@ async def mint_installation_token(
         return None
 
 
+async def _app_private_key(secrets_store: SecretsStore) -> str | None:
+    rec = await secrets_store.get(APP_KEY_SECRET)
+    return (rec.get("value") or None) if rec else None
+
+
 async def get_agent_github_token(
     agent_name: str,
     secrets_store: SecretsStore,
@@ -145,7 +165,10 @@ async def get_agent_github_token(
     GitHub App is not configured, or token minting fails for all
     installations.
     """
-    if not config.github_app_id or not config.github_app_private_key:
+    if not config.github_app_id:
+        return None
+    private_key = await _app_private_key(secrets_store)
+    if not private_key:
         return None
 
     installations = await secrets_store.get_agent_github_installations(agent_name)
@@ -164,7 +187,7 @@ async def get_agent_github_token(
             installation_id=iid,
             repo=repo,
             app_id=config.github_app_id,
-            private_key=config.github_app_private_key,
+            private_key=private_key,
             http_client=http_client,
         )
         if token:
@@ -173,30 +196,18 @@ async def get_agent_github_token(
     return None
 
 
-async def inject_agent_token(
+async def fetch_agent_token_state(
     agent_name: str,
-    env_dict: dict,
     secrets_store: SecretsStore,
     config: AppConfig,
     http_client: httpx.AsyncClient,
-) -> str | None:
-    """Fetch a short-lived GitHub token for *agent_name* and inject it into
-    *env_dict* as ``GITHUB_TOKEN`` (and ``GH_TOKEN``, which the ``gh`` CLI
-    prefers).
+) -> tuple[str | None, bool]:
+    """Return ``(token, granted)`` for *agent_name*. Never raises.
 
-    This is the expiry-aware wrapper the agent runtime calls at session
-    start and again on later turns. Because :func:`get_agent_github_token`
-    rides the lifetime-aware cache in :func:`mint_installation_token`, a
-    repeated call over a long session transparently returns a **fresh**
-    token whenever the cached one falls inside the 5-minute refresh window
-    — no agent process restart is needed to pick up the rotation.
-
-    Never leaves *env_dict* half-set and never raises: an agent with no
-    grant, an unconfigured GitHub App, or a transient mint failure simply
-    runs without a token (``GITHUB_TOKEN`` stays unset), which matches the
-    current behaviour of an agent that has never been granted GitHub access.
-
-    Returns the injected token, or ``None`` if none could be obtained.
+    The two ``None`` cases need different handling, so ``granted`` separates
+    them. ``(None, False)``: the agent has no grant, so a delivered token must
+    be withdrawn. ``(None, True)``: minting failed or could not be checked, so a
+    delivered token may still be valid and must be left alone.
     """
     try:
         token = await get_agent_github_token(
@@ -204,9 +215,127 @@ async def inject_agent_token(
         )
     except Exception:  # noqa: BLE001 - degrade, never break agent startup
         logger.exception("Could not fetch GitHub token for agent %s", agent_name)
-        return None
-
+        return None, True
     if token:
-        env_dict["GITHUB_TOKEN"] = token
-        env_dict["GH_TOKEN"] = token
-    return token
+        return token, True
+    if not config.github_app_id:
+        return None, False
+    try:
+        return None, bool(await secrets_store.get_agent_github_installations(agent_name))
+    except Exception:  # noqa: BLE001 - unknown is not the same as revoked
+        logger.exception("Could not read GitHub grants for agent %s", agent_name)
+        return None, True
+
+
+async def deploy_github_token(
+    app_state, agent_name: str, secrets_store: SecretsStore | None, remote: str | None = None
+) -> str:
+    """The token to deploy *agent_name* with, or ``""`` if it gets none.
+
+    A remote agent gets none: the refresh loop only reaches local containers, so
+    its token would expire an hour after deploy with nothing to replace it.
+    """
+    config = getattr(app_state, "config", None)
+    http_client = getattr(app_state, "http_client", None)
+    if remote or secrets_store is None or config is None or http_client is None:
+        return ""
+    token, _granted = await fetch_agent_token_state(
+        agent_name, secrets_store, config, http_client
+    )
+    return token or ""
+
+
+async def push_token_file(container: str, token: str) -> bool:
+    """Write *token* to the agent container's 0600 credential file."""
+    from tinyagentos import containers
+
+    fd, tmp_path = tempfile.mkstemp(suffix=".token")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(token + "\n")
+        rc, output = await containers.push_file(container, tmp_path, CONTAINER_TOKEN_PATH)
+    finally:
+        os.unlink(tmp_path)
+    if rc != 0:
+        logger.warning("Could not push GitHub token to %s (rc=%s)", container, rc)
+        return False
+    rc, output = await containers.exec_in_container(
+        container, ["chmod", "600", CONTAINER_TOKEN_PATH]
+    )
+    if rc != 0:
+        logger.warning("Could not chmod GitHub token in %s: %s", container, output[-200:])
+        return False
+    return True
+
+
+async def _remove_token_file(container: str) -> bool:
+    from tinyagentos import containers
+
+    rc, output = await containers.exec_in_container(
+        container, ["rm", "-f", CONTAINER_TOKEN_PATH]
+    )
+    if rc != 0:
+        logger.warning("Could not remove GitHub token from %s: %s", container, output[-200:])
+    return rc == 0
+
+
+async def refresh_agent_tokens(app_state) -> None:
+    """Rotate the GitHub token of every agent that has one, once.
+
+    Covers the taOS agent's opencode servers and running local agent containers.
+    A container's process env cannot change after start, so its credential file
+    is the rotation channel. A removed grant withdraws the file; the token itself
+    stays valid at GitHub until it expires, at most an hour later.
+    """
+    config = getattr(app_state, "config", None)
+    secrets_store = getattr(app_state, "secrets", None)
+    http_client = getattr(app_state, "http_client", None)
+    if config is None or secrets_store is None or http_client is None:
+        return
+
+    pushed: dict[str, str] = getattr(app_state, "github_tokens_pushed", None) or {}
+    app_state.github_tokens_pushed = pushed
+    servers = getattr(app_state, "taos_opencode_servers", None) or {}
+
+    for server in list(servers.values()):
+        agent_name = getattr(server, "github_agent", None)
+        if not agent_name:
+            continue
+        token, granted = await fetch_agent_token_state(
+            agent_name, secrets_store, config, http_client
+        )
+        if token or not granted:
+            server.set_github_token(token)
+
+    # Nothing can be minted and nothing was delivered: skip the container listing.
+    if not config.github_app_id and not pushed:
+        return
+
+    from tinyagentos import containers
+
+    prefix = "taos-agent-"
+    for info in await containers.list_containers(prefix):
+        if info.status.lower() != "running":
+            continue
+        agent_name = info.name.removeprefix(prefix)
+        token, granted = await fetch_agent_token_state(
+            agent_name, secrets_store, config, http_client
+        )
+        if token:
+            if pushed.get(agent_name) != token and await push_token_file(info.name, token):
+                pushed[agent_name] = token
+        elif not granted and agent_name in pushed:
+            if await _remove_token_file(info.name):
+                del pushed[agent_name]
+
+
+async def github_token_refresh_loop(app_state, interval: float = REFRESH_INTERVAL_S) -> None:
+    """Run :func:`refresh_agent_tokens` until cancelled."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await refresh_agent_tokens(app_state)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - the next pass retries
+            logger.exception("GitHub token refresh pass failed")

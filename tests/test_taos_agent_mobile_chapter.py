@@ -103,7 +103,7 @@ async def _system_sent_to_harness(client, app, monkeypatch, device_class: str) -
     async def no_problem(app_state, model, prefs):
         return None
 
-    async def fake_ensure_server(state, model):
+    async def fake_ensure_server(state, model, github_agent=None):
         return SimpleNamespace(base_url="http://127.0.0.1:4188")
 
     seen: dict = {}

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import stat
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -688,3 +689,39 @@ def test_set_github_token_refreshes_credential_file(tmp_path):
 
     server.set_github_token(None)
     assert not cred_file.exists()
+
+
+def test_github_token_file_is_private_and_leaves_no_temp_file(tmp_path):
+    cfg = _github_token_cfg(tmp_path)
+    server = OpenCodeServer(cfg)
+
+    server.set_github_token("ghs_one")
+    server.set_github_token("ghs_two")
+
+    path = tmp_path / ".taos-github-token"
+    assert path.read_text() == "ghs_two\n"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".taos-github-token")] == [
+        ".taos-github-token"
+    ]
+
+
+def test_github_token_file_creates_a_missing_home(tmp_path):
+    home = tmp_path / "not-created-yet"
+    server = OpenCodeServer(_github_token_cfg(home))
+
+    server.set_github_token("ghs_one")
+
+    assert (home / ".taos-github-token").read_text() == "ghs_one\n"
+
+
+def test_github_agent_property(tmp_path):
+    assert OpenCodeServer(_github_token_cfg(tmp_path)).github_agent is None
+    assert OpenCodeServer(_github_token_cfg(tmp_path, github_agent="taos-agent")).github_agent == "taos-agent"
+
+
+def _github_token_cfg(home, **kwargs):
+    return OpenCodeServerConfig(
+        home=str(home), port=1, server_password="p", litellm_base_url="http://x/v1",
+        litellm_key="k", model_ids=["m"], **kwargs,
+    )

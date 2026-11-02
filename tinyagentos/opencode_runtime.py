@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -155,6 +156,13 @@ class OpenCodeServerConfig:
     before `git push` / `gh pr create`.
     """
 
+    github_agent: str | None = None
+    """The agent whose GitHub grant this server carries, or None for no token.
+
+    The refresh loop in :mod:`tinyagentos.github_token` rotates the token only
+    on servers that name an agent here.
+    """
+
     binary: str = "opencode"
     """Path or name of the opencode binary."""
 
@@ -216,29 +224,51 @@ class OpenCodeServer:
 
     # ------------------------------------------------------- github token env
 
+    @property
+    def github_agent(self) -> str | None:
+        """The agent whose GitHub grant this server carries, if any."""
+        return self._cfg.github_agent
+
+    @property
+    def github_token(self) -> str | None:
+        """The current GitHub token, if the server holds one."""
+        return self._cfg.github_token
+
     def _github_token_file(self) -> Path:
         """Path of the agent GitHub token credential file inside the server home."""
         return Path(self._cfg.home) / ".taos-github-token"
 
     def _write_github_token_file(self) -> None:
-        """Write the current token to a 0600 credential file in the agent home.
+        """Atomically write the token to a 0600 credential file in the agent home.
 
         A long-lived server's process env is fixed at spawn, so once the
         short-lived token rotates during a session the running process cannot
-        see the new value through ``GITHUB_TOKEN``. The PR-ops skill tells the
-        agent to ``export GITHUB_TOKEN="$(cat $HOME/.taos-github-token)"``
-        before ``git push`` / ``gh pr create`` so it always uses the freshest
-        token even over a multi-hour session. Best-effort: failures only log.
+        see the new value through ``GITHUB_TOKEN``. The agent manual tells the
+        agent to re-export from this file before using git or gh. Best-effort:
+        failures only log.
         """
         token = self._cfg.github_token
         if not token:
             return
         path = self._github_token_file()
+        tmp_path: str | None = None
         try:
-            path.write_text(token + "\n", encoding="utf-8")
-            os.chmod(path, 0o600)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # mkstemp creates the file 0600, so the token is never readable by
+            # anyone else, and the rename means a reader never sees half of it.
+            fd, tmp_path = tempfile.mkstemp(dir=path.parent, prefix=f"{path.name}.")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(token + "\n")
+            os.replace(tmp_path, path)
+            tmp_path = None
         except OSError:
             logger.debug("opencode_runtime: could not write github token file %s", path)
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    logger.debug("opencode_runtime: could not remove %s", tmp_path)
 
     def set_github_token(self, token: str | None) -> None:
         """Refresh the agent's GitHub token for a long-running session.

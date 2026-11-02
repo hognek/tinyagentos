@@ -414,6 +414,12 @@ Match the symptom against that log. Known classics: apps that grabbed a core por
 before mid-2026 need a Store reinstall; cluster workers from before pairing need a
 one-time re-pair (restart the worker, approve the code in Cluster).
 
+## GitHub pull requests
+
+If the user has granted you GitHub access, your token is in `GITHUB_TOKEN`/`GH_TOKEN`
+and, always current, in `$HOME/.taos-github-token`. It lasts about an hour, so re-export
+from the file before using git or gh. Full flow: `docs/agent-manual/github/github-prs.md`.
+
 ## Hard things to never do
 
 - Never show or ask for passwords, API keys, or tokens in chat.

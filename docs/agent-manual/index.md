@@ -24,6 +24,13 @@ Run `python3 scripts/build-agent-manual.py` to compile these into `docs/taos-age
 | `13-memory-mode-framework.md` | Memory mode `framework`: native memory only, no taOSmd calls, redeploy clears all |
 | `14-memory-mode-taosmd.md` | Memory mode `taosmd`: taOSmd only, for frameworks with no native memory, single source of truth |
 
+## Conditional chapters
+
+Kept out of the compile above and appended by `routes/taos_agent.py` only when they apply.
+
+- `mobile/15-mobile.md`: on a phone.
+- `github/github-prs.md`: while the taOS agent holds a GitHub token. Opening a pull request with it.
+
 ## Companion skills
 
 - **taos-agent** (`../../.claude/skills/taos-agent/SKILL.md`): the actionable skill for the

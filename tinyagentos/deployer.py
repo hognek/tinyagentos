@@ -179,6 +179,11 @@ class DeployRequest:
     # When non-empty, injected as TAOS_AGENT_TOKEN into the container env.
     # Additive: TAOS_LOCAL_TOKEN is unchanged.
     agent_token: str = ""
+    # Short-lived GitHub token for an agent with a GitHub grant. When non-empty,
+    # injected as GITHUB_TOKEN/GH_TOKEN and written to the credential file that
+    # github_token.refresh_agent_tokens keeps current. Empty on a remote deploy,
+    # which the refresh loop cannot reach.
+    github_token: str = ""
 
 
 # Where an agent container reaches its LLM: its OWN loopback, port 4000, the
@@ -401,6 +406,10 @@ async def deploy_agent(req: DeployRequest) -> dict:
         env["OPENAI_API_KEY"] = ""
     if "LITELLM_API_KEY" not in env:
         env["LITELLM_API_KEY"] = ""
+
+    if req.github_token:
+        env["GITHUB_TOKEN"] = req.github_token
+        env["GH_TOKEN"] = req.github_token
 
     # Agent-granted secrets — injected as env vars so frameworks pick them up
     # at startup (e.g. OPENROUTER_API_KEY for Hermes). Each secret name is
@@ -645,6 +654,12 @@ async def deploy_agent(req: DeployRequest) -> dict:
                 else:
                     logger.info("Deploy %s: materialized SSH key %r at %s", req.name, _sk_name, _dest)
             steps.append("ssh_keys_materialized")
+
+        if req.github_token:
+            from tinyagentos.github_token import push_token_file
+            # Non-fatal: the refresh loop writes the file on its next pass.
+            if await push_token_file(container_name, req.github_token):
+                steps.append("github_token_written")
 
         # Step 3: Install base dependencies (framework needs these).
         # Skipped entirely when the pre-built openclaw base image is in

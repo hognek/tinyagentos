@@ -309,7 +309,7 @@ async def test_chat_opencode_with_gateway_and_no_litellm_is_not_a_litellm_503(cl
     await client.patch("/api/taos-agent/settings", json={"model": "default"})
     reached = []
 
-    async def fake_ensure(app_state, model):
+    async def fake_ensure(app_state, model, github_agent=None):
         reached.append(model)
         raise _SentinelStart("sentinel-opencode-start")
 

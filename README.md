@@ -88,6 +88,8 @@ sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   libtorrent-rasterbar-dev libboost-python-dev sqlite3 libsqlcipher-dev vulkan-tools
 curl -fsSL https://raw.githubusercontent.com/jaylfc/taOS/master/scripts/install-server.sh | sudo sh
 ```
+
+The installer also tries to add `gh`, which the taOS agent needs to open GitHub pull requests. It is optional, and the install carries on without it.
 </details>
 
 <details><summary>Fedora — install dependencies first</summary>
